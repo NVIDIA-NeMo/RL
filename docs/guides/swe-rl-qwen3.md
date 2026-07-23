@@ -71,7 +71,7 @@ Both stages use the same training backbone. Key configuration choices (full conf
 
 - **Async GRPO, non-colocated**: generation runs on a separate pool of nodes from training (`policy.generation.colocated.enabled=false`), with `grpo.async_grpo.enabled=true`, `max_trajectory_age_steps=1`, and `in_flight_weight_updates=true`. This is essential for agentic rollouts whose latency varies widely (a multi-turn SWE trajectory can take many minutes).
 - **MoE stability**: the router is frozen (`freeze_moe_router=true`) and the auxiliary load-balancing loss is disabled (`moe_aux_loss_coeff=0`), so RL does not perturb expert routing.
-- **Megatron parallelism** (per 8-GPU node): `TP×EP×CP×PP` = `2×8×4×2` (SWE1) / `4×8×4×2` (SWE2), with sequence parallel and sequence packing enabled, at `max_total_sequence_length=131072`.
+- **Megatron parallelism**: SWE1 sets TP=2, EP=8, CP=4, PP=2; SWE2 sets TP=4, EP=8, CP=4, PP=2. These dimensions do not form one per-node product: expert parallelism partitions the data-parallel expert group. Both stages use sequence parallel and sequence packing at `max_total_sequence_length=131072`.
 - **No KL penalty** (`reference_policy_kl_penalty=0`), decoupled clipping (`ratio_clip_min=0.2`, `ratio_clip_max=0.28`), constant LR `1e-6`.
 
 ## Results
@@ -115,6 +115,9 @@ Both stages use the NeMo-Gym GRPO entry point:
 ```bash
 uv run --frozen ./examples/nemo_gym/run_grpo_nemo_gym.py --config <config.yaml> {overrides}
 ```
+
+For the SGLang generation and streaming-refit variant, see
+[SGLang Generation and Weight Refit](sglang-refit.md).
 
 ### Prerequisites
 

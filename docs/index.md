@@ -170,6 +170,13 @@ Off-policy distillation across mismatched tokenizers — build a (student, teach
 Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
 :::
 
+:::{grid-item-card} {octicon}`broadcast` SGLang Generation and Refit
+:link: guides/sglang-refit
+:link-type: doc
+
+Run SGLang rollouts with colocated IPC or Megatron-to-SGLang NCCL weight streaming.
+:::
+
 :::{grid-item-card} {octicon}`sync` Checkpoint-Engine Refit
 :link: guides/checkpoint-engine-refit
 :link-type: doc
@@ -303,6 +310,7 @@ guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
+guides/sglang-refit.md
 guides/checkpoint-engine-refit.md
 guides/router-replay.md
 guides/muon-optimizer.md

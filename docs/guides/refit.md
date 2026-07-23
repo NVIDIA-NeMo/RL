@@ -23,14 +23,15 @@ delta and NIXL cannot both be active.
 | Transport | Generation backend | Policy backend | Quantization and MoE |
 |---|---|---|---|
 | Colocated IPC/HTTP | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
-| NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
+| NCCL | vLLM, Megatron, or SGLang | DTensor or Megatron | SGLang non-colocated GRPO broadcast currently requires Megatron; the other backends use their standard full-weight loader. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
 | NIXL, full weights | vLLM | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. |
 | NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
 
-Non-colocated SGLang generation is not supported. The NIXL restrictions are on
-the generation backend; both Megatron and DTensor policy workers can send
-weights. Sparse delta is currently limited to GRPO. NIXL is initialized by the
+Non-colocated SGLang generation uses a GRPO-specific side communicator and
+requires the Megatron policy backend. The NIXL restrictions are on the
+generation backend; both Megatron and DTensor policy workers can send weights
+to vLLM. Sparse delta is currently limited to GRPO. NIXL is initialized by the
 GRPO and distillation setup paths; PPO currently requires colocated generation.
 
 ## Minimal Configuration
@@ -96,5 +97,7 @@ policy:
   performance tuning, FP8, sharded experts, and fault tolerance.
 - [Checkpoint Engines](../design-docs/checkpoint-engines.md) describes the
   checkpoint-engine protocol and implementation.
+- [SGLang Generation and Weight Refit](sglang-refit.md) covers SGLang topology,
+  refit validation, NeMo-Gym, and failure markers.
 - [Training and Generation Backends](../about/backends.md) summarizes backend
   compatibility.
