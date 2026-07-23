@@ -42,9 +42,11 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     DistributedCrossEntropy,
+    allgather_cp_contiguous_tensor,
     cp_shift_next,
     group_all_reduce_sum,
     vocab_parallel_full_log_softmax,
+    vocab_parallel_gather_logits,
     vocab_parallel_log_softmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
@@ -3427,17 +3429,37 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         for the v6 preset; the v1/v2/v5 surface-match path is not ported.
 
         Per-teacher contract (mirrors ``_compute_same_vocab_kl``):
-        ``student_logits`` is CP-relaid contiguous, ``teacher_full_logits`` is
-        the reassembled full-vocab teacher logits, and ``align`` carries the
-        localized student/teacher input ids, per-chunk position spans,
-        ``pair_valid`` and ``num_chunks``. ``tp_group``/``cp_group`` are accepted
-        for the native TP/CP gather (wired in a later phase); this body is
-        single-GPU-correct (TP=CP=1).
+        ``student_logits`` is this rank's CP-contiguous window,
+        ``teacher_full_logits`` is the reassembled full-vocab teacher window,
+        and ``align`` carries the localized student/teacher input ids, per-chunk
+        global position spans, ``pair_valid`` and ``num_chunks``. The body is
+        native TP/CP-correct: ``student_logits`` is vocab-gathered across
+        ``tp_group`` and sequence-gathered across ``cp_group`` (teacher likewise
+        on the sequence) so the arbitrary vocab-column / global-span indexing is
+        materialized full; ``global_valid_chunks`` is WORLD-reduced in-loss. All
+        gathers are no-ops at world size 1 (single-GPU byte-exact).
 
         Returns ``(loss, metrics_dict)``.
         """
         cfg = self.cfg
         device = student_logits.device
+        # ----- Native TP/CP gather (Phase 2) -----------------------------
+        # v6 indexes arbitrary vocab columns (common/support token ids) and
+        # arbitrary sequence positions (global chunk spans), and takes a full-
+        # vocab logsumexp per position. Under TP the vocab is sharded and under
+        # CP the sequence is windowed, so both must be materialized full before
+        # any indexing. CP is a contiguous sequence all-gather (the student is
+        # relaid to a contiguous window and the teacher is contiguous-block
+        # sharded); TP is a raw-logit vocab all-gather. The axes are orthogonal
+        # so they compose. Both are no-ops at world size 1 -> the single-GPU
+        # path (and CPU parity) is byte-exact. Spans / input_ids arrive global
+        # from prepare_xtoken_cross_tokenizer_loss_input.
+        student_logits = allgather_cp_contiguous_tensor(student_logits, cp_group)
+        student_logits = vocab_parallel_gather_logits(student_logits, tp_group=tp_group)
+        with torch.no_grad():
+            teacher_full_logits = allgather_cp_contiguous_tensor(
+                teacher_full_logits, cp_group
+            )
         # B is the per-sample loop bound; S is the student-side
         # predictor-position bound used in the classify-loop range check.
         # V_s (student vocab) is implicitly bounded by the logits gather
@@ -3615,11 +3637,19 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # ----- Single-shot host pull of input_ids ------------------------
         # One .detach().cpu().numpy() per tensor, then per-chunk numpy indexing
         # inside the classify/collect loop. The ids ride on the localized
-        # alignment: student ids are CP-relaid contiguous, teacher ids are this
-        # CP rank's contiguous teacher window (both unshifted; the classify loop
-        # applies its own per-chunk kl_chunk_shift).
+        # alignment as this CP rank's contiguous window (both unshifted; the
+        # classify loop applies its own per-chunk kl_chunk_shift); they are
+        # CP-gathered to the full sequence to match the gathered logits and the
+        # global spans (no-op at CP=1).
         input_ids_student = to_local_if_dtensor(align.student_input_ids)
         input_ids_teacher = to_local_if_dtensor(align.teacher_input_ids)
+        with torch.no_grad():
+            input_ids_student = allgather_cp_contiguous_tensor(
+                input_ids_student, cp_group
+            )
+            input_ids_teacher = allgather_cp_contiguous_tensor(
+                input_ids_teacher, cp_group
+            )
         inp_s_np = input_ids_student.detach().cpu().numpy()
         inp_t_np = input_ids_teacher.detach().cpu().numpy()
 
@@ -3781,32 +3811,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                         (b, M, N, s_pred, t_pred, s_labels, t_labels)
                     )
 
-        # ----- Early-out: no chunks -------------------------------------
-        if not common_chunks and not mismatch_chunks:
-            # Keep gradient-connected zero so backward() doesn't fail on
-            # no-valid-chunk microbatches.
-            zero = (student_logits.sum() * 0.0).to(student_logits.dtype)
-            metrics = {
-                "loss": zero.item(),
-                "train:loss": zero.item(),
-                "kl_common_per_chunk": zero.item(),
-                "kl_partition_last_per_chunk": zero.item(),
-                "num_common_chunks": 0,
-                "num_mismatch_chunks": 0,
-                "num_noise_filtered_common_chunks": (noise_filtered_common_chunks),
-                "num_noise_filtered_mismatch_chunks": (noise_filtered_mismatch_chunks),
-                "top1_acc_per_chunk": zero.item(),
-                # Worker side (dtensor_policy_worker_v2.py:466) keys
-                # num_valid_samples unconditionally. Provide 0 here so the
-                # no-chunk microbatch is reported but doesn't contribute.
-                "num_valid_samples": 0,
-            }
-            if v3_position_0_kl:
-                metrics["kl_partition_first_per_chunk"] = zero.item()
-            if noise_filter_topk > 0:
-                metrics["prefix_bidir_v3_noise_filter_topk"] = noise_filter_topk
-            return zero, metrics
-
+        # ----- No early-out on empty chunks -----------------------------
+        # A microbatch with no valid chunks (empty common + mismatch) is NOT
+        # returned early: it must still reach the ``global_valid_chunks``
+        # WORLD-reduce below so a rank with zero local chunks participates in
+        # the collective (other DP/CP ranks may have chunks). The empty
+        # common/mismatch loops leave both partition losses at zero and the
+        # combine step returns a gradient-connected zero.
         accum_dtype = (
             torch.float32
             if student_logits.dtype in (torch.float16, torch.bfloat16)
@@ -4602,6 +4613,30 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # ----- Combine + T^2 scale (tokenalign.py:7362-7425) -----------
         effective_mismatch_count = len(support_sizes)
         effective_count = len(common_chunks) + effective_mismatch_count
+        # DP×CP-global valid-chunk count, computed in-loss. Reduce over the full
+        # mesh (WORLD), then divide out the TP replication: the chunk count is
+        # identical on every TP rank (chunks are vocab-independent), so
+        # ``WORLD-sum == tp_world × (DP×CP-sum)`` exactly, and dividing by
+        # ``tp_world`` recovers the DP×CP count. This matches the CE term's
+        # ``global_valid_toks`` (which carries no TP factor), so the KD keeps its
+        # configured weight relative to CE at TP>1 — unlike the deleted P-KL/gold
+        # WORLD-reduce, which under-weighted the KD by 1/tp. The reduce is
+        # unconditional so a no-chunk rank still fires the collective (the
+        # early-return was removed for exactly this). At world size 1 (and CPU
+        # parity) it is a no-op, so ``global_valid_chunks`` collapses to the local
+        # ``effective_count`` and the normalization is byte-exact.
+        if global_valid_chunks is None:
+            global_valid_chunks = group_all_reduce_sum(
+                torch.tensor(float(effective_count), device=device, dtype=torch.float32),
+                group=torch.distributed.group.WORLD,
+            )
+            tp_world = (
+                torch.distributed.get_world_size(tp_group)
+                if tp_group is not None
+                else 1
+            )
+            if tp_world > 1:
+                global_valid_chunks = global_valid_chunks / float(tp_world)
         mismatch_last_loss = mismatch_loss
         mismatch_combined_loss, mismatch_loss = _combine_v3_mismatch_terms(
             mismatch_last_loss,
@@ -4620,22 +4655,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             chunk_sum = common_loss * float(len(common_chunks)) + mismatch_loss * float(
                 effective_mismatch_count
             )
-            if global_valid_chunks is not None and float(global_valid_chunks) > 0:
-                # Per-chunk normalisation. The trainer's sum-reduction
-                # across microbatches and ranks yields
-                # `total_chunk_KL × T² / global_valid_chunks` — i.e. the
-                # natural per-chunk KL averaged over the global batch.
-                # This is the natural unit for v3's chunk-level partition
-                # KL and matches the per-token convention used by
-                # _compute_ce on its own terms (each loss normalises by
-                # its natural global denominator).
-                loss_total = chunk_sum / global_valid_chunks.to(chunk_sum.dtype)
-            else:
-                # Legacy per-mb local chunk-average (sum across mbs gives
-                # "sum of per-mb chunk-averages", NOT a global per-chunk
-                # avg). Retained for any caller that doesn't pass
-                # global_valid_chunks; the v3 dispatcher always passes it.
-                loss_total = chunk_sum / float(effective_count)
+            # Per-chunk normalisation. ``global_valid_chunks`` is either the
+            # in-loss WORLD-reduce above or a caller-supplied count (both
+            # >= this rank's ``effective_count`` > 0 here, so no div-by-zero).
+            # The trainer's sum-reduction across microbatches and ranks then
+            # yields `total_chunk_KL × T² / global_valid_chunks` — the natural
+            # per-chunk KL averaged over the global batch, matching the
+            # per-token convention used by _compute_ce (each loss normalises by
+            # its own natural global denominator).
+            loss_total = chunk_sum / global_valid_chunks.to(chunk_sum.dtype)
         else:
             # No usable chunks. Keep gradient-connected zero.
             loss_total = (student_logits.sum() * 0.0).to(accum_dtype)

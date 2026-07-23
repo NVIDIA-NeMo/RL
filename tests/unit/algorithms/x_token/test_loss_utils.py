@@ -789,6 +789,219 @@ class XtokenShardTestActor:
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
 
+    def run_v6(self):
+        """TP/CP parallelism-invariance for the v6 cross-tokenizer partition KL.
+
+        Builds a full-tensor single-GPU reference (loss + student-logit grad) and
+        a sharded run — student vocab-sharded over TP, student/teacher sequence
+        contiguous-block-sharded over CP — of
+        ``_compute_prefix_bidir_partition_kl_v3``, then asserts:
+
+          * each rank's loss == ``reference_loss / cp_size``. The in-loss
+            ``global_valid_chunks`` normalizer is the DP×CP-reduced chunk count
+            (WORLD-reduce ÷ tp_world), so TP is *replicated* (no TP factor,
+            matching CE's ``global_valid_toks``) while each CP rank holds a
+            ``1/cp_size`` share that sums back to the full loss; and
+          * the student-logit gradient, reconstructed from the shards, equals
+            ``reference_grad`` exactly. The CP contiguous-gather backward
+            all-reduces the per-rank grad to full magnitude (the CP factor
+            cancels) and TP carries no loss-scale factor, so nothing is left over.
+
+        The reference passes ``global_valid_chunks`` explicitly (so it does *not*
+        WORLD-reduce) with ``tp_group=cp_group=None`` (gathers are no-ops), so it
+        is a purely local per-rank computation with no collectives.
+        """
+        import os
+        import tempfile
+
+        from nemo_rl.algorithms.loss.loss_functions import (
+            CrossTokenizerDistillationLossFn,
+        )
+        from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
+
+        try:
+            torch.distributed.init_process_group(backend="nccl")
+            rank = int(os.environ["RANK"])
+            ws = int(os.environ["WORLD_SIZE"])
+            tp_size, cp_size = self.tp_size, self.cp_size
+            assert ws == tp_size * cp_size
+            device = torch.device("cuda")
+            # NamedSharding layout is ``arange(ws).reshape(tp, cp)`` so
+            # ``rank == tp_idx * cp_size + cp_idx``.
+            tp_idx, cp_idx = rank // cp_size, rank % cp_size
+
+            # TP / CP subgroups. Every rank must invoke every ``new_group``
+            # (it is a collective over the default group), keeping only its own.
+            tp_group = None
+            for c in range(cp_size):
+                g = torch.distributed.new_group(
+                    ranks=[t * cp_size + c for t in range(tp_size)]
+                )
+                if c == cp_idx:
+                    tp_group = g
+            cp_group = None
+            for t in range(tp_size):
+                g = torch.distributed.new_group(
+                    ranks=[t * cp_size + c for c in range(cp_size)]
+                )
+                if t == tp_idx:
+                    cp_group = g
+            if tp_size == 1:
+                tp_group = None
+            if cp_size == 1:
+                cp_group = None
+
+            # ---- Fixture (identical on every rank; sharded below) ----------
+            # Three single-token common chunks per sample (ids 0..9); the v6
+            # common-vocab JSD partition KL exercises the arbitrary vocab-column
+            # and sequence-position indexing that TP/CP must gather.
+            torch.manual_seed(0)
+            B, S, T, v_s, v_t = 2, 4, 4, 16, 16
+            temp = 1.0
+            student_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.long)
+            teacher_ids = student_ids.clone()
+            chunks = [(0, 1, 0, 1), (1, 2, 1, 2), (2, 3, 2, 3)]  # (ss, se, ts, te)
+            max_pairs = len(chunks)
+            s_spans = torch.zeros(B, max_pairs, 2, dtype=torch.long)
+            t_spans = torch.zeros(B, max_pairs, 2, dtype=torch.long)
+            pair_valid = torch.zeros(B, max_pairs, dtype=torch.bool)
+            num_chunks = torch.full((B,), max_pairs, dtype=torch.long)
+            for b in range(B):
+                for k, (ss, se, ts, te) in enumerate(chunks):
+                    s_spans[b, k, 0], s_spans[b, k, 1] = ss, se
+                    t_spans[b, k, 0], t_spans[b, k, 1] = ts, te
+                    pair_valid[b, k] = True
+            student_full = torch.randn(B, S, v_s)  # CPU -> deterministic
+            teacher_full = torch.randn(B, T, v_t)
+            gvc = float(B * len(chunks))  # total valid chunks (single-rank)
+
+            student_ids = student_ids.to(device)
+            teacher_ids = teacher_ids.to(device)
+            s_spans, t_spans = s_spans.to(device), t_spans.to(device)
+            pair_valid, num_chunks = pair_valid.to(device), num_chunks.to(device)
+            student_full, teacher_full = student_full.to(device), teacher_full.to(device)
+
+            # Tiny 1-to-1 subtok tables so ``common_indices_from_subtoks`` derives
+            # the common-vocab support without a projection matrix.
+            tmpdir = tempfile.mkdtemp()
+            subtoks = torch.full((v_s, 3), -1, dtype=torch.long)
+            lengths = torch.zeros((v_s,), dtype=torch.long)
+            for s in range(10):
+                subtoks[s, 0], lengths[s] = s, 1
+            fwd_path = os.path.join(tmpdir, "fwd.pt")
+            rev_path = os.path.join(tmpdir, "rev.pt")
+            torch.save({"subtoks": subtoks, "lengths": lengths}, fwd_path)
+            torch.save({"subtoks": subtoks.clone(), "lengths": lengths.clone()}, rev_path)
+
+            cfg = {
+                "temperature": temp,
+                "vocab_topk": 8,
+                "reverse_kl": False,
+                "kl_loss_weight": 1.0,
+                "ce_loss_scale": 1.0,
+                "dynamic_loss_scaling": False,
+                "kd_loss_mode": "sum",
+                "normalize_teacher_by_vocab": False,
+                "alpha": 1.0,
+                "sum_weights_metric": None,
+                "student_vocab_size": v_s,
+                "teacher_vocab_sizes": [v_t],
+                "projection_matrix_paths": ["dummy.pt"],
+                "teacher_weights": [1.0],
+                "common_indices_from_subtoks": True,
+                "pseudo_target_paths": [fwd_path],
+                "reverse_pseudo_target_paths": [rev_path],
+                "kl_chunk_shift": False,
+                "prefix_bidir_v3_position_0_kl": False,
+                "prefix_bidir_v3_loss_fn": "jsd",
+                "prefix_bidir_v3_last_pos_loss_fn": "jsd",
+                "prefix_bidir_v3_jsd_beta": 0.5,
+                "prefix_bidir_v3_noise_filter_topk": 0,
+            }
+            loss_fn = CrossTokenizerDistillationLossFn(cfg)
+
+            def _align(student_input_ids, teacher_input_ids):
+                return LocalizedAlignment(
+                    sample_mask=torch.ones(B, dtype=torch.bool, device=device),
+                    pair_valid=pair_valid,
+                    student_input_ids=student_input_ids,
+                    teacher_input_ids=teacher_input_ids,
+                    student_spans=s_spans,
+                    teacher_spans=t_spans,
+                    num_chunks=num_chunks,
+                )
+
+            # ---- Single-GPU reference (explicit gvc => no WORLD-reduce; tp/cp
+            #      None => gathers are no-ops => purely local, no collectives). --
+            ref_logits = student_full.clone().requires_grad_(True)
+            ref_loss, _ = loss_fn._compute_prefix_bidir_partition_kl_v3(
+                0,
+                ref_logits,
+                teacher_full.clone(),
+                _align(student_ids, teacher_ids),
+                teacher_vocab_size=v_t,
+                tp_group=None,
+                cp_group=None,
+                global_valid_chunks=torch.tensor(gvc, device=device),
+            )
+            ref_loss.backward()
+            ref_grad = ref_logits.grad.detach().clone()  # [B, S, v_s]
+
+            # ---- Sharded run: CP contiguous seq block x TP vocab slice. -------
+            sblk, tblk, vblk = S // cp_size, T // cp_size, v_s // tp_size
+            s_lo, t_lo, v_lo = cp_idx * sblk, cp_idx * tblk, tp_idx * vblk
+            student_shard = (
+                student_full[:, s_lo : s_lo + sblk, v_lo : v_lo + vblk]
+                .detach()
+                .clone()
+                .requires_grad_(True)
+            )
+            # Teacher is full-vocab (only CP-sharded on the sequence).
+            teacher_shard = teacher_full[:, t_lo : t_lo + tblk, :].detach().clone()
+            sh_loss, _ = loss_fn._compute_prefix_bidir_partition_kl_v3(
+                0,
+                student_shard,
+                teacher_shard,
+                _align(
+                    student_ids[:, s_lo : s_lo + sblk].contiguous(),
+                    teacher_ids[:, t_lo : t_lo + tblk].contiguous(),
+                ),
+                teacher_vocab_size=v_t,
+                tp_group=tp_group,
+                cp_group=cp_group,
+                global_valid_chunks=None,  # => in-loss WORLD-reduce over ws
+            )
+            sh_loss.backward()
+            sh_grad = student_shard.grad.detach().clone()  # [B, S/cp, v_s/tp]
+
+            # Loss invariance: every rank == reference / cp_size (TP replicated;
+            # each CP rank holds a 1/cp_size share of the full loss).
+            torch.testing.assert_close(
+                sh_loss.detach(),
+                ref_loss.detach() / cp_size,
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+            # Grad invariance: reconstruct the full student grad from the shards;
+            # it equals the single-GPU reference exactly (CP contributions
+            # all-reduce to full magnitude, TP carries no loss-scale factor).
+            gathered = [torch.empty_like(sh_grad) for _ in range(ws)]
+            torch.distributed.all_gather(gathered, sh_grad.contiguous())
+            recon = torch.zeros_like(ref_grad)
+            for r in range(ws):
+                r_tp, r_cp = r // cp_size, r % cp_size
+                recon[
+                    :, r_cp * sblk : (r_cp + 1) * sblk, r_tp * vblk : (r_tp + 1) * vblk
+                ] = gathered[r]
+            torch.testing.assert_close(recon, ref_grad, rtol=1e-4, atol=1e-4)
+            return {"success": True, "error": None}
+        except Exception:
+            return {"success": False, "error": traceback.format_exc()}
+        finally:
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+
 
 _ACTOR_FQN = f"{XtokenShardTestActor.__module__}.XtokenShardTestActor"
 
@@ -835,3 +1048,18 @@ def test_tp2cp1_sharded_helpers(register_actor):
 
 def test_tp1cp2_sharded_helpers(register_actor):
     _run(register_actor, tp_size=1, cp_size=2, method="run_cp")
+
+
+def test_v6_tp2cp1(register_actor):
+    """v6 partition-KL is invariant under TP=2 vocab sharding."""
+    _run(register_actor, tp_size=2, cp_size=1, method="run_v6")
+
+
+def test_v6_tp1cp2(register_actor):
+    """v6 partition-KL is invariant under CP=2 sequence sharding."""
+    _run(register_actor, tp_size=1, cp_size=2, method="run_v6")
+
+
+def test_v6_tp2cp2(register_actor):
+    """v6 partition-KL is invariant under composed TP=2 x CP=2 sharding."""
+    _run(register_actor, tp_size=2, cp_size=2, method="run_v6")

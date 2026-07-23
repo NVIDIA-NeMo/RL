@@ -1372,6 +1372,64 @@ class AllGatherCPTensor(torch.autograd.Function):
         return grad_input, None, None  # , None
 
 
+class AllGatherCPContiguousTensor(torch.autograd.Function):
+    """Autograd-aware all-gather of a *contiguously* CP-sharded tensor.
+
+    Unlike :class:`AllGatherCPTensor` (which un-does PyTorch's load-balanced
+    ``2*cp`` interleaving), this gathers plain contiguous blocks: CP rank ``r``
+    holds ``x[:, r*L:(r+1)*L]`` and the output is the rank-ordered concatenation
+    ``[B, cp*L, ...]``. Forward concatenates the gathered blocks; backward
+    all-reduces (SUM) the upstream grad over the CP group and narrows to this
+    rank's block. So when every CP rank materializes the full sequence and
+    computes the same scalar, the all-reduce routes the correct full-magnitude
+    gradient to each rank's own shard (the CP normalization factor cancels), and
+    every rank participates in the backward collective (no deadlock).
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        tensor: torch.Tensor,
+        cp_group: torch.distributed.ProcessGroup,
+        seq_dim: int = 1,
+    ) -> torch.Tensor:
+        cp_size = torch.distributed.get_world_size(cp_group)
+        parts = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(parts, tensor.contiguous(), group=cp_group)
+        ctx.seq_dim = seq_dim
+        ctx.cp_group = cp_group
+        ctx.cp_rank = torch.distributed.get_rank(cp_group)
+        ctx.local_len = tensor.shape[seq_dim]
+        return torch.cat(parts, dim=seq_dim)
+
+    @staticmethod
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
+        torch.distributed.all_reduce(grad_output, group=ctx.cp_group)
+        grad_input = grad_output.narrow(
+            ctx.seq_dim, ctx.cp_rank * ctx.local_len, ctx.local_len
+        )
+        return grad_input.contiguous(), None, None
+
+
+def allgather_cp_contiguous_tensor(
+    tensor: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """All-gather a contiguously CP-sharded tensor to the full sequence.
+
+    No-op (returns the input) when ``cp_group`` is ``None`` or world size <= 1,
+    so single-process / CPU paths are unchanged. See
+    :class:`AllGatherCPContiguousTensor` for the load-balanced-vs-contiguous
+    distinction and the backward semantics.
+    """
+    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
+        return tensor
+    return AllGatherCPContiguousTensor.apply(tensor, cp_group, seq_dim)
+
+
 def cp_load_balanced_to_contiguous(
     x: torch.Tensor,
     *,
@@ -1473,6 +1531,33 @@ def vocab_parallel_full_log_softmax(
             sharded_log_probs, group=tp_group
         )
     return torch.log_softmax(scaled, dim=-1)
+
+
+def vocab_parallel_gather_logits(
+    logits: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Gather TP vocab-sharded logits to the full vocab ``[..., V]`` (autograd-aware).
+
+    Returns the raw logits over the full vocab so callers that index arbitrary
+    vocab columns (and compute their own ``logsumexp``) can operate as if the
+    vocab were unsharded. With ``tp_group`` world > 1 the shards are all-gathered
+    via Megatron's autograd-aware gather; otherwise the (already-full) local
+    logits are returned. Unlike :func:`vocab_parallel_full_log_softmax`, no
+    ``log_softmax`` is applied — use this when the downstream math needs raw
+    logits rather than log-probs.
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        # Local import keeps the optional Megatron dependency boundary intact.
+        from megatron.core.tensor_parallel import (
+            gather_from_tensor_model_parallel_region,
+        )
+
+        return gather_from_tensor_model_parallel_region(logits, group=tp_group)
+    return logits
 
 
 def vocab_parallel_argmax(

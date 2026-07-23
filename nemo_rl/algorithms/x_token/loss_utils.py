@@ -46,6 +46,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
+    allgather_cp_contiguous_tensor,
     cp_load_balanced_to_contiguous,
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
@@ -1099,17 +1100,25 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         )
         # Contiguous, UNSHIFTED chunk ids -> per-chunk position spans for the v6
         # path. v6 reads spans and applies its own per-chunk kl_chunk_shift, so
-        # it must NOT see the P-KL/gold next-token-shifted chunk ids. (Spans are
-        # this CP rank's local-window positions, matching the local student /
-        # teacher logits; correct at CP=1 — full-sequence gather is a later
-        # phase.)
+        # it must NOT see the P-KL/gold next-token-shifted chunk ids.
         student_chunk_id_contig = cp_load_balanced_to_contiguous(
             align.student_chunk_id, cp_group=cp_group
         )
         teacher_chunk_id_contig = align.teacher_chunk_id
         max_pairs = align.pair_valid.shape[1]
-        align.student_spans = _chunk_ids_to_spans(student_chunk_id_contig, max_pairs)
-        align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_contig, max_pairs)
+        # GLOBAL spans: the v6 KD term gathers the student/teacher logits to the
+        # full sequence, so its spans must index global positions. Gather the
+        # contiguous-window chunk ids to the full sequence before deriving spans
+        # (no-op at CP=1, where the window is already the full sequence, so the
+        # single-GPU spans are byte-exact).
+        student_chunk_id_full = allgather_cp_contiguous_tensor(
+            student_chunk_id_contig, cp_group
+        )
+        teacher_chunk_id_full = allgather_cp_contiguous_tensor(
+            teacher_chunk_id_contig, cp_group
+        )
+        align.student_spans = _chunk_ids_to_spans(student_chunk_id_full, max_pairs)
+        align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_full, max_pairs)
         # num_chunks bounds the per-sample classify loop; pair_valid gates each
         # slot, so max_pairs (loop all slots) is always correct.
         align.num_chunks = torch.full(
