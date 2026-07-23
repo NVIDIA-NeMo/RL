@@ -13,15 +13,13 @@
 # limitations under the License.
 """All-field TransferQueue fetch at packed training-microbatch granularity.
 
-NeMo-RL supplies an exact key and packing plan. One rank per data-parallel
-replica reads those keys from TQ, materializes every selected train field, and
-distributes the CPU payload over a dedicated Gloo group. Every model-parallel
-rank publishes the microbatch to a local capacity-one queue only after that
-distribution completes.
+NeMo-RL supplies an exact key and packing plan. One TP0/CP0 leader for every
+fixed data-parallel and pipeline-parallel stage reads those keys from TQ and
+materializes every selected train field on a background CPU thread. When that
+stage consumes the microbatch, its foreground training thread broadcasts the
+payload through the existing TP×CP NCCL group.
 
-The dedicated background group is important for pipeline parallelism: pipeline
-stages consume their data iterators at different times, so the main thread must
-not enter an all-stage collective from ``next()``.
+No collective spans pipeline stages, and no producer thread launches NCCL.
 """
 
 from __future__ import annotations
@@ -31,7 +29,6 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any, Callable, Generic, Iterator, Sequence, TypeVar
 
 import torch
@@ -49,6 +46,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.nsys import nsys_nvtx_range
 from nemo_rl.utils.r3_trace import trace_tq_prefetch_payload
 
 TQ_SAMPLE_IDS_FIELD = "__tq_sample_ids"
@@ -75,12 +73,12 @@ class RankCoordinates:
 
 @dataclass(frozen=True)
 class TrainMicrobatchPrefetchGroup:
-    """Dedicated CPU distribution group for one DP replica."""
+    """Direct-reader and stage-local NCCL topology for this rank."""
 
-    replica_group: Any
-    replica_ranks: tuple[int, ...]
-    source_rank: int
-    is_source: bool
+    stage_group: Any
+    stage_ranks: tuple[int, ...]
+    stage_source_rank: int
+    is_stage_leader: bool
 
 
 @dataclass(frozen=True)
@@ -109,7 +107,7 @@ class TrainMicrobatchPlan:
 
 @dataclass(frozen=True)
 class PrefetchedMicrobatch:
-    """One fully materialized and distributed CPU microbatch."""
+    """One fully materialized microbatch, GPU-resident after stage fanout."""
 
     global_batch_index: int
     microbatch_index: int
@@ -287,15 +285,19 @@ def build_replica_topology(
                 key=lambda coord: coord.global_rank,
             )
         )
-        sources = [
-            coord
-            for coord in members
-            if coord.pp_rank == 0 and coord.tp_rank == 0 and coord.cp_rank == 0
+        pp_ranks = {coord.pp_rank for coord in members}
+        stage_leaders = [
+            coord for coord in members if coord.tp_rank == 0 and coord.cp_rank == 0
         ]
-        if len(sources) != 1:
+        if len(stage_leaders) != len(pp_ranks):
             raise ValueError(
-                "train-prefetch topology requires exactly one PP=TP=CP=0 "
-                f"source for DP {dp_rank}; got {len(sources)}"
+                "train-prefetch topology requires exactly one TP=CP=0 leader "
+                f"per PP stage for DP {dp_rank}; got leaders={stage_leaders}"
+            )
+        if {leader.pp_rank for leader in stage_leaders} != pp_ranks:
+            raise ValueError(
+                "train-prefetch topology is missing a TP=CP=0 leader for at "
+                f"least one PP stage in DP {dp_rank}"
             )
         logical_coords = {
             (coord.pp_rank, coord.tp_rank, coord.cp_rank) for coord in members
@@ -306,15 +308,8 @@ def build_replica_topology(
     return replicas
 
 
-def initialize_train_microbatch_prefetch_group(
-    *, collective_timeout_s: float | None
-) -> TrainMicrobatchPrefetchGroup:
-    """Create one dedicated Gloo group per DP replica on every world rank."""
-    if collective_timeout_s is not None:
-        collective_timeout_s = _validate_timeout_seconds(
-            collective_timeout_s,
-            name="policy.train_microbatch_prefetch.collective_timeout_s",
-        )
+def initialize_train_microbatch_prefetch_group() -> TrainMicrobatchPrefetchGroup:
+    """Select one direct TQ reader and existing TP×CP NCCL group per PP stage."""
     if not torch.distributed.is_initialized():
         raise RuntimeError("train microbatch prefetch requires torch.distributed")
 
@@ -343,29 +338,43 @@ def initialize_train_microbatch_prefetch_group(
     ]
     replicas = build_replica_topology(coordinates)
 
-    groups: dict[int, Any] = {}
-    for dp_rank, members in replicas.items():
-        group_kwargs: dict[str, Any] = {
-            "ranks": [coord.global_rank for coord in members],
-            "backend": "gloo",
-        }
-        if collective_timeout_s is not None:
-            group_kwargs["timeout"] = timedelta(seconds=collective_timeout_s)
-        groups[dp_rank] = torch.distributed.new_group(**group_kwargs)
-
     my_dp_rank = parallel_state.get_data_parallel_rank()
     my_members = replicas[my_dp_rank]
-    source = next(
-        coord
-        for coord in my_members
-        if coord.pp_rank == 0 and coord.tp_rank == 0 and coord.cp_rank == 0
+    my_pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    my_stage_members = tuple(
+        coord for coord in my_members if coord.pp_rank == my_pp_rank
     )
+    stage_leaders = [
+        coord for coord in my_stage_members if coord.tp_rank == 0 and coord.cp_rank == 0
+    ]
+    if len(stage_leaders) != 1:
+        raise ValueError(
+            "train-prefetch topology requires exactly one stage leader for "
+            f"DP {my_dp_rank}, PP {my_pp_rank}; got {len(stage_leaders)}"
+        )
+    stage_leader = stage_leaders[0]
+
+    stage_group = parallel_state.get_tensor_and_context_parallel_group()
+    expected_stage_ranks = tuple(
+        sorted(coord.global_rank for coord in my_stage_members)
+    )
+    actual_stage_ranks = tuple(torch.distributed.get_process_group_ranks(stage_group))
+    if set(actual_stage_ranks) != set(expected_stage_ranks) or len(
+        actual_stage_ranks
+    ) != len(expected_stage_ranks):
+        raise RuntimeError(
+            "Megatron TP×CP group does not match the train-prefetch PP stage: "
+            f"expected={expected_stage_ranks}, actual={actual_stage_ranks}"
+        )
+    if torch.distributed.get_backend(stage_group) != "nccl":
+        raise RuntimeError("train-prefetch stage-local group must use NCCL")
+
     my_rank = torch.distributed.get_rank()
     return TrainMicrobatchPrefetchGroup(
-        replica_group=groups[my_dp_rank],
-        replica_ranks=tuple(coord.global_rank for coord in my_members),
-        source_rank=source.global_rank,
-        is_source=my_rank == source.global_rank,
+        stage_group=stage_group,
+        stage_ranks=expected_stage_ranks,
+        stage_source_rank=stage_leader.global_rank,
+        is_stage_leader=my_rank == stage_leader.global_rank,
     )
 
 
@@ -375,6 +384,13 @@ def _tensor_bytes(data: BatchedDataDict[Any]) -> int:
         for value in data.values()
         if isinstance(value, torch.Tensor)
     )
+
+
+def _move_stage_payload_to_cuda(
+    data: BatchedDataDict[Any],
+) -> BatchedDataDict[Any]:
+    """Stage the complete leader payload before peers enter payload collectives."""
+    return data.to(torch.cuda.current_device())
 
 
 class _ThreadPrefetchError(RuntimeError):
@@ -586,7 +602,7 @@ class _ThreadPrefetchIterator(Iterator[_T], Generic[_T]):
 
 
 class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
-    """Synchronously load and distribute one planned microbatch at a time."""
+    """Synchronously load one planned microbatch from TQ."""
 
     def __init__(
         self,
@@ -595,20 +611,17 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
         meta: KVBatchMeta,
         plan: TrainMicrobatchPlan,
         items: Sequence[tuple[int, int, tuple[str, ...]]],
-        group: TrainMicrobatchPrefetchGroup,
         pad_value_dict: dict[str, Any],
     ) -> None:
         self._client = client
         self._meta = meta
         self._plan = plan
         self._items = iter(items)
-        self._group = group
         self._pad_value_dict = pad_value_dict
         self._metrics_lock = threading.Lock()
         self._metrics: dict[str, float] = {
             "tq_get_s": 0.0,
             "materialize_s": 0.0,
-            "distribute_s": 0.0,
             "tq_get_calls": 0.0,
             "materialized_payload_bytes": 0.0,
         }
@@ -620,18 +633,6 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
         with self._metrics_lock:
             self._metrics[key] += value
 
-    def _broadcast_envelope(self, envelope: list[Any]) -> tuple[Any, ...]:
-        if len(self._group.replica_ranks) > 1:
-            torch.distributed.broadcast_object_list(
-                envelope,
-                src=self._group.source_rank,
-                group=self._group.replica_group,
-            )
-        value = envelope[0]
-        if not isinstance(value, tuple):
-            raise ValueError(f"invalid train-prefetch envelope: {value!r}")
-        return value
-
     @staticmethod
     def _batch_error(
         gb_idx: int, mb_idx: int, message: str
@@ -641,27 +642,28 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
             f"{gb_idx}, microbatch {mb_idx}: {message}"
         )
 
-    def _load_source(
+    def _load(
         self, gb_idx: int, mb_idx: int, sample_ids: tuple[str, ...]
     ) -> PrefetchedMicrobatch:
-        data: BatchedDataDict[Any] | None = None
         try:
             start = time.perf_counter()
-            wire = self._client.get_samples(
-                sample_ids=list(sample_ids),
-                partition_id=self._meta.partition_id,
-                select_fields=list(self._plan.fields),
-            )
+            with nsys_nvtx_range("train_prefetch/tq_get"):
+                wire = self._client.get_samples(
+                    sample_ids=list(sample_ids),
+                    partition_id=self._meta.partition_id,
+                    select_fields=list(self._plan.fields),
+                )
             self._record("tq_get_s", time.perf_counter() - start)
             self._record("tq_get_calls", 1.0)
 
             start = time.perf_counter()
-            data = materialize(
-                wire,
-                layout="padded",
-                pad_value_dict=self._pad_value_dict,
-                pad_to_seqlen=self._plan.pad_to_seqlen,
-            )
+            with nsys_nvtx_range("train_prefetch/materialize"):
+                data = materialize(
+                    wire,
+                    layout="padded",
+                    pad_value_dict=self._pad_value_dict,
+                    pad_to_seqlen=self._plan.pad_to_seqlen,
+                )
             del wire
             if data.size != len(sample_ids):
                 raise ValueError(
@@ -673,71 +675,17 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
             payload_bytes = float(_tensor_bytes(data))
             self._record("materialize_s", time.perf_counter() - start)
             self._record("materialized_payload_bytes", payload_bytes)
-            envelope: list[Any] = [("ok", gb_idx, mb_idx)]
-        except Exception as error:
-            envelope = [
-                (
-                    "error",
-                    gb_idx,
-                    mb_idx,
-                    f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
-                )
-            ]
-
-        start = time.perf_counter()
-        status = self._broadcast_envelope(envelope)
-        if status[0] == "error":
-            self._record("distribute_s", time.perf_counter() - start)
-            raise self._batch_error(gb_idx, mb_idx, str(status[3]))
-        assert data is not None
-        if len(self._group.replica_ranks) > 1:
-            data = _broadcast_batched_data_dict(
-                data,
-                is_leader=True,
-                src=self._group.source_rank,
-                group=self._group.replica_group,
-            )
-        self._record("distribute_s", time.perf_counter() - start)
-        return PrefetchedMicrobatch(gb_idx, mb_idx, sample_ids, data)
-
-    def _load_receiver(
-        self, expected_gb: int, expected_mb: int, sample_ids: tuple[str, ...]
-    ) -> PrefetchedMicrobatch:
-        start = time.perf_counter()
-        status = self._broadcast_envelope([None])
-        if status[0] == "error":
-            self._record("distribute_s", time.perf_counter() - start)
-            raise self._batch_error(int(status[1]), int(status[2]), str(status[3]))
-        if status != ("ok", expected_gb, expected_mb):
-            raise self._batch_error(
-                expected_gb,
-                expected_mb,
-                "train-prefetch order mismatch: expected "
-                f"({expected_gb}, {expected_mb}), received {status}",
-            )
-        data = _broadcast_batched_data_dict(
-            None,
-            is_leader=False,
-            src=self._group.source_rank,
-            group=self._group.replica_group,
-        )
-        self._record("distribute_s", time.perf_counter() - start)
-        return PrefetchedMicrobatch(expected_gb, expected_mb, sample_ids, data)
-
-    def __next__(self) -> PrefetchedMicrobatch:
-        gb_idx, mb_idx, sample_ids = next(self._items)
-        try:
-            if self._group.is_source:
-                return self._load_source(gb_idx, mb_idx, sample_ids)
-            return self._load_receiver(gb_idx, mb_idx, sample_ids)
-        except TrainMicrobatchPrefetchError:
-            raise
         except Exception as error:
             raise self._batch_error(
                 gb_idx,
                 mb_idx,
                 f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
             ) from error
+        return PrefetchedMicrobatch(gb_idx, mb_idx, sample_ids, data)
+
+    def __next__(self) -> PrefetchedMicrobatch:
+        gb_idx, mb_idx, sample_ids = next(self._items)
+        return self._load(gb_idx, mb_idx, sample_ids)
 
     def metrics(self) -> dict[str, float]:
         with self._metrics_lock:
@@ -745,7 +693,7 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
 
 
 class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
-    """Prefetch fully distributed train microbatches with bounded lookahead."""
+    """Prefetch on each stage leader and fan out through foreground NCCL."""
 
     def __init__(
         self,
@@ -771,44 +719,174 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             for batch in self.plan.global_batches
             for mb_idx, sample_ids in enumerate(batch.microbatch_sample_ids)
         )
-        self._loader = _TrainMicrobatchLoader(
-            client=client,
-            meta=meta,
-            plan=self.plan,
-            items=self._items,
-            group=group,
-            pad_value_dict=pad_value_dict,
-        )
-        # Depth controls source-side TQ lookahead. Receivers always pre-post
-        # the next collective because pipeline stages consume at uneven times.
-        lookahead = depth == 1 or not group.is_source
-        self._prefetch_iterator = _ThreadPrefetchIterator(
-            self._loader,
-            lookahead=lookahead,
-            item_ready_timeout_s=item_ready_timeout_s,
-            thread_name=(
-                f"train-microbatch-prefetch-rank-{torch.distributed.get_rank()}"
-            ),
-            item_size=lambda item: _tensor_bytes(item.data),
-        )
+        self._group = group
+        self._loader: _TrainMicrobatchLoader | None = None
+        self._prefetch_iterator: (
+            _ThreadPrefetchIterator[PrefetchedMicrobatch] | None
+        ) = None
+        if group.is_stage_leader:
+            self._loader = _TrainMicrobatchLoader(
+                client=client,
+                meta=meta,
+                plan=self.plan,
+                items=self._items,
+                pad_value_dict=pad_value_dict,
+            )
+            self._prefetch_iterator = _ThreadPrefetchIterator(
+                self._loader,
+                lookahead=depth == 1,
+                item_ready_timeout_s=item_ready_timeout_s,
+                thread_name=(
+                    f"train-microbatch-prefetch-rank-{torch.distributed.get_rank()}"
+                ),
+                item_size=lambda item: _tensor_bytes(item.data),
+            )
         self._consumed = 0
+        self._metrics_lock = threading.Lock()
+        self._foreground_distribute_s = 0.0
 
     def __iter__(self) -> TrainMicrobatchPrefetcher:
         return self
+
+    @staticmethod
+    def _batch_error(
+        gb_idx: int, mb_idx: int, message: str
+    ) -> TrainMicrobatchPrefetchError:
+        return TrainMicrobatchPrefetchError(
+            "train microbatch prefetch failed for global batch "
+            f"{gb_idx}, microbatch {mb_idx}: {message}"
+        )
+
+    def _take_stage_leader_item(
+        self,
+    ) -> PrefetchedMicrobatch | _PrefetchFailure:
+        if self._prefetch_iterator is None:
+            return _PrefetchFailure(
+                "stage leader has no background TQ prefetch iterator",
+                from_source=False,
+            )
+        try:
+            with nsys_nvtx_range("train_prefetch/consumer_wait"):
+                return next(self._prefetch_iterator)
+        except Exception as error:
+            return _PrefetchFailure(
+                f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
+                from_source=(
+                    error.from_source
+                    if isinstance(error, _ThreadPrefetchError)
+                    else False
+                ),
+            )
+
+    def _stage_fanout(
+        self,
+        item: PrefetchedMicrobatch | _PrefetchFailure | None,
+        *,
+        expected_gb: int,
+        expected_mb: int,
+        expected_ids: tuple[str, ...],
+    ) -> PrefetchedMicrobatch:
+        """Broadcast one PP-stage payload from TP0/CP0 in the foreground."""
+        start = time.perf_counter()
+        with nsys_nvtx_range("train_prefetch/foreground_distribute"):
+            if self._group.is_stage_leader:
+                if isinstance(item, PrefetchedMicrobatch):
+                    try:
+                        item = PrefetchedMicrobatch(
+                            item.global_batch_index,
+                            item.microbatch_index,
+                            item.sample_ids,
+                            _move_stage_payload_to_cuda(item.data),
+                        )
+                    except Exception as error:
+                        item = _PrefetchFailure(
+                            "stage-leader GPU staging failed: "
+                            f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
+                            from_source=False,
+                        )
+                if isinstance(item, _PrefetchFailure):
+                    envelope: list[Any] = [
+                        (
+                            "error",
+                            expected_gb,
+                            expected_mb,
+                            item.message,
+                        )
+                    ]
+                elif isinstance(item, PrefetchedMicrobatch):
+                    envelope = [
+                        (
+                            "ok",
+                            item.global_batch_index,
+                            item.microbatch_index,
+                            item.sample_ids,
+                        )
+                    ]
+                else:
+                    envelope = [
+                        (
+                            "error",
+                            expected_gb,
+                            expected_mb,
+                            "stage leader has no prefetched payload",
+                        )
+                    ]
+            else:
+                envelope = [None]
+
+            torch.distributed.broadcast_object_list(
+                envelope,
+                src=self._group.stage_source_rank,
+                group=self._group.stage_group,
+            )
+            status = envelope[0]
+            if not isinstance(status, tuple) or not status:
+                raise self._batch_error(
+                    expected_gb,
+                    expected_mb,
+                    f"invalid stage-prefetch envelope: {status!r}",
+                )
+            if status[0] == "error":
+                raise self._batch_error(
+                    int(status[1]),
+                    int(status[2]),
+                    str(status[3]),
+                )
+
+            data = _broadcast_batched_data_dict(
+                item.data if isinstance(item, PrefetchedMicrobatch) else None,
+                is_leader=self._group.is_stage_leader,
+                src=self._group.stage_source_rank,
+                group=self._group.stage_group,
+                keep_on_broadcast_device=True,
+            )
+            # Complete the shared payload collective before evaluating local
+            # metadata. A rank-local early exit would strand its stage peers.
+            expected_status = ("ok", expected_gb, expected_mb, expected_ids)
+            if status != expected_status:
+                raise self._batch_error(
+                    expected_gb,
+                    expected_mb,
+                    "stage-prefetch order mismatch: expected "
+                    f"{expected_status}, received {status}",
+                )
+        with self._metrics_lock:
+            self._foreground_distribute_s += time.perf_counter() - start
+        return PrefetchedMicrobatch(expected_gb, expected_mb, expected_ids, data)
 
     def __next__(self) -> PrefetchedMicrobatch:
         if self._consumed >= len(self._items):
             raise StopIteration
         expected_gb, expected_mb, expected_ids = self._items[self._consumed]
-        try:
-            item = next(self._prefetch_iterator)
-        except _ThreadPrefetchError as error:
-            if error.from_source:
-                raise TrainMicrobatchPrefetchError(str(error)) from error
-            raise TrainMicrobatchPrefetchError(
-                "train microbatch prefetch failed for global batch "
-                f"{expected_gb}, microbatch {expected_mb}: {error}"
-            ) from error
+        leader_item: PrefetchedMicrobatch | _PrefetchFailure | None = None
+        if self._group.is_stage_leader:
+            leader_item = self._take_stage_leader_item()
+        item = self._stage_fanout(
+            leader_item,
+            expected_gb=expected_gb,
+            expected_mb=expected_mb,
+            expected_ids=expected_ids,
+        )
         if (
             item.global_batch_index != expected_gb
             or item.microbatch_index != expected_mb
@@ -854,10 +932,32 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
 
     def metrics(self) -> dict[str, float]:
         """Return development metrics for this rank."""
-        result = self._loader.metrics()
-        iterator_metrics = self._prefetch_iterator.metrics()
+        result = (
+            self._loader.metrics()
+            if self._loader is not None
+            else {
+                "tq_get_s": 0.0,
+                "materialize_s": 0.0,
+                "tq_get_calls": 0.0,
+                "materialized_payload_bytes": 0.0,
+            }
+        )
+        iterator_metrics = (
+            self._prefetch_iterator.metrics()
+            if self._prefetch_iterator is not None
+            else {
+                "consumer_wait_s": 0.0,
+                "first_item_ready_s": 0.0,
+                "queued_payload_peak_bytes": 0.0,
+                "ready_count": 0.0,
+                "consume_count": 0.0,
+            }
+        )
+        with self._metrics_lock:
+            foreground_distribute_s = self._foreground_distribute_s
         result.update(
             {
+                "foreground_distribute_s": foreground_distribute_s,
                 "consumer_wait_s": iterator_metrics["consumer_wait_s"],
                 "first_microbatch_ready_s": iterator_metrics["first_item_ready_s"],
                 "queued_payload_peak_bytes": iterator_metrics[
@@ -872,6 +972,8 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         return result
 
     def close(self) -> None:
+        if self._prefetch_iterator is None:
+            return
         try:
             self._prefetch_iterator.close()
         except _ThreadPrefetchError as error:

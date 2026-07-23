@@ -105,29 +105,78 @@ def _stamp_train_normalization(
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_train_results(
+    results: list[dict[str, Any]],
+    *,
+    prefetch_metric_results: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Aggregate one result per DP while retaining all PP-stage prefetch metrics."""
     out: dict[str, Any] = {
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
-    # train_from_meta returns the axis-zero worker for each DP replica, so
-    # these are intentionally source-side metrics rather than all-rank stats.
-    if "train_microbatch_prefetch_metrics" in results[0]:
-        out["train_microbatch_prefetch_source_metrics"] = [
-            {
+    metric_results = (
+        prefetch_metric_results if prefetch_metric_results is not None else results
+    )
+    if metric_results and "train_microbatch_prefetch_metrics" in metric_results[0]:
+        source_metrics: list[dict[str, Any]] = []
+        for result in metric_results:
+            entry = {
                 "rank": result["rank"],
                 **result["train_microbatch_prefetch_metrics"],
             }
-            for result in results
-        ]
+            if "train_microbatch_prefetch_dp_rank" in result:
+                entry["dp_rank"] = result["train_microbatch_prefetch_dp_rank"]
+            if "train_microbatch_prefetch_pp_rank" in result:
+                entry["pp_rank"] = result["train_microbatch_prefetch_pp_rank"]
+            source_metrics.append(entry)
+        out["train_microbatch_prefetch_source_metrics"] = source_metrics
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
             all_mb_metrics[k].extend(v)
     out["all_mb_metrics"] = dict(all_mb_metrics)
     return out
+
+
+def _select_train_prefetch_primary_results(
+    stage_results: list[dict[str, Any]],
+    *,
+    dp_size: int,
+    pp_size: int,
+) -> list[dict[str, Any]]:
+    """Validate the DP×PP result grid and return PP0 once per DP replica."""
+    expected = {
+        (dp_rank, pp_rank) for dp_rank in range(dp_size) for pp_rank in range(pp_size)
+    }
+    by_coordinate: dict[tuple[int, int], dict[str, Any]] = {}
+    for result in stage_results:
+        try:
+            coordinate = (
+                int(result["train_microbatch_prefetch_dp_rank"]),
+                int(result["train_microbatch_prefetch_pp_rank"]),
+            )
+        except KeyError as error:
+            raise RuntimeError(
+                "train microbatch prefetch worker result is missing DP/PP "
+                "stage coordinates"
+            ) from error
+        if coordinate in by_coordinate:
+            raise RuntimeError(
+                "train microbatch prefetch returned duplicate stage coordinate "
+                f"{coordinate}"
+            )
+        by_coordinate[coordinate] = result
+
+    actual = set(by_coordinate)
+    if actual != expected:
+        raise RuntimeError(
+            "train microbatch prefetch returned an invalid DP×PP stage grid: "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+        )
+    return [by_coordinate[(dp_rank, 0)] for dp_rank in range(dp_size)]
 
 
 # Logprob results land in TQ directly via the worker-side
@@ -487,6 +536,16 @@ class TQPolicy(Policy):
             for m in dp_metas:
                 self.flops_tracker.track_batch(list(m.sequence_lengths or []))
 
+        prefetch_enabled = bool(
+            (self.cfg.get("train_microbatch_prefetch") or {}).get("enabled")
+        )
+        output_is_replicated = [
+            "context_parallel",
+            "tensor_parallel",
+        ]
+        if not prefetch_enabled:
+            output_is_replicated.append("pipeline_parallel")
+
         with (
             timer.time("policy_training/submit_training_futures")
             if timer
@@ -501,11 +560,7 @@ class TQPolicy(Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
+                output_is_replicated=output_is_replicated,
                 common_kwargs={
                     "loss_fn": loss_fn,
                     "eval_mode": eval_mode,
@@ -513,8 +568,20 @@ class TQPolicy(Policy):
                     "mbs": micro_batch_size,
                 },
             )
-        results = self.worker_group.get_all_worker_results(futures)
-        aggregated_results = _aggregate_train_results(results)
+        stage_results = self.worker_group.get_all_worker_results(futures)
+        if prefetch_enabled:
+            results = _select_train_prefetch_primary_results(
+                stage_results,
+                dp_size=self.sharding_annotations.get_axis_size("data_parallel"),
+                pp_size=self.sharding_annotations.get_axis_size("pipeline_parallel"),
+            )
+            aggregated_results = _aggregate_train_results(
+                results,
+                prefetch_metric_results=stage_results,
+            )
+        else:
+            results = stage_results
+            aggregated_results = _aggregate_train_results(results)
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops

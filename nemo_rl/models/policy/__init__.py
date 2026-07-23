@@ -512,16 +512,13 @@ class RouterReplayConfig(TypedDict):
 
 
 class TrainMicrobatchPrefetchConfig(TypedDict):
-    """Sync-TQ train fetch granularity and failure deadlines."""
+    """Sync-TQ train fetch granularity and item-readiness deadline."""
 
     enabled: bool
     # 0 fetches on demand; 1 overlaps preparation of the next microbatch.
     depth: NotRequired[Literal[0, 1]]
     # Required when enabled: maximum foreground wait for one microbatch.
     item_ready_timeout_s: NotRequired[float]
-    # Includes receiver lead and depth-zero compute gaps. When absent,
-    # PyTorch's Gloo backend default is used.
-    collective_timeout_s: NotRequired[float]
 
 
 class PolicyConfig(TypedDict):

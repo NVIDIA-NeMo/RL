@@ -603,9 +603,11 @@ def test_summarize_train_microbatch_prefetch_source_metrics() -> None:
         "train_microbatch_prefetch_source_metrics": [
             {
                 "rank": 0,
+                "dp_rank": 0,
+                "pp_rank": 0,
                 "tq_get_s": 1.0,
                 "materialize_s": 0.2,
-                "distribute_s": 0.3,
+                "foreground_distribute_s": 0.3,
                 "consumer_wait_s": 0.4,
                 "first_microbatch_ready_s": 0.6,
                 "tq_get_calls": 2.0,
@@ -617,9 +619,11 @@ def test_summarize_train_microbatch_prefetch_source_metrics() -> None:
             },
             {
                 "rank": 16,
+                "dp_rank": 0,
+                "pp_rank": 1,
                 "tq_get_s": 2.0,
                 "materialize_s": 0.1,
-                "distribute_s": 0.6,
+                "foreground_distribute_s": 0.6,
                 "consumer_wait_s": 0.25,
                 "first_microbatch_ready_s": 0.7,
                 "tq_get_calls": 4.0,
@@ -637,7 +641,7 @@ def test_summarize_train_microbatch_prefetch_source_metrics() -> None:
     assert summary == {
         "microbatch_prefetch_source/tq_get_s_max": 2.0,
         "microbatch_prefetch_source/materialize_s_max": 0.2,
-        "microbatch_prefetch_source/distribute_s_max": 0.6,
+        "microbatch_prefetch_source/foreground_distribute_s_max": 0.6,
         "microbatch_prefetch_source/consumer_wait_s_max": 0.4,
         "microbatch_prefetch_source/first_microbatch_ready_s_max": 0.7,
         "microbatch_prefetch_source/tq_get_calls_sum": 6.0,

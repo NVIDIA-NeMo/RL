@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from types import SimpleNamespace
@@ -24,7 +23,6 @@ from typing import Any
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.column_io import kv_first_write
@@ -58,6 +56,51 @@ def prefetch_module():
     from nemo_rl.models.megatron import train_microbatch_prefetch
 
     return train_microbatch_prefetch
+
+
+def _direct_stage_group(
+    prefetch_module,
+    *,
+    stage_group: Any | None = None,
+    stage_ranks: tuple[int, ...] = (0,),
+    stage_source_rank: int = 0,
+    is_stage_leader: bool = True,
+):
+    return prefetch_module.TrainMicrobatchPrefetchGroup(
+        stage_group=object() if stage_group is None else stage_group,
+        stage_ranks=stage_ranks,
+        stage_source_rank=stage_source_rank,
+        is_stage_leader=is_stage_leader,
+    )
+
+
+def _patch_single_rank_stage_collectives(monkeypatch, prefetch_module) -> None:
+    monkeypatch.setattr(
+        prefetch_module,
+        "_move_stage_payload_to_cuda",
+        lambda data: data,
+    )
+    monkeypatch.setattr(
+        prefetch_module.torch.distributed,
+        "broadcast_object_list",
+        lambda payload, *, src, group: None,
+    )
+
+    def fake_broadcast(
+        data,
+        *,
+        is_leader: bool,
+        src: int,
+        group: Any,
+        keep_on_broadcast_device: bool,
+    ):
+        assert is_leader
+        assert src == 0
+        assert data is not None
+        assert keep_on_broadcast_device
+        return data
+
+    monkeypatch.setattr(prefetch_module, "_broadcast_batched_data_dict", fake_broadcast)
 
 
 def _meta(
@@ -175,72 +218,82 @@ def test_build_replica_topology_is_independent_of_global_rank_layout(
     assert tuple(x.global_rank for x in topology[1]) == (0, 2)
 
 
-@pytest.mark.parametrize(
-    ("timeout_s", "expected_timeout_s"),
-    [(None, None), (321.5, 321.5)],
-)
-def test_prefetch_group_uses_configured_collective_timeout(
+@pytest.mark.parametrize("my_rank", [0, 1, 4, 7])
+def test_prefetch_group_reuses_direct_stage_nccl_group(
     monkeypatch,
     prefetch_module,
-    timeout_s: float | None,
-    expected_timeout_s: float | None,
+    my_rank: int,
 ) -> None:
+    coordinates = (
+        (0, 0, 0, 0),
+        (0, 0, 0, 1),
+        (0, 0, 1, 0),
+        (0, 0, 1, 1),
+        (0, 1, 0, 0),
+        (0, 1, 0, 1),
+        (0, 1, 1, 0),
+        (0, 1, 1, 1),
+    )
+    dp_rank, pp_rank, tp_rank, cp_rank = coordinates[my_rank]
+    stage_group = object()
+    expected_stage_ranks = (0, 1, 2, 3) if pp_rank == 0 else (4, 5, 6, 7)
+    expected_source = expected_stage_ranks[0]
+
     distributed = prefetch_module.torch.distributed
     monkeypatch.setattr(distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(distributed, "get_world_size", lambda: 1)
-    monkeypatch.setattr(distributed, "get_backend", lambda: "gloo")
-    monkeypatch.setattr(distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(distributed, "get_world_size", lambda: len(coordinates))
     monkeypatch.setattr(
         distributed,
-        "all_gather",
-        lambda gathered, local: gathered[0].copy_(local),
+        "get_backend",
+        lambda group=None: "gloo" if group is None else "nccl",
     )
-    group_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(distributed, "get_rank", lambda: my_rank)
 
-    def fake_new_group(**kwargs):
-        group_calls.append(kwargs)
-        return object()
+    def fake_all_gather(gathered, local) -> None:
+        for target, values in zip(gathered, coordinates, strict=True):
+            target.copy_(torch.tensor(values, dtype=torch.long))
 
-    monkeypatch.setattr(distributed, "new_group", fake_new_group)
+    monkeypatch.setattr(distributed, "all_gather", fake_all_gather)
     monkeypatch.setattr(
-        prefetch_module.parallel_state, "get_data_parallel_rank", lambda: 0
+        distributed,
+        "get_process_group_ranks",
+        lambda group: list(expected_stage_ranks),
+    )
+    monkeypatch.setattr(
+        distributed,
+        "new_group",
+        lambda **kwargs: pytest.fail(f"unexpected new_group call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        prefetch_module.parallel_state, "get_data_parallel_rank", lambda: dp_rank
     )
     monkeypatch.setattr(
         prefetch_module.parallel_state,
         "get_pipeline_model_parallel_rank",
-        lambda: 0,
+        lambda: pp_rank,
     )
     monkeypatch.setattr(
         prefetch_module.parallel_state,
         "get_tensor_model_parallel_rank",
-        lambda: 0,
+        lambda: tp_rank,
     )
     monkeypatch.setattr(
         prefetch_module.parallel_state,
         "get_context_parallel_rank",
-        lambda: 0,
+        lambda: cp_rank,
+    )
+    monkeypatch.setattr(
+        prefetch_module.parallel_state,
+        "get_tensor_and_context_parallel_group",
+        lambda: stage_group,
     )
 
-    prefetch_module.initialize_train_microbatch_prefetch_group(
-        collective_timeout_s=timeout_s
-    )
+    result = prefetch_module.initialize_train_microbatch_prefetch_group()
 
-    assert len(group_calls) == 1
-    if expected_timeout_s is None:
-        assert "timeout" not in group_calls[0]
-    else:
-        assert group_calls[0]["timeout"].total_seconds() == expected_timeout_s
-
-
-@pytest.mark.parametrize("timeout_s", [0, -1, float("nan"), float("inf")])
-def test_prefetch_group_rejects_invalid_collective_timeout(
-    prefetch_module,
-    timeout_s: float,
-) -> None:
-    with pytest.raises(ValueError, match="collective_timeout_s"):
-        prefetch_module.initialize_train_microbatch_prefetch_group(
-            collective_timeout_s=timeout_s
-        )
+    assert result.stage_group is stage_group
+    assert result.stage_ranks == expected_stage_ranks
+    assert result.stage_source_rank == expected_source
+    assert result.is_stage_leader is (my_rank == expected_source)
 
 
 @pytest.mark.parametrize("timeout_s", [0, -1, float("nan"), float("inf")])
@@ -248,12 +301,7 @@ def test_prefetcher_rejects_invalid_item_ready_timeout(
     prefetch_module,
     timeout_s: float,
 ) -> None:
-    group = prefetch_module.TrainMicrobatchPrefetchGroup(
-        replica_group=object(),
-        replica_ranks=(0,),
-        source_rank=0,
-        is_source=True,
-    )
+    group = _direct_stage_group(prefetch_module)
     with pytest.raises(ValueError, match="item_ready_timeout_s"):
         prefetch_module.TrainMicrobatchPrefetcher(
             client=object(),
@@ -263,6 +311,171 @@ def test_prefetcher_rejects_invalid_item_ready_timeout(
             depth=1,
             item_ready_timeout_s=timeout_s,
         )
+
+
+def test_train_prefetch_schedule_accepts_standard_pipeline() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _validate_train_microbatch_prefetch_schedule,
+    )
+
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            hybrid_context_parallel=False,
+            virtual_pipeline_model_parallel_size=None,
+        )
+    )
+    _validate_train_microbatch_prefetch_schedule(cfg)
+
+
+@pytest.mark.parametrize(
+    ("hybrid_context_parallel", "virtual_pipeline_size", "error"),
+    [
+        (True, None, "hybrid_context_parallel"),
+        (False, 1, "virtual pipeline"),
+        (False, 2, "virtual pipeline"),
+    ],
+)
+def test_train_prefetch_schedule_rejects_unsupported_iterators(
+    hybrid_context_parallel: bool,
+    virtual_pipeline_size: int | None,
+    error: str,
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _validate_train_microbatch_prefetch_schedule,
+    )
+
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            hybrid_context_parallel=hybrid_context_parallel,
+            virtual_pipeline_model_parallel_size=virtual_pipeline_size,
+        )
+    )
+    with pytest.raises(ValueError, match=error):
+        _validate_train_microbatch_prefetch_schedule(cfg)
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (StopIteration(), "StopIteration"),
+        (ValueError("injected iterator failure"), "injected iterator failure"),
+    ],
+)
+def test_stage_leader_turns_unexpected_iterator_errors_into_failures(
+    prefetch_module,
+    error: Exception,
+    message: str,
+) -> None:
+    class BrokenIterator:
+        def __next__(self):
+            raise error
+
+    prefetcher = object.__new__(prefetch_module.TrainMicrobatchPrefetcher)
+    prefetcher._prefetch_iterator = BrokenIterator()
+
+    failure = prefetcher._take_stage_leader_item()
+
+    assert isinstance(failure, prefetch_module._PrefetchFailure)
+    assert message in failure.message
+    assert failure.from_source is False
+
+
+def test_stage_leader_gpu_staging_error_is_broadcast_before_payload(
+    monkeypatch,
+    prefetch_module,
+) -> None:
+    group = _direct_stage_group(prefetch_module)
+    prefetcher = object.__new__(prefetch_module.TrainMicrobatchPrefetcher)
+    prefetcher._group = group
+    prefetcher._metrics_lock = threading.Lock()
+    prefetcher._foreground_distribute_s = 0.0
+    envelope_seen: list[Any] = []
+
+    def fail_gpu_staging(_data):
+        raise RuntimeError("injected H2D failure")
+
+    def capture_envelope(payload, *, src, group) -> None:
+        envelope_seen.extend(payload)
+
+    monkeypatch.setattr(
+        prefetch_module,
+        "_move_stage_payload_to_cuda",
+        fail_gpu_staging,
+    )
+    monkeypatch.setattr(
+        prefetch_module.torch.distributed,
+        "broadcast_object_list",
+        capture_envelope,
+    )
+    monkeypatch.setattr(
+        prefetch_module,
+        "_broadcast_batched_data_dict",
+        lambda *_args, **_kwargs: pytest.fail(
+            "payload NCCL must not begin after leader GPU staging fails"
+        ),
+    )
+    item = prefetch_module.PrefetchedMicrobatch(0, 0, ("A",), _payload(["A"]))
+
+    with pytest.raises(
+        prefetch_module.TrainMicrobatchPrefetchError,
+        match="injected H2D failure",
+    ):
+        prefetcher._stage_fanout(
+            item,
+            expected_gb=0,
+            expected_mb=0,
+            expected_ids=("A",),
+        )
+
+    assert envelope_seen
+    assert envelope_seen[0][0] == "error"
+
+
+def test_stage_order_mismatch_finishes_payload_collective_before_raising(
+    monkeypatch,
+    prefetch_module,
+) -> None:
+    prefetcher = object.__new__(prefetch_module.TrainMicrobatchPrefetcher)
+    prefetcher._group = _direct_stage_group(prefetch_module)
+    prefetcher._metrics_lock = threading.Lock()
+    prefetcher._foreground_distribute_s = 0.0
+    payload_broadcasted = False
+
+    monkeypatch.setattr(
+        prefetch_module,
+        "_move_stage_payload_to_cuda",
+        lambda data: data,
+    )
+    monkeypatch.setattr(
+        prefetch_module.torch.distributed,
+        "broadcast_object_list",
+        lambda payload, *, src, group: None,
+    )
+
+    def broadcast_payload(*_args, **_kwargs):
+        nonlocal payload_broadcasted
+        payload_broadcasted = True
+        return _payload(["B"])
+
+    monkeypatch.setattr(
+        prefetch_module,
+        "_broadcast_batched_data_dict",
+        broadcast_payload,
+    )
+    item = prefetch_module.PrefetchedMicrobatch(0, 0, ("B",), _payload(["B"]))
+
+    with pytest.raises(
+        prefetch_module.TrainMicrobatchPrefetchError,
+        match="stage-prefetch order mismatch",
+    ):
+        prefetcher._stage_fanout(
+            item,
+            expected_gb=0,
+            expected_mb=0,
+            expected_ids=("A",),
+        )
+
+    assert payload_broadcasted
 
 
 def test_stamp_train_normalization_matches_current_formula() -> None:
@@ -481,6 +694,16 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
         "TrainMicrobatchPrefetcher",
         FakePrefetcher,
     )
+    monkeypatch.setattr(
+        megatron_policy_worker.parallel_state,
+        "get_data_parallel_rank",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker.parallel_state,
+        "get_pipeline_model_parallel_rank",
+        lambda: 1,
+    )
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _: None)
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
     meta = _meta(["A"], indices=[[[0, 1]]], lengths=[[4]])
@@ -500,6 +723,8 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
     assert calls["assert_complete"] is True
     assert calls["closed"] is True
     assert result["train_microbatch_prefetch_metrics"] == {"ready_fraction": 1.0}
+    assert result["train_microbatch_prefetch_dp_rank"] == 2
+    assert result["train_microbatch_prefetch_pp_rank"] == 1
 
 
 def test_prefetch_plan_matches_legacy_complete_shard_fetch(
@@ -550,12 +775,8 @@ def test_prefetch_plan_matches_legacy_complete_shard_fetch(
             pad_to_seqlen=8,
         )
 
-        group = prefetch_module.TrainMicrobatchPrefetchGroup(
-            replica_group=object(),
-            replica_ranks=(0,),
-            source_rank=0,
-            is_source=True,
-        )
+        group = _direct_stage_group(prefetch_module)
+        _patch_single_rank_stage_collectives(monkeypatch, prefetch_module)
         monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
         prefetcher = prefetch_module.TrainMicrobatchPrefetcher(
             client=tq_client_backends,
@@ -848,12 +1069,7 @@ def _single_rank_prefetcher(monkeypatch, prefetch_module, *, depth: int):
         indices=[[[0, 2], [2, 3], [3, 4]]],
         lengths=[[8, 4, 4]],
     )
-    group = prefetch_module.TrainMicrobatchPrefetchGroup(
-        replica_group=object(),
-        replica_ranks=(0,),
-        source_rank=0,
-        is_source=True,
-    )
+    group = _direct_stage_group(prefetch_module)
 
     def fake_materialize(
         wire: BatchedDataDict,
@@ -869,6 +1085,7 @@ def _single_rank_prefetcher(monkeypatch, prefetch_module, *, depth: int):
 
     monkeypatch.setattr(prefetch_module, "materialize", fake_materialize)
     monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
+    _patch_single_rank_stage_collectives(monkeypatch, prefetch_module)
     return client, prefetch_module.TrainMicrobatchPrefetcher(
         client=client,
         meta=meta,
@@ -885,15 +1102,11 @@ def test_close_is_bounded_after_item_ready_timeout(
 ) -> None:
     client = _BlockingClient()
     meta = _meta(["A"], indices=[[[0, 1]]], lengths=[[4]])
-    group = prefetch_module.TrainMicrobatchPrefetchGroup(
-        replica_group=object(),
-        replica_ranks=(0,),
-        source_rank=0,
-        is_source=True,
-    )
+    group = _direct_stage_group(prefetch_module)
     monkeypatch.setattr(prefetch_module, "materialize", lambda wire, **_: wire)
     monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(prefetch_module, "_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_single_rank_stage_collectives(monkeypatch, prefetch_module)
     prefetcher = prefetch_module.TrainMicrobatchPrefetcher(
         client=client,
         meta=meta,
@@ -1047,7 +1260,7 @@ def test_depth_one_stays_exactly_one_microbatch_ahead(
         assert {
             "tq_get_s",
             "materialize_s",
-            "distribute_s",
+            "foreground_distribute_s",
             "consumer_wait_s",
             "first_microbatch_ready_s",
             "ready_fraction",
@@ -1096,14 +1309,10 @@ def test_multiple_global_batches_are_consumed_without_crossing_boundaries(
         lengths=[[8, 4], [4, 8]],
         elem_counts=[3, 3],
     )
-    group = prefetch_module.TrainMicrobatchPrefetchGroup(
-        replica_group=object(),
-        replica_ranks=(0,),
-        source_rank=0,
-        is_source=True,
-    )
+    group = _direct_stage_group(prefetch_module)
     monkeypatch.setattr(prefetch_module, "materialize", lambda wire, **_: wire)
     monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
+    _patch_single_rank_stage_collectives(monkeypatch, prefetch_module)
     prefetcher = prefetch_module.TrainMicrobatchPrefetcher(
         client=client,
         meta=meta,
@@ -1124,8 +1333,15 @@ def test_multiple_global_batches_are_consumed_without_crossing_boundaries(
 
 
 class _DistributedClient:
-    def __init__(self, *, rank: int, fail_on_call: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        rank: int,
+        source_rank: int,
+        fail_on_call: int | None = None,
+    ) -> None:
         self.rank = rank
+        self.source_rank = source_rank
         self.fail_on_call = fail_on_call
         self.calls = 0
 
@@ -1136,7 +1352,9 @@ class _DistributedClient:
         partition_id: str,
         select_fields: list[str],
     ) -> BatchedDataDict:
-        assert self.rank == 0, f"non-source rank {self.rank} touched TQ"
+        assert self.rank == self.source_rank, (
+            f"non-source rank {self.rank} touched TQ; source={self.source_rank}"
+        )
         assert partition_id == "train"
         assert select_fields == FIELDS
         self.calls += 1
@@ -1145,117 +1363,117 @@ class _DistributedClient:
         return _payload(sample_ids)
 
 
-def _distributed_worker(
-    rank: int, world_size: int, init_file: str, result_queue
-) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
+def _run_nccl_direct_stage_reader(rank: int, world_size: int) -> None:
+    from nemo_rl.models.megatron import train_microbatch_prefetch as module
+
+    def fail_h2d(_data):
+        raise RuntimeError("injected H2D failure")
+
+    meta = _meta(
+        ["A", "B", "C"],
+        indices=[[[0, 1], [1, 2], [2, 3]]],
+        lengths=[[8, 8, 8]],
     )
+    original_materialize = module.materialize
+    original_move = module._move_stage_payload_to_cuda
+    module.materialize = lambda wire, **_: wire
     try:
-        from nemo_rl.models.megatron import train_microbatch_prefetch as module
-
-        group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
-        prefetch_group = module.TrainMicrobatchPrefetchGroup(
-            replica_group=group,
-            replica_ranks=tuple(range(world_size)),
-            source_rank=0,
-            is_source=rank == 0,
-        )
-        meta = _meta(
-            list("ABCD"),
-            indices=[[[0, 2], [2, 3], [3, 4]]],
-            lengths=[[8, 4, 4]],
-        )
-        module.materialize = lambda wire, **_: wire
-
-        for depth in (0, 1):
-            client = _DistributedClient(rank=rank)
-            prefetcher = module.TrainMicrobatchPrefetcher(
-                client=client,
-                meta=meta,
-                group=prefetch_group,
-                pad_value_dict={},
-                depth=depth,
-                item_ready_timeout_s=5,
+        for source_rank in (0, 1):
+            prefetch_group = module.TrainMicrobatchPrefetchGroup(
+                stage_group=dist.group.WORLD,
+                stage_ranks=tuple(range(world_size)),
+                stage_source_rank=source_rank,
+                is_stage_leader=rank == source_rank,
             )
-            for step, expected_ids in enumerate((("A", "B"), ("C",), ("D",))):
-                if rank >= world_size // 2:
-                    time.sleep(0.03 * (step + 1))
-                item = next(prefetcher)
-                assert item.sample_ids == expected_ids
-                for row, sample_id in enumerate(expected_ids):
-                    expected = ord(sample_id) - ord("A") + 1
-                    assert torch.all(item.data["input_ids"][row] == expected)
-                    assert torch.all(item.data["routed_experts"][row] == expected)
-            prefetcher.assert_complete()
-            prefetcher.close()
-            assert client.calls == (3 if rank == 0 else 0)
-            dist.barrier()
+            for depth in (0, 1):
+                client = _DistributedClient(rank=rank, source_rank=source_rank)
+                prefetcher = module.TrainMicrobatchPrefetcher(
+                    client=client,
+                    meta=meta,
+                    group=prefetch_group,
+                    pad_value_dict={},
+                    depth=depth,
+                    item_ready_timeout_s=30,
+                )
+                try:
+                    for expected_id in ("A", "B", "C"):
+                        item = next(prefetcher)
+                        assert item.sample_ids == (expected_id,)
+                        for field in FIELDS:
+                            assert item.data[field].device.type == "cuda", field
+                        expected = ord(expected_id) - ord("A") + 1
+                        assert torch.all(item.data["input_ids"] == expected)
+                        assert torch.all(item.data["routed_experts"] == expected)
 
-        failing_client = _DistributedClient(rank=rank, fail_on_call=2)
+                        data_ptr = item.data["input_ids"].data_ptr()
+                        item.data.to("cuda")
+                        assert item.data["input_ids"].data_ptr() == data_ptr
+                    prefetcher.assert_complete()
+
+                    expected_calls = 3 if rank == source_rank else 0
+                    assert client.calls == expected_calls
+                    metrics = prefetcher.metrics()
+                    assert metrics["tq_get_calls"] == expected_calls
+                    assert metrics["foreground_distribute_s"] > 0
+                finally:
+                    prefetcher.close()
+                dist.barrier()
+
+        source_rank = 1
+        prefetch_group = module.TrainMicrobatchPrefetchGroup(
+            stage_group=dist.group.WORLD,
+            stage_ranks=tuple(range(world_size)),
+            stage_source_rank=source_rank,
+            is_stage_leader=rank == source_rank,
+        )
+
         failing = module.TrainMicrobatchPrefetcher(
-            client=failing_client,
+            client=_DistributedClient(
+                rank=rank,
+                source_rank=source_rank,
+                fail_on_call=1,
+            ),
             meta=meta,
             group=prefetch_group,
             pad_value_dict={},
             depth=1,
-            item_ready_timeout_s=5,
+            item_ready_timeout_s=30,
         )
-        assert next(failing).sample_ids == ("A", "B")
-        with pytest.raises(module.TrainMicrobatchPrefetchError, match="injected"):
-            next(failing)
-        failing.close()
-        assert failing_client.calls == (2 if rank == 0 else 0)
+        try:
+            with pytest.raises(
+                module.TrainMicrobatchPrefetchError,
+                match="injected TQ failure",
+            ):
+                next(failing)
+        finally:
+            failing.close()
         dist.barrier()
 
-        early_client = _DistributedClient(rank=rank)
-        early = module.TrainMicrobatchPrefetcher(
-            client=early_client,
+        if rank == source_rank:
+            module._move_stage_payload_to_cuda = fail_h2d
+        h2d_failing = module.TrainMicrobatchPrefetcher(
+            client=_DistributedClient(rank=rank, source_rank=source_rank),
             meta=meta,
             group=prefetch_group,
             pad_value_dict={},
             depth=1,
-            item_ready_timeout_s=5,
+            item_ready_timeout_s=30,
         )
-        assert next(early).sample_ids == ("A", "B")
-        early.close()
-        assert early_client.calls == (3 if rank == 0 else 0)
+        try:
+            with pytest.raises(
+                module.TrainMicrobatchPrefetchError,
+                match="injected H2D failure",
+            ):
+                next(h2d_failing)
+        finally:
+            h2d_failing.close()
         dist.barrier()
-        result_queue.put((rank, "ok"))
-    except Exception as error:  # pragma: no cover - surface child failures
-        result_queue.put((rank, f"{type(error).__name__}: {error}"))
     finally:
-        dist.destroy_process_group()
+        module.materialize = original_materialize
+        module._move_stage_payload_to_cuda = original_move
 
 
-def test_all_field_distribution_survives_uneven_pp_consumption(tmp_path) -> None:
-    init_file = str(tmp_path / "prefetch-init")
-    context = mp.get_context("spawn")
-    result_queue = context.Queue()
-    processes = [
-        context.Process(
-            target=_distributed_worker,
-            args=(rank, 4, init_file, result_queue),
-        )
-        for rank in range(4)
-    ]
-    for process in processes:
-        process.start()
-    try:
-        for process in processes:
-            process.join(timeout=60)
-            assert process.exitcode == 0, f"worker exited with {process.exitcode}"
-        results = sorted(result_queue.get(timeout=5) for _ in processes)
-        assert results == [(rank, "ok") for rank in range(4)], results
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        for process in processes:
-            process.join(timeout=5)
+def test_nccl_direct_stage_reader_keeps_payload_on_gpu_and_fans_out_errors(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_nccl_direct_stage_reader, world_size=2)

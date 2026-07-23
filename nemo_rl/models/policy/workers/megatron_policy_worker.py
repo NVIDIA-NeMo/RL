@@ -111,6 +111,23 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _validate_train_microbatch_prefetch_schedule(megatron_cfg: Any) -> None:
+    """Reject MCore schedules that do not advance one iterator on every rank."""
+    model_cfg = megatron_cfg.model
+    if bool(getattr(model_cfg, "hybrid_context_parallel", False)):
+        raise ValueError(
+            "policy.train_microbatch_prefetch does not support "
+            "hybrid_context_parallel because only TP rank 0 advances the "
+            "training data iterator"
+        )
+    if getattr(model_cfg, "virtual_pipeline_model_parallel_size", None) is not None:
+        raise ValueError(
+            "policy.train_microbatch_prefetch does not support virtual pipeline "
+            "parallelism because the interleaved schedule requires one data "
+            "iterator per model chunk"
+        )
+
+
 def _should_use_router_replay(
     *,
     enabled: bool,
@@ -301,6 +318,12 @@ class MegatronPolicyWorkerImpl(
         else:
             prefetcher.close()
             result["train_microbatch_prefetch_metrics"] = prefetcher.metrics()
+            result["train_microbatch_prefetch_dp_rank"] = (
+                parallel_state.get_data_parallel_rank()
+            )
+            result["train_microbatch_prefetch_pp_rank"] = (
+                parallel_state.get_pipeline_model_parallel_rank()
+            )
             return result
 
     @staticmethod
@@ -376,11 +399,16 @@ class MegatronPolicyWorkerImpl(
         self._train_microbatch_prefetch_enabled = bool(prefetch_cfg.get("enabled"))
         self._train_microbatch_prefetch_depth = 0
         self._train_microbatch_prefetch_item_ready_timeout_s = 0.0
-        self._train_microbatch_prefetch_collective_timeout_s: float | None = None
         self._train_microbatch_prefetch_group: Optional[
             TrainMicrobatchPrefetchGroup
         ] = None
         if self._train_microbatch_prefetch_enabled:
+            if "collective_timeout_s" in prefetch_cfg:
+                raise ValueError(
+                    "policy.train_microbatch_prefetch.collective_timeout_s was "
+                    "specific to the removed Gloo transport; remove this option "
+                    "for stage-local NCCL prefetch"
+                )
             if "item_ready_timeout_s" not in prefetch_cfg:
                 raise ValueError(
                     "policy.train_microbatch_prefetch.item_ready_timeout_s is "
@@ -390,11 +418,6 @@ class MegatronPolicyWorkerImpl(
             self._train_microbatch_prefetch_item_ready_timeout_s = float(
                 prefetch_cfg["item_ready_timeout_s"]
             )
-            collective_timeout_s = prefetch_cfg.get("collective_timeout_s")
-            if collective_timeout_s is not None:
-                self._train_microbatch_prefetch_collective_timeout_s = float(
-                    collective_timeout_s
-                )
             if self._train_microbatch_prefetch_depth not in (0, 1):
                 raise ValueError(
                     "policy.train_microbatch_prefetch.depth must be 0 or 1"
@@ -468,6 +491,8 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
+        if self._train_microbatch_prefetch_enabled:
+            _validate_train_microbatch_prefetch_schedule(self.megatron_cfg)
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
         self.offload_optimizer_for_logprob = (
@@ -549,15 +574,10 @@ class MegatronPolicyWorkerImpl(
             self.optimizer,
         )
         if self._train_microbatch_prefetch_enabled:
-            # Actor construction is already world-collective through Megatron
-            # setup. Create every prefetch group here so a later per-rank TQ
-            # connection failure cannot strand healthy ranks in new_group().
+            # Reuse Megatron's existing TP×CP NCCL group. No additional process
+            # group is created for train-microbatch transport.
             self._train_microbatch_prefetch_group = (
-                initialize_train_microbatch_prefetch_group(
-                    collective_timeout_s=(
-                        self._train_microbatch_prefetch_collective_timeout_s
-                    )
-                )
+                initialize_train_microbatch_prefetch_group()
             )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None

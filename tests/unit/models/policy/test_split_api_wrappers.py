@@ -31,9 +31,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
+
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
-from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
+from nemo_rl.models.policy.tq_policy import (
+    TQPolicy,
+    _aggregate_train_results,
+    _select_train_prefetch_primary_results,
+)
 
 
 class _SplitStubWorker(TQWorkerMixin):
@@ -142,6 +149,150 @@ class TestTQPolicySplitFanout:
         assert out["train_microbatch_prefetch_source_metrics"] == [
             {"rank": 0, "consumer_wait_s": 0.1},
             {"rank": 16, "consumer_wait_s": 0.2},
+        ]
+
+    def test_train_aggregation_uses_pp0_outputs_but_all_stage_metrics(self):
+        def _result(rank: int, dp_rank: int, pp_rank: int, loss: float) -> dict:
+            return {
+                "rank": rank,
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [loss]},
+                "train_microbatch_prefetch_metrics": {
+                    "consumer_wait_s": loss,
+                },
+                "train_microbatch_prefetch_dp_rank": dp_rank,
+                "train_microbatch_prefetch_pp_rank": pp_rank,
+            }
+
+        dp0_pp0 = _result(0, 0, 0, 0.1)
+        dp0_pp1 = _result(4, 0, 1, 0.2)
+        dp1_pp0 = _result(16, 1, 0, 0.3)
+        dp1_pp1 = _result(20, 1, 1, 0.4)
+
+        out = _aggregate_train_results(
+            [dp0_pp0, dp1_pp0],
+            prefetch_metric_results=[dp0_pp0, dp0_pp1, dp1_pp0, dp1_pp1],
+        )
+
+        assert out["all_mb_metrics"]["loss"] == [0.1, 0.3]
+        assert out["train_microbatch_prefetch_source_metrics"] == [
+            {"rank": 0, "consumer_wait_s": 0.1, "dp_rank": 0, "pp_rank": 0},
+            {"rank": 4, "consumer_wait_s": 0.2, "dp_rank": 0, "pp_rank": 1},
+            {"rank": 16, "consumer_wait_s": 0.3, "dp_rank": 1, "pp_rank": 0},
+            {"rank": 20, "consumer_wait_s": 0.4, "dp_rank": 1, "pp_rank": 1},
+        ]
+
+    def test_prefetch_stage_grid_rejects_duplicate_and_missing_coordinate(self):
+        def result(dp_rank: int, pp_rank: int) -> dict:
+            return {
+                "train_microbatch_prefetch_dp_rank": dp_rank,
+                "train_microbatch_prefetch_pp_rank": pp_rank,
+            }
+
+        stage_results = [
+            result(0, 0),
+            result(0, 1),
+            result(0, 0),
+            result(0, 1),
+        ]
+        with pytest.raises(RuntimeError, match="duplicate stage coordinate"):
+            _select_train_prefetch_primary_results(
+                stage_results,
+                dp_size=2,
+                pp_size=2,
+            )
+        with pytest.raises(RuntimeError, match=r"missing=\[\(1, 1\)\]"):
+            _select_train_prefetch_primary_results(
+                [result(0, 0), result(0, 1), result(1, 0)],
+                dp_size=2,
+                pp_size=2,
+            )
+
+    def test_train_from_meta_collects_one_result_per_dp_pp_stage(self):
+        p, wg = _make_tq_policy()
+        p.cfg = {
+            "train_global_batch_size": 2,
+            "train_micro_batch_size": 1,
+            "train_microbatch_prefetch": {"enabled": True},
+        }
+        p._router_replay_enabled = False
+
+        def axis_size(axis: str) -> int:
+            return {"data_parallel": 1, "pipeline_parallel": 2}[axis]
+
+        p.sharding_annotations.get_axis_size.side_effect = axis_size
+
+        def stage_result(rank: int, pp_rank: int) -> dict:
+            return {
+                "rank": rank,
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [float(pp_rank)]},
+                "train_microbatch_prefetch_metrics": {
+                    "consumer_wait_s": 0.1 + pp_rank,
+                },
+                "train_microbatch_prefetch_dp_rank": 0,
+                "train_microbatch_prefetch_pp_rank": pp_rank,
+            }
+
+        wg.get_all_worker_results.return_value = [
+            stage_result(0, 0),
+            stage_result(4, 1),
+        ]
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta], None),
+            ),
+        ):
+            out = p.train_from_meta(
+                meta,
+                loss_fn=object(),
+                sample_mask=torch.ones(2),
+                token_mask=torch.ones(2, 4),
+            )
+
+        dispatch = wg.run_all_workers_sharded_data.call_args
+        assert dispatch.kwargs["output_is_replicated"] == [
+            "context_parallel",
+            "tensor_parallel",
+        ]
+        assert "pipeline_parallel" in dispatch.kwargs["replicate_on_axes"]
+        assert out["all_mb_metrics"]["loss"] == [0.0]
+        assert [
+            (metric["dp_rank"], metric["pp_rank"])
+            for metric in out["train_microbatch_prefetch_source_metrics"]
+        ] == [(0, 0), (0, 1)]
+
+    def test_train_from_meta_legacy_output_remains_pp_replicated(self):
+        p, wg = _make_tq_policy()
+        result = {
+            "global_loss": 1.0,
+            "grad_norm": 0.5,
+            "all_mb_metrics": {"loss": [0.1]},
+        }
+        wg.get_all_worker_results.return_value = [result, result]
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ),
+        ):
+            p.train_from_meta(meta, loss_fn=object())
+
+        assert wg.run_all_workers_sharded_data.call_args.kwargs[
+            "output_is_replicated"
+        ] == [
+            "context_parallel",
+            "tensor_parallel",
+            "pipeline_parallel",
         ]
 
     def test_begin_consumes_single_data_futures_with_ray_get(self):

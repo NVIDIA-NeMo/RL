@@ -14,7 +14,8 @@
 import atexit
 import json
 import os
-from typing import Any, Protocol
+from contextlib import contextmanager
+from typing import Any, Iterator, Protocol
 
 import rich
 import torch
@@ -57,6 +58,20 @@ class ProfilablePolicy(Protocol):
     def start_gpu_profiling(self) -> None: ...
 
     def stop_gpu_profiling(self) -> None: ...
+
+
+@contextmanager
+def nsys_nvtx_range(name: str) -> Iterator[None]:
+    """Emit an exception-safe NVTX range only for Nsight-enabled workers."""
+    if not NRL_NSYS_WORKER_PATTERNS or not torch.cuda.is_available():
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
