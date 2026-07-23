@@ -154,7 +154,10 @@ def _build_generation(
         generation_config["sglang_cfg"].setdefault(
             "model_path", master_config.policy["model_name"]
         )
-        gen = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        gen = SGLangGeneration(
+            cluster=inference_cluster,
+            sglang_cfg=generation_config,
+        )
     else:
         raise ValueError(
             f"single_controller_utils.setup only supports vllm or sglang generation; got {backend!r}"

@@ -18,7 +18,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
-    WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -30,6 +29,5 @@ __all__ = [
     "AsyncRLConfig",
     "MasterConfig",
     "SingleControllerActorArgs",
-    "WeightSyncConfig",
     "setup_single_controller",
 ]

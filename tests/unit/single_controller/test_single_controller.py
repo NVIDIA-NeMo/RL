@@ -30,6 +30,10 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.utils.timer import Timer
 
 
+class FakeWeightSynchronizer:
+    pass
+
+
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
@@ -68,6 +72,49 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
             master_config=master_config,
             actor_args=actor_args,
         )
+
+
+def test_logs_concrete_weight_synchronizer(
+    monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 8},
+        grpo={
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 4,
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger={},
+    )
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=FakeWeightSynchronizer(),
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        train_cluster=None,
+        inference_cluster=None,
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+
+    controller_cls(
+        master_config=master_config,
+        actor_args=actor_args,
+    )
+
+    output = capsys.readouterr().out
+    assert "weight_sync=FakeWeightSynchronizer" in output
+    assert "transport=stub" not in output
 
 
 class _EmptySampler:

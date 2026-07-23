@@ -75,10 +75,3 @@ class AdvantageConfig:
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: Optional[str] = "prev_logprobs"
     reference_logprobs_field: Optional[str] = "reference_policy_logprobs"
-
-
-@dataclass
-class WeightSyncConfig:
-    transport: str = "stub"
-    nccl_addr: str = "127.0.0.1"
-    nccl_port: Optional[int] = None

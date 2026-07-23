@@ -157,6 +157,29 @@ def patched_factories():
         }
 
 
+def test_build_generation_passes_sglang_config():
+    """SGLangGeneration receives the complete generation config by keyword."""
+    master_config = _make_master_config(backend="sglang")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    master_config.policy["generation"]["sglang_cfg"] = {}
+    inference_cluster = MagicMock(name="inference_cluster")
+
+    with patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang:
+        generation = sc_setup_mod._build_generation(
+            inference_cluster,
+            master_config,
+        )
+
+    mock_sglang.assert_called_once_with(
+        cluster=inference_cluster,
+        sglang_cfg=master_config.policy["generation"],
+    )
+    assert master_config.policy["generation"]["sglang_cfg"]["model_path"] == (
+        "Qwen/Qwen3-0.6B"
+    )
+    generation.finish_generation.assert_called_once_with()
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 

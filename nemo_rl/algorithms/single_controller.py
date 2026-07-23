@@ -46,7 +46,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
-    WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
@@ -92,7 +91,6 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
         """
         self._advantage_cfg = AdvantageConfig()
-        self._weight_sync_cfg = WeightSyncConfig()
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
@@ -199,7 +197,7 @@ class SingleControllerActor:
             f"sampler={self._async_cfg.sampler.name} "
             f"buffer={self._async_cfg.max_buffered_rollouts} "
             f"inflight={self._async_cfg.max_inflight_prompts} "
-            f"transport={self._weight_sync_cfg.transport}",
+            f"weight_sync={type(self._weight_synchronizer).__name__}",
             flush=True,
         )
 
