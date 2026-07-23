@@ -169,10 +169,18 @@ class TeacherAlignerConfig(BaseModel, extra="allow"):
         drop_first_assistant_chunk_kl: Whether chat-mode alignment drops the
             first content pair in each assistant message for this teacher. The
             CE token mask is unaffected.
+        pseudo_target_path: Path to this teacher's forward pseudo-target table
+            (student-to-teacher sub-token chains). ``None`` for a same-tokenizer
+            teacher.
+        reverse_pseudo_target_path: Path to this teacher's reverse pseudo-target
+            table (teacher-to-student sub-token chains). ``None`` for a
+            same-tokenizer teacher.
     """
 
     projection_matrix_path: Optional[str] = None
     drop_first_assistant_chunk_kl: bool = False
+    pseudo_target_path: Optional[str] = None
+    reverse_pseudo_target_path: Optional[str] = None
 
 
 class TeacherConfig(BaseModel, extra="allow"):
@@ -189,23 +197,31 @@ class TeacherConfig(BaseModel, extra="allow"):
         weight: Static loss weight for this teacher when several teachers are
             aggregated (``kd_loss_mode="sum"`` / the convex ``"averaged_logits"``
             mix). Single-teacher runs leave it at ``1.0``.
-        gold_loss: Optional per-teacher override of ``loss_fn.gold_loss``.
-            ``None`` falls back to the global value. Honored only in
-            ``kd_loss_mode="sum"`` (other modes use the global).
-        xtoken_loss: Optional per-teacher override of ``loss_fn.xtoken_loss``,
-            same semantics as ``gold_loss``.
     """
 
     aligner: TeacherAlignerConfig = Field(default_factory=TeacherAlignerConfig)
     weight: float = 1.0
-    gold_loss: Optional[bool] = None
-    xtoken_loss: Optional[bool] = None
 
     @model_validator(mode="before")
     @classmethod
     def _migrate_legacy_projection_matrix_path(cls, value: Any) -> Any:
         """Migrate the released root projection path into ``aligner``."""
-        if not isinstance(value, dict) or "projection_matrix_path" not in value:
+        if not isinstance(value, dict):
+            return value
+
+        root_pseudo_paths = {
+            key
+            for key in ("pseudo_target_path", "reverse_pseudo_target_path")
+            if key in value
+        }
+        if root_pseudo_paths:
+            keys = ", ".join(f"teachers[i].{key}" for key in sorted(root_pseudo_paths))
+            raise ValueError(
+                f"{keys} must be nested under teachers[i].aligner; root-level "
+                "pseudo-target paths are not supported"
+            )
+
+        if "projection_matrix_path" not in value:
             return value
 
         migrated = dict(value)
@@ -258,7 +274,7 @@ class TeacherConfig(BaseModel, extra="allow"):
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
         return cast(
             PolicyConfig,
-            self.model_dump(exclude={"aligner", "weight", "gold_loss", "xtoken_loss"}),
+            self.model_dump(exclude={"aligner", "weight"}),
         )
 
 
@@ -565,8 +581,12 @@ def setup(
             teacher.aligner.projection_matrix_path for teacher in teachers
         ],
         "teacher_weights": [t.weight for t in teachers],
-        "teacher_gold_loss": [t.gold_loss for t in teachers],
-        "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
+        # v6 pseudo-target tables (student<->teacher sub-token chains) per
+        # cross-tokenizer teacher; None for same-tokenizer teachers.
+        "pseudo_target_paths": [t.aligner.pseudo_target_path for t in teachers],
+        "reverse_pseudo_target_paths": [
+            t.aligner.reverse_pseudo_target_path for t in teachers
+        ],
     }
     loss_fn = CrossTokenizerDistillationLossFn(loss_config)
 

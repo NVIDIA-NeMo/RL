@@ -317,6 +317,14 @@ class LocalizedAlignment:
     # next-token-accuracy metric and the same-tokenizer KD path.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
+    # Filled post-construction for the v6 (prefix_bidir_partition_kl_v3) path:
+    # this CP rank's contiguous teacher input ids, per-chunk contiguous position
+    # spans ``[B, max_pairs, 2]`` derived from the unshifted chunk ids, and the
+    # per-sample chunk count ``[B]``. Left ``None`` for a same-tokenizer teacher.
+    teacher_input_ids: Optional[torch.Tensor] = None
+    student_spans: Optional[torch.Tensor] = None
+    teacher_spans: Optional[torch.Tensor] = None
+    num_chunks: Optional[torch.Tensor] = None
 
 
 def localize_alignment(
@@ -1006,6 +1014,42 @@ def build_exact_token_map(
     return result
 
 
+def _chunk_ids_to_spans(chunk_id: torch.Tensor, max_pairs: int) -> torch.Tensor:
+    """Contiguous ``[start, end)`` position span per chunk id.
+
+    Args:
+        chunk_id: ``[B, T]`` where each entry is the pair/chunk index the
+            position belongs to (sentinel ``< 0`` or ``>= max_pairs`` for
+            unaligned positions).
+        max_pairs: chunk-id space width (the ``pair_valid`` slot count).
+
+    Returns:
+        ``[B, max_pairs, 2]`` long tensor; row ``k`` is ``[first, last + 1)``
+        over the positions with ``chunk_id == k``. A chunk id absent from a
+        sample gets ``[0, 0)`` (zero-length — the v6 ``M/N > 0`` gate and
+        ``pair_valid`` both skip it). Assumes each chunk's positions are
+        contiguous (the offset-based cluster alignment guarantees this).
+    """
+    b, t = chunk_id.shape
+    device = chunk_id.device
+    pos = torch.arange(t, device=device).unsqueeze(0).expand(b, t)
+    valid = (chunk_id >= 0) & (chunk_id < max_pairs)
+    idx = chunk_id.clamp(0, max_pairs - 1)
+    # Invalid positions carry T (ignored by amin) / -1 (ignored by amax), so a
+    # clamped-in bucket is never corrupted by an unaligned position.
+    pos_for_min = torch.where(valid, pos, torch.full_like(pos, t))
+    pos_for_max = torch.where(valid, pos, torch.full_like(pos, -1))
+    first = torch.full((b, max_pairs), t, dtype=torch.long, device=device)
+    last = torch.full((b, max_pairs), -1, dtype=torch.long, device=device)
+    first.scatter_reduce_(1, idx, pos_for_min, reduce="amin", include_self=True)
+    last.scatter_reduce_(1, idx, pos_for_max, reduce="amax", include_self=True)
+    has = first < t
+    spans = torch.zeros(b, max_pairs, 2, dtype=torch.long, device=device)
+    spans[:, :, 0] = torch.where(has, first, torch.zeros_like(first))
+    spans[:, :, 1] = torch.where(has, last + 1, torch.zeros_like(last))
+    return spans
+
+
 def prepare_xtoken_cross_tokenizer_loss_input(
     logits: torch.Tensor,
     data: Mapping[str, Any],
@@ -1126,28 +1170,24 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             )
             continue
         alignment_prefix = f"alignment_{i}_"
+        teacher_seq_len = teacher_full_logits.shape[1]
         if cp_sharder is not None:
-            student_chunk_id = to_local_if_dtensor(
+            student_chunk_id_full = to_local_if_dtensor(
                 data[f"{alignment_prefix}student_chunk_id"]
-            ).roll(shifts=-1, dims=1)
-            student_chunk_id[:, -1] = -1
-            student_chunk_id = student_chunk_id[
+            )
+            student_chunk_id_contig = student_chunk_id_full[
                 :, student_seq_start : student_seq_start + student_seq_len
             ].contiguous()
 
-            teacher_chunk_id = to_local_if_dtensor(
+            teacher_chunk_id_full = to_local_if_dtensor(
                 data[f"{alignment_prefix}teacher_chunk_id"]
-            ).roll(shifts=-1, dims=1)
-            teacher_chunk_id[:, -1] = -1
-            teacher_seq_len = teacher_full_logits.shape[1]
+            )
             teacher_seq_start = cp_rank * teacher_seq_len
-            teacher_chunk_id = teacher_chunk_id[
+            teacher_chunk_id_contig = teacher_chunk_id_full[
                 :, teacher_seq_start : teacher_seq_start + teacher_seq_len
             ].contiguous()
             align = LocalizedAlignment(
                 sample_mask=sample_mask,
-                student_chunk_id=student_chunk_id,
-                teacher_chunk_id=teacher_chunk_id,
                 pair_valid=to_local_if_dtensor(data[f"{alignment_prefix}pair_valid"]),
                 pair_is_correct=to_local_if_dtensor(
                     data[f"{alignment_prefix}pair_is_correct"]
@@ -1160,15 +1200,60 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 alignment_prefix=alignment_prefix,
                 cp_group=cp_group,
             )
+            student_chunk_id_contig = cp_load_balanced_to_contiguous(
+                align.student_chunk_id, cp_group=cp_group
+            )
+            teacher_chunk_id_contig = align.teacher_chunk_id
+            cp_rank = (
+                torch.distributed.get_rank(cp_group)
+                if cp_group is not None
+                and torch.distributed.get_world_size(cp_group) > 1
+                else 0
+            )
+            teacher_seq_start = cp_rank * teacher_seq_len
+
+        # Contiguous, UNSHIFTED chunk ids -> per-chunk position spans for the v6
+        # path. v6 reads spans and applies its own per-chunk kl_chunk_shift, so
+        # it must not derive them from next-token-shifted chunk ids. Spans are
+        # this CP rank's local-window positions at this stage; native full-CP
+        # gathering is added by the following commit.
+        max_pairs = align.pair_valid.shape[1]
+        align.student_spans = _chunk_ids_to_spans(student_chunk_id_contig, max_pairs)
+        align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_contig, max_pairs)
+        # Preserve the aligner's real per-sample chunk count rather than
+        # iterating every padded pair slot; pair_valid remains the final gate.
+        align.num_chunks = to_local_if_dtensor(
+            data[f"{alignment_prefix}num_chunks"]
+        )
+        # Teacher input ids for this CP rank's contiguous teacher window (matches
+        # the teacher-logit / teacher_chunk_id slice).
+        teacher_ids_full = to_local_if_dtensor(data[f"teacher_{i}_input_ids"])
+        align.teacher_input_ids = teacher_ids_full[
+            :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+        ]
+        # Preserve the established next-token-shifted localized fields for
+        # metrics and compatibility while v6 consumes the unshifted spans.
+        if cp_sharder is not None:
+            student_chunk_id_shifted = student_chunk_id_full.roll(
+                shifts=-1, dims=1
+            )
+            student_chunk_id_shifted[:, -1] = -1
+            align.student_chunk_id = student_chunk_id_shifted[
+                :, student_seq_start : student_seq_start + student_seq_len
+            ].contiguous()
+            teacher_chunk_id_shifted = teacher_chunk_id_full.roll(
+                shifts=-1, dims=1
+            )
+            teacher_chunk_id_shifted[:, -1] = -1
+            align.teacher_chunk_id = teacher_chunk_id_shifted[
+                :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+            ].contiguous()
+        else:
             align.student_chunk_id = cp_shift_next(
-                cp_load_balanced_to_contiguous(
-                    align.student_chunk_id, cp_group=cp_group
-                ),
-                cp_group,
-                fill=-1,
+                student_chunk_id_contig, cp_group, fill=-1
             )
             align.teacher_chunk_id = cp_shift_next(
-                align.teacher_chunk_id, cp_group, fill=-1
+                teacher_chunk_id_contig, cp_group, fill=-1
             )
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask

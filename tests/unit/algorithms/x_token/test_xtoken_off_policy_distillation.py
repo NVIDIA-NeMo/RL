@@ -327,6 +327,8 @@ def test_teacher_aligner_config_defaults():
     assert isinstance(teacher.aligner, TeacherAlignerConfig)
     assert teacher.aligner.projection_matrix_path is None
     assert teacher.aligner.drop_first_assistant_chunk_kl is False
+    assert teacher.aligner.pseudo_target_path is None
+    assert teacher.aligner.reverse_pseudo_target_path is None
 
 
 def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy():
@@ -335,6 +337,8 @@ def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy
         aligner={
             "projection_matrix_path": "/tmp/projection.pt",
             "drop_first_assistant_chunk_kl": True,
+            "pseudo_target_path": "/tmp/forward.pt",
+            "reverse_pseudo_target_path": "/tmp/reverse.pt",
         },
     )
 
@@ -342,6 +346,8 @@ def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy
     assert dumped["aligner"] == {
         "projection_matrix_path": "/tmp/projection.pt",
         "drop_first_assistant_chunk_kl": True,
+        "pseudo_target_path": "/tmp/forward.pt",
+        "reverse_pseudo_target_path": "/tmp/reverse.pt",
     }
     assert "projection_matrix_path" not in dumped
     assert "aligner" not in teacher.policy_config()
@@ -361,6 +367,15 @@ def test_conflicting_legacy_and_nested_projection_paths_fail():
             projection_matrix_path="/tmp/legacy.pt",
             aligner={"projection_matrix_path": "/tmp/nested.pt"},
         )
+
+
+@pytest.mark.parametrize("field", ["pseudo_target_path", "reverse_pseudo_target_path"])
+def test_root_pseudo_target_paths_are_rejected(field):
+    with pytest.raises(
+        ValidationError,
+        match="must be nested under teachers\\[i\\]\\.aligner",
+    ):
+        TeacherConfig(**{field: "/tmp/table.pt"})
 
 
 def test_shared_drop_first_assistant_chunk_kl_is_rejected():
@@ -417,6 +432,8 @@ def test_setup_requires_dtensor_v2_teacher():
 
 def test_setup_injects_vocab_sizes_into_loss_config():
     cfg = _make_master_config()
+    cfg.teachers[0].aligner.pseudo_target_path = "/tmp/forward.pt"
+    cfg.teachers[0].aligner.reverse_pseudo_target_path = "/tmp/reverse.pt"
     original_loss_cfg = deepcopy(cfg.loss_fn)
 
     _, mocks = _patched_setup_call(cfg, student_vocab=128, teacher_vocab=256)
@@ -428,6 +445,8 @@ def test_setup_injects_vocab_sizes_into_loss_config():
     assert injected_cfg["teacher_vocab_sizes"] == [256]
     assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt"]
     assert injected_cfg["teacher_weights"] == [1.0]
+    assert injected_cfg["pseudo_target_paths"] == ["/tmp/forward.pt"]
+    assert injected_cfg["reverse_pseudo_target_paths"] == ["/tmp/reverse.pt"]
     assert mocks["collator"].call_args.kwargs[
         "drop_first_assistant_chunk_kl_by_teacher"
     ] == [False]
@@ -1352,50 +1371,3 @@ def test_compute_dynamic_weights_softmax_over_teachers():
         torch.softmax(torch.tensor([8.0, 0.0]), dim=0)[0].item()
     )
     assert sharp[0].item() > weights[0].item()
-
-
-# ---------------------------------------------------------------------------
-# per-teacher gold/xtoken overrides + the xtoken-requires-gold guard
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_gold_xtoken_per_teacher_overrides():
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
-    fn.gold_loss = False  # global defaults
-    fn.xtoken_loss = False
-    fn.teacher_gold_loss = [True, None]  # t0 overrides gold; t1 falls back
-    fn.teacher_xtoken_loss = [None, True]  # t0 falls back; t1 overrides xtoken
-
-    # use_per_teacher=True honors per-teacher overrides; None falls back to global.
-    assert fn._resolve_gold_xtoken(0, True) == (True, False)
-    assert fn._resolve_gold_xtoken(1, True) == (False, True)
-    # use_per_teacher=False ignores the per-teacher lists -> globals for all.
-    assert fn._resolve_gold_xtoken(0, False) == (False, False)
-    assert fn._resolve_gold_xtoken(1, False) == (False, False)
-
-
-def test_compute_teacher_kd_rejects_xtoken_without_gold():
-    # A cross-tokenizer teacher resolved to xtoken_loss=True but gold_loss=False
-    # must fail loud per teacher (xtoken is a modifier inside the gold path).
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
-    fn.gold_loss = False
-    fn.xtoken_loss = False
-    fn.projection_matrix_paths = ["t0_proj.pt"]  # non-null => cross-tokenizer
-    fn.teacher_vocab_sizes = [24]
-    fn.teacher_gold_loss = [False]
-    fn.teacher_xtoken_loss = [True]
-
-    with pytest.raises(
-        ValueError, match="teacher 0: xtoken_loss=True requires gold_loss=True"
-    ):
-        fn._compute_teacher_kd(
-            0,
-            torch.zeros(1, 4, 8),
-            {},
-            {0: torch.zeros(1, 4, 24)},
-            {0: MagicMock()},
-            torch.tensor(10.0),
-            use_per_teacher_flags=True,
-            tp_group=None,
-            cp_group=None,
-        )
