@@ -7,10 +7,16 @@ sft:
   val_at_end: false
   seed: 42
   save_freq: 250
+  val_batches: 8
+  val_micro_batch_size: 1
 checkpointing:
   enabled: true
   save_period: 250
   checkpoint_dir: /home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native/results/code7x_native_noclip_multi
+  metric_name: null
+  higher_is_better: false
+  keep_top_k: 100
+  checkpoint_must_save_by: null
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
@@ -270,6 +276,17 @@ logger:
   mlflow_enabled: false
   swanlab_enabled: false
   monitor_gpus: false
+  tensorboard:
+    log_dir: tb_logs-sft-dev-${data.train.dataset_name}
+  mlflow:
+    experiment_name: sft-dev
+    run_name: sft-dev-${data.train.dataset_name}
+  swanlab:
+    project: sft-dev
+    name: sft-dev-${data.train.dataset_name}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
 cluster:
   gpus_per_node: 8
   num_nodes: 1
