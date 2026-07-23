@@ -42,7 +42,7 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nsys import nsys_nvtx_range, wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
@@ -234,25 +234,28 @@ class TQWorkerMixin:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
             if is_leader:
-                td = self._require_dp_client().get_samples(
-                    sample_ids=meta.sample_ids,
-                    partition_id=meta.partition_id,
-                    select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                )
-                data = materialize(
-                    td,
-                    layout=layout,
-                    pad_value_dict=pad_value_dict,
-                    pad_to_seqlen=pad_to_seqlen,
-                )
+                with nsys_nvtx_range("tq_full_shard/tq_get"):
+                    td = self._require_dp_client().get_samples(
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                with nsys_nvtx_range("tq_full_shard/materialize"):
+                    data = materialize(
+                        td,
+                        layout=layout,
+                        pad_value_dict=pad_value_dict,
+                        pad_to_seqlen=pad_to_seqlen,
+                    )
             else:
                 data = None
-            data = _broadcast_batched_data_dict(
-                data,
-                is_leader=is_leader,
-                src=leader,
-                group=replica_group,
-            )
+            with nsys_nvtx_range("tq_full_shard/distribute"):
+                data = _broadcast_batched_data_dict(
+                    data,
+                    is_leader=is_leader,
+                    src=leader,
+                    group=replica_group,
+                )
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
@@ -265,17 +268,19 @@ class TQWorkerMixin:
                 data = preprocess(self, data)
             return data
 
-        td = self._require_dp_client().get_samples(
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-        )
-        data = materialize(
-            td,
-            layout=layout,
-            pad_value_dict=pad_value_dict,
-            pad_to_seqlen=pad_to_seqlen,
-        )
+        with nsys_nvtx_range("tq_full_shard/tq_get"):
+            td = self._require_dp_client().get_samples(
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            )
+        with nsys_nvtx_range("tq_full_shard/materialize"):
+            data = materialize(
+                td,
+                layout=layout,
+                pad_value_dict=pad_value_dict,
+                pad_to_seqlen=pad_to_seqlen,
+            )
         attach_message_log_view(data)
         trace_tq_fetch_payload(
             stage=meta.task_name or "unknown",
