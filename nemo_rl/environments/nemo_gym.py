@@ -22,6 +22,7 @@ from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, ConfigDict
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
@@ -52,6 +53,32 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+class NemoGymRuntimeOptions(BaseModel):
+    """NeMo-RL-owned options nested under ``env.nemo_gym``.
+
+    The remaining keys in that mapping are forwarded to NeMo Gym as its global
+    config. Keeping NeMo-RL's options in a model gives every call site the same
+    defaults without hidden ``dict.get`` fallbacks.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
+
+
+def split_nemo_gym_runtime_options(
+    config: dict[str, Any],
+) -> tuple[NemoGymRuntimeOptions, dict[str, Any]]:
+    """Split NeMo-RL runtime options from the config forwarded to NeMo Gym."""
+    options = NemoGymRuntimeOptions.model_validate(config)
+    gym_global_config = dict(config)
+    for key in NemoGymRuntimeOptions.model_fields:
+        gym_global_config.pop(key, None)
+    return options, gym_global_config
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -118,7 +145,7 @@ class NemoGymConfig(TypedDict):
     # When absent/false (default), such an episode raises the contiguity
     # assertion below, which kills the rollout task; under async GRPO a single
     # such episode can then stall the training step indefinitely.
-    truncate_noncontiguous_episodes: NotRequired[bool]
+    truncate_noncontiguous_episodes: bool
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -660,14 +687,10 @@ def spinup_nemo_gym_actor(
     Returns:
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
     """
-    nemo_gym_dict = dict(env_configs["nemo_gym"])
-
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
-    invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
-    thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-    truncate_noncontiguous_episodes = nemo_gym_dict.pop(
-        "truncate_noncontiguous_episodes", None
+    runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
+        dict(env_configs["nemo_gym"])
     )
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
@@ -682,12 +705,14 @@ def spinup_nemo_gym_actor(
     nemo_gym_cfg = NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
+        invalid_tool_call_patterns=runtime_options.invalid_tool_call_patterns,
+        thinking_tags=runtime_options.thinking_tags,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
-        truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        truncate_noncontiguous_episodes=(
+            runtime_options.truncate_noncontiguous_episodes
+        ),
         initial_global_config_dict=nemo_gym_dict,
     )
 

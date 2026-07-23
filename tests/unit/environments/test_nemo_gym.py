@@ -32,6 +32,7 @@ from nemo_rl.environments.nemo_gym import (
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
+    split_nemo_gym_runtime_options,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -61,6 +62,26 @@ def test_extract_reward_components():
     )
     assert components == {"correctness": 1.0, "format": 0.5}
     assert all(isinstance(v, float) for v in components.values())
+
+
+def test_split_nemo_gym_runtime_options_centralizes_defaults():
+    options, gym_global_config = split_nemo_gym_runtime_options(
+        {
+            "num_servers": 2,
+            "invalid_tool_call_patterns": ["<tool>"],
+            "thinking_tags": ["<think>", "</think>"],
+        }
+    )
+
+    assert options.truncate_noncontiguous_episodes is False
+    assert options.invalid_tool_call_patterns == ["<tool>"]
+    assert options.thinking_tags == ["<think>", "</think>"]
+    assert gym_global_config == {"num_servers": 2}
+
+    enabled, _ = split_nemo_gym_runtime_options(
+        {"truncate_noncontiguous_episodes": True}
+    )
+    assert enabled.truncate_noncontiguous_episodes is True
 
 
 def test_build_reward_component_columns():
@@ -372,6 +393,8 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     assert "apply_chat_template failed" in msg
     assert "RuntimeError" in msg
     assert "['reasoning']" in msg
+
+
 def _make_noncontiguous_nemo_gym_result():
     """Two assistant turns where turn 2's prompt breaks token-prefix contiguity.
 
