@@ -21,12 +21,6 @@ policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
     name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    chat_template: '{% for message in messages %}{%- if message[''role''] == ''system''  %}{{''Context:
-      '' + message[''content''].strip()}}{%- elif message[''role''] == ''user''  %}{{''
-      Question: '' + message[''content''].strip() + '' Answer:''}}{%- elif message[''role'']
-      == ''assistant''  %}{{'' '' + message[''content''].strip()}}{%- endif %}{% endfor
-      %}'
-    chat_template_kwargs: null
   train_global_batch_size: 16
   train_micro_batch_size: 2
   max_total_sequence_length: 512
