@@ -11,7 +11,7 @@ sft:
   save_freq: 100
 checkpointing:
   enabled: true
-  checkpoint_dir: /home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native/results/native100_clip1_sa_ckpt
+  checkpoint_dir: /home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native/results/native100v2_clip1_sa_ckpt
   metric_name: null
   higher_is_better: false
   keep_top_k: 100
