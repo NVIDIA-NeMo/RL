@@ -1341,6 +1341,39 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    @pytest.mark.parametrize(
+        ("backend", "backend_config", "should_wait"),
+        [
+            (
+                "sglang",
+                {"use_async_rollouts": True},
+                True,
+            ),
+            (
+                "trtllm",
+                {"trtllm_cfg": {"async_engine": True}},
+                False,
+            ),
+        ],
+    )
+    def test_prepare_for_refit_preserves_sglang_barrier(
+        self, backend, backend_config, should_wait
+    ):
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": backend,
+            **backend_config,
+        }
+        collector.master_config.grpo["async_grpo"]["in_flight_weight_updates"] = True
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        if should_wait:
+            collector.wait_for_pending_generations.assert_called_once_with()
+        else:
+            collector.wait_for_pending_generations.assert_not_called()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
         buffer = ReplayBuffer.remote(max_size=10)

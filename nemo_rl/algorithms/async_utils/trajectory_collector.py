@@ -491,7 +491,8 @@ class AsyncTrajectoryCollector:
         to continue with their current KV caches while weights are updated.
         This significantly improves async performance.
 
-        For non-async engines, waits for all pending generations to complete before refit.
+        SGLang always waits for pending generations because its refit protocol
+        pauses the rollout engines. Other non-async engines wait as well.
         """
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
@@ -517,6 +518,10 @@ class AsyncTrajectoryCollector:
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "sglang":
+            # SGLang can collect trajectories asynchronously, but weight refit
+            # is a barrier and cannot overlap pending generation requests.
+            is_async_engine = False
         else:
             is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(

@@ -958,6 +958,28 @@ def test_nemo_gym_context_limit_uses_policy_cap_for_nullable_sglang_limit():
         )
 
 
+def test_nemo_gym_context_limit_dispatches_trtllm_despite_inherited_vllm_config():
+    policy_generation = type(
+        "_PolicyGeneration",
+        (),
+        {
+            "cfg": {
+                "backend": "trtllm",
+                "trtllm_cfg": {"max_model_len": 1024},
+                "vllm_cfg": {"max_model_len": 1},
+            }
+        },
+    )()
+
+    assert (
+        rollouts_mod._resolve_generation_context_limit(
+            policy_generation,
+            policy_max_seq_len=512,
+        )
+        == 1024
+    )
+
+
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
     """One native batch can be split without changing data or metric semantics."""
 
