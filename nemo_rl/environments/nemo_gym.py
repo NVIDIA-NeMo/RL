@@ -105,6 +105,9 @@ class NemoGymConfig(TypedDict):
     routed_experts_dtype: NotRequired[
         str
     ]  # Carry dtype name for routed_experts tensors ("int8"/"int16"/"int32"), resolved from the model's expert count
+    # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
+    # tokenizer consistently with the driver. Defaults to off when absent.
+    use_fastokens: NotRequired[bool]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -278,6 +281,10 @@ Depending on your data shape, you may want to change these values."""
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
+
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)

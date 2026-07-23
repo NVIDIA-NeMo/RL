@@ -636,6 +636,7 @@ def setup(
                 if router_replay_enabled(policy_config)
                 else "int16"
             ),
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}
