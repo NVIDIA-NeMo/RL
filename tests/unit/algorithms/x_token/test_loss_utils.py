@@ -133,11 +133,6 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
             "rebuild_teacher_full_logits_from_ipc",
             return_value=teacher_logits,
         ) as rebuild_teacher,
-        patch(
-            "nemo_rl.algorithms.x_token.loss_utils."
-            "allgather_cp_contiguous_tensor",
-            side_effect=lambda tensor, _group: tensor,
-        ),
     ):
         student_logits, teachers, aligns, tp_group, returned_cp_group = (
             prepare_xtoken_cross_tokenizer_loss_input(

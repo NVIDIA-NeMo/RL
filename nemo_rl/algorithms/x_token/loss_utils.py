@@ -1221,12 +1221,18 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         # full sequence, so its spans must index global positions. Gather the
         # contiguous-window chunk ids to the full sequence before deriving spans
         # (no-op at CP=1).
-        student_chunk_id_global = allgather_cp_contiguous_tensor(
-            student_chunk_id_contig, cp_group
-        )
-        teacher_chunk_id_global = allgather_cp_contiguous_tensor(
-            teacher_chunk_id_contig, cp_group
-        )
+        if cp_sharder is not None:
+            # Automodel has already restored these data tensors to the full,
+            # canonical sequence before the local contiguous window is sliced.
+            student_chunk_id_global = student_chunk_id_source_full
+            teacher_chunk_id_global = teacher_chunk_id_source_full
+        else:
+            student_chunk_id_global = allgather_cp_contiguous_tensor(
+                student_chunk_id_contig, cp_group
+            )
+            teacher_chunk_id_global = allgather_cp_contiguous_tensor(
+                teacher_chunk_id_contig, cp_group
+            )
         align.student_spans = _chunk_ids_to_spans(student_chunk_id_global, max_pairs)
         align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_global, max_pairs)
         # Preserve the aligner's real per-sample chunk count rather than
