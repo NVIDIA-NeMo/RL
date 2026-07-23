@@ -1,0 +1,177 @@
+# Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 smoke test on polygon_naming.
+#
+# Sibling of grpo_nemotron_omni_30ba3b_gymv_smoke.yaml. Same model + shape;
+# swaps the environment from gym-v to the multi-turn multimodal
+# polygon_naming benchmark (this repo's 3rdparty/Gym-workspace/Gym/
+# resources_servers/polygon_naming), driven by multimodal_simple_agent.
+#
+# Rollout on each task:
+#   1. /seed_session injects a user turn with two 128×128 polygon canvases.
+#   2. Model calls submit_turn(answers=[[sides, colour], [sides, colour]]).
+#   3. /submit_turn (turn 1) acks + injects a user turn with image 3.
+#   4. Model calls submit_turn(answers=[[sides, colour]]).
+#   5. /submit_turn (turn 2) returns plain text; model emits a final
+#      assistant message; agent loop terminates.
+#   6. /verify multiset-compares against ground truth → reward 0.0 / 1.0.
+#
+# Shape (2 nodes × 8 GPUs, non-colocated) — identical to gym-v smoke:
+#   - Node 1: vLLM generation, TP=8
+#   - Node 2: Megatron policy training, TP=2, EP=8, CP=2, PP=1
+#
+# Data: Gym JSONLs at 3rdparty/Gym-workspace/Gym/resources_servers/
+# polygon_naming/data/{train,validation}.jsonl. Generate them first with:
+#   examples/nemo_gym/generate_polygon_naming_data.sh
+#
+# Run with:
+#   uv run --locked --extra mcore --extra vllm \
+#     examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_polygon_naming_smoke.yaml
+
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 1
+  # polygon_naming completes in 3 rollout turns (2 tool calls + terminal
+  # assistant msg). Give one turn of headroom.
+  max_rollout_turns: 4
+  max_num_epochs: 1
+  max_num_steps: 100
+  val_period: 500
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+  async_grpo:
+    enabled: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-nemotron-omni-30ba3b-polygon-naming-smoke"
+
+policy:
+  # model_name: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+  model_name: "/data/models/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+  is_vlm: true
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+    sequence_parallel: true
+    activation_checkpointing: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    # See gym-v smoke recipe: sound tower needs frozen forward path before
+    # DDP grad-reduce overlap can be re-enabled.
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+
+    scheduler:
+      lr_warmup_iters: 0
+
+  make_sequence_length_divisible_by: 32
+
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    bad_words: ["<image>", "<img>", "</img>"]
+    vllm_cfg:
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        # Required for the OpenAI-style content-parts list to be flattened
+        # into a string before Nemotron-Omni's Jinja template touches it.
+        # Without this, the assistant branch stringifies the list as a Python
+        # repr, breaking the turn-2 token-prefix contiguity check at
+        # nemo_gym.py:474 for any multi-turn rollout.
+        chat_template_content_format: string
+        # Threaded into every incoming ChatCompletionRequest by
+        # vllm_worker_async.py so the Jinja template sees these at render time.
+        # vLLM 0.20's OpenAIServingChat.__init__ has no chat_template_kwargs
+        # arg; NeMo-RL's wire lives in the request handler.
+        chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      # 3 images per rollout (2 injected on turn 1, 1 injected on turn 2).
+      # Keep a small buffer for retries.
+      limit_mm_per_prompt: {"image": 6}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: "float32"
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+
+data:
+  train:
+    # Generated by examples/nemo_gym/generate_polygon_naming_data.sh.
+    # Path is relative to the container's WD (/opt/nemo-rl); override via
+    # `data.train.data_path=...` if your checkout lives elsewhere.
+    data_path: /opt/nemo-rl/3rdparty/Gym-workspace/Gym/resources_servers/polygon_naming/data/train.jsonl
+  validation:
+    data_path: /opt/nemo-rl/3rdparty/Gym-workspace/Gym/resources_servers/polygon_naming/data/validation.jsonl
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    is_trajectory_collection: false
+    # Quiet-unblock: current NeMo-Gym flags polygon_naming's shipped server
+    # blocks (polygon_naming_resources_server / polygon_naming_multimodal_simple_agent)
+    # as "almost-servers" with schema-validation errors and aborts spinup by
+    # default. DoorKey/gym_v pass because their server blocks lack the fields
+    # the validator now demands. Bypass here so the smoke run reaches the
+    # multi-turn multimodal path; the real fix is either updating
+    # 3rdparty/Gym-workspace/Gym/resources_servers/polygon_naming/configs/polygon_naming.yaml
+    # to add the missing fields (grep the log for
+    # "Configuration Warnings: Almost-Servers Detected" to see which) or
+    # bumping the pinned NeMo-Gym to a version where they're optional.
+    error_on_almost_servers: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/polygon_naming/configs/polygon_naming.yaml
+    # Outer group name matches the agent instance key in polygon_naming.yaml.
+    # multimodal_simple_agent's tool loop needs a small handful of steps:
+    # 1 for turn 1's submit_turn, 1 for turn 2's submit_turn, 1 for the
+    # final assistant message. `max_steps=4` leaves one slot of slack.
+    polygon_naming_multimodal_simple_agent:
+      responses_api_agents:
+        multimodal_simple_agent:
+          max_steps: 4
+
+logger:
+  log_dir: "logs/grpo-nemotron-omni-30ba3b-polygon-naming-smoke"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: "grpo-nemotron-omni-polygon-naming"
+    name: "grpo-nemotron-omni-30ba3b-polygon-naming-smoke"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

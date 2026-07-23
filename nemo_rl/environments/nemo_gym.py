@@ -14,11 +14,20 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
+from PIL import Image
 from transformers import PreTrainedTokenizerBase
+
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    encode_images_in_examples,
+    get_dim_to_pack_along,
+    get_multimodal_keys_from_processor,
+    resolve_to_image,
+)
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
@@ -80,6 +89,10 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
+    tokenizer_config: NotRequired[
+        Optional[Dict[str, Any]]
+    ]  # For processor reconstruction inside the actor
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -142,12 +155,119 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     return is_invalid_tool_call, has_malformed_thinking
 
 
+########################################
+# Multimodal helpers
+########################################
+
+
+def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
+    """Pull PIL images out of a Responses-API user-role item's content list."""
+    images: list[Image.Image] = []
+    content = item.get("content") or []
+    if not isinstance(content, list):
+        return images
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in ("input_image", "image", "image_url"):
+            continue
+        src = part.get("image") or part.get("image_url") or part.get("url")
+        if src is None:
+            continue
+        if isinstance(src, dict):
+            src = src.get("url")
+        if src is None:
+            continue
+        images.append(resolve_to_image(src))
+    return images
+
+
+def _index_per_turn_images(
+    seed_obs: list[dict], output: list[dict]
+) -> list[list[Image.Image]]:
+    """Bin server-returned user images by the assistant turn that saw them.
+
+    Walks the Responses-API items in order, accumulating images from user-role
+    items into a pending list, and flushing them into a per-turn bucket each
+    time a trainable assistant item (one carrying ``generation_token_ids``) is
+    reached. The returned list has one entry per trainable assistant turn,
+    aligned with the postprocess loop's ``turn_idx``.
+    """
+    per_turn: list[list[Image.Image]] = []
+    pending: list[Image.Image] = []
+    for item in [*(seed_obs or []), *output]:
+        if item.get("role") == "user":
+            pending.extend(_extract_input_images_from_message(item))
+        elif "generation_token_ids" in item:
+            per_turn.append(pending)
+            pending = []
+    return per_turn
+
+
+def _attach_multimodal_data_to_user_message(
+    user_message: dict,
+    *,
+    images: list[Image.Image],
+    processor: Any,
+) -> None:
+    """Attach per-turn multimodal tensors to ``user_message``.
+
+    The processor is only invoked to extract multimodal tensors (pixel_values,
+    imgs_sizes, num_patches, etc.); its text output is discarded — vLLM's
+    tokens remain the trajectory. We therefore feed it the minimal placeholder
+    text it needs to count image regions: one ``processor.image_token`` per
+    image. Passing the vLLM-decoded text does not work because that text
+    already contains expanded ``<img>...<image>*N...</img>`` regions, and the
+    processor would try to re-expand every embedded ``<image>``.
+    """
+    if not images or processor is None:
+        return
+    image_token = getattr(processor, "image_token", "<image>")
+    processed = processor(
+        text=image_token * len(images),
+        images=images,
+        return_tensors="pt",
+    )
+    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
+    # imgs_sizes / num_frames are not always declared in model_input_names by
+    # bundled image processors, so append them explicitly when present. RADIO
+    # (Nemotron-Omni vision encoder) uses temporal patching even for still
+    # images and requires one num_frames=1 entry per image/tile — mirror the
+    # SFT-path fix at nemo_rl/data/processors.py:589-594.
+    if "imgs_sizes" in processed and "imgs_sizes" not in multimodal_keys:
+        multimodal_keys.append("imgs_sizes")
+    if "imgs_sizes" in processed and "num_frames" not in processed:
+        processed["num_frames"] = torch.ones(
+            len(processed["imgs_sizes"]), dtype=torch.long
+        )
+    if "num_frames" in processed and "num_frames" not in multimodal_keys:
+        multimodal_keys.append("num_frames")
+    for key in multimodal_keys:
+        if key not in processed:
+            continue
+        value = processed[key]
+        if key == "imgs_sizes":
+            value = value.to(dtype=torch.int32)
+        user_message[key] = PackedTensor(
+            value,
+            dim_to_pack=get_dim_to_pack_along(processor, key),
+        )
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        # Reconstruct the processor inside the actor (rather than serializing it
+        # per rollout call) for full-trajectory multimodal postprocessing.
+        self._processor: Optional[Any] = None
+        tokenizer_config = cfg.get("tokenizer_config")
+        if tokenizer_config:
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self._processor = get_tokenizer(tokenizer_config, get_processor=True)
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -260,6 +380,11 @@ Depending on your data shape, you may want to change these values."""
     ) -> list[dict]:
         timer = Timer()
 
+        # For multimodal runs, replace local filesystem image paths in the
+        # examples with base64 data URLs before shipping to vLLM. No-op when
+        # examples carry no `input_image` items (text-only case).
+        encode_images_in_examples(nemo_gym_examples)
+
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
@@ -276,7 +401,7 @@ Depending on your data shape, you may want to change these values."""
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
+                        nemo_gym_row, nemo_gym_result, tokenizer
                     )
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
@@ -317,11 +442,21 @@ Depending on your data shape, you may want to change these values."""
         return nemo_rl_results, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
-        self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
+        self,
+        nemo_gym_row: dict,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
+
+        processor = getattr(self, "_processor", None)
+        per_turn_images = _index_per_turn_images(
+            nemo_gym_result["response"].get("seed_obs") or [],
+            nemo_gym_result["response"]["output"],
+        )
+        turn_idx = 0
 
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
@@ -341,6 +476,7 @@ Depending on your data shape, you may want to change these values."""
             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
 """
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
@@ -388,6 +524,18 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
+
+            if processor is not None:
+                images_this_turn = (
+                    per_turn_images[turn_idx]
+                    if turn_idx < len(per_turn_images)
+                    else []
+                )
+                _attach_multimodal_data_to_user_message(
+                    user_message,
+                    images=images_this_turn,
+                    processor=processor,
+                )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -422,6 +570,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             batch_decode_items.append(
                 (output_item_dict, prompt_token_ids, generation_token_ids)
             )
+            turn_idx += 1
 
         if batch_decode_items:
             prompt_strs = tokenizer.batch_decode(
@@ -484,3 +633,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    # For VLM runs, plumb the tokenizer config into the gym env config so the
+    # NemoGym actor can reconstruct the processor inside itself (needed for
+    # multi-turn multimodal postprocessing).
+    if config.policy.get("is_vlm", False):
+        env_cfg = config.env.setdefault("nemo_gym", {})
+        env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))

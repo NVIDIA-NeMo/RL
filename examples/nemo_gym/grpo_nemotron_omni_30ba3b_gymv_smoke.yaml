@@ -1,0 +1,187 @@
+# Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 smoke test on gym-v.
+#
+# Sibling of grpo_qwen25vl_gymv_smoke.yaml. Nemotron-Omni is the known-good
+# multimodal + NeMo-Gym baseline in-house (see the games-bandit recipe chain);
+# this file adapts it to the current mm-integration branch so the Qwen path
+# and the Nemotron-Omni path can be exercised through the same code path.
+#
+# Both the model AND the env are multimodal here — expect real visual RL
+# signal (unlike the earlier text-only Nemotron placeholder).
+#
+# Shape (2 nodes × 8 GPUs, non-colocated):
+#   - Node 1: vLLM generation, TP=8
+#   - Node 2: Megatron policy training, TP=8, EP=8, PP=1, CP=1
+#
+# Data: size=4 FrozenLake ablation manifest (multi-turn train, single-turn
+# eval), sourced from nemo-rl-games-bandit's frozenlake_size4.yaml chain.
+#
+# Run with:
+#   uv run --locked --extra mcore --extra vllm \
+#     examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke.yaml
+
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 1                # smoke: minimal loop
+  num_generations_per_prompt: 16         # gbs = 1 * 16 = 16
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 4
+  max_num_epochs: 1
+  max_num_steps: 20                       # 
+  val_period: 500
+  val_at_start: false                     # exercise eval before training
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+  async_grpo:
+    enabled: false                       # sync for the smoke run
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-nemotron-omni-30ba3b-gymv-smoke"
+
+policy:
+  model_name: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+  is_vlm: true                           # required by run_multimodal_grpo_nemo_gym.py
+  tokenizer:
+    name: ${policy.model_name}
+    # Nano-Omni-Reasoning uses a native <think> block; keep it open and
+    # preserve prior reasoning across turns (append-only trajectory rep).
+    # Mirrors the games-bandit grpo_game_rlvr_trajectory_collection.yaml recipe.
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+
+  megatron_cfg:
+    # Full 8-GPU policy node: TP=8, EP=8, PP=1, CP=1. Overrides
+    # grpo_nanov3.yaml's TP=2/PP=2/CP=4 layout (tuned for a 32-node run).
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+    sequence_parallel: true             # sp only pays off with tp + cp
+    activation_checkpointing: true
+    # RADIO CPE eval mode: keeps vision-tower positional embeddings in eval
+    # mode during rollout/train (required for the frozen vision path to
+    # produce stable features).
+    radio_force_cpe_eval_mode: true
+    # Empty the CUDA cache before the vLLM refit broadcast so the packed
+    # staging tensor (see nemo_rl/utils/packed_tensor.py) doesn't OOM against
+    # Adam m/v that materialize at the end of iter 1.
+    clear_memory_caches_before_refit: true
+    # Nemotron-Omni carries a sound_encoder / sound_projection tower that
+    # never sees an audio input in gym-v. Those params live in the DDP bucket
+    # with requires_grad=True but never receive a backward hook, so MCore's
+    # async grad-reduce path trips the golden-count assertion at
+    # param_and_grad_buffer.py:272 on iter 2's zero_grad_buffer(). Disable
+    # the overlap paths until the sound tower is actually frozen via a
+    # nemo-rl pre_wrap_hook (mirror of freeze_moe_router). This is a real
+    # perf cost — remove once the freeze path is wired.
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+
+    # Flat LR throughout: skip warmup (base recipe warmed 3e-7 → 3e-6 over 10
+    # iters). Combined with lr_decay_style="constant" and min_lr == lr from
+    # grpo_nanov3.yaml, this pins the LR at 3e-6 from step 0 onward.
+    scheduler:
+      lr_warmup_iters: 0
+
+  # base recipe ties this to dtensor_cfg.tensor_parallel_size; we're on
+  # megatron, so pin to the megatron TP directly.
+  make_sequence_length_divisible_by: 32
+
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}                 # per-turn cap; 4 turns fit in 8k context
+    # Nano-Omni-Reasoning bad_words: only the vision-side text tokens (safe,
+    # in-vocab). The audio-delimiter tokens (<so_embedding>, <so_start>,
+    # <so_end>) sit past the LM's text-logit width and cause vLLM
+    # out-of-bounds writes in bad_words masking — see the games-bandit
+    # vlm_grpo_games.yaml history comment for the full incident.
+    bad_words: ["<image>", "<img>", "</img>"]
+    vllm_cfg:
+      # Full 8-GPU vLLM node.
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true                # skip CUDA-graph capture for the smoke run
+      # Nano-Omni + prefix caching crashes vLLM's mm cache (mm_hash miss).
+      # Belt-and-suspenders: also disabled via mm_processor_cache_gb=0 below.
+      enable_prefix_caching: false
+      # VLMs need the tokenizer initialized (run_multimodal_grpo_nemo_gym.py asserts).
+      skip_tokenizer_init: false
+      # Nano-Omni chat template expects string content, not the OpenAI
+      # {type: text, text: ...} list. Keeps the NeMo-Gym prompt-token prefix
+      # invariant across multi-turn rollouts.
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nemotron_v3
+        # chat_template_content_format: string
+    vllm_kwargs:
+      # Bounds per-prompt image count (multi-turn appends one board / turn).
+      limit_mm_per_prompt: {"image": 8}
+      # Disable vLLM's mm processor cache — the mm-cache desync crash on
+      # Nano-Omni is the load-bearing fix. Must sit in vllm_kwargs, not
+      # vllm_cfg (see vlm_grpo_3B.yaml note).
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 16384
+      # Nano-Omni's mamba backbone needs SSM cache in fp32 (accuracy).
+      mamba_ssm_cache_dtype: "float32"
+    colocated:
+      enabled: false                     # non-colocated: dedicated vLLM node
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+
+data:
+  train:
+    # Sourced from nemo-rl-games-bandit's frozenlake_size4.yaml — the
+    # size=4 (num_holes=3) FrozenLake ablation train manifest.
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/frozenlake_ablations/size_4/train_manifest.jsonl
+  validation:
+    # Paired eval manifest for the size=4 FrozenLake ablation. Note: rows are
+    # `Games/FrozenLake-singleturn-v0` with horizon_cap=1 (single-turn eval),
+    # while train rows are the multi-turn `Games/FrozenLake-v0`.
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/frozenlake_ablations/size_4/eval_manifest.jsonl
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    is_trajectory_collection: false
+    # Replace the base recipe's math/code/etc bundle with gym-v only. Any
+    # env-block overrides inherited from grpo_nanov3.yaml (math_with_judge,
+    # code_gen, workplace_assistant, ...) are ignored by Gym when their
+    # config_paths aren't loaded.
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - environments/gym_v/config.yaml
+    # Agent-side horizon; keep in sync with grpo.max_rollout_turns.
+    # Outer group name matches the manifest's agent_ref.name = "gym_v_agent"
+    # (see 3rdparty/Gym-workspace/Gym/environments/gym_v/config.yaml).
+    gym_v_agent:
+      responses_api_agents:
+        gymv_agent:
+          max_steps: 1
+          done_if_no_boxed_answer: true
+
+logger:
+  log_dir: "logs/grpo-nemotron-omni-30ba3b-gymv-smoke"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: "grpo-nemotron-omni-gymv"
+    name: "grpo-nemotron-omni-30ba3b-gymv-smoke"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

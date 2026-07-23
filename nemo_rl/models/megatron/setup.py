@@ -1348,6 +1348,15 @@ def setup_model_and_optimizer(
                 # Handle VLM models
                 if hasattr(model_module, "thinker"):
                     model_module = model_module.thinker
+                # NemotronVLModel / NemotronOmniModel wrap the GPT under
+                # `.llava_model.language_model`; unwrap that layer first so the
+                # generic `.language_model.decoder.layers` walk below finds the
+                # MoE router.
+                if (
+                    getattr(model_module, "llava_model", None) is not None
+                    and hasattr(model_module.llava_model, "language_model")
+                ):
+                    model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):
                     model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
