@@ -212,7 +212,7 @@ Set the following before each `bash ultra_launch.sh` invocation:
 | Variable | Purpose |
 |---|---|
 | `EXP_NAME` | Job name, W&B run name, and the suffix for output directories. Must be unique per run; same name across resubmissions resumes from the latest checkpoint. |
-| `CONFIG_PATH` | Path to the per-stage YAML config (e.g. `examples/configs/ultra/student_rlvr.yaml`). |
+| `CONFIG_PATH` | Path to the per-stage YAML config (e.g. `examples/configs/ultra/student_rlvr1.yaml`). |
 | `MODEL_PATH` | Initial policy checkpoint (HuggingFace repo id or local path). Student RLVR starts from the Ultra SFT checkpoint; the teacher stages start from the Student RLVR checkpoint; MOPD starts from the student (the Student RLVR checkpoint). |
 | `TRAIN_PATH` | Training data JSONL. |
 | `VAL_PATH` | Validation data JSONL. |

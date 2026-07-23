@@ -36,11 +36,13 @@ cluster:
   segment_size: 16
 
 # =============================================================================
-# SIF image root — required, set by the launcher via SIF_DIR. The SWE agent's
-# container_formatter (in env.nemo_gym.swe_agents_train) resolves
-# `${sif_dir}/<subdir>/{instance_id}.sif` per SWE benchmark family.
+# SIF image root — required at runtime, set by the launcher via SIF_DIR. The SWE
+# agent's container_formatter (in env.nemo_gym.swe_agents_train) resolves
+# `${sif_dir}/<subdir>/{instance_id}.sif` per SWE benchmark family. The value
+# below is a placeholder so the config resolves at load/validation time;
+# ultra_launch.sh hard-requires SIF_DIR and overrides it for real runs.
 # =============================================================================
-sif_dir: ???
+sif_dir: /path/to/sif_images
 
 # =============================================================================
 # Checkpointing
