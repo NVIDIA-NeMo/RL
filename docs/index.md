@@ -41,7 +41,7 @@ Explore the current features and upcoming enhancements in NeMo RL, including dis
 :link: about/tips-and-tricks
 :link-type: doc
 
-Troubleshooting common issues including missing submodules, Ray dashboard access, and debugging techniques.
+Troubleshooting common issues including missing submodules and memory fragmentation.
 :::
 
 ::::
@@ -73,10 +73,10 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
-:link: about/clusters
+:link: cluster
 :link-type: doc
 
-Configure and deploy NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
 ::::
@@ -163,6 +163,20 @@ Extend a model's context window with YaRN RoPE scaling on the Megatron backend f
 Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
 :::
 
+:::{grid-item-card} {octicon}`arrow-both` Weight Refit
+:link: guides/refit
+:link-type: doc
+
+Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
+:::
+
+:::{grid-item-card} {octicon}`sync` Checkpoint-Engine Refit
+:link: guides/checkpoint-engine-refit
+:link-type: doc
+
+Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
+:::
+
 ::::
 
 ## Advanced Topics
@@ -196,7 +210,7 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link-type: doc
 
 Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
-Includes NVFP4 W4A16 real rollout.
+Includes NVFP4 W4A4 and W4A16 real rollout.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -222,9 +236,12 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 ::::
 
+## Full Documentation Index
+
+The complete table of contents below lists all pages, including guide, development, and design-doc pages that are not shown in the cards above.
+
 ```{toctree}
 :caption: About
-:hidden:
 
 about/overview
 about/performance-summary
@@ -243,7 +260,6 @@ about/tips-and-tricks
 
 ```{toctree}
 :caption: Environment Start
-:hidden:
 
 local-workstation.md
 cluster.md
@@ -252,14 +268,12 @@ cluster.md
 
 ```{toctree}
 :caption: E2E Examples
-:hidden:
 
 guides/sft-openmathinstruct2.md
 ```
 
 ```{toctree}
 :caption: Guides
-:hidden:
 
 guides/nemotron-3-nano.md
 guides/nemotron-3-nano-omni.md
@@ -288,6 +302,8 @@ guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
+guides/refit.md
+guides/checkpoint-engine-refit.md
 guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
@@ -296,14 +312,12 @@ guides/ft-launcher-guide.md
 
 ```{toctree}
 :caption: Containers
-:hidden:
 
 docker.md
 ```
 
 ```{toctree}
 :caption: Development
-:hidden:
 
 ci-cd.md
 testing.md
@@ -316,7 +330,6 @@ guides/use-custom-vllm.md
 
 ```{toctree}
 :caption: Design Docs
-:hidden:
 
 design-docs/design-and-philosophy.md
 design-docs/padding.md
@@ -325,6 +338,8 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/sparse-delta-refit.md
+design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
@@ -332,11 +347,11 @@ design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
+design-docs/modelopt-real-quant-architecture.md
 ```
 
 ```{toctree}
 :caption: API Reference
-:hidden:
 
 apidocs/index
 ```

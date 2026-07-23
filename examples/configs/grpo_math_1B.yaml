@@ -163,6 +163,9 @@ policy:
   
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     # Compute next-token logprobs directly from hidden states with a chunked
     # linear cross-entropy fusion, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
@@ -333,8 +336,8 @@ policy:
   generation:
     # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
     # See ray.sub for the full port layout.
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -342,6 +345,17 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    # null = topology default (IPC colocated, NCCL non-colocated).
+    # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
+    refit_transport: null
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        backend_name: UCX
+        backend_init_params: null
+        release_after_refit: false
+        shard_expert_weights: false
     mcore_generation_config:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
@@ -379,6 +393,9 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
+      http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
+      http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
+      zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
@@ -449,6 +466,8 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
@@ -467,8 +486,8 @@ cluster:
   # Port range for the distributed master address (TCPStore / NCCL rendezvous)
   # and per-worker available ports.  Kept below the OS ephemeral range
   # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
-  master_port_range_low: 25000
-  master_port_range_high: 28000
+  master_port_range_low: 1400
+  master_port_range_high: 1999
   segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
 # TransferQueue-mediated data plane for sync GRPO.

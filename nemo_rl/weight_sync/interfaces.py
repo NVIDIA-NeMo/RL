@@ -18,7 +18,8 @@ WeightSynchronizer is a dedicated abstraction that decouples weight transfer
 logic from both PolicyInterface and GenerationInterface. It owns the
 transfer of model weights between training and generation components.
 
-Transport-specific implementations (IPC/ZMQ, HTTP, NCCL collectives) each
+Transport-specific implementations (IPC/ZMQ, HTTP, NCCL collectives, checkpoint
+engines) each
 encapsulate the transfer lifecycle, so algorithm code never branches on
 backend type.
 
@@ -52,8 +53,8 @@ class WeightSynchronizer(ABC):
 
     Colocated transports (IPC, HTTP) own phase transitions internally
     (offload_before_refit, prepare_for_generation, offload_after_refit).
-    The NCCL collective transport is a pure data mover; the orchestrator
-    handles phases externally.
+    Non-colocated collective and checkpoint-engine transports are pure data movers;
+    the orchestrator handles phases externally.
     """
 
     @abstractmethod
@@ -62,7 +63,7 @@ class WeightSynchronizer(ABC):
         *,
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
-    ) -> None:
+    ) -> Optional[dict[str, float]]:
         """Transfer the latest policy weights to the generation backend.
 
         This method encapsulates the full sync lifecycle:
@@ -73,8 +74,8 @@ class WeightSynchronizer(ABC):
         5. Restore both sides to their ready state
 
         Steps 1-2 and 5 (phase transitions) are only performed by colocated
-        transports (IPC, HTTP). The NCCL collective transport skips them since
-        policy and generation run on separate GPUs.
+        transports (IPC, HTTP). Non-colocated collective and checkpoint-engine
+        transports skip them since policy and generation run on separate GPUs.
 
         Step 4 (verification) is performed explicitly by IPC and NCCL
         transports, which check ``update_success`` and raise on failure. The
@@ -84,9 +85,11 @@ class WeightSynchronizer(ABC):
         Args:
             timer: Optional Timer for profiling individual phases.
             kv_scales: Optional KV cache scales for FP8 quantization.
-                **Note**: Only honored by the NCCL collective transport,
-                which forwards them to ``policy.broadcast_weights_for_collective()``.
-                IPC and HTTP transports ignore this parameter.
+                Honored by the IPC/ZMQ and NCCL collective transports. The
+                HTTP transport ignores this parameter.
+
+        Returns:
+            Optional transport-specific scalar metrics for the current sync.
 
         Raises:
             RuntimeError: If the weight transfer fails.

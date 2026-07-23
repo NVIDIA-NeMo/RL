@@ -207,8 +207,8 @@ policy:
   scheduler: null
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -289,8 +289,8 @@ env:
     thinking_tags:
       - "<think>"
       - "</think>"
-    port_range_low: 15001
-    port_range_high: 20000
+    port_range_low: 5000
+    port_range_high: 5999
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
@@ -334,6 +334,7 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

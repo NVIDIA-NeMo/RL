@@ -171,6 +171,8 @@ def mock_components():
             },
             "logger": {
                 "num_val_samples_to_print": 5,
+                "wandb_enabled": False,
+                "wandb": {"log_nemo_gym_full_result_tables": False},
             },
             "cluster": {
                 "num_nodes": 1,
@@ -227,6 +229,43 @@ def test_distillation_train_max_steps(mock_components):
     assert mock_components["student_policy"].train.call_count == 5
 
 
+def test_ft_save_period_triggers_periodic_saves(mock_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_components["master_config"]
+    cfg.distillation["max_num_steps"] = 5
+    cfg.distillation["val_period"] = 0
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    distillation_save_state = _default_distillation_save_state()
+
+    with patch("nemo_rl.algorithms.distillation.torch.save"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            checkpointer,
+            distillation_save_state,
+            cfg,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]
+
+
 def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
     master_config.distillation["max_num_steps"] = 1
@@ -246,7 +285,7 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
 
     with (
         patch(
-            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            "nemo_rl.algorithms.distillation.run_nemo_gym_rollout_sync",
             return_value=mock_rollout_result,
         ) as mock_nemo_gym_rollout,
         patch(
@@ -475,13 +514,12 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
         rollout_metrics={
             "mean_gen_tokens_per_sample": 2.0,
             "score": 0.5,
-            "full_result_debug": {"large_response": True},
         },
     )
 
     with (
         patch(
-            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            "nemo_rl.algorithms.distillation.run_nemo_gym_rollout_sync",
             return_value=mock_rollout_result,
         ) as mock_nemo_gym_rollout,
         patch(
@@ -506,13 +544,13 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert rollout_kwargs["max_seq_len"] is None
     assert rollout_kwargs["max_rollout_turns"] is None
     assert rollout_kwargs["greedy"] is False
+    assert rollout_kwargs["log_full_result_tables"] is False
     mock_async_rollout.assert_not_called()
     mock_rollout.assert_not_called()
     assert val_metrics["accuracy"] == 1.0
     assert val_metrics["avg_length"] == 2.0
     assert val_metrics["mean_gen_tokens_per_sample"] == 2.0
     assert val_metrics["score"] == 0.5
-    assert "full_result_debug" not in val_metrics
     assert isinstance(validation_timings, dict)
 
 
@@ -825,7 +863,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
-def test_distillation_setup_non_colocated_smoke(monkeypatch):
+@pytest.mark.parametrize("refit_transport", [None, "nixl"])
+def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
     """Smoke test: calling setup with a non-colocated config should succeed."""
     from unittest.mock import MagicMock, patch
 
@@ -840,6 +879,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
                     "top_p": 1.0,
                     "top_k": None,
                     "backend": "vllm",
+                    "refit_transport": refit_transport,
+                    "refit_cfg": None,
                     "colocated": {
                         "enabled": False,
                         "resources": {
@@ -901,6 +942,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             return ip_port
 
     class DummyPolicy:
+        collective_calls = []
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -911,11 +954,15 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             return None
 
         def init_collective(self, *args, **kwargs):
+            self.collective_calls.append((args, kwargs))
             return [MagicMock()]
 
     class DummyVllmGeneration:
+        collective_calls = []
+
         def __init__(self, *args, **kwargs):
-            pass
+            self.cfg = kwargs["config"]
+            self.weight_synchronizer = None
 
         def finish_generation(self):
             return None
@@ -924,6 +971,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             return None
 
         def init_collective(self, *args, **kwargs):
+            self.collective_calls.append((args, kwargs))
             return [MagicMock()]
 
     with (
@@ -933,6 +981,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(
+            distil_mod, "create_weight_synchronizer"
+        ) as mock_create_synchronizer,
         patch.object(distil_mod, "get_nemo_gym_uv_cache_dir") as mock_uv_cache_dir,
         patch.object(distil_mod, "get_nemo_gym_venv_dir") as mock_uv_venv_dir,
         patch.object(distil_mod, "ray") as mock_ray,
@@ -949,6 +1000,15 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         assert result[3] is None
         mock_uv_cache_dir.assert_not_called()
         mock_uv_venv_dir.assert_not_called()
+        if refit_transport == "nixl":
+            mock_create_synchronizer.assert_called_once()
+            mock_create_synchronizer.return_value.init_communicator.assert_called_once()
+            assert not DummyPolicy.collective_calls
+            assert not DummyVllmGeneration.collective_calls
+        else:
+            mock_create_synchronizer.assert_not_called()
+            assert DummyPolicy.collective_calls
+            assert DummyVllmGeneration.collective_calls
 
 
 @pytest.mark.parametrize(

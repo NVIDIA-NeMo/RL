@@ -83,7 +83,8 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                 buffer_size_bytes = self._compute_buffer_size()
 
                 futures_train = self._policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
+                    buffer_size_bytes=buffer_size_bytes,
+                    kv_scales=kv_scales,
                 )
                 futures_inference = self._generation.update_weights_via_ipc_zmq()
 

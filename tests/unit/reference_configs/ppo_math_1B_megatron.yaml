@@ -126,6 +126,9 @@ policy:
 
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"
@@ -294,6 +297,9 @@ value:
 
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 1
@@ -408,6 +414,7 @@ logger:
   wandb:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"

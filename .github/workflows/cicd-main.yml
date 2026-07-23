@@ -359,8 +359,11 @@ jobs:
       build-contexts: |
         nemo-rl=.
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
+      trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
+      trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       build-args: |
         MAX_JOBS=4
+        TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
   build-container-gb200:
@@ -374,6 +377,7 @@ jobs:
         needs.pre-flight.outputs.test_level != 'none' &&
         needs.pre-flight.outputs.image_tag == '' &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
+        vars.DISABLE_GB200_TESTS != 'true' &&
         contains('L1 L2', needs.pre-flight.outputs.test_level) &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -397,8 +401,11 @@ jobs:
       build-contexts: |
         nemo-rl=.
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
+      trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
+      trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       build-args: |
         MAX_JOBS=4
+        TRTLLM_BUILD_JOBS=8
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
   update-uv-cache:
@@ -521,6 +528,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Sglang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L0_Unit_Tests_Trtllm
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Mcore
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Mcore_Policy_1
@@ -581,6 +590,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: main
+        # Lfast reuses the main image. Until TRT-LLM lands on main, running this
+        # shard would make prefetch_venvs compile the cp313 wheel from source.
+        if: ${{ needs.pre-flight.outputs.test_level != 'Lfast' || matrix.script != 'L0_Unit_Tests_Trtllm' }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -705,6 +717,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SGLang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Trtllm
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_GRPO_1
@@ -801,6 +815,7 @@ jobs:
         always() &&
         contains('L1 L2', needs.pre-flight.outputs.test_level) &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
+        vars.DISABLE_GB200_TESTS != 'true' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         (
@@ -952,6 +967,7 @@ jobs:
                     ) &&
                     (
                       needs.org-member-pre-flight.outputs.is_member != 'true' ||
+                      vars.DISABLE_GB200_TESTS == 'true' ||
                       !contains('L1 L2', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-functional-tests-gb200.result == 'success'
                     ) &&

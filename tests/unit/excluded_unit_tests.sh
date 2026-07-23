@@ -209,10 +209,18 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/models/dtensor/test_parallelize.py::test_parallelize_plan_keys
 
     ###########################################################################
-    # EXPERIENCE — rollout tests all require vLLM setup (~67-91s setup each)
+    # EXPERIENCE — rollout tests need vLLM setup (~67-91s each).
+    # Keep pure Python tests, plus the 3 matches_original tests that guard correctness.
     ###########################################################################
 
-    --ignore=unit/experience/test_rollouts.py
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_multi_step_calculator_vllm_sync
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_multi_step_calculator_vllm_async
+    --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_sync
+    --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_async
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_sliding_puzzle_vllm
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager_truncation
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_nemo_gym_rollout_manager
 
     ###########################################################################
     # ENVIRONMENTS

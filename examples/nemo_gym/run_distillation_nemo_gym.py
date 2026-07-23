@@ -160,7 +160,7 @@ The validation set you pass in will directly be used for validation with no addi
         raise ValueError("NeMo-Gym distillation setup did not initialize Nemo-Gym")
 
     # Bind task_to_env and val_task_to_env for nemo_gym env
-    # Hardcode here to match `run_async_nemo_gym_rollout`
+    # NeMo-Gym is the only environment used by this runner.
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 

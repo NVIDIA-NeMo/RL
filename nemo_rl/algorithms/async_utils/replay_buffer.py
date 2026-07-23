@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import statistics
 import threading as _threading
+import uuid
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -40,6 +47,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+    @staticmethod
+    def _rollout_metrics_turn_count_for_diagnostics(
+        rm: dict[str, Any],
+    ) -> Optional[float]:
+        """One scalar turn-depth per buffered trajectory for starvation diagnostics.
+
+        Supports sync multi-turn rollouts (`max_turns_per_sample` / `avg_turns_per_sample`)
+        and NeMo Gym (`turns_per_sample/max` / `turns_per_sample/mean`).
+        """
+        if "max_turns_per_sample" in rm:
+            return float(rm["max_turns_per_sample"])
+        if "avg_turns_per_sample" in rm:
+            return float(rm["avg_turns_per_sample"])
+        if "turns_per_sample/max" in rm:
+            return float(rm["turns_per_sample/max"])
+        if "turns_per_sample/mean" in rm:
+            return float(rm["turns_per_sample/mean"])
+        return None
 
     def add(
         self,
@@ -71,12 +97,70 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
-        return {
+        info: dict[str, Any] = {
             "total_trajectories": len(self.trajectories),
             "trajectory_versions": self.trajectory_versions,
             "target_weight_versions": self.target_weight_versions,
             "max_size": self.max_size,
         }
+        if self.trajectories:
+            durations = []
+            max_gen_tokens_per_turn_list = []
+            turn_counts_list = []
+            for t in self.trajectories:
+                rm = t.get("rollout_metrics", {})
+                if "trajectory_duration_s" in rm:
+                    durations.append(rm["trajectory_duration_s"])
+                if "max_gen_tokens_per_turn/max" in rm:
+                    max_gen_tokens_per_turn_list.append(
+                        rm["max_gen_tokens_per_turn/max"]
+                    )
+                elif "max_gen_tokens_per_turn" in rm:
+                    max_gen_tokens_per_turn_list.append(rm["max_gen_tokens_per_turn"])
+                tc = self._rollout_metrics_turn_count_for_diagnostics(rm)
+                if tc is not None:
+                    turn_counts_list.append(tc)
+
+            def _pct(values: list[float], p: float) -> float:
+                if not values:
+                    return 0.0
+                sorted_v = sorted(values)
+                idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+                return float(sorted_v[idx])
+
+            info["starvation_diagnostics"] = {
+                "trajectory_duration_s": {
+                    "mean": sum(durations) / len(durations) if durations else 0,
+                    "median": statistics.median(durations) if durations else 0,
+                    "max": max(durations) if durations else 0,
+                    "p95": _pct(durations, 95),
+                },
+                "max_gen_tokens_per_turn_in_buffer": {
+                    "mean": sum(max_gen_tokens_per_turn_list)
+                    / len(max_gen_tokens_per_turn_list)
+                    if max_gen_tokens_per_turn_list
+                    else 0,
+                    "median": statistics.median(max_gen_tokens_per_turn_list)
+                    if max_gen_tokens_per_turn_list
+                    else 0,
+                    "max": max(max_gen_tokens_per_turn_list)
+                    if max_gen_tokens_per_turn_list
+                    else 0,
+                    "p95": _pct(max_gen_tokens_per_turn_list, 95),
+                },
+                "turns_per_sample_in_buffer": {
+                    "mean": sum(turn_counts_list) / len(turn_counts_list)
+                    if turn_counts_list
+                    else 0,
+                    "median": statistics.median(turn_counts_list)
+                    if turn_counts_list
+                    else 0,
+                    "max": max(turn_counts_list) if turn_counts_list else 0,
+                    "p95": _pct(turn_counts_list, 95),
+                },
+                "num_trajectories_sampled": len(self.trajectories),
+            }
+        return info
 
     def get_last_target_weight_already_generated(self) -> int:
         with self._lock:
@@ -551,93 +635,208 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
-# WIP: DO NOT USE - This class is WIP and may be changed without notice, please DO NOT USE it.
-# Will be replaced by TQReplayBuffer once TQ is ready.
-@ray.remote  # pragma: no cover
-class ReplayBufferNew(ReplayBufferImpl):
-    """Staleness-window replay buffer.
+class TQReplayBuffer:
+    """Meta cache + TQ writer with reserve-then-commit slot semantics.
 
-    -- WIP: DO NOT USE --
-    This class is WIP and may be changed without notice, please DO NOT USE it.
-
-    Differences from ReplayBuffer:
-    - _evict(): Stale rows (trainer_version - weight_version > max_staleness) are evicted
-      at the start of every sample() call.
-    - sample(): selects trajectories in freshest-first order (default) or FIFO order,
-      controlled by the sample_freshest_first flag, from whatever remains in the buffer
-      after eviction.
-
-    TODO: remove when cleaning up
-    - max_age_steps won't be used in ReplayBufferNew;
-    - self.target_weight_versions won't be used in ReplayBufferNew and will be removed
-      when cleaning up. target_weight_versions gates generation on specific trainer steps,
-      which causes generation pauses; ReplayBufferNew intentionally avoids this.
-    - add this class to nemo_rl/algorithms/async_utils/__init__.py
+    meta_list, weight_list, ready_list, _group_ids are parallel; a slot stays
+    ready=False until commit fills it.
     """
 
     def __init__(
-        self, max_size: int, max_staleness: int, sample_freshest_first: bool = True
-    ):
-        super().__init__(max_size)
-        if max_staleness < 0:
-            raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
-        self.max_staleness = max_staleness
-        # will move to StalenessSampler when we implement it
-        self.sample_freshest_first = sample_freshest_first
-
-    def _evict(self, current_weight_version: int) -> None:
-        """Evict rows where trainer_version - weight_version > max_staleness.
-
-        Must be called with self._lock held.
-        """
-        min_valid = current_weight_version - self.max_staleness
-        stale = [i for i, v in enumerate(self.trajectory_versions) if v < min_valid]
-        self._remove_indices(stale)
-
-    def sample(
         self,
-        num_prompt_groups: int,
-        current_weight_version: int,
-        max_age_steps: int,
-    ) -> Optional[dict[str, Any]]:
-        """Sample num_prompt_groups trajectories, freshest-first.
+        dp_client: Any,
+        partition_id: str,
+        *,
+        pad_value_dict: Mapping[str, int],
+    ):
+        self._dp_client = dp_client
+        self._partition_id = partition_id
+        self._pad_value_dict = dict(pad_value_dict)
+        self.meta_list: list[Optional[KVBatchMeta]] = []
+        self.start_weight_list: list[int] = []
+        self.end_weight_list: list[int] = []
+        # Per-slot target training step (set when force_in_order=True, else None).
+        self.target_step_list: list[Optional[int]] = []
+        self.ready_list: list[bool] = []
+        self._group_ids: list[str] = []
 
-        Will evict stale rows before sampling, so we will get [current_weight_version - self.max_staleness, current_weight_version] valid trajectories.
+    def reserve(
+        self,
+        *,
+        weight_version: int,
+        target_step: Optional[int] = None,
+        group_id: Optional[str] = None,
+    ) -> str:
+        """Append an unready slot tagged with weight_version.
+
+        Args:
+            weight_version: Weight version stamped on the slot.
+            target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
+            group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None.
+            group_id used by the matching commit.
         """
-        with self._lock:
-            self._evict(current_weight_version)
+        if group_id is None:
+            group_id = str(uuid.uuid4())
+        self.meta_list.append(None)
+        self.start_weight_list.append(weight_version)
+        self.end_weight_list.append(-1)
+        self.target_step_list.append(target_step)
+        self.ready_list.append(False)
+        self._group_ids.append(group_id)
+        return group_id
 
-            if not self.trajectories:
-                return None
+    async def commit(
+        self,
+        group_id: str,
+        record: PromptGroupRecord,
+        start_weight_version: int,
+        end_weight_version: int,
+    ) -> KVBatchMeta:
+        """Tensorize record, write N rows to TQ, and mark the slot ready.
 
-            all_indices = range(len(self.trajectory_versions))
-            if self.sample_freshest_first:
-                all_indices = sorted(
-                    all_indices,
-                    key=lambda i: self.trajectory_versions[i],
-                    reverse=True,
-                )
+        Args:
+            group_id: group_id returned by the matching reserve call.
+            record: PromptGroupRecord to tensorize.
+            start_weight_version: Weight version stamped on the slot before rollout.
+                The same as the one from reserve, passed again to avoid race condition when lookup.
+            end_weight_version: Weight version stamped on the slot after rollout.
 
-            if len(all_indices) < num_prompt_groups:
-                print(
-                    f"Insufficient trajectories: have {len(all_indices)}, "
-                    f"need {num_prompt_groups}. Waiting."
-                )
-                return None
+        Returns:
+            KVBatchMeta for the committed group.
 
-            selected = all_indices[:num_prompt_groups]
-            sampled_weights = [self.trajectory_versions[i] for i in selected]
-            avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
-                sampled_weights
+        Raises:
+            ValueError: group_id has no live slot (removed or never reserved).
+        """
+        # Precondition: reserve() must have registered this group_id. Raise
+        # before any side effects so a stray commit doesn't leak orphan DP rows.
+        if group_id not in self._group_ids:
+            raise ValueError(
+                f"commit called with unknown group_id={group_id!r}; "
+                f"reserve() must precede commit() (or the slot was already removed)"
+            )
+        train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
+        sample_ids, fields, tags = pack_payload(
+            train_batch, weight_version=start_weight_version, group_id=group_id
+        )
+        try:
+            await self._call_dp(
+                "put_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+                fields=fields,
+                tags=tags,
             )
 
-            sampled_items = [self.trajectories[i] for i in selected]
-            self._remove_indices(selected)
+            # mirrors kv_first_write
+            lengths = train_batch["input_lengths"]
+            meta = KVBatchMeta(
+                partition_id=self._partition_id,
+                task_name="train",
+                sample_ids=list(sample_ids),
+                fields=list(fields.keys()),
+                sequence_lengths=[int(s) for s in lengths.tolist()],
+                tags=[dict(t) for t in tags],
+            )
 
-            return {
-                "trajectories": sampled_items,
-                "avg_trajectory_age": avg_trajectory_age,
-            }
+            idx = self._group_ids.index(group_id)
+            self.meta_list[idx] = meta
+            self.end_weight_list[idx] = end_weight_version
+            self.ready_list[idx] = True
+            return meta
+        except BaseException as commit_error:
+            # put_samples may have written rows before raising. Roll back by the
+            # deterministic IDs known here; the caller removes the reserved slot.
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=list(sample_ids),
+                    partition_id=self._partition_id,
+                )
+            except BaseException as rollback_error:
+                if isinstance(commit_error, asyncio.CancelledError):
+                    raise commit_error from rollback_error
+                raise BaseExceptionGroup(
+                    f"commit and rollback both failed for group_id={group_id!r}",
+                    [commit_error, rollback_error],
+                )
+            raise
+
+    async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
+        """Remove the live slot identified by ``group_id``.
+
+        Args:
+            group_id: Group identifier returned by :meth:`reserve`.
+            remove_in_dp: Whether to clear rows referenced by a committed slot.
+
+        Returns:
+            Number of removed slots (always one on success).
+
+        Raises:
+            ValueError: ``group_id`` has no live slot.
+        """
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError as error:
+            raise ValueError(f"unknown group_id={group_id!r}") from error
+        return await self.remove([idx], remove_in_dp=remove_in_dp)
+
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        """Drop entries at the given indices and optionally clear them from DataPlane.
+
+        Args:
+            idxs: Entry indices to drop. Must be within [0, size).
+            remove_in_dp: If True, also clear the dropped rows from DataPlane.
+
+        Returns:
+            Number of group entries removed from the buffer.
+        """
+        if len(idxs) == 0:
+            return 0
+
+        drop_idxs = sorted(idxs, reverse=True)
+        if drop_idxs[0] >= len(self.meta_list):
+            raise IndexError(
+                f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
+                f"size={len(self.meta_list)}"
+            )
+
+        dropped_sample_ids: list[str] = []
+        for i in drop_idxs:
+            meta = self.meta_list[i]
+            if meta is not None:
+                dropped_sample_ids.extend(meta.sample_ids)
+            del self.meta_list[i]
+            del self.start_weight_list[i]
+            del self.end_weight_list[i]
+            del self.target_step_list[i]
+            del self.ready_list[i]
+            del self._group_ids[i]
+
+        if remove_in_dp:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=dropped_sample_ids,
+                partition_id=self._partition_id,
+            )
+
+        return len(drop_idxs)
+
+    def size(self) -> int:
+        """Return the number of prompt-group entries currently held."""
+        return len(self.meta_list)
+
+    def __len__(self) -> int:
+        return len(self.meta_list)
+
+    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
+        """Call a DataPlaneClient method, awaiting Ray remotes if needed."""
+        method = getattr(self._dp_client, method_name)
+        remote = getattr(method, "remote", None)
+        if remote is not None:
+            return await remote(**kwargs)
+        result = method(**kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result

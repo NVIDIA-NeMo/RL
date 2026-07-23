@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import subprocess
+import sys
+from collections import Counter
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -29,6 +33,15 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
+# Kept local (not imported from models.generation) so the gym actor stays free of
+# generation-module imports. Must cover every name resolve_routed_experts_dtype
+# can produce.
+_ROUTED_EXPERTS_DTYPES = {
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+}
+
 DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "<tool_call>",
     "</tool_call>",
@@ -36,6 +49,15 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _has_nan_generation_logprobs(result: dict) -> bool:
+    """Return whether a postprocessed rollout contains NaN policy logprobs."""
+    return any(
+        message.get("generation_logprobs") is not None
+        and torch.isnan(message["generation_logprobs"]).any()
+        for message in result["message_log"]
+    )
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -67,7 +89,7 @@ class NemoGymConfig(TypedDict):
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
     # Port range for Gym HTTP servers (head server + subprocess servers).
-    # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (15001-20000) from
+    # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
@@ -80,6 +102,9 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    routed_experts_dtype: NotRequired[
+        str
+    ]  # Carry dtype name for routed_experts tensors ("int8"/"int16"/"int32"), resolved from the model's expert count
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -227,14 +252,6 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
-        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
-            "rollout_max_attempts_to_avoid_lp_nan", 1
-        )
-
-        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
-            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
-        )
-
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -257,64 +274,69 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> list[dict]:
+    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+        """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        if not nemo_gym_examples:
+            raise ValueError("NeMo-Gym rollout batch must not be empty")
+
         timer = Timer()
+        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
-        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
-        while trial < max_attempts:
-            nemo_gym_num_rows = len(nemo_gym_examples)
-            nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
-            )
-
-            nemo_rl_rowidxs = []
-            nemo_rl_results = []
-            for task in nemo_gym_result_iterator:
-                with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
-
-                with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
-
-                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-                nemo_rl_results.append(nemo_rl_result)
-
-            # determine if generation_logprobs contain NaN; if not, break;
-            logprob_contains_nan = False
-            for nemo_rl_result in nemo_rl_results:
-                for message in nemo_rl_result["message_log"]:
-                    if (
-                        "generation_logprobs" in message
-                        and message["generation_logprobs"] is not None
-                    ):
-                        if torch.isnan(message["generation_logprobs"]).any():
-                            logprob_contains_nan = True
-                            break
-            if logprob_contains_nan:
-                trial += 1
-                print(
-                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
-                )
-                continue
-            else:
-                break
-
-        nemo_rl_sort_results = [None] * nemo_gym_num_rows
-        for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
-            nemo_rl_sort_results[rowidx] = result
-        nemo_rl_results = nemo_rl_sort_results
-
-        timer.stop("_run_rollouts_total")
-        timing_metrics = timer.get_timing_metrics("sum")
-        total_time = timing_metrics.pop("_run_rollouts_total")
-        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+        nemo_gym_result_iterator = self.rch.run_examples(
+            examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
 
-        return nemo_rl_results, timing_metrics
+        num_results = 0
+        for task in nemo_gym_result_iterator:
+            with timer.time(label=f"{timer_prefix}/await_results"):
+                try:
+                    nemo_gym_row, nemo_gym_result = await task
+                except Exception as error:
+                    if hasattr(error, "response_content"):
+                        print(
+                            "EXCEPTION RESULT",
+                            error.response_content,
+                            file=sys.stderr,
+                        )
+                    raise
+
+            with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                    nemo_gym_result, tokenizer
+                )
+                if _has_nan_generation_logprobs(nemo_rl_result):
+                    raise RuntimeError("Generation logprobs contain NaN")
+
+            num_results += 1
+            timing_metrics = None
+            if num_results == len(nemo_gym_examples):
+                timer.stop("_run_rollouts_total")
+                timing_metrics = timer.get_timing_metrics("sum")
+                total_time = timing_metrics.pop("_run_rollouts_total")
+                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                    100
+                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                    / total_time
+                )
+
+            agent_name = nemo_gym_row["agent_ref"]["name"]
+            counts_left[agent_name] -= 1
+            if counts_left[agent_name] <= 0:
+                counts_left.pop(agent_name)
+            if num_results % 10 == 0 and counts_left:
+                top_left = counts_left.most_common(5)
+                top_left_str = "\n".join(
+                    f"{index + 1}. {name}: {count}"
+                    for index, (name, count) in enumerate(top_left)
+                )
+                print(
+                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                    f"{top_left_str}",
+                    file=sys.stderr,
+                )
+
+            yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
@@ -351,7 +373,12 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
             routed_experts = None
             if routed_experts_raw is not None:
-                routed_experts = torch.as_tensor(routed_experts_raw, dtype=torch.int32)
+                routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
+                    self.cfg.get("routed_experts_dtype", "int16")
+                ]
+                routed_experts = torch.as_tensor(
+                    routed_experts_raw, dtype=routed_experts_dtype
+                )
                 if routed_experts.dim() != 3:
                     raise ValueError(
                         "NeMo Gym returned routed_experts with invalid shape. "
@@ -439,16 +466,28 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
-            )
+            try:
+                prompt_token_ids = tokenizer.apply_chat_template(
+                    input_messages, tokenize=True
+                )
+                prompt_len_str = f"{len(prompt_token_ids)} tokens"
+            except Exception as e:
+                prompt_len_str = (
+                    f"<unknown — apply_chat_template failed: {type(e).__name__}: {e}>"
+                )
+            output_item_types = [
+                o.get("type") for o in nemo_gym_result["response"]["output"]
+            ]
             raise ValueError(
                 f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated; "
+                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
+                f"  Prompt length: {prompt_len_str}.\n"
+                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                f"above the prompt length above.\n"
+                f"  → If (2): inspect why no assistant content was produced for this rollout."
             )
 
         return {
@@ -467,6 +506,76 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
     def global_post_process_and_metrics(self, batch):
         # Similar to the step function, this is not used.
         raise NotImplementedError
+
+
+def extract_reward_components(nemo_gym_result: dict) -> Dict[str, float] | None:
+    """Return per-component rewards from a NeMo Gym verify result, or None.
+
+    Single-reward NeMo Gym environments return only a scalar ``reward``. Multi-reward
+    environments additionally return ``reward_components``: a mapping of
+    component-name -> score. These are surfaced as ``reward/<name>`` batch keys and
+    consumed by GDPO (see ``nemo_rl.algorithms.advantage_estimator.GDPOAdvantageEstimator``).
+
+    Returns ``None`` when the environment is single-reward (no ``reward_components``),
+    so callers fall back to the scalar ``reward`` path unchanged.
+    """
+    components = nemo_gym_result.get("reward_components")
+    if not components:
+        return None
+    return {str(name): float(score) for name, score in components.items()}
+
+
+def build_reward_component_columns(
+    component_dicts: List[Dict[str, float] | None],
+) -> Dict[str, torch.Tensor]:
+    """Build ``reward/<name>`` batch columns from per-sample reward-component dicts.
+
+    Takes the union of component names across the batch in sorted (deterministic) order
+    and, for each, emits a ``reward/<name>`` tensor with one entry per sample. A
+    component absent on a given sample is filled with ``0.0`` so every column covers all
+    samples (the per-prompt baseline requires each component present for all responses).
+
+    Keys are prefixed ``reward/`` so they are exactly what
+    ``nemo_rl.algorithms.utils.get_gdpo_reward_component_keys`` selects (it matches
+    ``startswith("reward/")`` and sorts by name); the name carries the component identity,
+    so no positional index is needed. Returns an empty dict when no sample has components.
+    """
+    component_names = sorted(
+        {name for c in component_dicts if c is not None for name in c}
+    )
+    return {
+        f"reward/{name}": torch.tensor(
+            [c[name] if c is not None and name in c else 0.0 for c in component_dicts]
+        )
+        for name in component_names
+    }
+
+
+def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> None:
+    """Assert each multi-reward result sets ``reward == sum(reward_components)``.
+
+    A multi-reward verifier must set the scalar ``reward`` to the sum of its
+    ``reward_components`` so single-reward (GRPO) consumers and GDPO read the same
+    aggregate. We keep the verifier's scalar ``reward`` as ``total_reward`` rather than
+    silently overwriting it with the component sum, so a verifier that violates this
+    contract must be surfaced here instead of masked.
+
+    Raises ``ValueError`` on the first violating result. A no-op for single-reward
+    results (those without ``reward_components``).
+    """
+    for idx, result in enumerate(nemo_gym_results):
+        components = extract_reward_components(result)
+        if components is None:
+            continue
+        scalar_reward = float(result["reward"])
+        component_sum = sum(components.values())
+        if not math.isclose(scalar_reward, component_sum, rel_tol=1e-5, abs_tol=1e-6):
+            raise ValueError(
+                f"NeMo Gym verify result {idx} has reward={scalar_reward} but its "
+                f"reward_components sum to {component_sum} ({components}). A multi-reward "
+                "verifier must set reward = sum(reward_components.values()) so single-reward "
+                "(GRPO) consumers and GDPO read the same aggregate."
+            )
 
 
 ########################################

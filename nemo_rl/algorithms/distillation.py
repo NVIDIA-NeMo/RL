@@ -26,7 +26,6 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import (
-    _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
     aggregate_rollout_metrics,
@@ -62,13 +61,17 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -77,10 +80,15 @@ from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
     print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -217,6 +225,18 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    checkpoint_engine_config = None
+    if generation_config["backend"] == "vllm":
+        vllm_config = cast(VllmConfig, generation_config)
+        normalize_vllm_refit_config(vllm_config)
+        refit_transport = vllm_config.get("refit_transport")
+        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError(
+                "Remote sparse refit is currently supported only by GRPO; "
+                "distillation support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
+        checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
@@ -586,12 +606,23 @@ def setup(
         init_reference_model=False,
     )
 
-    if student_generation is not None:
+    if checkpoint_engine_config is not None:
+        assert isinstance(student_generation, VllmGeneration)
+        student_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=student_policy,
+            generation=student_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        student_generation.weight_synchronizer.init_communicator()
+    elif student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and checkpoint_engine_config is None:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()
@@ -714,6 +745,8 @@ def distillation_train(
     # Run distillation training (multi-epoch until reaching max_num_steps or max_num_epochs)
     batch: BatchedDataDict[DatumSpec]
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
             f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
@@ -762,13 +795,17 @@ def distillation_train(
                     # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if use_nemo_gym:
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=student_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                wandb_enabled=master_config.logger["wandb_enabled"],
+                                wandb_config=master_config.logger["wandb"],
+                            ),
                             max_rollout_turns=None,
                             greedy=False,
                         )
@@ -776,12 +813,6 @@ def distillation_train(
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
-                        # NeMo Gym responses can be very large and expensive to log.
-                        # Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
                     # Use async rollouts if vLLM async engine is enabled
                     elif _should_use_async_rollouts(master_config):
                         (
@@ -951,6 +982,10 @@ def distillation_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
@@ -1026,7 +1061,10 @@ def distillation_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=student_policy.finalize_async_save,
+                        )
 
             # Logging
             # Log training data
@@ -1101,9 +1139,11 @@ def distillation_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_steps:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -1113,6 +1153,13 @@ def distillation_train(
         # End of epoch
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_epochs falls through the while loop and bypasses the
+    # inline shutdown() calls at the max_steps / timeout early returns, so
+    # without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(
@@ -1160,22 +1207,22 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
             if use_nemo_gym:
                 generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger["wandb_enabled"],
+                        wandb_config=master_config.logger["wandb"],
+                    ),
                     max_rollout_turns=None,
                     greedy=False,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                if not _should_log_nemo_gym_responses(master_config):
-                    for key in list(gen_metrics):
-                        if "full_result" in key:
-                            gen_metrics.pop(key)
                 for key, value in gen_metrics.items():
                     validation_rollout_metrics.setdefault(key, []).append(value)
             # Use async rollouts if vLLM async engine is enabled

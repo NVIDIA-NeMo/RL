@@ -57,6 +57,7 @@ def _mock_policy(**overrides):
 
 def _mock_generation(**overrides):
     gen = MagicMock()
+    gen.cfg = {}
     gen.prepare_for_generation.return_value = True
     gen.finish_generation.return_value = True
     gen.prepare_refit_info.return_value = None
@@ -117,6 +118,19 @@ class TestIPCWeightSynchronizer:
         gen.update_weights_via_ipc_zmq.assert_called_once()
         policy.offload_after_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_passes_kv_scales(self, mock_ray: MagicMock) -> None:
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = IPCWeightSynchronizer(policy, gen)
+        kv_scales = {"layer.0": 0.5}
+
+        sync.sync_weights(kv_scales=kv_scales)
+
+        call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
+        assert call_kwargs.kwargs["kv_scales"] == kv_scales
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
@@ -222,6 +236,17 @@ class TestIPCWeightSynchronizer:
 
 
 class TestHTTPWeightSynchronizer:
+    def test_sync_weights_rejects_kv_scales(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = HTTPWeightSynchronizer(policy, gen)
+
+        with pytest.raises(AssertionError, match="does not support"):
+            sync.sync_weights(kv_scales={"layer.0": 0.5})
+
+        policy.offload_before_refit.assert_not_called()
+        gen.prepare_for_generation.assert_not_called()
+
     @patch("nemo_rl.weight_sync.http_weight_synchronizer.ray")
     def test_sync_weights_calls_full_lifecycle(self, mock_ray):
         mock_ray.get.return_value = [True]
