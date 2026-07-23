@@ -2864,6 +2864,7 @@ def refit_sglang_colocated(
     from nemo_rl.models.policy.utils import (
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
+        invalidate_sglang_kv_cache_for_refit,
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
@@ -2893,8 +2894,8 @@ def refit_sglang_colocated(
     # still-valid in-place state.
     pause_mode = policy_generation.pause_generation_mode
     policy_generation.pause_generation(mode=pause_mode)
-    policy_generation.invalidate_kv_cache()
     try:
+        invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
         # Per-worker actor method is now synchronous (per-chunk ray.get +
         # lifetime-safe IPC handled inside send_hf_buckets_via_ipc_actor_impl),
         # but the policy-group dispatch still returns one Ray future per
@@ -2927,6 +2928,7 @@ def refit_sglang_distributed(
     from nemo_rl.models.policy.utils import (
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
+        invalidate_sglang_kv_cache_for_refit,
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
@@ -2956,9 +2958,8 @@ def refit_sglang_distributed(
     # still-valid in-place state.
     pause_mode = policy_generation.pause_generation_mode
     policy_generation.pause_generation(mode=pause_mode)
-    if pause_mode != "in_place":
-        policy_generation.invalidate_kv_cache()
     try:
+        invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
         futures = policy.update_weights_to_sglang_distributed(
             rollout_engines=rollout_engines,
             rollout_engine_lock=rollout_engine_lock,

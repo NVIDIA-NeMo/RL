@@ -956,6 +956,24 @@ def get_sglang_quantization_cfg(policy_generation: Any) -> dict:
     return dict(policy_generation.sglang_cfg["sglang_cfg"].get("quantization") or {})
 
 
+def invalidate_sglang_kv_cache_for_refit(
+    policy_generation: Any, pause_mode: str
+) -> None:
+    """Invalidate generation state before refit, or fail without streaming.
+
+    ``in_place`` intentionally preserves the paused engine's KV cache. Every
+    other pause mode must report successful invalidation before a weight update
+    can begin; continuing after a failed flush could serve cached activations
+    computed with stale weights.
+    """
+    if pause_mode == "in_place":
+        return
+    if not policy_generation.invalidate_kv_cache():
+        raise RuntimeError(
+            "SGLang KV-cache invalidation failed before refit; no weights were sent."
+        )
+
+
 def fetch_updatable_engines_with_recover(policy_generation: Any) -> tuple:
     """Run the design-mandated weight-update prelude.
 
