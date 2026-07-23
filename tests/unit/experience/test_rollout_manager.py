@@ -745,6 +745,8 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,
+        num_generations=num_generations,
+        log_full_result_tables=False,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         max_rollout_turns=None,
     )
