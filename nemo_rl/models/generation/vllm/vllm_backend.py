@@ -656,6 +656,16 @@ class VllmInternalWorkerExtension:
                         self._load_weights(weights)
                     except Exception as error:
                         batch_error = error
+                        # The manifest only keeps the exception message; log
+                        # the full traceback and the batch contents so loader
+                        # failures stay diagnosable from worker logs.
+                        batch_desc = ", ".join(
+                            f"{k}: {tuple(w.shape)} {w.dtype}"
+                            for k, w in (weights or [])[:40]
+                        )
+                        logger.exception(
+                            "IPC weight batch load failed (batch: %s)", batch_desc
+                        )
                     finally:
                         # Synchronize before releasing or ACKing an IPC allocation,
                         # including when a loader failed after scheduling CUDA work.
