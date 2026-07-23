@@ -34,6 +34,9 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.sglang import (
+    sglang_generation as sglang_generation_module,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
 from .helpers import (
@@ -226,6 +229,40 @@ def _make_minimal_sglang_gen_for_clamp_test(
     ] = 1
     sglang_gen._async_loop = _ImmediateAsyncLoop()
     return sglang_gen
+
+
+def test_pickle_hooks_drop_and_rebuild_driver_runtime_state(monkeypatch):
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation.sglang_cfg = _make_sglang_generation_cfg()
+    generation._http_client = object()
+    generation._async_loop = object()
+    generation._health_monitor = object()
+
+    state = generation.__getstate__()
+
+    assert state["_http_client"] is None
+    assert state["_async_loop"] is None
+    assert state["_health_monitor"] is None
+
+    rebuilt_loop = object()
+    rebuilt_client = object()
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "AsyncLoopThread",
+        lambda: rebuilt_loop,
+    )
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "HttpClient",
+        lambda config: rebuilt_client,
+    )
+
+    restored = SGLangGeneration.__new__(SGLangGeneration)
+    restored.__setstate__(state)
+
+    assert restored._async_loop is rebuilt_loop
+    assert restored._http_client is rebuilt_client
+    assert restored._health_monitor is None
 
 
 # ===================================================================

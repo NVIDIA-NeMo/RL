@@ -174,19 +174,19 @@ class SGLangGeneration(GenerationInterface):
 
     # --- pickling support -------------------------------------------------
     # Async GRPO ships this handle into the trajectory-collector Ray actor.
-    # ``_http_client`` (aiohttp) and ``_async_loop`` (a live thread + asyncio
+    # ``_http_client`` (httpx) and ``_async_loop`` (a live thread + asyncio
     # loop) hold contextvars/threads and cannot pickle; ``_health_monitor``
     # owns engine-liveness threads that belong to the driver only. Drop all
     # three and rebuild the client/loop lazily after unpickle (the collector
     # never runs health monitoring, so ``_health_monitor`` stays ``None``).
-    def __getstate__(self):
+    def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_http_client"] = None
         state["_async_loop"] = None
         state["_health_monitor"] = None
         return state
 
-    def __setstate__(self, state):
+    def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         if self.__dict__.get("_async_loop") is None:
             self._async_loop = AsyncLoopThread()
