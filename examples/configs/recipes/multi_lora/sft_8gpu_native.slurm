@@ -54,8 +54,9 @@ rm -rf /opt/nemo-rl/nemo_rl/models/multi_lora
 cp -r ${NATIVE_DIR}/nemo_rl/models/multi_lora /opt/nemo-rl/nemo_rl/models/multi_lora
 cp -f ${NATIVE_DIR}/examples/run_sft_multi_lora.py /opt/nemo-rl/examples/run_sft_multi_lora.py
 cp -f ${NATIVE_DIR}/patches/automodel/nemo_automodel_components__peft_lora.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/_peft/lora.py
-cp -f ${HOST_AUTOMODEL_DIR}/nemo_automodel/components/distributed/parallelizer.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/parallelizer.py
-cp -f ${HOST_AUTOMODEL_DIR}/nemo_automodel/components/checkpoint/checkpointing.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/checkpoint/checkpointing.py
+cp -f ${NATIVE_DIR}/patches/automodel/nemo_automodel_components_distributed_parallelizer.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/parallelizer.py
+cp -f ${NATIVE_DIR}/patches/automodel/nemo_automodel_components_distributed_parallelizer_utils.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/parallelizer_utils.py
+cp -f ${NATIVE_DIR}/patches/automodel/nemo_automodel_components_checkpoint_checkpointing.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/checkpoint/checkpointing.py
 md5sum /opt/nemo-rl/nemo_rl/models/policy/workers/dtensor_policy_worker_v2.py /opt/nemo-rl/nemo_rl/models/multi_lora/adapter.py /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/_peft/lora.py
 python - <<'EOF'
 import importlib.util, sys
@@ -98,6 +99,10 @@ export TORCH_NCCL_BLOCKING_WAIT=0
 export NOUSNET_PAD_TOKEN_ID=0
 export RAY_DEDUP_LOGS=0
 export NOUSNET_RUN_DIR=${EXP_DIR}
+# Driver-side imports resolve from the native worktree (the NeMo-RL fork under
+# test) — same role the campaign's HOST_RL_DIR PYTHONPATH entry played. Worker
+# processes inherit the ray daemons' env, so the cp overlay above covers them.
+export PYTHONPATH=${NATIVE_DIR}:\${PYTHONPATH:-}
 cd /opt/nemo-rl
 python examples/run_sft_multi_lora.py --config ${EXP_DIR}/config.yaml
 echo 'SFT_DONE_OK'
