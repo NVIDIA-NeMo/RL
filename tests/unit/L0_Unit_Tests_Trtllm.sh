@@ -17,6 +17,10 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
+# The release image persists the build-time wheel at this path. Require it so
+# this shard fails quickly instead of silently starting a source compilation.
+TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels \
+TRTLLM_REQUIRE_CACHED_WHEEL=1 \
 uv run --extra trtllm bash -x ./tests/run_unit.sh \
     "unit/" \
     "${EXCLUDED_UNIT_TESTS[@]}" \

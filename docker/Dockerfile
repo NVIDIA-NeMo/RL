@@ -379,7 +379,10 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
 fi
 # Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
 # stay in /root/.cache/uv, which remains available to symlinked environments.
+# Mirror only the current content-addressed TRT-LLM wheel into the image so
+# runtime `uv run --extra trtllm` calls do not fall back to a source build.
 export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
+export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS

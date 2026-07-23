@@ -207,7 +207,8 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         if env.get("TRTLLM_REQUIRE_CACHED_WHEEL") == "1":
             raise RuntimeError(
                 "TRT-LLM cached wheel is required but was not found at "
-                f"{cache_dir}. Refusing to compile TRT-LLM during release venv prefetch."
+                f"{cache_dir}. Refusing to compile TRT-LLM because "
+                "TRTLLM_REQUIRE_CACHED_WHEEL=1."
             )
 
         # Build directly into cache_dir so later venv syncs can reuse the wheel.
@@ -230,6 +231,20 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         print(f"[trtllm-backend] Wheel built and cached to: {cache_dir}", flush=True)
     else:
         print(f"[trtllm-backend] Cache hit — reusing wheel: {wheel}", flush=True)
+
+    # BuildKit cache mounts are not included in the resulting image. Allow the
+    # release build to mirror only this wheel's content-addressed cache entry
+    # into a persistent image path for later `uv run --extra trtllm` calls.
+    mirror_base = env.get("TRTLLM_WHEEL_CACHE_MIRROR_DIR")
+    if mirror_base:
+        mirror_dir = _wheel_cache_dir(
+            mirror_base, git_url, git_ref, _build_input_tag(arch)
+        )
+        mirror_dir.mkdir(parents=True, exist_ok=True)
+        mirror = mirror_dir / wheel.name
+        if wheel.resolve() != mirror.resolve():
+            shutil.copy2(wheel, mirror)
+        print(f"[trtllm-backend] Mirrored cached wheel to: {mirror}", flush=True)
 
     destination = Path(wheel_directory) / wheel.name
     shutil.copy2(wheel, destination)
