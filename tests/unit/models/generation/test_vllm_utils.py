@@ -539,6 +539,24 @@ def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
     assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
 
 
+def test_model_dump_chat_response_reports_non_finite_field_path():
+    class Response:
+        choices = [SimpleNamespace(message=SimpleNamespace(routed_experts=None))]
+
+        def model_dump(self):
+            return {
+                "choices": [
+                    {"logprobs": {"content": [{"token": "x", "logprob": float("nan")}]}}
+                ]
+            }
+
+    with pytest.raises(
+        ValueError,
+        match=r"\$\.choices\[0\]\.logprobs\.content\[0\]\.logprob=nan",
+    ):
+        model_dump_chat_response_with_routed_experts(Response())
+
+
 @pytest.mark.vllm
 def test_vllm_speculative_decoding_patch_removed():
     # The speculative decoding patch was fixed upstream in vLLM >= 0.14.0:
