@@ -12,56 +12,162 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dry-run test: SC._train_pump drives the split-API cycle per mini-batch.
-
-TODO: once the SingleController setup entrypoint lands (real TQPolicy,
-WeightSynchronizer, and advantage_estimator wiring), replace the fakes
-below with the real components and turn this into an integration test.
-Today the trainer / weight_synchronizer / advantage_estimator are all
-stubs — the test exercises the pump's control flow (claim → adv-stage →
-split-API cycle → clear → sync) but not the collaborators' semantics.
-"""
+"""End-to-end tests for SC._train_pump."""
 
 from __future__ import annotations
+
+import gc
+import math
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy.tq_policy import TQPolicy
+from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
+from tests.unit.single_controller._dp_fakes import _PARTITION_ID
+from tests.unit.test_utils import SimpleLossFn
 
-_PARTITION_ID = "rollout_data"
-_ROLLOUT_FIELDS = [
+# Union of DP_TRAIN_FIELDS (TQPolicy) + rollout extras (total_reward,
+# prompt_ids_for_adv) — the partition schema must cover every field any
+# producer/consumer touches.
+_REGISTERED_FIELDS = [
     "input_ids",
     "input_lengths",
+    "generation_logprobs",
+    "prev_logprobs",
+    "reference_policy_logprobs",
+    "advantages",
     "token_mask",
     "sample_mask",
     "total_reward",
     "prompt_ids_for_adv",
 ]
-_ADV_FIELD = "advantages"
 
 
-@ray.remote(num_cpus=0)
-class _DPActor(NoOpDataPlaneClient):
-    """Ray-wrapped NoOpDataPlaneClient for cross-process DP inspection."""
+def _simple_tq_cfg() -> dict:
+    """Simple in-process TQ backend cfg (mirrors tests/unit/data_plane/conftest.py)."""
+    return {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "simple",
+        "storage_capacity": 1024,
+        "num_storage_units": 1,
+        "claim_meta_poll_interval_s": 0.5,
+        "global_segment_size": 8589934592,  # 8 GiB
+        "local_buffer_size": 1073741824,  # 1 GiB
+    }
 
-    def claim_meta(self, *args, **kwargs):
-        meta = super().claim_meta(*args, **kwargs)
-        rec = self._partitions[meta.partition_id]
-        meta.tags = [dict(rec.tags.get(sid, {})) for sid in meta.sample_ids]
-        return meta
 
-    def peek_count(self, partition_id: str) -> int:
-        return len(self._partitions[partition_id].rows)
+def _populate_group(
+    dp_client,
+    *,
+    group_uuid: str,
+    group_size: int,
+    seq_len: int,
+    weight_version: int,
+) -> KVBatchMeta:
+    """Write one complete prompt group to DP and return its meta."""
+    sample_ids = [f"{group_uuid}_g{i}" for i in range(group_size)]
+    fields = TensorDict(
+        {
+            "input_ids": torch.randint(0, 1000, (group_size, seq_len)).long(),
+            "input_lengths": torch.tensor([seq_len] * group_size).long(),
+            "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
+            "sample_mask": torch.ones(group_size, dtype=torch.long),
+            "generation_logprobs": torch.zeros(
+                group_size, seq_len, dtype=torch.float32
+            ),
+            # prev_logprobs / reference_policy_logprobs are read by
+            # TQPolicy workers as part of DP_TRAIN_FIELDS; pre-seed with
+            # zeros since the loss (SimpleLossFn) ignores them.
+            "prev_logprobs": torch.zeros(group_size, seq_len, dtype=torch.float32),
+            "reference_policy_logprobs": torch.zeros(
+                group_size, seq_len, dtype=torch.float32
+            ),
+            "total_reward": torch.arange(group_size, dtype=torch.float32) * 0.5 + 1.0,
+            "prompt_ids_for_adv": torch.zeros(group_size, seq_len, dtype=torch.long),
+        },
+        batch_size=(group_size,),
+    )
+    tags = [{"weight_version": int(weight_version)} for _ in range(group_size)]
+    dp_client.put_samples(
+        sample_ids=sample_ids,
+        partition_id=_PARTITION_ID,
+        fields=fields,
+        tags=tags,
+    )
+    return KVBatchMeta(
+        partition_id=_PARTITION_ID,
+        task_name="train",
+        sample_ids=sample_ids,
+        fields=list(fields.keys()),
+        sequence_lengths=[seq_len] * group_size,
+        tags=[dict(t) for t in tags],
+    )
 
 
-@ray.remote(num_cpus=0)
+def _prepopulate_buffer(
+    buffer: TQReplayBuffer, meta: KVBatchMeta, *, weight_version: int
+) -> None:
+    """Insert a ready slot into TQReplayBuffer, mirroring what commit() sets."""
+    buffer.meta_list.append(meta)
+    buffer.start_weight_list.append(int(weight_version))
+    buffer.end_weight_list.append(int(weight_version))
+    buffer.target_step_list.append(None)
+    buffer.ready_list.append(True)
+    # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
+    group_id = meta.sample_ids[0].rpartition("_g")[0]
+    buffer._group_ids.append(group_id)
+
+
+@pytest.fixture(scope="function")
+def train_cluster():
+    """Single-GPU virtual cluster for the trainer worker group."""
+    cluster = RayVirtualCluster(
+        name="test-sc-train-cluster",
+        bundle_ct_per_node_list=[1],
+        use_gpus=True,
+        num_gpus_per_node=1,
+        max_colocated_worker_groups=1,
+    )
+    try:
+        yield cluster
+    finally:
+        cluster.shutdown()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class _FakeAdvEstimator:
+    """Passthrough advantage: returns rewards unchanged."""
+
+    def compute_advantage(
+        self,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        repeated_batch: dict,
+        **kwargs,
+    ) -> torch.Tensor:
+        return rewards.unsqueeze(-1).expand(mask.shape).detach().clone()
+
+
+@ray.remote(num_cpus=0)  # pragma: no cover
 class _CallLog:
     """Ordered append-only log the fakes below write to."""
 
@@ -76,29 +182,43 @@ class _CallLog:
         return list(self._entries)
 
 
-class _FakeTrainer:
-    """Sync driver-side TQPolicy stand-in."""
+class _RecordingLogger:
+    """Forward metrics logged inside SC to a Ray actor visible to the test."""
 
-    def __init__(self, log_handle) -> None:
+    def __init__(self, log_handle: Any) -> None:
         self._log = log_handle
 
-    def begin_train_step(self, loss_fn) -> None:
-        ray.get(self._log.record.remote("begin_train_step", {}))
-
-    def train_microbatches_from_meta(self, meta) -> None:
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: str | None = "",
+    ) -> None:
         ray.get(
             self._log.record.remote(
-                "train_microbatches_from_meta", {"meta_size": int(meta.size)}
+                "metrics",
+                {
+                    "metrics": dict(metrics),
+                    "step": int(step),
+                    "prefix": prefix,
+                },
             )
         )
 
-    def finish_train_step(self) -> dict:
-        ray.get(self._log.record.remote("finish_train_step", {}))
-        return {"loss": 0.0}
+
+@ray.remote(num_cpus=1, num_gpus=0)
+class _RecordingSingleControllerActor(
+    SingleControllerActor.__ray_metadata__.modified_class
+):
+    """SingleControllerActor variant with an observable logger."""
+
+    def __init__(self, *, metric_log_handle: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._logger = _RecordingLogger(metric_log_handle)
 
 
 class _FakeWeightSync:
-    """Async WeightSynchronizer stand-in."""
+    """Records the version SC syncs at end-of-step, via a Ray actor log."""
 
     def __init__(self, log_handle) -> None:
         self._log = log_handle
@@ -107,194 +227,137 @@ class _FakeWeightSync:
         ray.get(self._log.record.remote("sync_weights", {"version": int(version)}))
 
 
-class _FakeAdvEstimator:
-    """Records shapes SC hands the estimator; returns a per-sample scalar."""
+@pytest.mark.mcore
+@pytest.mark.hf_gated
+def test_train_pump_drives_mcore_training_step(
+    train_cluster,
+    tiny_llama_model_path,
+    tmp_path,
+):
+    """SC._train_pump runs one outer step against a real Megatron TQPolicy."""
+    train_steps = 2
+    train_gbs = 4
+    num_generations = 2
+    num_prompts = 2
 
-    def __init__(self, log_handle) -> None:
-        self._log = log_handle
-
-    def compute_advantage(
-        self,
-        prompt_ids: torch.Tensor,
-        rewards: torch.Tensor,
-        mask: torch.Tensor,
-        repeated_batch: dict,
-        **kwargs,
-    ) -> torch.Tensor:
-        ray.get(
-            self._log.record.remote(
-                "compute_advantage",
-                {
-                    "rewards_shape": tuple(rewards.shape),
-                    "mask_shape": tuple(mask.shape),
-                    "prompt_ids_shape": tuple(prompt_ids.shape),
-                    "rb_keys": sorted(repeated_batch.keys()),
-                    "kwargs_keys": sorted(kwargs.keys()),
-                },
-            )
-        )
-        return rewards.detach().clone()
-
-
-def _populate_group(
-    dp,
-    group_uuid: str,
-    group_size: int,
-    seq_len: int,
-    weight_version: int,
-) -> list[str]:
-    """Write one complete prompt group to DP."""
-    sample_ids = [f"{group_uuid}_g{i}" for i in range(group_size)]
-    fields = TensorDict(
-        {
-            "input_ids": torch.arange(group_size * seq_len)
-            .reshape(group_size, seq_len)
-            .long(),
-            "input_lengths": torch.tensor([seq_len] * group_size).long(),
-            "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
-            "sample_mask": torch.ones(group_size, 1, dtype=torch.long),
-            "total_reward": (
-                torch.arange(group_size, dtype=torch.float32) * 0.5 + 1.0
-            ).unsqueeze(-1),
-            "prompt_ids_for_adv": torch.zeros(group_size, seq_len, dtype=torch.long),
-        },
-        batch_size=(group_size,),
+    policy_cfg = create_megatron_test_config(tiny_llama_model_path, tp=1, pp=1)
+    policy_cfg["train_global_batch_size"] = train_gbs
+    policy_cfg["train_micro_batch_size"] = train_gbs
+    tokenizer = get_tokenizer(policy_cfg["tokenizer"])
+    policy_cfg["generation"] = configure_generation_config(
+        policy_cfg["generation"], tokenizer
     )
-    tags = [
-        {
-            "weight_version": int(weight_version),
-            "expected_num_samples": int(group_size),
-            "committed": True,
-            "input_lengths": int(seq_len),
-        }
-        for _ in range(group_size)
-    ]
-    ray.get(
-        dp.put_samples.remote(
-            sample_ids=sample_ids,
+
+    dp_cfg = _simple_tq_cfg()
+    # TQPolicy's ctor bootstraps the TQ controller (bootstrap=True) and
+    # fans out setup_data_plane to workers (bootstrap=False on workers).
+    trainer = TQPolicy(
+        cluster=train_cluster,
+        config=policy_cfg,
+        tokenizer=tokenizer,
+        dp_cfg=dp_cfg,
+        tq_partition_id=_PARTITION_ID,
+    )
+
+    try:
+        # Reuse TQPolicy's driver-side dp_client for SC — same controller,
+        # no double-bootstrap.
+        dp_client = trainer.dp_client
+
+        # Register the partition once with the full field union. All
+        # pre-populated samples across every step live here at once.
+        dp_client.register_partition(
             partition_id=_PARTITION_ID,
-            fields=fields,
-            tags=tags,
+            fields=_REGISTERED_FIELDS,
+            num_samples=train_steps * train_gbs,
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
         )
-    )
-    return sample_ids
 
-
-@pytest.fixture(scope="module")
-def ray_cluster():
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, num_cpus=4, log_to_driver=False)
-    yield
-    ray.shutdown()
-
-
-def test_train_pump_dry_run(ray_cluster, tmp_path):
-    """SC._train_pump runs 2 mini-batches × 1 group each, then a single _sync_weights."""
-    del ray_cluster
-    group_size = 2
-    seq_len = 4
-    num_groups = 2  # target_groups_per_step
-    # train_gbs == group_size → groups_per_minibatch=1, num_minibatches=2.
-    train_gbs = group_size
-
-    dp = _DPActor.remote()
-    log = _CallLog.remote()
-    ray.get(
-        dp.register_partition.remote(
+        # Real TQReplayBuffer, pre-populated with one ready batch (num_prompts
+        # groups of num_generations samples) per step, stamped with the
+        # step's weight_version so the sampler can advance across steps.
+        tq_buffer = TQReplayBuffer(
+            dp_client,
             partition_id=_PARTITION_ID,
-            fields=[*_ROLLOUT_FIELDS, _ADV_FIELD],
-            num_samples=group_size * num_groups * 4,
-            consumer_tasks=["train"],
+            pad_value_dict={"input_ids": int(tokenizer.pad_token_id or 0)},
         )
-    )
-    for g in range(num_groups):
-        _populate_group(
-            dp,
-            group_uuid=f"prompt{g}",
-            group_size=group_size,
-            seq_len=seq_len,
-            weight_version=0,
+        for step in range(train_steps):
+            for g in range(num_prompts):
+                meta = _populate_group(
+                    dp_client,
+                    group_uuid=f"step{step}_prompt{g}",
+                    group_size=num_generations,
+                    seq_len=16,
+                    weight_version=step,
+                )
+                _prepopulate_buffer(tq_buffer, meta, weight_version=step)
+
+        log = _CallLog.remote()
+        weight_sync = _FakeWeightSync(log)
+        adv_est = _FakeAdvEstimator()
+        # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
+        rollout_manager = SimpleNamespace(_tq_buffer=None)
+
+        cfg = SingleControllerConfig.model_construct(
+            sampler=WindowedSamplerConfig(max_staleness_versions=1),
+            min_groups_per_batch=num_prompts,
+            target_groups_per_step=num_prompts,
+            group_size=num_generations,
+            max_inflight_prompts=num_prompts,
+            max_buffered_rollouts=num_prompts,
+            max_train_steps=train_steps,
+            max_num_epochs=None,
+            train_global_batch_size=train_gbs,
+            partition_id=_PARTITION_ID,
+            advantage_enabled=True,
+            advantage_repeated_batch_fields=[],
+            advantage_policy_logprobs_field=None,
+            advantage_reference_logprobs_field=None,
+            diagnostics=False,
+            logger={
+                "log_dir": str(tmp_path / "logs"),
+                "wandb_enabled": False,
+                "swanlab_enabled": False,
+                "tensorboard_enabled": False,
+                "mlflow_enabled": False,
+                "monitor_gpus": False,
+            },
         )
 
-    trainer = _FakeTrainer(log)
-    weight_sync = _FakeWeightSync(log)
-    adv_est = _FakeAdvEstimator(log)
+        ctrl = _RecordingSingleControllerActor.remote(
+            metric_log_handle=log,
+            cfg=cfg,
+            dp_client_handle=dp_client,
+            gen_handle=None,
+            trainer_handle=trainer,
+            weight_synchronizer=weight_sync,
+            loss_fn=SimpleLossFn(),
+            rollout_manager=rollout_manager,
+            advantage_estimator=adv_est,
+            dataloader=None,
+            tq_buffer=tq_buffer,
+        )
 
-    cfg = SingleControllerConfig.model_construct(
-        max_weight_staleness_versions=1,
-        min_groups_per_batch=num_groups,
-        target_groups_per_step=num_groups,
-        group_size=group_size,
-        batch_selection_strategy="staleness_window",
-        max_inflight_prompts=8,
-        max_buffered_rollouts=8,
-        max_train_steps=1,
-        max_rollout_prompts=num_groups,
-        train_global_batch_size=train_gbs,
-        partition_id=_PARTITION_ID,
-        consumer_task_name="train",
-        claim_required_fields=["input_ids"],
-        max_claim_groups=8,
-        advantage_enabled=True,
-        advantage_repeated_batch_fields=[],
-        advantage_policy_logprobs_field=None,
-        advantage_reference_logprobs_field=None,
-        diagnostics=False,
-        logger={
-            "log_dir": str(tmp_path / "logs"),
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": False,
-        },
-    )
+        # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.
+        ray.get(ctrl._train_pump.remote())
 
-    ctrl = SingleControllerActor.remote(
-        cfg=cfg,
-        prompts=[],  # rollout pump is not started
-        dp_client_handle=dp,
-        gen_handle=None,
-        trainer_handle=trainer,
-        weight_synchronizer=weight_sync,
-        loss_fn=object(),
-        advantage_estimator=adv_est,
-    )
+        state = ray.get(ctrl.ping.remote())
+        assert state["train_steps"] == train_steps
+        assert state["trainer_version"] == train_steps
 
-    # _train_pump exits when max_train_steps is reached — no cancel needed.
-    ray.get(ctrl._train_pump.remote())
+        entries = ray.get(log.get.remote())
+        sync_versions = [p["version"] for k, p in entries if k == "sync_weights"]
+        assert sync_versions == list(range(1, train_steps + 1))
 
-    state = ray.get(ctrl.ping.remote())
-    assert state["train_steps"] == 1
-    assert state["trainer_version"] == 2  # one bump per mini-batch
+        train_metrics = [
+            p["metrics"]
+            for kind, p in entries
+            if kind == "metrics" and p["prefix"] == "train"
+        ]
+        assert len(train_metrics) == train_steps
+        for metrics in train_metrics:
+            assert math.isfinite(metrics["reward"])
+            assert math.isfinite(metrics["advantages/mean"])
 
-    entries = ray.get(log.get.remote())
-    kinds = [k for k, _ in entries]
-    assert kinds == [
-        "compute_advantage",
-        "begin_train_step",
-        "train_microbatches_from_meta",
-        "finish_train_step",
-        "compute_advantage",
-        "begin_train_step",
-        "train_microbatches_from_meta",
-        "finish_train_step",
-        "sync_weights",
-    ]
-
-    # sync_weights fires with the post-bump trainer_version.
-    sync_payload = next(p for k, p in entries if k == "sync_weights")
-    assert sync_payload["version"] == 2
-
-    for k, p in entries:
-        if k == "train_microbatches_from_meta":
-            assert p["meta_size"] == group_size
-        elif k == "compute_advantage":
-            assert p["rewards_shape"] == (group_size,)
-            assert p["mask_shape"] == (group_size, seq_len)
-            assert p["prompt_ids_shape"] == (group_size, seq_len)
-            assert p["rb_keys"] == ["total_reward"]
-            assert p["kwargs_keys"] == []
-
-    # clear_samples was called after each finish_train_step.
-    assert ray.get(dp.peek_count.remote(_PARTITION_ID)) == 0
+    finally:
+        trainer.shutdown()

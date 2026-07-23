@@ -101,6 +101,9 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
 
+    for s in streams:
+        s.synchronize()
+
 
 def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     """Consume a packed tensor and unpack it into a list of tensors.
@@ -208,3 +211,6 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                         )
                     )
                 break
+
+    for s in streams:
+        s.synchronize()

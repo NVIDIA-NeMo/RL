@@ -124,6 +124,14 @@ fi
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
+# Optional override for policy.tokenizer.use_fastokens (Rust-backed BPE tokenizer,
+# ~10x faster encode). The config is the source of truth; propagate this env var
+# to all Ray nodes ONLY when the user explicitly set it before submitting.
+# Unset means "defer to config"; forcing a default here would override config off.
+if [[ -n "${NRL_USE_FASTOKENS:-}" ]]; then
+  export NRL_USE_FASTOKENS
+fi
+
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
 # It's session based and won't affect the system outside the script
@@ -657,6 +665,13 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source $LOG_DIR/topology_probe.sh
 
+# Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
+# MPI_Init (in the ray daemon child process below) starts clean.
+# NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
+for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/{print \$1}'); do
+    unset "\$v"
+done
+
 # Start the head without --block. 'ray start --head' then returns as soon as the
 # GCS is listening, so we touch STARTED_RAY_HEAD only after the head is actually up.
 # Workers gate on that file, so they only try to connect once the GCS is accepting
@@ -850,6 +865,13 @@ log-sync-sidecar &
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
 source $LOG_DIR/topology_probe.sh
+
+# Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
+# MPI_Init (in the ray daemon child process below) starts clean.
+# NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
+for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/{print \$1}'); do
+    unset "\$v"
+done
 
 # Wait for the head to signal that its GCS is listening before connecting.
 echo "[INFO] Worker \$SLURM_PROCID: waiting for Ray head GCS to be ready..."

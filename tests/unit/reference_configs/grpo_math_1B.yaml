@@ -115,6 +115,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
   hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
@@ -454,6 +455,7 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
