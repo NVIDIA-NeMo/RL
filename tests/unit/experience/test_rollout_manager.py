@@ -739,17 +739,25 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         }
     )
 
-    original_result = run_async_nemo_gym_rollout(
-        policy_generation=nemo_gym_vllm_generation,
-        input_batch=repeated_batch,
-        tokenizer=nemo_gym_tokenizer,
-        task_to_env={"nemo_gym": nemo_gym},
-        generation_config=nemo_gym_vllm_generation.cfg,
-        num_generations=num_generations,
-        log_full_result_tables=False,
-        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
-        max_rollout_turns=None,
-    )
+    async def _collect_original_results():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=nemo_gym_vllm_generation,
+                input_batch=repeated_batch,
+                tokenizer=nemo_gym_tokenizer,
+                task_to_env={"nemo_gym": nemo_gym},
+                generation_config=nemo_gym_vllm_generation.cfg,
+                num_generations=num_generations,
+                log_full_result_tables=False,
+                max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+                max_rollout_turns=None,
+            )
+        ]
+
+    original_results = asyncio.run(_collect_original_results())
+    assert len(original_results) == 1
+    original_result = original_results[0]
 
     manager = RolloutManager(
         use_nemo_gym=True,
