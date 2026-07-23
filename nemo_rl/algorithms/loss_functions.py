@@ -35,7 +35,7 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 # ---------------------------------------------------------------------------
 # Bit-equivalence diagnostic hook for NLLLoss (singles path).
-# Symmetric with nousnet.rl.lora.multi.diag's MultiAdapterLoss hook so a
+# Symmetric with nemo_rl.models.multi_lora.diag's MultiAdapterLoss hook so a
 # direct compare of single_X step N vs multi_adapter_X step N is meaningful.
 # No-op unless NOUSNET_DIAG_ENABLED=1. Reads `who` from NOUSNET_DIAG_WHO.
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ def _nllloss_diag_metrics(
     if _os.environ.get("NOUSNET_DIAG_ENABLED", "0") != "1":
         return {}
     try:
-        from nousnet.rl.lora.multi import diag as _diag
+        from nemo_rl.models.multi_lora import diag as _diag
     except ImportError:
         return {}
     who = _os.environ.get("NOUSNET_DIAG_WHO", "single_unknown")

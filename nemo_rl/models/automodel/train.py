@@ -474,7 +474,7 @@ def automodel_forward_backward(
                         and not getattr(automodel_forward_backward, "_nousnet_fp_dumped", False)
                     ):
                         try:
-                            from nousnet.debug.forward_backward_fingerprint import (
+                            from nemo_rl.models.multi_lora.debug.forward_backward_fingerprint import (
                                 log_all_param_grads,
                             )
                             log_all_param_grads(model, step=1, log_rank=0)

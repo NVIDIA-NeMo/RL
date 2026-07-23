@@ -69,7 +69,7 @@ def _per_adapter_clip_grad_norm(
     For non-multi-LoRA models (no MultiLinearLoRA modules), falls back to
     stock global clip so this is safe to call unconditionally.
     """
-    from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+    from nemo_rl.models.multi_lora.adapter import MultiLinearLoRA
 
     # Collect all MultiLinearLoRA modules
     multi_modules = [m for m in model.modules() if isinstance(m, MultiLinearLoRA)]
@@ -224,7 +224,7 @@ def _maybe_merge_lora_weight(
     # stacked Parameters. Per-adapter checkpoint export is handled separately
     # by the downstream multi-adapter splitter.
     try:
-        from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+        from nemo_rl.models.multi_lora.adapter import MultiLinearLoRA
     except ImportError:
         MultiLinearLoRA = None  # nousnet not installed — no multi-LoRA modules exist
     if MultiLinearLoRA is not None and isinstance(module, MultiLinearLoRA):
@@ -331,7 +331,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         import os as _diag_os
         if _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
             try:
-                from nousnet.rl.lora.multi.diag import enable_absolute_determinism
+                from nemo_rl.models.multi_lora.diag import enable_absolute_determinism
                 _seed = int(_diag_os.environ.get("NOUSNET_DETERMINISTIC_SEED", "42"))
                 _det_status = enable_absolute_determinism(seed=_seed)
                 print(f"[DIAG] worker determinism: {_det_status}", flush=True)
@@ -431,7 +431,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         ):
             import hashlib as _init_xfer_hashlib
             import inspect as _init_xfer_inspect
-            import nousnet.rl.lora.multi.adapter as _init_xfer_adapter
+            import nemo_rl.models.multi_lora.adapter as _init_xfer_adapter
 
             _init_xfer_source = _init_xfer_inspect.getsourcefile(_init_xfer_adapter)
             with open(_init_xfer_source, "rb") as _init_xfer_file:
@@ -441,7 +441,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 f"{_init_xfer_source} {_init_xfer_sha}",
                 flush=True,
             )
-            from nousnet.rl.lora.multi.init_transfer import maybe_transfer_initial_lora
+            from nemo_rl.models.multi_lora.init_transfer import maybe_transfer_initial_lora
 
             maybe_transfer_initial_lora(self.model)
 
@@ -482,7 +482,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         import os as _dump_os
         if _dump_os.environ.get("NOUSNET_DUMP_EVERYTHING") == "1":
             try:
-                from nousnet.debug import dump_everything as _dump
+                from nemo_rl.models.multi_lora.debug import dump_everything as _dump
                 _dump.set_step(_dump.get_step() + 1)
                 _dump.dump_params_and_opt(self.model, self.optimizer, phase="pre_step")
             except Exception as _e:
@@ -498,14 +498,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             adapter_ids = data.get("adapter_ids")
         if adapter_ids is not None:
             try:
-                from nousnet.rl.lora.multi.routing import seed_microbatch_routing
+                from nemo_rl.models.multi_lora.routing import seed_microbatch_routing
             except ImportError:
                 # nousnet not installed but batch carries adapter_ids —
                 # this is a misconfiguration. Fail loudly rather than train
                 # silently against the wrong adapter slot.
                 raise RuntimeError(
                     "Batch carries `adapter_ids` but nousnet multi-LoRA "
-                    "routing helpers are not importable. Install nousnet or "
+                    "routing helpers are not importable. This NeMo-RL build vendors multi-LoRA natively; "
                     "remove `adapter_ids` from the batch."
                 )
             seed_microbatch_routing(self.model, adapter_ids)
@@ -605,7 +605,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         and _sample_mask is not None
                         and _adapter_ids is not None
                     ):
-                        from nousnet.rl.lora.multi.loss import (
+                        from nemo_rl.models.multi_lora.loss import (
                             GLOBAL_ADAPTER_TOKEN_COUNTS_KEY,
                         )
 
@@ -738,7 +738,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         and _diag_os.environ.get("NOUSNET_DIAG_LORA_STEP", "1") == "1"
                     ):
                         try:
-                            from nousnet.rl.lora.multi import diag as _diag
+                            from nemo_rl.models.multi_lora import diag as _diag
                             # Try to get the canonical adapter order. The
                             # MultiAdapterDataLoader stores it on the run
                             # context; for now we infer from the model's first
@@ -770,7 +770,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # written and params reflect the gradient update.
                     if _dump_os.environ.get("NOUSNET_DUMP_EVERYTHING") == "1":
                         try:
-                            from nousnet.debug import dump_everything as _dump
+                            from nemo_rl.models.multi_lora.debug import dump_everything as _dump
                             _dump.dump_params_and_opt(
                                 self.model, self.optimizer, phase="post_optstep"
                             )
@@ -782,7 +782,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         and _diag_os.environ.get("NOUSNET_DIAG_LORA_STEP", "1") == "1"
                     ):
                         try:
-                            from nousnet.rl.lora.multi import diag as _diag
+                            from nemo_rl.models.multi_lora import diag as _diag
                             _diag_adapter_names = _diag_os.environ.get(
                                 "NOUSNET_DIAG_ADAPTER_NAMES", ""
                             ).split(",")
@@ -1333,7 +1333,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         import os as _os
         if _os.environ.get("NOUSNET_FORWARD_BACKWARD_DIAG") == "1":
             try:
-                from nousnet.debug.forward_backward_fingerprint import (
+                from nemo_rl.models.multi_lora.debug.forward_backward_fingerprint import (
                     install_fingerprint_hooks,
                 )
                 install_fingerprint_hooks(
@@ -1364,7 +1364,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # is advanced from the train loop via dump_everything.set_step(step).
         if _os.environ.get("NOUSNET_DUMP_EVERYTHING") == "1":
             try:
-                from nousnet.debug.dump_everything import install_dump_hooks
+                from nemo_rl.models.multi_lora.debug.dump_everything import install_dump_hooks
                 install_dump_hooks(self.model)
             except Exception as _e:
                 print(f"[DUMP_EVERYTHING] failed to install dump hooks: {_e}", flush=True)

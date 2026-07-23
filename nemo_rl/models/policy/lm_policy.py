@@ -539,7 +539,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # contiguous also lets mbs=2 hit MultiLinearLoRA's exact homogeneous
         # F.linear path.
         if "adapter_ids" in data:
-            from nousnet.rl.lora.multi.sharding import rank_striped_indices
+            from nemo_rl.models.multi_lora.sharding import rank_striped_indices
 
             reorder = rank_striped_indices(data["adapter_ids"], dp_size)
             data = data.select_indices(reorder)
