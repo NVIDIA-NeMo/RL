@@ -31,10 +31,42 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
     compute_spec_decode_metrics,
+    find_non_finite_float_paths,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
 )
+
+
+def test_find_non_finite_float_paths_reports_nested_json_locations():
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "content": [
+                        {"logprob": -0.25},
+                        {"logprob": float("nan")},
+                        {"logprob": float("-inf")},
+                    ]
+                }
+            }
+        ],
+        "finite": 1.0,
+    }
+
+    assert find_non_finite_float_paths(payload) == [
+        "$.choices[0].logprobs.content[1].logprob",
+        "$.choices[0].logprobs.content[2].logprob",
+    ]
+
+
+def test_find_non_finite_float_paths_bounds_diagnostics():
+    assert find_non_finite_float_paths([float("nan"), float("inf")], max_paths=1) == [
+        "$[0]"
+    ]
+
+    with pytest.raises(ValueError, match="max_paths must be positive"):
+        find_non_finite_float_paths({}, max_paths=0)
 
 
 def _mk_inputs(batch_size: int = 2, seq_len: int = 5):

@@ -67,12 +67,27 @@ description: Safe Slurm procedures for NeMo-RL on cw-dfw-cs-001. Use when launch
    showed a PyTorch CUDA/driver mismatch. Run this test with two GPUs in the
    validated SWE container; use `interactive`, omit `--exclusive`, CPU, and
    memory requests, and preflight CUDA visibility inside the exact container.
+8. Cache standalone NeMo Gym test environments by the Gym `uv.lock` digest.
+   Build developer-test environments with `uv sync --frozen --extra dev
+   --no-group docs`: the docs group installs `accessible-pygments`, whose
+   overlapping `pygments` namespace can remove `pygments.plugin` from the
+   standard package and break pytest at import time. Agent-specific tests also
+   need their local `requirements.txt` (for example, SWE agents declare
+   `tomlkit` there rather than in the root Gym project). Keep this environment
+   separate from NeMo-RL's shared `.venv`, and reuse the explicit
+   `UV_CACHE_DIR`; do not repair the conflict by mutating the root environment.
 
 ## Attached `srun` lifecycle
 
 - Set the client/tool timeout longer than the Slurm `--time` limit for a long
   attached `srun`, or submit with `sbatch` and a persistent output file. A
   short client timeout can detach without terminating the allocation.
+- A direct multi-node `srun` starts one launcher task per node unless its task
+  layout says otherwise. Do not let every task invoke `ray.sub`: two launchers
+  race to create the same Ray head and fail before model loading. Also do not
+  use `--ntasks=1` with `--nodes=2`; this cluster reduces that request to one
+  node. Request one task per node and make the direct launcher a rank-0-only
+  operation while the outer step retains the full-node allocation.
 - After an interrupted or timed-out `srun`, immediately inspect both `squeue`
   and `sacct`. A running allocation with only an `.extern` step, no workload
   step, and no GPU process is orphaned; cancel it promptly.

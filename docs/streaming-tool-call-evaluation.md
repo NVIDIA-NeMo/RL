@@ -1861,6 +1861,147 @@ the actual per-worker directories, and merge complete artifacts back through
 the cache helpers and audit path: 18 tests passed, Ruff passed, and the launcher
 passed `bash -n` using the warm `uvlock-c63db1454435` cache namespace.
 
+#### Production-Super trace replay: admission size versus completed overlap
+
+Slurm `14250389` replays recorded tool-output-to-next-model-call transitions
+from the fused Super TP8 first-16 run without rerunning the agent. It uses the
+production engine shape: Nemotron-3-Super TP8, `max_num_batched_tokens=8480`,
+Mamba cache alignment, asynchronous scheduling disabled, eager compilation
+backend with graph capture, and the nightly Gym image. Before every arm it
+resets APC and warms the same authoritative prefix. Prompt and tool text are
+not written to the result; only hashes, lengths, token counts, latency, and
+output-contract diagnostics are retained.
+
+The control performs the ordinary final request. The candidate appends the
+exact remaining prompt to the same resumable request. A 0, 100, or 250 ms delay
+is made available to speculative prefill before final enqueue; that delay is
+not included in candidate TTFT, so it models command time that can overlap GPU
+work rather than adding sleep to the model-call metric. Each cell contains 15
+identical transitions and three alternating control/candidate repeats (45
+paired measurements). Fifteen, rather than 16, are common to all cells because
+one trajectory has no replayable 4096-character tool output.
+
+The full source has 411 tool-output transitions followed by another model call
+across 16 trajectories. Eligibility below is an upper bound based on recorded
+final output length and exact stable-token construction; it does not prove that
+the live snapshot poll observed the threshold early enough.
+
+| Snapshot threshold | Replayable pairs / 411 | Coverage | Replayable trajectories | Coverage vs 427 source tool calls |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 characters | 325 | 79.08% | 16 | 76.11% |
+| 1024 characters | 201 | 48.91% | 16 | 47.07% |
+| 4096 characters | 63 | 15.33% | 15 | 14.75% |
+
+| Characters | Available overlap | Stable dynamic tokens, mean (min--max) | Prefill completed before final | TTFT saving mean / P50 | Paired wins | Modal output contract |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 0 ms | 68.3 (4--86) | 0.0% | -65.33 / -69.16 ms | 1/45 | 15/15 |
+| 256 | 100 ms | 68.3 (4--86) | 93.3% | +7.47 / +4.31 ms | 40/45 | 15/15 |
+| 256 | 250 ms | 68.3 (4--86) | 100% | +9.81 / +5.94 ms | 40/45 | 15/15 |
+| 1024 | 0 ms | 304.1 (33--387) | 0.0% | -72.86 / -68.15 ms | 0/45 | 15/15 |
+| 1024 | 100 ms | 304.1 (33--387) | 80.0% | +5.85 / +8.15 ms | 39/45 | 15/15 |
+| 1024 | 250 ms | 304.1 (33--387) | 100% | +13.87 / +10.82 ms | 41/45 | 15/15 |
+| 4096 | 0 ms | 1256.2 (556--1549) | 0.0% | -113.13 / -111.80 ms | 0/45 | 15/15 |
+| 4096 | 100 ms | 1256.2 (556--1549) | 6.7% | -11.71 / -9.42 ms | 9/45 | 15/15 |
+| 4096 | 250 ms | 1256.2 (556--1549) | 100% | +26.01 / +29.49 ms | 42/45 | 15/15 |
+
+All nine cells pass the repeated semantic contract: for every trace, a
+majority of three candidate outputs matches the unique modal output of the
+three ordinary controls. Raw pairwise exact parity ranges from 95.56% to 100%
+because ordinary greedy Super requests themselves are not bitwise deterministic
+under concurrent GPU reductions; the modal controls prevent that baseline
+variation from being misclassified as a streaming mutation.
+
+The result identifies completion, not token count alone, as the handoff gate.
+An unfinished same-request promotion loses 65--113 ms with no overlap. Once the
+speculative dummy completes, 256 and 1024 characters save about 6--14 ms; the
+4096-character arm needs more than 100 ms and saves 26 ms at 250 ms, but its
+potential coverage is only 15.33%. The full v13c rollout sealed 119 sessions
+with zero completed chunks; v14 again sealed 119, with only two completed and
+117 in-flight promotions. Their 52.19% and 47.98% protocol-admission rates
+among eligible actions are therefore not beneficial-admission rates.
+
+Production finalization now requires completed speculative prefill. An
+unfinished session is closed without waiting, its exact incremental-tokenizer
+IDs are retained, and the ordinary foreground final request is used. A separate
+incomplete-fallback counter distinguishes this expected overhead guard from a
+prefill failure. This preserves the 256-character upper-bound coverage for
+commands that provide enough overlap while removing the measured negative
+handoff for late admissions. A real first-16 full-flow rerun remains necessary
+to verify the completed/fallback funnel under foreground contention; the fixed
+replay proves per-call latency and semantic output behavior, not aggregate
+agent E2E.
+
+The machine-readable result is
+`results/streaming_tool_call_background_prefill_benchmark/super-trace-replay-v3/streaming-trace-replay-v3.json`.
+
+#### Super TP8 foreground-16 validation and the completed-prefill safety boundary
+
+The July 23 production rerun uses Nemotron-3-Super TP8, concurrency 16,
+temperature zero, top-p one, 30 agent turns, the frozen first-16
+SWE-Verified rows, a 256-character first bucket, 50 ms snapshot polling, one
+streamed cache page, and foreground slack 16. Slurm `14262857` completed all 16
+rows and logged to W&B
+[`qz4drced`](https://wandb.ai/nvidia/swe-benchmark/runs/qz4drced). The raw
+trajectory is under
+`results/streaming_tool_call_verified/super-tp8-prefill-fg16-ttl-refresh-first16-20260723-v26/`.
+
+| First-16 metric | Streaming off | Foreground slack 8 | Foreground slack 16, fixed |
+| --- | ---: | ---: | ---: |
+| Strict resolved | 7/16 | 7/16 | 6/16 |
+| OpenHands run time, mean (s) | 277.80 | 280.80 | 321.09 |
+| Model API time, mean (s) | 227.93 | 227.47 | 268.54 |
+| Command time, mean (s) | 11.56 | 9.22 | 7.75 |
+| Model calls / tool calls | 452 / 443 | 461 / 459 | 410 / 384 |
+| Eligible actions | -- | 237 | 188 |
+| Same-request final decodes | -- | 27 | 64 |
+| Same-request / eligible | -- | 11.39% | 34.04% |
+| Same-request / all tool calls | -- | 5.88% | 16.67% |
+| Streaming overhead / tool call | -- | 21.69 ms | 18.70 ms |
+| Same-request engine fallbacks | -- | 0 | 0 |
+
+Foreground slack 16 therefore raises useful admission 2.99x over slack 8 while
+reducing measured control-plane overhead per tool call by 13.8%. The raw
+OpenHands, model, command, and accuracy means are not causal comparisons:
+greedy agent trajectories still diverge, and the three arms execute different
+numbers of model and tool calls. They are retained as full-flow safety and
+workload observations, not as a performance claim.
+
+The rerun also closes the earlier 900-second failure. In Slurm `14261073` /
+W&B [`7zyp66wh`](https://wandb.ai/nvidia/swe-benchmark/runs/7zyp66wh), a
+healthy final decode continued producing engine tokens while its session idle
+age increased from 894.1 to 899.1 seconds. At exactly the 900-second TTL the
+manager cancelled it and the caller recorded `fallback_engine_error`. The
+session timestamp had been refreshed when the final suffix was enqueued, but
+not when authoritative final outputs arrived. The manager now treats every
+final engine output as activity. A separate 60-second per-output stall timeout
+still fails open if final decoding genuinely stops making progress. The fixed
+production run has zero agent/evaluation timeout and zero same-request
+fallback; liveness snapshots keep the active final session's idle age near
+zero. Focused compute-node validation is 42 tests passed, including a final
+decode whose total duration exceeds its session TTL while every output gap
+remains below the stall timeout.
+
+Two fixed-prompt Super TP8 tests separate causal model-call behavior from the
+divergent rollout. Both use the production 8,480-token scheduler budget,
+131,072-token context, Mamba `align` cache, priority scheduling, and a
+36,896-token final prompt:
+
+| Controlled 16-request test | Output parity | Candidate TTFT mean | Control TTFT mean | Mean TTFT change |
+| --- | ---: | ---: | ---: | ---: |
+| Final only after prefill acknowledgement | 16/16 | 0.443 s | 1.239 s | -0.796 s (-64.3%) |
+| Final queued before prefill acknowledgement | 9/16 | 8.961 s | 4.728 s | +4.234 s |
+
+The first row is the causal benefit for safely admitted work: every output is
+identical and every request wins. The second row is a deliberate negative
+test, Slurm `14264051`, with machine-readable output at
+`results/streaming_tool_call_background_prefill_benchmark/super-concurrent-final-before-ack-v25/concurrent-final-before-ack.json`.
+It proves that an unfinished vLLM streaming-input transition is neither a
+correctness-safe nor a latency-safe promotion boundary under concurrency.
+Production therefore keeps `require_completed_prefill=True`: unfinished work
+is closed without waiting and the unchanged ordinary final request is used.
+The fixed rollout reports 64 completed same-request seals and zero in-flight
+promotions, so this guard loses none of its 64 measured useful admissions.
+
 #### Historical batch E2E accounting (not the current acceptance metric)
 
 The new boundary and transport metrics replace the earlier approximation. For

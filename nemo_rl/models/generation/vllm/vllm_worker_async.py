@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 import uuid
@@ -55,6 +56,7 @@ from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallError,
     StreamingToolCallFinalizationUnavailableError,
     StreamingToolCallPrefillManager,
+    StreamingToolCallPrefillIncompleteError,
     StreamingToolCallPrefixMismatchError,
     StreamingToolCallPromptTooLongError,
     StreamingToolCallSessionClosedError,
@@ -63,6 +65,7 @@ from nemo_rl.models.generation.vllm.streaming_tool_call import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
+    find_non_finite_float_paths,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
@@ -75,6 +78,136 @@ LOGGER = logging.getLogger(__name__)
 StreamingToolCallManagerResult = TypeVar("StreamingToolCallManagerResult")
 
 
+def _build_streaming_tool_call_prefill_sampling_params(
+    sampling_params_type: type, request_output_kind: Any
+) -> Any:
+    """Build the resumable prefill contract used before final generation."""
+    return sampling_params_type(
+        temperature=0,
+        top_p=1,
+        top_k=1,
+        max_tokens=1,
+        # The sampled dummy token is discarded when the request resumes. Do
+        # not pay to materialize its logprob; the output-state patch handles
+        # vLLM's final-chunk logprob transition before authoritative decode.
+        output_kind=request_output_kind.DELTA,
+    )
+
+
+def _defer_vllm_output_handler_to_http_loop(llm: Any) -> bool:
+    """Cancel an eagerly-created output handler before the HTTP loop starts.
+
+    ``AsyncLLM`` eagerly creates its output-handler task when constructed from
+    an async Ray actor method.  NeMo RL serves OpenAI requests from a separate
+    uvicorn thread, so leaving that task on the Ray loop makes it mutate
+    request collectors owned by the HTTP loop.  Under concurrent cancellation
+    this can corrupt ``asyncio.Event`` waiter iteration.  Clearing the task here
+    lets vLLM recreate it on the first HTTP request's owning loop.
+    """
+    output_handler = llm.output_handler
+    if output_handler is None:
+        return False
+
+    current_loop = asyncio.get_running_loop()
+    if output_handler.get_loop() is not current_loop:
+        raise RuntimeError(
+            "eager vLLM output handler is owned by an unexpected event loop"
+        )
+    output_handler.cancel()
+    llm.output_handler = None
+    return True
+
+
+def _streaming_tool_call_debug_snapshot(
+    llm: Any,
+    manager: StreamingToolCallPrefillManager,
+) -> dict[str, Any]:
+    """Summarize vLLM frontend and streaming-session liveness.
+
+    This deliberately reports only aggregate counts. Prompt contents and
+    request IDs must not leak into operational logs.
+    """
+    output_handler = llm.output_handler
+    output_handler_done = bool(output_handler and output_handler.done())
+    output_handler_cancelled = bool(output_handler_done and output_handler.cancelled())
+    output_handler_exception = None
+    if output_handler_done and not output_handler_cancelled:
+        exception = output_handler.exception()
+        if exception is not None:
+            output_handler_exception = type(exception).__name__
+
+    request_states = tuple(llm.output_processor.request_states.values())
+    streaming_states = tuple(
+        state
+        for state in request_states
+        if getattr(state, "streaming_input", False)
+        or getattr(state, "input_chunk_queue", None) is not None
+    )
+    queues = tuple(
+        state.queue for state in request_states if getattr(state, "queue", None)
+    )
+    snapshot: dict[str, Any] = {
+        "output_handler_absent": output_handler is None,
+        "output_handler_done": output_handler_done,
+        "output_handler_cancelled": output_handler_cancelled,
+        "output_handler_exception": output_handler_exception,
+        "output_handler_on_http_loop": bool(
+            output_handler and output_handler.get_loop() is asyncio.get_running_loop()
+        ),
+        "frontend_request_states": len(request_states),
+        "frontend_streaming_states": len(streaming_states),
+        "frontend_prefilling_states": sum(
+            getattr(state, "is_prefilling", False) for state in request_states
+        ),
+        "frontend_queued_streaming_updates": sum(
+            len(state.input_chunk_queue)
+            for state in request_states
+            if getattr(state, "input_chunk_queue", None) is not None
+        ),
+        "frontend_ready_output_queues": sum(queue.ready.is_set() for queue in queues),
+        "frontend_buffered_output_queues": sum(
+            queue.output is not None for queue in queues
+        ),
+        "frontend_prompt_tokens": sum(
+            getattr(state, "prompt_len", 0) for state in request_states
+        ),
+    }
+    snapshot.update(manager.debug_snapshot())
+    return snapshot
+
+
+def _latest_vllm_debug_metrics_snapshot(worker: Any) -> dict[str, int | float]:
+    """Return the latest engine gauges/counters already sampled by the worker."""
+    if not worker.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+        return {}
+
+    metric_series = {
+        "engine_running_requests": worker.inflight_batch_sizes,
+        "engine_waiting_requests": worker.num_pending_samples,
+        "engine_kv_cache_usage": worker.kv_cache_usage_perc,
+        "engine_generation_tokens": worker.generation_tokens,
+        "engine_streaming_dummy_tokens": worker.streaming_tool_call_dummy_tokens,
+        "engine_streaming_prefill_tokens": worker.streaming_tool_call_prefill_tokens,
+    }
+    with worker._vllm_metrics_lock:
+        return {
+            metric_name: values[-1]
+            for metric_name, values in metric_series.items()
+            if values
+        }
+
+
+def _background_prefill_max_cache_pages(
+    streaming_tool_call_config: dict[str, Any],
+) -> int | None:
+    """Bound APC work without imposing page alignment on a live request."""
+    if not streaming_tool_call_config["stop_after_first_prefill_page"]:
+        return None
+    if streaming_tool_call_config.get("same_request_final_decode", False):
+        return None
+    return 1
+
+
 def _configure_background_prefill_scheduling(
     llm_kwargs: dict[str, Any],
     streaming_tool_call_config: dict[str, Any] | None,
@@ -83,6 +216,11 @@ def _configure_background_prefill_scheduling(
     if streaming_tool_call_config is None or not streaming_tool_call_config.get(
         "background_prefill_completion"
     ):
+        for variable in (
+            "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS",
+            "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP",
+        ):
+            os.environ.pop(variable, None)
         return 0
 
     background_prefill_priority = streaming_tool_call_config[
@@ -102,6 +240,34 @@ def _configure_background_prefill_scheduling(
         raise ValueError(
             "background prefill completion requires vLLM scheduling_policy='priority'"
         )
+    max_foreground_requests = streaming_tool_call_config[
+        "background_prefill_max_foreground_requests"
+    ]
+    if (
+        isinstance(max_foreground_requests, bool)
+        or not isinstance(max_foreground_requests, int)
+        or max_foreground_requests < 0
+    ):
+        raise ValueError(
+            "background_prefill_max_foreground_requests must be a non-negative integer"
+        )
+    os.environ["NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS"] = str(
+        max_foreground_requests
+    )
+    max_tokens_per_step = streaming_tool_call_config[
+        "background_prefill_max_tokens_per_step"
+    ]
+    if (
+        isinstance(max_tokens_per_step, bool)
+        or not isinstance(max_tokens_per_step, int)
+        or max_tokens_per_step < 0
+    ):
+        raise ValueError(
+            "background_prefill_max_tokens_per_step must be a non-negative integer"
+        )
+    os.environ["NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP"] = str(
+        max_tokens_per_step
+    )
     return background_prefill_priority
 
 
@@ -372,6 +538,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         background_prefill_priority = _configure_background_prefill_scheduling(
             llm_kwargs, streaming_tool_call_config
         )
+        if background_prefill_priority and not getattr(
+            self, "vllm_patch_capabilities", {}
+        ).get("strict_priority_scheduling", False):
+            raise RuntimeError(
+                "background prefill completion requires strict vLLM priority "
+                "scheduling so speculative prefill cannot delay foreground requests"
+            )
 
         # Workaround: convert compilation_config dict to CompilationConfig object
         # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
@@ -403,6 +576,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            # ``AsyncLLM.__init__`` starts the output handler immediately when
+            # Ray invokes this synchronous method from an asyncio actor loop.
+            # The HTTP server owns all request queues and must also own the
+            # output handler that writes to them.
+            if _defer_vllm_output_handler_to_http_loop(self.llm):
+                LOGGER.info(
+                    "Deferred eager vLLM output handler to the HTTP server event loop"
+                )
 
         self.streaming_tool_call_manager = None
         if (
@@ -413,12 +595,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             from vllm.engine.protocol import StreamingInput
             from vllm.sampling_params import RequestOutputKind, SamplingParams
 
-            prefill_sampling_params = SamplingParams(
-                temperature=0,
-                top_p=1,
-                top_k=1,
-                max_tokens=1,
-                output_kind=RequestOutputKind.DELTA,
+            prefill_sampling_params = (
+                _build_streaming_tool_call_prefill_sampling_params(
+                    SamplingParams, RequestOutputKind
+                )
             )
 
             def generate_prefill(input_stream, request_id):
@@ -469,6 +649,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 require_cache_page_crossing=not streaming_tool_call_config.get(
                     "same_request_final_decode", False
                 ),
+                final_output_stall_timeout_seconds=streaming_tool_call_config[
+                    "request_timeout_seconds"
+                ],
             )
 
         self.server_thread, self.base_url, self.http_server = None, None, None
@@ -1058,6 +1241,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             required_prefix_token_ids: Optional[List[int]] = None
             required_full_prompt_token_ids: Optional[List[int]] = None
             streaming_tool_call_session_id: Optional[str] = None
+            streaming_tool_call_deferred_final_sequence_no: Optional[int] = None
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
@@ -1287,6 +1471,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             assert request.top_p == generation_config["top_p"]
 
             same_request_status = None
+            deferred_final_metrics = None
+            deferred_final_sequence_no = (
+                request.streaming_tool_call_deferred_final_sequence_no
+            )
+            if deferred_final_sequence_no is not None:
+                deferred_session_id = request.streaming_tool_call_session_id
+                if deferred_session_id is None:
+                    raise ValueError(
+                        "deferred streaming-tool finalization requires a session ID"
+                    )
+                deferred_final_metrics = (
+                    await finalize_streaming_tool_call_in_chat_request(
+                        request=request,
+                        raw_request=raw_request,
+                        session_id=deferred_session_id,
+                        sequence_no=deferred_final_sequence_no,
+                    )
+                )
             same_request_session_id = request.streaming_tool_call_session_id
             same_request_enabled = bool(
                 same_request_session_id
@@ -1333,6 +1535,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             "Same-request final decode fell back (%s): %s",
                             same_request_status,
                             error,
+                            exc_info=error,
                         )
                         generator = await openai_serving_chat.create_chat_completion(
                             request,
@@ -1356,6 +1559,35 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         same_request_status = "used"
                         if isinstance(generator, ErrorResponse):
                             await manager.abort(session_id=same_request_session_id)
+                        elif isinstance(generator, ChatCompletionResponse):
+                            same_request_response = (
+                                model_dump_chat_response_with_routed_experts(generator)
+                            )
+                            non_finite_paths = find_non_finite_float_paths(
+                                same_request_response
+                            )
+                            if non_finite_paths:
+                                # A non-finite logprob cannot be represented by
+                                # the OpenAI JSON contract and is unsafe for RL
+                                # training. Fail open to an ordinary full-prompt
+                                # request instead of returning HTTP 500 or
+                                # silently replacing policy logprobs.
+                                LOGGER.error(
+                                    "Same-request final decode produced a "
+                                    "non-JSON response; falling back to a "
+                                    "standard request. non_finite_paths=%s",
+                                    non_finite_paths,
+                                )
+                                await manager.abort(session_id=same_request_session_id)
+                                request = fallback_request
+                                request.streaming_tool_call_session_id = None
+                                same_request_status = "fallback_error"
+                                generator = (
+                                    await openai_serving_chat.create_chat_completion(
+                                        request,
+                                        raw_request,
+                                    )
+                                )
                 else:
                     generator = await openai_serving_chat.create_chat_completion(
                         request, raw_request
@@ -1386,9 +1618,32 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 response_content = model_dump_chat_response_with_routed_experts(
                     generator
                 )
+                non_finite_paths = find_non_finite_float_paths(response_content)
+                if non_finite_paths:
+                    LOGGER.error(
+                        "Chat completion response contains non-finite floats: %s",
+                        non_finite_paths,
+                    )
+                    return JSONResponse(
+                        content={
+                            "error": {
+                                "message": (
+                                    "model response contains non-finite floating-point "
+                                    "values"
+                                ),
+                                "type": "server_error",
+                                "code": 500,
+                            }
+                        },
+                        status_code=500,
+                    )
                 if same_request_status is not None:
                     response_content["streaming_tool_call_same_request_status"] = (
                         same_request_status
+                    )
+                if deferred_final_metrics is not None:
+                    response_content["streaming_tool_call_deferred_final_metrics"] = (
+                        deferred_final_metrics
                     )
                 return JSONResponse(content=response_content)
 
@@ -1993,6 +2248,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             prefill_background_enqueue_seconds = 0.0
             prefill_background_completion_seconds = 0.0
             prefill_same_request_session_sealed = 0
+            prefill_same_request_submitted_tokens = 0
+            prefill_same_request_inflight_tokens = 0
+            prefill_same_request_inflight_promotions = 0
+            prefill_same_request_incomplete_fallbacks = 0
             if request.prefill:
                 prefill_manager = get_streaming_tool_call_manager()
                 background_prefill_completion = bool(
@@ -2007,6 +2266,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     and streaming_config
                     and streaming_config["stop_after_first_prefill_page"]
                 )
+                # APC prefill stops at an exact cache-page boundary. A live
+                # same-request session intentionally admits a partial page, so
+                # only the client-side single-admission stop applies there.
                 background_enqueue_response = background_prefill_request and (
                     request.sequence_no == 0 or bounded_background_prefill_request
                 )
@@ -2017,11 +2279,33 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         if streaming_config and streaming_config.get(
                             "same_request_final_decode", False
                         ):
-                            prefill_close_result = await prefill_manager.seal(
-                                session_id=request.session_id,
-                                final_prompt_token_ids=result.tokens,
-                            )
-                            prefill_same_request_session_sealed = 1
+                            try:
+                                prefill_close_result = await prefill_manager.seal(
+                                    session_id=request.session_id,
+                                    final_prompt_token_ids=result.tokens,
+                                    require_completed_prefill=True,
+                                )
+                            except StreamingToolCallPrefillIncompleteError:
+                                # Controlled Super trace replay shows that promoting
+                                # an unfinished prefill adds 65--113 ms at zero
+                                # overlap. Close without waiting and preserve the
+                                # exact tokenizer result for a normal final request.
+                                prefill_close_result = await prefill_manager.close(
+                                    session_id=request.session_id,
+                                    final_prompt_token_ids=result.tokens,
+                                )
+                                prefill_same_request_incomplete_fallbacks = 1
+                            else:
+                                prefill_same_request_session_sealed = 1
+                                prefill_same_request_submitted_tokens = (
+                                    prefill_close_result.submitted_tokens
+                                )
+                                prefill_same_request_inflight_tokens = (
+                                    prefill_close_result.inflight_submitted_tokens
+                                )
+                                prefill_same_request_inflight_promotions = int(
+                                    prefill_close_result.inflight_submitted_tokens > 0
+                                )
                         else:
                             prefill_close_result = await prefill_manager.close(
                                 session_id=request.session_id,
@@ -2048,7 +2332,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                                                 request.required_prefix_token_ids or []
                                             ),
                                             max_cache_pages=(
-                                                1
+                                                _background_prefill_max_cache_pages(
+                                                    streaming_config
+                                                )
                                                 if bounded_background_prefill_request
                                                 else None
                                             ),
@@ -2286,6 +2572,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     "prefill_same_request_session_sealed": (
                         prefill_same_request_session_sealed
                     ),
+                    "prefill_same_request_submitted_tokens": (
+                        prefill_same_request_submitted_tokens
+                    ),
+                    "prefill_same_request_inflight_tokens": (
+                        prefill_same_request_inflight_tokens
+                    ),
+                    "prefill_same_request_inflight_promotions": (
+                        prefill_same_request_inflight_promotions
+                    ),
+                    "prefill_same_request_incomplete_fallbacks": (
+                        prefill_same_request_incomplete_fallbacks
+                    ),
                     "prefix_seed_attempts": prefix_seed_attempts,
                     "prefix_seed_successes": prefix_seed_successes,
                     "prefix_seed_fallbacks": prefix_seed_fallbacks,
@@ -2413,6 +2711,125 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
             return result
 
+        async def finalize_streaming_tool_call_in_chat_request(
+            *,
+            request: NeMoRLChatCompletionRequest,
+            raw_request: Request,
+            session_id: str,
+            sequence_no: int,
+        ) -> dict[str, Any]:
+            """Finalize tokenization and seal the live request in the chat handler."""
+            started_at = time.perf_counter()
+            request.streaming_tool_call_deferred_final_sequence_no = None
+            chat_values = request.model_dump()
+            incremental_values = {
+                field_name: chat_values[field_name]
+                for field_name in NeMoRLIncrementalTokenizeChatRequest.model_fields
+                if field_name in chat_values
+            }
+            incremental_values.update(
+                {
+                    "session_id": session_id,
+                    "sequence_no": sequence_no,
+                    "final": True,
+                    "return_tokens": True,
+                    "prefill": True,
+                    "prefill_continuation": True,
+                    "prefill_from_required_prefix": False,
+                    "finalize_from_required_prefix": False,
+                    "compact_context": False,
+                    "max_contexts": None,
+                    "context_ttl_seconds": None,
+                }
+            )
+            try:
+                incremental_request = (
+                    NeMoRLIncrementalTokenizeChatRequest.model_validate(
+                        incremental_values
+                    )
+                )
+                result = await incremental_tokenize(
+                    incremental_request,
+                    raw_request,
+                )
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "fused incremental finalization returned an HTTP response"
+                    )
+                prompt_token_ids = result.pop("tokens", None)
+                if prompt_token_ids is None:
+                    raise RuntimeError(
+                        "fused incremental finalization returned no prompt tokens"
+                    )
+            except Exception as error:
+                incremental_request_contexts.pop(session_id, None)
+                tokenizer_manager = incremental_tokenizer_manager
+                if tokenizer_manager is not None:
+                    tokenizer_manager.abort(session_id)
+                prefill_manager = getattr(
+                    worker_self, "streaming_tool_call_manager", None
+                )
+                if prefill_manager is not None:
+                    prefill_manager.bind_to_current_loop()
+                    await prefill_manager.abort(session_id=session_id)
+                request.required_full_prompt_token_ids = None
+                request.streaming_tool_call_session_id = None
+                LOGGER.warning(
+                    "Fused deferred streaming-tool finalization failed open "
+                    "for session %s: %s",
+                    session_id,
+                    error,
+                )
+                return {
+                    "completed": False,
+                    "request_seconds": time.perf_counter() - started_at,
+                    "token_count": 0,
+                    "prefill_failures": 1,
+                }
+
+            prompt_token_ids = list(prompt_token_ids)
+            request.required_full_prompt_token_ids = prompt_token_ids
+            session_sealed = int(result.get("prefill_same_request_session_sealed", 0))
+            request.streaming_tool_call_session_id = (
+                session_id if session_sealed else None
+            )
+            metric_names = (
+                "prefill_seconds",
+                "prefill_prefix_matched",
+                "prefill_failures",
+                "prefill_committed_tokens",
+                "prefill_completed_chunks",
+                "prefill_dummy_tokens",
+                "prefill_background_scheduled_chunks",
+                "prefill_background_scheduled_tokens",
+                "prefill_background_completed_chunks",
+                "prefill_background_completed_tokens",
+                "prefill_background_cancelled_chunks",
+                "prefill_background_cancelled_tokens",
+                "prefill_background_failed_chunks",
+                "prefill_background_failed_tokens",
+                "prefill_same_request_session_sealed",
+                "prefill_same_request_submitted_tokens",
+                "prefill_same_request_inflight_tokens",
+                "prefill_same_request_inflight_promotions",
+                "prefill_same_request_incomplete_fallbacks",
+                "server_render_seconds",
+                "server_incremental_tokenizer_seconds",
+                "server_request_handler_seconds",
+            )
+            metrics = {
+                metric_name: result.get(metric_name, 0) for metric_name in metric_names
+            }
+            metrics.update(
+                {
+                    "completed": True,
+                    "request_seconds": time.perf_counter() - started_at,
+                    "token_count": len(prompt_token_ids),
+                    "prompt_token_ids": prompt_token_ids,
+                }
+            )
+            return metrics
+
         @app.post("/incremental_tokenize/abort")
         async def abort_incremental_tokenize(
             request: StreamingToolCallAbortRequest,
@@ -2450,6 +2867,42 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             manager = getattr(self, "streaming_tool_call_manager", None)
             if manager is not None:
                 manager.bind_to_current_loop()
+            debug_interval = float(
+                os.environ.get(
+                    "NEMO_RL_STREAMING_TOOL_CALL_DEBUG_INTERVAL_SECONDS", "0"
+                )
+            )
+            if manager is None or debug_interval <= 0:
+                return
+
+            async def log_streaming_tool_call_liveness() -> None:
+                while True:
+                    await asyncio.sleep(debug_interval)
+                    try:
+                        snapshot = _streaming_tool_call_debug_snapshot(
+                            self.llm, manager
+                        )
+                        snapshot.update(_latest_vllm_debug_metrics_snapshot(self))
+                    except Exception:
+                        LOGGER.exception("Streaming tool-call liveness snapshot failed")
+                    else:
+                        LOGGER.warning("Streaming tool-call liveness: %s", snapshot)
+
+            app.state.streaming_tool_call_debug_task = asyncio.create_task(
+                log_streaming_tool_call_liveness(),
+                name="streaming-tool-call-liveness",
+            )
+
+        @app.on_event("shutdown")
+        async def stop_streaming_tool_call_debug_task() -> None:
+            task = getattr(app.state, "streaming_tool_call_debug_task", None)
+            if task is None:
+                return
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         @app.post("/v1/streaming_tool_call/start")
         async def start_streaming_tool_call(

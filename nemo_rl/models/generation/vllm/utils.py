@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -28,6 +29,42 @@ R3_MISSING_ROUTE_SENTINEL = -1
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def find_non_finite_float_paths(value: Any, *, max_paths: int = 16) -> list[str]:
+    """Return JSON-style paths to non-finite floats in a response payload.
+
+    Starlette deliberately rejects NaN and infinity when serializing JSON.  A
+    path list makes the upstream producer diagnosable without logging the full
+    model response, which can contain a large prompt or sensitive trajectory
+    content.
+    """
+    if max_paths <= 0:
+        raise ValueError("max_paths must be positive")
+
+    paths: list[str] = []
+
+    def visit(item: Any, path: str) -> None:
+        if len(paths) >= max_paths:
+            return
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                paths.append(path)
+            return
+        if isinstance(item, dict):
+            for key, child in item.items():
+                visit(child, f"{path}.{key}")
+                if len(paths) >= max_paths:
+                    return
+            return
+        if isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                visit(child, f"{path}[{index}]")
+                if len(paths) >= max_paths:
+                    return
+
+    visit(value, "$")
+    return paths
 
 
 def _as_routed_experts_tensor(

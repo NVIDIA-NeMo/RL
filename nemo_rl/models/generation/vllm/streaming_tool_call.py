@@ -40,12 +40,22 @@ class StreamingToolCallSessionClosedError(StreamingToolCallError):
     """Raised when work is submitted to a closed or failed session."""
 
 
+class StreamingToolCallFinalOutputStallError(StreamingToolCallSessionClosedError):
+    """Raised when authoritative final decode stops producing output."""
+
+
 class StreamingToolCallEngineStateMismatchError(StreamingToolCallSessionClosedError):
     """Raised when local and engine streaming-prompt accounting diverge."""
 
 
 class StreamingToolCallFinalizationUnavailableError(StreamingToolCallError):
     """Raised before final decode when a session cannot be reused safely."""
+
+
+class StreamingToolCallPrefillIncompleteError(
+    StreamingToolCallFinalizationUnavailableError
+):
+    """Raised when final decode requires a completed speculative prefill."""
 
 
 def validate_prompt_token_count(
@@ -87,6 +97,8 @@ class StreamingToolCallCloseResult:
 
     prefix_matched: bool
     committed_tokens: int
+    submitted_tokens: int
+    inflight_submitted_tokens: int
     completed_chunks: int
     dummy_tokens: int
     background_scheduled_chunks: int
@@ -126,7 +138,7 @@ class _PendingChunk:
 @dataclass
 class _PendingFinal:
     streaming_input: Any
-    token_count: int
+    token_ids: list[int]
 
 
 @dataclass(frozen=True)
@@ -144,6 +156,7 @@ class _StreamingToolCallSession:
     input_queue: asyncio.Queue[_PendingChunk | _PendingFinal | None]
     append_lock: asyncio.Lock
     task: asyncio.Task[None] | None = None
+    expiry_task: asyncio.Task[None] | None = None
     committed_token_ids: list[int] = field(default_factory=list)
     last_candidate_token_ids: list[int] | None = None
     last_result: StreamingToolCallAppendResult | None = None
@@ -160,6 +173,8 @@ class _StreamingToolCallSession:
     final_output_queue: asyncio.Queue[Any] | None = None
     final_output_closed: bool = False
     engine_submitted_prompt_tokens: int = 0
+    engine_submitted_token_ids: list[int] = field(default_factory=list)
+    engine_prompt_token_boundaries: list[int] = field(default_factory=list)
     engine_observed_prompt_tokens: int | None = None
     background_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     background_start_prompt_token_ids: list[int] | None = None
@@ -214,6 +229,7 @@ class StreamingToolCallPrefillManager:
         max_prompt_tokens: int,
         cache_page_size_tokens: int | None = None,
         require_cache_page_crossing: bool = True,
+        final_output_stall_timeout_seconds: float | None = None,
     ) -> None:
         if max_sessions < 1:
             raise ValueError("max_sessions must be at least 1")
@@ -225,6 +241,13 @@ class StreamingToolCallPrefillManager:
             raise ValueError("max_prompt_tokens must be at least 1")
         if cache_page_size_tokens is not None and cache_page_size_tokens < 1:
             raise ValueError("cache_page_size_tokens must be positive when set")
+        if (
+            final_output_stall_timeout_seconds is not None
+            and final_output_stall_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "final_output_stall_timeout_seconds must be positive when set"
+            )
 
         self._generate = generate
         self._make_streaming_input = make_streaming_input
@@ -237,6 +260,7 @@ class StreamingToolCallPrefillManager:
         self._max_prompt_tokens = max_prompt_tokens
         self._cache_page_size_tokens = cache_page_size_tokens
         self._require_cache_page_crossing = require_cache_page_crossing
+        self._final_output_stall_timeout_seconds = final_output_stall_timeout_seconds
         self._sessions: dict[str, _StreamingToolCallSession] = {}
         self._aborted_sessions: OrderedDict[str, float] = OrderedDict()
         self._lock = asyncio.Lock()
@@ -268,6 +292,70 @@ class StreamingToolCallPrefillManager:
     def active_session_count(self) -> int:
         """Return the number of currently registered sessions."""
         return len(self._sessions)
+
+    def debug_snapshot(self) -> dict[str, int | float]:
+        """Return aggregate live-session state without exposing request data.
+
+        The HTTP server invokes this on the manager's owning event loop, so the
+        snapshot cannot race with session mutation and does not need to acquire
+        the async lock. It is intended for an opt-in, low-frequency watchdog;
+        the rollout hot path never calls it.
+        """
+        self._assert_owner_loop()
+        sessions = tuple(self._sessions.values())
+        tasks = tuple(session.task for session in sessions if session.task is not None)
+        expiry_tasks = tuple(
+            session.expiry_task
+            for session in sessions
+            if session.expiry_task is not None
+        )
+        now = time.monotonic()
+        return {
+            "manager_active_sessions": len(sessions),
+            "manager_sealed_sessions": sum(session.sealed for session in sessions),
+            "manager_finalizing_sessions": sum(
+                session.finalizing for session in sessions
+            ),
+            "manager_closed_sessions": sum(session.closed for session in sessions),
+            "manager_terminal_errors": sum(
+                session.terminal_error is not None for session in sessions
+            ),
+            "manager_tasks_pending": sum(not task.done() for task in tasks),
+            "manager_tasks_done": sum(task.done() for task in tasks),
+            "manager_tasks_cancelled": sum(task.cancelled() for task in tasks),
+            "manager_expiry_tasks_pending": sum(
+                not task.done() for task in expiry_tasks
+            ),
+            "manager_input_queue_depth": sum(
+                session.input_queue.qsize() for session in sessions
+            ),
+            "manager_pending_acknowledgements": sum(
+                len(session.pending_acknowledgements) for session in sessions
+            ),
+            "manager_final_output_queue_depth": sum(
+                session.final_output_queue.qsize()
+                for session in sessions
+                if session.final_output_queue is not None
+            ),
+            "manager_background_tasks_pending": sum(
+                not task.done()
+                for session in sessions
+                for task in session.background_tasks
+            ),
+            "manager_committed_tokens": sum(
+                len(session.committed_token_ids) for session in sessions
+            ),
+            "manager_submitted_tokens": sum(
+                session.engine_submitted_prompt_tokens for session in sessions
+            ),
+            "manager_observed_tokens": sum(
+                session.engine_observed_prompt_tokens or 0 for session in sessions
+            ),
+            "manager_oldest_idle_seconds": max(
+                (now - session.last_activity_monotonic for session in sessions),
+                default=0.0,
+            ),
+        }
 
     @property
     def total_dummy_tokens(self) -> int:
@@ -319,6 +407,18 @@ class StreamingToolCallPrefillManager:
         """
         committed_tokens = len(session.committed_token_ids)
         submitted_tokens = session.engine_submitted_prompt_tokens
+        if submitted_tokens != len(session.engine_submitted_token_ids):
+            raise StreamingToolCallEngineStateMismatchError(
+                "streaming tool-call submitted token accounting diverged: "
+                f"count={submitted_tokens}, "
+                f"tokens={len(session.engine_submitted_token_ids)}"
+            )
+        if not _has_prefix(
+            session.engine_submitted_token_ids, session.committed_token_ids
+        ):
+            raise StreamingToolCallEngineStateMismatchError(
+                "streaming tool-call committed tokens do not prefix submitted tokens"
+            )
         observed_tokens = session.engine_observed_prompt_tokens
         if submitted_tokens != committed_tokens or observed_tokens not in (
             None,
@@ -386,6 +486,10 @@ class StreamingToolCallPrefillManager:
             session.task = asyncio.create_task(
                 self._run_session(session),
                 name=f"streaming-tool-call-{session_id}",
+            )
+            session.expiry_task = asyncio.create_task(
+                self._expire_session_after_idle(session),
+                name=f"streaming-tool-call-expiry-{session_id}",
             )
             return session, True
 
@@ -849,6 +953,12 @@ class StreamingToolCallPrefillManager:
         return StreamingToolCallCloseResult(
             prefix_matched=prefix_matched,
             committed_tokens=len(session.committed_token_ids),
+            submitted_tokens=len(session.engine_submitted_token_ids),
+            inflight_submitted_tokens=max(
+                0,
+                len(session.engine_submitted_token_ids)
+                - len(session.committed_token_ids),
+            ),
             completed_chunks=session.completed_chunks,
             dummy_tokens=session.dummy_tokens,
             background_scheduled_chunks=session.background_scheduled_chunks,
@@ -875,7 +985,11 @@ class StreamingToolCallPrefillManager:
         )
 
     async def seal(
-        self, *, session_id: str, final_prompt_token_ids: list[int]
+        self,
+        *,
+        session_id: str,
+        final_prompt_token_ids: list[int],
+        require_completed_prefill: bool = False,
     ) -> StreamingToolCallCloseResult:
         """Seal a settled session for one authoritative same-request decode.
 
@@ -892,25 +1006,37 @@ class StreamingToolCallPrefillManager:
             raise StreamingToolCallFinalizationUnavailableError(
                 f"streaming tool-call session is already finalizing: {session_id}"
             )
-        if (
-            session.append_lock.locked()
-            or session.pending_acknowledgements
-            or not session.input_queue.empty()
-            or any(not task.done() for task in session.background_tasks)
-        ):
+        # A background chunk that has already entered vLLM is safe to reuse even
+        # before its one-token acknowledgement arrives. Late append tasks observe
+        # ``sealed`` and fail without submitting more input. The queue itself must
+        # be empty so the final suffix is ordered directly after the exact token
+        # prefix already handed to the engine.
+        if not session.input_queue.empty():
             raise StreamingToolCallFinalizationUnavailableError(
-                f"streaming tool-call session still has in-flight work: {session_id}"
+                f"streaming tool-call session has unsubmitted queued work: {session_id}"
             )
-        self._validate_engine_prompt_accounting(session)
-        if session.completed_chunks <= 0:
+        submitted_prompt_token_ids = session.engine_submitted_token_ids
+        if session.engine_submitted_prompt_tokens != len(submitted_prompt_token_ids):
+            raise StreamingToolCallEngineStateMismatchError(
+                "streaming tool-call submitted token accounting diverged"
+            )
+        if not submitted_prompt_token_ids:
             raise StreamingToolCallFinalizationUnavailableError(
-                f"streaming tool-call session completed no prefill: {session_id}"
+                f"streaming tool-call session submitted no prefill: {session_id}"
             )
-        if not _has_prefix(final_prompt_token_ids, session.committed_token_ids):
+        inflight_submitted_tokens = len(submitted_prompt_token_ids) - len(
+            session.committed_token_ids
+        )
+        if require_completed_prefill and inflight_submitted_tokens:
+            raise StreamingToolCallPrefillIncompleteError(
+                "streaming tool-call prefill has not completed: "
+                f"session={session_id}, inflight_tokens={inflight_submitted_tokens}"
+            )
+        if not _has_prefix(final_prompt_token_ids, submitted_prompt_token_ids):
             raise StreamingToolCallPrefixMismatchError(
-                "final prompt token IDs do not extend the committed session prefix"
+                "final prompt token IDs do not extend the submitted session prefix"
             )
-        if len(final_prompt_token_ids) == len(session.committed_token_ids):
+        if len(final_prompt_token_ids) == len(submitted_prompt_token_ids):
             raise StreamingToolCallFinalizationUnavailableError(
                 f"streaming tool-call final suffix is empty: {session_id}"
             )
@@ -955,19 +1081,13 @@ class StreamingToolCallPrefillManager:
                 raise StreamingToolCallPrefixMismatchError(
                     "final model-call tokens differ from the sealed prompt tokens"
                 )
-            if (
-                session.append_lock.locked()
-                or session.pending_acknowledgements
-                or not session.input_queue.empty()
-                or any(not task.done() for task in session.background_tasks)
-            ):
+            if not session.input_queue.empty():
                 raise StreamingToolCallFinalizationUnavailableError(
-                    f"streaming tool-call session has late in-flight work: {session_id}"
+                    f"streaming tool-call session has late queued work: {session_id}"
                 )
-            self._validate_engine_prompt_accounting(session)
 
             final_suffix_token_ids = final_prompt_token_ids[
-                len(session.committed_token_ids) :
+                len(session.engine_submitted_token_ids) :
             ]
             if not final_suffix_token_ids:
                 raise StreamingToolCallFinalizationUnavailableError(
@@ -982,7 +1102,7 @@ class StreamingToolCallPrefillManager:
             session.input_queue.put_nowait(
                 _PendingFinal(
                     streaming_input=final_input,
-                    token_count=len(final_suffix_token_ids),
+                    token_ids=list(final_suffix_token_ids),
                 )
             )
             session.last_activity_monotonic = time.monotonic()
@@ -996,12 +1116,32 @@ class StreamingToolCallPrefillManager:
         assert output_queue is not None
         try:
             while True:
-                output = await output_queue.get()
+                try:
+                    if self._final_output_stall_timeout_seconds is None:
+                        output = await output_queue.get()
+                    else:
+                        output = await asyncio.wait_for(
+                            output_queue.get(),
+                            timeout=self._final_output_stall_timeout_seconds,
+                        )
+                except TimeoutError as error:
+                    raise StreamingToolCallFinalOutputStallError(
+                        "streaming tool-call final decode produced no output for "
+                        f"{self._final_output_stall_timeout_seconds:g}s: "
+                        f"session={session.session_id}, "
+                        f"committed={len(session.committed_token_ids)}, "
+                        f"submitted={session.engine_submitted_prompt_tokens}, "
+                        f"observed={session.engine_observed_prompt_tokens}, "
+                        "pending_acknowledgements="
+                        f"{len(session.pending_acknowledgements)}"
+                    ) from error
                 if output is _FINAL_OUTPUT_DONE:
                     return
                 if isinstance(output, _FinalOutputError):
                     raise StreamingToolCallSessionClosedError(
-                        f"streaming tool-call final decode failed: {session.session_id}"
+                        "streaming tool-call final decode failed: "
+                        f"session={session.session_id}, "
+                        f"cause={type(output.error).__name__}: {output.error}"
                     ) from output.error
                 yield output
         finally:
@@ -1067,6 +1207,11 @@ class StreamingToolCallPrefillManager:
         for session in sessions:
             self._cancel_session(session)
         tasks = [session.task for session in sessions if session.task is not None]
+        tasks.extend(
+            session.expiry_task
+            for session in sessions
+            if session.expiry_task is not None
+        )
         tasks.extend(task for session in sessions for task in session.background_tasks)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1100,6 +1245,31 @@ class StreamingToolCallPrefillManager:
         for session in stale_sessions:
             self._cancel_session(session)
         return len(stale_sessions)
+
+    async def _expire_session_after_idle(
+        self, session: _StreamingToolCallSession
+    ) -> None:
+        """Proactively reclaim one idle session without polling the hot path."""
+        while True:
+            expires_at = session.last_activity_monotonic + self._session_ttl_seconds
+            remaining = expires_at - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+
+            async with self._lock:
+                if self._sessions.get(session.session_id) is not session:
+                    return
+                # Activity can race the lock acquisition after the timer wakes.
+                # Re-evaluate under the same lock used to unregister.
+                if (
+                    time.monotonic() - session.last_activity_monotonic
+                    < self._session_ttl_seconds
+                ):
+                    continue
+                self._sessions.pop(session.session_id)
+            self._cancel_session(session)
+            return
 
     async def wait_for_cleanup(self) -> None:
         """Yield once so cancellation reaches session tasks in tests and shutdown."""
@@ -1218,11 +1388,13 @@ class StreamingToolCallPrefillManager:
                 if chunk is None:
                     return
                 if isinstance(chunk, _PendingFinal):
-                    submitted_tokens = (
-                        session.engine_submitted_prompt_tokens + chunk.token_count
+                    submitted_tokens = session.engine_submitted_prompt_tokens + len(
+                        chunk.token_ids
                     )
                     self._validate_prompt_token_count(submitted_tokens)
                     session.engine_submitted_prompt_tokens = submitted_tokens
+                    session.engine_submitted_token_ids.extend(chunk.token_ids)
+                    session.engine_prompt_token_boundaries.append(submitted_tokens)
                     yield chunk.streaming_input
                     return
                 submitted_tokens = session.engine_submitted_prompt_tokens + len(
@@ -1235,29 +1407,82 @@ class StreamingToolCallPrefillManager:
                         chunk.acknowledgement.set_exception(error)
                     raise
                 session.engine_submitted_prompt_tokens = submitted_tokens
+                session.engine_submitted_token_ids.extend(chunk.token_ids)
+                session.engine_prompt_token_boundaries.append(submitted_tokens)
                 session.pending_acknowledgements.append(chunk.acknowledgement)
                 yield self._make_streaming_input(chunk.token_ids)
 
         try:
             async for output in self._generate(input_stream(), session.request_id):
+                observed_prompt_tokens = None
                 if self._get_prompt_token_count is not None:
                     observed_prompt_tokens = self._get_prompt_token_count(output)
                     if observed_prompt_tokens is not None:
+                        previous_observed_prompt_tokens = (
+                            session.engine_observed_prompt_tokens
+                        )
                         session.engine_observed_prompt_tokens = observed_prompt_tokens
                         if (
                             observed_prompt_tokens
-                            != session.engine_submitted_prompt_tokens
+                            not in session.engine_prompt_token_boundaries
+                            or (
+                                previous_observed_prompt_tokens is not None
+                                and observed_prompt_tokens
+                                < previous_observed_prompt_tokens
+                            )
                         ):
                             raise StreamingToolCallEngineStateMismatchError(
                                 "vLLM reported an unexpected streaming prompt length: "
-                                f"submitted={session.engine_submitted_prompt_tokens}, "
+                                "submitted_boundaries="
+                                f"{session.engine_prompt_token_boundaries}, "
                                 f"observed={observed_prompt_tokens}"
                             )
+                output_tokens = self._count_output_tokens(output)
+                is_authoritative_final_output = (
+                    session.finalizing
+                    and session.sealed_prompt_token_ids is not None
+                    and observed_prompt_tokens == len(session.sealed_prompt_token_ids)
+                )
+                if (
+                    session.pending_acknowledgements
+                    and output_tokens
+                    and not is_authoritative_final_output
+                ):
+                    if output_tokens > len(session.pending_acknowledgements):
+                        raise StreamingToolCallEngineStateMismatchError(
+                            "vLLM combined speculative dummy and final output tokens"
+                        )
+                    for _ in range(output_tokens):
+                        acknowledgement = session.pending_acknowledgements.popleft()
+                        if not acknowledgement.done():
+                            acknowledgement.set_result(1)
+                    # The speculative one-token decode exists only to make vLLM
+                    # retain the resumable session. Never expose it as final model
+                    # output when finalization races the acknowledgement.
+                    continue
                 if session.finalizing:
+                    if session.pending_acknowledgements:
+                        if not is_authoritative_final_output:
+                            raise StreamingToolCallEngineStateMismatchError(
+                                "vLLM final output did not report the sealed prompt "
+                                "boundary while a prefill acknowledgement was pending"
+                            )
+                        while session.pending_acknowledgements:
+                            acknowledgement = session.pending_acknowledgements.popleft()
+                            if not acknowledgement.done():
+                                # vLLM suppressed the discarded transition dummy
+                                # before its aggregate queue. Reaching the final
+                                # prompt proves that the preceding prefill completed.
+                                acknowledgement.set_result(1)
                     assert session.final_output_queue is not None
                     session.final_output_queue.put_nowait(output)
+                    # Final decode can legitimately run longer than the idle
+                    # session TTL. Treat every engine output as progress so
+                    # the expiry task does not cancel an actively generating
+                    # request. A genuinely stalled final decode is bounded by
+                    # ``final_output_stall_timeout_seconds`` at the consumer.
+                    session.last_activity_monotonic = time.monotonic()
                     continue
-                output_tokens = self._count_output_tokens(output)
                 for _ in range(output_tokens):
                     if not session.pending_acknowledgements:
                         break
@@ -1295,6 +1520,13 @@ class StreamingToolCallPrefillManager:
                 queued_chunk.acknowledgement.set_exception(error)
         if session.task is not None and not session.task.done():
             session.task.cancel()
+        current_task = asyncio.current_task()
+        if (
+            session.expiry_task is not None
+            and session.expiry_task is not current_task
+            and not session.expiry_task.done()
+        ):
+            session.expiry_task.cancel()
         for task in tuple(session.background_tasks):
             if not task.done():
                 task.cancel()

@@ -63,6 +63,8 @@
 #               PREFIX_SEEDED_START,
 #               PREFILL_AFTER_ADMISSION,
 #               BACKGROUND_PREFILL_COMPLETION,
+#               BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS,
+#               BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP,
 #               STOP_AFTER_FIRST_PREFILL_PAGE,
 #               STABLE_FIRST_SNAPSHOT_PREFILL,
 #               COMPACT_REQUEST_CONTEXT,
@@ -102,6 +104,7 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 # ================ Container and mount config ================
 # NeMo RL nightly-gym used for Nano 3 streaming-prefill development.
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/joyang/RL/results/images/nemo-rl-nightly-gym-20260718.squashfs}"
+export NEMO_RL_STREAMING_TOOL_CALL_DEBUG_INTERVAL_SECONDS="${NEMO_RL_STREAMING_TOOL_CALL_DEBUG_INTERVAL_SECONDS:-0}"
 GYM_CODE="${REPO_ROOT}/3rdparty/Gym-workspace/Gym"
 export MOUNTS="/lustre:/lustre,${REPO_ROOT}:${REPO_ROOT},${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
@@ -129,8 +132,11 @@ FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS="${FINAL_ONLY_PREFILL_COMPLETION_GRA
 PREFIX_SEEDED_START="${PREFIX_SEEDED_START:-0}"
 PREFILL_AFTER_ADMISSION="${PREFILL_AFTER_ADMISSION:-0}"
 BACKGROUND_PREFILL_COMPLETION="${BACKGROUND_PREFILL_COMPLETION:-0}"
+BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS="${BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS:-0}"
+BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP="${BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP:-0}"
 STOP_AFTER_FIRST_PREFILL_PAGE="${STOP_AFTER_FIRST_PREFILL_PAGE:-0}"
 SAME_REQUEST_FINAL_DECODE="${SAME_REQUEST_FINAL_DECODE:-0}"
+DEFER_FINALIZATION_TO_MODEL_CALL="${DEFER_FINALIZATION_TO_MODEL_CALL:-0}"
 STABLE_FIRST_SNAPSHOT_PREFILL="${STABLE_FIRST_SNAPSHOT_PREFILL:-0}"
 COMPACT_REQUEST_CONTEXT="${COMPACT_REQUEST_CONTEXT:-0}"
 INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL:-8}"
@@ -201,6 +207,14 @@ if [ "${BACKGROUND_PREFILL_COMPLETION}" = "1" ] && [ "${PREFILL_AFTER_ADMISSION}
   echo "ERROR: BACKGROUND_PREFILL_COMPLETION requires PREFILL_AFTER_ADMISSION=1." >&2
   exit 1
 fi
+if ! [[ "${BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "${BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP must be a non-negative integer." >&2
+  exit 1
+fi
 if [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" != "0" ] && [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" != "1" ]; then
   echo "ERROR: STOP_AFTER_FIRST_PREFILL_PAGE must be 0 or 1." >&2
   exit 1
@@ -215,6 +229,14 @@ if [ "${SAME_REQUEST_FINAL_DECODE}" != "0" ] && [ "${SAME_REQUEST_FINAL_DECODE}"
 fi
 if [ "${SAME_REQUEST_FINAL_DECODE}" = "1" ] && [ "${BACKGROUND_PREFILL_COMPLETION}" != "1" ]; then
   echo "ERROR: SAME_REQUEST_FINAL_DECODE requires BACKGROUND_PREFILL_COMPLETION=1." >&2
+  exit 1
+fi
+if [ "${DEFER_FINALIZATION_TO_MODEL_CALL}" != "0" ] && [ "${DEFER_FINALIZATION_TO_MODEL_CALL}" != "1" ]; then
+  echo "ERROR: DEFER_FINALIZATION_TO_MODEL_CALL must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${DEFER_FINALIZATION_TO_MODEL_CALL}" = "1" ] && { [ "${SAME_REQUEST_FINAL_DECODE}" != "1" ] || [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" != "1" ] || [ "${COMPACT_REQUEST_CONTEXT}" != "1" ]; }; then
+  echo "ERROR: DEFER_FINALIZATION_TO_MODEL_CALL requires SAME_REQUEST_FINAL_DECODE=1, STOP_AFTER_FIRST_PREFILL_PAGE=1, and COMPACT_REQUEST_CONTEXT=1." >&2
   exit 1
 fi
 if [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" != "0" ] && [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" != "1" ]; then
@@ -326,6 +348,12 @@ if [ "${SAME_REQUEST_FINAL_DECODE}" = "1" ]; then
   STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-same-request"
 else
   SAME_REQUEST_FINAL_DECODE_ENABLED=False
+fi
+if [ "${DEFER_FINALIZATION_TO_MODEL_CALL}" = "1" ]; then
+  DEFER_FINALIZATION_TO_MODEL_CALL_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-deferred-final"
+else
+  DEFER_FINALIZATION_TO_MODEL_CALL_ENABLED=False
 fi
 if [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" = "1" ]; then
   STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED=True
@@ -652,8 +680,11 @@ echo "Final-only incremental tokenizer: ${FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABL
 echo "Final-only prefill: ${FINAL_ONLY_PREFILL_ENABLED}"
 echo "Final-only prefill completion grace: ${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS}s"
 echo "Background prefill completion: ${BACKGROUND_PREFILL_COMPLETION_ENABLED}"
+echo "Background prefill max foreground requests: ${BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS}"
+echo "Background prefill max tokens per step: ${BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP}"
 echo "Stop after first prefill page: ${STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED}"
 echo "Same-request final decode: ${SAME_REQUEST_FINAL_DECODE_ENABLED}"
+echo "Defer finalization to model call: ${DEFER_FINALIZATION_TO_MODEL_CALL_ENABLED}"
 echo "Authoritative-prefix seeded start: ${PREFIX_SEEDED_START_ENABLED}"
 echo "Prefill after admission: ${PREFILL_AFTER_ADMISSION_ENABLED}"
 echo "Stable first-snapshot prefill: ${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED}"
@@ -823,6 +854,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   TORCH_CUDA_ARCH_LIST='9.0 10.0' \
   NVTE_CUDA_ARCHS='90;100' \
   NEMO_GYM_SKIP_VENV_IF_PRESENT=1 \
+  NEMO_RL_STREAMING_TOOL_CALL_DEBUG_INTERVAL_SECONDS=${NEMO_RL_STREAMING_TOOL_CALL_DEBUG_INTERVAL_SECONDS} \
   uv run --frozen --extra mcore ./examples/nemo_gym/run_grpo_nemo_gym.py \
   --config=${CONFIG_FILE} \
   cluster.num_nodes=${TOTAL_NODES} \
@@ -882,8 +914,11 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   policy.generation.vllm_cfg.streaming_tool_call.prefix_seeded_start=${PREFIX_SEEDED_START_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.prefill_after_admission=${PREFILL_AFTER_ADMISSION_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.background_prefill_completion=${BACKGROUND_PREFILL_COMPLETION_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.background_prefill_max_foreground_requests=${BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS} \
+  policy.generation.vllm_cfg.streaming_tool_call.background_prefill_max_tokens_per_step=${BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP} \
   policy.generation.vllm_cfg.streaming_tool_call.stop_after_first_prefill_page=${STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.same_request_final_decode=${SAME_REQUEST_FINAL_DECODE_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.defer_finalization_to_model_call=${DEFER_FINALIZATION_TO_MODEL_CALL_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.stable_first_snapshot_prefill=${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.compact_request_context=${COMPACT_REQUEST_CONTEXT_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \
@@ -902,6 +937,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   env.nemo_gym.streaming_tool_call.background_prefill_completion=${BACKGROUND_PREFILL_COMPLETION_ENABLED} \
   env.nemo_gym.streaming_tool_call.stop_after_first_prefill_page=${STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED} \
   env.nemo_gym.streaming_tool_call.same_request_final_decode=${SAME_REQUEST_FINAL_DECODE_ENABLED} \
+  env.nemo_gym.streaming_tool_call.defer_finalization_to_model_call=${DEFER_FINALIZATION_TO_MODEL_CALL_ENABLED} \
   env.nemo_gym.streaming_tool_call.stable_first_snapshot_prefill=${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED} \
   env.nemo_gym.streaming_tool_call.compact_request_context=${COMPACT_REQUEST_CONTEXT_ENABLED} \
   env.nemo_gym.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -20,6 +21,7 @@ import time
 import types
 from copy import deepcopy
 from pathlib import Path
+from threading import Lock
 from unittest.mock import MagicMock
 
 import pytest
@@ -42,14 +44,122 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _build_streaming_tool_call_prefill_sampling_params,
     _configure_background_prefill_scheduling,
+    _defer_vllm_output_handler_to_http_loop,
+    _latest_vllm_debug_metrics_snapshot,
     _materialize_message_tool_calls,
     _replace_prefix_tokens,
+    _streaming_tool_call_debug_snapshot,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.asyncio
+async def test_vllm_http_output_handler_is_recreated_on_http_loop():
+    output_handler = asyncio.create_task(asyncio.Event().wait())
+    llm = types.SimpleNamespace(output_handler=output_handler)
+
+    assert _defer_vllm_output_handler_to_http_loop(llm)
+    assert llm.output_handler is None
+    await asyncio.sleep(0)
+    assert output_handler.cancelled()
+
+
+def test_vllm_http_output_handler_defer_is_noop_outside_async_construction():
+    llm = types.SimpleNamespace(output_handler=None)
+
+    assert not _defer_vllm_output_handler_to_http_loop(llm)
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_debug_snapshot_reports_aggregate_liveness():
+    output_handler = asyncio.create_task(asyncio.Event().wait())
+    queue = types.SimpleNamespace(
+        ready=asyncio.Event(),
+        output=object(),
+    )
+    request_state = types.SimpleNamespace(
+        streaming_input=False,
+        input_chunk_queue=[],
+        is_prefilling=True,
+        queue=queue,
+        prompt_len=12,
+    )
+    manager = types.SimpleNamespace(
+        debug_snapshot=lambda: {"manager_active_sessions": 1}
+    )
+    llm = types.SimpleNamespace(
+        output_handler=output_handler,
+        output_processor=types.SimpleNamespace(
+            request_states={"redacted": request_state}
+        ),
+    )
+
+    snapshot = _streaming_tool_call_debug_snapshot(llm, manager)
+
+    assert snapshot == {
+        "output_handler_absent": False,
+        "output_handler_done": False,
+        "output_handler_cancelled": False,
+        "output_handler_exception": None,
+        "output_handler_on_http_loop": True,
+        "frontend_request_states": 1,
+        "frontend_streaming_states": 1,
+        "frontend_prefilling_states": 1,
+        "frontend_queued_streaming_updates": 0,
+        "frontend_ready_output_queues": 0,
+        "frontend_buffered_output_queues": 1,
+        "frontend_prompt_tokens": 12,
+        "manager_active_sessions": 1,
+    }
+    output_handler.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await output_handler
+
+
+def test_latest_vllm_debug_metrics_snapshot_uses_sampled_values():
+    worker = types.SimpleNamespace(
+        cfg={"vllm_cfg": {"enable_vllm_metrics_logger": True}},
+        _vllm_metrics_lock=Lock(),
+        inflight_batch_sizes=[2, 3],
+        num_pending_samples=[4],
+        kv_cache_usage_perc=[0.75],
+        generation_tokens=[100, 120],
+        streaming_tool_call_dummy_tokens=[5],
+        streaming_tool_call_prefill_tokens=[90],
+    )
+
+    assert _latest_vllm_debug_metrics_snapshot(worker) == {
+        "engine_running_requests": 3,
+        "engine_waiting_requests": 4,
+        "engine_kv_cache_usage": 0.75,
+        "engine_generation_tokens": 120,
+        "engine_streaming_dummy_tokens": 5,
+        "engine_streaming_prefill_tokens": 90,
+    }
+
+
+def test_streaming_prefill_avoids_discarded_dummy_logprobs():
+    class FakeSamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    params = _build_streaming_tool_call_prefill_sampling_params(
+        FakeSamplingParams,
+        types.SimpleNamespace(DELTA="delta"),
+    )
+
+    assert params.kwargs == {
+        "temperature": 0,
+        "top_p": 1,
+        "top_k": 1,
+        "max_tokens": 1,
+        "output_kind": "delta",
+    }
 
 
 def test_background_prefill_scheduling_protects_foreground_requests():
@@ -60,11 +170,15 @@ def test_background_prefill_scheduling_protects_foreground_requests():
         {
             "background_prefill_completion": True,
             "background_prefill_priority": 1,
+            "background_prefill_max_foreground_requests": 2,
+            "background_prefill_max_tokens_per_step": 128,
         },
     )
 
     assert priority == 1
     assert llm_kwargs["scheduling_policy"] == "priority"
+    assert os.environ["NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS"] == "2"
+    assert os.environ["NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP"] == "128"
 
 
 @pytest.mark.parametrize("priority", [True, 0, -1, 1.5])
@@ -88,6 +202,47 @@ def test_background_prefill_scheduling_rejects_fcfs_override():
                 "background_prefill_priority": 1,
             },
         )
+
+
+@pytest.mark.parametrize("max_foreground", [True, -1, 1.5, "1"])
+def test_background_prefill_scheduling_rejects_invalid_max_foreground(
+    max_foreground,
+):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _configure_background_prefill_scheduling(
+            {},
+            {
+                "background_prefill_completion": True,
+                "background_prefill_priority": 1,
+                "background_prefill_max_foreground_requests": max_foreground,
+            },
+        )
+
+
+@pytest.mark.parametrize("max_tokens", [True, -1, 1.5, "128"])
+def test_background_prefill_scheduling_rejects_invalid_max_tokens(max_tokens):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _configure_background_prefill_scheduling(
+            {},
+            {
+                "background_prefill_completion": True,
+                "background_prefill_priority": 1,
+                "background_prefill_max_foreground_requests": 1,
+                "background_prefill_max_tokens_per_step": max_tokens,
+            },
+        )
+
+
+def test_background_prefill_scheduling_clears_stale_environment(monkeypatch):
+    variables = (
+        "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS",
+        "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP",
+    )
+    for variable in variables:
+        monkeypatch.setenv(variable, "4")
+
+    assert _configure_background_prefill_scheduling({}, None) == 0
+    assert all(variable not in os.environ for variable in variables)
 
 
 def test_materialize_message_tool_calls_supports_deepcopy():
@@ -263,11 +418,15 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.chat_completion",
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
+        "vllm.entrypoints.utils",
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
+        "vllm.renderers",
+        "vllm.sampling_params",
         "vllm.tool_parsers",
+        "vllm.utils",
         "vllm.v1",
         "vllm.v1.engine",
     ):
@@ -329,6 +488,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.entrypoints.openai.engine.protocol",
         ErrorResponse=type("ErrorResponse", (), {}),
+        RequestResponseMetadata=type("RequestResponseMetadata", (), {}),
     )
     make_module(
         "vllm.entrypoints.openai.models.protocol",
@@ -338,6 +498,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.models.serving",
         OpenAIServingModels=OpenAIServingModels,
     )
+    make_module("vllm.entrypoints.utils", get_max_tokens=MagicMock())
     make_module(
         "vllm.entrypoints.serve.tokenize.protocol",
         TokenizeChatRequest=type("TokenizeChatRequest", (), {}),
@@ -357,9 +518,19 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=ReasoningParserManager,
     )
+    make_module("vllm.renderers", merge_kwargs=MagicMock())
+    make_module(
+        "vllm.sampling_params",
+        RequestOutputKind=types.SimpleNamespace(DELTA="delta"),
+    )
     make_module(
         "vllm.tool_parsers.abstract_tool_parser",
         ToolParserManager=ToolParserManager,
+    )
+    make_module(
+        "vllm.utils.mistral",
+        is_mistral_tokenizer=MagicMock(return_value=False),
+        is_mistral_tool_parser=MagicMock(return_value=False),
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
     return ToolParserManager, ReasoningParserManager, OpenAIServingChat
@@ -372,6 +543,13 @@ class _FakeFastAPIApp:
     def post(self, path):
         def decorator(func):
             self.routes.append((path, func))
+            return func
+
+        return decorator
+
+    def on_event(self, event):
+        def decorator(func):
+            self.routes.append((event, func))
             return func
 
         return decorator
@@ -1670,6 +1848,10 @@ def test_vllm_http_server(cluster, tokenizer):
         "stable_first_snapshot_prefill": True,
         "background_prefill_completion": True,
         "background_prefill_priority": 1,
+        "background_prefill_max_foreground_requests": 0,
+        "background_prefill_max_tokens_per_step": 0,
+        "stop_after_first_prefill_page": False,
+        "same_request_final_decode": True,
         "compact_request_context": True,
         "incremental_tokenizer_checkpoint_interval": 8,
         "counterfactual_full_tokenizer_timing": True,
@@ -2167,6 +2349,75 @@ def test_vllm_http_server(cluster, tokenizer):
     assert deferred_final["prefill_background_enqueue_seconds"] == 0
     assert deferred_final["prefill_background_cancelled_chunks"] == 0
     assert deferred_final["prefill_background_failed_chunks"] == 0
+
+    # The production deferred-finalization path does not issue a separate
+    # final incremental-tokenize HTTP request. Instead, the authoritative chat
+    # request carries the tokenizer sequence number; the chat handler locally
+    # finalizes tokenization, seals the live prefill request, and decodes from
+    # that exact request. Compare it with an ordinary request for both prompt
+    # tokens and generated-token parity.
+    fused_body = deepcopy(final_only_body)
+    fused_body["session_id"] = "fused-deferred-prefill-http-test"
+    fused_body["messages"][-1]["content"] = "y" * 300
+    fused_body["sequence_no"] = 0
+    fused_body["final"] = False
+    fused_body["prefill"] = True
+    fused_body["prefill_continuation"] = True
+    fused_body["prefill_from_required_prefix"] = True
+    fused_start = requests.post(url=incremental_url, json=fused_body).json()
+    time.sleep(0.25)
+
+    fused_messages = deepcopy(fused_body["messages"])
+    fused_messages[-1]["content"] = "y" * 300 + " done"
+    fused_chat_body = {
+        "model": generation_config["model_name"],
+        "messages": fused_messages,
+        "tools": fused_body["tools"],
+        "required_prefix_token_ids": authoritative_prefix_tokens,
+        "streaming_tool_call_session_id": fused_body["session_id"],
+        "streaming_tool_call_deferred_final_sequence_no": 1,
+        "temperature": generation_config["temperature"],
+        "top_p": generation_config["top_p"],
+        "logprobs": True,
+        "return_tokens_as_token_ids": True,
+        "max_tokens": 1,
+    }
+    control_chat_body = deepcopy(fused_chat_body)
+    control_chat_body.pop("streaming_tool_call_session_id")
+    control_chat_body.pop("streaming_tool_call_deferred_final_sequence_no")
+    control_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=control_chat_body,
+    )
+    fused_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=fused_chat_body,
+    )
+    assert control_response.status_code == 200, control_response.text
+    assert fused_response.status_code == 200, fused_response.text
+    control_result = control_response.json()
+    fused_result = fused_response.json()
+    fused_metrics = fused_result["streaming_tool_call_deferred_final_metrics"]
+    fused_prompt_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": fused_messages,
+            "tools": fused_body["tools"],
+            "required_prefix_token_ids": authoritative_prefix_tokens,
+        },
+    ).json()["tokens"]
+
+    assert fused_start["deferred_prefill_admissions"] == 1
+    assert fused_metrics["completed"] is True
+    assert fused_metrics["prompt_token_ids"] == fused_prompt_tokens
+    assert fused_metrics["token_count"] == len(fused_prompt_tokens)
+    assert fused_metrics["prefill_same_request_session_sealed"] == 1
+    assert fused_result["streaming_tool_call_same_request_status"] == "used"
+    assert (
+        fused_result["choices"][0]["logprobs"]["content"][0]["token"]
+        == control_result["choices"][0]["logprobs"]["content"][0]["token"]
+    )
 
     # A command that finishes below the admission bucket still reuses exact
     # tokens. It seeds and finalizes from the model prefix in one request.

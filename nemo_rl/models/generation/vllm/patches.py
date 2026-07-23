@@ -373,25 +373,96 @@ def _patch_vllm_streaming_session_priority(logger) -> bool:
         )
         return False
 
+    scheduler_add_original = (
+        "            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+        '                assert existing.streaming_queue is not None, "duplicate request id"\n'
+        "                # Queue next input chunk (or finished sentinel).\n"
+        "                existing.streaming_queue.append(update)\n"
+        "            elif update is not None:\n"
+        "                # Commence next input chunk.\n"
+        "                self._update_request_as_session(existing, update)\n"
+    )
+    scheduler_add_v1 = (
+        "            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+        '                assert existing.streaming_queue is not None, "duplicate request id"\n'
+        "                # Queue next input chunk (or finished sentinel).\n"
+        "                existing.streaming_queue.append(update)\n"
+        "                # A final streaming chunk turns speculative prefill into\n"
+        "                # foreground model-call work. Promote the live request\n"
+        "                # immediately instead of waiting for its current dummy\n"
+        "                # decode to finish; otherwise strict priority can block\n"
+        "                # the request that the foreground caller is awaiting.\n"
+        "                if update is not None and update.priority < existing.priority:\n"
+        "                    queued_request_queue = None\n"
+        "                    if existing.status == RequestStatus.WAITING:\n"
+        "                        queued_request_queue = self.waiting\n"
+        "                    elif self._is_blocked_waiting_status(existing.status):\n"
+        "                        queued_request_queue = self.skipped_waiting\n"
+        "                    if queued_request_queue is not None:\n"
+        "                        queued_request_queue.remove_request(existing)\n"
+        "                    existing.priority = update.priority\n"
+        "                    existing.arrival_time = update.arrival_time\n"
+        "                    if queued_request_queue is not None:\n"
+        "                        queued_request_queue.add_request(existing)\n"
+        "            elif update is not None:\n"
+        "                # Commence next input chunk.\n"
+        "                self._update_request_as_session(existing, update)\n"
+    )
+    scheduler_add_v2 = (
+        "            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+        '                assert existing.streaming_queue is not None, "duplicate request id"\n'
+        "                # Queue next input chunk (or finished sentinel).\n"
+        "                existing.streaming_queue.append(update)\n"
+        "                # A final streaming chunk turns speculative prefill into\n"
+        "                # foreground model-call work. Promote the live request\n"
+        "                # immediately instead of waiting for its current dummy\n"
+        "                # decode to finish; otherwise strict priority can block\n"
+        "                # the request that the foreground caller is awaiting.\n"
+        "                if update is not None and update.priority < existing.priority:\n"
+        "                    queued_request_queue = None\n"
+        "                    if existing.status == RequestStatus.WAITING:\n"
+        "                        queued_request_queue = self.waiting\n"
+        "                    elif self._is_blocked_waiting_status(existing.status):\n"
+        "                        queued_request_queue = self.skipped_waiting\n"
+        "                    if queued_request_queue is not None:\n"
+        "                        queued_request_queue.remove_request(existing)\n"
+        "                    existing.priority = update.priority\n"
+        "                    existing.arrival_time = update.arrival_time\n"
+        "                    if queued_request_queue is not None:\n"
+        "                        queued_request_queue.add_request(existing)\n"
+        "            elif update is not None:\n"
+        "                # WAITING_FOR_STREAMING_REQ lives in skipped_waiting. A\n"
+        "                # priority-changing continuation must be removed before\n"
+        "                # mutating the heap key, then inserted into the queue\n"
+        "                # selected by its new WAITING status and priority.\n"
+        "                self.skipped_waiting.remove_request(existing)\n"
+        "                self._update_request_as_session(existing, update)\n"
+        "                self._enqueue_waiting_request(existing)\n"
+    )
+
     replacements = (
         (
             protocol_file,
-            "    prompt: EngineInput\n"
-            "    sampling_params: SamplingParams | None = None\n",
+            (
+                "    prompt: EngineInput\n"
+                "    sampling_params: SamplingParams | None = None\n",
+            ),
             "    prompt: EngineInput\n"
             "    sampling_params: SamplingParams | None = None\n"
             "    priority: int | None = None\n",
         ),
         (
             async_llm_file,
-            "                    # TODO(nick): Avoid re-validating reused sampling parameters\n"
-            "                    req = self.input_processor.process_inputs(\n"
-            "                        request_id=internal_req_id,\n"
-            "                        prompt=input_chunk.prompt,\n"
-            "                        params=sp,\n"
-            "                        resumable=True,\n"
-            "                        **inputs,  # type: ignore[arg-type]\n"
-            "                    )\n",
+            (
+                "                    # TODO(nick): Avoid re-validating reused sampling parameters\n"
+                "                    req = self.input_processor.process_inputs(\n"
+                "                        request_id=internal_req_id,\n"
+                "                        prompt=input_chunk.prompt,\n"
+                "                        params=sp,\n"
+                "                        resumable=True,\n"
+                "                        **inputs,  # type: ignore[arg-type]\n"
+                "                    )\n",
+            ),
             "                    chunk_inputs = inputs\n"
             "                    if input_chunk.priority is not None:\n"
             "                        chunk_inputs = dict(\n"
@@ -408,16 +479,18 @@ def _patch_vllm_streaming_session_priority(logger) -> bool:
         ),
         (
             request_file,
-            "    sampling_params: SamplingParams | None\n\n    @classmethod\n",
+            ("    sampling_params: SamplingParams | None\n\n    @classmethod\n",),
             "    sampling_params: SamplingParams | None\n"
             "    priority: int\n\n"
             "    @classmethod\n",
         ),
         (
             request_file,
-            "            arrival_time=request.arrival_time,\n"
-            "            sampling_params=request.sampling_params,\n"
-            "        )\n",
+            (
+                "            arrival_time=request.arrival_time,\n"
+                "            sampling_params=request.sampling_params,\n"
+                "        )\n",
+            ),
             "            arrival_time=request.arrival_time,\n"
             "            sampling_params=request.sampling_params,\n"
             "            priority=request.priority,\n"
@@ -425,13 +498,20 @@ def _patch_vllm_streaming_session_priority(logger) -> bool:
         ),
         (
             scheduler_file,
-            "        assert update.sampling_params.max_tokens is not None\n"
-            "        session.max_tokens = update.sampling_params.max_tokens\n"
-            "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n",
+            (
+                "        assert update.sampling_params.max_tokens is not None\n"
+                "        session.max_tokens = update.sampling_params.max_tokens\n"
+                "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n",
+            ),
             "        assert update.sampling_params.max_tokens is not None\n"
             "        session.max_tokens = update.sampling_params.max_tokens\n"
             "        session.priority = update.priority\n"
             "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n",
+        ),
+        (
+            scheduler_file,
+            (scheduler_add_original, scheduler_add_v1),
+            scheduler_add_v2,
         ),
     )
 
@@ -440,29 +520,376 @@ def _patch_vllm_streaming_session_priority(logger) -> bool:
     # before changing any of them.
     lock_path = protocol_file + ".streaming_session_priority_patch_lock"
     with _exclusive_patch_lock(lock_path):
-        source_contents = {}
-        for file_path, old_snippet, new_snippet in replacements:
-            with open(file_path) as source_file:
-                content = source_file.read()
-            source_contents[file_path] = content
+        source_contents: dict[str, str] = {}
+        patched_contents: dict[str, str] = {}
+        for file_path, old_snippets, new_snippet in replacements:
+            if file_path not in source_contents:
+                with open(file_path) as source_file:
+                    source_contents[file_path] = source_file.read()
+                patched_contents[file_path] = source_contents[file_path]
+            content = patched_contents[file_path]
             if new_snippet in content:
                 continue
-            if old_snippet not in content:
+            if not any(old_snippet in content for old_snippet in old_snippets):
                 logger.warning(
                     "Could not apply vLLM streaming-session priority patch: "
                     "expected snippet not found in %s.",
                     file_path,
                 )
                 return False
+            old_snippet = next(
+                old_snippet for old_snippet in old_snippets if old_snippet in content
+            )
+            patched_contents[file_path] = content.replace(old_snippet, new_snippet, 1)
 
-        for file_path, old_snippet, new_snippet in replacements:
-            content = source_contents[file_path]
-            if new_snippet in content:
+        for file_path, content in patched_contents.items():
+            if content == source_contents[file_path]:
                 continue
             with open(file_path, "w") as source_file:
-                source_file.write(content.replace(old_snippet, new_snippet, 1))
+                source_file.write(content)
 
     logger.info("Successfully patched vLLM streaming-session priority updates.")
+    return True
+
+
+def _patch_vllm_strict_priority_scheduling(logger) -> bool:
+    """Bound lower-priority prefill sharing with foreground work.
+
+    vLLM 0.20 orders newly admitted requests by priority, but once a request is
+    RUNNING it is scheduled before the WAITING queue without another priority
+    comparison. A background streaming prefill can therefore consume the
+    token budget before a newly arrived foreground request, or share a large
+    prefill batch with foreground decode. Enforce priority across both queues.
+
+    The NeMo RL worker exposes a non-negative foreground-slack limit through
+    ``NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS``. Zero keeps
+    strict idle-only behavior. Positive values allow one background request
+    per scheduler step only after all foreground requests have been ordered
+    first, and only while the active foreground count is within the limit.
+    ``NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP`` can additionally
+    cap that request's tokens per scheduler step so a cache-page fill is spread
+    across multiple foreground decode steps. An unset foreground limit leaves
+    non-streaming vLLM scheduling unchanged.
+
+    Returns whether the installed source already contains or accepted the
+    guarded patch.
+    """
+    try:
+        scheduler_file = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning("Could not locate vLLM scheduler for strict priority patch.")
+        return False
+
+    import_original = "import itertools\nimport time\n"
+    import_patched = "import itertools\nimport os\nimport time\n"
+    init_original = (
+        "        self.scheduler_config = vllm_config.scheduler_config\n"
+        "        self.cache_config = vllm_config.cache_config\n"
+    )
+    init_bounded_legacy = (
+        "        self.scheduler_config = vllm_config.scheduler_config\n"
+        "        _nemo_rl_background_slack = os.environ.get(\n"
+        '            "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS"\n'
+        "        )\n"
+        "        self._nemo_rl_background_prefill_max_foreground_requests = None\n"
+        "        if _nemo_rl_background_slack is not None:\n"
+        "            try:\n"
+        "                _nemo_rl_background_slack = int(_nemo_rl_background_slack)\n"
+        "            except ValueError as exc:\n"
+        "                raise ValueError(\n"
+        '                    "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS "\n'
+        '                    "must be a non-negative integer"\n'
+        "                ) from exc\n"
+        "            if _nemo_rl_background_slack < 0:\n"
+        "                raise ValueError(\n"
+        '                    "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS "\n'
+        '                    "must be a non-negative integer"\n'
+        "                )\n"
+        "            self._nemo_rl_background_prefill_max_foreground_requests = (\n"
+        "                _nemo_rl_background_slack\n"
+        "            )\n"
+        "        self.cache_config = vllm_config.cache_config\n"
+    )
+    init_patched = (
+        "        self.scheduler_config = vllm_config.scheduler_config\n"
+        "        _nemo_rl_background_slack = os.environ.get(\n"
+        '            "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS"\n'
+        "        )\n"
+        "        _nemo_rl_background_max_tokens = os.environ.get(\n"
+        '            "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP"\n'
+        "        )\n"
+        "        self._nemo_rl_background_prefill_max_foreground_requests = None\n"
+        "        self._nemo_rl_background_prefill_max_tokens_per_step = None\n"
+        "        if _nemo_rl_background_slack is not None:\n"
+        "            try:\n"
+        "                _nemo_rl_background_slack = int(_nemo_rl_background_slack)\n"
+        "            except ValueError as exc:\n"
+        "                raise ValueError(\n"
+        '                    "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS "\n'
+        '                    "must be a non-negative integer"\n'
+        "                ) from exc\n"
+        "            if _nemo_rl_background_slack < 0:\n"
+        "                raise ValueError(\n"
+        '                    "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS "\n'
+        '                    "must be a non-negative integer"\n'
+        "                )\n"
+        "            self._nemo_rl_background_prefill_max_foreground_requests = (\n"
+        "                _nemo_rl_background_slack\n"
+        "            )\n"
+        "        if _nemo_rl_background_max_tokens is not None:\n"
+        "            try:\n"
+        "                _nemo_rl_background_max_tokens = int(\n"
+        "                    _nemo_rl_background_max_tokens\n"
+        "                )\n"
+        "            except ValueError as exc:\n"
+        "                raise ValueError(\n"
+        '                    "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP "\n'
+        '                    "must be a non-negative integer"\n'
+        "                ) from exc\n"
+        "            if _nemo_rl_background_max_tokens < 0:\n"
+        "                raise ValueError(\n"
+        '                    "NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP "\n'
+        '                    "must be a non-negative integer"\n'
+        "                )\n"
+        "            if _nemo_rl_background_max_tokens > 0:\n"
+        "                self._nemo_rl_background_prefill_max_tokens_per_step = (\n"
+        "                    _nemo_rl_background_max_tokens\n"
+        "                )\n"
+        "        self.cache_config = vllm_config.cache_config\n"
+    )
+    schedule_original = (
+        "        token_budget = self.max_num_scheduled_tokens\n"
+        "        if self._pause_state == PauseState.PAUSED_ALL:\n"
+    )
+    schedule_patched = (
+        "        token_budget = self.max_num_scheduled_tokens\n"
+        "        nemo_rl_background_prefills_scheduled = 0\n"
+        "        if (\n"
+        "            self.policy == SchedulingPolicy.PRIORITY\n"
+        "            and self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "            is not None\n"
+        "            and any(request.priority > 0 for request in self.running)\n"
+        "        ):\n"
+        "            # Stable ordering guarantees foreground work consumes the\n"
+        "            # token budget before an admitted background prefill.\n"
+        "            self.running.sort(key=lambda request: request.priority)\n"
+        "        if self._pause_state == PauseState.PAUSED_ALL:\n"
+    )
+    running_original = (
+        "            request = self.running[req_index]\n\n            if (\n"
+    )
+    running_legacy = (
+        "            request = self.running[req_index]\n"
+        "\n"
+        "            if (\n"
+        "                self.policy == SchedulingPolicy.PRIORITY\n"
+        "                and (\n"
+        "                    any(\n"
+        "                        candidate.priority < request.priority\n"
+        "                        for candidate in self.running\n"
+        "                    )\n"
+        "                    or (\n"
+        "                        self.waiting\n"
+        "                        and self.waiting.peek_request().priority\n"
+        "                        < request.priority\n"
+        "                    )\n"
+        "                    or (\n"
+        "                        self.skipped_waiting\n"
+        "                        and self.skipped_waiting.peek_request().priority\n"
+        "                        < request.priority\n"
+        "                    )\n"
+        "                )\n"
+        "            ):\n"
+        "                req_index += 1\n"
+        "                continue\n"
+        "\n"
+        "            if (\n"
+    )
+    running_patched = (
+        "            request = self.running[req_index]\n"
+        "\n"
+        "            if (\n"
+        "                self.policy == SchedulingPolicy.PRIORITY\n"
+        "                and request.priority > 0\n"
+        "                and self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                is not None\n"
+        "            ):\n"
+        "                nemo_rl_higher_priority_running = sum(\n"
+        "                    candidate.priority < request.priority\n"
+        "                    for candidate in self.running\n"
+        "                )\n"
+        "                nemo_rl_higher_priority_waiting = (\n"
+        "                    self.waiting\n"
+        "                    and self.waiting.peek_request().priority < request.priority\n"
+        "                ) or (\n"
+        "                    self.skipped_waiting\n"
+        "                    and self.skipped_waiting.peek_request().priority\n"
+        "                    < request.priority\n"
+        "                )\n"
+        "                if (\n"
+        "                    nemo_rl_higher_priority_running\n"
+        "                    > self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                    or nemo_rl_higher_priority_waiting\n"
+        "                    or nemo_rl_background_prefills_scheduled >= 1\n"
+        "                ):\n"
+        "                    req_index += 1\n"
+        "                    continue\n"
+        "\n"
+        "            if (\n"
+    )
+    # A prior bounded-patch revision checked the short pristine prefix before
+    # the full legacy guard. Because the pristine prefix is also the start of
+    # the legacy guard, it inserted the bounded guard ahead of strict priority
+    # instead of replacing strict priority. Detect and repair that exact
+    # composition before the normal idempotence checks below.
+    running_malformed_upgrade = (
+        running_patched + running_legacy[len(running_original) :]
+    )
+    running_account_original = (
+        "            token_budget -= num_new_tokens\n            req_index += 1\n"
+    )
+    running_account_patched = (
+        "            token_budget -= num_new_tokens\n"
+        "            if (\n"
+        "                self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                is not None\n"
+        "                and request.priority > 0\n"
+        "            ):\n"
+        "                nemo_rl_background_prefills_scheduled += 1\n"
+        "            req_index += 1\n"
+    )
+    running_token_cap_original = (
+        "            num_new_tokens = min(num_new_tokens, token_budget)\n"
+        "\n"
+        "            # Make sure the input position does not exceed the max model len.\n"
+    )
+    running_token_cap_patched = (
+        "            num_new_tokens = min(num_new_tokens, token_budget)\n"
+        "            if (\n"
+        "                request.priority > 0\n"
+        "                and self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                is not None\n"
+        "                and self._nemo_rl_background_prefill_max_tokens_per_step\n"
+        "                is not None\n"
+        "            ):\n"
+        "                num_new_tokens = min(\n"
+        "                    num_new_tokens,\n"
+        "                    self._nemo_rl_background_prefill_max_tokens_per_step,\n"
+        "                )\n"
+        "\n"
+        "            # Make sure the input position does not exceed the max model len.\n"
+    )
+    waiting_original = (
+        "                request = request_queue.peek_request()\n"
+        "                request_id = request.request_id\n"
+        "\n"
+        "                # try to promote blocked statuses while traversing skipped queue.\n"
+    )
+    waiting_legacy = (
+        "                request = request_queue.peek_request()\n"
+        "                request_id = request.request_id\n"
+        "\n"
+        "                if (\n"
+        "                    self.policy == SchedulingPolicy.PRIORITY\n"
+        "                    and any(\n"
+        "                        candidate.priority < request.priority\n"
+        "                        for candidate in self.running\n"
+        "                    )\n"
+        "                ):\n"
+        "                    break\n"
+        "\n"
+        "                # try to promote blocked statuses while traversing skipped queue.\n"
+    )
+    waiting_patched = (
+        "                request = request_queue.peek_request()\n"
+        "                request_id = request.request_id\n"
+        "\n"
+        "                if (\n"
+        "                    self.policy == SchedulingPolicy.PRIORITY\n"
+        "                    and request.priority > 0\n"
+        "                    and self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                    is not None\n"
+        "                ):\n"
+        "                    nemo_rl_higher_priority_running = sum(\n"
+        "                        candidate.priority < request.priority\n"
+        "                        for candidate in self.running\n"
+        "                    )\n"
+        "                    if (\n"
+        "                        nemo_rl_higher_priority_running\n"
+        "                        > self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                        or nemo_rl_background_prefills_scheduled >= 1\n"
+        "                    ):\n"
+        "                        break\n"
+        "\n"
+        "                # try to promote blocked statuses while traversing skipped queue.\n"
+    )
+    waiting_account_original = (
+        "                token_budget -= num_new_tokens\n"
+        "                request.status = RequestStatus.RUNNING\n"
+    )
+    waiting_account_patched = (
+        "                token_budget -= num_new_tokens\n"
+        "                if (\n"
+        "                    self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                    is not None\n"
+        "                    and request.priority > 0\n"
+        "                ):\n"
+        "                    nemo_rl_background_prefills_scheduled += 1\n"
+        "                request.status = RequestStatus.RUNNING\n"
+    )
+    waiting_token_cap_original = (
+        "                    num_new_tokens = min(num_new_tokens, token_budget)\n"
+        "                    assert num_new_tokens > 0\n"
+    )
+    waiting_token_cap_patched = (
+        "                    num_new_tokens = min(num_new_tokens, token_budget)\n"
+        "                    if (\n"
+        "                        request.priority > 0\n"
+        "                        and self._nemo_rl_background_prefill_max_foreground_requests\n"
+        "                        is not None\n"
+        "                        and self._nemo_rl_background_prefill_max_tokens_per_step\n"
+        "                        is not None\n"
+        "                    ):\n"
+        "                        num_new_tokens = min(\n"
+        "                            num_new_tokens,\n"
+        "                            self._nemo_rl_background_prefill_max_tokens_per_step,\n"
+        "                        )\n"
+        "                    assert num_new_tokens > 0\n"
+    )
+
+    with _locked_file_patch(scheduler_file) as (content, write_back):
+        if running_malformed_upgrade in content:
+            content = content.replace(running_malformed_upgrade, running_patched, 1)
+        replacements = (
+            ((import_original,), import_patched),
+            ((init_original, init_bounded_legacy), init_patched),
+            ((schedule_original,), schedule_patched),
+            ((running_legacy, running_original), running_patched),
+            ((running_token_cap_original,), running_token_cap_patched),
+            ((running_account_original,), running_account_patched),
+            ((waiting_original, waiting_legacy), waiting_patched),
+            ((waiting_token_cap_original,), waiting_token_cap_patched),
+            ((waiting_account_original,), waiting_account_patched),
+        )
+        for originals, patched in replacements:
+            if patched in content:
+                continue
+            if not any(original in content for original in originals):
+                logger.warning(
+                    "Could not apply vLLM bounded priority patch: expected snippet "
+                    "not found in %s.",
+                    scheduler_file,
+                )
+                return False
+
+        for originals, patched in replacements:
+            if patched in content:
+                continue
+            original = next(original for original in originals if original in content)
+            content = content.replace(original, patched, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM bounded priority scheduling.")
     return True
 
 
@@ -480,10 +907,15 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
     prompt and the new chunk's sampling parameters. Use a shallow request copy
     for that output-only view: AsyncLLM sends the original request to the
     scheduler after updating the output processor, and the scheduler must still
-    receive only the incremental chunk. This mirrors the scheduler, which
-    discards the last sampled dummy token before applying the update. Guard
-    every replacement so future vLLM versions fail closed instead of receiving
-    a partial source patch.
+    receive only the incremental chunk. The scheduler can adopt a queued final
+    chunk before the output processor consumes the prior dummy completion. In
+    that one transition, ignore logprobs attached under the new sampling
+    contract and suppress the discarded dummy before AsyncLLM's aggregate
+    queue. Otherwise the queue either requires logprobs for the dummy or merges
+    its token into the authoritative final output. This mirrors the scheduler
+    without paying to calculate dummy-token logprobs. Guard every replacement
+    so future vLLM versions fail closed instead of receiving a partial source
+    patch.
     """
     try:
         output_processor_file = _get_vllm_file("v1/engine/output_processor.py")
@@ -572,6 +1004,81 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
         "            tokenizer=tokenizer, request=request\n",
         "            tokenizer=tokenizer, request=output_request\n",
     )
+    transition_logprobs_original = (
+        "                req_state.logprobs_processor.update_from_output("
+        "engine_core_output)\n"
+    )
+    transition_logprobs_previous = (
+        "                # The scheduler may adopt a queued final streaming chunk\n"
+        "                # before this processor consumes the prior dummy completion.\n"
+        "                # That can attach the final chunk's logprob contract to the\n"
+        "                # dummy output even though the old processor requested none.\n"
+        "                # The dummy token is discarded when the chunk is applied.\n"
+        "                transition_dummy_logprobs = (\n"
+        "                    req_state.streaming_input\n"
+        "                    and bool(req_state.input_chunk_queue)\n"
+        "                    and finish_reason is not None\n"
+        "                    and req_state.logprobs_processor.num_logprobs is None\n"
+        "                    and engine_core_output.new_logprobs is not None\n"
+        "                )\n"
+        "                if not transition_dummy_logprobs:\n"
+        "                    req_state.logprobs_processor.update_from_output(\n"
+        "                        engine_core_output\n"
+        "                    )\n"
+    )
+    transition_output_patched = (
+        "                # The scheduler may adopt a queued final streaming chunk\n"
+        "                # before this processor consumes the prior dummy completion.\n"
+        "                # That can attach the final chunk's logprob contract to the\n"
+        "                # dummy output even though the old processor requested none.\n"
+        "                # Suppress that dummy before AsyncLLM's aggregate queue; the\n"
+        "                # authoritative final chunk immediately replaces it.\n"
+        "                queued_streaming_update = (\n"
+        "                    req_state.input_chunk_queue[0]\n"
+        "                    if req_state.input_chunk_queue\n"
+        "                    else None\n"
+        "                )\n"
+        "                transition_dummy_output = (\n"
+        "                    req_state.streaming_input\n"
+        "                    and queued_streaming_update is not None\n"
+        "                    and queued_streaming_update.final\n"
+        "                    and finish_reason is not None\n"
+        "                )\n"
+        "                transition_dummy_logprobs = (\n"
+        "                    transition_dummy_output\n"
+        "                    and req_state.logprobs_processor.num_logprobs is None\n"
+        "                    and engine_core_output.new_logprobs is not None\n"
+        "                )\n"
+        "                if not transition_dummy_logprobs:\n"
+        "                    req_state.logprobs_processor.update_from_output(\n"
+        "                        engine_core_output\n"
+        "                    )\n"
+    )
+    request_output_original = (
+        "            if request_output := req_state.make_request_output(\n"
+        "                new_token_ids,\n"
+        "                pooling_output,\n"
+        "                finish_reason,\n"
+        "                stop_reason,\n"
+        "                kv_transfer_params,\n"
+        "                routed_experts,\n"
+        "            ):\n"
+    )
+    request_output_patched = (
+        "            request_output = (\n"
+        "                None\n"
+        "                if pooling_output is None and transition_dummy_output\n"
+        "                else req_state.make_request_output(\n"
+        "                    new_token_ids,\n"
+        "                    pooling_output,\n"
+        "                    finish_reason,\n"
+        "                    stop_reason,\n"
+        "                    kv_transfer_params,\n"
+        "                    routed_experts,\n"
+        "                )\n"
+        "            )\n"
+        "            if request_output:\n"
+    )
 
     replacements = (
         ("import asyncio\n", "import asyncio\nfrom copy import copy\n"),
@@ -620,6 +1127,8 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
             "            request=request,\n"
             "        )\n",
         ),
+        (transition_logprobs_original, transition_output_patched),
+        (request_output_original, request_output_patched),
     )
 
     lock_path = output_processor_file + ".streaming_session_output_state_patch_lock"
@@ -634,6 +1143,14 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
         # chunks and duplicating the prompt.
         if unsafe_apply_snippet in content:
             content = content.replace(unsafe_apply_snippet, safe_apply_snippet, 1)
+
+        # Upgrade the low-overhead logprob-only guard. It prevented the old
+        # LogprobsProcessor assertion but still allowed the discarded dummy to
+        # enter AsyncLLM's aggregate queue.
+        if transition_logprobs_previous in content:
+            content = content.replace(
+                transition_logprobs_previous, transition_output_patched, 1
+            )
 
         for old_snippet, new_snippet in replacements:
             if new_snippet in content:
@@ -658,6 +1175,47 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
     return True
 
 
+def _patch_vllm_streaming_session_support(logger) -> dict[str, bool]:
+    """Apply the cross-file streaming patch suite as one transaction.
+
+    Every vLLM worker imports and patches the same shared environment. The
+    individual helpers protect their own files, but that is not sufficient
+    when two helpers both rewrite ``scheduler.py``: another worker can observe
+    a partially composed suite and report a false incompatibility. Serialize
+    the complete suite with one feature-level lock while retaining the
+    per-file locks for callers that exercise an individual helper.
+    """
+    try:
+        scheduler_file = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate the vLLM scheduler for the streaming patch suite."
+        )
+        return {
+            "streaming_session_max_tokens": False,
+            "streaming_session_priority": False,
+            "strict_priority_scheduling": False,
+            "streaming_session_output_state": False,
+        }
+
+    lock_path = scheduler_file + ".streaming_session_patch_suite_lock"
+    with _exclusive_patch_lock(lock_path):
+        return {
+            "streaming_session_max_tokens": (
+                _patch_vllm_streaming_session_max_tokens(logger)
+            ),
+            "streaming_session_priority": (
+                _patch_vllm_streaming_session_priority(logger)
+            ),
+            "strict_priority_scheduling": (
+                _patch_vllm_strict_priority_scheduling(logger)
+            ),
+            "streaming_session_output_state": (
+                _patch_vllm_streaming_session_output_state(logger)
+            ),
+        }
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
 ) -> dict[str, bool]:
@@ -671,11 +1229,4 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
-    max_tokens_supported = _patch_vllm_streaming_session_max_tokens(patch_logger)
-    priority_supported = _patch_vllm_streaming_session_priority(patch_logger)
-    output_state_supported = _patch_vllm_streaming_session_output_state(patch_logger)
-    return {
-        "streaming_session_max_tokens": max_tokens_supported,
-        "streaming_session_priority": priority_supported,
-        "streaming_session_output_state": output_state_supported,
-    }
+    return _patch_vllm_streaming_session_support(patch_logger)

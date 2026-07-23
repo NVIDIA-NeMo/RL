@@ -17,6 +17,18 @@
 
 set -euo pipefail
 
+# A multi-node allocation created directly with srun normally starts one copy
+# of this script per task. Only one copy may launch ray.sub; otherwise the
+# copies race to create the same Ray head and shared log directory. Keep the
+# other allocation tasks exit cleanly; the outer allocation remains owned by
+# rank 0 until the launcher completes.
+if [ "${SUBMIT_MODE:-sbatch}" = "direct" ] \
+  && [ "${SLURM_NTASKS:-1}" -gt 1 ] \
+  && [ "${SLURM_PROCID:-0}" != "0" ]; then
+  echo "Direct launch is owned by SLURM_PROCID=0; rank ${SLURM_PROCID} is idle."
+  exit 0
+fi
+
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 LAUNCHER="${REPO_ROOT}/examples/swe_bench/run_grpo_swe2_scale_gen.sh"
 AUDITOR="${REPO_ROOT}/examples/swe_bench/verified_trajectory_audit.py"
@@ -77,6 +89,12 @@ fi
 if [ "${PREWARM_SWEBENCH_ARTIFACTS}" = "1" ]; then
   if [ "${DRY_RUN:-0}" = "1" ]; then
     echo "[DRY_RUN] Would prewarm and offline-verify SWE-bench artifacts for ${VERIFIED_DATA_PATH}"
+  elif [ "${SUBMIT_MODE:-sbatch}" = "direct" ]; then
+    # The outer direct srun already owns the requested nodes. Starting another
+    # non-overlapping srun here fails with "Requested nodes are busy" before
+    # ray.sub can launch. Reuse the current rank-0 allocation instead.
+    /usr/bin/env SWEBENCH_PREWARM_IN_SRUN=1 \
+      bash "${ARTIFACT_PREWARMER}" "${VERIFIED_DATA_PATH}"
   else
     bash "${ARTIFACT_PREWARMER}" "${VERIFIED_DATA_PATH}"
   fi

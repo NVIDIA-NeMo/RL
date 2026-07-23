@@ -9,7 +9,8 @@ import pytest
 
 from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallError,
-    StreamingToolCallFinalizationUnavailableError,
+    StreamingToolCallFinalOutputStallError,
+    StreamingToolCallPrefillIncompleteError,
     StreamingToolCallPrefillManager,
     StreamingToolCallPrefixMismatchError,
     StreamingToolCallPromptTooLongError,
@@ -57,6 +58,45 @@ class _FakeEngine:
             )
 
 
+class _SuppressTransitionDummyEngine(_FakeEngine):
+    async def generate(
+        self, inputs: AsyncIterator[_FakeStreamingInput], request_id: str
+    ) -> AsyncGenerator[_FakeOutput, None]:
+        self.request_ids.append(request_id)
+        prefill = await anext(inputs)
+        self.received_chunks.append(prefill.token_ids)
+        final = await anext(inputs)
+        self.received_chunks.append(final.token_ids)
+        assert final.final
+        yield _FakeOutput(
+            token_count=1,
+            prompt_token_count=len(prefill.token_ids) + len(final.token_ids),
+        )
+
+
+class _LongFinalEngine(_FakeEngine):
+    async def generate(
+        self, inputs: AsyncIterator[_FakeStreamingInput], request_id: str
+    ) -> AsyncGenerator[_FakeOutput, None]:
+        self.request_ids.append(request_id)
+        prefill = await anext(inputs)
+        self.received_chunks.append(prefill.token_ids)
+        yield _FakeOutput(
+            token_count=1,
+            prompt_token_count=len(prefill.token_ids),
+        )
+
+        final = await anext(inputs)
+        self.received_chunks.append(final.token_ids)
+        prompt_token_count = len(prefill.token_ids) + len(final.token_ids)
+        for _ in range(5):
+            await asyncio.sleep(0.03)
+            yield _FakeOutput(
+                token_count=1,
+                prompt_token_count=prompt_token_count,
+            )
+
+
 def _make_manager(
     engine: _FakeEngine,
     *,
@@ -66,6 +106,7 @@ def _make_manager(
     max_prompt_tokens: int = 1024,
     cache_page_size_tokens: int | None = None,
     require_cache_page_crossing: bool = True,
+    final_output_stall_timeout_seconds: float | None = None,
 ) -> StreamingToolCallPrefillManager:
     return StreamingToolCallPrefillManager(
         generate=engine.generate,
@@ -85,6 +126,7 @@ def _make_manager(
         max_prompt_tokens=max_prompt_tokens,
         cache_page_size_tokens=cache_page_size_tokens,
         require_cache_page_crossing=require_cache_page_crossing,
+        final_output_stall_timeout_seconds=final_output_stall_timeout_seconds,
     )
 
 
@@ -224,8 +266,76 @@ async def test_sealed_session_streams_authoritative_final_suffix() -> None:
 
     assert sealed.prefix_matched
     assert sealed.committed_tokens == 3
+    assert sealed.submitted_tokens == 3
+    assert sealed.inflight_submitted_tokens == 0
     assert engine.received_chunks == [[1, 2, 3], [4, 5]]
     assert len(outputs) == 1
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_final_decode_stall_fails_open_without_waiting_for_session_ttl() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(
+        engine,
+        session_ttl_seconds=60,
+        final_output_stall_timeout_seconds=0.01,
+    )
+
+    await manager.start(session_id="session", prompt_token_ids=[1, 2, 3], sequence_no=0)
+    await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        sequence_no=1,
+    )
+    await manager.seal(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+    engine.block_outputs = True
+    final_outputs = await manager.finalize(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+        final_sampling_params="final-params",
+    )
+
+    with pytest.raises(
+        StreamingToolCallFinalOutputStallError,
+        match="produced no output for 0.01s",
+    ):
+        await anext(final_outputs)
+
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_active_final_decode_is_not_expired_by_session_ttl() -> None:
+    engine = _LongFinalEngine()
+    manager = _make_manager(
+        engine,
+        session_ttl_seconds=0.1,
+        final_output_stall_timeout_seconds=0.08,
+    )
+
+    await manager.start(session_id="session", prompt_token_ids=[1, 2, 3], sequence_no=0)
+    await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        sequence_no=1,
+    )
+    await manager.seal(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+    final_outputs = await manager.finalize(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+        final_sampling_params="final-params",
+    )
+
+    outputs = [output async for output in final_outputs]
+
+    assert len(outputs) == 5
     assert manager.active_session_count == 0
 
 
@@ -256,7 +366,9 @@ async def test_seal_rejects_oversized_final_suffix_before_engine_submission() ->
 
 
 @pytest.mark.asyncio
-async def test_seal_rejects_engine_tokens_without_append_acknowledgement() -> None:
+async def test_seal_accepts_exact_submitted_prefix_without_append_acknowledgement() -> (
+    None
+):
     engine = _FakeEngine()
     engine.block_outputs = True
     manager = _make_manager(engine)
@@ -277,23 +389,58 @@ async def test_seal_rejects_engine_tokens_without_append_acknowledgement() -> No
     while session.pending_acknowledgements:
         await asyncio.sleep(0)
 
-    with pytest.raises(
-        StreamingToolCallSessionClosedError,
-        match=(
-            "engine prompt accounting diverged: committed=0, submitted=3, observed=3"
-        ),
-    ):
-        await manager.seal(
-            session_id="session",
-            final_prompt_token_ids=[1, 2, 3, 4, 5],
-        )
+    sealed = await manager.seal(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
 
+    assert sealed.prefix_matched
+    assert sealed.committed_tokens == 0
+    assert sealed.submitted_tokens == 3
+    assert sealed.inflight_submitted_tokens == 3
     assert engine.received_chunks == [[1, 2, 3]]
     assert await manager.abort(session_id="session")
 
 
 @pytest.mark.asyncio
-async def test_seal_fails_open_without_waiting_for_inflight_prefill() -> None:
+async def test_inflight_prefill_is_reused_by_authoritative_final_decode() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine)
+
+    await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+    )
+
+    sealed = await asyncio.wait_for(
+        manager.seal(
+            session_id="session",
+            final_prompt_token_ids=[1, 2, 3, 4, 5],
+        ),
+        timeout=0.1,
+    )
+    final_outputs = await manager.finalize(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+        final_sampling_params="final-params",
+    )
+
+    engine.release_output.set()
+    outputs = [output async for output in final_outputs]
+
+    assert sealed.prefix_matched
+    assert sealed.committed_tokens == 0
+    assert sealed.submitted_tokens == 3
+    assert sealed.inflight_submitted_tokens == 3
+    assert engine.received_chunks == [[1, 2, 3], [4, 5]]
+    assert [output.prompt_token_count for output in outputs] == [5]
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_prefill_gate_rejects_inflight_without_waiting() -> None:
     engine = _FakeEngine()
     engine.block_outputs = True
     manager = _make_manager(engine)
@@ -305,15 +452,80 @@ async def test_seal_fails_open_without_waiting_for_inflight_prefill() -> None:
     )
 
     with pytest.raises(
-        StreamingToolCallFinalizationUnavailableError,
-        match="in-flight work",
+        StreamingToolCallPrefillIncompleteError,
+        match="inflight_tokens=3",
     ):
         await asyncio.wait_for(
             manager.seal(
                 session_id="session",
                 final_prompt_token_ids=[1, 2, 3, 4, 5],
+                require_completed_prefill=True,
             ),
             timeout=0.1,
+        )
+
+    closed = await asyncio.wait_for(
+        manager.close(
+            session_id="session",
+            final_prompt_token_ids=[1, 2, 3, 4, 5],
+        ),
+        timeout=0.1,
+    )
+    assert closed.inflight_submitted_tokens == 3
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_inflight_prefill_accepts_suppressed_transition_dummy() -> None:
+    engine = _SuppressTransitionDummyEngine()
+    manager = _make_manager(engine)
+
+    await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+    )
+    sealed = await manager.seal(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+    final_outputs = await manager.finalize(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+        final_sampling_params="final-params",
+    )
+
+    outputs = [output async for output in final_outputs]
+
+    assert sealed.inflight_submitted_tokens == 3
+    assert engine.received_chunks == [[1, 2, 3], [4, 5]]
+    assert [output.prompt_token_count for output in outputs] == [5]
+    assert manager.total_dummy_tokens == 1
+    assert manager.total_prefill_tokens == 3
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_inflight_prefill_finalization_rejects_changed_submitted_token() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine)
+
+    await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+    )
+    while not engine.received_chunks:
+        await asyncio.sleep(0)
+
+    with pytest.raises(
+        StreamingToolCallPrefixMismatchError,
+        match="submitted session prefix",
+    ):
+        await manager.seal(
+            session_id="session",
+            final_prompt_token_ids=[1, 9, 3, 4, 5],
         )
 
     assert await manager.abort(session_id="session")
@@ -893,6 +1105,22 @@ async def test_invalidate_all_cancels_every_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_debug_snapshot_reports_aggregate_session_state() -> None:
+    manager = _make_manager(_FakeEngine())
+    await manager.start(session_id="session", prompt_token_ids=[1, 2, 3])
+
+    snapshot = manager.debug_snapshot()
+
+    assert snapshot["manager_active_sessions"] == 1
+    assert snapshot["manager_tasks_pending"] == 1
+    assert snapshot["manager_tasks_done"] == 0
+    assert snapshot["manager_expiry_tasks_pending"] == 1
+    assert snapshot["manager_committed_tokens"] == 0
+    assert snapshot["manager_oldest_idle_seconds"] >= 0
+    assert await manager.abort(session_id="session")
+
+
+@pytest.mark.asyncio
 async def test_pause_invalidates_and_blocks_admission_until_resume() -> None:
     engine = _FakeEngine()
     manager = _make_manager(engine)
@@ -954,6 +1182,19 @@ async def test_expires_stale_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
 
     now = 102.0
     assert await manager.expire_stale_sessions() == 1
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_session_expires_without_new_manager_request() -> None:
+    manager = _make_manager(_FakeEngine(), session_ttl_seconds=0.01)
+    await manager.start(session_id="session", prompt_token_ids=[1])
+
+    async def wait_for_expiry() -> None:
+        while manager.active_session_count:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_expiry(), timeout=1)
     assert manager.active_session_count == 0
 
 

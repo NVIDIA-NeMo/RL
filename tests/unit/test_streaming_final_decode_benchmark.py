@@ -19,6 +19,7 @@ import pytest
 
 from examples.swe_bench.benchmark_streaming_final_decode import (
     FinalGenerationMeasurement,
+    _classify_streaming_output,
     _extract_completion_delta,
     _max_abs_logprob_delta,
     _modal_control_contract,
@@ -29,6 +30,9 @@ from examples.swe_bench.benchmark_streaming_final_decode import (
     _stable_streamed_prefix,
 )
 from examples.swe_bench.benchmark_streaming_tool_call_prefill import PromptTrace
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _background_prefill_max_cache_pages,
+)
 
 
 def _measurement(
@@ -50,6 +54,27 @@ def _measurement(
         decoded_text=decoded_text,
         time_to_first_output_seconds=ttft,
         total_seconds=total,
+    )
+
+
+def test_background_prefill_page_bound_does_not_reject_same_request() -> None:
+    assert (
+        _background_prefill_max_cache_pages(
+            {
+                "stop_after_first_prefill_page": True,
+                "same_request_final_decode": True,
+            }
+        )
+        is None
+    )
+    assert (
+        _background_prefill_max_cache_pages(
+            {
+                "stop_after_first_prefill_page": True,
+                "same_request_final_decode": False,
+            }
+        )
+        == 1
     )
 
 
@@ -95,6 +120,45 @@ def test_extract_completion_delta_allows_missing_optional_logprobs() -> None:
     assert _extract_completion_delta(
         SimpleNamespace(outputs=[completion]), require_logprobs=False
     ) == ((7,), (), "ok")
+
+
+def test_classify_streaming_output_uses_prompt_boundary_not_output_order() -> None:
+    # A suppressed transition dummy means the first visible token can already
+    # be authoritative final output.
+    final_output = SimpleNamespace(prompt_token_ids=list(range(32)))
+    assert (
+        _classify_streaming_output(
+            final_output,
+            prefill_prompt_boundaries={24},
+            final_prompt_tokens=32,
+        )
+        == "final"
+    )
+
+    prefill_output = SimpleNamespace(prompt_token_ids=list(range(24)))
+    assert (
+        _classify_streaming_output(
+            prefill_output,
+            prefill_prompt_boundaries={16, 24},
+            final_prompt_tokens=32,
+        )
+        == "prefill"
+    )
+
+
+def test_classify_streaming_output_rejects_missing_or_unknown_boundary() -> None:
+    with pytest.raises(RuntimeError, match="did not report prompt token IDs"):
+        _classify_streaming_output(
+            SimpleNamespace(prompt_token_ids=None),
+            prefill_prompt_boundaries={24},
+            final_prompt_tokens=32,
+        )
+    with pytest.raises(RuntimeError, match="unexpected prompt boundary"):
+        _classify_streaming_output(
+            SimpleNamespace(prompt_token_ids=list(range(28))),
+            prefill_prompt_boundaries={24},
+            final_prompt_tokens=32,
+        )
 
 
 @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])

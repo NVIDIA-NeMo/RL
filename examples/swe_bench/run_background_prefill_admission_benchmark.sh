@@ -17,7 +17,8 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 BENCH_MODE="${BENCH_MODE:-background_prefill}"
-if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+if [[ "${BENCH_MODE}" == "same_request_final_decode" \
+  || "${BENCH_MODE}" == "trace_replay" ]]; then
   MODEL_PATH="${MODEL_PATH:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 else
   MODEL_PATH="${MODEL_PATH:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16}"
@@ -102,6 +103,8 @@ _run_worker() {
   export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
   export NRL_IGNORE_VERSION_MISMATCH=1
   export NRL_VLLM_USE_V1=1
+  export NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS="${BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS}"
+  export NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP="${BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP}"
   export VLLM_CACHE_ROOT="${local_vllm_cache}"
   export DG_JIT_CACHE_DIR="${local_vllm_cache}/deep_gemm"
   export INDUCTOR_CACHE_DIR="${local_inductor_cache}"
@@ -110,12 +113,48 @@ _run_worker() {
 
   echo "[CACHE] runtime=${BENCH_RUNTIME_PYTHON} hf=${HF_HOME} hf_datasets=${HF_DATASETS_CACHE} vllm_local=${VLLM_CACHE_ROOT} vllm_persistent=${persistent_vllm_cache} inductor=${INDUCTOR_CACHE_DIR} triton=${TRITON_CACHE_DIR}"
   echo "[PREFLIGHT] validating prewarmed vLLM environment"
-  "${BENCH_RUNTIME_PYTHON}" -c 'import torch, transformers, vllm; from examples.swe_bench import benchmark_background_prefill_admission, benchmark_streaming_final_decode; assert torch.cuda.is_available(); assert vllm.__version__ == "0.20.0"; print(torch.__version__, transformers.__version__, vllm.__version__, benchmark_background_prefill_admission.__file__, benchmark_streaming_final_decode.__file__)'
+  "${BENCH_RUNTIME_PYTHON}" -c 'import logging, py_compile; from nemo_rl.models.generation.vllm import patches; logger = logging.getLogger("streaming-prefill-benchmark"); capabilities = patches._patch_vllm_streaming_session_support(logger); assert all(capabilities.values()), capabilities; scheduler = patches._get_vllm_file("v1/core/sched/scheduler.py"); py_compile.compile(scheduler, doraise=True); import torch, transformers, vllm; from examples.swe_bench import benchmark_background_prefill_admission, benchmark_streaming_final_decode, benchmark_streaming_trace_replay; assert torch.cuda.is_available(); assert vllm.__version__ == "0.20.0"; print(torch.__version__, transformers.__version__, vllm.__version__, scheduler, benchmark_background_prefill_admission.__file__, benchmark_streaming_final_decode.__file__, benchmark_streaming_trace_replay.__file__)'
+
+  if [[ "${BENCH_MODE}" == "trace_replay" ]]; then
+    trace_replay_sweep_args=()
+    if [[ -n "${BENCH_SNAPSHOT_CHARS_SWEEP}" ]]; then
+      trace_replay_sweep_args+=(--snapshot-chars-sweep "${BENCH_SNAPSHOT_CHARS_SWEEP}")
+    fi
+    "${BENCH_RUNTIME_PYTHON}" \
+      examples/swe_bench/benchmark_streaming_trace_replay.py \
+      --trajectory-jsonl "${BENCH_TRAJECTORY_JSONL}" \
+      --model "${MODEL_PATH}" \
+      --tensor-parallel-size "${tensor_parallel_size}" \
+      --gpu-memory-utilization "${BENCH_GPU_MEMORY_UTILIZATION}" \
+      --max-model-len 131072 \
+      --trace-limit "${BENCH_TRACE_LIMIT}" \
+      --max-traces-per-trajectory "${BENCH_MAX_TRACES_PER_TRAJECTORY}" \
+      --snapshot-chars "${BENCH_SNAPSHOT_CHARS}" \
+      "${trace_replay_sweep_args[@]}" \
+      --final-delay-seconds-sweep "${BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP}" \
+      --stability-margin-tokens 8 \
+      --background-priority "${BENCH_BACKGROUND_PRIORITY}" \
+      --warmup-repeats "${BENCH_WARMUP_REPEATS}" \
+      --repeats "${BENCH_REPEATS}" \
+      --output "${BENCH_OUTPUT_JSON}"
+    return
+  fi
 
   if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
     nan_diagnostic_args=()
     if [[ "${BENCH_DIAGNOSE_NAN_LOGITS}" == "true" ]]; then
       nan_diagnostic_args=(--diagnose-nan-logits)
+    fi
+    final_before_ack_args=()
+    if [[ "${BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK}" == "true" ]]; then
+      final_before_ack_args=(--same-request-final-before-prefill-ack)
+    fi
+    final_delay_sweep_args=()
+    if [[ -n "${BENCH_SAME_REQUEST_FINAL_DELAY_SWEEP}" ]]; then
+      final_delay_sweep_args=(
+        --same-request-final-delay-sweep
+        "${BENCH_SAME_REQUEST_FINAL_DELAY_SWEEP}"
+      )
     fi
     "${BENCH_RUNTIME_PYTHON}" \
       examples/swe_bench/benchmark_streaming_final_decode.py \
@@ -134,6 +173,8 @@ _run_worker() {
       --cleanup-delay-seconds 0.05 \
       --max-output-tokens "${BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS}" \
       --same-request-prefill-chunks "${BENCH_SAME_REQUEST_PREFILL_CHUNKS}" \
+      "${final_before_ack_args[@]}" \
+      "${final_delay_sweep_args[@]}" \
       --concurrent-same-request-sessions "${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS}" \
       --prefill-logprobs "${BENCH_FINAL_DECODE_PREFILL_LOGPROBS}" \
       --warmup-repeats "${BENCH_WARMUP_REPEATS}" \
@@ -159,6 +200,10 @@ _run_worker() {
   if (( BENCH_MAX_CACHE_PAGES > 0 )); then
     max_cache_pages_args=(--max-cache-pages "${BENCH_MAX_CACHE_PAGES}")
   fi
+  async_scheduling_arg=(--async-scheduling)
+  if [[ "${BENCH_ASYNC_SCHEDULING}" == "false" ]]; then
+    async_scheduling_arg=(--no-async-scheduling)
+  fi
 
   "${BENCH_RUNTIME_PYTHON}" \
     examples/swe_bench/benchmark_background_prefill_admission.py \
@@ -166,12 +211,18 @@ _run_worker() {
     --tensor-parallel-size "${tensor_parallel_size}" \
     --gpu-memory-utilization "${BENCH_GPU_MEMORY_UTILIZATION}" \
     --max-model-len 131072 \
+    --max-num-batched-tokens "${BENCH_MAX_NUM_BATCHED_TOKENS}" \
+    --mamba-cache-mode "${BENCH_MAMBA_CACHE_MODE}" \
+    --compilation-backend "${BENCH_COMPILATION_BACKEND}" \
+    "${async_scheduling_arg[@]}" \
     --immutable-prefix-tokens 32768 \
     --tool-output-tokens 8192 \
     --mutable-suffix-tokens 32 \
     --candidate-chunk-tokens "${BENCH_CANDIDATE_CHUNK_TOKENS}" \
     --stability-margin-tokens 8 \
     --background-priority "${BENCH_BACKGROUND_PRIORITY}" \
+    --background-max-foreground-requests "${BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS}" \
+    --background-max-tokens-per-step "${BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP}" \
     "${cache_page_args[@]}" \
     "${max_cache_pages_args[@]}" \
     --overlap-seconds "${BENCH_OVERLAP_SECONDS}" \
@@ -179,7 +230,10 @@ _run_worker() {
     --warmup-repeats "${BENCH_WARMUP_REPEATS}" \
     --repeats "${BENCH_REPEATS}" \
     --contention-repeats "${BENCH_CONTENTION_REPEATS}" \
+    --contention-foreground-requests "${BENCH_CONTENTION_FOREGROUND_REQUESTS}" \
     --contention-foreground-tokens "${BENCH_CONTENTION_FOREGROUND_TOKENS}" \
+    --contention-foreground-output-tokens "${BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS}" \
+    --contention-overlap-seconds "${BENCH_CONTENTION_OVERLAP_SECONDS}" \
     "${size_sweep_args[@]}" \
     --output "${BENCH_OUTPUT_JSON}"
 }
@@ -198,6 +252,39 @@ BENCH_REPEATS="${BENCH_REPEATS:-5}"
 BENCH_WARMUP_REPEATS="${BENCH_WARMUP_REPEATS:-1}"
 BENCH_CANDIDATE_CHUNK_TOKENS="${BENCH_CANDIDATE_CHUNK_TOKENS:-1024}"
 BENCH_BACKGROUND_PRIORITY="${BENCH_BACKGROUND_PRIORITY:-1}"
+BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS="${BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS:-0}"
+if ! [[ "${BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS must be a non-negative integer." >&2
+  exit 1
+fi
+BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP="${BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP:-0}"
+if ! [[ "${BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP must be a non-negative integer." >&2
+  exit 1
+fi
+BENCH_MAX_NUM_BATCHED_TOKENS="${BENCH_MAX_NUM_BATCHED_TOKENS:-2048}"
+if ! [[ "${BENCH_MAX_NUM_BATCHED_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BENCH_MAX_NUM_BATCHED_TOKENS must be a positive integer." >&2
+  exit 1
+fi
+BENCH_MAMBA_CACHE_MODE="${BENCH_MAMBA_CACHE_MODE:-all}"
+if [[ "${BENCH_MAMBA_CACHE_MODE}" != "all" \
+  && "${BENCH_MAMBA_CACHE_MODE}" != "align" ]]; then
+  echo "ERROR: BENCH_MAMBA_CACHE_MODE must be all or align." >&2
+  exit 1
+fi
+BENCH_COMPILATION_BACKEND="${BENCH_COMPILATION_BACKEND:-inductor}"
+if [[ "${BENCH_COMPILATION_BACKEND}" != "eager" \
+  && "${BENCH_COMPILATION_BACKEND}" != "inductor" ]]; then
+  echo "ERROR: BENCH_COMPILATION_BACKEND must be eager or inductor." >&2
+  exit 1
+fi
+BENCH_ASYNC_SCHEDULING="${BENCH_ASYNC_SCHEDULING:-true}"
+if [[ "${BENCH_ASYNC_SCHEDULING}" != "true" \
+  && "${BENCH_ASYNC_SCHEDULING}" != "false" ]]; then
+  echo "ERROR: BENCH_ASYNC_SCHEDULING must be true or false." >&2
+  exit 1
+fi
 if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
   BENCH_CACHE_PAGE_SIZE_TOKENS="${BENCH_CACHE_PAGE_SIZE_TOKENS:-1056}"
 else
@@ -217,7 +304,23 @@ if (( BENCH_MAX_CACHE_PAGES > 0 && BENCH_CACHE_PAGE_SIZE_TOKENS == 0 )); then
   exit 1
 fi
 BENCH_CONTENTION_REPEATS="${BENCH_CONTENTION_REPEATS:-10}"
+BENCH_CONTENTION_FOREGROUND_REQUESTS="${BENCH_CONTENTION_FOREGROUND_REQUESTS:-4}"
 BENCH_CONTENTION_FOREGROUND_TOKENS="${BENCH_CONTENTION_FOREGROUND_TOKENS:-2048}"
+BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS="${BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS:-128}"
+BENCH_CONTENTION_OVERLAP_SECONDS="${BENCH_CONTENTION_OVERLAP_SECONDS:-0.1}"
+if ! [[ "${BENCH_CONTENTION_FOREGROUND_REQUESTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BENCH_CONTENTION_FOREGROUND_REQUESTS must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "${BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS must be a positive integer." >&2
+  exit 1
+fi
+if ! awk -v value="${BENCH_CONTENTION_OVERLAP_SECONDS}" \
+  'BEGIN { exit !(value >= 0.0) }'; then
+  echo "ERROR: BENCH_CONTENTION_OVERLAP_SECONDS must be non-negative." >&2
+  exit 1
+fi
 BENCH_OVERLAP_SECONDS="${BENCH_OVERLAP_SECONDS:-0,0.025,0.05,0.075,0.1,0.15,0.25}"
 BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP="${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP:-}"
 if [[ "${BENCH_MODE}" == "same_request_final_decode" && -z "${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP}" ]]; then
@@ -229,9 +332,48 @@ BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS="${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS:-
 BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS="${BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS:-8}"
 BENCH_FINAL_DECODE_OVERLAP_SECONDS="${BENCH_FINAL_DECODE_OVERLAP_SECONDS:-0.1}"
 BENCH_SAME_REQUEST_PREFILL_CHUNKS="${BENCH_SAME_REQUEST_PREFILL_CHUNKS:-1}"
+BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK="${BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK:-false}"
+if [[ "${BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK}" != "true" && "${BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK}" != "false" ]]; then
+  echo "ERROR: BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK must be true or false." >&2
+  exit 1
+fi
+BENCH_SAME_REQUEST_FINAL_DELAY_SWEEP="${BENCH_SAME_REQUEST_FINAL_DELAY_SWEEP:-}"
 BENCH_CONCURRENT_SAME_REQUEST_SESSIONS="${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS:-0}"
 BENCH_FINAL_DECODE_PREFILL_LOGPROBS="${BENCH_FINAL_DECODE_PREFILL_LOGPROBS:-none}"
 BENCH_DIAGNOSE_NAN_LOGITS="${BENCH_DIAGNOSE_NAN_LOGITS:-false}"
+BENCH_TRAJECTORY_JSONL="${BENCH_TRAJECTORY_JSONL:-}"
+BENCH_TRACE_LIMIT="${BENCH_TRACE_LIMIT:-16}"
+BENCH_MAX_TRACES_PER_TRAJECTORY="${BENCH_MAX_TRACES_PER_TRAJECTORY:-1}"
+BENCH_SNAPSHOT_CHARS="${BENCH_SNAPSHOT_CHARS:-256}"
+BENCH_SNAPSHOT_CHARS_SWEEP="${BENCH_SNAPSHOT_CHARS_SWEEP:-}"
+BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP="${BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP:-0}"
+if [[ "${BENCH_MODE}" == "trace_replay" ]]; then
+  if [[ ! -f "${BENCH_TRAJECTORY_JSONL}" ]]; then
+    echo "ERROR: BENCH_TRAJECTORY_JSONL must name an existing trajectory JSONL." >&2
+    exit 1
+  fi
+  if ! [[ "${BENCH_TRACE_LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCH_TRACE_LIMIT must be a positive integer." >&2
+    exit 1
+  fi
+  if ! [[ "${BENCH_MAX_TRACES_PER_TRAJECTORY}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCH_MAX_TRACES_PER_TRAJECTORY must be a positive integer." >&2
+    exit 1
+  fi
+  if ! [[ "${BENCH_SNAPSHOT_CHARS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCH_SNAPSHOT_CHARS must be a positive integer." >&2
+    exit 1
+  fi
+  if [[ -n "${BENCH_SNAPSHOT_CHARS_SWEEP}" ]] \
+    && [[ ! "${BENCH_SNAPSHOT_CHARS_SWEEP}" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+    echo "ERROR: BENCH_SNAPSHOT_CHARS_SWEEP must be comma-separated positive integers." >&2
+    exit 1
+  fi
+  if [[ ! "${BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP}" =~ ^[0-9]+([.][0-9]+)?(,[0-9]+([.][0-9]+)?)*$ ]]; then
+    echo "ERROR: BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP must contain non-negative numbers." >&2
+    exit 1
+  fi
+fi
 if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
   if ! [[ "${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS must be a positive integer." >&2
@@ -277,6 +419,8 @@ BENCH_RUNTIME_PYTHON="${BENCH_RUNTIME_PYTHON:-${BENCH_RUNTIME_ROOT}/ray_venvs/vl
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
   output_stem="same-request-final-decode"
+elif [[ "${BENCH_MODE}" == "trace_replay" ]]; then
+  output_stem="streaming-trace-replay"
 else
   output_stem="background-prefill"
 fi
@@ -287,15 +431,26 @@ export REPO_ROOT MODEL_PATH VLLM_TP BENCH_GPU_MEMORY_UTILIZATION
 export BENCH_MODE
 export BENCH_REPEATS BENCH_WARMUP_REPEATS BENCH_CACHE_NAMESPACE
 export BENCH_BACKGROUND_PRIORITY BENCH_CANDIDATE_CHUNK_TOKENS BENCH_OVERLAP_SECONDS
+export BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS
+export BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP
+export BENCH_MAX_NUM_BATCHED_TOKENS BENCH_MAMBA_CACHE_MODE
+export BENCH_COMPILATION_BACKEND BENCH_ASYNC_SCHEDULING
 export BENCH_CACHE_PAGE_SIZE_TOKENS
 export BENCH_MAX_CACHE_PAGES
-export BENCH_CONTENTION_REPEATS BENCH_CONTENTION_FOREGROUND_TOKENS
+export BENCH_CONTENTION_REPEATS BENCH_CONTENTION_FOREGROUND_REQUESTS
+export BENCH_CONTENTION_FOREGROUND_TOKENS BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS
+export BENCH_CONTENTION_OVERLAP_SECONDS
 export BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP BENCH_SIZE_SWEEP_OVERLAP_SECONDS
 export BENCH_SIZE_SWEEP_REPEATS
 export BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS
 export BENCH_FINAL_DECODE_OVERLAP_SECONDS
 export BENCH_SAME_REQUEST_PREFILL_CHUNKS BENCH_CONCURRENT_SAME_REQUEST_SESSIONS
+export BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK
+export BENCH_SAME_REQUEST_FINAL_DELAY_SWEEP
 export BENCH_FINAL_DECODE_PREFILL_LOGPROBS BENCH_DIAGNOSE_NAN_LOGITS
+export BENCH_TRAJECTORY_JSONL BENCH_TRACE_LIMIT
+export BENCH_MAX_TRACES_PER_TRAJECTORY BENCH_SNAPSHOT_CHARS
+export BENCH_SNAPSHOT_CHARS_SWEEP BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP
 export BENCH_OUTPUT_JSON BENCH_BUILD_CACHE_ROOT BENCH_RUNTIME_PYTHON
 export BENCH_LOCAL_VLLM_CACHE BENCH_LOCAL_INDUCTOR_CACHE BENCH_LOCAL_TRITON_CACHE
 export BENCH_PERSISTENT_VLLM_CACHE BENCH_PERSISTENT_INDUCTOR_CACHE
@@ -310,9 +465,16 @@ echo "[LAUNCH] output=${BENCH_OUTPUT_JSON}"
 echo "[LAUNCH] candidate_chunk_token_sweep=${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP:-disabled}"
 echo "[LAUNCH] cache_page_size_tokens=${BENCH_CACHE_PAGE_SIZE_TOKENS} (0 disables page-aware admission)"
 echo "[LAUNCH] max_cache_pages=${BENCH_MAX_CACHE_PAGES} (0 disables the cap)"
+echo "[LAUNCH] background_prefill_max_foreground_requests=${BENCH_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS}"
+echo "[LAUNCH] background_prefill_max_tokens_per_step=${BENCH_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP}"
+echo "[LAUNCH] max_num_batched_tokens=${BENCH_MAX_NUM_BATCHED_TOKENS} mamba_cache_mode=${BENCH_MAMBA_CACHE_MODE} async_scheduling=${BENCH_ASYNC_SCHEDULING} compilation_backend=${BENCH_COMPILATION_BACKEND}"
+echo "[LAUNCH] contention_foreground_requests=${BENCH_CONTENTION_FOREGROUND_REQUESTS} output_tokens=${BENCH_CONTENTION_FOREGROUND_OUTPUT_TOKENS} overlap_seconds=${BENCH_CONTENTION_OVERLAP_SECONDS}"
 if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
   echo "[LAUNCH] prefill_logprobs=${BENCH_FINAL_DECODE_PREFILL_LOGPROBS} diagnose_nan_logits=${BENCH_DIAGNOSE_NAN_LOGITS}"
-  echo "[LAUNCH] same_request_prefill_chunks=${BENCH_SAME_REQUEST_PREFILL_CHUNKS} concurrent_same_request_sessions=${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS}"
+  echo "[LAUNCH] same_request_prefill_chunks=${BENCH_SAME_REQUEST_PREFILL_CHUNKS} final_before_prefill_ack=${BENCH_SAME_REQUEST_FINAL_BEFORE_PREFILL_ACK} final_delay_sweep=${BENCH_SAME_REQUEST_FINAL_DELAY_SWEEP:-disabled} concurrent_same_request_sessions=${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS}"
+fi
+if [[ "${BENCH_MODE}" == "trace_replay" ]]; then
+  echo "[LAUNCH] trajectory_jsonl=${BENCH_TRAJECTORY_JSONL} trace_limit=${BENCH_TRACE_LIMIT} max_traces_per_trajectory=${BENCH_MAX_TRACES_PER_TRAJECTORY} snapshot_chars=${BENCH_SNAPSHOT_CHARS} snapshot_sweep=${BENCH_SNAPSHOT_CHARS_SWEEP:-disabled} final_delay_sweep=${BENCH_TRACE_FINAL_DELAY_SECONDS_SWEEP}"
 fi
 
 srun \

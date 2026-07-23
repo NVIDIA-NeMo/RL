@@ -70,6 +70,19 @@ class StreamingToolCallConfig(TypedDict):
             background prefill requests. Foreground requests use priority zero,
             and larger values run later. Background completion automatically
             enables vLLM's priority scheduler. The recommended default is 1.
+        background_prefill_max_foreground_requests: Maximum number of active
+            foreground requests allowed while one lower-priority background
+            prefill is scheduled in the same vLLM step. Zero is strict
+            idle-only scheduling. Positive values improve tail admission at
+            the cost of bounded foreground contention. At most one background
+            request is scheduled per step. The recommended default is 0 while
+            this tradeoff is being validated.
+        background_prefill_max_tokens_per_step: Maximum number of tokens from
+            one lower-priority background prefill that may share a scheduler
+            step with foreground work. Zero leaves vLLM's normal per-request
+            token budget unchanged. A positive value spreads a cache-page
+            fill across decode steps to bound foreground latency. The
+            recommended default is 0 while this tradeoff is being validated.
         stop_after_first_prefill_page: Whether continuation streaming stops
             requesting shell snapshots after vLLM schedules the first
             cache-page-aligned background prefill and caps that session at the
@@ -84,6 +97,11 @@ class StreamingToolCallConfig(TypedDict):
             in-flight sessions fail open to the unchanged foreground request.
             The recommended default is false while this optimization is being
             validated.
+        defer_finalization_to_model_call: Whether the final incremental
+            tokenization and live-request seal are coalesced into the next chat
+            request. This removes one tool-path HTTP round trip while retaining
+            exact prompt-token validation in the model proxy. The recommended
+            default is false while this optimization is being validated.
         compact_request_context: Whether sequence-zero tokenizer requests
             register their immutable chat context so later sequence-numbered
             requests send only cumulative tool output. Both HTTP hops rebuild
@@ -143,8 +161,11 @@ class StreamingToolCallConfig(TypedDict):
     stable_first_snapshot_prefill: NotRequired[bool]
     background_prefill_completion: NotRequired[bool]
     background_prefill_priority: int
+    background_prefill_max_foreground_requests: int
+    background_prefill_max_tokens_per_step: int
     stop_after_first_prefill_page: bool
     same_request_final_decode: NotRequired[bool]
+    defer_finalization_to_model_call: NotRequired[bool]
     compact_request_context: NotRequired[bool]
     incremental_tokenizer_checkpoint_interval: NotRequired[int]
     counterfactual_full_tokenizer_timing: NotRequired[bool]

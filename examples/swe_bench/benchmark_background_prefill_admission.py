@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import time
 import uuid
@@ -72,12 +73,18 @@ class BackgroundMeasurement:
 
 @dataclass(frozen=True)
 class ForegroundContentionMeasurement:
-    """Foreground request latency while one background prefill is admitted."""
+    """Foreground decode latency with optional bounded background prefill."""
 
-    background_priority: int
-    foreground_generation: GenerationMeasurement
+    background_enabled: bool
+    background_priority: int | None
+    foreground_generations: tuple[GenerationMeasurement, ...]
+    active_foreground_at_enqueue: int
+    active_foreground_at_close: int
+    background_scheduled_chunks: int
     background_completed_chunks: int
     background_cancelled_chunks: int
+    background_completion_seconds: float
+    final_generation: GenerationMeasurement
 
 
 def _parse_overlaps(value: str) -> tuple[float, ...]:
@@ -104,12 +111,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--max-model-len", type=int, default=16_384)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2_048)
+    parser.add_argument(
+        "--mamba-cache-mode",
+        choices=("all", "align"),
+        default="all",
+    )
+    parser.add_argument(
+        "--compilation-backend",
+        choices=("eager", "inductor"),
+        default="inductor",
+    )
+    parser.add_argument(
+        "--async-scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--immutable-prefix-tokens", type=int, default=4_096)
     parser.add_argument("--tool-output-tokens", type=int, default=4_096)
     parser.add_argument("--mutable-suffix-tokens", type=int, default=32)
     parser.add_argument("--candidate-chunk-tokens", type=int, default=512)
     parser.add_argument("--stability-margin-tokens", type=int, default=8)
     parser.add_argument("--background-priority", type=int, default=1)
+    parser.add_argument("--background-max-foreground-requests", type=int, default=0)
+    parser.add_argument("--background-max-tokens-per-step", type=int, default=0)
     parser.add_argument("--cache-page-size-tokens", type=int)
     parser.add_argument("--max-cache-pages", type=int)
     parser.add_argument("--overlap-seconds", type=_parse_overlaps, default=(0.0,))
@@ -117,7 +142,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-repeats", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--contention-repeats", type=int, default=10)
+    parser.add_argument("--contention-foreground-requests", type=int, default=4)
     parser.add_argument("--contention-foreground-tokens", type=int, default=2_048)
+    parser.add_argument("--contention-foreground-output-tokens", type=int, default=128)
+    parser.add_argument("--contention-overlap-seconds", type=float, default=0.1)
     parser.add_argument(
         "--candidate-chunk-token-sweep",
         type=_parse_positive_ints,
@@ -284,15 +312,17 @@ async def _run_foreground_contention(
     llm: Any,
     *,
     trace: PromptTrace,
-    foreground_prompt_token_ids: list[int],
-    background_priority: int,
+    foreground_prompt_token_ids: list[list[int]],
+    background_priority: int | None,
     cleanup_delay_seconds: float,
     sampling_params: Any,
+    foreground_sampling_params: Any,
     tokens_prompt_type: type,
     streaming_input_type: type,
     stability_margin_tokens: int,
     cache_page_size_tokens: int | None,
     max_cache_pages: int | None,
+    contention_overlap_seconds: float,
 ) -> ForegroundContentionMeasurement:
     await _warm_authoritative_prefix(
         llm,
@@ -305,41 +335,111 @@ async def _run_foreground_contention(
     if cleanup_delay_seconds:
         await asyncio.sleep(cleanup_delay_seconds)
 
-    manager = _make_prefill_manager(
+    first_token_events = [asyncio.Event() for _ in foreground_prompt_token_ids]
+
+    async def generate_foreground(
+        prompt_token_ids: list[int], first_token_event: asyncio.Event
+    ) -> GenerationMeasurement:
+        request_id = f"background-prefill-contention-foreground-{uuid.uuid4()}"
+        started_at = time.perf_counter()
+        first_token_at: float | None = None
+        cached_tokens: int | None = None
+        output_token_ids: list[int] = []
+        result_generator = llm.generate(
+            prompt=tokens_prompt_type(prompt_token_ids=prompt_token_ids),
+            sampling_params=foreground_sampling_params,
+            request_id=request_id,
+            priority=0,
+        )
+        async for request_output in result_generator:
+            if request_output.num_cached_tokens is not None:
+                cached_tokens = request_output.num_cached_tokens
+            new_token_ids = [
+                token_id
+                for completion_output in request_output.outputs
+                for token_id in completion_output.token_ids
+            ]
+            if new_token_ids and first_token_at is None:
+                first_token_at = time.perf_counter()
+                first_token_event.set()
+            output_token_ids.extend(new_token_ids)
+        finished_at = time.perf_counter()
+        if cached_tokens is None or first_token_at is None or not output_token_ids:
+            raise RuntimeError("foreground contention request produced no output")
+        return GenerationMeasurement(
+            cached_tokens=cached_tokens,
+            prompt_tokens=len(prompt_token_ids),
+            output_token_ids=tuple(output_token_ids),
+            time_to_first_token_seconds=first_token_at - started_at,
+            total_seconds=finished_at - started_at,
+        )
+
+    foreground_tasks = [
+        asyncio.create_task(generate_foreground(prompt, event))
+        for prompt, event in zip(
+            foreground_prompt_token_ids, first_token_events, strict=True
+        )
+    ]
+    await asyncio.gather(*(event.wait() for event in first_token_events))
+    active_at_enqueue = sum(not task.done() for task in foreground_tasks)
+
+    scheduled_chunks = 0
+    completed_chunks = 0
+    cancelled_chunks = 0
+    completion_seconds = 0.0
+    manager = None
+    session_id = None
+    if background_priority is not None:
+        manager = _make_prefill_manager(
+            llm,
+            sampling_params=sampling_params,
+            tokens_prompt_type=tokens_prompt_type,
+            streaming_input_type=streaming_input_type,
+            stability_margin_tokens=stability_margin_tokens,
+            max_prompt_tokens=len(trace.final),
+            priority=background_priority,
+            cache_page_size_tokens=cache_page_size_tokens,
+        )
+        first_snapshot = trace.snapshots[0]
+        stable_candidate_end = len(first_snapshot) - trace.mutable_suffix_tokens
+        session_id = f"background-prefill-contention-{uuid.uuid4()}"
+        started = await manager.start_background(
+            session_id=session_id,
+            prompt_token_ids=first_snapshot,
+            initial_candidate_token_ids=first_snapshot[:stable_candidate_end],
+            dynamic_token_baseline=trace.immutable_prefix_tokens,
+            max_cache_pages=max_cache_pages,
+        )
+        scheduled_chunks = started.scheduled_chunks
+
+    await asyncio.sleep(contention_overlap_seconds)
+    active_at_close = sum(not task.done() for task in foreground_tasks)
+    if manager is not None and session_id is not None:
+        closed = await manager.close(
+            session_id=session_id,
+            final_prompt_token_ids=trace.final,
+        )
+        completed_chunks = closed.background_completed_chunks
+        cancelled_chunks = closed.background_cancelled_chunks
+        completion_seconds = closed.background_completion_seconds
+    foreground_generations = tuple(await asyncio.gather(*foreground_tasks))
+    final_generation = await _generate_one_token(
         llm,
+        prompt_token_ids=trace.final,
         sampling_params=sampling_params,
         tokens_prompt_type=tokens_prompt_type,
-        streaming_input_type=streaming_input_type,
-        stability_margin_tokens=stability_margin_tokens,
-        max_prompt_tokens=len(trace.final),
-        priority=background_priority,
-        cache_page_size_tokens=cache_page_size_tokens,
-    )
-    first_snapshot = trace.snapshots[0]
-    stable_candidate_end = len(first_snapshot) - trace.mutable_suffix_tokens
-    session_id = f"background-prefill-contention-{uuid.uuid4()}"
-    await manager.start_background(
-        session_id=session_id,
-        prompt_token_ids=first_snapshot,
-        initial_candidate_token_ids=first_snapshot[:stable_candidate_end],
-        dynamic_token_baseline=trace.immutable_prefix_tokens,
-        max_cache_pages=max_cache_pages,
-    )
-    foreground_generation = await _generate_one_token(
-        llm,
-        prompt_token_ids=foreground_prompt_token_ids,
-        sampling_params=sampling_params,
-        tokens_prompt_type=tokens_prompt_type,
-    )
-    closed = await manager.close(
-        session_id=session_id,
-        final_prompt_token_ids=trace.final,
     )
     return ForegroundContentionMeasurement(
+        background_enabled=background_priority is not None,
         background_priority=background_priority,
-        foreground_generation=foreground_generation,
-        background_completed_chunks=closed.background_completed_chunks,
-        background_cancelled_chunks=closed.background_cancelled_chunks,
+        foreground_generations=foreground_generations,
+        active_foreground_at_enqueue=active_at_enqueue,
+        active_foreground_at_close=active_at_close,
+        background_scheduled_chunks=scheduled_chunks,
+        background_completed_chunks=completed_chunks,
+        background_cancelled_chunks=cancelled_chunks,
+        background_completion_seconds=completion_seconds,
+        final_generation=final_generation,
     )
 
 
@@ -452,8 +552,18 @@ async def _main(args: argparse.Namespace) -> None:
         raise ValueError("repeats must be positive and warmup_repeats non-negative")
     if args.size_sweep_overlap_seconds < 0:
         raise ValueError("size_sweep_overlap_seconds must be non-negative")
+    if args.contention_overlap_seconds < 0:
+        raise ValueError("contention_overlap_seconds must be non-negative")
+    if args.contention_foreground_requests <= 0:
+        raise ValueError("contention_foreground_requests must be positive")
+    if args.contention_foreground_output_tokens <= 0:
+        raise ValueError("contention_foreground_output_tokens must be positive")
     if args.background_priority <= 0:
         raise ValueError("background_priority must be positive")
+    if args.background_max_foreground_requests < 0:
+        raise ValueError("background_max_foreground_requests must be non-negative")
+    if args.background_max_tokens_per_step < 0:
+        raise ValueError("background_max_tokens_per_step must be non-negative")
     if args.cache_page_size_tokens is not None and args.cache_page_size_tokens <= 0:
         raise ValueError("cache_page_size_tokens must be positive when set")
     if args.max_cache_pages is not None:
@@ -469,8 +579,19 @@ async def _main(args: argparse.Namespace) -> None:
         raise ValueError(
             "contention_foreground_tokens must be in [1, final prompt tokens]"
         )
-    foreground_prompt_token_ids = list(
+    foreground_prompt_base = list(
         reversed(trace.final[-args.contention_foreground_tokens :])
+    )
+    foreground_prompt_token_ids = [
+        foreground_prompt_base[index % len(foreground_prompt_base) :]
+        + foreground_prompt_base[: index % len(foreground_prompt_base)]
+        for index in range(args.contention_foreground_requests)
+    ]
+    os.environ["NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_FOREGROUND_REQUESTS"] = str(
+        args.background_max_foreground_requests
+    )
+    os.environ["NEMO_RL_VLLM_BACKGROUND_PREFILL_MAX_TOKENS_PER_STEP"] = str(
+        args.background_max_tokens_per_step
     )
     llm = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
@@ -478,10 +599,17 @@ async def _main(args: argparse.Namespace) -> None:
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
             enable_prefix_caching=True,
             enforce_eager=args.enforce_eager,
             trust_remote_code=True,
             scheduling_policy="priority",
+            async_scheduling=args.async_scheduling,
+            mamba_cache_mode=args.mamba_cache_mode,
+            compilation_config={
+                "backend": args.compilation_backend,
+                "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64],
+            },
         )
     )
     sampling_params = SamplingParams(
@@ -489,6 +617,14 @@ async def _main(args: argparse.Namespace) -> None:
         top_p=1,
         top_k=1,
         max_tokens=1,
+        output_kind=RequestOutputKind.DELTA,
+    )
+    foreground_sampling_params = SamplingParams(
+        temperature=0,
+        top_p=1,
+        top_k=1,
+        max_tokens=args.contention_foreground_output_tokens,
+        ignore_eos=True,
         output_kind=RequestOutputKind.DELTA,
     )
 
@@ -503,7 +639,10 @@ async def _main(args: argparse.Namespace) -> None:
 
     controls = {str(overlap): [] for overlap in args.overlap_seconds}
     backgrounds = {str(overlap): [] for overlap in args.overlap_seconds}
-    contention = {0: [], args.background_priority: []}
+    contention: dict[str, list[ForegroundContentionMeasurement]] = {
+        "control": [],
+        "background": [],
+    }
 
     async def run_control(overlap: float) -> None:
         await reset_cache()
@@ -537,21 +676,26 @@ async def _main(args: argparse.Namespace) -> None:
             )
         )
 
-    async def run_contention(priority: int) -> None:
+    async def run_contention(background_enabled: bool) -> None:
         await reset_cache()
-        contention[priority].append(
+        case = "background" if background_enabled else "control"
+        contention[case].append(
             await _run_foreground_contention(
                 llm,
                 trace=trace,
                 foreground_prompt_token_ids=foreground_prompt_token_ids,
-                background_priority=priority,
+                background_priority=(
+                    args.background_priority if background_enabled else None
+                ),
                 cleanup_delay_seconds=args.cleanup_delay_seconds,
                 sampling_params=sampling_params,
+                foreground_sampling_params=foreground_sampling_params,
                 tokens_prompt_type=TokensPrompt,
                 streaming_input_type=StreamingInput,
                 stability_margin_tokens=args.stability_margin_tokens,
                 cache_page_size_tokens=args.cache_page_size_tokens,
                 max_cache_pages=args.max_cache_pages,
+                contention_overlap_seconds=args.contention_overlap_seconds,
             )
         )
 
@@ -573,11 +717,11 @@ async def _main(args: argparse.Namespace) -> None:
 
         for repeat_index in range(args.contention_repeats):
             if repeat_index % 2 == 0:
-                await run_contention(0)
-                await run_contention(args.background_priority)
+                await run_contention(False)
+                await run_contention(True)
             else:
-                await run_contention(args.background_priority)
-                await run_contention(0)
+                await run_contention(True)
+                await run_contention(False)
 
         size_sweep: dict[str, dict[str, Any]] = {}
         size_sweep_generations: list[GenerationMeasurement] = []
@@ -674,25 +818,60 @@ async def _main(args: argparse.Namespace) -> None:
             for item in measurements
         ) or not all(size_sweep_prefix_matches):
             raise RuntimeError("background prefill committed a non-final prefix")
-        contention_outputs = {
-            item.foreground_generation.output_token_ids
-            for measurements in contention.values()
-            for item in measurements
-        }
-        if len(contention_outputs) != 1:
-            raise RuntimeError("deterministic contention output changed across cases")
+        for control, background in zip(
+            contention["control"], contention["background"], strict=True
+        ):
+            control_outputs = tuple(
+                item.output_token_ids for item in control.foreground_generations
+            )
+            background_outputs = tuple(
+                item.output_token_ids for item in background.foreground_generations
+            )
+            if control_outputs != background_outputs:
+                raise RuntimeError(
+                    "deterministic contention output changed across cases"
+                )
+            if (
+                control.final_generation.output_token_ids
+                != background.final_generation.output_token_ids
+            ):
+                raise RuntimeError(
+                    "deterministic post-contention output changed across cases"
+                )
 
-        equal_priority_ttft = [
-            item.foreground_generation.time_to_first_token_seconds
-            for item in contention[0]
+        control_ttft = [
+            generation.time_to_first_token_seconds
+            for measurement in contention["control"]
+            for generation in measurement.foreground_generations
         ]
-        low_priority_ttft = [
-            item.foreground_generation.time_to_first_token_seconds
-            for item in contention[args.background_priority]
+        background_ttft = [
+            generation.time_to_first_token_seconds
+            for measurement in contention["background"]
+            for generation in measurement.foreground_generations
         ]
-        foreground_priority_savings = [
-            equal - low
-            for equal, low in zip(equal_priority_ttft, low_priority_ttft, strict=True)
+        control_total = [
+            generation.total_seconds
+            for measurement in contention["control"]
+            for generation in measurement.foreground_generations
+        ]
+        background_total = [
+            generation.total_seconds
+            for measurement in contention["background"]
+            for generation in measurement.foreground_generations
+        ]
+        foreground_total_regression = [
+            background - control
+            for control, background in zip(control_total, background_total, strict=True)
+        ]
+        contention_observed_dynamic_cached_tokens = [
+            max(
+                0,
+                background.final_generation.cached_tokens
+                - control.final_generation.cached_tokens,
+            )
+            for control, background in zip(
+                contention["control"], contention["background"], strict=True
+            )
         ]
 
         result = {
@@ -700,10 +879,18 @@ async def _main(args: argparse.Namespace) -> None:
             "engine": {
                 "tensor_parallel_size": args.tensor_parallel_size,
                 "max_model_len": args.max_model_len,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
                 "gpu_memory_utilization": args.gpu_memory_utilization,
                 "enforce_eager": args.enforce_eager,
+                "async_scheduling": args.async_scheduling,
+                "mamba_cache_mode": args.mamba_cache_mode,
+                "compilation_backend": args.compilation_backend,
                 "scheduling_policy": "priority",
                 "background_priority": args.background_priority,
+                "background_max_foreground_requests": (
+                    args.background_max_foreground_requests
+                ),
+                "background_max_tokens_per_step": (args.background_max_tokens_per_step),
                 "cache_page_size_tokens": args.cache_page_size_tokens,
                 "max_cache_pages": args.max_cache_pages,
             },
@@ -726,18 +913,59 @@ async def _main(args: argparse.Namespace) -> None:
             },
             "contention": {
                 "repeats": args.contention_repeats,
-                "foreground_prompt_tokens": len(foreground_prompt_token_ids),
-                "equal_priority_foreground_ttft_seconds": _summary(equal_priority_ttft),
-                "low_priority_foreground_ttft_seconds": _summary(low_priority_ttft),
-                "paired_foreground_ttft_savings_seconds": _summary(
-                    foreground_priority_savings
+                "foreground_requests": len(foreground_prompt_token_ids),
+                "foreground_prompt_tokens": len(foreground_prompt_token_ids[0]),
+                "foreground_output_tokens": args.contention_foreground_output_tokens,
+                "background_overlap_seconds": args.contention_overlap_seconds,
+                "control_foreground_ttft_seconds": _summary(control_ttft),
+                "background_foreground_ttft_seconds": _summary(background_ttft),
+                "control_foreground_total_seconds": _summary(control_total),
+                "background_foreground_total_seconds": _summary(background_total),
+                "paired_foreground_total_regression_seconds": _summary(
+                    foreground_total_regression
                 ),
-                "low_priority_win_fraction": statistics.fmean(
-                    saving > 0 for saving in foreground_priority_savings
+                "background_foreground_win_fraction": statistics.fmean(
+                    regression < 0 for regression in foreground_total_regression
+                ),
+                "background_completion_fraction": statistics.fmean(
+                    item.background_completed_chunks > 0
+                    for item in contention["background"]
+                ),
+                "background_cancellation_fraction": statistics.fmean(
+                    item.background_cancelled_chunks > 0
+                    for item in contention["background"]
+                ),
+                "observed_kv_cache_admission_fraction": statistics.fmean(
+                    cached_tokens > 0
+                    for cached_tokens in contention_observed_dynamic_cached_tokens
+                ),
+                "observed_dynamic_cached_tokens": _summary(
+                    [
+                        float(tokens)
+                        for tokens in contention_observed_dynamic_cached_tokens
+                    ]
+                ),
+                "background_completion_seconds": _summary(
+                    [
+                        item.background_completion_seconds
+                        for item in contention["background"]
+                    ]
+                ),
+                "active_foreground_at_enqueue": _summary(
+                    [
+                        float(item.active_foreground_at_enqueue)
+                        for item in contention["background"]
+                    ]
+                ),
+                "active_foreground_at_close": _summary(
+                    [
+                        float(item.active_foreground_at_close)
+                        for item in contention["background"]
+                    ]
                 ),
                 "raw": {
-                    str(priority): [asdict(item) for item in measurements]
-                    for priority, measurements in contention.items()
+                    case: [asdict(item) for item in measurements]
+                    for case, measurements in contention.items()
                 },
             },
             "summary": {
