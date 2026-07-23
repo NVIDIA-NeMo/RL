@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
+import os
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
+import numpy as np
 import torch
 from pydantic import BaseModel
 
@@ -1342,6 +1345,99 @@ class MseValueLossFn(LossFunction):
 # =====================================================================
 
 
+def _generalized_jsd(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Per-element generalized Jensen-Shannon Divergence on log-probabilities.
+
+    Mirrors TRL's ``GOLDTrainer.generalized_jsd_loss`` (huggingface/trl @v1.0.0
+    ``trl/experimental/gold/gold_trainer.py``). Inputs are log-probs (may be
+    sub-distribution slices - no normalization is applied here, so the
+    divergence is on raw probability mass).
+
+    beta semantics (matches TRL):
+      * beta = 0   -> forward KL : KL(teacher || student)   (mean-seeking)
+      * beta = 1   -> reverse KL : KL(student || teacher)   (mode-seeking; TRL's default)
+      * beta = 0.5 -> symmetric JSD
+      * 0 < beta < 1 -> blended KL on a (1-beta).student + beta.teacher mixture
+
+    Numerics: computation is forced to fp32 even when inputs are bf16/fp16.
+    bf16's ~7.8e-3 epsilon causes (student_log_probs - teacher_log_probs) to
+    underflow as the student converges, collapsing the matched-term loss to
+    exactly 0 mid-training. Cast back to the input dtype on return.
+
+    Returns a tensor with the same shape as the inputs (per-element divergence,
+    matching F.kl_div(reduction='none')). Caller does the chunk/vocab sum.
+    """
+    in_dtype = student_log_probs.dtype
+    s_lp = student_log_probs.to(torch.float32)
+    t_lp = teacher_log_probs.to(torch.float32)
+
+    if beta == 0.0:
+        out = torch.nn.functional.kl_div(
+            s_lp,
+            t_lp,
+            reduction="none",
+            log_target=True,
+        )
+        return out.to(in_dtype)
+    if beta == 1.0:
+        out = torch.nn.functional.kl_div(
+            t_lp,
+            s_lp,
+            reduction="none",
+            log_target=True,
+        )
+        return out.to(in_dtype)
+    beta_t = torch.as_tensor(beta, dtype=torch.float32, device=s_lp.device)
+    # mixture_log_probs[v] = log( (1-beta)*p_s(v) + beta*p_t(v) )
+    mixture_log_probs = torch.logsumexp(
+        torch.stack(
+            [
+                s_lp + torch.log1p(-beta_t),
+                t_lp + torch.log(beta_t),
+            ]
+        ),
+        dim=0,
+    )
+    kl_teacher = torch.nn.functional.kl_div(
+        mixture_log_probs,
+        t_lp,
+        reduction="none",
+        log_target=True,
+    )
+    kl_student = torch.nn.functional.kl_div(
+        mixture_log_probs,
+        s_lp,
+        reduction="none",
+        log_target=True,
+    )
+    out = beta_t * kl_teacher + (1 - beta_t) * kl_student
+    return out.to(in_dtype)
+
+
+def _combine_v3_mismatch_terms(
+    last_loss: torch.Tensor,
+    pos0_loss: torch.Tensor,
+    *,
+    pos0_coefficient: float,
+    loss_multiplier: float,
+    convex: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine the two non-1-to-1 v6 loss terms.
+
+    New configs use ``beta * (L_last + alpha * L_pos0)``. ``convex=True``
+    retains the historical formula for configs using the legacy lambda key.
+    """
+    if convex:
+        combined = (1.0 - pos0_coefficient) * last_loss + pos0_coefficient * pos0_loss
+    else:
+        combined = last_loss + pos0_coefficient * pos0_loss
+    return combined, combined * loss_multiplier
+
+
 class CrossTokenizerDistillationLossConfig(TypedDict):
     """Config for cross-tokenizer distillation loss.
 
@@ -1426,6 +1522,68 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     teacher_weights: NotRequired[list[float]]
     teacher_gold_loss: NotRequired[list[Optional[bool]]]
     teacher_xtoken_loss: NotRequired[list[Optional[bool]]]
+    # ------------------------------------------------------------------ #
+    # v6 (prefix_bidir_partition_kl_v3) bundle. The cross-tokenizer KD    #
+    # term is the prefix-bidir partition KL (MtoM-as-ALM + rest bucket).  #
+    # All fields are NotRequired so existing YAMLs keep validating.       #
+    # ------------------------------------------------------------------ #
+    # Per-chunk "logits[t-1] predicts token t" shift, applied only to chunks
+    # not at a sequence start (v6 default False).
+    kl_chunk_shift: NotRequired[bool]
+    # Derive the (common_student, common_teacher) exact-match set from the
+    # forward subtoks table (length-1 chains) instead of the projection matrix.
+    # Lets common-only v6 runs skip the projection matrix entirely.
+    common_indices_from_subtoks: NotRequired[bool]
+    # Adds the position-0 partition KL on common-vocab for each multi-token
+    # chunk (v6 default False; the preset sets True).
+    prefix_bidir_v3_position_0_kl: NotRequired[bool]
+    # Loss fn for the position-0 common-vocab term AND the 1-to-1 common-vocab
+    # KL. Choices: "kl" | "jsd" | "bce" (v6 default "kl").
+    prefix_bidir_v3_loss_fn: NotRequired[str]
+    # beta argument for _generalized_jsd (0.5 -> symmetric JSD; v6 default 0.5).
+    prefix_bidir_v3_jsd_beta: NotRequired[float]
+    # Overrides loss fn for the position-N-1 partition KL only. None means
+    # "inherit from prefix_bidir_v3_loss_fn".
+    prefix_bidir_v3_last_pos_loss_fn: NotRequired[Optional[str]]
+    # Additive coefficient alpha for non-1-to-1 chunks: the mismatch loss is
+    # beta * (position-N-1 + alpha * position-0). Non-negative; defaults 1.0.
+    prefix_bidir_v3_mismatch_pos0_alpha: NotRequired[float]
+    # Outer multiplier beta in the additive non-1-to-1 formula. Distinct from
+    # prefix_bidir_v3_jsd_beta (which controls the JSD mixture itself).
+    prefix_bidir_v3_mismatch_loss_beta: NotRequired[float]
+    # Deprecated convex-blend key: lambda * position-0 + (1-lambda) *
+    # position-N-1. Cannot be combined with the alpha/beta keys.
+    prefix_bidir_v3_mismatch_pos0_weight: NotRequired[Optional[float]]
+    # Deprecated compatibility scalar for the old convex combination formula.
+    prefix_bidir_v3_mismatch_loss_scale: NotRequired[float]
+    # Noise filter: when > 0, chunks whose realized teacher labels were not in
+    # the teacher's true top-k are dropped from KD (keep only the CE anchor).
+    prefix_bidir_v3_noise_filter_topk: NotRequired[int]
+    # Pure-ALM baseline: every aligned chunk uses only the realized
+    # student/teacher token-chain probability plus one rest bucket. Disables
+    # the 1-to-1 common-vocab KL/JSD and the position-0 auxiliary term.
+    prefix_bidir_v3_pure_alm: NotRequired[bool]
+    # Temperature for pure-ALM BCE. When the v3 loss fn is "bce", the binary
+    # target/input are p_teacher ** (1/tau) and p_student ** (1/tau).
+    prefix_bidir_v3_alm_bce_tau: NotRequired[float]
+    # Sparse teacher transport: when > 0, the teacher exports top-k logits +
+    # ids + full-vocab logZ via IPC and v6 computes KL/JSD over the explicit
+    # top-k support plus one rest bucket instead of full teacher logits.
+    teacher_topk_ipc_k: NotRequired[int]
+    # Sparse teacher IPC support policy: "row_topk" | "microbatch_global_topk".
+    teacher_topk_ipc_support_mode: NotRequired[str]
+    # Reserve the realized teacher label as support and use the remaining k-1
+    # slots for teacher alternatives (sparse path).
+    teacher_topk_ipc_keep_realized: NotRequired[bool]
+    # Per-teacher forward pseudo-target table .pt paths (keys ``subtoks`` /
+    # ``lengths``: student->teacher sub-token chains), needed for each cross-tok
+    # teacher's prefix-support index unless pure_alm=True. ``None`` for
+    # same-vocab teachers. Runtime-injected by
+    # ``xtoken_off_policy_distillation.setup`` from ``teachers[i]``.
+    pseudo_target_paths: NotRequired[list[Optional[str]]]
+    # Per-teacher reverse pseudo-target table .pt paths (teacher->student
+    # sub-token chains), needed unless pure_alm=True.
+    reverse_pseudo_target_paths: NotRequired[list[Optional[str]]]
 
 
 class CrossTokenizerDistillationLossDataDict(TypedDict):
@@ -1594,6 +1752,45 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 f"per-teacher lists must be equal length, got {per_teacher_lens}"
             )
         self.num_teachers = len(self.projection_matrix_paths)
+        # ------------------------------------------------------------------
+        # v6 (prefix_bidir_partition_kl_v3) state. Each cross-tokenizer teacher's
+        # KD term is the prefix-bidir partition KL; same-vocab teachers keep the
+        # direct-KL path and hold no v6 state. Per-teacher artifact caches
+        # (common-index set, prefix-support index, pseudo-target tables) are
+        # keyed by teacher index so any number of cross-tok teachers compose.
+        # ------------------------------------------------------------------
+        self.common_indices_from_subtoks = bool(
+            cfg.get("common_indices_from_subtoks", False)
+        )
+        # Per-teacher pseudo-target table paths (forward: student->teacher
+        # chains; reverse: teacher->student chains). None for same-vocab
+        # teachers. Runtime-injected symmetrically to projection_matrix_paths.
+        self.pseudo_target_paths: list[Optional[str]] = list(
+            cfg.get("pseudo_target_paths", [None] * self.num_teachers)
+        )
+        self.reverse_pseudo_target_paths: list[Optional[str]] = list(
+            cfg.get("reverse_pseudo_target_paths", [None] * self.num_teachers)
+        )
+        # Optional per-microbatch loss dump for parity comparison
+        # (NRL_XTOKEN_LOSS_DUMP_DIR). Raw floats from the loss-compute site.
+        self._loss_dump_dir = os.environ.get("NRL_XTOKEN_LOSS_DUMP_DIR")
+        self._loss_dump_records: list[dict[str, Any]] = []
+        self._loss_dump_call_idx = 0
+        # Lazy v6 caches, populated on first call, keyed by (device, teacher_idx).
+        self._v3_common_indices_per_device: dict[
+            tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._v3_teacher_to_common_student_per_device: dict[
+            tuple[torch.device, int], torch.Tensor
+        ] = {}
+        self._v3_prefix_index_per_device: dict[
+            tuple[torch.device, int], dict[str, Any]
+        ] = {}
+        # Per-teacher pseudo-target tables, loaded lazily. idx ->
+        # (subtoks_t, lengths_t, subtoks_s, lengths_s).
+        self._v3_subtoks_per_teacher: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
         # The materialized projection matrix and the derived exact-map
         # partition both live in process-local caches in
         # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
@@ -2645,3 +2842,2305 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             label_mask,
             global_normalization_factor=global_valid_toks,
         )
+
+    # === v6 (prefix_bidir_partition_kl_v3) ported methods ===
+    @staticmethod
+    def _rebuild_teacher_full_logits(
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+    ) -> torch.Tensor:
+        """Unpack ``teacher_full_logits_ipc`` to a stacked ``[B, T_t, V_t]`` CUDA tensor.
+
+        The IPC handles point at views the teacher worker stashed in its
+        ``_teacher_ipc_buffer``; rebuilding does not allocate new memory
+        on the producer side. Casts to ``float32`` to match the loss math
+        (the producer also writes FP32 via :class:`FullLogitsPostProcessor`).
+        """
+        from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+        handles = data["teacher_full_logits_ipc"]
+        consumer_device = torch.cuda.current_device()
+        per_sample = [
+            rebuild_cuda_tensor_from_ipc(h["logits_ipc"], consumer_device)
+            for h in handles
+        ]
+        return torch.stack(per_sample, dim=0).float()
+
+    @staticmethod
+    def _rebuild_teacher_sparse_logits(
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Unpack sparse teacher-logit IPC handles.
+
+        Returns:
+            topk_logits:  ``[B, T_t, k]`` raw teacher logits, fp32
+            topk_indices: ``[B, T_t, k]`` sorted teacher token ids, int32
+            log_z:        ``[B, T_t]`` logsumexp(logits / temperature), fp32
+            gt_in_topk:   optional ``[B, T_t]`` bool mask recording whether
+                          the realized teacher label was in the true teacher
+                          top-k before forced insertion.
+        """
+        from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+        handles = data["teacher_sparse_logits_ipc"]
+        consumer_device = torch.cuda.current_device()
+        per_sample_logits = []
+        per_sample_indices = []
+        per_sample_log_z = []
+        per_sample_gt_in_topk = []
+        first_shards = handles[0].get("teacher_shards", [handles[0]]) if handles else []
+        has_gt_in_topk = bool(first_shards) and "gt_in_topk_ipc" in first_shards[0]
+        for sample_entry in handles:
+            shards = sample_entry.get("teacher_shards", [sample_entry])
+            shards = sorted(shards, key=lambda h: int(h.get("global_seq_start", 0)))
+            if any(("gt_in_topk_ipc" in h) != has_gt_in_topk for h in shards):
+                raise ValueError(
+                    "Sparse teacher IPC handles mix gt_in_topk and "
+                    "non-gt_in_topk payloads."
+                )
+            if len(shards) > 1:
+                expected_start = 0
+                for h in shards:
+                    start = int(h["global_seq_start"])
+                    if start != expected_start:
+                        raise ValueError(
+                            "Sparse teacher CP shards must cover the sequence "
+                            f"contiguously; expected start {expected_start}, got {start}."
+                        )
+                    expected_start += int(h["topk_shape"][0])
+                full_seq_len = int(shards[0]["full_seq_len"])
+                if expected_start != full_seq_len:
+                    raise ValueError(
+                        "Sparse teacher CP shards do not cover the full sequence: "
+                        f"covered={expected_start}, full_seq_len={full_seq_len}."
+                    )
+
+            sample_logits = [
+                rebuild_cuda_tensor_from_ipc(h["topk_logits_ipc"], consumer_device)
+                for h in shards
+            ]
+            sample_indices = [
+                rebuild_cuda_tensor_from_ipc(h["topk_indices_ipc"], consumer_device)
+                for h in shards
+            ]
+            sample_log_z = [
+                rebuild_cuda_tensor_from_ipc(h["log_z_ipc"], consumer_device)
+                for h in shards
+            ]
+            per_sample_logits.append(torch.cat(sample_logits, dim=0))
+            per_sample_indices.append(torch.cat(sample_indices, dim=0))
+            per_sample_log_z.append(torch.cat(sample_log_z, dim=0))
+            if has_gt_in_topk:
+                per_sample_gt_in_topk.append(
+                    torch.cat(
+                        [
+                            rebuild_cuda_tensor_from_ipc(
+                                h["gt_in_topk_ipc"], consumer_device
+                            )
+                            for h in shards
+                        ],
+                        dim=0,
+                    )
+                )
+        gt_in_topk = (
+            torch.stack(per_sample_gt_in_topk, dim=0).to(torch.bool)
+            if has_gt_in_topk
+            else None
+        )
+        return (
+            torch.stack(per_sample_logits, dim=0).float(),
+            torch.stack(per_sample_indices, dim=0).to(torch.int32),
+            torch.stack(per_sample_log_z, dim=0).float(),
+            gt_in_topk,
+        )
+
+    def _get_v3_teacher_to_common_student(
+        self,
+        device: torch.device,
+        v_t: int,
+        common_student_idx_t: torch.Tensor,
+        common_teacher_idx_t: torch.Tensor,
+    ) -> torch.Tensor:
+        cache_key = (device, int(v_t))
+        cached = self._v3_teacher_to_common_student_per_device.get(cache_key)
+        if cached is not None:
+            return cached
+        mapping = torch.full(
+            (int(v_t),),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        valid = common_teacher_idx_t < int(v_t)
+        mapping[common_teacher_idx_t[valid]] = common_student_idx_t[valid]
+        self._v3_teacher_to_common_student_per_device[cache_key] = mapping
+        return mapping
+
+    @staticmethod
+    def _lookup_sparse_teacher_logp(
+        topk_logits: torch.Tensor,
+        topk_indices: torch.Tensor,
+        teacher_log_z: torch.Tensor,
+        b_idx: torch.Tensor,
+        pos: torch.Tensor,
+        token_ids: torch.Tensor,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lookup teacher log-probs for explicit token ids in sparse top-k rows.
+
+        ``topk_indices`` must be sorted ascending along the last dimension.
+        ``pos`` and ``token_ids`` may be either ``[K]`` or ``[K, N]``.
+        Missing ids return an arbitrary log-prob value and ``found=False``;
+        callers must mask them into the rest bucket.
+        """
+        squeeze = False
+        if pos.dim() == 1:
+            pos = pos.unsqueeze(-1)
+            token_ids = token_ids.unsqueeze(-1)
+            squeeze = True
+
+        original_shape = token_ids.shape
+        b_flat = b_idx.unsqueeze(-1).expand_as(pos).reshape(-1)
+        pos_flat = pos.reshape(-1)
+        token_flat = token_ids.reshape(-1).to(topk_indices.dtype)
+        out_logp = torch.empty(
+            (token_flat.numel(),),
+            device=topk_logits.device,
+            dtype=topk_logits.dtype,
+        )
+        out_found = torch.empty(
+            (token_flat.numel(),),
+            device=topk_indices.device,
+            dtype=torch.bool,
+        )
+
+        k_top = topk_indices.shape[-1]
+        row_chunk = int(os.environ.get("TOKENALIGN_SPARSE_LOOKUP_ROWS", "2048"))
+        row_chunk = max(row_chunk, 1)
+        for start in range(0, token_flat.numel(), row_chunk):
+            end = min(start + row_chunk, token_flat.numel())
+            rows_idx = topk_indices[b_flat[start:end], pos_flat[start:end]]
+            rows_vals = topk_logits[b_flat[start:end], pos_flat[start:end]]
+            targets = token_flat[start:end]
+
+            insert = torch.searchsorted(rows_idx, targets.unsqueeze(-1))
+            insert = insert.squeeze(-1)
+            in_bounds = insert < k_top
+            safe_insert = insert.clamp(max=k_top - 1)
+            row_arange = torch.arange(
+                rows_idx.shape[0],
+                device=rows_idx.device,
+                dtype=torch.long,
+            )
+            matched_idx = rows_idx[row_arange, safe_insert]
+            found = in_bounds & (matched_idx == targets)
+            raw_logits = rows_vals[row_arange, safe_insert]
+            flat_log_z = teacher_log_z[b_flat[start:end], pos_flat[start:end]]
+
+            out_logp[start:end] = raw_logits / float(temperature) - flat_log_z
+            out_found[start:end] = found
+
+        logp = out_logp.reshape(original_shape)
+        found = out_found.reshape(original_shape)
+
+        if squeeze:
+            logp = logp.squeeze(-1)
+            found = found.squeeze(-1)
+        return logp, found
+
+
+    def _maybe_dump_loss(self, metrics: dict[str, Any]) -> None:
+        """Append per-call raw loss values to a per-rank dump file.
+
+        Activated by ``NRL_XTOKEN_LOSS_DUMP_DIR``. One file per rank,
+        rewritten on each call with the full record list. Records are raw
+        ``loss.item()`` values from the loss-compute site — not scaled,
+        aggregated, or DP-summed — matching the dump protocol used for
+        PT-vs-NRL parity comparisons (cf. ``feedback_sanity_loss_dump``).
+        """
+        if not self._loss_dump_dir:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # The P-KL path emits kl_loss/ce_loss/kl_loss_scale/num_valid_pairs;
+        # the gold-loss path emits kl_common/l1_uncommon/num_valid_chunks;
+        # the v3 path emits ce_loss_per_token/kl_loss_per_token plus the
+        # per-chunk diagnostics. Record everything that's present so the
+        # same dump file format serves all — downstream comparison scripts
+        # read by key.
+        record: dict[str, Any] = {
+            "call_idx": self._loss_dump_call_idx,
+            "loss": metrics["loss"],
+        }
+        for k in (
+            "kl_loss",
+            "ce_loss",
+            "kl_loss_per_chunk",
+            "ce_loss_per_token",
+            "kl_loss_scale",
+            "num_valid_pairs",
+            "kl_common",
+            "kl_common_per_chunk",
+            "kl_partition_first_per_chunk",
+            "kl_partition_last_per_chunk",
+            "l1_uncommon",
+            "num_valid_chunks",
+        ):
+            if k in metrics:
+                record[k] = metrics[k]
+        self._loss_dump_records.append(record)
+        self._loss_dump_call_idx += 1
+        os.makedirs(self._loss_dump_dir, exist_ok=True)
+        torch.save(
+            self._loss_dump_records,
+            os.path.join(self._loss_dump_dir, f"rank{rank}.pt"),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Loss-mode implementations
+    # ------------------------------------------------------------------ #
+
+    def _get_common_indices_v3(
+        self,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached (common_student, common_teacher) for v3.
+
+        Adapts tokenalign.py:_get_renorm_common_pkl_indices (line 5535).
+        Rather than re-deriving the exact map from the dense projection
+        arrays, we delegate to nemo_rl's `_build_exact_token_map` which
+        already returns the same paired (common_student, common_teacher)
+        LongTensors and caches its own per-device result. v3 keeps a
+        second tiny cache here so its hot path doesn't dict-lookup
+        through `_exact_map_cache` on every call.
+        """
+        if device in self._v3_common_indices_per_device:
+            return self._v3_common_indices_per_device[device]
+        if self.common_indices_from_subtoks:
+            # Source the exact-match common set from the forward subtoks table
+            # (no projection matrix needed). See _common_indices_from_subtoks.
+            common_s, common_t = self._common_indices_from_subtoks(device)
+        else:
+            exact_map = self._build_exact_token_map(device)
+            common_s = exact_map["common_student"]
+            common_t = exact_map["common_teacher"]
+        self._v3_common_indices_per_device[device] = (common_s, common_t)
+        return common_s, common_t
+
+    def _common_indices_from_subtoks(
+        self,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Derive (common_student, common_teacher) from the forward subtoks table.
+
+        A student token is exactly "common" (1-to-1 with the teacher vocab) iff
+        its forward sub-token chain has length 1; the paired teacher id is
+        ``subtoks_t[s, 0]``. This reads the same forward table the v3 prefix
+        index uses (``cfg['pseudo_target_path']``, keys ``subtoks``/``lengths``
+        from examples/converters/build_subtoks_table.py), so a common-only v3
+        run needs no projection matrix. Teacher collisions (rare for true exact
+        matches) are deduped keeping the lowest student id, matching the
+        projection strict-mode contract that ``common_teacher`` is unique.
+        Result is sorted by student index, like ``_build_exact_token_map``.
+        """
+        # Load the forward subtoks table on first use (small CPU tensors). The
+        # v3 prefix index (`_ensure_bidir_prefix_support_index`) loads the same
+        # tensors lazily; whichever runs first populates the shared cache.
+        if self._v3_subtoks_t is None or self._v3_lengths_t is None:
+            fwd_path = self.cfg.get("pseudo_target_path", "") or ""
+            if not fwd_path or not os.path.exists(fwd_path):
+                raise RuntimeError(
+                    "common_indices_from_subtoks=True requires a valid "
+                    "pseudo_target_path (forward subtoks table); "
+                    f"got {fwd_path!r}. Build it with "
+                    "examples/converters/build_subtoks_table.py."
+                )
+            fwd = torch.load(fwd_path, map_location="cpu", weights_only=False)
+            self._v3_subtoks_t = fwd["subtoks"].long()
+            self._v3_lengths_t = fwd["lengths"].long()
+
+        v_teacher = int(self.cfg["teacher_vocab_size"])
+        lengths_t = self._v3_lengths_t
+        subtoks_t = self._v3_subtoks_t
+
+        common_s = (lengths_t == 1).nonzero(as_tuple=True)[0]
+        common_t = subtoks_t[common_s, 0]
+        in_bounds = (common_t >= 0) & (common_t < v_teacher)
+        common_s = common_s[in_bounds]
+        common_t = common_t[in_bounds]
+
+        if common_t.numel() > 0:
+            # Sort by student id, then keep the first (lowest-student) entry per
+            # teacher id so common_teacher is unique.
+            order = torch.argsort(common_s)
+            common_s, common_t = common_s[order], common_t[order]
+            sort_t, t_order = torch.sort(common_t, stable=True)
+            first_of_t = torch.ones_like(sort_t, dtype=torch.bool)
+            first_of_t[1:] = sort_t[1:] != sort_t[:-1]
+            keep = torch.zeros(common_t.shape[0], dtype=torch.bool)
+            keep[t_order[first_of_t]] = True
+            common_s, common_t = common_s[keep], common_t[keep]
+            re_order = torch.argsort(common_s)
+            common_s, common_t = common_s[re_order], common_t[re_order]
+
+        return common_s.to(device), common_t.to(device)
+
+    def _ensure_bidir_prefix_support_index(
+        self,
+        device: torch.device,
+    ) -> dict[str, Any]:
+        """Lazy-build the bidirectional prefix support index for v3.
+
+        Faithful port of tokenalign.py:5941-6019. The cache maps
+        ``(length, prefix_tuple) -> tuple[(s_id, t_id), ...]`` for both
+        forward and reverse pseudo-target tables. Built once per device.
+
+        Reads .pt files at ``cfg["pseudo_target_path"]`` (with keys
+        ``subtoks``/``lengths``) and ``cfg["reverse_pseudo_target_path"]``.
+        Raises RuntimeError if either path is missing.
+        """
+        if device in self._v3_prefix_index_per_device:
+            return self._v3_prefix_index_per_device[device]
+        cfg = self.cfg
+        fwd_path = cfg.get("pseudo_target_path", "") or ""
+        rev_path = cfg.get("reverse_pseudo_target_path", "") or ""
+        if not fwd_path or not rev_path:
+            raise RuntimeError(
+                "v3 requires pseudo_target_path and "
+                "reverse_pseudo_target_path to be set; generate them with "
+                "examples/converters/build_subtoks_table.py"
+            )
+        if not os.path.exists(fwd_path):
+            raise RuntimeError(
+                "v3 requires pseudo_target_path and "
+                "reverse_pseudo_target_path to be set; generate them with "
+                f"examples/converters/build_subtoks_table.py (missing: {fwd_path})"
+            )
+        if not os.path.exists(rev_path):
+            raise RuntimeError(
+                "v3 requires pseudo_target_path and "
+                "reverse_pseudo_target_path to be set; generate them with "
+                f"examples/converters/build_subtoks_table.py (missing: {rev_path})"
+            )
+
+        # Load and cache the pseudo-target tables on first use. They are
+        # small CPU tensors (shape [V, max_chain]) so we keep them on CPU
+        # and move slices to device only on demand.
+        if self._v3_subtoks_t is None:
+            fwd = torch.load(fwd_path, map_location="cpu", weights_only=False)
+            self._v3_subtoks_t = fwd["subtoks"].long()
+            self._v3_lengths_t = fwd["lengths"].long()
+        if self._v3_subtoks_s is None:
+            rev = torch.load(rev_path, map_location="cpu", weights_only=False)
+            self._v3_subtoks_s = rev["subtoks"].long()
+            self._v3_lengths_s = rev["lengths"].long()
+
+        # Build the prefix-keyed dicts. Faithful port of
+        # tokenalign.py:5956-5982.
+        forward: dict[tuple[int, tuple[int, ...]], list[tuple[int, int]]] = (
+            collections.defaultdict(list)
+        )
+        subtoks_t_cpu = self._v3_subtoks_t
+        lengths_t_cpu = self._v3_lengths_t
+        for s_id, length in enumerate(lengths_t_cpu.tolist()):
+            length = int(length)
+            if length <= 1 or length > subtoks_t_cpu.size(1):
+                continue
+            row = subtoks_t_cpu[s_id, :length]
+            if bool((row < 0).any().item()):
+                continue
+            prefix = tuple(int(x) for x in row[: length - 1].tolist())
+            final_t = int(row[length - 1].item())
+            forward[(length, prefix)].append((int(s_id), final_t))
+
+        reverse: dict[tuple[int, tuple[int, ...]], list[tuple[int, int]]] = (
+            collections.defaultdict(list)
+        )
+        subtoks_s_cpu = self._v3_subtoks_s
+        lengths_s_cpu = self._v3_lengths_s
+        for t_id, length in enumerate(lengths_s_cpu.tolist()):
+            length = int(length)
+            if length <= 1 or length > subtoks_s_cpu.size(1):
+                continue
+            row = subtoks_s_cpu[t_id, :length]
+            if bool((row < 0).any().item()):
+                continue
+            prefix = tuple(int(x) for x in row[: length - 1].tolist())
+            final_s = int(row[length - 1].item())
+            reverse[(length, prefix)].append((int(t_id), final_s))
+
+        # Pre-dedupe (tokenalign.py:5984-6017). The same env override
+        # gate is preserved so A/B verification stays available.
+        _prededuped = os.environ.get("TOKENALIGN_PREDEDUP_PREFIX_INDEX", "1") == "1"
+
+        def _dedup_by_second(pairs_list):
+            seen_second = set()
+            out = []
+            for p in pairs_list:
+                second = p[1]
+                if second in seen_second:
+                    continue
+                seen_second.add(second)
+                out.append(p)
+            return tuple(out)
+
+        if _prededuped:
+            cache: dict[str, Any] = {
+                "forward": {
+                    key: _dedup_by_second(value) for key, value in forward.items()
+                },
+                "reverse": {
+                    key: _dedup_by_second(value) for key, value in reverse.items()
+                },
+                "_prededuped": True,
+            }
+        else:
+            cache = {
+                "forward": {key: tuple(value) for key, value in forward.items()},
+                "reverse": {key: tuple(value) for key, value in reverse.items()},
+                "_prededuped": False,
+            }
+        # Cache the table sizes used by the chunk-classification skip rules
+        # below — equivalent to ``subtoks_t.size(1)`` /
+        # ``subtoks_s.size(1)`` on the source side.
+        cache["max_chain_t"] = int(self._v3_subtoks_t.size(1))
+        cache["max_chain_s"] = int(self._v3_subtoks_s.size(1))
+        self._v3_prefix_index_per_device[device] = cache
+        return cache
+
+    @staticmethod
+    def _append_rest_bucket_logp(
+        logp: torch.Tensor,
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        """Append log probability for the complement of a support set.
+
+        Verbatim port of tokenalign.py:_append_rest_bucket_logp (line 6083).
+        ``eps=1e-12`` (per the porting spec's faithful-numerics rule) is
+        the clamp floor for the complement mass.
+        """
+        if logp.numel() == 0:
+            return logp
+        work = logp.float() if logp.dtype in (torch.float16, torch.bfloat16) else logp
+        support_mass = work.exp().sum(dim=-1, keepdim=True)
+        rest_mass = (1.0 - support_mass).clamp(min=eps)
+        return torch.cat([work, rest_mass.log()], dim=-1)
+
+    @staticmethod
+    def _binary_power_bce_from_logp(
+        student_logp_with_rest: torch.Tensor,
+        teacher_logp_with_rest: torch.Tensor,
+        tau: float = 1.0,
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        """Soft-label BCE on ALM's binary realized-vs-rest distribution.
+
+        ``student_logp_with_rest`` and ``teacher_logp_with_rest`` must have
+        exactly two columns: realized-chain log-probability and rest-bucket
+        log-probability. The BCE input and target follow:
+
+            input  = p_student_realized ** (1 / tau)
+            target = p_teacher_realized ** (1 / tau)
+
+        The returned tensor has the same trailing width of 2, with the realized
+        and rest BCE terms split so existing support/rest masking still applies.
+        """
+        if tau <= 0.0:
+            raise ValueError(f"prefix_bidir_v3_alm_bce_tau must be > 0, got {tau}")
+        if (
+            student_logp_with_rest.shape[-1] != 2
+            or teacher_logp_with_rest.shape[-1] != 2
+        ):
+            raise ValueError(
+                "ALM BCE expects binary realized-vs-rest support; got "
+                f"student shape {tuple(student_logp_with_rest.shape)} and "
+                f"teacher shape {tuple(teacher_logp_with_rest.shape)}"
+            )
+
+        work_dtype = (
+            torch.float32
+            if student_logp_with_rest.dtype in (torch.float16, torch.bfloat16)
+            else student_logp_with_rest.dtype
+        )
+        eps = max(float(eps), float(torch.finfo(work_dtype).eps))
+        exponent = 1.0 / float(tau)
+        student_real = (
+            student_logp_with_rest[..., 0]
+            .to(work_dtype)
+            .exp()
+            .clamp(min=0.0, max=1.0)
+            .pow(exponent)
+            .clamp(min=eps, max=1.0 - eps)
+        )
+        teacher_real = (
+            teacher_logp_with_rest[..., 0]
+            .to(work_dtype)
+            .exp()
+            .clamp(min=0.0, max=1.0)
+            .pow(exponent)
+            .detach()
+        )
+        realized_term = -teacher_real * student_real.log()
+        rest_term = -(1.0 - teacher_real) * torch.log1p(-student_real)
+        return torch.stack([realized_term, rest_term], dim=-1)
+
+    @staticmethod
+    def _topk_mask_by_score(
+        candidate_mask: torch.Tensor,
+        scores: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        """Keep the row-wise top-k valid candidates by score."""
+        k = int(k)
+        if k <= 0:
+            return torch.zeros_like(candidate_mask, dtype=torch.bool)
+        candidate_mask = candidate_mask.to(torch.bool)
+        if candidate_mask.shape[-1] <= k:
+            return candidate_mask
+        masked_scores = torch.where(
+            candidate_mask,
+            scores,
+            torch.full_like(scores, -1.0e30),
+        )
+        _, keep_idx = torch.topk(masked_scores, k=k, dim=-1)
+        keep_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        keep_mask.scatter_(dim=-1, index=keep_idx, value=True)
+        return keep_mask & candidate_mask
+
+    @staticmethod
+    def _unique_bidir_pairs_cpu(
+        pairs,
+        swap: bool = False,
+        assume_unique: bool = False,
+    ) -> tuple[list[int], list[int]]:
+        """CPU dedupe of ``(s_id, t_id)`` pairs.
+
+        Verbatim port of tokenalign.py:_unique_bidir_pairs_cpu (line 6122).
+        When ``assume_unique=True`` we skip the Python set dedupe loop and
+        unpack via numpy. ``swap=True`` treats input as ``(t_id, s_id)``
+        (used for the reverse prefix-index branch).
+        """
+        if not pairs:
+            return [], []
+        if assume_unique:
+            arr = np.asarray(pairs, dtype=np.int64)
+            if swap:
+                return arr[:, 1].tolist(), arr[:, 0].tolist()
+            return arr[:, 0].tolist(), arr[:, 1].tolist()
+        seen_s: set[int] = set()
+        seen_t: set[int] = set()
+        s_list: list[int] = []
+        t_list: list[int] = []
+        for p in pairs:
+            if swap:
+                t_id = int(p[0])
+                s_id = int(p[1])
+            else:
+                s_id = int(p[0])
+                t_id = int(p[1])
+            if s_id in seen_s or t_id in seen_t:
+                continue
+            seen_s.add(s_id)
+            seen_t.add(t_id)
+            s_list.append(s_id)
+            t_list.append(t_id)
+        return s_list, t_list
+
+    def _partition_kl_mismatch_batched(
+        self,
+        chunk_records,
+        student_logits: torch.Tensor,
+        teacher_logits: Optional[torch.Tensor],
+        student_log_z: torch.Tensor,
+        teacher_log_z: torch.Tensor,
+        temperature: float,
+        reverse_kl: bool,
+        loss_fn: str = "kl",
+        jsd_beta: float = 0.5,
+        alm_bce_tau: float = 1.0,
+        teacher_sparse: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        teacher_sparse_keep_realized: bool = False,
+    ) -> tuple[torch.Tensor, int, int, list[int], list[bool]]:
+        """Batched partition-KL over a flat list of mismatch chunk records.
+
+        Verbatim port of tokenalign.py:_partition_kl_mismatch_batched
+        (line 6161). Each record is the 11-tuple
+        ``(b, s_last, t_last, s_prefix_pred_pos, s_prefix_label_id,
+        t_prefix_pred_pos, t_prefix_label_id, s_ids_list, t_ids_list,
+        realized_s_last_id, realized_t_last_id)``.
+        Returns ``(loss_sum, used_count, matches, support_sizes, valid_flags)``.
+        """
+        device = student_logits.device
+        accum_dtype = (
+            torch.float32
+            if student_logits.dtype in (torch.float16, torch.bfloat16)
+            else student_logits.dtype
+        )
+        if not chunk_records:
+            zero = torch.tensor(0.0, device=device, dtype=accum_dtype)
+            return zero, 0, 0, [], []
+
+        K = len(chunk_records)
+        Pmax_s = max(len(r[3]) for r in chunk_records)
+        Pmax_t = max(len(r[5]) for r in chunk_records)
+        Smax = max(len(r[7]) for r in chunk_records)
+        # Sentinel that survives kl_div: exp(-1e30) underflows to 0 in fp32 so
+        # the masked entry contributes 0 to support-mass and to the per-row KL
+        # sum, while target - input stays finite (no 0*nan).
+        NEG_INF = -1.0e30
+
+        # Numpy fast path mirrors the source's `_use_np` default-on
+        # branch (tokenalign.py:6211-6268). The legacy Python-list branch
+        # is preserved for A/B verification via the same env override.
+        _use_np = os.environ.get("TOKENALIGN_BATCHED_HELPER_NUMPY", "1") == "1"
+
+        b_idx_list = [r[0] for r in chunk_records]
+        s_last_list = [r[1] for r in chunk_records]
+        t_last_list = [r[2] for r in chunk_records]
+        s_realized_list = [r[9] if len(r) > 9 else -1 for r in chunk_records]
+        t_realized_list = [r[10] if len(r) > 10 else -1 for r in chunk_records]
+        support_sizes = [len(r[7]) for r in chunk_records]
+
+        np_accum_dtype = np.float32 if accum_dtype == torch.float32 else np.float64
+
+        s_pred_pos = None
+        s_label_id = None
+        s_pmask = None
+        t_pred_pos = None
+        t_label_id = None
+        t_pmask = None
+
+        if _use_np:
+            s_ids_np = np.zeros((K, Smax), dtype=np.int64)
+            t_ids_np = np.zeros((K, Smax), dtype=np.int64)
+            smask_np = np.zeros((K, Smax), dtype=np_accum_dtype)
+            if Pmax_s > 0:
+                s_pred_pos_np = np.zeros((K, Pmax_s), dtype=np.int64)
+                s_label_id_np = np.zeros((K, Pmax_s), dtype=np.int64)
+                s_pmask_np = np.zeros((K, Pmax_s), dtype=np_accum_dtype)
+            if Pmax_t > 0:
+                t_pred_pos_np = np.zeros((K, Pmax_t), dtype=np.int64)
+                t_label_id_np = np.zeros((K, Pmax_t), dtype=np.int64)
+                t_pmask_np = np.zeros((K, Pmax_t), dtype=np_accum_dtype)
+            for i, r in enumerate(chunk_records):
+                s_pp, s_lid = r[3], r[4]
+                t_pp, t_lid = r[5], r[6]
+                s_list, t_list = r[7], r[8]
+                ns_p = len(s_pp)
+                if ns_p > 0:
+                    s_pred_pos_np[i, :ns_p] = s_pp
+                    s_label_id_np[i, :ns_p] = s_lid
+                    s_pmask_np[i, :ns_p] = 1.0
+                nt_p = len(t_pp)
+                if nt_p > 0:
+                    t_pred_pos_np[i, :nt_p] = t_pp
+                    t_label_id_np[i, :nt_p] = t_lid
+                    t_pmask_np[i, :nt_p] = 1.0
+                n_sup = len(s_list)
+                if n_sup > 0:
+                    s_ids_np[i, :n_sup] = s_list
+                    t_ids_np[i, :n_sup] = t_list
+                    smask_np[i, :n_sup] = 1.0
+
+            b_idx = torch.from_numpy(np.asarray(b_idx_list, dtype=np.int64)).to(
+                device, non_blocking=True
+            )
+            s_last = torch.from_numpy(np.asarray(s_last_list, dtype=np.int64)).to(
+                device, non_blocking=True
+            )
+            t_last = torch.from_numpy(np.asarray(t_last_list, dtype=np.int64)).to(
+                device, non_blocking=True
+            )
+            s_realized_last = torch.from_numpy(
+                np.asarray(s_realized_list, dtype=np.int64)
+            ).to(device, non_blocking=True)
+            t_realized_last = torch.from_numpy(
+                np.asarray(t_realized_list, dtype=np.int64)
+            ).to(device, non_blocking=True)
+            s_ids = torch.from_numpy(s_ids_np).to(device, non_blocking=True)
+            t_ids = torch.from_numpy(t_ids_np).to(device, non_blocking=True)
+            support_mask = torch.from_numpy(smask_np).to(
+                device,
+                dtype=accum_dtype,
+                non_blocking=True,
+            )
+            if Pmax_s > 0:
+                s_pred_pos = torch.from_numpy(s_pred_pos_np).to(
+                    device,
+                    non_blocking=True,
+                )
+                s_label_id = torch.from_numpy(s_label_id_np).to(
+                    device,
+                    non_blocking=True,
+                )
+                s_pmask = torch.from_numpy(s_pmask_np).to(
+                    device,
+                    dtype=accum_dtype,
+                    non_blocking=True,
+                )
+            if Pmax_t > 0:
+                t_pred_pos = torch.from_numpy(t_pred_pos_np).to(
+                    device,
+                    non_blocking=True,
+                )
+                t_label_id = torch.from_numpy(t_label_id_np).to(
+                    device,
+                    non_blocking=True,
+                )
+                t_pmask = torch.from_numpy(t_pmask_np).to(
+                    device,
+                    dtype=accum_dtype,
+                    non_blocking=True,
+                )
+        else:
+            s_pred_pos_buf = [[0] * Pmax_s for _ in range(K)] if Pmax_s > 0 else None
+            s_label_id_buf = [[0] * Pmax_s for _ in range(K)] if Pmax_s > 0 else None
+            s_pmask_buf = [[0.0] * Pmax_s for _ in range(K)] if Pmax_s > 0 else None
+            t_pred_pos_buf = [[0] * Pmax_t for _ in range(K)] if Pmax_t > 0 else None
+            t_label_id_buf = [[0] * Pmax_t for _ in range(K)] if Pmax_t > 0 else None
+            t_pmask_buf = [[0.0] * Pmax_t for _ in range(K)] if Pmax_t > 0 else None
+            s_ids_buf = [[0] * Smax for _ in range(K)]
+            t_ids_buf = [[0] * Smax for _ in range(K)]
+            smask_buf = [[0.0] * Smax for _ in range(K)]
+
+            for i, r in enumerate(chunk_records):
+                s_pp, s_lid = r[3], r[4]
+                t_pp, t_lid = r[5], r[6]
+                s_list, t_list = r[7], r[8]
+                for j, (p, lid) in enumerate(zip(s_pp, s_lid)):
+                    s_pred_pos_buf[i][j] = p
+                    s_label_id_buf[i][j] = lid
+                    s_pmask_buf[i][j] = 1.0
+                for j, (p, lid) in enumerate(zip(t_pp, t_lid)):
+                    t_pred_pos_buf[i][j] = p
+                    t_label_id_buf[i][j] = lid
+                    t_pmask_buf[i][j] = 1.0
+                n_sup = len(s_list)
+                for j in range(n_sup):
+                    s_ids_buf[i][j] = s_list[j]
+                    t_ids_buf[i][j] = t_list[j]
+                    smask_buf[i][j] = 1.0
+
+            b_idx = torch.tensor(b_idx_list, device=device, dtype=torch.long)
+            s_last = torch.tensor(
+                s_last_list,
+                device=device,
+                dtype=torch.long,
+            )
+            t_last = torch.tensor(
+                t_last_list,
+                device=device,
+                dtype=torch.long,
+            )
+            s_realized_last = torch.tensor(
+                s_realized_list,
+                device=device,
+                dtype=torch.long,
+            )
+            t_realized_last = torch.tensor(
+                t_realized_list,
+                device=device,
+                dtype=torch.long,
+            )
+            s_ids = torch.tensor(s_ids_buf, device=device, dtype=torch.long)
+            t_ids = torch.tensor(t_ids_buf, device=device, dtype=torch.long)
+            support_mask = torch.tensor(
+                smask_buf,
+                device=device,
+                dtype=accum_dtype,
+            )
+            if Pmax_s > 0:
+                s_pred_pos = torch.tensor(
+                    s_pred_pos_buf,
+                    device=device,
+                    dtype=torch.long,
+                )
+                s_label_id = torch.tensor(
+                    s_label_id_buf,
+                    device=device,
+                    dtype=torch.long,
+                )
+                s_pmask = torch.tensor(
+                    s_pmask_buf,
+                    device=device,
+                    dtype=accum_dtype,
+                )
+            if Pmax_t > 0:
+                t_pred_pos = torch.tensor(
+                    t_pred_pos_buf,
+                    device=device,
+                    dtype=torch.long,
+                )
+                t_label_id = torch.tensor(
+                    t_label_id_buf,
+                    device=device,
+                    dtype=torch.long,
+                )
+                t_pmask = torch.tensor(
+                    t_pmask_buf,
+                    device=device,
+                    dtype=accum_dtype,
+                )
+
+        # ---- Student prefix chain (batched gather) ----
+        if Pmax_s > 0:
+            s_prefix_logits = (
+                student_logits[b_idx[:, None], s_pred_pos, s_label_id] / temperature
+            )
+            s_prefix_scores = (
+                s_prefix_logits.to(accum_dtype)
+                - student_log_z[b_idx[:, None], s_pred_pos]
+            )
+            s_prefix_logp = (s_prefix_scores * s_pmask).sum(dim=-1)  # (K,)
+        else:
+            s_prefix_logp = torch.zeros(
+                (K,),
+                device=device,
+                dtype=accum_dtype,
+            )
+
+        # ---- Teacher prefix chain (batched gather; detached) ----
+        prefix_found = torch.ones((K,), device=device, dtype=torch.bool)
+        if Pmax_t > 0:
+            if teacher_sparse is not None:
+                teacher_topk_logits, teacher_topk_indices = teacher_sparse
+                t_prefix_scores, t_prefix_found = self._lookup_sparse_teacher_logp(
+                    teacher_topk_logits,
+                    teacher_topk_indices,
+                    teacher_log_z,
+                    b_idx,
+                    t_pred_pos,
+                    t_label_id,
+                    temperature,
+                )
+                t_prefix_scores = torch.where(
+                    t_prefix_found,
+                    t_prefix_scores.to(accum_dtype),
+                    torch.zeros_like(t_prefix_scores, dtype=accum_dtype),
+                )
+                prefix_found = (t_prefix_found | (t_pmask <= 0)).all(dim=-1)
+            else:
+                assert teacher_logits is not None
+                t_prefix_logits = (
+                    teacher_logits[b_idx[:, None], t_pred_pos, t_label_id] / temperature
+                )
+                t_prefix_scores = (
+                    t_prefix_logits.to(accum_dtype)
+                    - teacher_log_z[b_idx[:, None], t_pred_pos]
+                )
+            t_prefix_logp = (t_prefix_scores * t_pmask).sum(dim=-1)
+        else:
+            t_prefix_logp = torch.zeros(
+                (K,),
+                device=device,
+                dtype=accum_dtype,
+            )
+
+        # ---- Final-position support scores (batched gather) ----
+        s_final_logits = (
+            student_logits[b_idx[:, None], s_last[:, None], s_ids] / temperature
+        )
+        s_final_scores = s_final_logits.to(accum_dtype) - student_log_z[
+            b_idx, s_last
+        ].unsqueeze(-1)
+        s_full_scores = s_final_scores + s_prefix_logp.unsqueeze(-1)
+        s_full_scores = torch.where(
+            support_mask > 0,
+            s_full_scores,
+            torch.full_like(s_full_scores, NEG_INF),
+        )
+
+        with torch.no_grad():
+            if teacher_sparse is not None:
+                teacher_topk_logits, teacher_topk_indices = teacher_sparse
+                t_last_pos = t_last.unsqueeze(-1).expand_as(t_ids)
+                t_final_scores, t_final_found = self._lookup_sparse_teacher_logp(
+                    teacher_topk_logits,
+                    teacher_topk_indices,
+                    teacher_log_z,
+                    b_idx,
+                    t_last_pos,
+                    t_ids,
+                    temperature,
+                )
+                if teacher_sparse_keep_realized:
+                    topk_width = int(teacher_topk_indices.shape[-1])
+                    alt_budget = max(topk_width - 1, 0)
+                    realized_pair_mask = (
+                        (support_mask > 0)
+                        & (s_ids == s_realized_last[:, None])
+                        & (t_ids == t_realized_last[:, None])
+                    )
+                    alt_candidate_mask = (
+                        (support_mask > 0) & t_final_found & (~realized_pair_mask)
+                    )
+                    alt_keep_mask = self._topk_mask_by_score(
+                        alt_candidate_mask,
+                        t_final_scores.to(accum_dtype),
+                        alt_budget,
+                    )
+                    final_keep_mask = (
+                        realized_pair_mask & t_final_found
+                    ) | alt_keep_mask
+                else:
+                    final_keep_mask = (support_mask > 0) & t_final_found
+                teacher_support_mask = final_keep_mask & prefix_found.unsqueeze(-1)
+                t_full_scores = t_final_scores.to(
+                    accum_dtype
+                ) + t_prefix_logp.unsqueeze(-1)
+                support_mask = support_mask * teacher_support_mask.to(accum_dtype)
+            else:
+                assert teacher_logits is not None
+                t_final_logits = (
+                    teacher_logits[b_idx[:, None], t_last[:, None], t_ids] / temperature
+                )
+                t_final_scores = t_final_logits.to(accum_dtype) - teacher_log_z[
+                    b_idx, t_last
+                ].unsqueeze(-1)
+                t_full_scores = t_final_scores + t_prefix_logp.unsqueeze(-1)
+            t_full_scores = torch.where(
+                support_mask > 0,
+                t_full_scores,
+                torch.full_like(t_full_scores, NEG_INF),
+            )
+
+        # Teacher sparse support pruning is computed without gradients, but the
+        # student scores must be masked with autograd enabled.
+        s_full_scores = torch.where(
+            support_mask > 0,
+            s_full_scores,
+            torch.full_like(s_full_scores, NEG_INF),
+        )
+
+        # ---- Append REST bucket (per-row valid-mass complement) ----
+        s_logp_with_rest = self._append_rest_bucket_logp(s_full_scores)
+        t_logp_with_rest = self._append_rest_bucket_logp(t_full_scores)
+
+        # Validity: row contributes if it has at least 1 support position.
+        valid_row = support_mask.sum(dim=-1) >= 1.0  # (K,) bool
+
+        # ---- Batched partition loss ----
+        if loss_fn == "bce":
+            kl_per_pos = self._binary_power_bce_from_logp(
+                s_logp_with_rest,
+                t_logp_with_rest,
+                tau=alm_bce_tau,
+            )
+        elif loss_fn == "jsd":
+            kl_per_pos = _generalized_jsd(
+                s_logp_with_rest,
+                t_logp_with_rest,
+                jsd_beta,
+            )
+        elif not reverse_kl:
+            kl_per_pos = torch.nn.functional.kl_div(
+                s_logp_with_rest,
+                t_logp_with_rest,
+                reduction="none",
+                log_target=True,
+            )
+        else:
+            kl_per_pos = torch.nn.functional.kl_div(
+                t_logp_with_rest,
+                s_logp_with_rest,
+                reduction="none",
+                log_target=True,
+            )
+        # Mask padded support columns to zero (REST column stays).
+        rest_one = torch.ones((K, 1), device=device, dtype=accum_dtype)
+        full_mask = torch.cat([support_mask, rest_one], dim=-1)
+        per_row_kl = (kl_per_pos * full_mask).sum(dim=-1)  # (K,)
+        per_row_kl = per_row_kl * valid_row.to(per_row_kl.dtype)
+        loss_sum = per_row_kl.sum()
+
+        with torch.no_grad():
+            s_arg = s_full_scores.argmax(dim=-1)
+            t_arg = t_full_scores.argmax(dim=-1)
+            match_row = (s_arg == t_arg) & valid_row
+
+        stats_cpu = torch.stack([valid_row, match_row], dim=0).detach().cpu()
+        valid_flags = [bool(x) for x in stats_cpu[0].tolist()]
+        matches = int(stats_cpu[1].sum().item())
+        used_count = int(sum(valid_flags))
+        effective_support_cpu = support_mask.sum(dim=-1).detach().cpu().tolist()
+        support_sizes_used = [
+            int(size)
+            for size, is_valid in zip(effective_support_cpu, valid_flags)
+            if is_valid
+        ]
+
+        return loss_sum, used_count, matches, support_sizes_used, valid_flags
+
+    def _compute_prefix_bidir_partition_kl_v3(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        global_valid_chunks: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """v3 (v6 preset) prefix-bidir partition KL with MtoM-as-ALM.
+
+        Faithful port of tokenalign.py:_compute_prefix_bidir_exact_support_kl_loss
+        (lines 6413-7425) for the v3 path: ``mtom_as_alm=True``,
+        ``rest_bucket=True``, ``support_topk=0``, ``batched_mismatch=True``.
+        v7-v11-only flags (``v3_average_non_1to1``) are baked in as
+        ``False``. v1/v2/v5 surface-match path is intentionally not
+        ported — MtoM-as-ALM is hardcoded.
+
+        Returns ``(loss, metrics_dict)`` matching the dispatcher contract.
+        """
+        cfg = self.cfg
+        device = logits.device
+        student_logits = logits
+        # B is the per-sample loop bound; S is the student-side
+        # predictor-position bound used in the classify-loop range check.
+        # V_s (student vocab) is implicitly bounded by the logits gather
+        # indices (common_student_idx_t) so we don't bind it here.
+        B, S, _ = student_logits.shape
+
+        # v6 preset knobs (with safe defaults matching tokenalign args
+        # defaults at line 6420-6434):
+        kl_chunk_shift = bool(cfg.get("kl_chunk_shift", False))
+        temperature = float(cfg["temperature"])
+        reverse_kl = bool(cfg.get("reverse_kl", False))
+        v3_position_0_kl = bool(cfg.get("prefix_bidir_v3_position_0_kl", False))
+        v3_loss_fn = str(cfg.get("prefix_bidir_v3_loss_fn", "kl") or "kl")
+        v3_jsd_beta = float(cfg.get("prefix_bidir_v3_jsd_beta", 0.5))
+        v3_alm_bce_tau = float(cfg.get("prefix_bidir_v3_alm_bce_tau", 1.0))
+        v3_last_pos_loss_fn_cfg = cfg.get("prefix_bidir_v3_last_pos_loss_fn")
+        pure_alm = bool(cfg.get("prefix_bidir_v3_pure_alm", False))
+        if pure_alm:
+            # Position-0 is a common-vocab auxiliary partition term. Pure ALM
+            # should only compare realized chain probability vs rest bucket.
+            v3_position_0_kl = False
+        # v6 hybrid: None means "inherit v3_loss_fn"; "kl"/"jsd" overrides
+        # only the position-N-1 (last-position) partition KL.
+        effective_last_pos_loss_fn = (
+            v3_last_pos_loss_fn_cfg
+            if v3_last_pos_loss_fn_cfg is not None
+            else v3_loss_fn
+        )
+        mismatch_pos0_alpha_raw = cfg.get(
+            "prefix_bidir_v3_mismatch_pos0_alpha",
+        )
+        mismatch_loss_beta_raw = cfg.get(
+            "prefix_bidir_v3_mismatch_loss_beta",
+        )
+        mismatch_pos0_weight_raw = cfg.get(
+            "prefix_bidir_v3_mismatch_pos0_weight",
+        )
+        mismatch_loss_scale_raw = cfg.get(
+            "prefix_bidir_v3_mismatch_loss_scale",
+        )
+        uses_additive_coefficients = (
+            mismatch_pos0_alpha_raw is not None or mismatch_loss_beta_raw is not None
+        )
+        if uses_additive_coefficients and (
+            mismatch_pos0_weight_raw is not None or mismatch_loss_scale_raw is not None
+        ):
+            raise ValueError(
+                "New mismatch alpha/beta keys cannot be combined with the "
+                "deprecated mismatch weight/scale keys."
+            )
+
+        mismatch_pos0_alpha: Optional[float] = None
+        mismatch_loss_beta: Optional[float] = None
+        mismatch_pos0_weight: Optional[float] = None
+        mismatch_loss_scale = 1.0
+        requires_pos0_support = False
+        if uses_additive_coefficients:
+            mismatch_pos0_alpha = float(
+                1.0 if mismatch_pos0_alpha_raw is None else mismatch_pos0_alpha_raw
+            )
+            mismatch_loss_beta = float(
+                1.0 if mismatch_loss_beta_raw is None else mismatch_loss_beta_raw
+            )
+            if mismatch_pos0_alpha < 0.0:
+                raise ValueError(
+                    "prefix_bidir_v3_mismatch_pos0_alpha must be >= 0, "
+                    f"got {mismatch_pos0_alpha}"
+                )
+            if mismatch_loss_beta < 0.0:
+                raise ValueError(
+                    "prefix_bidir_v3_mismatch_loss_beta must be >= 0, "
+                    f"got {mismatch_loss_beta}"
+                )
+            requires_pos0_support = mismatch_pos0_alpha > 0.0
+            mismatch_pos0_coefficient = mismatch_pos0_alpha
+            mismatch_loss_multiplier = mismatch_loss_beta
+            mismatch_combination_is_convex = False
+        else:
+            if mismatch_pos0_weight_raw is not None:
+                mismatch_pos0_weight = float(mismatch_pos0_weight_raw)
+                if not 0.0 <= mismatch_pos0_weight <= 1.0:
+                    raise ValueError(
+                        "prefix_bidir_v3_mismatch_pos0_weight must be in "
+                        f"[0, 1], got {mismatch_pos0_weight}"
+                    )
+                requires_pos0_support = mismatch_pos0_weight > 0.0
+            mismatch_loss_scale = float(
+                1.0 if mismatch_loss_scale_raw is None else mismatch_loss_scale_raw
+            )
+            if mismatch_loss_scale < 0.0:
+                raise ValueError(
+                    "prefix_bidir_v3_mismatch_loss_scale must be >= 0, "
+                    f"got {mismatch_loss_scale}"
+                )
+            mismatch_pos0_coefficient = (
+                1.0 if mismatch_pos0_weight is None else mismatch_pos0_weight
+            )
+            mismatch_loss_multiplier = mismatch_loss_scale
+            mismatch_combination_is_convex = mismatch_pos0_weight is not None
+        if requires_pos0_support and not v3_position_0_kl:
+            coefficient_name = (
+                "prefix_bidir_v3_mismatch_pos0_alpha"
+                if uses_additive_coefficients
+                else "prefix_bidir_v3_mismatch_pos0_weight"
+            )
+            raise ValueError(
+                f"{coefficient_name} > 0 requires prefix_bidir_v3_position_0_kl=true."
+            )
+        noise_filter_topk = int(cfg.get("prefix_bidir_v3_noise_filter_topk", 0) or 0)
+        if noise_filter_topk < 0:
+            raise ValueError(
+                "prefix_bidir_v3_noise_filter_topk must be >= 0, "
+                f"got {noise_filter_topk}"
+            )
+        teacher_topk_ipc_k = int(cfg.get("teacher_topk_ipc_k", 0) or 0)
+        teacher_topk_keep_realized = teacher_topk_ipc_k > 0 and (
+            pure_alm
+            or teacher_topk_ipc_k == 1
+            or bool(cfg.get("teacher_topk_ipc_keep_realized", True))
+        )
+        # mtom_as_alm=True and rest_bucket=True are baked in for v6 per
+        # the porting spec (Section 8 hard constraints 7 + 8).
+        mtom_as_alm = True
+        rest_bucket = True
+
+        v_t = int(cfg["teacher_vocab_size"])
+        teacher_sparse_payload: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        ] = None
+        teacher_gt_in_topk: Optional[torch.Tensor] = None
+        teacher_logits: Optional[torch.Tensor] = None
+        if "teacher_sparse_logits_ipc" in data:
+            teacher_sparse_payload = self._rebuild_teacher_sparse_logits(data)
+            (
+                teacher_topk_logits,
+                teacher_topk_indices,
+                teacher_log_z,
+                teacher_gt_in_topk,
+            ) = teacher_sparse_payload
+            B2, T, _ = teacher_topk_logits.shape
+        else:
+            # ----- Rebuild teacher full logits and slice to v_t -----------
+            teacher_full_logits = self._rebuild_teacher_full_logits(data)
+            # Slice teacher logits by `v_t` BEFORE indexing — match the idiom
+            # at loss_functions.py:1791-1792 and 1933-1934.
+            if teacher_full_logits.shape[-1] > v_t:
+                teacher_full_logits = teacher_full_logits[..., :v_t]
+            teacher_logits = teacher_full_logits
+            # V_t shape is implicit (common_teacher_idx_t bounds it); we only
+            # bind T (teacher-side predictor bound) and B2 (sanity check).
+            B2, T, _ = teacher_logits.shape
+        assert B == B2, f"batch size mismatch: student={B} teacher={B2}"
+
+        # ----- Lazy caches (per-device) ----------------------------------
+        if pure_alm:
+            common_student_idx_t = torch.empty(
+                (0,),
+                device=device,
+                dtype=torch.long,
+            )
+            common_teacher_idx_t = torch.empty(
+                (0,),
+                device=device,
+                dtype=torch.long,
+            )
+            has_common_support = True
+        else:
+            common_student_idx_t, common_teacher_idx_t = self._get_common_indices_v3(
+                device,
+            )
+            has_common_support = common_student_idx_t.numel() > 0
+        if requires_pos0_support and not has_common_support:
+            coefficient_name = (
+                "prefix_bidir_v3_mismatch_pos0_alpha"
+                if uses_additive_coefficients
+                else "prefix_bidir_v3_mismatch_pos0_weight"
+            )
+            raise ValueError(
+                f"{coefficient_name} > 0 requires non-empty common-vocab support."
+            )
+
+        # ----- Single-shot host pull of input_ids ------------------------
+        # tokenalign.py:6773-6774 — one .detach().cpu().numpy() per tensor,
+        # then per-chunk numpy indexing inside the classify/collect loop.
+        input_ids_student = data["input_ids"]
+        input_ids_teacher = data["teacher_input_ids"]
+        inp_s_np = input_ids_student.detach().cpu().numpy()
+        inp_t_np = input_ids_teacher.detach().cpu().numpy()
+
+        teacher_gt_in_topk_np: Optional[np.ndarray] = None
+        teacher_filter_topk_indices_np: Optional[np.ndarray] = None
+        if noise_filter_topk > 0:
+            if teacher_sparse_payload is not None:
+                if teacher_gt_in_topk is None:
+                    raise ValueError(
+                        "prefix_bidir_v3_noise_filter_topk requires sparse "
+                        "teacher IPC handles with gt_in_topk metadata. Ensure "
+                        "the teacher IPC path receives force_include_token_ids."
+                    )
+                teacher_gt_in_topk_np = (
+                    teacher_gt_in_topk.detach().cpu().numpy().astype(bool)
+                )
+            else:
+                assert teacher_logits is not None
+                filter_k = min(noise_filter_topk, int(teacher_logits.shape[-1]))
+                if filter_k > 0:
+                    with torch.no_grad():
+                        teacher_filter_topk_indices_np = (
+                            torch.topk(
+                                teacher_logits,
+                                k=filter_k,
+                                dim=-1,
+                            )
+                            .indices.detach()
+                            .cpu()
+                            .numpy()
+                        )
+
+        def _teacher_targets_pass_noise_filter(
+            b_idx: int,
+            pred_positions: list[int],
+            label_positions: list[int],
+        ) -> bool:
+            if noise_filter_topk <= 0:
+                return True
+            if len(pred_positions) != len(label_positions):
+                return False
+            if teacher_gt_in_topk_np is not None:
+                for pred_pos in pred_positions:
+                    if (
+                        pred_pos < 0
+                        or pred_pos >= teacher_gt_in_topk_np.shape[1]
+                        or not bool(teacher_gt_in_topk_np[b_idx, pred_pos])
+                    ):
+                        return False
+                return True
+            if teacher_filter_topk_indices_np is None:
+                return False
+            for pred_pos, label_pos in zip(pred_positions, label_positions):
+                if pred_pos < 0 or pred_pos >= teacher_filter_topk_indices_np.shape[1]:
+                    return False
+                if label_pos < 0 or label_pos >= inp_t_np.shape[1]:
+                    return False
+                label_id = int(inp_t_np[b_idx, label_pos])
+                if not bool(
+                    np.any(teacher_filter_topk_indices_np[b_idx, pred_pos] == label_id)
+                ):
+                    return False
+            return True
+
+        # ----- Alignment payload (padded tensors -> tokenalign 7-tuples) -
+        # tokenalign iterates per-batch python lists of 7-tuples; nemo_rl
+        # ships padded tensors + a validity mask. Per the porting spec's
+        # Adapter shim, we replace tokenalign's `start1 == -1` skip with an
+        # explicit ``pair_valid`` check.
+        s_spans = data["alignment_student_spans"]  # [B, max_pairs, 2]
+        t_spans = data["alignment_teacher_spans"]  # [B, max_pairs, 2]
+        pair_valid = data["alignment_pair_valid"]  # [B, max_pairs]
+        num_chunks = data["alignment_num_chunks"]  # [B]
+        # Host-side copies for the classification loop (no GPU sync per
+        # chunk).
+        s_spans_np = s_spans.detach().cpu().numpy()
+        t_spans_np = t_spans.detach().cpu().numpy()
+        pair_valid_np = pair_valid.detach().cpu().numpy().astype(bool)
+        num_chunks_np = num_chunks.detach().cpu().numpy().astype(np.int64)
+
+        # ----- Classify chunks (tokenalign.py:6590-6627) ----------------
+        common_chunks: list[tuple[int, int, int, int, int]] = []
+        mismatch_chunks: list[
+            tuple[int, int, int, list[int], list[int], list[int], list[int]]
+        ] = []
+        noise_filtered_common_chunks = 0
+        noise_filtered_mismatch_chunks = 0
+        T_s_label = input_ids_student.shape[1]
+        T_t_label = input_ids_teacher.shape[1]
+        for b in range(B):
+            n = int(num_chunks_np[b])
+            for k in range(n):
+                if not bool(pair_valid_np[b, k]):
+                    # tokenalign's `start1 == -1` skip (tokenalign.py:6597)
+                    # is replaced by pair_valid check per the Adapter shim.
+                    continue
+                s_start = int(s_spans_np[b, k, 0])
+                s_end = int(s_spans_np[b, k, 1])
+                t_start = int(t_spans_np[b, k, 0])
+                t_end = int(t_spans_np[b, k, 1])
+                # tokenalign.py:6597 also skips when explicit -1 sentinels
+                # appear. pair_valid handles padding, but guard anyway.
+                if s_start == -1 or t_start == -1:
+                    continue
+                M = s_end - s_start
+                N = t_end - t_start
+                if M <= 0 or N <= 0:
+                    continue
+                # NOTE: preserve per-chunk kl_chunk_shift (tokenalign.py:6603).
+                # Do NOT reuse nemo_rl's tensor-level global shift —
+                # v3 needs the conditional per-chunk shift (chunks at
+                # sequence-start are NOT shifted).
+                if kl_chunk_shift and s_start > 0 and t_start > 0:
+                    s_pred = list(range(s_start - 1, s_end - 1))
+                    t_pred = list(range(t_start - 1, t_end - 1))
+                    s_labels = list(range(s_start, s_end))
+                    t_labels = list(range(t_start, t_end))
+                else:
+                    s_pred = list(range(s_start, s_end))
+                    t_pred = list(range(t_start, t_end))
+                    s_labels = s_pred
+                    t_labels = t_pred
+
+                if any(pos < 0 or pos >= S for pos in s_pred):
+                    continue
+                if any(pos < 0 or pos >= T for pos in t_pred):
+                    continue
+                if any(pos < 0 or pos >= T_s_label for pos in s_labels):
+                    continue
+                if any(pos < 0 or pos >= T_t_label for pos in t_labels):
+                    continue
+
+                if M == 1 and N == 1 and (has_common_support or pure_alm):
+                    if not _teacher_targets_pass_noise_filter(
+                        b,
+                        t_pred,
+                        t_labels,
+                    ):
+                        noise_filtered_common_chunks += 1
+                        continue
+                    common_chunks.append(
+                        (
+                            b,
+                            s_pred[0],
+                            t_pred[0],
+                            int(inp_s_np[b, s_labels[0]]),
+                            int(inp_t_np[b, t_labels[0]]),
+                        )
+                    )
+                else:
+                    if not _teacher_targets_pass_noise_filter(
+                        b,
+                        t_pred,
+                        t_labels,
+                    ):
+                        noise_filtered_mismatch_chunks += 1
+                        continue
+                    mismatch_chunks.append(
+                        (b, M, N, s_pred, t_pred, s_labels, t_labels)
+                    )
+
+        # ----- Early-out: no chunks -------------------------------------
+        if not common_chunks and not mismatch_chunks:
+            # Keep gradient-connected zero so backward() doesn't fail on
+            # no-valid-chunk microbatches (mirrors _compute_gold/_compute_p_kl).
+            zero = (student_logits.sum() * 0.0).to(student_logits.dtype)
+            metrics = {
+                "loss": zero.item(),
+                "train:loss": zero.item(),
+                "kl_common_per_chunk": zero.item(),
+                "kl_partition_last_per_chunk": zero.item(),
+                "num_common_chunks": 0,
+                "num_mismatch_chunks": 0,
+                "num_noise_filtered_common_chunks": (noise_filtered_common_chunks),
+                "num_noise_filtered_mismatch_chunks": (noise_filtered_mismatch_chunks),
+                "top1_acc_per_chunk": zero.item(),
+                # Worker side (dtensor_policy_worker_v2.py:466) keys
+                # num_valid_samples unconditionally. Provide 0 here so the
+                # no-chunk microbatch is reported but doesn't contribute.
+                "num_valid_samples": 0,
+            }
+            if v3_position_0_kl:
+                metrics["kl_partition_first_per_chunk"] = zero.item()
+            if noise_filter_topk > 0:
+                metrics["prefix_bidir_v3_noise_filter_topk"] = noise_filter_topk
+            return zero, metrics
+
+        accum_dtype = (
+            torch.float32
+            if student_logits.dtype in (torch.float16, torch.bfloat16)
+            else student_logits.dtype
+        )
+        common_loss = torch.tensor(0.0, device=device, dtype=accum_dtype)
+        mismatch_loss = torch.tensor(0.0, device=device, dtype=accum_dtype)
+        common_matches = 0
+        mismatch_matches = 0
+
+        # ----- Pre-compute log_Z's per (b, predictor-position) ----------
+        # Partition-KL (rest_bucket=True) needs log Z[b, s] for every
+        # (b, predictor) position the chunk loops reference. Chunked along
+        # the seq axis to bound peak fp32 temporary (tokenalign.py:6647-6661).
+        def _precompute_log_z(_logits: torch.Tensor, _chunk: int = 256):
+            _B, _S, _V = _logits.shape
+            _out = torch.empty(
+                (_B, _S),
+                dtype=accum_dtype,
+                device=_logits.device,
+            )
+            for _s in range(0, _S, _chunk):
+                _end = min(_s + _chunk, _S)
+                _chunk_t = _logits[:, _s:_end, :].to(accum_dtype) / temperature
+                _out[:, _s:_end] = torch.logsumexp(_chunk_t, dim=-1)
+            return _out
+
+        student_log_z = _precompute_log_z(student_logits)
+        if teacher_sparse_payload is None:
+            assert teacher_logits is not None
+            with torch.no_grad():
+                teacher_log_z = _precompute_log_z(teacher_logits)
+
+        # ----- Common-vocab KL (tokenalign.py:6663-6743) ----------------
+        if common_chunks:
+            sb_full = torch.tensor(
+                [c[0] for c in common_chunks],
+                device=device,
+                dtype=torch.long,
+            )
+            sp_full = torch.tensor(
+                [c[1] for c in common_chunks],
+                device=device,
+                dtype=torch.long,
+            )
+            tp_full = torch.tensor(
+                [c[2] for c in common_chunks],
+                device=device,
+                dtype=torch.long,
+            )
+            rs_full = torch.tensor(
+                [c[3] for c in common_chunks],
+                device=device,
+                dtype=torch.long,
+            )
+            rt_full = torch.tensor(
+                [c[4] for c in common_chunks],
+                device=device,
+                dtype=torch.long,
+            )
+
+            common_loss_sum = torch.tensor(
+                0.0,
+                device=device,
+                dtype=accum_dtype,
+            )
+            common_matches_sum_t = torch.zeros(
+                (),
+                device=device,
+                dtype=torch.long,
+            )
+
+            _env_common_mb = os.environ.get("TOKENALIGN_COMMON_LOOP_MB")
+            common_mb = int(_env_common_mb) if _env_common_mb else len(common_chunks)
+            if teacher_sparse_payload is not None and not _env_common_mb:
+                common_mb = min(common_mb, 64)
+            teacher_to_common_student = None
+            if teacher_sparse_payload is not None and not pure_alm:
+                teacher_to_common_student = self._get_v3_teacher_to_common_student(
+                    device,
+                    v_t,
+                    common_student_idx_t,
+                    common_teacher_idx_t,
+                )
+
+            for mb_start in range(0, len(common_chunks), common_mb):
+                mb_end = min(mb_start + common_mb, len(common_chunks))
+                sb = sb_full[mb_start:mb_end]
+                sp = sp_full[mb_start:mb_end]
+                tp = tp_full[mb_start:mb_end]
+                rs = rs_full[mb_start:mb_end]
+                rt = rt_full[mb_start:mb_end]
+                support_mask = None
+                common_valid_row = None
+                if pure_alm:
+                    student_common_logp = (
+                        student_logits[sb, sp, rs].to(accum_dtype) / temperature
+                        - student_log_z[sb, sp]
+                    ).unsqueeze(-1)
+                    if teacher_sparse_payload is None:
+                        assert teacher_logits is not None
+                        teacher_common_logp = (
+                            teacher_logits[sb, tp, rt].to(accum_dtype) / temperature
+                            - teacher_log_z[sb, tp]
+                        ).unsqueeze(-1)
+                        common_valid_row = torch.ones(
+                            (sb.shape[0],),
+                            device=device,
+                            dtype=torch.bool,
+                        )
+                    else:
+                        teacher_topk_logits, teacher_topk_indices, _, _ = (
+                            teacher_sparse_payload
+                        )
+                        t_real_logp, t_real_found = self._lookup_sparse_teacher_logp(
+                            teacher_topk_logits,
+                            teacher_topk_indices,
+                            teacher_log_z,
+                            sb,
+                            tp,
+                            rt,
+                            temperature,
+                        )
+                        teacher_common_logp = t_real_logp.to(accum_dtype).unsqueeze(-1)
+                        common_valid_row = t_real_found
+                    support_mask = common_valid_row.unsqueeze(-1)
+                    neg_inf = torch.full_like(student_common_logp, -1.0e30)
+                    student_common_logp = torch.where(
+                        support_mask,
+                        student_common_logp,
+                        neg_inf,
+                    )
+                    teacher_common_logp = torch.where(
+                        support_mask,
+                        teacher_common_logp,
+                        neg_inf,
+                    )
+                elif teacher_sparse_payload is None:
+                    assert teacher_logits is not None
+                    student_common_logits = (
+                        student_logits[
+                            sb[:, None],
+                            sp[:, None],
+                            common_student_idx_t[None, :],
+                        ]
+                        / temperature
+                    )
+                    teacher_common_logits = (
+                        teacher_logits[
+                            sb[:, None],
+                            tp[:, None],
+                            common_teacher_idx_t[None, :],
+                        ]
+                        / temperature
+                    )
+                    # rest_bucket=True path (the v3/v6 default — baked in).
+                    s_log_z_mb = student_log_z[sb, sp].unsqueeze(-1)
+                    t_log_z_mb = teacher_log_z[sb, tp].unsqueeze(-1)
+                    student_common_logp = (
+                        student_common_logits.to(accum_dtype) - s_log_z_mb
+                    )
+                    teacher_common_logp = (
+                        teacher_common_logits.to(accum_dtype) - t_log_z_mb
+                    )
+                else:
+                    assert teacher_to_common_student is not None
+                    teacher_topk_logits, teacher_topk_indices, _, _ = (
+                        teacher_sparse_payload
+                    )
+                    topk_ids = teacher_topk_indices[sb, tp]
+                    topk_vals = teacher_topk_logits[sb, tp]
+                    mapped_student = teacher_to_common_student[topk_ids.long()]
+                    support_mask = mapped_student >= 0
+                    if teacher_topk_keep_realized:
+                        topk_width = int(topk_ids.shape[-1])
+                        alt_budget = max(topk_width - 1, 0)
+                        support_mask = (
+                            support_mask
+                            & (mapped_student != rs[:, None])
+                            & (topk_ids.long() != rt[:, None])
+                        )
+                        support_mask = self._topk_mask_by_score(
+                            support_mask,
+                            topk_vals.to(accum_dtype),
+                            alt_budget,
+                        )
+                    safe_student_ids = mapped_student.clamp_min(0)
+                    student_common_logits = (
+                        student_logits[sb[:, None], sp[:, None], safe_student_ids]
+                        / temperature
+                    )
+                    student_common_logp = student_common_logits.to(
+                        accum_dtype
+                    ) - student_log_z[sb, sp].unsqueeze(-1)
+                    teacher_common_logp = topk_vals.to(
+                        accum_dtype
+                    ) / temperature - teacher_log_z[sb, tp].unsqueeze(-1)
+                    neg_inf = torch.full_like(student_common_logp, -1.0e30)
+                    student_common_logp = torch.where(
+                        support_mask,
+                        student_common_logp,
+                        neg_inf,
+                    )
+                    teacher_common_logp = torch.where(
+                        support_mask,
+                        teacher_common_logp,
+                        neg_inf,
+                    )
+                    if teacher_topk_keep_realized:
+                        t_real_logp, t_real_found = self._lookup_sparse_teacher_logp(
+                            teacher_topk_logits,
+                            teacher_topk_indices,
+                            teacher_log_z,
+                            sb,
+                            tp,
+                            rt,
+                            temperature,
+                        )
+                        realized_common_student = teacher_to_common_student[rt.long()]
+                        realized_common_mask = t_real_found & (
+                            realized_common_student == rs
+                        )
+                        s_real_logp = (
+                            student_logits[sb, sp, rs].to(accum_dtype) / temperature
+                            - student_log_z[sb, sp]
+                        )
+                        student_common_logp = torch.cat(
+                            [
+                                student_common_logp,
+                                torch.where(
+                                    realized_common_mask,
+                                    s_real_logp,
+                                    torch.full_like(s_real_logp, -1.0e30),
+                                ).unsqueeze(-1),
+                            ],
+                            dim=-1,
+                        )
+                        teacher_common_logp = torch.cat(
+                            [
+                                teacher_common_logp,
+                                torch.where(
+                                    realized_common_mask,
+                                    t_real_logp.to(accum_dtype),
+                                    torch.full_like(t_real_logp, -1.0e30),
+                                ).unsqueeze(-1),
+                            ],
+                            dim=-1,
+                        )
+                        support_mask = torch.cat(
+                            [
+                                support_mask,
+                                realized_common_mask.unsqueeze(-1),
+                            ],
+                            dim=-1,
+                        )
+                    common_valid_row = support_mask.any(dim=-1)
+                student_loss_logp = self._append_rest_bucket_logp(
+                    student_common_logp,
+                )
+                teacher_loss_logp = self._append_rest_bucket_logp(
+                    teacher_common_logp,
+                )
+                if v3_loss_fn == "bce":
+                    per_elem = self._binary_power_bce_from_logp(
+                        student_loss_logp,
+                        teacher_loss_logp,
+                        tau=v3_alm_bce_tau,
+                    )
+                elif v3_loss_fn == "jsd":
+                    per_elem = _generalized_jsd(
+                        student_loss_logp,
+                        teacher_loss_logp,
+                        v3_jsd_beta,
+                    )
+                elif not reverse_kl:
+                    per_elem = torch.nn.functional.kl_div(
+                        student_loss_logp,
+                        teacher_loss_logp,
+                        reduction="none",
+                        log_target=True,
+                    )
+                else:
+                    per_elem = torch.nn.functional.kl_div(
+                        teacher_loss_logp,
+                        student_loss_logp,
+                        reduction="none",
+                        log_target=True,
+                    )
+                if support_mask is not None:
+                    rest_one = torch.ones(
+                        (support_mask.shape[0], 1),
+                        device=device,
+                        dtype=per_elem.dtype,
+                    )
+                    full_mask = torch.cat(
+                        [support_mask.to(per_elem.dtype), rest_one],
+                        dim=-1,
+                    )
+                    per_row = (per_elem * full_mask).sum(dim=-1)
+                    per_row = per_row * common_valid_row.to(per_row.dtype)
+                    common_loss_sum = common_loss_sum + per_row.sum().to(
+                        accum_dtype,
+                    )
+                else:
+                    common_loss_sum = common_loss_sum + per_elem.sum().to(
+                        accum_dtype,
+                    )
+                with torch.no_grad():
+                    row_match = student_common_logp.argmax(
+                        dim=-1
+                    ) == teacher_common_logp.argmax(dim=-1)
+                    if common_valid_row is not None:
+                        row_match = row_match & common_valid_row
+                    common_matches_sum_t = common_matches_sum_t + row_match.sum().to(
+                        torch.long
+                    )
+            common_loss = common_loss_sum / float(len(common_chunks))
+            common_matches = int(common_matches_sum_t.item())
+
+        # ----- Mismatch loss (tokenalign.py:6745-7127) ------------------
+        skipped_no_support = 0
+        support_sizes: list[int] = []
+        v3_pos0_records: list[tuple[int, int, int, int, int, frozenset[int]]] = []
+        prefix_index = None
+        if mismatch_chunks:
+            if pure_alm:
+                _prefix_index_prededuped = False
+                max_chain_t = 0
+                max_chain_s = 0
+            else:
+                prefix_index = self._ensure_bidir_prefix_support_index(device)
+                _prefix_index_prededuped = bool(prefix_index.get("_prededuped", False))
+                max_chain_t = int(prefix_index.get("max_chain_t", 0))
+                max_chain_s = int(prefix_index.get("max_chain_s", 0))
+
+            chunk_records: list[
+                tuple[
+                    int,
+                    int,
+                    int,
+                    list[int],
+                    list[int],
+                    list[int],
+                    list[int],
+                    list[int],
+                    list[int],
+                    int,
+                    int,
+                ]
+            ] = []
+            for b, M, N, s_pred, t_pred, s_labels, t_labels in mismatch_chunks:
+                if pure_alm:
+                    s_realized_id = int(inp_s_np[b, s_labels[-1]])
+                    t_realized_id = int(inp_t_np[b, t_labels[-1]])
+                    s_prefix_pred = list(s_pred[:-1])
+                    s_prefix_lab_ids = [int(inp_s_np[b, pos]) for pos in s_labels[:-1]]
+                    t_prefix_pred = list(t_pred[:-1])
+                    t_prefix_lab_ids = [int(inp_t_np[b, pos]) for pos in t_labels[:-1]]
+                    chunk_records.append(
+                        (
+                            b,
+                            int(s_pred[-1]),
+                            int(t_pred[-1]),
+                            s_prefix_pred,
+                            s_prefix_lab_ids,
+                            t_prefix_pred,
+                            t_prefix_lab_ids,
+                            [s_realized_id],
+                            [t_realized_id],
+                            s_realized_id,
+                            t_realized_id,
+                        )
+                    )
+                elif M == 1 and N > 1:
+                    # 1-to-many (tokenalign.py:6792-6832)
+                    s_realized_id = int(inp_s_np[b, s_labels[0]])
+                    t_realized_id = int(inp_t_np[b, t_labels[-1]])
+                    if N > max_chain_t and not teacher_topk_keep_realized:
+                        skipped_no_support += 1
+                        continue
+                    pairs = ()
+                    if N <= max_chain_t:
+                        teacher_prefix = tuple(
+                            int(inp_t_np[b, pos]) for pos in t_labels[: N - 1]
+                        )
+                        pairs = prefix_index["forward"].get(
+                            (N, teacher_prefix),
+                            (),
+                        )
+                    if not pairs and not teacher_topk_keep_realized:
+                        skipped_no_support += 1
+                        continue
+                    s_list, t_list = self._unique_bidir_pairs_cpu(
+                        pairs,
+                        swap=False,
+                        assume_unique=_prefix_index_prededuped,
+                    )
+                    if teacher_topk_keep_realized and (
+                        s_realized_id,
+                        t_realized_id,
+                    ) not in set(zip(s_list, t_list)):
+                        s_list.append(s_realized_id)
+                        t_list.append(t_realized_id)
+                    min_support = 1 if teacher_topk_keep_realized else 2
+                    if len(s_list) < min_support:
+                        skipped_no_support += 1
+                        continue
+                    t_prefix_pred = list(t_pred[:-1])
+                    t_prefix_lab_ids = [int(inp_t_np[b, pos]) for pos in t_labels[:-1]]
+                    chunk_records.append(
+                        (
+                            b,
+                            int(s_pred[0]),
+                            int(t_pred[-1]),
+                            [],
+                            [],
+                            t_prefix_pred,
+                            t_prefix_lab_ids,
+                            s_list,
+                            t_list,
+                            s_realized_id,
+                            t_realized_id,
+                        )
+                    )
+                    if v3_position_0_kl:
+                        v3_pos0_records.append(
+                            (
+                                int(b),
+                                int(s_pred[0]),
+                                int(t_pred[0]),
+                                int(inp_s_np[b, s_labels[0]]),
+                                int(inp_t_np[b, t_labels[0]]),
+                                frozenset(int(x) for x in s_list),
+                            )
+                        )
+                elif M > 1 and N == 1:
+                    # Many-to-1 (tokenalign.py:6833-6874)
+                    s_realized_id = int(inp_s_np[b, s_labels[-1]])
+                    t_realized_id = int(inp_t_np[b, t_labels[0]])
+                    if M > max_chain_s and not teacher_topk_keep_realized:
+                        skipped_no_support += 1
+                        continue
+                    pairs = ()
+                    if M <= max_chain_s:
+                        student_prefix = tuple(
+                            int(inp_s_np[b, pos]) for pos in s_labels[: M - 1]
+                        )
+                        pairs = prefix_index["reverse"].get(
+                            (M, student_prefix),
+                            (),
+                        )
+                    if not pairs and not teacher_topk_keep_realized:
+                        skipped_no_support += 1
+                        continue
+                    s_list, t_list = self._unique_bidir_pairs_cpu(
+                        pairs,
+                        swap=True,
+                        assume_unique=_prefix_index_prededuped,
+                    )
+                    if teacher_topk_keep_realized and (
+                        s_realized_id,
+                        t_realized_id,
+                    ) not in set(zip(s_list, t_list)):
+                        s_list.append(s_realized_id)
+                        t_list.append(t_realized_id)
+                    min_support = 1 if teacher_topk_keep_realized else 2
+                    if len(s_list) < min_support:
+                        skipped_no_support += 1
+                        continue
+                    s_prefix_pred = list(s_pred[:-1])
+                    s_prefix_lab_ids = [int(inp_s_np[b, pos]) for pos in s_labels[:-1]]
+                    chunk_records.append(
+                        (
+                            b,
+                            int(s_pred[-1]),
+                            int(t_pred[0]),
+                            s_prefix_pred,
+                            s_prefix_lab_ids,
+                            [],
+                            [],
+                            s_list,
+                            t_list,
+                            s_realized_id,
+                            t_realized_id,
+                        )
+                    )
+                    if v3_position_0_kl:
+                        v3_pos0_records.append(
+                            (
+                                int(b),
+                                int(s_pred[0]),
+                                int(t_pred[0]),
+                                int(inp_s_np[b, s_labels[0]]),
+                                int(inp_t_np[b, t_labels[0]]),
+                                frozenset(int(x) for x in s_list),
+                            )
+                        )
+                else:
+                    # Many-to-many (tokenalign.py:6875-6933).
+                    # v6 hardcodes mtom_as_alm=True (see Section 8 hard
+                    # constraint 7), so the ALM single-pair branch is the
+                    # only path taken here. Surface-match enumeration
+                    # (`_bidir_surface_support_pairs`) is intentionally not
+                    # ported.
+                    assert mtom_as_alm, (
+                        "v6 requires mtom_as_alm=True; surface-match path "
+                        "is not ported."
+                    )
+                    s_realized_id = int(inp_s_np[b, s_labels[-1]])
+                    t_realized_id = int(inp_t_np[b, t_labels[-1]])
+                    s_list = [s_realized_id]
+                    t_list = [t_realized_id]
+                    s_prefix_pred = list(s_pred[:-1])
+                    s_prefix_lab_ids = [int(inp_s_np[b, pos]) for pos in s_labels[:-1]]
+                    t_prefix_pred = list(t_pred[:-1])
+                    t_prefix_lab_ids = [int(inp_t_np[b, pos]) for pos in t_labels[:-1]]
+                    chunk_records.append(
+                        (
+                            b,
+                            int(s_pred[-1]),
+                            int(t_pred[-1]),
+                            s_prefix_pred,
+                            s_prefix_lab_ids,
+                            t_prefix_pred,
+                            t_prefix_lab_ids,
+                            s_list,
+                            t_list,
+                            s_realized_id,
+                            t_realized_id,
+                        )
+                    )
+                    if v3_position_0_kl:
+                        v3_pos0_records.append(
+                            (
+                                int(b),
+                                int(s_pred[0]),
+                                int(t_pred[0]),
+                                int(inp_s_np[b, s_labels[0]]),
+                                int(inp_t_np[b, t_labels[0]]),
+                                frozenset(int(x) for x in s_list),
+                            )
+                        )
+
+            if chunk_records:
+                (
+                    loss_sum_b,
+                    used_b,
+                    matches_b,
+                    support_sizes_b,
+                    valid_flags_b,
+                ) = self._partition_kl_mismatch_batched(
+                    chunk_records,
+                    student_logits,
+                    teacher_logits,
+                    student_log_z,
+                    teacher_log_z,
+                    temperature,
+                    reverse_kl,
+                    loss_fn=effective_last_pos_loss_fn,
+                    jsd_beta=v3_jsd_beta,
+                    alm_bce_tau=v3_alm_bce_tau,
+                    teacher_sparse=(
+                        None
+                        if teacher_sparse_payload is None
+                        else (
+                            teacher_sparse_payload[0],
+                            teacher_sparse_payload[1],
+                        )
+                    ),
+                    teacher_sparse_keep_realized=teacher_topk_keep_realized,
+                )
+                if v3_position_0_kl:
+                    v3_pos0_records = [
+                        rec
+                        for rec, is_valid in zip(v3_pos0_records, valid_flags_b)
+                        if is_valid
+                    ]
+                if used_b > 0:
+                    mismatch_loss = loss_sum_b / float(used_b)
+                    mismatch_matches += matches_b
+                    support_sizes = support_sizes_b
+
+        # ----- v3 position-0 partition KL (tokenalign.py:7129-7360) -----
+        v3_pos0_loss_term = torch.tensor(
+            0.0,
+            device=device,
+            dtype=accum_dtype,
+        )
+        if (
+            v3_position_0_kl
+            and has_common_support
+            and len(v3_pos0_records) > 0
+            and rest_bucket
+        ):
+            K = len(v3_pos0_records)
+            b_idx_np = np.zeros((K,), dtype=np.int64)
+            s_first_np = np.zeros((K,), dtype=np.int64)
+            t_first_np = np.zeros((K,), dtype=np.int64)
+            valid_row_np = np.zeros((K,), dtype=bool)
+
+            for k, rec in enumerate(v3_pos0_records):
+                b_i, s_first_pred, t_first_pred, *_ = rec
+                b_idx_np[k] = b_i
+                s_first_np[k] = s_first_pred
+                t_first_np[k] = t_first_pred
+            b_idx_v3 = torch.from_numpy(b_idx_np).to(device, non_blocking=True)
+            s_first = torch.from_numpy(s_first_np).to(device, non_blocking=True)
+            t_first = torch.from_numpy(t_first_np).to(device, non_blocking=True)
+
+            NEG_INF = -1.0e30
+            if teacher_sparse_payload is None:
+                common_t_cpu = common_teacher_idx_t.detach().cpu().tolist()
+                common_s_cpu = common_student_idx_t.detach().cpu().tolist()
+                V_common = len(common_s_cpu)
+                t_to_pair_slot = {int(t): i for i, t in enumerate(common_t_cpu)}
+                s_to_pair_slot = {int(s): i for i, s in enumerate(common_s_cpu)}
+                exclude_mask_np = np.zeros((K, V_common), dtype=bool)
+
+                for k, rec in enumerate(v3_pos0_records):
+                    (
+                        _b_i,
+                        _s_first_pred,
+                        _t_first_pred,
+                        r_s_id,
+                        r_t_id,
+                        slast_set,
+                    ) = rec
+                    n_excluded = 0
+                    slot = s_to_pair_slot.get(int(r_s_id))
+                    if slot is not None and not exclude_mask_np[k, slot]:
+                        exclude_mask_np[k, slot] = True
+                        n_excluded += 1
+                    slot = t_to_pair_slot.get(int(r_t_id))
+                    if slot is not None and not exclude_mask_np[k, slot]:
+                        exclude_mask_np[k, slot] = True
+                        n_excluded += 1
+                    for sid in slast_set:
+                        slot = s_to_pair_slot.get(int(sid))
+                        if slot is not None and not exclude_mask_np[k, slot]:
+                            exclude_mask_np[k, slot] = True
+                            n_excluded += 1
+                    valid_row_np[k] = (V_common - n_excluded) >= 1
+
+                exclude_mask = torch.from_numpy(exclude_mask_np).to(
+                    device,
+                    non_blocking=True,
+                )
+                valid_row_v3 = torch.from_numpy(valid_row_np).to(
+                    device,
+                    non_blocking=True,
+                )
+                s_full_logits = (
+                    student_logits[
+                        b_idx_v3[:, None],
+                        s_first[:, None],
+                        common_student_idx_t[None, :],
+                    ].to(accum_dtype)
+                    / temperature
+                )
+                s_log_z_v3 = student_log_z[b_idx_v3, s_first].unsqueeze(-1)
+                s_logp_v3 = s_full_logits - s_log_z_v3
+                s_logp_v3 = torch.where(
+                    exclude_mask,
+                    torch.full_like(s_logp_v3, NEG_INF),
+                    s_logp_v3,
+                )
+
+                with torch.no_grad():
+                    assert teacher_logits is not None
+                    t_full_logits = (
+                        teacher_logits[
+                            b_idx_v3[:, None],
+                            t_first[:, None],
+                            common_teacher_idx_t[None, :],
+                        ].to(accum_dtype)
+                        / temperature
+                    )
+                    t_log_z_v3 = teacher_log_z[b_idx_v3, t_first].unsqueeze(-1)
+                    t_logp_v3 = t_full_logits - t_log_z_v3
+                    t_logp_v3 = torch.where(
+                        exclude_mask,
+                        torch.full_like(t_logp_v3, NEG_INF),
+                        t_logp_v3,
+                    )
+            else:
+                teacher_topk_logits, teacher_topk_indices, _, _ = teacher_sparse_payload
+                teacher_to_common_student = self._get_v3_teacher_to_common_student(
+                    device,
+                    v_t,
+                    common_student_idx_t,
+                    common_teacher_idx_t,
+                )
+                topk_ids = teacher_topk_indices[b_idx_v3, t_first]
+                topk_vals = teacher_topk_logits[b_idx_v3, t_first]
+                mapped_student = teacher_to_common_student[topk_ids.long()]
+                support_mask = mapped_student >= 0
+
+                for k, rec in enumerate(v3_pos0_records):
+                    (
+                        _b_i,
+                        _s_first_pred,
+                        _t_first_pred,
+                        r_s_id,
+                        r_t_id,
+                        slast_set,
+                    ) = rec
+                    exclude_s_ids = [int(r_s_id), *(int(x) for x in slast_set)]
+                    if exclude_s_ids:
+                        exclude_s_t = torch.tensor(
+                            exclude_s_ids,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        support_mask[k] = support_mask[k] & ~torch.isin(
+                            mapped_student[k],
+                            exclude_s_t,
+                        )
+                    support_mask[k] = support_mask[k] & (topk_ids[k] != int(r_t_id))
+
+                valid_row_v3 = support_mask.any(dim=-1)
+                exclude_mask = ~support_mask
+                safe_student_ids = mapped_student.clamp_min(0)
+                s_full_logits = (
+                    student_logits[
+                        b_idx_v3[:, None], s_first[:, None], safe_student_ids
+                    ].to(accum_dtype)
+                    / temperature
+                )
+                s_logp_v3 = s_full_logits - student_log_z[b_idx_v3, s_first].unsqueeze(
+                    -1
+                )
+                t_logp_v3 = topk_vals.to(accum_dtype) / temperature - teacher_log_z[
+                    b_idx_v3, t_first
+                ].unsqueeze(-1)
+                s_logp_v3 = torch.where(
+                    support_mask,
+                    s_logp_v3,
+                    torch.full_like(s_logp_v3, NEG_INF),
+                )
+                t_logp_v3 = torch.where(
+                    support_mask,
+                    t_logp_v3,
+                    torch.full_like(t_logp_v3, NEG_INF),
+                )
+
+            s_logp_with_rest = self._append_rest_bucket_logp(s_logp_v3)
+            t_logp_with_rest = self._append_rest_bucket_logp(t_logp_v3)
+
+            if v3_loss_fn == "bce":
+                per_pos = self._binary_power_bce_from_logp(
+                    s_logp_with_rest,
+                    t_logp_with_rest,
+                    tau=v3_alm_bce_tau,
+                )
+            elif v3_loss_fn == "jsd":
+                per_pos = _generalized_jsd(
+                    s_logp_with_rest,
+                    t_logp_with_rest,
+                    v3_jsd_beta,
+                )
+            elif not reverse_kl:
+                per_pos = torch.nn.functional.kl_div(
+                    s_logp_with_rest,
+                    t_logp_with_rest,
+                    reduction="none",
+                    log_target=True,
+                )
+            else:
+                per_pos = torch.nn.functional.kl_div(
+                    t_logp_with_rest,
+                    s_logp_with_rest,
+                    reduction="none",
+                    log_target=True,
+                )
+
+            keep_mask_support = (~exclude_mask).to(per_pos.dtype)
+            rest_keep = torch.ones(
+                (K, 1),
+                device=device,
+                dtype=per_pos.dtype,
+            )
+            full_keep_mask = torch.cat(
+                [keep_mask_support, rest_keep],
+                dim=-1,
+            )
+            per_chunk_sum = (per_pos * full_keep_mask).sum(dim=-1)  # (K,)
+            per_chunk_sum = per_chunk_sum * valid_row_v3.to(per_chunk_sum.dtype)
+            denom = max(len(support_sizes), 1)
+            v3_pos0_loss_term = per_chunk_sum.sum().to(accum_dtype) / float(denom)
+
+        # ----- Combine + T^2 scale (tokenalign.py:7362-7425) -----------
+        effective_mismatch_count = len(support_sizes)
+        effective_count = len(common_chunks) + effective_mismatch_count
+        mismatch_last_loss = mismatch_loss
+        mismatch_combined_loss, mismatch_loss = _combine_v3_mismatch_terms(
+            mismatch_last_loss,
+            v3_pos0_loss_term,
+            pos0_coefficient=mismatch_pos0_coefficient,
+            loss_multiplier=mismatch_loss_multiplier,
+            convex=mismatch_combination_is_convex,
+        )
+        # v3_average_non_1to1 is a v7/v8/v9 knob; v6 leaves it False so
+        # we omit the *0.5 rescale per the porting spec's v6-only scope.
+        if effective_count > 0:
+            # Sum of all chunk-level KLs for this microbatch. common_loss /
+            # mismatch_loss are local per-chunk averages over their
+            # respective partitions; multiplying by chunk counts recovers
+            # the un-normalised partition sums.
+            chunk_sum = common_loss * float(len(common_chunks)) + mismatch_loss * float(
+                effective_mismatch_count
+            )
+            if global_valid_chunks is not None and float(global_valid_chunks) > 0:
+                # Per-chunk normalisation. The trainer's sum-reduction
+                # across microbatches and ranks yields
+                # `total_chunk_KL × T² / global_valid_chunks` — i.e. the
+                # natural per-chunk KL averaged over the global batch.
+                # This is the natural unit for v3's chunk-level partition
+                # KL and matches the per-token convention used by
+                # _compute_ce on its own terms (each loss normalises by
+                # its natural global denominator).
+                loss_total = chunk_sum / global_valid_chunks.to(chunk_sum.dtype)
+            else:
+                # Legacy per-mb local chunk-average (sum across mbs gives
+                # "sum of per-mb chunk-averages", NOT a global per-chunk
+                # avg). Retained for any caller that doesn't pass
+                # global_valid_chunks; the v3 dispatcher always passes it.
+                loss_total = chunk_sum / float(effective_count)
+        else:
+            # No usable chunks. Keep gradient-connected zero.
+            loss_total = (student_logits.sum() * 0.0).to(accum_dtype)
+        top1_accuracy = (common_matches + mismatch_matches) / max(
+            effective_count,
+            1,
+        )
+
+        # Final loss × T^2 (tokenalign.py:7425).
+        final_loss = loss_total * (temperature**2)
+
+        # Metric naming convention for wandb clarity:
+        #   - `loss` / `train:loss`: sum-reduced by the trainer. When
+        #     global_valid_chunks is provided, final wandb value is the
+        #     per-chunk KL averaged over the global batch
+        #     (`total_chunk_KL × T² / global_valid_chunks`). The dispatcher
+        #     additionally overwrites `loss` with the dynamic-scaled
+        #     `kl_scale * kl + ce` combination — that final value mixes
+        #     a per-chunk KL term and a per-token CE term (consistent
+        #     gradient balance by construction of kl_scale). `train:loss`
+        #     is also the checkpoint-selection metric.
+        #   - `*_per_chunk`: mean-reduced by the trainer (whitelisted in
+        #     xtoken_distillation.py); final wandb value is the average
+        #     per-mb local chunk-average — a clean per-chunk quantity when
+        #     chunk counts are roughly uniform across microbatches.
+        #   - `num_*`: sum-reduced; total count across the step.
+        metrics: dict[str, Any] = {
+            "loss": final_loss.item(),
+            "train:loss": final_loss.item(),
+            "kl_common_per_chunk": common_loss.item(),
+            "kl_partition_last_per_chunk": mismatch_last_loss.item(),
+            "kl_mismatch_combined_per_chunk": mismatch_combined_loss.item(),
+            "kl_mismatch_scaled_per_chunk": mismatch_loss.item(),
+            "num_common_chunks": len(common_chunks),
+            "num_mismatch_chunks": effective_mismatch_count,
+            "num_noise_filtered_common_chunks": noise_filtered_common_chunks,
+            "num_noise_filtered_mismatch_chunks": noise_filtered_mismatch_chunks,
+            "top1_acc_per_chunk": float(top1_accuracy),
+            "num_valid_samples": data["input_ids"].shape[0],
+        }
+        if uses_additive_coefficients:
+            assert mismatch_pos0_alpha is not None
+            assert mismatch_loss_beta is not None
+            metrics["prefix_bidir_v3_mismatch_pos0_alpha"] = mismatch_pos0_alpha
+            metrics["prefix_bidir_v3_mismatch_loss_beta"] = mismatch_loss_beta
+        else:
+            metrics["prefix_bidir_v3_mismatch_loss_scale"] = mismatch_loss_scale
+        if not uses_additive_coefficients and mismatch_pos0_weight is not None:
+            metrics["prefix_bidir_v3_mismatch_pos0_weight"] = mismatch_pos0_weight
+        if noise_filter_topk > 0:
+            metrics["prefix_bidir_v3_noise_filter_topk"] = noise_filter_topk
+        if v3_position_0_kl:
+            metrics["kl_partition_first_per_chunk"] = v3_pos0_loss_term.item()
+        return final_loss, metrics
+
