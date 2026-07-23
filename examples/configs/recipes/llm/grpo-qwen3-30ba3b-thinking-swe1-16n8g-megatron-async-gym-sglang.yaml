@@ -4,7 +4,7 @@
 #   - eight 8-GPU nodes for Megatron training
 #   - eight 8-GPU nodes for 32 TP2 SGLang engines
 #
-# This is a short integration recipe, not a convergence recipe.
+# This is a manual short integration recipe, not a nightly or convergence recipe.
 defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml
 
 grpo:
@@ -21,6 +21,8 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-async-gym-sglang
 
 policy:
+  # Set NRL_MODEL_PATH to an immutable shared snapshot for exact reproduction.
+  model_name: ${oc.env:NRL_MODEL_PATH,Qwen/Qwen3-30B-A3B-Thinking-2507}
   tokenizer:
     # Keep the tokenizer/Gym rendering path independent of the inherited
     # vLLM block, which is disabled below for the SGLang backend.
@@ -137,6 +139,7 @@ policy:
       disable_piecewise_cuda_graph: true
       disable_cuda_graph: false
       use_fault_tolerance: false
+      engine_startup_timeout_s: 1800
       refit_timeout_s: 1800
       quantization:
         scheme: bf16
