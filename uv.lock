@@ -133,7 +133,7 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 [[manifest.dependency-metadata]]
 name = "megatron-bridge"
 version = "0.0.0"
-requires-dist = ["transformers>=5.8.1,<5.9.0", "mistral-common>=1.10.0", "peft>=0.18.1", "datasets>=2.20.0", "accelerate", "diffusers>=0.36.0", "peft>=0.18.0", "einops", "omegaconf>=2.3.0", "tensorboard>=2.19.0", "typing-extensions", "rich", "wandb>=0.25.0", "six>=1.17.0", "regex>=2024.11.6", "pyyaml>=6.0.2", "tqdm>=4.67.1", "hydra-core>1.3,<=1.3.2", "qwen-vl-utils", "nvidia-resiliency-ext", "flash-linear-attention", "timm", "open-clip-torch>=3.2.0", "mlflow>=3.9.0", "comet-ml>=3.50.0", "torch>=2.6.0", "flashinfer-python==0.6.8.post1", "flashinfer-cubin==0.6.8.post1"]
+requires-dist = ["transformers>=5.8,<=5.12.1", "mistral-common>=1.10.0", "peft>=0.18.1", "datasets>=2.20.0", "accelerate", "diffusers>=0.36.0", "peft>=0.18.0", "einops", "omegaconf>=2.3.0", "tensorboard>=2.19.0", "typing-extensions", "rich", "wandb>=0.25.0", "six>=1.17.0", "regex>=2024.11.6", "pyyaml>=6.0.2", "tqdm>=4.67.1", "hydra-core>1.3,<=1.3.2", "qwen-vl-utils", "nvidia-resiliency-ext", "flash-linear-attention", "timm", "open-clip-torch>=3.2.0", "mlflow>=3.9.0", "comet-ml>=3.50.0", "torch>=2.6.0", "flashinfer-python==0.6.8.post1", "flashinfer-cubin==0.6.8.post1"]
 
 [[manifest.dependency-metadata]]
 name = "nv-grouped-gemm"
@@ -2561,7 +2561,7 @@ requires-dist = [
     { name = "timm" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "transformers", specifier = ">=5.8.1,<5.9.0" },
+    { name = "transformers", specifier = ">=5.8,<=5.12.1" },
     { name = "typing-extensions" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
@@ -2595,6 +2595,7 @@ requires-dist = [
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "numpy" },
+    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.26.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
@@ -2612,7 +2613,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=b9d690e042b1c4e455214e7dab65d6d3512c05d6" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=2e559f062497bef768dfbe9d7e45548fadeca80a" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
