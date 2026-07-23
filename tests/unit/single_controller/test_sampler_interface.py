@@ -152,7 +152,9 @@ class TestInOrderEvictMatchesSelect:
 
 class TestFactory:
     def test_windowed_config_builds_windowed(self):
-        s = create_sampler(FakeBuffer(), WindowedSamplerConfig(max_staleness_versions=3))
+        s = create_sampler(
+            FakeBuffer(), WindowedSamplerConfig(max_staleness_versions=3)
+        )
         assert isinstance(s, WindowedSampler)
         assert s.max_staleness_versions == 3
 
@@ -166,7 +168,9 @@ class TestFactory:
             WeightFifoSamplerConfig,
         )
 
-        s = create_sampler(FakeBuffer(), WeightFifoSamplerConfig(max_staleness_versions=4))
+        s = create_sampler(
+            FakeBuffer(), WeightFifoSamplerConfig(max_staleness_versions=4)
+        )
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
 

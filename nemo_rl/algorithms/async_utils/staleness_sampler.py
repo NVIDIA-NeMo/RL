@@ -121,8 +121,9 @@ class BaseSampler(abc.ABC):
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
-        ...
+    async def admit(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> Optional[int]: ...
 
     # ── train-pump side ──────────────────────────────────────────────────
     @abc.abstractmethod
@@ -132,8 +133,7 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
-        ...
+    ) -> tuple[Optional[KVBatchMeta], int]: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Default: drop *ready* groups below the weight window.
@@ -437,15 +437,12 @@ def create_sampler(
             buffer, max_staleness_versions=cfg.max_staleness_versions
         )
     if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(
-            buffer, max_lookahead_versions=cfg.max_lookahead_versions
-        )
+        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
     if isinstance(cfg, CustomSamplerConfig):
         module_name, sep, class_name = cfg.target.partition(":")
         if not sep:
             raise ValueError(
-                f"custom sampler target must be 'module:ClassName', got "
-                f"{cfg.target!r}"
+                f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
             )
         sampler_cls = getattr(importlib.import_module(module_name), class_name)
         sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
