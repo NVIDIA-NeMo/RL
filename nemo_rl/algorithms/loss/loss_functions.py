@@ -31,13 +31,9 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
     build_exact_token_map,
     ce_label_mask,
-    chunk_average_log_probs,
-    get_sparse_projection_matrix,
     next_token_accuracy,
-    project_student_to_teacher_vocab,
     select_teacher_topk_indices,
     student_next_token_ce,
-    valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -47,7 +43,6 @@ from nemo_rl.distributed.model_utils import (
     group_all_reduce_sum,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_logits,
-    vocab_parallel_log_softmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
@@ -2596,7 +2591,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             found = found.squeeze(-1)
         return logp, found
 
-
     def _maybe_dump_loss(self, metrics: dict[str, Any]) -> None:
         """Append per-call raw loss values to a per-rank dump file.
 
@@ -4627,7 +4621,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # ``effective_count`` and the normalization is byte-exact.
         if global_valid_chunks is None:
             global_valid_chunks = group_all_reduce_sum(
-                torch.tensor(float(effective_count), device=device, dtype=torch.float32),
+                torch.tensor(
+                    float(effective_count), device=device, dtype=torch.float32
+                ),
                 group=torch.distributed.group.WORLD,
             )
             tp_world = (
@@ -4718,4 +4714,3 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if v3_position_0_kl:
             metrics["kl_partition_first_per_chunk"] = v3_pos0_loss_term.item()
         return final_loss, metrics
-

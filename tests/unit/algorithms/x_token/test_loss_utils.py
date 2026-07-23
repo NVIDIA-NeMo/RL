@@ -879,7 +879,10 @@ class XtokenShardTestActor:
             teacher_ids = teacher_ids.to(device)
             s_spans, t_spans = s_spans.to(device), t_spans.to(device)
             pair_valid, num_chunks = pair_valid.to(device), num_chunks.to(device)
-            student_full, teacher_full = student_full.to(device), teacher_full.to(device)
+            student_full, teacher_full = (
+                student_full.to(device),
+                teacher_full.to(device),
+            )
 
             # Tiny 1-to-1 subtok tables so ``common_indices_from_subtoks`` derives
             # the common-vocab support without a projection matrix.
@@ -891,7 +894,9 @@ class XtokenShardTestActor:
             fwd_path = os.path.join(tmpdir, "fwd.pt")
             rev_path = os.path.join(tmpdir, "rev.pt")
             torch.save({"subtoks": subtoks, "lengths": lengths}, fwd_path)
-            torch.save({"subtoks": subtoks.clone(), "lengths": lengths.clone()}, rev_path)
+            torch.save(
+                {"subtoks": subtoks.clone(), "lengths": lengths.clone()}, rev_path
+            )
 
             cfg = {
                 "temperature": temp,
