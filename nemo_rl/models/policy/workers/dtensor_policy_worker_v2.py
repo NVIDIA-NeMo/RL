@@ -1422,7 +1422,10 @@ def refit_sglang_colocated(
     Ray IPC, post-process, continue. Mirrors the Megatron colocated driver;
     the FSDP path is BF16-only.
     """
-    from nemo_rl.models.policy.utils import fetch_updatable_engines_with_recover
+    from nemo_rl.models.policy.utils import (
+        fetch_updatable_engines_with_recover,
+        invalidate_sglang_kv_cache_for_refit,
+    )
 
     (
         rollout_engines,
@@ -1448,8 +1451,8 @@ def refit_sglang_colocated(
     # still-valid in-place state.
     pause_mode = policy_generation.pause_generation_mode
     policy_generation.pause_generation(mode=pause_mode)
-    policy_generation.invalidate_kv_cache()
     try:
+        invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
         futures = policy.update_weights_to_sglang_colocated(
             rollout_engines=rollout_engines,
             buffer_size_bytes=buffer_size_bytes,
