@@ -85,9 +85,8 @@ class WeightSynchronizer(ABC):
         Args:
             timer: Optional Timer for profiling individual phases.
             kv_scales: Optional KV cache scales for FP8 quantization.
-                **Note**: Only honored by the NCCL collective transport,
-                which forwards them to ``policy.broadcast_weights_for_collective()``.
-                IPC and HTTP transports ignore this parameter.
+                Honored by the IPC/ZMQ and NCCL collective transports. The
+                HTTP transport ignores this parameter.
 
         Returns:
             Optional transport-specific scalar metrics for the current sync.

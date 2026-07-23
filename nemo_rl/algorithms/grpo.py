@@ -2261,7 +2261,8 @@ def refit_policy_generation(
                 # tensors in-place and feeds them into the inference engine's
                 # loader.
                 futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
+                    buffer_size_bytes=buffer_size_bytes,
+                    kv_scales=kv_scales,
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
@@ -4049,6 +4050,30 @@ def async_grpo_train(
         )
 
         if current_step_ready:
+            # Keep the async pipeline one step ahead before entering training.
+
+            # A restored buffer may already contain `step`, allowing startup to
+            # consume it before the collector generates `step + 1`. After refit,
+            # the collector advances to targets starting at `step + 2`, leaving
+            # `step + 1` permanently missing. Wait for the initial collector,
+            # whose range includes both steps, to complete the lookahead first.
+            max_num_steps = master_config.grpo["max_num_steps"]
+            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
+            if need_lookahead:
+                next_step_ready = ray.get(
+                    replay_buffer.has_complete_batch.remote(
+                        step + 1, num_prompts_per_step, max_trajectory_age_steps
+                    )
+                )
+                if not next_step_ready:  # pragma: no cover
+                    print(
+                        f"  Pipeline barrier: step {step} ready but "
+                        f"step {step + 1} not yet — waiting for lookahead fill "
+                        f"to prevent resume deadlock"
+                    )
+                    wait_iterations += 1
+                    time.sleep(1.0)
+                    continue
             break
 
         trajectories_needed = ray.get(
