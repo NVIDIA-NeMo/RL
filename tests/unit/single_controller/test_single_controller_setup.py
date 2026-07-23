@@ -186,6 +186,18 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_clusters_rejects_non_colocated_megatron_generation():
+    """The topology guard identifies Megatron as the generation backend."""
+    master_config = _make_master_config(colocated=False, backend="megatron")
+    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+
+    with pytest.raises(
+        AssertionError,
+        match="Megatron generation backend.*non-colocated inference",
+    ):
+        sc_setup_mod._build_clusters(master_config)
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 

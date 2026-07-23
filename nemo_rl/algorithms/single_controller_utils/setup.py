@@ -46,7 +46,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane import build_data_plane_client
+from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollout_manager import RolloutManager
@@ -71,7 +71,7 @@ class SingleControllerActorArgs:
     env_handles: dict[str, EnvironmentInterface]
     train_cluster: RayVirtualCluster
     inference_cluster: RayVirtualCluster
-    dp_client: Any
+    dp_client: DataPlaneClient
     dataloader: StatefulDataLoader
     weight_synchronizer: WeightSynchronizer
     advantage_estimator: Any
@@ -109,7 +109,8 @@ def _build_clusters(
 
     # Non-colocated: split node into train + inference clusters.
     assert backend != "megatron", (
-        "Non-colocated inference is not supported for Megatron generation backends."
+        "The Megatron generation backend does not support non-colocated inference "
+        "in SingleController."
     )
     inference_resources = generation_config["colocated"]["resources"]
     inference_gpus_per_node = inference_resources["gpus_per_node"]
