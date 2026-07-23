@@ -1604,6 +1604,10 @@ def test_run_async_nemo_gym_rollout(
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
         final_batch.pop("message_log", None)
+        # idx is trivially correct ([0, 1, ...]); task_name is a non-deterministic
+        # temp filename — exclude both from the structural comparison.
+        final_batch.pop("idx", None)
+        final_batch.pop("task_name", None)
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()

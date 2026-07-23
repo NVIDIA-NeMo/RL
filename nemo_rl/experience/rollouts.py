@@ -2542,7 +2542,7 @@ def _postprocess_single_nemo_gym_group(
             ),
             "loss_multiplier": input_batch["loss_multiplier"],
             # Required by get_idx_grouping for advantage estimation grouping.
-            "idx": input_batch["idx"],
+            "idx": input_batch.get("idx", list(range(len(results)))),
             "task_name": input_batch.get("task_name", [None] * len(results)),
             # Unused DatumSpec fields:
             # extra_env_info: dict[str, Any]
