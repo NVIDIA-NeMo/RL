@@ -59,6 +59,8 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -362,6 +364,7 @@ class SingleControllerActor:
             groups_dispatched = 0
             min_sample_version = None
             step_open = False
+            calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
                 while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
@@ -459,6 +462,20 @@ class SingleControllerActor:
                             int(s) for s in train_meta.sequence_lengths
                         )
 
+                    if getattr(self._gen, "requires_kv_scale_sync", False):
+                        calibration_fields = [
+                            field
+                            for field in (train_meta.fields or [])
+                            if field in DP_CALIB_INPUT_FIELDS
+                        ]
+                        calibration_batches.append(
+                            await asyncio.to_thread(
+                                self._trainer.read_from_dataplane,
+                                train_meta,
+                                select_fields=calibration_fields,
+                            )
+                        )
+
                     # Refresh min_sample_version
                     curr_min_sample_version = min(
                         t["weight_version"]
@@ -492,7 +509,12 @@ class SingleControllerActor:
                 self._trainer_version += 1
                 self._train_steps += 1
                 with self._timer.time("weight_sync"):
-                    await self._sync_weights()
+                    calibration_data = (
+                        BatchedDataDict.from_batches(calibration_batches)
+                        if calibration_batches
+                        else None
+                    )
+                    await self._sync_weights(calibration_data=calibration_data)
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -543,7 +565,11 @@ class SingleControllerActor:
                 flush=True,
             )
 
-    async def _sync_weights(self) -> None:
+    async def _sync_weights(
+        self,
+        *,
+        calibration_data: Optional[BatchedDataDict[Any]] = None,
+    ) -> None:
         """Pause new rollout dispatches, synchronize weights, resume.
 
         SC owns the pause gate; in-flight generations continue through the
@@ -552,8 +578,9 @@ class SingleControllerActor:
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. weight_synchronizer.sync_weights()
-          3. _rollout_permitted.set()   — resume
+          2. Optionally calibrate FP8 KV-cache scales.
+          3. weight_synchronizer.sync_weights(kv_scales=...)
+          4. _rollout_permitted.set()   — resume
         """
         self._rollout_permitted.clear()
 
@@ -573,7 +600,23 @@ class SingleControllerActor:
         # )
 
         t0 = time.monotonic()
-        await asyncio.to_thread(self._weight_synchronizer.sync_weights)
+        kv_scales = None
+        if (
+            getattr(self._gen, "requires_kv_scale_sync", False)
+            and calibration_data is not None
+        ):
+            print("▶ Computing KV cache scales...", flush=True)
+            calibration_result = await asyncio.to_thread(
+                self._trainer.calibrate_qkv_fp8_scales,
+                calibration_data,
+                include_q=True,
+            )
+            kv_scales = calibration_result["layers"]
+
+        await asyncio.to_thread(
+            self._weight_synchronizer.sync_weights,
+            kv_scales=kv_scales,
+        )
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             self._gen.invalidate_kv_cache()
         elapsed = time.monotonic() - t0

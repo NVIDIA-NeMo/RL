@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -28,6 +29,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import Timer
 
 
@@ -134,16 +136,53 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
-    ctrl._gen = SimpleNamespace(invalidate_kv_cache=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(),
+        requires_kv_scale_sync=False,
+    )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
 
     asyncio.run(ctrl._sync_weights())
 
-    ctrl._weight_synchronizer.sync_weights.assert_called_once_with()
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(3)
     assert ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(),
+        requires_kv_scale_sync=True,
+    )
+    ctrl._trainer = SimpleNamespace(
+        calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
+    )
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 3
+    calibration_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "input_lengths": torch.tensor([2]),
+        }
+    )
+
+    asyncio.run(ctrl._sync_weights(calibration_data=calibration_data))
+
+    ctrl._trainer.calibrate_qkv_fp8_scales.assert_called_once_with(
+        calibration_data,
+        include_q=True,
+    )
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
+        kv_scales={"layer.0": 0.5}
+    )
 
 
 class _EmptySampler:
@@ -215,6 +254,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
