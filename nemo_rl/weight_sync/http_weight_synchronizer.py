@@ -66,6 +66,12 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        assert kv_scales is None, (
+            "HTTP transport (SGLang) does not support FP8 KV cache scale sync. "
+            "`kv_scales` is accepted only for interface uniformity; if this "
+            "assertion fires, calibrated scales were routed through a path that "
+            "would otherwise silently ignore them."
+        )
         self._policy.offload_before_refit()
         self._generation.prepare_for_generation(tags=["weights"])
 

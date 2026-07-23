@@ -26,10 +26,11 @@ docker buildx build -f docker/Dockerfile \
 Skip optional backends to reduce build time:
 
 ```bash
-# Skip vLLM and SGLang
+# Skip vLLM, SGLang, and TRT-LLM
 docker buildx build -f docker/Dockerfile \
     --build-arg SKIP_VLLM_BUILD=1 \
     --build-arg SKIP_SGLANG_BUILD=1 \
+    --build-arg SKIP_TRTLLM_BUILD=1 \
     --tag nemo-rl:latest .
 ```
 

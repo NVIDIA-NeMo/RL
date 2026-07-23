@@ -105,6 +105,9 @@ class NemoGymConfig(TypedDict):
     routed_experts_dtype: NotRequired[
         str
     ]  # Carry dtype name for routed_experts tensors ("int8"/"int16"/"int32"), resolved from the model's expert count
+    # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
+    # tokenizer consistently with the driver. Defaults to off when absent.
+    use_fastokens: NotRequired[bool]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -278,6 +281,10 @@ Depending on your data shape, you may want to change these values."""
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
+
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
@@ -523,6 +530,32 @@ def extract_reward_components(nemo_gym_result: dict) -> Dict[str, float] | None:
     if not components:
         return None
     return {str(name): float(score) for name, score in components.items()}
+
+
+def build_reward_component_columns(
+    component_dicts: List[Dict[str, float] | None],
+) -> Dict[str, torch.Tensor]:
+    """Build ``reward/<name>`` batch columns from per-sample reward-component dicts.
+
+    Takes the union of component names across the batch in sorted (deterministic) order
+    and, for each, emits a ``reward/<name>`` tensor with one entry per sample. A
+    component absent on a given sample is filled with ``0.0`` so every column covers all
+    samples (the per-prompt baseline requires each component present for all responses).
+
+    Keys are prefixed ``reward/`` so they are exactly what
+    ``nemo_rl.algorithms.utils.get_gdpo_reward_component_keys`` selects (it matches
+    ``startswith("reward/")`` and sorts by name); the name carries the component identity,
+    so no positional index is needed. Returns an empty dict when no sample has components.
+    """
+    component_names = sorted(
+        {name for c in component_dicts if c is not None for name in c}
+    )
+    return {
+        f"reward/{name}": torch.tensor(
+            [c[name] if c is not None and name in c else 0.0 for c in component_dicts]
+        )
+        for name in component_names
+    }
 
 
 def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> None:

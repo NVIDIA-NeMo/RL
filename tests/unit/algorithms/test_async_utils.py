@@ -36,10 +36,7 @@ from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
 )
-from nemo_rl.algorithms.async_utils.replay_buffer import (
-    ReplayBufferImpl,
-    ReplayBufferNew,
-)
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _get_next_nemo_gym_task_index,
@@ -1042,159 +1039,66 @@ class TestReplayBuffer:
         os.unlink(checkpoint_path)
         ray.kill(buffer2)
 
+    def test_resume_deadlock_precondition_detectable(self):
+        """Regression: restored buffer can expose the async-GRPO resume deadlock.
 
-class TestReplayBufferNew:
-    """Tests for ReplayBufferNew: staleness-window sampling via _evict + sample."""
+        After PR #2651 introduced replay-buffer checkpointing, resuming from a
+        checkpoint where target N is complete but target N+1 is absent caused an
+        async-GRPO deadlock:
 
-    def _make_traj(self, label: str) -> dict:
-        return {"batch": {"data": label}, "rollout_metrics": {}}
+          1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
+          2. Training consumes all target-N trajectories and triggers a refit.
+          3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
+          4. Training waits for target N+1, which nobody generates — stall forever.
 
-    def _add(self, buf, label: str, weight_version: int):
-        return ray.get(
-            buf.add.remote(
-                self._make_traj(label),
-                weight_version=weight_version,
-                target_weight_version=0,  # unused in ReplayBufferNew
+        The fix is a startup pipeline barrier: before breaking, also require
+        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
+        constructs the exact precondition state — current step complete, lookahead
+        absent — to ensure it remains detectable and to document the expected
+        buffer readiness values that the barrier logic branches on.
+        """
+        num_prompts = 8
+        resume_step = 30
+        max_age = 1
+
+        # Build a pre-checkpoint buffer: 8 trajectories for target 30, none for 31.
+        buffer1 = ReplayBuffer.remote(max_size=20)
+        for _ in range(num_prompts):
+            ray.get(
+                buffer1.add.remote(
+                    {"batch": {"data": "x"}, "rollout_metrics": {}},
+                    weight_version=resume_step - 1,
+                    target_weight_version=resume_step,
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        # Restore at step 30, simulating a checkpoint resume.
+        buffer2 = ReplayBuffer.remote(max_size=20)
+        ray.get(
+            buffer2.load_state_dict.remote(
+                state,
+                num_prompts_per_step=num_prompts,
+                current_training_step=resume_step,
+                max_age_steps=max_age,
             )
         )
 
-    def _sample(self, buf, num_groups: int, trainer_version: int):
-        return ray.get(
-            buf.sample.remote(
-                num_prompt_groups=num_groups,
-                current_weight_version=trainer_version,
-                max_age_steps=0,  # unused in ReplayBufferNew
-            )
-        )
+        # Step 30 is complete — this is what makes the broken startup return early.
+        assert ray.get(
+            buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
+        ), "target step must be complete after restore"
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+        # Step 31 is absent — this is the deadlock precondition.
+        # The startup pipeline barrier must detect this and continue waiting
+        # instead of breaking, giving the collector time to generate step 31.
+        assert not ray.get(
+            buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
+        ), "lookahead step must be absent; barrier should block here"
 
-    def test_invalid_max_staleness_raises(self):
-        with pytest.raises(Exception):
-            buf = ReplayBufferNew.remote(max_size=10, max_staleness=-1)
-            ray.get(buf.size.remote())
-
-    # ------------------------------------------------------------------
-    # _evict (via sample)
-    # ------------------------------------------------------------------
-
-    def test_stale_rows_evicted_before_sampling(self):
-        """Rows with age > max_staleness are removed before sample() selects."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=2)
-        # age at trainer=4: gen_v=1 → 3 > 2 (stale), gen_v=3 → 1 ≤ 2 (valid)
-        self._add(buf, "stale", weight_version=1)
-        self._add(buf, "fresh", weight_version=3)
-
-        result = self._sample(buf, num_groups=1, trainer_version=4)
-
-        assert result is not None
-        assert result["trajectories"][0]["batch"]["data"] == "fresh"
-        assert ray.get(buf.size.remote()) == 0  # stale row also gone
-        ray.kill(buf)
-
-    def test_all_stale_returns_none(self):
-        """sample() returns None when all rows are evicted as stale."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=1)
-        self._add(buf, "a", weight_version=0)
-        self._add(buf, "b", weight_version=1)
-
-        # trainer=5: both ages > 1
-        result = self._sample(buf, num_groups=1, trainer_version=5)
-
-        assert result is None
-        assert ray.get(buf.size.remote()) == 0
-        ray.kill(buf)
-
-    def test_eviction_frees_capacity(self):
-        """Evicting a stale row allows a subsequent add() to succeed."""
-        buf = ReplayBufferNew.remote(max_size=1, max_staleness=1)
-        self._add(buf, "x", weight_version=1)
-        assert self._add(buf, "x", weight_version=1) == "full"
-
-        # sample() at trainer=5 evicts the stale row (age 4 > 1)
-        self._sample(buf, num_groups=1, trainer_version=5)
-
-        assert self._add(buf, "y", weight_version=4) == "success"
-        ray.kill(buf)
-
-    def test_within_window_not_evicted(self):
-        """Rows whose age is within max_staleness are not evicted."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=3)
-        self._add(buf, "x", weight_version=4)
-
-        # trainer=6: age = 6 - 4 = 2 ≤ 3 → should survive
-        # should return None since there is only 1 row
-        result = self._sample(buf, num_groups=2, trainer_version=6)
-        assert result is None
-
-        # this sample should still be there
-        assert ray.get(buf.size.remote()) == 1
-        ray.kill(buf)
-
-    # ------------------------------------------------------------------
-    # sample()
-    # ------------------------------------------------------------------
-
-    @pytest.mark.parametrize("sample_freshest_first", [True, False])
-    def test_sample_freshest_first(self, sample_freshest_first):
-        """sample() returns the freshest trajectories first."""
-        buf = ReplayBufferNew.remote(
-            max_size=10, max_staleness=5, sample_freshest_first=sample_freshest_first
-        )
-        for gen_v in [3, 4, 5]:
-            self._add(buf, f"v{gen_v}", weight_version=gen_v)
-
-        result = self._sample(buf, num_groups=2, trainer_version=6)
-
-        assert result is not None
-        data = [t["batch"]["data"] for t in result["trajectories"]]
-        if sample_freshest_first:
-            assert data == ["v5", "v4"]
-        else:
-            assert data == ["v3", "v4"]
-        ray.kill(buf)
-
-    def test_sample_returns_none_when_insufficient(self):
-        """sample() returns None when fewer rows than requested remain after eviction."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
-        self._add(buf, "only", weight_version=1)
-
-        result = self._sample(buf, num_groups=3, trainer_version=2)
-
-        assert result is None
-        ray.kill(buf)
-
-    def test_sample_returns_none_on_empty_buffer(self):
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
-        result = self._sample(buf, num_groups=1, trainer_version=1)
-        assert result is None
-        ray.kill(buf)
-
-    def test_sample_avg_trajectory_age(self):
-        """avg_trajectory_age is computed from the sampled generation versions."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
-        # freshest first: gen 8 (age 2), gen 6 (age 4) → avg = 3.0
-        for gen_v in [6, 8]:
-            self._add(buf, f"v{gen_v}", weight_version=gen_v)
-
-        result = self._sample(buf, num_groups=2, trainer_version=10)
-
-        assert result is not None
-        assert abs(result["avg_trajectory_age"] - 3.0) < 1e-6
-        ray.kill(buf)
-
-    def test_sample_consumes_selected_rows(self):
-        """Rows returned by sample() are removed from the buffer."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
-        for gen_v in [1, 2, 3]:
-            self._add(buf, f"v{gen_v}", weight_version=gen_v)
-
-        self._sample(buf, num_groups=2, trainer_version=4)
-
-        assert ray.get(buf.size.remote()) == 1
-        ray.kill(buf)
+        ray.kill(buffer2)
 
 
 class TestAsyncTrajectoryCollector:

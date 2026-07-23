@@ -444,6 +444,12 @@ async def generate_responses_async(
         use_async_generation = bool(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
+    elif backend == "trtllm":
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        use_async_generation = True
     elif backend == "megatron":
         use_async_generation = bool(
             generation_config.get("mcore_generation_config", {}).get(
@@ -2397,6 +2403,10 @@ def _postprocess_single_nemo_gym_group(
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
             ]
+        elif "trtllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"][
+                "max_model_len"
+            ]
         elif "mcore_generation_config" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg[
                 "mcore_generation_config"
@@ -2597,30 +2607,17 @@ def _postprocess_single_nemo_gym_group(
     # Gym environments so GDPO can compute per-component advantages; single-reward envs
     # are unaffected. Mirrors the native rollout path's reward-component handling above.
     from nemo_rl.environments.nemo_gym import (
+        build_reward_component_columns,
         extract_reward_components,
         validate_reward_components_match_scalar,
     )
 
     component_dicts = [extract_reward_components(r["full_result"]) for r in results]
     if any(c is not None for c in component_dicts):
-        # Emit each component under a `reward/<name>` key, matching the native
-        # multi-reward path and what get_gdpo_reward_component_keys() consumes (it selects
-        # keys starting with "reward/" and sorts them by name). The name carries the
-        # component identity, so ordering is handled downstream by that sort — no
-        # positional index needed. Take the union of names across the batch and default a
-        # component absent on a given sample to 0.0, so every sample carries the same key
-        # set (the per-prompt baseline requires each reward/<name> present for all
-        # responses to a prompt).
-        component_names = sorted(
-            {name for c in component_dicts if c is not None for name in c}
-        )
-        for name in component_names:
-            final_batch[f"reward/{name}"] = torch.tensor(
-                [
-                    c[name] if c is not None and name in c else 0.0
-                    for c in component_dicts
-                ]
-            )
+        # Emit each component under a `reward/<name>` key (see
+        # build_reward_component_columns): matches the native multi-reward path and what
+        # get_gdpo_reward_component_keys() consumes.
+        final_batch.update(build_reward_component_columns(component_dicts))
         # Leave total_reward as the verifier's scalar `reward` (set above); do not
         # silently overwrite it. When a verifier emits reward_components, the contract is
         # reward == sum(components), so overwriting would be a no-op in the correct case
