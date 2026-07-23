@@ -162,9 +162,9 @@ policy:
 
 data:
   train:
-    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/train-split.jsonl"
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/${oc.env:NRL_DATASET_REVISION}/train-split.jsonl"
   validation:
-    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/val-split.jsonl"
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/${oc.env:NRL_DATASET_REVISION}/val-split.jsonl"
 
 env:
   should_use_nemo_gym: true

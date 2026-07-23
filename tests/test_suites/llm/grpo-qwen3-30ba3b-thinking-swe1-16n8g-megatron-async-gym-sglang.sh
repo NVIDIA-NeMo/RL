@@ -68,12 +68,15 @@ if [[ ! "${NRL_DATASET_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
     echo "[ERROR] NRL_DATASET_REVISION must be an immutable 40-character dataset commit"
     exit 1
 fi
+SWE1_DATA_DIR="$HF_HOME/superv3_data/swe1/$NRL_DATASET_REVISION"
 for SPLIT in train-split.jsonl val-split.jsonl; do
-    if [[ ! -s "$HF_HOME/superv3_data/swe1/$SPLIT" ]]; then
-        echo "[ERROR] Missing immutable SWE1 dataset artifact $HF_HOME/superv3_data/swe1/$SPLIT"
+    if [[ ! -s "$SWE1_DATA_DIR/$SPLIT" ]]; then
+        echo "[ERROR] Missing immutable SWE1 dataset artifact $SWE1_DATA_DIR/$SPLIT"
         exit 1
     fi
 done
+TRAIN_DATA_SHA256=$(sha256sum "$SWE1_DATA_DIR/train-split.jsonl" | awk '{print $1}')
+VAL_DATA_SHA256=$(sha256sum "$SWE1_DATA_DIR/val-split.jsonl" | awk '{print $1}')
 if [[ "${NRL_IMAGE_REF:-}" != *@sha256:* ]]; then
     echo "[ERROR] NRL_IMAGE_REF must include an immutable sha256 image digest"
     exit 1
@@ -112,6 +115,8 @@ mkdir -p "$LOG_DIR" "$CKPT_DIR"
     printf 'model_revision=%s\n' "$NRL_MODEL_REVISION"
     printf 'model_path=%s\n' "$NRL_MODEL_PATH"
     printf 'dataset_revision=%s\n' "$NRL_DATASET_REVISION"
+    printf 'dataset_train_sha256=%s\n' "$TRAIN_DATA_SHA256"
+    printf 'dataset_validation_sha256=%s\n' "$VAL_DATA_SHA256"
     printf 'run_id=%s\n' "$RUN_ID"
     printf 'command='
     printf '%q ' "$0" "$@"
