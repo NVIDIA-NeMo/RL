@@ -16,7 +16,7 @@
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Optional, Tuple
 
 import torch
 from transformers import AutoTokenizer
@@ -283,6 +283,32 @@ def process_microbatch(
         seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
         cp_buffers = [input_ids, position_ids, seq_index]
 
+        # Cross-tokenizer distillation rides student-seq-aligned alignment /
+        # mask fields on the same mb. CP-shard the student-seq fields with
+        # the student cp_mesh so the loss sees matching seq dims against
+        # the redistributed student logits. Teacher-seq fields (T_t may
+        # differ from T_s) stay full; the loss slices them contiguously by
+        # student CP rank because the IPC consumer ships contiguous teacher
+        # slices (see FullLogitsPostProcessor un-interleave in train.py).
+        # There is one set of student-seq alignment fields per teacher:
+        # single-teacher uses the unprefixed ``alignment_student_*`` keys,
+        # multi-teacher uses ``alignment_{i}_student_*`` (the suffix match
+        # captures both and excludes teacher-seq ``*_teacher_*`` fields).
+        student_seq_alignment_fields = [
+            k
+            for k in mb
+            if k.startswith("alignment_")
+            and (
+                k.endswith("_student_chunk_id")
+                or k.endswith("_student_exact_partition_mask")
+            )
+        ]
+        if student_seq_alignment_fields:
+            if "token_mask" in mb:
+                cp_buffers.append(mb["token_mask"])
+            for student_seq_field in student_seq_alignment_fields:
+                cp_buffers.append(mb[student_seq_field])
+
     return ProcessedInputs(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -348,7 +374,11 @@ def process_global_batch(
     }
 
 
-def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
+def check_sequence_dim(
+    data: BatchedDataDict[Any],
+    *,
+    skip_keys: Optional[Iterable[str]] = None,
+) -> Tuple[int, int]:
     """Check and validate sequence dimension across all tensors.
 
     Verifies that dimension 1 is the sequence dimension for all tensors
@@ -356,6 +386,10 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
 
     Args:
         data: BatchedDataDict to validate
+        skip_keys: Keys whose tensors are not student-sequence-aligned at
+            dim 1 and should be excluded from the check (e.g. cross-tokenizer
+            teacher and alignment auxiliaries that ride along on the same
+            BatchedDataDict).
 
     Returns:
         Tuple of (sequence_dim, seq_dim_size)
@@ -363,9 +397,12 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
     Raises:
         AssertionError: If any tensor has inconsistent sequence dimension
     """
+    skip_set = set(skip_keys) if skip_keys is not None else set()
     sequence_dim = 1
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
-    for _, v in data.items():
+    for k, v in data.items():
+        if k in skip_set:
+            continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"

@@ -1,0 +1,72 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-8n4g-megatron
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 16
+    sequence_parallel: true
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    defer_fp32_logits: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    mtp_use_repeated_layer: true
+    mtp_loss_scaling_factor: 0.3
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+      NRL_REFIT_NUM_BUFFERS: "1"
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+      env_vars:
+        NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+        NRL_REFIT_NUM_BUFFERS: "1"
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+      mamba_cache_mode: align
+      speculative_config:
+        num_speculative_tokens: 5
+        method: mtp
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron3-super-120BA12B-8n4g-megatron
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  segment_size: 4

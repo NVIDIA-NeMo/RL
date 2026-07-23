@@ -1,0 +1,36 @@
+defaults: ./grpo-qwen3-30ba3b-4n4g-mxfp8-rollout.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 8
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      precision: "fp8"
+      is_mx: true
+      quantization_ignored_layer_kws:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2

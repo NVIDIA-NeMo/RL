@@ -1,0 +1,47 @@
+# PPO-DAPO with Megatron-Core Backend
+# DAPO-style PPO: no KL penalty, asymmetric clipping, dual-clip, reward scaling
+# Dynamic sampling is disabled (standard PPO batching).
+defaults: ppo_math_1B.yaml
+
+checkpointing:
+  checkpoint_dir: results/ppo_dapo_megatron
+
+policy:
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  scheduler: null
+
+# Value Model with Megatron-Core Backend (for GAE in PPO)
+value:
+  reward_model_cfg:
+    enabled: false  # only used for DTensor V2 value worker
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+  make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  scheduler: null
+
+logger:
+  wandb:
+    project: ppo-dapo-megatron-dev
+    name: ppo_dapo_megatron_1B
+    # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
+    log_nemo_gym_full_result_tables: false
+  swanlab:
+    project: ppo-dapo-megatron-dev
+    name: ppo_dapo_megatron_1B
+  mlflow:
+    experiment_name: ppo-dapo-megatron-dev
+    run_name: ppo_dapo_megatron_1B

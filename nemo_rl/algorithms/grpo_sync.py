@@ -48,6 +48,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _should_log_nemo_gym_responses,
@@ -75,6 +76,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import Logger, print_message_log_samples
@@ -82,6 +84,36 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+
+
+def _raise_if_message_level_advantage_penalties_enabled(
+    master_config: MasterConfig,
+) -> None:
+    """Raise if message-level advantage penalties are set in the sync trainer.
+
+    Message-level advantage penalties are not supported with
+    ``data_plane.enabled=true``. Raises NotImplementedError listing the
+    offending keys so the user can disable them or switch to the legacy GRPO
+    trainer.
+    """
+    unsupported_keys = [
+        key
+        for key in (
+            "invalid_tool_call_advantage",
+            "malformed_thinking_advantage",
+        )
+        if master_config.grpo.get(key) is not None
+    ]
+    if not unsupported_keys:
+        return
+
+    raise NotImplementedError(
+        "Message-level advantage penalties are not supported with "
+        "data_plane.enabled=true yet. Disable "
+        f"{', '.join(f'grpo.{key}' for key in unsupported_keys)} or use the "
+        "legacy GRPO trainer."
+    )
+
 
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
@@ -373,7 +405,10 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = True
+    NEED_REFIT = not (
+        isinstance(policy_generation, MegatronGeneration)
+        and master_config.policy["generation"]["colocated"]["enabled"]
+    )
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
@@ -401,8 +436,6 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    adv_estimator = _create_advantage_estimator(master_config)
-
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
     # bootstraps the controller and attaches workers; ``policy.dp_cfg``
@@ -416,6 +449,8 @@ def grpo_train_sync(
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
             "want TransferQueue."
         )
+    _raise_if_message_level_advantage_penalties_enabled(master_config)
+    adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
     # jagged tensors for variable-length token fields (input_ids,
@@ -486,6 +521,8 @@ def grpo_train_sync(
             "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
             "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used."
         )
+
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -620,11 +657,6 @@ def grpo_train_sync(
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
                         )
                     )
-
-                    if not _should_log_nemo_gym_responses(master_config):
-                        for key in list(rollout_metrics):
-                            if "full_result" in key:
-                                rollout_metrics.pop(key)
 
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
@@ -844,6 +876,7 @@ def grpo_train_sync(
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.sample_ids so workers fetch
                 # the union via train_presharded.
+                advantages = _clip_grpo_advantages(advantages, master_config.grpo)
                 policy.write_to_dataplane(
                     meta,
                     fields={
@@ -1039,6 +1072,10 @@ def grpo_train_sync(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
@@ -1122,7 +1159,10 @@ def grpo_train_sync(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             # Per-step log_data jsonl. The 1-hop driver holds per-token
@@ -1272,10 +1312,12 @@ def grpo_train_sync(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -1285,3 +1327,10 @@ def grpo_train_sync(
 
         current_epoch += 1
         current_step = 0
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()

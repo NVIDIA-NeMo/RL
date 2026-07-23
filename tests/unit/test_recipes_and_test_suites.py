@@ -46,6 +46,9 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "rm": "examples/configs/rm.yaml",
     "dapo": "examples/configs/grpo_math_1B.yaml",
     "prorlv2": "examples/configs/prorlv2.v2.yaml",
+    "ppo": "examples/configs/ppo_math_1B_megatron.yaml",
+    "mopd": "examples/configs/grpo_math_1B.yaml",
+    "gdpo": "examples/configs/gdpo_math_1B.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing
@@ -188,6 +191,26 @@ def test_no_overlap_across_test_suites(all_test_suites):
     )
 
 
+def test_nightly_suites_match_gpus_per_node(
+    nightly_test_suite, nightly_gb200_test_suite
+):
+    for test_suite, expected_gpus_per_node in (
+        (nightly_test_suite, 8),
+        (nightly_gb200_test_suite, 4),
+    ):
+        for test_script in test_suite:
+            gpus_per_node = 8
+            with open(os.path.join(project_root, test_script)) as f:
+                for line in f:
+                    if line.startswith("GPUS_PER_NODE="):
+                        gpus_per_node = int(line.split("=", 1)[1].split()[0])
+                        break
+            assert gpus_per_node == expected_gpus_per_node, (
+                f"{test_script} requests {gpus_per_node} GPUs per node, but its "
+                f"nightly suite requires {expected_gpus_per_node}"
+            )
+
+
 def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
     all_test_scripts_in_test_suites = set(all_test_suites)
 
@@ -233,7 +256,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1360_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_3420_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -265,8 +288,8 @@ def test_nightly_compute_stays_below_1360_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1360, (
-        f"Total GPU hours exceeded 1360: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 3420, (
+        f"Total GPU hours exceeded 3420: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 

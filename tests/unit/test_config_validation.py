@@ -23,9 +23,18 @@ from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    RewardPenaltyConfig,
+)
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+    MasterConfig as XTokenOffPolicyDistillationMasterConfig,
+)
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
@@ -112,6 +121,19 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif "teachers" in config_dict or (
+        "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
+    ):
+        # Cross-tokenizer off-policy distillation also has a top-level
+        # ``distillation`` block, so it must be matched before the generic
+        # ``distillation`` branch below. The multi-teacher cross-tokenizer config
+        # is identified by its top-level ``teachers`` list (online distillation
+        # uses a singular ``teacher``); the per-(student, teacher) projection path
+        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
+        # as a fallback for any single-teacher config that still carries it.
+        master_config_class = XTokenOffPolicyDistillationMasterConfig
+        config_type = "xtoken_off_policy_distillation"
     elif "distillation" in config_dict:
         master_config_class = DistillationMasterConfig
         config_type = "distillation"
@@ -124,6 +146,9 @@ def test_all_config_files_have_required_keys(config_file):
     elif "grpo" in config_dict:
         master_config_class = GRPOMasterConfig
         config_type = "grpo"
+    elif "ppo" in config_dict:
+        master_config_class = PPOMasterConfig
+        config_type = "ppo"
     elif "rm" in config_dict:
         master_config_class = RMMasterConfig
         config_type = "rm"
@@ -134,6 +159,32 @@ def test_all_config_files_have_required_keys(config_file):
 
     # Validate the entire config using the appropriate MasterConfig
     validate_config_section(config_dict, master_config_class, config_file)
+
+
+def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
+    """Unwanted-token penalty requires explicit unwanted-token config.
+
+    Validates that token_ids.unwanted is present whenever penalize_unwanted_tokens
+    is enabled.
+    """
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids=None)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={})
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={"unwanted": []})
+
+    config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [2]},
+    )
+    assert config.token_ids is not None
+    assert config.token_ids.unwanted == [2]
 
 
 @pytest.mark.parametrize("config_file", config_files)
