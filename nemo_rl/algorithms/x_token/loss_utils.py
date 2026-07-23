@@ -46,6 +46,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
+    allgather_cp_contiguous_tensor,
     cp_load_balanced_to_contiguous,
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
@@ -1172,18 +1173,18 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         alignment_prefix = f"alignment_{i}_"
         teacher_seq_len = teacher_full_logits.shape[1]
         if cp_sharder is not None:
-            student_chunk_id_full = to_local_if_dtensor(
+            student_chunk_id_source_full = to_local_if_dtensor(
                 data[f"{alignment_prefix}student_chunk_id"]
             )
-            student_chunk_id_contig = student_chunk_id_full[
+            student_chunk_id_contig = student_chunk_id_source_full[
                 :, student_seq_start : student_seq_start + student_seq_len
             ].contiguous()
 
-            teacher_chunk_id_full = to_local_if_dtensor(
+            teacher_chunk_id_source_full = to_local_if_dtensor(
                 data[f"{alignment_prefix}teacher_chunk_id"]
             )
             teacher_seq_start = cp_rank * teacher_seq_len
-            teacher_chunk_id_contig = teacher_chunk_id_full[
+            teacher_chunk_id_contig = teacher_chunk_id_source_full[
                 :, teacher_seq_start : teacher_seq_start + teacher_seq_len
             ].contiguous()
             align = LocalizedAlignment(
@@ -1214,12 +1215,20 @@ def prepare_xtoken_cross_tokenizer_loss_input(
 
         # Contiguous, UNSHIFTED chunk ids -> per-chunk position spans for the v6
         # path. v6 reads spans and applies its own per-chunk kl_chunk_shift, so
-        # it must not derive them from next-token-shifted chunk ids. Spans are
-        # this CP rank's local-window positions at this stage; native full-CP
-        # gathering is added by the following commit.
+        # it must not derive them from next-token-shifted chunk ids.
         max_pairs = align.pair_valid.shape[1]
-        align.student_spans = _chunk_ids_to_spans(student_chunk_id_contig, max_pairs)
-        align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_contig, max_pairs)
+        # GLOBAL spans: the v6 KD term gathers the student/teacher logits to the
+        # full sequence, so its spans must index global positions. Gather the
+        # contiguous-window chunk ids to the full sequence before deriving spans
+        # (no-op at CP=1).
+        student_chunk_id_global = allgather_cp_contiguous_tensor(
+            student_chunk_id_contig, cp_group
+        )
+        teacher_chunk_id_global = allgather_cp_contiguous_tensor(
+            teacher_chunk_id_contig, cp_group
+        )
+        align.student_spans = _chunk_ids_to_spans(student_chunk_id_global, max_pairs)
+        align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_global, max_pairs)
         # Preserve the aligner's real per-sample chunk count rather than
         # iterating every padded pair slot; pair_valid remains the final gate.
         align.num_chunks = to_local_if_dtensor(
@@ -1234,14 +1243,14 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         # Preserve the established next-token-shifted localized fields for
         # metrics and compatibility while v6 consumes the unshifted spans.
         if cp_sharder is not None:
-            student_chunk_id_shifted = student_chunk_id_full.roll(
+            student_chunk_id_shifted = student_chunk_id_source_full.roll(
                 shifts=-1, dims=1
             )
             student_chunk_id_shifted[:, -1] = -1
             align.student_chunk_id = student_chunk_id_shifted[
                 :, student_seq_start : student_seq_start + student_seq_len
             ].contiguous()
-            teacher_chunk_id_shifted = teacher_chunk_id_full.roll(
+            teacher_chunk_id_shifted = teacher_chunk_id_source_full.roll(
                 shifts=-1, dims=1
             )
             teacher_chunk_id_shifted[:, -1] = -1
