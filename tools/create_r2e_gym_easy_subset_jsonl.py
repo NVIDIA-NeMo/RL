@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import random
 import re
 import subprocess
 from collections import Counter
@@ -57,6 +59,9 @@ REPO_NAME_MAP = {
     "tornado": "tornadoweb/tornado",
     "pyramid": "pylons/pyramid",
     "scrapy": "scrapy/scrapy",
+    "matplotlib": "matplotlib/matplotlib",
+    "moto": "getmoto/moto",
+    "sympy": "sympy/sympy",
 }
 
 R2E_COLUMNS = [
@@ -79,6 +84,28 @@ R2E_COLUMNS = [
 COMMIT_HASH_RE = re.compile(r"^[0-9a-f]{40}$")
 INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-[0-9a-f]{40}$")
 
+# Curriculum ordering for the train split, matching curate_rl_curriculum.py's defaults.
+CURRICULUM_SEED = 20260710
+CURRICULUM_BATCH_SIZE = 16
+CURRICULUM_CYCLES = 2
+CURRICULUM_MAX_PER_REPO = 3
+
+# Qwen3.5-397B, OpenHands, temperature 0.0.
+CURRICULUM_CLASSIC_PASS_RATE_BY_ENVIRONMENT = {
+    "aio-libs/aiohttp": 1 / 27,
+    "datalad/datalad": 2 / 4,
+    "nedbat/coveragepy": 0 / 4,
+    "numpy/numpy": 76 / 210,
+    "pandas-dev/pandas": 12 / 64,
+    "pylons/pyramid": 0 / 7,
+    "python-pillow/Pillow": 123 / 290,
+    "scrapy/scrapy": 10 / 25,
+    "tornadoweb/tornado": 2 / 54,
+}
+CURRICULUM_ENVIRONMENT_WEIGHT = 0.75
+CURRICULUM_CHANGED_LINES_WEIGHT = 0.25
+CURRICULUM_CHANGED_LINES_CAP = 20
+
 
 @dataclass(frozen=True)
 class ConversionPaths:
@@ -97,6 +124,17 @@ class SplitStats:
     neither_rows: int = 0
     train_ids: int = 0
     val_ids: int = 0
+    effective_max_per_repo: int = CURRICULUM_MAX_PER_REPO
+
+
+@dataclass
+class CurriculumItem:
+    identifier: str
+    repo: str
+    changed_lines: int
+    row: dict[str, Any]
+    difficulty: float = 0.0
+    tie_breaker: float = 0.0
 
 
 @dataclass
@@ -466,6 +504,138 @@ def converted_row_instance_id(row: dict[str, Any], row_number: int) -> str:
     return instance_id
 
 
+def curriculum_item(instance_id: str, row: dict[str, Any]) -> CurriculumItem:
+    metadata = row["responses_create_params"]["metadata"]
+    instance_dict = parse_json_object(metadata["instance_dict"], "metadata.instance_dict")
+    repo = instance_dict.get("repo") or metadata.get("repo")
+    changed_lines = int(instance_dict.get("num_non_test_lines") or 0)
+    return CurriculumItem(instance_id, repo, changed_lines, row)
+
+
+def choose_curriculum_item(
+    candidates: list[CurriculumItem],
+    batch_repo_counts: Counter,
+    emitted_bucket_repo_counts: Counter,
+    total_bucket_repo_counts: Counter,
+    max_per_repo: int,
+) -> CurriculumItem:
+    allowed = [item for item in candidates if batch_repo_counts[item.repo] < max_per_repo]
+    pool = allowed or candidates
+    item = min(
+        pool,
+        key=lambda candidate: (
+            emitted_bucket_repo_counts[candidate.repo] / total_bucket_repo_counts[candidate.repo],
+            batch_repo_counts[candidate.repo],
+            candidate.tie_breaker,
+            candidate.identifier,
+        ),
+    )
+    candidates.remove(item)
+    return item
+
+
+def curriculum_phase_sequence(full_batches: int, cycles: int) -> list[tuple[int, str]]:
+    batches_per_cycle = [full_batches // cycles] * cycles
+    for index in range(full_batches % cycles):
+        batches_per_cycle[index] += 1
+
+    sequence = []
+    for cycle, cycle_batches in enumerate(batches_per_cycle, start=1):
+        side = round(cycle_batches * 0.20)
+        phases = ["warmup"] * side + ["core"] * (cycle_batches - 2 * side) + ["hardening"] * side
+        sequence.extend((cycle, phase) for phase in phases)
+    return sequence
+
+
+def curriculum_order_train_items(items: list[CurriculumItem]) -> tuple[list[CurriculumItem], int]:
+    batch_size = CURRICULUM_BATCH_SIZE
+    full_batches = len(items) // batch_size
+    if CURRICULUM_CYCLES > full_batches:
+        raise ValueError(
+            f"Curriculum cycles ({CURRICULUM_CYCLES}) cannot exceed the number of full batches ({full_batches})"
+        )
+    unknown = sorted({item.repo for item in items} - CURRICULUM_CLASSIC_PASS_RATE_BY_ENVIRONMENT.keys())
+    if unknown:
+        raise ValueError(f"Missing classic pass rate for environment: {', '.join(unknown)}")
+
+    rng = random.Random(CURRICULUM_SEED)
+    for item in items:
+        pass_rate = CURRICULUM_CLASSIC_PASS_RATE_BY_ENVIRONMENT[item.repo]
+        size_penalty = min(item.changed_lines, CURRICULUM_CHANGED_LINES_CAP) / CURRICULUM_CHANGED_LINES_CAP
+        item.difficulty = (
+            CURRICULUM_ENVIRONMENT_WEIGHT * (1 - pass_rate) + CURRICULUM_CHANGED_LINES_WEIGHT * size_penalty
+        )
+    for item in items:
+        item.tie_breaker = rng.random()
+
+    # Bucket sizes: 25/50/25 over the scheduled full batches, plus a largest-remainder
+    # split of the leftover tail (medium wins ties, then easy, then hard).
+    scheduled = full_batches * batch_size
+    remainder = len(items) - scheduled
+    ratios = {"easy": 0.25, "medium": 0.50, "hard": 0.25}
+    tail = {name: math.floor(remainder * ratio) for name, ratio in ratios.items()}
+    missing = remainder - sum(tail.values())
+    tie_order = sorted(
+        ratios,
+        key=lambda name: (-(remainder * ratios[name] - tail[name]), {"medium": 0, "easy": 1, "hard": 2}[name]),
+    )
+    for name in tie_order[:missing]:
+        tail[name] += 1
+    counts = {
+        "easy": scheduled // 4 + tail["easy"],
+        "medium": scheduled // 2 + tail["medium"],
+        "hard": scheduled // 4 + tail["hard"],
+    }
+
+    ranked = sorted(items, key=lambda item: (item.difficulty, item.tie_breaker, item.identifier))
+    easy_end = counts["easy"]
+    medium_end = easy_end + counts["medium"]
+    buckets = {
+        "easy": ranked[:easy_end],
+        "medium": ranked[easy_end:medium_end],
+        "hard": ranked[medium_end:],
+    }
+
+    unit = batch_size // 8
+    quotas = {
+        "warmup": {"easy": 3 * unit, "medium": 4 * unit, "hard": unit},
+        "core": {"easy": 2 * unit, "medium": 4 * unit, "hard": 2 * unit},
+        "hardening": {"easy": unit, "medium": 4 * unit, "hard": 3 * unit},
+    }
+    phases = curriculum_phase_sequence(full_batches, CURRICULUM_CYCLES)
+
+    total_repo_counts = Counter(item.repo for item in items)
+    minimum_feasible_cap = max(math.ceil(count / len(phases)) for count in total_repo_counts.values())
+    effective_max_per_repo = max(CURRICULUM_MAX_PER_REPO, minimum_feasible_cap)
+    total_bucket_repo_counts = {name: Counter(item.repo for item in bucket) for name, bucket in buckets.items()}
+    emitted_bucket_repo_counts = {name: Counter() for name in buckets}
+    ordered: list[CurriculumItem] = []
+
+    for _cycle, phase in phases:
+        batch = []
+        batch_repo_counts: Counter = Counter()
+        for bucket_name in ("easy", "medium", "hard"):
+            for _ in range(quotas[phase][bucket_name]):
+                item = choose_curriculum_item(
+                    buckets[bucket_name],
+                    batch_repo_counts,
+                    emitted_bucket_repo_counts[bucket_name],
+                    total_bucket_repo_counts[bucket_name],
+                    effective_max_per_repo,
+                )
+                batch.append(item)
+                batch_repo_counts[item.repo] += 1
+                emitted_bucket_repo_counts[bucket_name][item.repo] += 1
+
+        rng.shuffle(batch)
+        ordered.extend(batch)
+
+    leftovers = buckets["easy"] + buckets["medium"] + buckets["hard"]
+    leftovers.sort(key=lambda item: (item.difficulty, item.tie_breaker, item.identifier))
+    ordered.extend(leftovers)
+    return ordered, effective_max_per_repo
+
+
 def split_jsonl_by_instance_ids(
     *,
     full_jsonl: Path,
@@ -484,30 +654,28 @@ def split_jsonl_by_instance_ids(
     val_tmp = val_jsonl.with_suffix(val_jsonl.suffix + ".tmp")
     train_found: set[str] = set()
     val_found: set[str] = set()
+    train_items: list[CurriculumItem] = []
     train_rows = 0
     val_rows = 0
     neither_rows = 0
+    effective_max_per_repo = CURRICULUM_MAX_PER_REPO
 
     try:
         train_jsonl.parent.mkdir(parents=True, exist_ok=True)
         val_jsonl.parent.mkdir(parents=True, exist_ok=True)
         with (
             full_jsonl.open(encoding="utf-8") as full_file,
-            train_tmp.open("w", encoding="utf-8") as train_file,
             val_tmp.open("w", encoding="utf-8") as val_file,
         ):
             for row_number, line in enumerate(full_file, start=1):
                 row = json.loads(line)
                 instance_id = converted_row_instance_id(row, row_number)
                 if instance_id in train_ids:
-                    # setdefault: rows written with --no-agent-ref lack the key
-                    row.setdefault("agent_ref", {})["name"] = "swe_agents_train"
-                    train_file.write(json.dumps(row, separators=(",", ":")))
-                    train_file.write("\n")
+                    row["agent_ref"]["name"] = "swe_agents_train"
+                    train_items.append(curriculum_item(instance_id, row))
                     train_found.add(instance_id)
-                    train_rows += 1
                 elif instance_id in val_ids:
-                    row.setdefault("agent_ref", {})["name"] = "swe_agents_val"
+                    row["agent_ref"]["name"] = "swe_agents_val"
                     val_file.write(json.dumps(row, separators=(",", ":")))
                     val_file.write("\n")
                     val_found.add(instance_id)
@@ -523,6 +691,13 @@ def split_jsonl_by_instance_ids(
                 f"missing_train={missing_train[:5]}, missing_val={missing_val[:5]}"
             )
 
+        ordered_train_items, effective_max_per_repo = curriculum_order_train_items(train_items)
+        with train_tmp.open("w", encoding="utf-8") as train_file:
+            for item in ordered_train_items:
+                train_file.write(json.dumps(item.row, separators=(",", ":")))
+                train_file.write("\n")
+                train_rows += 1
+
         train_tmp.replace(train_jsonl)
         val_tmp.replace(val_jsonl)
     except Exception:
@@ -536,6 +711,7 @@ def split_jsonl_by_instance_ids(
         neither_rows=neither_rows,
         train_ids=len(train_ids),
         val_ids=len(val_ids),
+        effective_max_per_repo=effective_max_per_repo,
     )
 
 
@@ -754,10 +930,15 @@ def main() -> None:
             val_jsonl=paths.val_jsonl,
         )
         print(
-            f"Wrote {split_stats.train_rows} train rows to {paths.train_jsonl} and "
+            f"Wrote {split_stats.train_rows} curriculum-ordered train rows to {paths.train_jsonl} and "
             f"{split_stats.val_rows} val rows to {paths.val_jsonl}. "
             f"Skipped {split_stats.neither_rows} rows not listed in either split."
         )
+        if split_stats.effective_max_per_repo != CURRICULUM_MAX_PER_REPO:
+            print(
+                f"Curriculum repository cap raised from {CURRICULUM_MAX_PER_REPO} to "
+                f"{split_stats.effective_max_per_repo} because of dataset imbalance."
+            )
 
 
 if __name__ == "__main__":
