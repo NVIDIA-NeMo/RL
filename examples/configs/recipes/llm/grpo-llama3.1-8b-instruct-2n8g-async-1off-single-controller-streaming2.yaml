@@ -20,14 +20,11 @@ data_plane:
 
 # SC async-RL runtime knobs.
 async_rl:
-  # Matches grpo.async_grpo.max_trajectory_age_steps=1.
-  max_staleness_versions: 1
+  sampler:
+    name: windowed
+    # Matches grpo.async_grpo.max_trajectory_age_steps=1.
+    max_staleness_versions: 1
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: 16
   max_inflight_prompts: ${grpo.num_prompts_per_step}  # match grpo-llama3.1-8b-instruct-2n8g-async-1off
-  # over_sampling=false requires
-  #   max_buffered_rollouts == grpo.num_prompts_per_step * (max_staleness_versions + 1)
-  #   64 * (1 + 1) = 128
   max_buffered_rollouts: 128
-  over_sampling: true
-  force_in_order: false

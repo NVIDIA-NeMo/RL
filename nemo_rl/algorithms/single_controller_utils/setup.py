@@ -374,7 +374,7 @@ def setup_single_controller(
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
-        env_handles=env_handles,
+        task_to_env=env_handles,
         num_generations_per_prompt=grpo_config["num_generations_per_prompt"],
         max_seq_len=_generation_max_seq_len(generation_config),
         max_rollout_turns=grpo_config.get("max_rollout_turns"),

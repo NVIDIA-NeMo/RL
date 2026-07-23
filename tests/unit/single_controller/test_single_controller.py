@@ -20,9 +20,11 @@ from types import SimpleNamespace
 import pytest
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    AsyncRLConfig,
+    MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.utils.timer import Timer
@@ -30,32 +32,41 @@ from nemo_rl.utils.timer import Timer
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
-    cfg = SingleControllerConfig.model_construct(
-        min_groups_per_batch=1,
-        target_groups_per_step=2,
-        group_size=4,
-        train_global_batch_size=4,
-        advantage_enabled=False,
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 4},
+        grpo={
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 4,
+        },
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
+    )
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=None,
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        train_cluster=None,
+        inference_cluster=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     with pytest.raises(
         ValueError,
         match=(
-            r"train_global_batch_size \(4\) must equal "
-            r"target_groups_per_step \(2\) \* group_size \(4\) = 8; "
-            r"multiple optimizer steps per RL step are not supported"
+            r"num_prompts_per_step \* num_generations_per_prompt \(8\) "
+            r"must equal policy.train_global_batch_size \(4\)"
         ),
     ):
         controller_cls(
-            cfg=cfg,
-            dp_client_handle=None,
-            gen_handle=None,
-            trainer_handle=None,
-            weight_synchronizer=None,
-            loss_fn=None,
-            rollout_manager=SimpleNamespace(_tq_buffer=None),
+            master_config=master_config,
+            actor_args=actor_args,
         )
 
 
@@ -109,15 +120,19 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._cfg = SimpleNamespace(
-        target_groups_per_step=2,
-        min_groups_per_batch=1,
-        max_train_steps=1,
-        advantage_policy_logprobs_field=None,
-        advantage_reference_logprobs_field=None,
-        advantage_enabled=False,
-        partition_id="rollout_data",
+    ctrl._master_config = SimpleNamespace(
+        grpo={
+            "num_prompts_per_step": 2,
+            "max_num_steps": 1,
+        }
     )
+    ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
+    ctrl._advantage_cfg = AdvantageConfig(
+        policy_logprobs_field=None,
+        reference_logprobs_field=None,
+    )
+    ctrl._advantage_estimator = None
+    ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)

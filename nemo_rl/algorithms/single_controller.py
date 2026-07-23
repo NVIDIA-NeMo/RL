@@ -42,7 +42,7 @@ from typing import Any, Optional, Union
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -127,38 +127,6 @@ class SingleControllerActor:
                 f"({self._async_cfg.min_groups_for_streaming_train})"
             )
 
-        if self._async_cfg.max_staleness_versions == 0:
-            if self._async_cfg.over_sampling:
-                raise ValueError(
-                    "max_staleness_versions=0 requires over_sampling=False: "
-                    "with zero staleness the dispatch gate needs to advance one batch "
-                    "per trainer_version, which over_sampling=True bypasses."
-                )
-            print("Running in sync mode (max_staleness_versions=0)", flush=True)
-            if not self._async_cfg.force_in_order:
-                print(
-                    "force_in_order=False is ignored in sync mode",
-                    flush=True,
-                )
-
-        if self._async_cfg.over_sampling:
-            if self._async_cfg.force_in_order:
-                raise ValueError(
-                    "force_in_order=True requires over_sampling=False so that each "
-                    "dispatched batch corresponds to exactly one target training step."
-                )
-        else:
-            expected_buffer = num_prompts_per_step * (
-                self._async_cfg.max_staleness_versions + 1
-            )
-            if self._async_cfg.max_buffered_rollouts != expected_buffer:
-                raise ValueError(
-                    f"over_sampling=False requires max_buffered_rollouts "
-                    f"({self._async_cfg.max_buffered_rollouts}) == "
-                    f"num_prompts_per_step * (max_staleness_versions + 1) "
-                    f"({expected_buffer})"
-                )
-
         # SC split path does one optimizer.step per RL step.
         # TODO: support multi-mini-step (legacy train() does gbs-sized
         # mini-steps with shared prev_logprobs).
@@ -176,27 +144,39 @@ class SingleControllerActor:
                 f"not supported on the SC split path."
             )
 
-        self._sampler = StalenessSampler(
+        self._sampler = create_sampler(
             self._buffer,
-            max_staleness_versions=self._async_cfg.max_staleness_versions,
-            strict_weight_fifo=not self._async_cfg.over_sampling,
-            force_in_order=self._async_cfg.force_in_order,
+            self._async_cfg.sampler,
         )
+        required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
+        if (
+            required_capacity is not None
+            and self._async_cfg.max_buffered_rollouts < required_capacity
+        ):
+            raise ValueError(
+                f"max_buffered_rollouts "
+                f"({self._async_cfg.max_buffered_rollouts}) is below the "
+                f"{type(self._sampler).__name__}'s required capacity "
+                f"({required_capacity} = num_prompts_per_step "
+                f"{num_prompts_per_step} * (lookahead + 1)); the rollout "
+                f"pump would deadlock waiting for buffer slots."
+            )
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
 
+        # Set only after _rollout_pump exhausts its configured epochs and all
+        # dispatched tasks finish successfully. Rollout failures propagate
+        # through run() instead of being reported as normal exhaustion.
+        self._rollout_exhausted: asyncio.Event = asyncio.Event()
+
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
-
-        # over_sampling=False batch gate: farthest trainer_version covered by
-        # already-dispatched batches.
-        self._max_rollout_version: int = -1
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
@@ -216,10 +196,9 @@ class SingleControllerActor:
 
         print(
             f"SingleControllerActor: "
-            f"staleness_cap={self._async_cfg.max_staleness_versions} "
+            f"sampler={self._async_cfg.sampler.name} "
             f"buffer={self._async_cfg.max_buffered_rollouts} "
             f"inflight={self._async_cfg.max_inflight_prompts} "
-            f"over_sampling={self._async_cfg.over_sampling} "
             f"transport={self._weight_sync_cfg.transport}",
             flush=True,
         )
@@ -287,9 +266,9 @@ class SingleControllerActor:
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
-        Per batch (over_sampling=False):
-          0. Wait while _max_rollout_version >= trainer_version + max_staleness,
-             then claim the next step by incrementing _max_rollout_version.
+        Per batch:
+          0. await sampler.admit(...) to wait until the batch may dispatch and
+             obtain its target_step stamp.
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
@@ -301,9 +280,7 @@ class SingleControllerActor:
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
-        over_sampling = self._async_cfg.over_sampling
-        max_staleness = self._async_cfg.max_staleness_versions
-        force_in_order = self._async_cfg.force_in_order
+        self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -347,17 +324,9 @@ class SingleControllerActor:
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
-                    # over_sampling=False: batch-level gate on max_rollout_version.
-                    if not over_sampling:
-                        while (
-                            self._max_rollout_version
-                            >= self._trainer_version + max_staleness
-                        ):
-                            await asyncio.sleep(0.005)
-                        self._max_rollout_version += 1
-
-                    # target_step = batch dispatch index when force_in_order is on.
-                    target_step = self._max_rollout_version if force_in_order else None
+                    target_step = await self._sampler.admit(
+                        trainer_version_fn=lambda: self._trainer_version
+                    )
 
                     for prompt_idx in range(prompt_batch.size):
                         prompt: DatumSpec = {  # type: ignore
@@ -394,6 +363,7 @@ class SingleControllerActor:
         if inflight:
             await asyncio.gather(*inflight, return_exceptions=True)
 
+        self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
@@ -456,6 +426,23 @@ class SingleControllerActor:
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
+                            if self._rollout_exhausted.is_set():
+                                buffered_groups = len(self._buffer)
+                                if groups_dispatched == 0 and buffered_groups == 0:
+                                    print(
+                                        "train_pump: rollout exhausted and "
+                                        "buffer drained",
+                                        flush=True,
+                                    )
+                                    return
+                                raise RuntimeError(
+                                    "rollout exhausted before a complete training "
+                                    f"step was assembled: dispatched "
+                                    f"{groups_dispatched}/"
+                                    f"{grpo_cfg['num_prompts_per_step']} prompt "
+                                    f"groups with {buffered_groups} group(s) "
+                                    f"remaining in the buffer"
+                                )
                             await asyncio.sleep(0.005)
                             continue
 
@@ -521,13 +508,6 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
-
-                if not step_open:
-                    print(
-                        "train_pump: rollout exhausted before any group ready",
-                        flush=True,
-                    )
-                    break
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
@@ -623,7 +603,7 @@ class SingleControllerActor:
 
         t0 = time.monotonic()
         await asyncio.to_thread(self._weight_synchronizer.sync_weights)
-        if self._async_cfg.max_staleness_versions == 0:
+        if self._sampler.is_on_policy:
             self._gen.invalidate_kv_cache()
         elapsed = time.monotonic() - t0
 

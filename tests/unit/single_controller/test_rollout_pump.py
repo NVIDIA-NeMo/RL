@@ -29,6 +29,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
     WindowedSampler,
+    WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -91,11 +92,11 @@ def test_rollout_pump_stamps_target_steps(
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._cfg = SimpleNamespace(
+    ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
         diagnostics=False,
-        max_num_epochs=1,
     )
+    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -149,11 +150,11 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         manager = _FailingRolloutManager()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._cfg = SimpleNamespace(
+        ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=2,
             diagnostics=False,
-            max_num_epochs=1,
         )
+        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -228,11 +229,11 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
     async def _main() -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._cfg = SimpleNamespace(
+        ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
             diagnostics=False,
-            max_num_epochs=1,
         )
+        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -294,12 +295,10 @@ def test_rollout_pump_writes_expected_tq_data(
             "max_num_epochs": 1,
         },
         async_rl=AsyncRLConfig(
-            max_staleness_versions=1,
+            sampler=WindowedSamplerConfig(max_staleness_versions=1),
             min_groups_for_streaming_train=1,
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
-            over_sampling=True,
-            force_in_order=False,
         ),
         logger={
             "log_dir": str(tmp_path / "logs"),

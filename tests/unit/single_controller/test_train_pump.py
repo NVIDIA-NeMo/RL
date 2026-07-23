@@ -27,6 +27,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -303,12 +304,10 @@ def test_train_pump_drives_mcore_training_step(
                 "max_num_epochs": None,
             },
             async_rl=AsyncRLConfig(
-                max_staleness_versions=1,
+                sampler=WindowedSamplerConfig(max_staleness_versions=1),
                 min_groups_for_streaming_train=num_prompts,
                 max_inflight_prompts=num_prompts,
                 max_buffered_rollouts=num_prompts,
-                over_sampling=True,
-                force_in_order=False,
             ),
             logger={
                 "log_dir": str(tmp_path / "logs"),
