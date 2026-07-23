@@ -37,6 +37,7 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
@@ -161,6 +162,7 @@ class MegatronPolicyWorkerImpl(
     # ``self._train_step_state = None`` after finish/abort type-checks.
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
+    _async_checkpoint_cuda_cache_active: bool = False
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -2095,6 +2097,12 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
+        # An in-flight async checkpoint keeps references to the CUDA tensors in
+        # its sharded state dict until the write is finalized. Offloading swaps
+        # those tensors for CPU storage, so the checkpoint references would keep
+        # the old CUDA storage alive and defeat the offload.
+        self.finalize_async_save()
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -2186,6 +2194,11 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
         """Offload as much as possible on the CPU."""
+        # Finalize before replacing model-buffer storage. With cached NVRx async
+        # saves, the persistent writer otherwise retains CUDA IPC handles to the
+        # old storage after the model is moved to CPU.
+        self.finalize_async_save()
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
@@ -2296,6 +2309,10 @@ class MegatronPolicyWorkerImpl(
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save
+        if is_async and self._requires_nvrx_cuda_cache_release():
+            # Set this before saving so an exception path can still tear down a
+            # writer that may already have received CUDA IPC handles.
+            self._async_checkpoint_cuda_cache_active = True
 
         try:
             # Block until any previous async save is fully written to disk.
@@ -2353,17 +2370,57 @@ class MegatronPolicyWorkerImpl(
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
 
-    def finalize_async_save(self):
-        """Block until the in-flight async write completes and run finalize_fns.
+    def _requires_nvrx_cuda_cache_release(self) -> bool:
+        """Whether checkpoint finalization must also drop cached CUDA IPC handles."""
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
+        generation_cfg = self.cfg.get("generation") or {}
+        colocated_cfg = generation_cfg.get("colocated") or {}
+        return bool(
+            ckpt_cfg.async_save
+            and getattr(ckpt_cfg, "async_strategy", "nvrx") == "nvrx"
+            and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
+            and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
+            and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
+            and colocated_cfg.get("enabled", False)
+        )
 
-        Safe to call when async_save is disabled (no-op).
-        Does NOT terminate the persistent worker — it stays alive for the next save.
+    def finalize_async_save(self):
+        """Finalize an async write and release unsafe colocated CUDA IPC caches.
+
+        NVRx constant-structure saves cache CUDA tensor handles in the persistent
+        writer. That is safe while model/optimizer storage stays fixed, but a
+        colocated policy replaces that storage during CPU offload. In that case,
+        close the completed writer and invalidate its training-side cache; NVRx
+        starts a fresh persistent writer lazily for the next checkpoint.
         """
+        release_cuda_cache = bool(
+            self._async_checkpoint_cuda_cache_active
+            and self._requires_nvrx_cuda_cache_release()
+        )
         maybe_finalize_async_save(
             self.mcore_state,
             ckpt_cfg=self.mcore_state.cfg.checkpoint,
             blocking=True,
+            terminate=release_cuda_cache,
         )
+        if release_cuda_cache:
+            _, async_modules = get_async_strategy(
+                self.mcore_state.cfg.checkpoint.async_strategy
+            )
+            writer_cls = async_modules["FileSystemWriterAsync"]
+            cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
+            if cleanup_tensor_caches is not None:
+                cleanup_tensor_caches()
+            else:
+                # Compatibility with older NVRx versions that predate the
+                # public cleanup helper.
+                cached_identifiers = getattr(writer_cls, "_cached_identifiers", None)
+                if cached_identifiers is not None:
+                    cached_identifiers.clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+            self._async_checkpoint_cuda_cache_active = False
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.
