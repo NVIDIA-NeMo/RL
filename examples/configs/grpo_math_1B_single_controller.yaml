@@ -80,6 +80,7 @@ checkpointing:
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
+  is_async: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -352,9 +353,17 @@ async_rl:
   over_sampling: true
 
 # Durable completed-sibling checkpoints for NeMo-Gym rollouts. The current
-# implementation supports NeMo-Gym only and requires a shared filesystem path.
+# implementation supports NeMo-Gym only and requires a dedicated shared
+# filesystem directory for each training lineage.
 rollout_checkpointing:
   enabled: false
+  # Basic Slurm recovery requires strict_on_policy scheduling,
+  # checkpointing.save_period=1, checkpointing.save_optimizer=true,
+  # synchronous model checkpointing (including Megatron async_save=false),
+  # async_rl.over_sampling=false, and max_buffered_rollouts equal to
+  # grpo.num_prompts_per_step.
+  # The directory-scoped manifest also enables recovery before train step 1.
+  slurm_recovery: false
   mode: "completed_generations"
   root_dir: null
   writer_concurrency: 8

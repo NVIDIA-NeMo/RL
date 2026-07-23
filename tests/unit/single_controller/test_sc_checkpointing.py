@@ -55,6 +55,9 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_checkpoint import (
+    DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -244,6 +247,23 @@ class _FakeDataloader(list):
         return dict(self._state)
 
 
+class _CountingDataloader:
+    """Dataloader that records whether the controller pulled its next batch."""
+
+    def __init__(self) -> None:
+        self.next_calls = 0
+
+    def __iter__(self) -> "_CountingDataloader":
+        return self
+
+    def __next__(self) -> Any:
+        self.next_calls += 1
+        raise StopIteration
+
+    def state_dict(self) -> dict[str, Any]:
+        return {}
+
+
 # ── builders ─────────────────────────────────────────────────────────────────
 
 
@@ -302,6 +322,7 @@ def _actor_master_config(
             "keep_top_k": None,
             "save_period": save_period,
             "save_optimizer": save_optimizer,
+            "is_async": False,
             "checkpoint_must_save_by": checkpoint_must_save_by,
         },
         data_plane={"enabled": True, "impl": "transfer_queue"},
@@ -316,6 +337,26 @@ def _actor_master_config(
             over_sampling=over_sampling,
         ),
         rollout_checkpointing=RolloutCheckpointingConfig(),
+    )
+
+
+def _enable_slurm_recovery(mc: MasterConfig, tmp_path: Path) -> None:
+    """Apply the guarded strict-on-policy configuration for basic recovery."""
+    num_prompts_per_step = mc.grpo["num_prompts_per_step"]
+    mc.rollout_checkpointing = RolloutCheckpointingConfig(
+        enabled=True,
+        slurm_recovery=True,
+        root_dir=tmp_path / "rollout-checkpoints",
+    )
+    mc.checkpointing["enabled"] = True
+    mc.checkpointing["save_period"] = 1
+    mc.async_rl = AsyncRLConfig(
+        batch_selection_strategy="strict_on_policy",
+        max_weight_staleness_versions=0,
+        min_prompt_groups_per_batch=1,
+        max_inflight_prompts=4,
+        max_buffered_rollouts=num_prompts_per_step,
+        over_sampling=False,
     )
 
 
@@ -432,6 +473,101 @@ class TestRolloutCheckpointWiring:
         assert work.sampling_fingerprint == "sampling-fingerprint"
         assert work.tokenizer_fingerprint == "tokenizer-fingerprint"
         assert actor._checkpoint_inflight_work == {}
+
+    @pytest.mark.parametrize(
+        ("current_step", "expected_dispatch_sequence"),
+        [(0, 0), (3, 6)],
+    )
+    def test_slurm_recovery_reconstructs_stable_group_identity(
+        self,
+        tmp_path,
+        current_step,
+        expected_dispatch_sequence,
+    ):
+        mc = _actor_master_config(tmp_path, num_prompts_per_step=2)
+        _enable_slurm_recovery(mc, tmp_path)
+        save_state = _default_grpo_save_state()
+        save_state["current_step"] = current_step
+        prompt = {
+            "message_log": [{"role": "user", "content": "question"}],
+            "extra_env_info": {},
+            "loss_multiplier": 1.0,
+            "idx": 7,
+            "task_name": "gym-task",
+        }
+        runtime = RolloutCheckpointRuntime(
+            writer=object(),
+            run_id=DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+            sampling_fingerprint="sampling-fingerprint",
+            tokenizer_fingerprint="tokenizer-fingerprint",
+        )
+
+        first_actor = _ACTOR_CLS(
+            mc,
+            _make_bundle(
+                save_state=dict(save_state),
+                rollout_checkpoint=runtime,
+            ),
+        )
+        restored_actor = _ACTOR_CLS(
+            mc,
+            _make_bundle(
+                save_state=dict(save_state),
+                rollout_checkpoint=runtime,
+            ),
+        )
+
+        first = first_actor._build_rollout_work(prompt, prompt_position=0)
+        restored = restored_actor._build_rollout_work(prompt, prompt_position=0)
+        sibling_group = restored_actor._build_rollout_work(
+            prompt,
+            prompt_position=1,
+        )
+
+        assert first is not None
+        assert restored is not None
+        assert sibling_group is not None
+        assert restored.group_id == first.group_id
+        assert (
+            restored.dispatch_sequence
+            == first.dispatch_sequence
+            == expected_dispatch_sequence
+        )
+        assert restored.policy_version == first.policy_version == current_step
+        assert sibling_group.group_id != first.group_id
+        assert sibling_group.dispatch_sequence == expected_dispatch_sequence + 1
+
+    def test_rollout_gate_prevents_dataloader_prefetch(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            num_prompts_per_step=1,
+            max_num_epochs=1,
+        )
+        _enable_slurm_recovery(mc, tmp_path)
+        dataloader = _CountingDataloader()
+        runtime = RolloutCheckpointRuntime(
+            writer=object(),
+            run_id=DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+            sampling_fingerprint="sampling-fingerprint",
+            tokenizer_fingerprint="tokenizer-fingerprint",
+        )
+        actor = _ACTOR_CLS(
+            mc,
+            _make_bundle(
+                dataloader=dataloader,  # type: ignore[arg-type]
+                rollout_checkpoint=runtime,
+            ),
+        )
+        actor._rollout_permitted.clear()
+
+        async def _drive() -> None:
+            task = asyncio.create_task(actor._rollout_pump())
+            await asyncio.sleep(0)
+            assert dataloader.next_calls == 0
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(_drive())
 
     def test_rollout_failure_propagates_and_releases_capacity(self, tmp_path):
         mc = _actor_master_config(
@@ -605,6 +741,46 @@ class TestCounterRestore:
 
 
 class TestSaveTrigger:
+    def test_slurm_recovery_holds_rollout_gate_through_checkpoint(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+        )
+        _enable_slurm_recovery(mc, tmp_path)
+        save_state = _default_grpo_save_state()
+        trainer = _FakeTrainer()
+        runtime = RolloutCheckpointRuntime(
+            writer=object(),
+            run_id=DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+            sampling_fingerprint="sampling-fingerprint",
+            tokenizer_fingerprint="tokenizer-fingerprint",
+        )
+        actor = _ACTOR_CLS(
+            mc,
+            _make_bundle(
+                trainer=trainer,
+                save_state=save_state,
+                rollout_checkpoint=runtime,
+            ),
+        )
+        actor._sampler = _FakeSampler()
+        gate_during_save: list[bool] = []
+        original_save = trainer.save_checkpoint
+
+        def _save_checkpoint(**kwargs: Any) -> None:
+            gate_during_save.append(actor._rollout_permitted.is_set())
+            original_save(**kwargs)
+
+        trainer.save_checkpoint = _save_checkpoint  # type: ignore[method-assign]
+
+        asyncio.run(actor._train_pump())
+
+        assert gate_during_save == [False]
+        assert not actor._rollout_permitted.is_set()
+        info = _training_info(tmp_path / "checkpoints", 1)
+        assert "rollout_checkpoint_run_id" not in info
+
     def test_saves_on_period_boundary_and_last_step(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         trainer = _FakeTrainer()

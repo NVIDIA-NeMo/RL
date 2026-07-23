@@ -1,0 +1,143 @@
+# Small Single Controller + NeMo-Gym recipe for exercising durable recovery of
+# completed rollout siblings. The companion script supplies durable absolute
+# paths for the dataset, model checkpoints, logs, and rollout checkpoints.
+defaults: "../configs/grpo_math_1B_single_controller.yaml"
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 1
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/rollout-recovery-smoke/model-checkpoints"
+  save_period: 1
+  save_optimizer: true
+  is_async: false
+
+policy:
+  model_name: "Qwen/Qwen3-0.6B"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: false
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+
+  sequence_packing:
+    enabled: false
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 128
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    dataset_name: "NemoGymDataset"
+    data_path: "results/rollout-recovery-smoke/data/train.jsonl"
+  validation: null
+  default:
+    dataset_name: "NemoGymDataset"
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+
+logger:
+  log_dir: "results/rollout-recovery-smoke/logs"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+data_plane:
+  enabled: true
+  impl: "transfer_queue"
+  backend: "simple"
+
+async_rl:
+  batch_selection_strategy: "strict_on_policy"
+  max_weight_staleness_versions: 0
+  min_prompt_groups_per_batch: 2
+  max_inflight_prompts: 2
+  max_buffered_rollouts: 2
+  over_sampling: false
+
+rollout_checkpointing:
+  enabled: true
+  slurm_recovery: true
+  mode: "completed_generations"
+  root_dir: "results/rollout-recovery-smoke/rollout-checkpoints"
+  writer_concurrency: 4
+  max_pending_writes: 32
+  write_timeout_s: 30.0
+  max_write_retries: 2
+  write_retry_backoff_s: 1.0
+  load_timeout_s: 30.0
+  max_load_retries: 2
+  load_retry_backoff_s: 1.0
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1

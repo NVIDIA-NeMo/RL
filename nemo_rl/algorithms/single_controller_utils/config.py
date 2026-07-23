@@ -55,6 +55,11 @@ class RolloutCheckpointingConfig(BaseModel, extra="allow"):
     """Completed-sibling durability for SingleController NeMo-Gym rollouts."""
 
     enabled: bool = False
+    # Reuse completed siblings after a Slurm restart, including before the first
+    # optimizer step. root_dir is a dedicated namespace for one training lineage.
+    # The basic implementation supports strict on-policy scheduling with one
+    # training checkpoint per optimizer step.
+    slurm_recovery: bool = False
     mode: Literal["completed_generations"] = "completed_generations"
     root_dir: Optional[Path] = None
     writer_concurrency: int = Field(default=8, ge=1)
@@ -68,6 +73,11 @@ class RolloutCheckpointingConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def _require_root_when_enabled(self) -> "RolloutCheckpointingConfig":
+        if self.slurm_recovery and not self.enabled:
+            raise ValueError(
+                "rollout_checkpointing.slurm_recovery requires "
+                "rollout_checkpointing.enabled=True"
+            )
         if self.enabled and self.root_dir is None:
             raise ValueError(
                 "rollout_checkpointing.root_dir is required when checkpointing "

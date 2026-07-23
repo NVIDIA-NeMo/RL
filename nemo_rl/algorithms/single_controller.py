@@ -64,6 +64,7 @@ from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.rollout_checkpoint import (
+    DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
     RolloutWorkItem,
     compute_rollout_fingerprint,
 )
@@ -150,6 +151,18 @@ class SingleControllerActor:
         # (val_reward, ...) pass through to saved checkpoints untouched.
         self._save_state: GRPOSaveState = bundle.save_state
         self._last_checkpoint_path: Optional[str] = bundle.last_checkpoint_path
+        if (
+            master_config.rollout_checkpointing.slurm_recovery
+            and (
+                self._rollout_checkpoint is None
+                or self._rollout_checkpoint.run_id
+                != DIRECTORY_SCOPED_ROLLOUT_RUN_ID
+            )
+        ):
+            raise ValueError(
+                "Slurm rollout recovery requires the directory-scoped "
+                "rollout checkpoint namespace"
+            )
         self._consumed_samples: int = bundle.save_state["consumed_samples"]
         self._current_epoch: int = bundle.save_state["current_epoch"]
         self._total_valid_tokens: int = bundle.save_state.get(
@@ -483,14 +496,14 @@ class SingleControllerActor:
     def _build_rollout_work(
         self,
         prompt: DatumSpec,
+        *,
+        prompt_position: int,
         target_step: Optional[int] = None,
     ) -> Optional[RolloutWorkItem]:
         """Assign stable checkpoint identity before dispatching one prompt group."""
         if self._rollout_checkpoint is None:
             return None
 
-        dispatch_sequence = self._next_rollout_dispatch_sequence
-        self._next_rollout_dispatch_sequence += 1
         prompt_index = int(prompt["idx"])
         task_name = prompt.get("task_name")
         prompt_fingerprint = compute_rollout_fingerprint(
@@ -502,9 +515,34 @@ class SingleControllerActor:
                 "loss_multiplier": prompt["loss_multiplier"],
             }
         )
+        if self._master_config.rollout_checkpointing.slurm_recovery:
+            # Before step 1, a restart deterministically returns to policy
+            # version 0 and the first prompt batch. After step 1, the finalized
+            # training checkpoint restores both the policy version and
+            # dataloader position. In both cases this reproduces the same key,
+            # allowing RolloutManager to load completed siblings and generate
+            # only the missing ones.
+            num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
+            num_generations = self._master_config.grpo[
+                "num_generations_per_prompt"
+            ]
+            dispatch_sequence = (
+                self._trainer_version * num_prompts_per_step + prompt_position
+            )
+            group_id = (
+                f"s{self._trainer_version:016x}-"
+                f"p{prompt_position:08x}-"
+                f"b{num_prompts_per_step:08x}-"
+                f"n{num_generations:08x}-{prompt_fingerprint}"
+            )
+        else:
+            dispatch_sequence = self._next_rollout_dispatch_sequence
+            self._next_rollout_dispatch_sequence += 1
+            group_id = f"g{dispatch_sequence:016x}-{uuid.uuid4().hex}"
+
         return RolloutWorkItem(
             run_id=self._rollout_checkpoint.run_id,
-            group_id=f"g{dispatch_sequence:016x}-{uuid.uuid4().hex}",
+            group_id=group_id,
             prompt_id=f"{task_name or 'prompt'}:{prompt_index}",
             dispatch_sequence=dispatch_sequence,
             target_step=target_step,
@@ -590,7 +628,8 @@ class SingleControllerActor:
         max_epochs = self._master_config.grpo["max_num_epochs"]
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
+                dataloader_iter = iter(self._dataloader)
+                while True:
                     # over_sampling=False: batch-level gate on max_rollout_version.
                     if not over_sampling:
                         while (
@@ -598,6 +637,18 @@ class SingleControllerActor:
                             >= self._trainer_version + max_staleness
                         ):
                             await asyncio.sleep(0.005)
+
+                    # Do not pull the next batch until rollout admission is
+                    # open. This keeps the dataloader state saved at a training
+                    # checkpoint aligned with the first prompt group that will
+                    # be reconstructed after restart.
+                    await self._rollout_permitted.wait()
+                    try:
+                        prompt_batch = next(dataloader_iter)
+                    except StopIteration:
+                        break
+
+                    if not over_sampling:
                         self._max_rollout_version += 1
 
                     # target_step = batch dispatch index when force_in_order is on.
@@ -617,7 +668,9 @@ class SingleControllerActor:
                             await self._rollout_permitted.wait()
 
                             checkpoint_work = self._build_rollout_work(
-                                prompt, target_step
+                                prompt,
+                                prompt_position=prompt_idx,
+                                target_step=target_step,
                             )
                             if checkpoint_work is not None:
                                 self._checkpoint_inflight_work[
@@ -659,6 +712,7 @@ class SingleControllerActor:
         """
         adv_cfg = self._advantage_cfg
         grpo_cfg = self._master_config.grpo
+        slurm_recovery = self._master_config.rollout_checkpointing.slurm_recovery
 
         # TODO: fix the prev_logprobs_required and reference_logprobs_required logic
         prev_logprobs_required = adv_cfg.policy_logprobs_field is not None
@@ -799,10 +853,11 @@ class SingleControllerActor:
                     with self._timer.time("weight_sync"):
                         await self._sync_weights(reopen_rollouts=False)
                     val_metrics = await self._run_validation(step=self._train_steps)
-                    self._rollout_permitted.set()
+                    if not slurm_recovery:
+                        self._rollout_permitted.set()
                 else:
                     with self._timer.time("weight_sync"):
-                        await self._sync_weights()
+                        await self._sync_weights(reopen_rollouts=not slurm_recovery)
 
                 # Checkpointing (ported from the legacy async loop).
                 self._consumed_samples += grpo_cfg["num_prompts_per_step"]
@@ -903,6 +958,15 @@ class SingleControllerActor:
                         await asyncio.to_thread(
                             self._checkpointer.finalize_checkpoint, checkpoint_path
                         )
+                        if (
+                            slurm_recovery
+                            and not is_last_step
+                            and not should_save_by_timeout
+                        ):
+                            # The newly synchronized policy may dispatch only
+                            # after its model, optimizer, dataloader position,
+                            # and training metadata are jointly durable.
+                            self._rollout_permitted.set()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"

@@ -24,6 +24,7 @@ from nemo_rl.experience.rollout_checkpoint import (
     CompletedSiblingRecord,
     PersistAck,
     RolloutCheckpointStore,
+    RolloutRecoveryManifest,
     RolloutWorkItem,
 )
 
@@ -49,6 +50,13 @@ class RolloutCheckpointWriter:  # pragma: no cover
     def persist_completed(self, record: CompletedSiblingRecord) -> PersistAck:
         """Durably persist one completed sibling."""
         return self._store.persist_completed(record)
+
+    def ensure_compatible_manifest(
+        self,
+        expected: RolloutRecoveryManifest,
+    ) -> RolloutRecoveryManifest:
+        """Create or validate the directory-scoped recovery manifest."""
+        return self._store.ensure_compatible_manifest(expected)
 
     def load_completed(
         self, work: RolloutWorkItem

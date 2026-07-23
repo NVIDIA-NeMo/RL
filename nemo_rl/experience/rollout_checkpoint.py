@@ -47,9 +47,12 @@ import torch
 from nemo_rl.experience.interfaces import Completion
 
 ROLLOUT_CHECKPOINT_SCHEMA_VERSION = 1
+ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION = 1
+DIRECTORY_SCOPED_ROLLOUT_RUN_ID = "active"
 _FILE_MAGIC = b"NEMORL_ROLLOUT_CHECKPOINT\n"
 _HEADER_LENGTH_BYTES = 8
 _MAX_HEADER_BYTES = 64 * 1024
+_RECOVERY_MANIFEST_FILENAME = "recovery_manifest.json"
 
 
 class RolloutCheckpointError(RuntimeError):
@@ -191,6 +194,32 @@ class PersistAck:
     already_existed: bool
 
 
+@dataclass(frozen=True)
+class RolloutRecoveryManifest:
+    """Compatibility guard for one directory-scoped rollout lineage."""
+
+    schema_version: int
+    run_id: str
+    compatibility_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "schema_version must equal "
+                f"{ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION}, "
+                f"got {self.schema_version}"
+            )
+        _validate_path_component(self.run_id, "run_id")
+        _validate_fingerprint(
+            self.compatibility_fingerprint,
+            "compatibility_fingerprint",
+        )
+
+
 @dataclass
 class _GroupLockEntry:
     """Reference-counted lock for one rollout group."""
@@ -212,7 +241,50 @@ class RolloutCheckpointStore:
         self.root_dir = Path(root_dir)
         self._group_locks_guard = threading.Lock()
         self._group_locks: dict[tuple[str, str], _GroupLockEntry] = {}
+        self._manifest_lock = threading.Lock()
         _create_directory_durably(self.root_dir)
+
+    def ensure_compatible_manifest(
+        self,
+        expected: RolloutRecoveryManifest,
+    ) -> RolloutRecoveryManifest:
+        """Create or validate the directory-scoped recovery manifest.
+
+        The manifest must be durably committed before rollout dispatch begins.
+        A retry with the same compatibility fingerprint is idempotent. A
+        different fingerprint fails closed so an old directory cannot silently
+        supply rollouts for a different initial policy or configuration.
+        """
+        with self._manifest_lock:
+            path = self.root_dir / _RECOVERY_MANIFEST_FILENAME
+            if path.exists():
+                existing = self._load_recovery_manifest(path)
+                if existing != expected:
+                    raise IncompatibleCheckpointError(
+                        "rollout checkpoint directory is already bound to an "
+                        "incompatible recovery manifest"
+                    )
+                return existing
+
+            payload = {
+                "schema_version": expected.schema_version,
+                "run_id": expected.run_id,
+                "compatibility_fingerprint": expected.compatibility_fingerprint,
+            }
+            payload["checksum"] = _json_checksum(payload)
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._atomic_write(path, encoded)
+
+            committed = self._load_recovery_manifest(path)
+            if committed != expected:
+                raise CorruptCheckpointError(
+                    f"rollout recovery manifest {path} failed post-commit verification"
+                )
+            return committed
 
     def persist_completed(self, record: CompletedSiblingRecord) -> PersistAck:
         """Atomically persist one completed sibling.
@@ -466,6 +538,59 @@ class RolloutCheckpointStore:
                 f"semantic checksum mismatch for rollout checkpoint {path}"
             )
         return _payload_to_record(payload, path), record_checksum
+
+    def _load_recovery_manifest(self, path: Path) -> RolloutRecoveryManifest:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise CorruptCheckpointError(
+                f"invalid UTF-8 in rollout recovery manifest {path}"
+            ) from exc
+        except OSError as exc:
+            raise StorageUnavailableError(
+                f"failed to read rollout recovery manifest {path}"
+            ) from exc
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CorruptCheckpointError(
+                f"invalid rollout recovery manifest JSON at {path}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CorruptCheckpointError(
+                f"rollout recovery manifest at {path} is not a dictionary"
+            )
+
+        expected_fields = {
+            "schema_version",
+            "run_id",
+            "compatibility_fingerprint",
+            "checksum",
+        }
+        if set(payload) != expected_fields:
+            raise CorruptCheckpointError(
+                f"rollout recovery manifest {path} has unexpected fields"
+            )
+        checksum = payload["checksum"]
+        manifest_body = {
+            key: value for key, value in payload.items() if key != "checksum"
+        }
+        if not isinstance(checksum, str) or checksum != _json_checksum(manifest_body):
+            raise CorruptCheckpointError(
+                f"rollout recovery manifest {path} failed its checksum"
+            )
+
+        try:
+            return RolloutRecoveryManifest(
+                schema_version=payload["schema_version"],
+                run_id=payload["run_id"],
+                compatibility_fingerprint=payload["compatibility_fingerprint"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise CorruptCheckpointError(
+                f"rollout recovery manifest {path} contains invalid metadata"
+            ) from exc
 
     def _load_fence_unlocked(self, run_id: str, group_id: str) -> int:
         path = self._fence_path(run_id, group_id)

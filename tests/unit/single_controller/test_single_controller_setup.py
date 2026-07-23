@@ -29,6 +29,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerBundle,
     setup_single_controller,
 )
+from nemo_rl.experience.rollout_checkpoint import (
+    DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+)
 
 
 def _make_master_config(
@@ -86,6 +89,7 @@ def _make_master_config(
             "keep_top_k": None,
             "save_period": 10,
             "save_optimizer": True,
+            "is_async": False,
             "checkpoint_must_save_by": None,
         },
         policy={
@@ -228,6 +232,10 @@ class TestSetup:
         with pytest.raises(ValueError, match="root_dir is required"):
             RolloutCheckpointingConfig(enabled=True)
 
+    def test_slurm_recovery_requires_rollout_checkpointing(self):
+        with pytest.raises(ValueError, match="requires.*enabled=True"):
+            RolloutCheckpointingConfig(slurm_recovery=True)
+
     def test_rollout_checkpointing_rejects_non_gym_path(self, tmp_path):
         config = RolloutCheckpointingConfig(enabled=True, root_dir=tmp_path)
 
@@ -271,6 +279,7 @@ class TestSetup:
                 config,
                 tokenizer=tokenizer,
                 generation_config=generation_config,
+                master_config=_make_master_config(),
             )
 
         assert runtime is not None
@@ -280,6 +289,145 @@ class TestSetup:
         assert len(runtime.tokenizer_fingerprint) == 64
         writer_cls.options.assert_called_once_with(max_concurrency=3)
         writer_cls.options.return_value.remote.assert_called_once_with(str(tmp_path))
+
+    def test_slurm_recovery_uses_directory_scoped_namespace(self, tmp_path):
+        config = RolloutCheckpointingConfig(
+            enabled=True,
+            slurm_recovery=True,
+            root_dir=tmp_path,
+        )
+        master_config = _make_master_config()
+        master_config.rollout_checkpointing = config
+        tokenizer = MagicMock(
+            name_or_path="tokenizer-name",
+            chat_template="{{ messages }}",
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            unk_token_id=3,
+        )
+        tokenizer.get_vocab.return_value = {"a": 0}
+        generation_config = {
+            "backend": "vllm",
+            "max_new_tokens": 128,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": None,
+            "stop_token_ids": [2],
+            "stop_strings": None,
+            "vllm_cfg": {"max_model_len": 256},
+        }
+        writer = MagicMock(name="rollout_checkpoint_writer")
+        writer.ensure_compatible_manifest.remote.side_effect = lambda manifest: manifest
+
+        with (
+            patch.object(sc_setup_mod, "RolloutCheckpointWriter") as writer_cls,
+            patch.object(sc_setup_mod.ray, "get", side_effect=lambda value: value),
+        ):
+            writer_cls.options.return_value.remote.return_value = writer
+            first = sc_setup_mod._build_rollout_checkpoint_runtime(
+                config,
+                tokenizer=tokenizer,
+                generation_config=generation_config,
+                master_config=master_config,
+            )
+            restored = sc_setup_mod._build_rollout_checkpoint_runtime(
+                config,
+                tokenizer=tokenizer,
+                generation_config=generation_config,
+                master_config=master_config,
+            )
+
+        assert first is not None
+        assert restored is not None
+        assert first.run_id == DIRECTORY_SCOPED_ROLLOUT_RUN_ID
+        assert restored.run_id == DIRECTORY_SCOPED_ROLLOUT_RUN_ID
+        manifests = [
+            call.args[0]
+            for call in writer.ensure_compatible_manifest.remote.call_args_list
+        ]
+        assert len(manifests) == 2
+        assert manifests[0] == manifests[1]
+
+    @pytest.mark.parametrize(
+        (
+            "checkpoint_enabled",
+            "save_period",
+            "save_optimizer",
+            "strategy",
+            "error",
+        ),
+        [
+            (False, 1, True, "strict_on_policy", "checkpointing.enabled=True"),
+            (True, 2, True, "strict_on_policy", "checkpointing.save_period=1"),
+            (True, 1, False, "strict_on_policy", "save_optimizer=True"),
+            (True, 1, True, "staleness_window", "strict_on_policy"),
+        ],
+    )
+    def test_slurm_recovery_rejects_non_reproducible_config(
+        self,
+        tmp_path,
+        checkpoint_enabled,
+        save_period,
+        save_optimizer,
+        strategy,
+        error,
+    ):
+        mc = _make_master_config()
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            slurm_recovery=True,
+            root_dir=tmp_path,
+        )
+        mc.checkpointing["enabled"] = checkpoint_enabled
+        mc.checkpointing["save_period"] = save_period
+        mc.checkpointing["save_optimizer"] = save_optimizer
+        mc.async_rl.batch_selection_strategy = strategy
+
+        with pytest.raises(ValueError, match=error):
+            sc_setup_mod._validate_slurm_rollout_recovery(mc)
+
+    def test_slurm_recovery_rejects_async_model_checkpointing(self, tmp_path):
+        mc = _make_master_config()
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            slurm_recovery=True,
+            root_dir=tmp_path,
+        )
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_period"] = 1
+        mc.checkpointing["is_async"] = True
+
+        with pytest.raises(ValueError, match="is_async=False"):
+            sc_setup_mod._validate_slurm_rollout_recovery(mc)
+
+    def test_slurm_recovery_rejects_megatron_async_save(self, tmp_path):
+        mc = _make_master_config()
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            slurm_recovery=True,
+            root_dir=tmp_path,
+        )
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_period"] = 1
+        mc.policy["megatron_cfg"]["checkpoint"] = {"async_save": True}
+
+        with pytest.raises(ValueError, match="async_save=False"):
+            sc_setup_mod._validate_slurm_rollout_recovery(mc)
+
+    def test_slurm_recovery_requires_one_strict_rollout_batch(self, tmp_path):
+        mc = _make_master_config(num_prompts_per_step=4)
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            slurm_recovery=True,
+            root_dir=tmp_path,
+        )
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_period"] = 1
+        mc.async_rl.max_buffered_rollouts = 3
+
+        with pytest.raises(ValueError, match="max_buffered_rollouts"):
+            sc_setup_mod._validate_slurm_rollout_recovery(mc)
 
     def test_returns_bundle(self, patched_factories):
         mc = _make_master_config(colocated=True)

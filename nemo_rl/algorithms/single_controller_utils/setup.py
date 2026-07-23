@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, cast
 
+import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -52,7 +53,12 @@ from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
-from nemo_rl.experience.rollout_checkpoint import compute_rollout_fingerprint
+from nemo_rl.experience.rollout_checkpoint import (
+    DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+    ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION,
+    RolloutRecoveryManifest,
+    compute_rollout_fingerprint,
+)
 from nemo_rl.experience.rollout_checkpoint_writer import RolloutCheckpointWriter
 from nemo_rl.experience.rollout_manager import (
     RolloutCheckpointIOPolicy,
@@ -300,11 +306,57 @@ def _validate_rollout_checkpointing_setup(
         )
 
 
+def _validate_slurm_rollout_recovery(master_config: MasterConfig) -> None:
+    """Reject configurations that cannot reproduce rollout work after restart."""
+    config = master_config.rollout_checkpointing
+    if not config.slurm_recovery:
+        return
+    if not master_config.checkpointing["enabled"]:
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery requires checkpointing.enabled=True"
+        )
+    if master_config.checkpointing["save_period"] != 1:
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery requires checkpointing.save_period=1"
+        )
+    if not master_config.checkpointing["save_optimizer"]:
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery requires "
+            "checkpointing.save_optimizer=True"
+        )
+    if master_config.checkpointing["is_async"]:
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery currently requires "
+            "checkpointing.is_async=False"
+        )
+    megatron_config = master_config.policy["megatron_cfg"]
+    if "checkpoint" in megatron_config and megatron_config["checkpoint"].get(
+        "async_save"
+    ):
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery currently requires "
+            "policy.megatron_cfg.checkpoint.async_save=False"
+        )
+    if master_config.async_rl.batch_selection_strategy != "strict_on_policy":
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery currently requires "
+            "async_rl.batch_selection_strategy='strict_on_policy'"
+        )
+    expected_buffered_rollouts = master_config.grpo["num_prompts_per_step"]
+    if master_config.async_rl.max_buffered_rollouts != expected_buffered_rollouts:
+        raise ValueError(
+            "rollout_checkpointing.slurm_recovery with strict_on_policy requires "
+            "async_rl.max_buffered_rollouts == grpo.num_prompts_per_step "
+            f"({expected_buffered_rollouts})"
+        )
+
+
 def _build_rollout_checkpoint_runtime(
     config: RolloutCheckpointingConfig,
     *,
     tokenizer: PreTrainedTokenizerBase,
     generation_config: Any,
+    master_config: MasterConfig,
 ) -> Optional[RolloutCheckpointRuntime]:
     """Create the single writer actor and immutable run-wide fingerprints."""
     if not config.enabled:
@@ -341,9 +393,44 @@ def _build_rollout_checkpoint_runtime(
             },
         }
     )
+    if config.slurm_recovery:
+        run_id = DIRECTORY_SCOPED_ROLLOUT_RUN_ID
+        config_snapshot = master_config.model_dump(mode="json")
+        grpo_snapshot = config_snapshot["grpo"]
+        compatibility_fingerprint = compute_rollout_fingerprint(
+            {
+                "policy": config_snapshot["policy"],
+                "data": config_snapshot["data"],
+                "env": config_snapshot["env"],
+                "rollout": {
+                    "seed": grpo_snapshot["seed"],
+                    "num_prompts_per_step": grpo_snapshot["num_prompts_per_step"],
+                    "num_generations_per_prompt": grpo_snapshot[
+                        "num_generations_per_prompt"
+                    ],
+                    "max_rollout_turns": grpo_snapshot.get("max_rollout_turns"),
+                },
+                "sampling_fingerprint": sampling_fingerprint,
+                "tokenizer_fingerprint": tokenizer_fingerprint,
+            }
+        )
+        expected_manifest = RolloutRecoveryManifest(
+            schema_version=ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION,
+            run_id=run_id,
+            compatibility_fingerprint=compatibility_fingerprint,
+        )
+        committed_manifest = ray.get(
+            writer.ensure_compatible_manifest.remote(expected_manifest)
+        )
+        if committed_manifest != expected_manifest:
+            raise RuntimeError(
+                "rollout checkpoint writer returned an unexpected recovery manifest"
+            )
+    else:
+        run_id = uuid.uuid4().hex
     return RolloutCheckpointRuntime(
         writer=writer,
-        run_id=uuid.uuid4().hex,
+        run_id=run_id,
         sampling_fingerprint=sampling_fingerprint,
         tokenizer_fingerprint=tokenizer_fingerprint,
     )
@@ -430,6 +517,7 @@ def setup_single_controller(
         rollout_checkpoint_config,
         use_nemo_gym=use_nemo_gym,
     )
+    _validate_slurm_rollout_recovery(master_config)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
@@ -611,6 +699,7 @@ def setup_single_controller(
         rollout_checkpoint_config,
         tokenizer=tokenizer,
         generation_config=generation_config,
+        master_config=master_config,
     )
     checkpoint_io_policy = None
     if rollout_checkpoint_config.enabled:

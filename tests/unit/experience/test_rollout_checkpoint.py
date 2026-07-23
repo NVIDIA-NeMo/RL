@@ -27,18 +27,31 @@ import torch
 import nemo_rl.experience.rollout_checkpoint as checkpoint_module
 from nemo_rl.experience.interfaces import Completion
 from nemo_rl.experience.rollout_checkpoint import (
+    DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
     ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION,
     CheckpointConflictError,
     CompletedSiblingRecord,
     CorruptCheckpointError,
     IncompatibleCheckpointError,
     PersistAck,
     RolloutCheckpointStore,
+    RolloutRecoveryManifest,
     RolloutWorkItem,
     StaleAttemptError,
     StorageUnavailableError,
     compute_rollout_fingerprint,
 )
+
+
+def _manifest(
+    compatibility_fingerprint: str = "initial-policy-and-rollout-sha",
+) -> RolloutRecoveryManifest:
+    return RolloutRecoveryManifest(
+        schema_version=ROLLOUT_RECOVERY_MANIFEST_SCHEMA_VERSION,
+        run_id=DIRECTORY_SCOPED_ROLLOUT_RUN_ID,
+        compatibility_fingerprint=compatibility_fingerprint,
+    )
 
 
 def _work(*, attempt_id: int = 0, policy_version: int = 7) -> RolloutWorkItem:
@@ -143,6 +156,54 @@ def test_rollout_fingerprint_is_stable_across_dictionary_order() -> None:
     assert compute_rollout_fingerprint(first) != compute_rollout_fingerprint(
         {**first, "prompt": [1, 3]}
     )
+
+
+def test_directory_manifest_is_durable_and_idempotent(tmp_path) -> None:
+    expected = _manifest()
+
+    first = RolloutCheckpointStore(tmp_path).ensure_compatible_manifest(expected)
+    restored = RolloutCheckpointStore(tmp_path).ensure_compatible_manifest(expected)
+
+    assert first == expected
+    assert restored == expected
+    assert (tmp_path / "recovery_manifest.json").exists()
+
+
+def test_directory_manifest_rejects_incompatible_reuse(tmp_path) -> None:
+    store = RolloutCheckpointStore(tmp_path)
+    store.ensure_compatible_manifest(_manifest("policy-a"))
+
+    with pytest.raises(IncompatibleCheckpointError, match="incompatible"):
+        store.ensure_compatible_manifest(_manifest("policy-b"))
+
+
+def test_directory_manifest_corruption_fails_closed(tmp_path) -> None:
+    store = RolloutCheckpointStore(tmp_path)
+    store.ensure_compatible_manifest(_manifest())
+    manifest_path = tmp_path / "recovery_manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    payload["compatibility_fingerprint"] = "tampered"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CorruptCheckpointError, match="failed its checksum"):
+        store.ensure_compatible_manifest(_manifest())
+
+
+def test_directory_manifest_write_failure_never_exposes_final_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = RolloutCheckpointStore(tmp_path)
+
+    def _fail_replace(_src, _dst):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+    with pytest.raises(StorageUnavailableError, match="atomically commit"):
+        store.ensure_compatible_manifest(_manifest())
+
+    assert not (tmp_path / "recovery_manifest.json").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_same_record_concurrent_retry_is_idempotent(tmp_path) -> None:
