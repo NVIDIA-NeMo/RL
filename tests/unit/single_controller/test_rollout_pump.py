@@ -26,6 +26,12 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    WeightFifoSampler,
+    WindowedSampler,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
@@ -53,14 +59,16 @@ from tests.unit.single_controller._dp_fakes import (
 
 
 @pytest.mark.parametrize(
-    ("force_in_order", "expected_target_steps"),
+    ("make_sampler", "expected_target_steps"),
     [
-        (False, [None, None]),
-        (True, [0, 1]),
+        # weight_fifo gates but does not stamp target_step.
+        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), [None, None]),
+        # in_order stamps the dispatch index as target_step.
+        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), [0, 1]),
     ],
 )
 def test_rollout_pump_stamps_target_steps(
-    force_in_order: bool,
+    make_sampler,
     expected_target_steps: list[int | None],
 ) -> None:
     class _RecordingBuffer:
@@ -85,13 +93,13 @@ def test_rollout_pump_stamps_target_steps(
     ctrl = object.__new__(controller_cls)
     ctrl._cfg = SimpleNamespace(
         max_inflight_prompts=2,
-        over_sampling=False,
-        max_weight_staleness_versions=1,
-        force_in_order=force_in_order,
         diagnostics=False,
         max_num_epochs=1,
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    # The sampler owns admission + target_step stamping (the dispatch counter
+    # lives on the sampler, not the actor).
+    ctrl._sampler = make_sampler(buffer)
     prompt_batch = BatchedDataDict(
         {"message_log": [[{"role": "user", "content": "prompt"}]]}
     )
@@ -101,7 +109,6 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
-    ctrl._max_rollout_version = -1
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
 
@@ -142,13 +149,12 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl = object.__new__(controller_cls)
         ctrl._cfg = SimpleNamespace(
             max_inflight_prompts=2,
-            over_sampling=True,
-            max_weight_staleness_versions=1,
-            force_in_order=False,
             diagnostics=False,
             max_num_epochs=1,
         )
         ctrl._rollout_manager = manager
+        # Over-sampled windowed policy: admit never gates (buffer unused here).
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
             BatchedDataDict(
                 {
@@ -164,7 +170,6 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._buffer_capacity = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
-        ctrl._max_rollout_version = -1
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
 
@@ -221,13 +226,12 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl = object.__new__(controller_cls)
         ctrl._cfg = SimpleNamespace(
             max_inflight_prompts=1,
-            over_sampling=True,
-            max_weight_staleness_versions=1,
-            force_in_order=False,
             diagnostics=False,
             max_num_epochs=1,
         )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
+        # Over-sampled windowed policy: admit never gates (buffer unused here).
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
             BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
         ]
@@ -236,7 +240,6 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._buffer_capacity = real_semaphore(1)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
-        ctrl._max_rollout_version = -1
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
 
@@ -277,15 +280,13 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     cfg = SingleControllerConfig.model_construct(
-        batch_selection_strategy="staleness_window",
-        max_weight_staleness_versions=1,
+        sampler=WindowedSamplerConfig(max_staleness_versions=1),
         min_groups_per_batch=1,
         group_size=num_generations,
         max_inflight_prompts=num_prompts,
         max_buffered_rollouts=num_prompts,
         max_train_steps=1,
         max_num_epochs=None,
-        over_sampling=True,
         partition_id=_PARTITION_ID,
         logger={
             "log_dir": str(tmp_path / "logs"),

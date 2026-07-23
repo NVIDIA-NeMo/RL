@@ -27,6 +27,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
@@ -298,16 +299,14 @@ def test_train_pump_drives_mcore_training_step(
         rollout_manager = SimpleNamespace(_tq_buffer=None)
 
         cfg = SingleControllerConfig.model_construct(
-            max_weight_staleness_versions=1,
+            sampler=WindowedSamplerConfig(max_staleness_versions=1),
             min_groups_per_batch=num_prompts,
             target_groups_per_step=num_prompts,
             group_size=num_generations,
-            batch_selection_strategy="staleness_window",
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
             max_train_steps=train_steps,
             max_num_epochs=None,
-            over_sampling=True,
             train_global_batch_size=train_gbs,
             partition_id=_PARTITION_ID,
             advantage_enabled=True,
