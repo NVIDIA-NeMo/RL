@@ -1,7 +1,7 @@
 # Cross-tokenizer off-policy distillation (supports multiple teachers).
 #
-# Defaults: Llama-3.2-1B (student) <- one teacher (Qwen3-4B), P-KL loss mode
-# (gold_loss=false, xtoken_loss=false). `teachers:` is a list — append more
+# Defaults: Llama-3.2-1B (student) <- one teacher (Qwen3-4B), v6 cross-tokenizer
+# KD (prefix-bidir partition KL). `teachers:` is a list — append more
 # entries for multi-teacher distillation (a commented Llama-3.2-3B second-teacher
 # example follows the first entry below). Each teacher carries its own
 # `projection_matrix_path` (null => same-tokenizer teacher: direct KL, no
@@ -21,35 +21,52 @@ distillation:
   val_at_end: false
 
 loss_fn:
-  # NOTE: the per-(student, teacher) projection matrix path now lives on each
+  # NOTE: the per-(student, teacher) projection matrix path lives on each
   # `teachers[i].projection_matrix_path` (see below), not here. The knobs in
   # this block are shared across all teachers.
   # See docs/guides/xtoken-off-policy-distillation.md for how to produce the
   # projection file.
-  # Loss-mode selection (shared default; override per teacher via
-  # teachers[i].gold_loss / .xtoken_loss in `sum` mode):
-  #   gold_loss=false                    -> P-KL: full-vocab teacher logits
-  #     transported via IPC; the loss derives a microbatch-global top-k
-  #     (size `vocab_topk`) inside, projects student to teacher vocab via
-  #     M, and chunk-averages KL on the [k] subset. CE term is added.
-  #   gold_loss=true, xtoken_loss=false  -> gold-loss:
-  #     KL on the exact-mapped common vocab (top-1 weight == 1.0) + L1
-  #     on the uncommon vocab tail (sorted, capped at `uncommon_topk`).
-  #   gold_loss=true, xtoken_loss=true   -> relaxed gold: same partition
-  #     math but exact-map threshold is >= 0.6 and collisions are resolved
-  #     by keeping the higher-weight student.
-  # `xtoken_loss=true` requires `gold_loss=true`.
-  gold_loss: false
-  xtoken_loss: false
+  #
+  # A cross-tokenizer teacher's KD term is the v6 prefix-bidir partition KL:
+  # a common-vocab partition KL/JSD on the exact 1-to-1 token map, plus a
+  # batched mismatch partition KL over prefix-support alternatives for non-
+  # 1-to-1 chunks (MtoM-as-ALM + rest bucket) and an optional position-0 KL,
+  # combined with a next-token student CE term. A same-tokenizer teacher
+  # (teachers[i].projection_matrix_path: null) uses a direct top-k KL instead.
   temperature: 1.0
-  vocab_topk: 8192            # P-KL only; size of the microbatch-global
-                              # top-k derived inside the loss
-  uncommon_topk: 8192         # gold-loss only; caps the L1 uncommon tail
-  reverse_kl: false
-  exact_token_match_only: false
-  kl_loss_weight: 1.0         # P-KL only
-  ce_loss_scale: 0.1          # P-KL only
-  dynamic_loss_scaling: true  # P-KL only
+  vocab_topk: 8192            # same-vocab direct-KL path only (top-k size)
+  reverse_kl: false           # KL(student||teacher) instead of KL(teacher||student)
+  kl_loss_weight: 1.0         # KD weight in fixed-weight mode
+  ce_loss_scale: 0.1          # CE weight in fixed-weight mode
+  dynamic_loss_scaling: true  # rescale KD to match CE magnitude each step
+                              # (kl_loss_weight / ce_loss_scale then ignored)
+  # ---- v6 (prefix-bidir partition KL) knobs ----
+  # Common-vocab support source: false => derive the exact 1-to-1 map from the
+  # projection matrix; true => from each teacher's forward pseudo-target table
+  # (teachers[i].pseudo_target_path, required when true).
+  common_indices_from_subtoks: false
+  # Per-chunk "logits[t-1] predicts token t" shift, skipped for chunks at a
+  # sequence start.
+  kl_chunk_shift: false
+  # Loss fn for the 1-to-1 common-vocab term and the position-0 term:
+  # "kl" | "jsd" | "bce".
+  prefix_bidir_v3_loss_fn: "kl"
+  # Loss fn for the position-N-1 (last-position) partition KL; null => inherit
+  # prefix_bidir_v3_loss_fn.
+  prefix_bidir_v3_last_pos_loss_fn: null
+  # beta for the generalized JSD mixture (0.5 => symmetric JSD; used when a
+  # loss fn above is "jsd").
+  prefix_bidir_v3_jsd_beta: 0.5
+  # Add the position-0 partition KL on common vocab for non-1-to-1 chunks.
+  prefix_bidir_v3_position_0_kl: false
+  # Drop chunks whose realized teacher label fell outside the teacher's true
+  # top-k (0 disables the filter).
+  prefix_bidir_v3_noise_filter_topk: 0
+  # Advanced (unset => v6 defaults): the non-1-to-1 mismatch weighting
+  # (prefix_bidir_v3_mismatch_pos0_alpha / _mismatch_loss_beta, both require
+  # position_0_kl: true), the pure-ALM baseline (prefix_bidir_v3_pure_alm), and
+  # the sparse teacher-IPC top-k path (teacher_topk_ipc_k, ...). See
+  # CrossTokenizerDistillationLossConfig for the full set.
   # ---- Multi-teacher aggregation (defaults reproduce single-teacher) ----
   # kd_loss_mode: how per-teacher KD terms are combined.
   #   "sum"             -> total_kd = Σ_i weight_i * KD_i  (default)
@@ -142,8 +159,13 @@ teachers:
     #   teachers.0.projection_matrix_path=/path/to/projection_matrix.pt
     projection_matrix_path: null
     weight: 1.0                  # static loss weight in kd_loss_mode=sum
-    # gold_loss / xtoken_loss (optional): per-teacher overrides of the loss_fn
-    # globals, honored only in kd_loss_mode=sum. Omit to use the globals.
+    # pseudo_target_path / reverse_pseudo_target_path (optional): this teacher's
+    # forward (student->teacher) and reverse (teacher->student) sub-token chain
+    # tables (.pt with `subtoks` / `lengths`). Needed for the prefix-support
+    # mismatch path and (when loss_fn.common_indices_from_subtoks: true) the
+    # common-vocab map. null => derive from the projection matrix / same-vocab.
+    pseudo_target_path: null
+    reverse_pseudo_target_path: null
     tokenizer:
       name: "Qwen/Qwen3-4B"
     train_global_batch_size: 64
