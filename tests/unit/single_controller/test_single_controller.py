@@ -16,6 +16,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -115,6 +116,34 @@ def test_logs_concrete_weight_synchronizer(
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
+
+
+@pytest.mark.parametrize(
+    ("recompute_kv_cache", "expected_invalidation_calls"),
+    [(False, 0), (True, 1)],
+)
+def test_sync_weights_honors_recompute_kv_cache_config(
+    recompute_kv_cache: bool,
+    expected_invalidation_calls: int,
+) -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(
+        recompute_kv_cache_after_weight_updates=recompute_kv_cache
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(invalidate_kv_cache=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 3
+
+    asyncio.run(ctrl._sync_weights())
+
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with()
+    assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(3)
+    assert ctrl._rollout_permitted.is_set()
 
 
 class _EmptySampler:

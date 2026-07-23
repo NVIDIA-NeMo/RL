@@ -23,6 +23,8 @@ async_rl:
   sampler:
     name: in_order
     max_lookahead_versions: 0
+  # Preserve sync-mode cache invalidation after every weight update.
+  recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${grpo.num_prompts_per_step}

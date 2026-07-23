@@ -10,6 +10,8 @@ async_rl:
     name: in_order
     # How far generation may run ahead of the trainer.
     max_lookahead_versions: 1
+  # Recompute generation KV caches after each weight update.
+  recompute_kv_cache_after_weight_updates: false
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.

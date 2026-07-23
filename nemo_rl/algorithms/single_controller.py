@@ -574,7 +574,7 @@ class SingleControllerActor:
 
         t0 = time.monotonic()
         await asyncio.to_thread(self._weight_synchronizer.sync_weights)
-        if self._sampler.is_on_policy:
+        if self._async_cfg.recompute_kv_cache_after_weight_updates:
             self._gen.invalidate_kv_cache()
         elapsed = time.monotonic() - t0
 
