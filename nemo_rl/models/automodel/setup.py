@@ -302,6 +302,11 @@ def validate_and_prepare_config(
                 "Sequence packing is not supported for VLM models. "
                 "Please set policy.sequence_packing.enabled = False to train VLM models."
             )
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Sequence packing requires precision='float16' or 'bfloat16' "
+                "because FlashAttention does not support float32 inputs."
+            )
         print(f"[Rank {rank}] Sequence packing is enabled for model {model_name}")
         print(f"[Rank {rank}] Using FlashAttention2 for sequence packing")
 
@@ -318,6 +323,11 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
+    if cp_size_cfg > 1 and dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "Context parallel requires precision='float16' or 'bfloat16' "
+            "because its ring-flash attention kernel does not support float32 inputs."
+        )
     attn_impl = (
         "flash_attention_2"
         if (enable_seq_packing and cp_size_cfg == 1)
@@ -348,12 +358,13 @@ def validate_and_prepare_config(
 
     if is_reward_model:
         # Validate reward model configuration
-        if enable_seq_packing:
+        rm_type = config["reward_model_cfg"]["reward_model_type"]
+        if enable_seq_packing and rm_type != "regression":
             raise NotImplementedError(
-                "Sequence packing is not supported for reward models"
+                "Sequence packing is only supported for token-level regression "
+                "reward models"
             )
 
-        rm_type = config["reward_model_cfg"]["reward_model_type"]
         if rm_type == "bradley_terry":
             model_class = NeMoAutoModelForSequenceClassification
             if model_config.num_labels != 1:
@@ -707,12 +718,11 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # Match Automodel's `get_train_context` in `cp_utils.py` where only
-        # flash and efficient backends are supported
-        sdpa_method = [
-            SDPBackend.FLASH_ATTENTION,
-            SDPBackend.EFFICIENT_ATTENTION,
-        ]
+        # PyTorch's ring-efficient CP kernel cannot merge GQA outputs when
+        # num_attention_heads != num_key_value_heads (for example Qwen2):
+        # its output and logsumexp head dimensions diverge. Force the ring-flash
+        # kernel, which supports the GQA layout used by these models.
+        sdpa_method = [SDPBackend.FLASH_ATTENTION]
     elif config["dtensor_cfg"]["activation_checkpointing"]:
         # For activation checkpointing, we must disable the cudnn SDPA backend because
         # it may not be selected during recomputation.
