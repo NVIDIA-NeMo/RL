@@ -1424,6 +1424,7 @@ def refit_sglang_colocated(
     the FSDP path is BF16-only.
     """
     from nemo_rl.models.policy.utils import (
+        cancel_ray_refs,
         fetch_updatable_engines_with_recover,
         invalidate_sglang_kv_cache_for_refit,
     )
@@ -1431,6 +1432,9 @@ def refit_sglang_colocated(
     monitor_refit_lease = None
     generation_pause_attempted = False
     generation_continue_succeeded = False
+    transfer_futures = []
+    transfer_started = False
+    unsafe_engine_state = False
     try:
         (
             rollout_engines,
@@ -1455,18 +1459,42 @@ def refit_sglang_colocated(
         generation_pause_attempted = True
         policy_generation.pause_generation(mode=pause_mode)
         invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
-        futures = policy.update_weights_to_sglang_colocated(
+        transfer_started = True
+        transfer_futures = policy.update_weights_to_sglang_colocated(
             rollout_engines=rollout_engines,
             buffer_size_bytes=buffer_size_bytes,
         )
-        ray.get(futures)
+        ray.get(transfer_futures)
         policy_generation.post_process_weights()
+    except BaseException as exc:
+        unsafe_engine_state = transfer_started
+        cancel_ray_refs(transfer_futures)
+        if unsafe_engine_state:
+            try:
+                quarantine_confirmed = policy_generation.quarantine_all_engines()
+            except BaseException as quarantine_exc:
+                quarantine_confirmed = False
+                exc.add_note(
+                    "SGLang engine quarantine raised while handling the partial "
+                    f"colocated weight update: {quarantine_exc!r}."
+                )
+            if not quarantine_confirmed:
+                exc.add_note(
+                    "Clean termination of every SGLang engine process could not "
+                    "be confirmed. All actor slots remain quarantined."
+                )
+            exc.add_note(
+                "The colocated SGLang weight stream may have been applied only "
+                "partially. Generation remains paused, the refit health-monitor "
+                "lease is retained, and this run must fail."
+            )
+        raise
     finally:
         active_error = sys.exception()
-        if generation_pause_attempted:
+        if generation_pause_attempted and not unsafe_engine_state:
             try:
                 policy_generation.continue_generation()
-            except Exception as cleanup_exc:
+            except BaseException as cleanup_exc:
                 if active_error is None:
                     raise
                 active_error.add_note(
@@ -1475,12 +1503,12 @@ def refit_sglang_colocated(
                 )
             else:
                 generation_continue_succeeded = True
-        if monitor_refit_lease is not None and (
-            not generation_pause_attempted or generation_continue_succeeded
+        if (
+            not unsafe_engine_state
+            and monitor_refit_lease is not None
+            and (not generation_pause_attempted or generation_continue_succeeded)
         ):
-            policy_generation.health_monitoring_release_refit(
-                monitor_refit_lease
-            )
+            policy_generation.health_monitoring_release_refit(monitor_refit_lease)
     return True
 
 

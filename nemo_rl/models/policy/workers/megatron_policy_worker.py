@@ -2990,6 +2990,7 @@ def refit_sglang_colocated(
     IPC, post-process, continue.
     """
     from nemo_rl.models.policy.utils import (
+        cancel_ray_refs,
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
         invalidate_sglang_kv_cache_for_refit,
@@ -3000,6 +3001,9 @@ def refit_sglang_colocated(
     monitor_refit_lease = None
     generation_pause_attempted = False
     generation_continue_succeeded = False
+    transfer_futures = []
+    transfer_started = False
+    unsafe_engine_state = False
     try:
         (
             rollout_engines,
@@ -3028,20 +3032,44 @@ def refit_sglang_colocated(
         # lifetime-safe IPC handled inside send_hf_buckets_via_ipc_actor_impl),
         # but the policy-group dispatch still returns one Ray future per
         # worker; we await those here to wait for all trainer ranks.
-        futures = policy.update_weights_to_sglang_colocated(
+        transfer_started = True
+        transfer_futures = policy.update_weights_to_sglang_colocated(
             rollout_engines=rollout_engines,
             buffer_size_bytes=buffer_size_bytes,
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quant,
         )
-        ray.get(futures)
+        ray.get(transfer_futures)
         policy_generation.post_process_weights()
+    except BaseException as exc:
+        unsafe_engine_state = transfer_started
+        cancel_ray_refs(transfer_futures)
+        if unsafe_engine_state:
+            try:
+                quarantine_confirmed = policy_generation.quarantine_all_engines()
+            except BaseException as quarantine_exc:
+                quarantine_confirmed = False
+                exc.add_note(
+                    "SGLang engine quarantine raised while handling the partial "
+                    f"colocated weight update: {quarantine_exc!r}."
+                )
+            if not quarantine_confirmed:
+                exc.add_note(
+                    "Clean termination of every SGLang engine process could not "
+                    "be confirmed. All actor slots remain quarantined."
+                )
+            exc.add_note(
+                "The colocated SGLang weight stream may have been applied only "
+                "partially. Generation remains paused, the refit health-monitor "
+                "lease is retained, and this run must fail."
+            )
+        raise
     finally:
         active_error = sys.exception()
-        if generation_pause_attempted:
+        if generation_pause_attempted and not unsafe_engine_state:
             try:
                 policy_generation.continue_generation()
-            except Exception as cleanup_exc:
+            except BaseException as cleanup_exc:
                 if active_error is None:
                     raise
                 active_error.add_note(
@@ -3050,12 +3078,12 @@ def refit_sglang_colocated(
                 )
             else:
                 generation_continue_succeeded = True
-        if monitor_refit_lease is not None and (
-            not generation_pause_attempted or generation_continue_succeeded
+        if (
+            not unsafe_engine_state
+            and monitor_refit_lease is not None
+            and (not generation_pause_attempted or generation_continue_succeeded)
         ):
-            policy_generation.health_monitoring_release_refit(
-                monitor_refit_lease
-            )
+            policy_generation.health_monitoring_release_refit(monitor_refit_lease)
     return True
 
 
@@ -3085,6 +3113,8 @@ def refit_sglang_distributed(
     generation_continue_succeeded = False
     transfer_futures = []
     communicator_touched = False
+    transfer_started = False
+    unsafe_engine_state = False
     try:
         (
             rollout_engines,
@@ -3126,6 +3156,10 @@ def refit_sglang_distributed(
         ):
             raise RuntimeError("SGLang KV-cache invalidation failed before refit")
 
+        # From this point onward, any error can leave a prefix of the new
+        # weights installed in-place on one or more engines. The pinned SGLang
+        # server cannot cancel an update after the HTTP client times out.
+        transfer_started = True
         transfer_futures = policy.update_weights_to_sglang_distributed(
             rollout_engines=rollout_engines,
             rollout_engine_lock=rollout_engine_lock,
@@ -3140,20 +3174,19 @@ def refit_sglang_distributed(
             cancel_on_error=True,
         )
         policy_generation.post_process_weights(deadline=deadline)
-    except Exception as exc:
+    except BaseException as exc:
         cancel_ray_refs(transfer_futures)
+        cleanup_timeout_s = max(
+            deadline.remaining_or_zero(),
+            _BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S,
+        )
+        communicator_cleanup_confirmed = not communicator_touched
         if communicator_touched:
-            cleanup_timeout_s = max(
-                deadline.remaining_or_zero(),
-                _BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S,
-            )
             cleanup_deadline = SGLangRefitDeadline(cleanup_timeout_s)
             try:
-                cleanup_refs = (
-                    policy.abort_sglang_rollout_engines_distributed(
-                        timeout_s=cleanup_deadline.remaining(
-                            "dispatching SGLang communicator cleanup"
-                        )
+                cleanup_refs = policy.abort_sglang_rollout_engines_distributed(
+                    timeout_s=cleanup_deadline.remaining(
+                        "dispatching SGLang communicator cleanup"
                     )
                 )
                 cleanup_deadline.ray_get(
@@ -3161,23 +3194,56 @@ def refit_sglang_distributed(
                     stage="waiting for SGLang communicator cleanup",
                     cancel_on_error=False,
                 )
-            except Exception as cleanup_exc:
+            except BaseException as cleanup_exc:
                 exc.add_note(
                     "SGLang communicator cleanup did not complete before "
                     f"returning the refit failure: {cleanup_exc!r}. A later "
                     "refit is fail-closed until cleanup is confirmed."
                 )
+            else:
+                communicator_cleanup_confirmed = True
+
+        unsafe_engine_state = transfer_started or not communicator_cleanup_confirmed
+        if unsafe_engine_state:
+            try:
+                quarantine_confirmed = policy_generation.quarantine_all_engines(
+                    timeout_s=cleanup_timeout_s
+                )
+            except BaseException as quarantine_exc:
+                quarantine_confirmed = False
+                exc.add_note(
+                    "SGLang engine quarantine raised while handling an unsafe "
+                    f"refit state: {quarantine_exc!r}."
+                )
+            if not quarantine_confirmed:
+                exc.add_note(
+                    "Clean termination of every SGLang engine process could not "
+                    "be confirmed. All actor slots remain quarantined."
+                )
+            if transfer_started:
+                exc.add_note(
+                    "The SGLang weight stream may have been applied only partially. "
+                    "Generation remains paused, the refit health-monitor lease is "
+                    "retained, and this run must fail rather than resume those "
+                    "engines."
+                )
+            else:
+                exc.add_note(
+                    "SGLang communicator bootstrap cleanup was not confirmed. "
+                    "The engines are quarantined and this run must fail rather "
+                    "than reuse uncertain engine control state."
+                )
         raise
     finally:
         active_error = sys.exception()
         completion_error = None
-        if generation_pause_attempted:
+        if generation_pause_attempted and not unsafe_engine_state:
             try:
                 policy_generation.continue_generation(
                     deadline=deadline,
                     best_effort=True,
                 )
-            except Exception as cleanup_exc:
+            except BaseException as cleanup_exc:
                 if active_error is None:
                     raise
                 active_error.add_note(
@@ -3186,28 +3252,23 @@ def refit_sglang_distributed(
                 )
             else:
                 generation_continue_succeeded = True
-                if (
-                    active_error is None
-                    and deadline.remaining_or_zero() <= 0
-                ):
+                if active_error is None and deadline.remaining_or_zero() <= 0:
                     completion_error = SGLangRefitTimeoutError(
-                        "SGLang refit deadline expired while safely resuming "
-                        "generation"
+                        "SGLang refit deadline expired while safely resuming generation"
                     )
 
-        if monitor_refit_lease is not None and (
-            not generation_pause_attempted or generation_continue_succeeded
+        if (
+            not unsafe_engine_state
+            and monitor_refit_lease is not None
+            and (not generation_pause_attempted or generation_continue_succeeded)
         ):
             try:
-                policy_generation.health_monitoring_release_refit(
-                    monitor_refit_lease
-                )
-            except Exception as cleanup_exc:
+                policy_generation.health_monitoring_release_refit(monitor_refit_lease)
+            except BaseException as cleanup_exc:
                 if active_error is None:
                     raise
                 active_error.add_note(
-                    "Restoring SGLang health monitoring also failed: "
-                    f"{cleanup_exc!r}"
+                    f"Restoring SGLang health monitoring also failed: {cleanup_exc!r}"
                 )
         if completion_error is not None:
             raise completion_error

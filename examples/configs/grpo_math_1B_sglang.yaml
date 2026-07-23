@@ -32,6 +32,9 @@ policy:
       rollout_health_check_interval: 60
       rollout_health_check_timeout: 60
       rollout_health_check_first_wait: 60
+      # One monotonic deadline for router startup, engine host/port discovery,
+      # process launch, HTTP health/cache flush, and router registration.
+      engine_startup_timeout_s: 1800
       # One monotonic orchestration deadline for communicator bootstrap,
       # SGLang transport, post-processing, and failure cleanup on the
       # disaggregated Megatron refit path. Synchronous Megatron/AutoBridge

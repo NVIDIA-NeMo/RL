@@ -974,9 +974,7 @@ def connect_rollout_engines_from_distributed(
     group = None
     rank_cursor = 1
     try:
-        for engine, gpu_count in zip(
-            rollout_engines, engine_gpu_counts, strict=True
-        ):
+        for engine, gpu_count in zip(rollout_engines, engine_gpu_counts, strict=True):
             refs.append(
                 engine.init_weights_update_group.remote(
                     master_address,
@@ -1042,8 +1040,7 @@ def connect_rollout_engines_from_distributed(
             )
         except Exception as cleanup_exc:
             exc.add_note(
-                "Dispatching engine communicator cleanup also failed: "
-                f"{cleanup_exc!r}"
+                f"Dispatching engine communicator cleanup also failed: {cleanup_exc!r}"
             )
         if abort_error is not None:
             raise SGLangCommunicatorRecoveryError(
@@ -1130,14 +1127,12 @@ def fetch_updatable_engines_with_recover(
     )
     try:
         use_ft = bool(
-            policy_generation.sglang_cfg["sglang_cfg"].get(
-                "use_fault_tolerance", False
-            )
+            policy_generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance", False)
         )
         if use_ft:
             policy_generation.recover_updatable_engines(deadline=deadline)
         state = policy_generation.get_updatable_engines_and_lock()
-    except Exception as exc:
+    except BaseException as exc:
         exc.add_note(
             "SGLang health monitoring remains suspended because engine "
             "recovery/topology inspection did not complete safely."
@@ -1257,8 +1252,7 @@ def broadcast_hf_buckets_via_distributed_impl(
                     released = deadline.ray_get(
                         release_ref,
                         stage=(
-                            "releasing the rollout-engine lock for "
-                            f"bucket {bucket_idx}"
+                            f"releasing the rollout-engine lock for bucket {bucket_idx}"
                         ),
                     )
                     if lock_acquired and not released:

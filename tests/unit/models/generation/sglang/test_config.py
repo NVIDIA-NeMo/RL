@@ -77,6 +77,7 @@ def test_normalize_materializes_centralized_defaults_and_preserves_passthrough()
     assert inner["rollout_health_check_interval"] is None
     assert inner["rollout_health_check_timeout"] is None
     assert inner["rollout_health_check_first_wait"] is None
+    assert inner["engine_startup_timeout_s"] == 1800
     assert inner["refit_timeout_s"] == 1800
     assert inner["sglang_router_config"]["use_external_router"] is False
     assert inner["custom_server_arg"] == "preserved"
@@ -212,12 +213,16 @@ def test_fault_tolerance_accepts_explicit_nonnegative_first_wait():
     assert _inner(config)["rollout_health_check_first_wait"] == 0
 
 
+@pytest.mark.parametrize(
+    "timeout_key",
+    ["engine_startup_timeout_s", "refit_timeout_s"],
+)
 @pytest.mark.parametrize("timeout_s", [0, -1])
-def test_refit_timeout_must_be_positive(timeout_s: float):
+def test_operation_timeout_must_be_positive(timeout_key: str, timeout_s: float):
     config = _valid_config()
-    _inner(config)["refit_timeout_s"] = timeout_s
+    _inner(config)[timeout_key] = timeout_s
 
-    with pytest.raises(ValidationError, match="refit_timeout_s"):
+    with pytest.raises(ValidationError, match=timeout_key):
         normalize_sglang_config(config)
 
 

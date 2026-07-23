@@ -229,6 +229,7 @@ class RolloutHealthMonitor:
 
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")
+        cleanup_failures = []
         for i in range(
             rollout_engine_id * self._sglang_generation.nodes_per_engine,
             (rollout_engine_id + 1) * self._sglang_generation.nodes_per_engine,
@@ -237,19 +238,34 @@ class RolloutHealthMonitor:
             if engine:
                 logger.info(f"Shutting down and killing engine at index {i}")
                 try:
-                    ray.get(
-                        engine.shutdown.remote(),
-                        timeout=self._check_timeout,
+                    shutdown_confirmed = ray.get(
+                        engine.shutdown.remote(timeout_s=self._check_timeout),
+                        timeout=self._check_timeout + 1,
                     )
+                    if shutdown_confirmed is not True:
+                        cleanup_failures.append(
+                            f"engine index {i} returned {shutdown_confirmed!r} "
+                            "from bounded shutdown"
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Failed to shut down engine at index {i} cleanly (e: {e})"
                     )
+                    cleanup_failures.append(
+                        f"engine index {i} shutdown was not confirmed: {e!r}"
+                    )
                 try:
-                    ray.kill(engine)
+                    ray.kill(engine, no_restart=True)
                     logger.info(f"Successfully killed engine at index {i}")
                 except Exception as e:
                     logger.warning(f"Failed to kill engine at index {i} (e: {e})")
+                    cleanup_failures.append(
+                        f"engine index {i} Ray actor kill failed: {e!r}"
+                    )
             else:
                 logger.info(f"Engine at index {i} is already None")
             self._sglang_generation.all_engines[i] = None
+        if cleanup_failures:
+            self._sglang_generation._latch_engine_cleanup_failure(
+                "; ".join(cleanup_failures)
+            )
