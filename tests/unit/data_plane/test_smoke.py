@@ -121,8 +121,8 @@ def test_async_and_sync_actors_share_env_tier() -> None:
     )
 
 
-def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
-    """TQ rollouts must mirror GRPO's length-based prompt extraction."""
+def test_sync_rollout_actor_masks_match_grpo() -> None:
+    """TQ rollouts must use GRPO loss masks: only generated assistant turns are trainable."""
     import torch
 
     from nemo_rl.experience.sync_rollout_actor import (
@@ -147,14 +147,12 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
         ]
     ]
 
-    flat, _input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
+    flat, _input_lengths = _flatten_rollout_message_log_for_tq(
         message_logs,
-        torch.tensor([5]),
         pad_token_id=0,
         make_sequence_length_divisible_by=1,
     )
 
-    assert torch.equal(prompt_flat["token_ids"], torch.tensor([[1, 2, 3, 4, 5]]))
     assert torch.equal(
         flat["token_loss_mask"],
         torch.tensor([[0, 0, 0, 0, 0, 1, 1]]),

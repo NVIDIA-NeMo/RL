@@ -52,6 +52,7 @@ from nemo_rl.data.datasets.response_datasets.openr1_math import OpenR1Math220KDa
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.response_datasets.tau_bench_dataset import TauBenchDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 from nemo_rl.data.datasets.utils import resolve_external_dataset_class
 
@@ -83,6 +84,7 @@ DATASET_REGISTRY = {
     "tulu3_sft_mixture": Tulu3SftMixtureDataset,
     "gsm8k": GSM8KDataset,
     "Nemotron-Cascade-2-SFT-Math": NemotronCascade2SFTMathDataset,
+    "tau_bench": TauBenchDataset,
     # load from local JSONL file or HuggingFace
     "openai_format": OpenAIFormatDataset,
     "NemoGymDataset": NemoGymDataset,
@@ -158,5 +160,6 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "TauBenchDataset",
     "load_response_dataset",
 ]
