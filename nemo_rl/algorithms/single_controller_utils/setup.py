@@ -23,14 +23,20 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.grpo import _create_advantage_estimator, _should_use_nemo_gym
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GrpoMasterConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    _create_advantage_estimator,
+    _should_use_nemo_gym,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -44,8 +50,10 @@ from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
@@ -105,6 +113,11 @@ def _build_clusters(
     )
     inference_resources = generation_config["colocated"]["resources"]
     inference_gpus_per_node = inference_resources["gpus_per_node"]
+    if inference_gpus_per_node is None:
+        raise ValueError(
+            "Non-colocated generation requires "
+            "policy.generation.colocated.resources.gpus_per_node."
+        )
     inference_nodes = inference_resources["num_nodes"] or 1
     if num_nodes == 1:
         train_gpus_per_node = gpus_per_node - inference_gpus_per_node
@@ -149,17 +162,19 @@ def _build_generation(
     generation_config["model_name"] = master_config.policy["model_name"]
     backend = generation_config["backend"]
     if backend == "vllm":
-        generation_config["vllm_kwargs"]["hf_overrides"] = master_config.policy.get(
-            "hf_config_overrides", {}
+        vllm_config = cast(VllmConfig, generation_config)
+        vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+            master_config.policy.get("hf_config_overrides", {})
         )
-        gen = VllmGeneration(cluster=inference_cluster, config=generation_config)
+        gen = VllmGeneration(cluster=inference_cluster, config=vllm_config)
     elif backend == "sglang":
-        generation_config["sglang_cfg"].setdefault(
+        sglang_config = cast(SGLangConfig, generation_config)
+        sglang_config["sglang_cfg"].setdefault(
             "model_path", master_config.policy["model_name"]
         )
         gen = SGLangGeneration(
             cluster=inference_cluster,
-            sglang_cfg=generation_config,
+            sglang_cfg=sglang_config,
         )
     else:
         raise ValueError(
@@ -302,14 +317,16 @@ def setup_single_controller(
     # Setup Dataset & Environments
     # ==========================
     # TODO: add validate dataset wiring.
-    if _should_use_nemo_gym(master_config):
+    if _should_use_nemo_gym(cast(GrpoMasterConfig, master_config)):
         raise NotImplementedError(
             "NeMo-Gym integration for SingleController is not supported yet; "
             "it will land in https://github.com/NVIDIA-NeMo/RL/pull/3267."
         )
-    dataset, _val_dataset, env_handles, _val_env_handles = setup_response_data(
+    response_data = setup_response_data(
         tokenizer, data_config, env_configs=master_config.env
     )
+    assert len(response_data) == 4
+    dataset, _val_dataset, env_handles, _val_env_handles = response_data
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
@@ -366,7 +383,9 @@ def setup_single_controller(
     # ==========================
     # Setup Algorithm + Rollout Wiring
     # ==========================
-    advantage_estimator = _create_advantage_estimator(master_config)
+    advantage_estimator = _create_advantage_estimator(
+        cast(GrpoMasterConfig, master_config)
+    )
     loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)

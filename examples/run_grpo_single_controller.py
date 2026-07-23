@@ -125,9 +125,21 @@ def main() -> None:
         result = ray.get(sc.run.remote())
         print(f"SC run complete: {result}")
     finally:
-        # Drain env actors before vLLM to avoid in-flight 500 on in-flight requests.
-        for handle in actor_args.env_handles.values():
-            ray.get(handle.shutdown.remote())
+        # Drain env actors before generation to avoid in-flight requests during shutdown.
+        for env_name, handle in actor_args.env_handles.items():
+            try:
+                ray.get(handle.shutdown.remote())
+            except Exception as e:
+                print(f"Env {env_name!r} shutdown failed: {e}")
+
+        for resource_name, resource in (
+            ("Generation", actor_args.gen_handle),
+            ("Trainer", actor_args.trainer_handle),
+        ):
+            try:
+                resource.shutdown()
+            except Exception as e:
+                print(f"{resource_name} shutdown failed: {e}")
 
 
 if __name__ == "__main__":

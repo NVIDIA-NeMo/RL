@@ -16,10 +16,13 @@ from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from examples import run_grpo_single_controller
 
 
-def test_main_configures_generation_for_trained_mtp(monkeypatch) -> None:
+@pytest.fixture
+def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     generation_config = {"backend": "vllm"}
     config = SimpleNamespace(
         policy={
@@ -35,7 +38,12 @@ def test_main_configures_generation_for_trained_mtp(monkeypatch) -> None:
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
     configure_generation = MagicMock(return_value=configured_generation)
     actor = SimpleNamespace(run=SimpleNamespace(remote=MagicMock(return_value="run")))
-    actor_args = SimpleNamespace(env_handles={})
+    actor_args = SimpleNamespace(
+        env_handles={},
+        gen_handle=SimpleNamespace(shutdown=MagicMock()),
+        trainer_handle=SimpleNamespace(shutdown=MagicMock()),
+    )
+    ray_get = MagicMock(return_value={})
 
     monkeypatch.setattr(
         run_grpo_single_controller,
@@ -75,14 +83,70 @@ def test_main_configures_generation_for_trained_mtp(monkeypatch) -> None:
         "remote",
         MagicMock(return_value=actor),
     )
-    monkeypatch.setattr(run_grpo_single_controller.ray, "get", lambda _: {})
+    monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
 
+    return SimpleNamespace(
+        actor_args=actor_args,
+        config=config,
+        configure_generation=configure_generation,
+        configured_generation=configured_generation,
+        generation_config=generation_config,
+        ray_get=ray_get,
+    )
+
+
+def test_cleanup_is_best_effort_and_preserves_run_error(
+    main_context: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failing_env = SimpleNamespace(
+        shutdown=SimpleNamespace(remote=MagicMock(return_value="failing-env"))
+    )
+    healthy_env = SimpleNamespace(
+        shutdown=SimpleNamespace(remote=MagicMock(return_value="healthy-env"))
+    )
+    generation = SimpleNamespace(
+        shutdown=MagicMock(side_effect=RuntimeError("generation cleanup failed"))
+    )
+    trainer = SimpleNamespace(shutdown=MagicMock())
+    main_context.actor_args.env_handles = {
+        "failing": failing_env,
+        "healthy": healthy_env,
+    }
+    main_context.actor_args.gen_handle = generation
+    main_context.actor_args.trainer_handle = trainer
+
+    def get(ref: object) -> None:
+        if ref == "run":
+            raise RuntimeError("training failed")
+        if ref == "failing-env":
+            raise RuntimeError("env cleanup failed")
+        return None
+
+    main_context.ray_get.side_effect = get
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        run_grpo_single_controller.main()
+
+    healthy_env.shutdown.remote.assert_called_once_with()
+    generation.shutdown.assert_called_once_with()
+    trainer.shutdown.assert_called_once_with()
+    output = capsys.readouterr().out
+    assert "Env 'failing' shutdown failed: env cleanup failed" in output
+    assert "Generation shutdown failed: generation cleanup failed" in output
+
+
+def test_main_configures_generation_for_trained_mtp(
+    main_context: SimpleNamespace,
+) -> None:
     run_grpo_single_controller.main()
 
-    configure_generation.assert_called_once_with(
-        generation_config,
+    main_context.configure_generation.assert_called_once_with(
+        main_context.generation_config,
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
     )
-    assert config.policy["generation"] is configured_generation
+    assert (
+        main_context.config.policy["generation"] is main_context.configured_generation
+    )

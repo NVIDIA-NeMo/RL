@@ -51,7 +51,7 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, NonNegativeInt
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
@@ -395,7 +395,7 @@ class InOrderSampler(_GatedSampler):
 class WindowedSamplerConfig(BaseModel, extra="allow"):
     name: Literal["windowed"] = "windowed"
     # Max weight-version gap a selected group may have from the trainer.
-    max_staleness_versions: int = Field(default=1, ge=0)
+    max_staleness_versions: NonNegativeInt = 1
     # Prefer smallest lag when picking from the in-window set.
     sample_freshest_first: bool = False
 
@@ -403,13 +403,13 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
 class WeightFifoSamplerConfig(BaseModel, extra="allow"):
     name: Literal["weight_fifo"] = "weight_fifo"
     # Lookahead + selectable weight window, in trainer versions.
-    max_staleness_versions: int = Field(default=1, ge=0)
+    max_staleness_versions: NonNegativeInt = 1
 
 
 class InOrderSamplerConfig(BaseModel, extra="allow"):
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
-    max_lookahead_versions: int = Field(default=1, ge=0)
+    max_lookahead_versions: NonNegativeInt = 1
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
