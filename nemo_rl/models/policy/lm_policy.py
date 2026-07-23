@@ -38,6 +38,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.sglang.utils.refit_deadline import (
+    SGLangRefitDeadline,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -1071,16 +1074,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         *,
         rollout_engines: list[ray.actor.ActorHandle],
         engine_gpu_counts: list[int],
+        timeout_s: float,
         group_name: Optional[str] = None,
     ) -> None:
         """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit."""
+        deadline = SGLangRefitDeadline(timeout_s)
         futures = self.worker_group.run_all_workers_single_data(
             "connect_sglang_rollout_engines_distributed",
             rollout_engines=rollout_engines,
             engine_gpu_counts=engine_gpu_counts,
+            timeout_s=deadline.remaining(
+                "dispatching trainer communicator bootstrap"
+            ),
             group_name=group_name,
         )
-        ray.get(futures)
+        deadline.ray_get(
+            futures,
+            stage="waiting for trainer communicator bootstrap",
+            cancel_on_error=True,
+        )
+
+    def abort_sglang_rollout_engines_distributed(
+        self, *, timeout_s: float
+    ) -> list[ray.ObjectRef]:
+        """Queue trainer-side communicator abort on every policy worker."""
+        return self.worker_group.run_all_workers_single_data(
+            "abort_sglang_rollout_engines_distributed",
+            timeout_s=timeout_s,
+        )
 
     def update_weights_to_sglang_distributed(
         self,
@@ -1088,6 +1109,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         rollout_engines: list[ray.actor.ActorHandle],
         rollout_engine_lock: ray.actor.ActorHandle,
         buffer_size_bytes: int,
+        timeout_s: float,
         target_precision: str = "bf16",
         sglang_quantization_cfg: Optional[dict[str, Any]] = None,
     ) -> list[ray.ObjectRef]:
@@ -1097,6 +1119,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             rollout_engines=rollout_engines,
             rollout_engine_lock=rollout_engine_lock,
             buffer_size_bytes=buffer_size_bytes,
+            timeout_s=timeout_s,
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quantization_cfg,
         )

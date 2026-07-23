@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import sys
 import time
 import warnings
 from collections import defaultdict
@@ -23,6 +24,8 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
+
+_BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S = 5.0
 
 import ray
 import torch
@@ -52,6 +55,10 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.sglang.utils.refit_deadline import (
+    SGLangRefitDeadline,
+    SGLangRefitTimeoutError,
+)
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -91,11 +98,13 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    SGLangCommunicatorRecoveryError,
+    _abort_process_group,
     broadcast_hf_buckets_via_distributed_impl,
     connect_colocate_topology,
     connect_rollout_engines_from_distributed,
-    disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    reset_rollout_engines_from_distributed,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -496,6 +505,8 @@ class MegatronPolicyWorkerImpl(
         self._sglang_dist_group: Any = None
         self._sglang_dist_group_name: str = "nemo_rl_sglang"
         self._sglang_dist_engines: list = []
+        self._sglang_dist_engine_reset_required: bool = False
+        self._sglang_dist_recovery_error: str | None = None
         self._sglang_weight_version: int = 0
 
         self._init_inference_engine_state()
@@ -2110,6 +2121,7 @@ class MegatronPolicyWorkerImpl(
         *,
         rollout_engines: list,
         engine_gpu_counts: list[int],
+        timeout_s: float,
         group_name: Optional[str] = None,
     ) -> None:
         """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit.
@@ -2120,25 +2132,118 @@ class MegatronPolicyWorkerImpl(
         """
         if self.rank != 0:
             return
+        deadline = SGLangRefitDeadline(timeout_s)
 
         if group_name is not None:
             self._sglang_dist_group_name = group_name
 
-        if self._sglang_dist_group is not None:
-            disconnect_rollout_engines_from_distributed(
-                group_name=self._sglang_dist_group_name,
-                model_update_group=self._sglang_dist_group,
-                rollout_engines=self._sglang_dist_engines,
+        if self._sglang_dist_recovery_error is not None:
+            raise RuntimeError(
+                "The previous SGLang trainer communicator could not be "
+                "aborted safely. This policy worker must be restarted before "
+                f"another refit: {self._sglang_dist_recovery_error}"
             )
-            self._sglang_dist_group = None
-            self._sglang_dist_engines = []
 
-        self._sglang_dist_group = connect_rollout_engines_from_distributed(
-            group_name=self._sglang_dist_group_name,
-            rollout_engines=list(rollout_engines),
-            engine_gpu_counts=list(engine_gpu_counts),
-        )
-        self._sglang_dist_engines = list(rollout_engines)
+        incoming_engines = list(rollout_engines)
+        if (
+            self._sglang_dist_group is not None
+            and not self._sglang_dist_engine_reset_required
+            and self._sglang_dist_engines == incoming_engines
+        ):
+            return
+
+        if self._sglang_dist_group is not None:
+            old_group = self._sglang_dist_group
+            self._sglang_dist_group = None
+            self._sglang_dist_engine_reset_required = True
+            try:
+                _abort_process_group(old_group)
+            except ValueError:
+                # A racing failure cleanup may already have unregistered it.
+                pass
+            except Exception as exc:
+                self._sglang_dist_recovery_error = repr(exc)
+                raise
+
+        if self._sglang_dist_engine_reset_required:
+            reset_rollout_engines_from_distributed(
+                group_name=self._sglang_dist_group_name,
+                rollout_engines=self._sglang_dist_engines or incoming_engines,
+                deadline=deadline,
+            )
+            self._sglang_dist_engine_reset_required = False
+
+        self._sglang_dist_engines = incoming_engines
+        try:
+            new_group = connect_rollout_engines_from_distributed(
+                group_name=self._sglang_dist_group_name,
+                rollout_engines=incoming_engines,
+                engine_gpu_counts=list(engine_gpu_counts),
+                deadline=deadline,
+            )
+        except SGLangCommunicatorRecoveryError as exc:
+            self._sglang_dist_recovery_error = repr(exc)
+            self._sglang_dist_engine_reset_required = True
+            raise
+        except Exception:
+            # The helper aborts any trainer group it managed to create and
+            # queues engine cleanup. Require a confirmed engine reset before
+            # a later attempt can initialize the same group name.
+            self._sglang_dist_engine_reset_required = True
+            raise
+        else:
+            self._sglang_dist_group = new_group
+            self._sglang_dist_engine_reset_required = False
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name(
+        "megatron_policy_worker/abort_sglang_rollout_engines_distributed"
+    )
+    def abort_sglang_rollout_engines_distributed(self, *, timeout_s: float) -> None:
+        """Abort trainer state and best-effort reset every engine communicator."""
+        if self.rank != 0:
+            return
+
+        deadline = SGLangRefitDeadline(timeout_s)
+        group = self._sglang_dist_group
+        self._sglang_dist_group = None
+        if self._sglang_dist_engines:
+            self._sglang_dist_engine_reset_required = True
+
+        abort_error = None
+        if group is not None:
+            try:
+                _abort_process_group(group)
+            except ValueError:
+                # A racing failure cleanup may already have unregistered it.
+                pass
+            except Exception as exc:
+                abort_error = exc
+                self._sglang_dist_recovery_error = repr(exc)
+
+        reset_error = None
+        if self._sglang_dist_engine_reset_required:
+            try:
+                reset_rollout_engines_from_distributed(
+                    group_name=self._sglang_dist_group_name,
+                    rollout_engines=self._sglang_dist_engines,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                reset_error = exc
+            else:
+                self._sglang_dist_engine_reset_required = False
+
+        if abort_error is not None:
+            if reset_error is not None:
+                abort_error.add_note(
+                    f"Engine communicator reset also failed: {reset_error!r}"
+                )
+            raise RuntimeError(
+                "Failed to abort the trainer-side SGLang communicator"
+            ) from abort_error
+        if reset_error is not None:
+            raise reset_error
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_distributed")
@@ -2148,6 +2253,7 @@ class MegatronPolicyWorkerImpl(
         rollout_engines: list,
         rollout_engine_lock,
         buffer_size_bytes: int,
+        timeout_s: float,
         target_precision: str = "bf16",
         sglang_quantization_cfg: Optional[dict] = None,
     ) -> None:
@@ -2158,6 +2264,7 @@ class MegatronPolicyWorkerImpl(
         participate in the NCCL broadcast. This matches the design's "trainer
         rank 0 as the only source" decision.
         """
+        deadline = SGLangRefitDeadline(timeout_s)
         self._sglang_weight_version += 1
         iterator = self._build_sglang_hf_iterator(
             target_precision=target_precision,
@@ -2170,9 +2277,13 @@ class MegatronPolicyWorkerImpl(
 
         if self.rank != 0:
             # Drain the iterator so AutoBridge collectives complete on every
-            # rank, but do not broadcast.
+            # rank, but do not broadcast. These synchronous collectives do
+            # not expose a per-call timeout; the driver Ray wait is
+            # authoritative and this check detects expiry between buckets.
             for _ in bucket_iter:
-                pass
+                deadline.remaining(
+                    "draining Megatron/AutoBridge restoration collectives"
+                )
             return
 
         if self._sglang_dist_group is None:
@@ -2181,14 +2292,35 @@ class MegatronPolicyWorkerImpl(
                 "before update_weights_to_sglang_distributed."
             )
 
-        broadcast_hf_buckets_via_distributed_impl(
-            bucket_iterator=bucket_iter,
-            rollout_engines=list(rollout_engines),
-            rollout_engine_lock=rollout_engine_lock,
-            group_name=self._sglang_dist_group_name,
-            model_update_group=self._sglang_dist_group,
-            weight_version=self._sglang_weight_version,
-        )
+        completed = False
+        try:
+            broadcast_hf_buckets_via_distributed_impl(
+                bucket_iterator=bucket_iter,
+                rollout_engines=list(rollout_engines),
+                rollout_engine_lock=rollout_engine_lock,
+                group_name=self._sglang_dist_group_name,
+                model_update_group=self._sglang_dist_group,
+                weight_version=self._sglang_weight_version,
+                deadline=deadline,
+            )
+            completed = True
+        finally:
+            if not completed:
+                active_error = sys.exception()
+                try:
+                    self.abort_sglang_rollout_engines_distributed(
+                        timeout_s=max(
+                            deadline.remaining_or_zero(),
+                            _BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S,
+                        )
+                    )
+                except Exception as cleanup_exc:
+                    if active_error is None:
+                        raise
+                    active_error.add_note(
+                        "SGLang trainer communicator abort failed: "
+                        f"{cleanup_exc!r}. This policy worker cannot be reused."
+                    )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
@@ -2865,32 +2997,32 @@ def refit_sglang_colocated(
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
     target_precision = sglang_quant["scheme"]
-
-    (
-        rollout_engines,
-        _rollout_engine_lock,
-        num_new_engines,
-        engine_gpu_counts,
-        engine_gpu_offsets,
-    ) = fetch_updatable_engines_with_recover(policy_generation)
-
-    if num_new_engines > 0:
-        policy.connect_sglang_rollout_engines(
-            engine_gpu_counts=engine_gpu_counts,
-            engine_gpu_offsets=engine_gpu_offsets,
-        )
-        policy_generation.clear_updatable_num_new_engines()
-        assert policy_generation.num_new_engines == 0, (
-            "clear_updatable_num_new_engines did not zero num_new_engines"
-        )
-
-    # Pause with the configured mode, but only invalidate the KV cache when
-    # the mode actually drops generation state. "in_place" leaves the engine
-    # paused without dropping its KV cache, so flushing would clobber the
-    # still-valid in-place state.
-    pause_mode = policy_generation.pause_generation_mode
-    policy_generation.pause_generation(mode=pause_mode)
+    monitor_refit_lease = None
+    generation_pause_attempted = False
+    generation_continue_succeeded = False
     try:
+        (
+            rollout_engines,
+            _rollout_engine_lock,
+            num_new_engines,
+            engine_gpu_counts,
+            engine_gpu_offsets,
+            monitor_refit_lease,
+        ) = fetch_updatable_engines_with_recover(policy_generation)
+
+        if num_new_engines > 0:
+            policy.connect_sglang_rollout_engines(
+                engine_gpu_counts=engine_gpu_counts,
+                engine_gpu_offsets=engine_gpu_offsets,
+            )
+            policy_generation.clear_updatable_num_new_engines()
+            assert policy_generation.num_new_engines == 0, (
+                "clear_updatable_num_new_engines did not zero num_new_engines"
+            )
+
+        pause_mode = policy_generation.pause_generation_mode
+        generation_pause_attempted = True
+        policy_generation.pause_generation(mode=pause_mode)
         invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
         # Per-worker actor method is now synchronous (per-chunk ray.get +
         # lifetime-safe IPC handled inside send_hf_buckets_via_ipc_actor_impl),
@@ -2905,7 +3037,25 @@ def refit_sglang_colocated(
         ray.get(futures)
         policy_generation.post_process_weights()
     finally:
-        policy_generation.continue_generation()
+        active_error = sys.exception()
+        if generation_pause_attempted:
+            try:
+                policy_generation.continue_generation()
+            except Exception as cleanup_exc:
+                if active_error is None:
+                    raise
+                active_error.add_note(
+                    "Generation resume after SGLang refit failure also failed: "
+                    f"{cleanup_exc!r}. Health monitoring remains suspended."
+                )
+            else:
+                generation_continue_succeeded = True
+        if monitor_refit_lease is not None and (
+            not generation_pause_attempted or generation_continue_succeeded
+        ):
+            policy_generation.health_monitoring_release_refit(
+                monitor_refit_lease
+            )
     return True
 
 
@@ -2922,49 +3072,143 @@ def refit_sglang_distributed(
     but do not broadcast. Includes optional fault-tolerance recover prelude.
     """
     from nemo_rl.models.policy.utils import (
+        cancel_ray_refs,
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
-        invalidate_sglang_kv_cache_for_refit,
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
     target_precision = sglang_quant["scheme"]
+    deadline = SGLangRefitDeadline(policy_generation.refit_timeout_s)
+    monitor_refit_lease = None
+    generation_pause_attempted = False
+    generation_continue_succeeded = False
+    transfer_futures = []
+    communicator_touched = False
+    try:
+        (
+            rollout_engines,
+            rollout_engine_lock,
+            num_new_engines,
+            engine_gpu_counts,
+            _engine_gpu_offsets,
+            monitor_refit_lease,
+        ) = fetch_updatable_engines_with_recover(
+            policy_generation,
+            deadline=deadline,
+        )
 
-    (
-        rollout_engines,
-        rollout_engine_lock,
-        num_new_engines,
-        engine_gpu_counts,
-        _engine_gpu_offsets,
-    ) = fetch_updatable_engines_with_recover(policy_generation)
-
-    if num_new_engines > 0:
+        # Every refit verifies the communicator state. The worker reuses the
+        # existing group when the same engines are still healthy and rebuilds
+        # it only when absent, changed, or marked poisoned.
+        communicator_touched = True
         policy.connect_sglang_rollout_engines_distributed(
             rollout_engines=rollout_engines,
             engine_gpu_counts=engine_gpu_counts,
-        )
-        policy_generation.clear_updatable_num_new_engines()
-        assert policy_generation.num_new_engines == 0, (
-            "clear_updatable_num_new_engines did not zero num_new_engines"
+            timeout_s=deadline.remaining(
+                "connecting the SGLang weight-update communicator"
+            ),
         )
 
-    # Pause with the configured mode, but only invalidate the KV cache when
-    # the mode actually drops generation state. "in_place" leaves the engine
-    # paused without dropping its KV cache, so flushing would clobber the
-    # still-valid in-place state.
-    pause_mode = policy_generation.pause_generation_mode
-    policy_generation.pause_generation(mode=pause_mode)
-    try:
-        invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
-        futures = policy.update_weights_to_sglang_distributed(
+        if num_new_engines > 0:
+            policy_generation.clear_updatable_num_new_engines()
+            assert policy_generation.num_new_engines == 0, (
+                "clear_updatable_num_new_engines did not zero num_new_engines"
+            )
+
+        # ``in_place`` preserves valid generation state, so cache invalidation
+        # is intentionally skipped for that mode.
+        pause_mode = policy_generation.pause_generation_mode
+        generation_pause_attempted = True
+        policy_generation.pause_generation(mode=pause_mode, deadline=deadline)
+        if pause_mode != "in_place" and not policy_generation.invalidate_kv_cache(
+            deadline=deadline
+        ):
+            raise RuntimeError("SGLang KV-cache invalidation failed before refit")
+
+        transfer_futures = policy.update_weights_to_sglang_distributed(
             rollout_engines=rollout_engines,
             rollout_engine_lock=rollout_engine_lock,
             buffer_size_bytes=buffer_size_bytes,
+            timeout_s=deadline.remaining("dispatching SGLang weight transfer"),
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quant,
         )
-        ray.get(futures)
-        policy_generation.post_process_weights()
+        deadline.ray_get(
+            transfer_futures,
+            stage="waiting for SGLang weight transfer",
+            cancel_on_error=True,
+        )
+        policy_generation.post_process_weights(deadline=deadline)
+    except Exception as exc:
+        cancel_ray_refs(transfer_futures)
+        if communicator_touched:
+            cleanup_timeout_s = max(
+                deadline.remaining_or_zero(),
+                _BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S,
+            )
+            cleanup_deadline = SGLangRefitDeadline(cleanup_timeout_s)
+            try:
+                cleanup_refs = (
+                    policy.abort_sglang_rollout_engines_distributed(
+                        timeout_s=cleanup_deadline.remaining(
+                            "dispatching SGLang communicator cleanup"
+                        )
+                    )
+                )
+                cleanup_deadline.ray_get(
+                    cleanup_refs,
+                    stage="waiting for SGLang communicator cleanup",
+                    cancel_on_error=False,
+                )
+            except Exception as cleanup_exc:
+                exc.add_note(
+                    "SGLang communicator cleanup did not complete before "
+                    f"returning the refit failure: {cleanup_exc!r}. A later "
+                    "refit is fail-closed until cleanup is confirmed."
+                )
+        raise
     finally:
-        policy_generation.continue_generation()
+        active_error = sys.exception()
+        completion_error = None
+        if generation_pause_attempted:
+            try:
+                policy_generation.continue_generation(
+                    deadline=deadline,
+                    best_effort=True,
+                )
+            except Exception as cleanup_exc:
+                if active_error is None:
+                    raise
+                active_error.add_note(
+                    "Generation resume after SGLang refit failure also failed: "
+                    f"{cleanup_exc!r}. Health monitoring remains suspended."
+                )
+            else:
+                generation_continue_succeeded = True
+                if (
+                    active_error is None
+                    and deadline.remaining_or_zero() <= 0
+                ):
+                    completion_error = SGLangRefitTimeoutError(
+                        "SGLang refit deadline expired while safely resuming "
+                        "generation"
+                    )
+
+        if monitor_refit_lease is not None and (
+            not generation_pause_attempted or generation_continue_succeeded
+        ):
+            try:
+                policy_generation.health_monitoring_release_refit(
+                    monitor_refit_lease
+                )
+            except Exception as cleanup_exc:
+                if active_error is None:
+                    raise
+                active_error.add_note(
+                    "Restoring SGLang health monitoring also failed: "
+                    f"{cleanup_exc!r}"
+                )
+        if completion_error is not None:
+            raise completion_error
     return True

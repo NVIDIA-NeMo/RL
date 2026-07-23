@@ -32,6 +32,11 @@ policy:
       rollout_health_check_interval: 60
       rollout_health_check_timeout: 60
       rollout_health_check_first_wait: 60
+      # One monotonic orchestration deadline for communicator bootstrap,
+      # SGLang transport, post-processing, and failure cleanup on the
+      # disaggregated Megatron refit path. Synchronous Megatron/AutoBridge
+      # restoration collectives remain governed by their process-group timeout.
+      refit_timeout_s: 1800
       # Weight precision for rollout/refit. scheme=bf16 (default) sends BF16
       # HF tensors; scheme=mxfp8 boots SGLang from an MXFP8 HF checkpoint and
       # quantizes refit tensors online (see SglangQuantizationConfig).

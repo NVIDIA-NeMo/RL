@@ -15,6 +15,8 @@
 import asyncio
 import logging
 import os
+import threading
+import uuid
 from typing import Any, AsyncGenerator, Optional
 
 import ray
@@ -47,6 +49,10 @@ from nemo_rl.models.generation.sglang.utils.http_utils import HttpClient
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import (
     _allocate_rollout_engine_addr_and_ports_normal,
 )
+from nemo_rl.models.generation.sglang.utils.refit_deadline import (
+    SGLangRefitDeadline,
+    SGLangRefitTimeoutError,
+)
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
     Lock,
@@ -58,6 +64,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+_BEST_EFFORT_REFIT_CLEANUP_TIMEOUT_S = 5.0
+_OFFLOAD_MONITOR_SUSPENSION = "offload"
 
 
 class SGLangGeneration(GenerationInterface):
@@ -116,6 +125,12 @@ class SGLangGeneration(GenerationInterface):
         self.num_new_engines: int = 0
         self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
         self._health_monitor: RolloutHealthMonitor | None = None
+        self._health_monitor_suspensions: dict[str, str] = {}
+        self._health_monitor_state_lock = threading.Lock()
+        if self.needs_offload:
+            self._health_monitor_suspensions[_OFFLOAD_MONITOR_SUSPENSION] = (
+                _OFFLOAD_MONITOR_SUSPENSION
+            )
 
         # --- Router bootstrap --------------------------------------------
         # Resolved router endpoint is held only on the instance; we don't
@@ -143,6 +158,8 @@ class SGLangGeneration(GenerationInterface):
             monitor = RolloutHealthMonitor(self, sglang_cfg)
             monitor.start()
             self._health_monitor = monitor
+            if not self._health_monitor_suspensions:
+                monitor.resume()
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -191,6 +208,7 @@ class SGLangGeneration(GenerationInterface):
         state["_http_client"] = None
         state["_async_loop"] = None
         state["_health_monitor"] = None
+        state["_health_monitor_state_lock"] = None
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -200,6 +218,7 @@ class SGLangGeneration(GenerationInterface):
             self._async_loop = AsyncLoopThread()
         if self.__dict__.get("_http_client") is None:
             self._http_client = HttpClient(self.sglang_cfg)
+        self._health_monitor_state_lock = threading.Lock()
 
     @property
     def engine_gpu_offsets(self) -> list[int]:
@@ -207,6 +226,32 @@ class SGLangGeneration(GenerationInterface):
             self.gpu_offset + j * self.num_gpus_per_engine
             for j in range(len(self.engines))
         ]
+
+    @property
+    def refit_timeout_s(self) -> float:
+        """Configured end-to-end timeout for disaggregated SGLang refits."""
+        timeout_s = float(self.sglang_cfg["sglang_cfg"]["refit_timeout_s"])
+        if timeout_s <= 0:
+            raise ValueError(
+                f"sglang_cfg.refit_timeout_s must be positive, got {timeout_s}"
+            )
+        return timeout_s
+
+    @staticmethod
+    def _wait_for_refit_refs(
+        refs,
+        *,
+        deadline: SGLangRefitDeadline | None,
+        stage: str,
+        cancel_on_error: bool = True,
+    ):
+        if deadline is None:
+            return ray.get(refs)
+        return deadline.ray_get(
+            refs,
+            stage=stage,
+            cancel_on_error=cancel_on_error,
+        )
 
     def get_rollout_engine_urls(self) -> list[str]:
         """Resolve node-0 engine HTTP base URLs once on the driver."""
@@ -355,7 +400,7 @@ class SGLangGeneration(GenerationInterface):
             ]
         )
 
-    def _recover(self) -> None:
+    def _recover(self, *, deadline: SGLangRefitDeadline | None = None) -> None:
         """Recover dead engines, overlapping init."""
         dead_indices = [
             i for i, engine in enumerate(self.all_engines) if engine is None
@@ -364,7 +409,11 @@ class SGLangGeneration(GenerationInterface):
         port_cursors: dict[int, int] = {}
         handles, _ = self._start_engines(port_cursors)
         if handles:
-            ray.get(handles)
+            self._wait_for_refit_refs(
+                handles,
+                deadline=deadline,
+                stage="restarting failed rollout engines",
+            )
 
         assert self.num_new_engines == len(dead_indices), (
             "num_new_engines does not match dead_indices length"
@@ -372,23 +421,50 @@ class SGLangGeneration(GenerationInterface):
 
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]
-            ray.get(
-                [
-                    engine.release_memory_occupation.remote(tags=["weights"])
-                    for engine in new_engines
-                ]
+            timeout_s = (
+                deadline.remaining("offloading recovered engine weights")
+                if deadline is not None
+                else None
             )
-            ray.get(
+            self._wait_for_refit_refs(
                 [
-                    engine.release_memory_occupation.remote(tags=["kv_cache"])
+                    engine.release_memory_occupation.remote(
+                        tags=["weights"], timeout_s=timeout_s
+                    )
                     for engine in new_engines
-                ]
+                ],
+                deadline=deadline,
+                stage="offloading recovered engine weights",
             )
-            ray.get(
+            timeout_s = (
+                deadline.remaining("offloading recovered engine KV caches")
+                if deadline is not None
+                else None
+            )
+            self._wait_for_refit_refs(
                 [
-                    engine.resume_memory_occupation.remote(tags=["weights"])
+                    engine.release_memory_occupation.remote(
+                        tags=["kv_cache"], timeout_s=timeout_s
+                    )
                     for engine in new_engines
-                ]
+                ],
+                deadline=deadline,
+                stage="offloading recovered engine KV caches",
+            )
+            timeout_s = (
+                deadline.remaining("restoring recovered engine weights")
+                if deadline is not None
+                else None
+            )
+            self._wait_for_refit_refs(
+                [
+                    engine.resume_memory_occupation.remote(
+                        tags=["weights"], timeout_s=timeout_s
+                    )
+                    for engine in new_engines
+                ],
+                deadline=deadline,
+                stage="restoring recovered engine weights",
             )
 
     def get_updatable_engines_and_lock(self):
@@ -401,11 +477,11 @@ class SGLangGeneration(GenerationInterface):
             self.engine_gpu_offsets,
         )
 
-    def recover_updatable_engines(self):
+    def recover_updatable_engines(
+        self, *, deadline: SGLangRefitDeadline | None = None
+    ):
         """Restart any dead rollout engines and update ``num_new_engines``."""
-        self.health_monitoring_pause()
-
-        self._recover()
+        self._recover(deadline=deadline)
 
         return (
             self.engines,
@@ -420,7 +496,12 @@ class SGLangGeneration(GenerationInterface):
         # manually after the refit dispatch connects the new engines.
         self.num_new_engines = 0
 
-    def pause_generation(self, mode: Optional[str] = None) -> None:
+    def pause_generation(
+        self,
+        mode: Optional[str] = None,
+        *,
+        deadline: SGLangRefitDeadline | None = None,
+    ) -> None:
         """Pause generation on every node-0 engine.
 
         Args:
@@ -435,20 +516,58 @@ class SGLangGeneration(GenerationInterface):
             return
         if mode is None:
             mode = self.pause_generation_mode
-        ray.get([e.pause_generation.remote(mode=mode) for e in engines])
+        timeout_s = (
+            deadline.remaining("dispatching generation pause")
+            if deadline is not None
+            else None
+        )
+        refs = [
+            e.pause_generation.remote(mode=mode, timeout_s=timeout_s) for e in engines
+        ]
+        self._wait_for_refit_refs(
+            refs,
+            deadline=deadline,
+            stage="waiting for generation pause",
+        )
 
-    def continue_generation(self) -> None:
+    def continue_generation(
+        self,
+        *,
+        deadline: SGLangRefitDeadline | None = None,
+        best_effort: bool = False,
+    ) -> None:
         """Resume generation on every node-0 engine."""
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return
-        ray.get([e.continue_generation.remote() for e in engines])
+        if deadline is None:
+            timeout_s = None
+            wait_deadline = None
+        elif best_effort:
+            cleanup_timeout_s = max(
+                deadline.remaining_or_zero(), _BEST_EFFORT_REFIT_CLEANUP_TIMEOUT_S
+            )
+            wait_deadline = SGLangRefitDeadline(cleanup_timeout_s)
+            timeout_s = wait_deadline.remaining("dispatching generation resume")
+        else:
+            timeout_s = deadline.remaining("dispatching generation resume")
+            wait_deadline = deadline
+        refs = [
+            e.continue_generation.remote(timeout_s=timeout_s) for e in engines
+        ]
+        self._wait_for_refit_refs(
+            refs,
+            deadline=wait_deadline,
+            stage="waiting for generation resume",
+            cancel_on_error=True,
+        )
 
     def post_process_weights(
         self,
         *,
         restore_weights_before_load: bool = False,
         post_process_quantization: bool = True,
+        deadline: SGLangRefitDeadline | None = None,
     ) -> None:
         """Run SGLang's ``/post_process_weights`` RPC on every node-0 engine.
 
@@ -459,23 +578,82 @@ class SGLangGeneration(GenerationInterface):
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return
-        ray.get(
-            [
-                e.post_process_weights.remote(
-                    restore_weights_before_load=restore_weights_before_load,
-                    post_process_quantization=post_process_quantization,
-                )
-                for e in engines
-            ]
+        timeout_s = (
+            deadline.remaining("dispatching weight post-processing")
+            if deadline is not None
+            else None
+        )
+        refs = [
+            e.post_process_weights.remote(
+                restore_weights_before_load=restore_weights_before_load,
+                post_process_quantization=post_process_quantization,
+                timeout_s=timeout_s,
+            )
+            for e in engines
+        ]
+        self._wait_for_refit_refs(
+            refs,
+            deadline=deadline,
+            stage="waiting for weight post-processing",
         )
 
-    def health_monitoring_pause(self) -> None:
-        if self._health_monitor:
-            self._health_monitor.pause()
+    def health_monitoring_suspend_for_refit(
+        self, *, deadline: SGLangRefitDeadline | None = None
+    ) -> str | None:
+        """Quiesce health checks and return a unique refit suspension lease.
 
-    def health_monitoring_resume(self) -> None:
-        if self._health_monitor:
-            self._health_monitor.resume()
+        The lease remains registered if quiescence times out. This fail-closed
+        latch prevents a later memory-onload call from re-enabling checks while
+        a health action or failed refit may still own engine state.
+        """
+        if not self._health_monitor:
+            return None
+
+        lease = f"refit:{uuid.uuid4().hex}"
+        with self._health_monitor_state_lock:
+            self._health_monitor_suspensions[lease] = "refit"
+            timeout_s = (
+                deadline.remaining("quiescing rollout health monitoring")
+                if deadline is not None
+                else self._health_monitor.default_quiesce_timeout_s
+            )
+            self._health_monitor.pause(timeout_s=timeout_s)
+        return lease
+
+    def health_monitoring_release_refit(self, lease: str | None) -> None:
+        """Release one successfully completed refit's monitor suspension."""
+        if not self._health_monitor or lease is None:
+            return
+        with self._health_monitor_state_lock:
+            reason = self._health_monitor_suspensions.get(lease)
+            if reason != "refit":
+                raise RuntimeError(f"Unknown SGLang refit monitor lease: {lease}")
+            del self._health_monitor_suspensions[lease]
+            if not self._health_monitor_suspensions:
+                self._health_monitor.resume()
+
+    def _health_monitoring_suspend_for_offload(self) -> None:
+        """Quiesce checks before releasing engine memory."""
+        if not self._health_monitor:
+            return
+        with self._health_monitor_state_lock:
+            self._health_monitor_suspensions[_OFFLOAD_MONITOR_SUSPENSION] = (
+                _OFFLOAD_MONITOR_SUSPENSION
+            )
+            self._health_monitor.pause(
+                timeout_s=self._health_monitor.default_quiesce_timeout_s
+            )
+
+    def _health_monitoring_release_offload(self) -> None:
+        """Release only the memory-offload suspension after a safe onload."""
+        if not self._health_monitor:
+            return
+        with self._health_monitor_state_lock:
+            self._health_monitor_suspensions.pop(
+                _OFFLOAD_MONITOR_SUSPENSION, None
+            )
+            if not self._health_monitor_suspensions:
+                self._health_monitor.resume()
 
     def shutdown(self) -> bool:
         ok = True
@@ -943,6 +1121,10 @@ class SGLangGeneration(GenerationInterface):
         if not engines:
             return
         ray.get([e.resume_memory_occupation.remote(tags=tags) for e in engines])
+        # ``tags=["weights"]`` is only the first half of colocated onload.
+        # Health requests require the KV cache to be active as well.
+        if tags is None or "kv_cache" in tags:
+            self._health_monitoring_release_offload()
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
@@ -952,9 +1134,14 @@ class SGLangGeneration(GenerationInterface):
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return
+        # Quiesce before releasing any resource a health request may touch.
+        # A failed release intentionally leaves monitoring paused.
+        self._health_monitoring_suspend_for_offload()
         ray.get([e.release_memory_occupation.remote(tags=tags) for e in engines])
 
-    def invalidate_kv_cache(self) -> bool:
+    def invalidate_kv_cache(
+        self, *, deadline: SGLangRefitDeadline | None = None
+    ) -> bool:
         """Invalidate KV cache before weight updates (Megatron-style).
 
         Flushes the cache on every node-0 engine so stale KV entries are
@@ -964,8 +1151,22 @@ class SGLangGeneration(GenerationInterface):
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return True
+        timeout_s = (
+            deadline.remaining("dispatching SGLang KV-cache invalidation")
+            if deadline is not None
+            else None
+        )
+        refs = [
+            e.invalidate_kv_cache.remote(timeout_s=timeout_s) for e in engines
+        ]
         try:
-            ray.get([e.invalidate_kv_cache.remote() for e in engines])
+            self._wait_for_refit_refs(
+                refs,
+                deadline=deadline,
+                stage="waiting for SGLang KV-cache invalidation",
+            )
+        except SGLangRefitTimeoutError:
+            raise
         except Exception as e:
             logger.error(f"[sglang refit] Error flushing SGLang caches: {e}")
             return False

@@ -33,6 +33,23 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
 logger = logging.getLogger(__name__)
 
 
+def _is_absent_weight_update_group_response(
+    response: requests.Response | None,
+) -> bool:
+    """Return whether SGLang reports that the requested group is already absent."""
+    if response is None or response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("success") is False
+        and "does not exist" in str(payload.get("message", "")).lower()
+    )
+
+
 @ray.remote  # pragma: no cover
 class SGLangGenerationWorker:
     def __init__(
@@ -141,12 +158,19 @@ class SGLangGenerationWorker:
             f"router {workers_url}.{detail}"
         )
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
+            timeout_s: Optional connect/read timeout in seconds.
 
         Returns:
             The JSON response from the server
@@ -155,7 +179,7 @@ class SGLangGenerationWorker:
             return
 
         url = f"{self.server_base_url}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, timeout=timeout_s)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -256,7 +280,12 @@ class SGLangGenerationWorker:
                 response.raise_for_status()
         kill_process_tree(self.process.pid)
 
-    def release_memory_occupation(self, tags: list[str] | None = None):
+    def release_memory_occupation(
+        self,
+        tags: list[str] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         """Release memory occupation. Available tags: weights, kv_cache."""
         from sglang.srt.constants import (
             GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -273,13 +302,19 @@ class SGLangGenerationWorker:
         if "kv_cache" in tags:
             sglang_tags.extend([GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
-        self.invalidate_kv_cache()
+        self.invalidate_kv_cache(timeout_s=timeout_s)
         return self._make_request(
             "release_memory_occupation",
             {"tags": sglang_tags},
+            timeout_s=timeout_s,
         )
 
-    def resume_memory_occupation(self, tags: list[str] | None = None):
+    def resume_memory_occupation(
+        self,
+        tags: list[str] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         """Available tags for multi-stage resume: weights, kv_cache."""
         from sglang.srt.constants import (
             GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -299,6 +334,7 @@ class SGLangGenerationWorker:
         return self._make_request(
             "resume_memory_occupation",
             {"tags": sglang_tags},
+            timeout_s=timeout_s,
         )
 
     def check_weights(self, action: str):
@@ -315,7 +351,15 @@ class SGLangGenerationWorker:
         response.raise_for_status()
 
     def init_weights_update_group(
-        self, master_address, master_port, rank_offset, world_size, group_name, backend
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend,
+        *,
+        timeout_s: float,
     ):
         return self._make_request(
             "init_weights_update_group",
@@ -327,19 +371,27 @@ class SGLangGenerationWorker:
                 "group_name": group_name,
                 "backend": backend,
             },
+            timeout_s=timeout_s,
         )
 
-    def destroy_weights_update_group(self, group_name):
+    def destroy_weights_update_group(self, group_name, *, timeout_s: float):
         try:
             return self._make_request(
                 "destroy_weights_update_group",
                 {
                     "group_name": group_name,
                 },
+                timeout_s=timeout_s,
             )
-        except requests.exceptions.RequestException:
-            # catch the case where the engine is just created and does not have the group.
-            pass
+        except requests.exceptions.HTTPError as exc:
+            if not _is_absent_weight_update_group_response(exc.response):
+                raise
+            # A partial bootstrap or previous best-effort cleanup can leave the
+            # group absent on only some engines. Treat that state as cleaned up.
+            return {
+                "success": True,
+                "message": "Custom process group was already absent.",
+            }
 
     def update_weights_from_distributed(
         self,
@@ -349,6 +401,7 @@ class SGLangGenerationWorker:
         group_name,
         flush_cache=False,
         weight_version: str | None = None,
+        timeout_s: float | None = None,
     ):
         payload = {
             "names": names,
@@ -362,18 +415,26 @@ class SGLangGenerationWorker:
         return self._make_request(
             "update_weights_from_distributed",
             payload,
+            timeout_s=timeout_s,
         )
 
-    def pause_generation(self, mode: str = "retract"):
+    def pause_generation(
+        self, mode: str = "retract", *, timeout_s: float | None = None
+    ):
         response = requests.post(
             f"{self.server_base_url}/pause_generation",
             json={"mode": mode},
+            timeout=timeout_s,
         )
         response.raise_for_status()
         return response
 
-    def continue_generation(self):
-        response = requests.post(f"{self.server_base_url}/continue_generation", json={})
+    def continue_generation(self, *, timeout_s: float | None = None):
+        response = requests.post(
+            f"{self.server_base_url}/continue_generation",
+            json={},
+            timeout=timeout_s,
+        )
         response.raise_for_status()
         return response
 
@@ -381,6 +442,7 @@ class SGLangGenerationWorker:
         self,
         restore_weights_before_load: bool = False,
         post_process_quantization: bool = False,
+        timeout_s: float | None = None,
     ):
         """Finalize engine-side weights after a distributed/IPC refit.
 
@@ -393,6 +455,7 @@ class SGLangGenerationWorker:
                 "restore_weights_before_load": restore_weights_before_load,
                 "post_process_quantization": post_process_quantization,
             },
+            timeout_s=timeout_s,
         )
 
     def _simulate_crash(self):
@@ -453,12 +516,15 @@ class SGLangGenerationWorker:
             return None
         return self.server_base_url
 
-    def invalidate_kv_cache(self) -> None:
+    def invalidate_kv_cache(self, *, timeout_s: float | None = None) -> None:
         """Flush this server's KV cache."""
         if self.node_rank != 0:
             return
 
-        response = requests.get(f"{self.server_base_url}/flush_cache")
+        response = requests.get(
+            f"{self.server_base_url}/flush_cache",
+            timeout=timeout_s,
+        )
         if response.status_code != 200:
             response.raise_for_status()
             raise RuntimeError(

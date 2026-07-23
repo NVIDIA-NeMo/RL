@@ -14,7 +14,10 @@
 
 import gc
 import os
+import sys
+import time
 import traceback
+import uuid
 from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
@@ -54,6 +57,11 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.sglang.utils.refit_deadline import (
+    SGLangRefitDeadline,
+    SGLangRefitTimeoutError,
+    cancel_ray_refs,
+)
 
 # an automodel factory for loading the huggingface models from correct class
 
@@ -612,7 +620,10 @@ def _check_weight_sync_results(results: list) -> None:
         if isinstance(result, Mapping):
             success = result.get("success")
             error_msg = (
-                result.get("error_message") or result.get("error") or "unknown error"
+                result.get("error_message")
+                or result.get("error")
+                or result.get("message")
+                or "unknown error"
             )
         elif hasattr(result, "success"):
             success = result.success
@@ -876,11 +887,72 @@ def init_process_group(
     return pg
 
 
+_BEST_EFFORT_REFIT_CLEANUP_TIMEOUT_S = 5.0
+
+
+class SGLangCommunicatorRecoveryError(RuntimeError):
+    """Raised when a failed trainer communicator cannot be aborted safely."""
+
+
+def _abort_process_group(
+    model_update_group: "torch.distributed.ProcessGroup",
+) -> None:
+    """Abort and unregister a failed NCCL group without flushing pending work.
+
+    PyTorch 2.11's normal ``destroy_process_group`` path calls ``shutdown()``,
+    which waits for pending kernels and can hang on a failed collective. Its
+    explicit failure path aborts the communicators and removes all Python/C++
+    registry entries, allowing an out-of-band-synchronized reconnect.
+    """
+    from torch.distributed.distributed_c10d import _abort_process_group
+
+    _abort_process_group(model_update_group)
+
+
+def _destroy_engine_weight_update_groups(
+    *,
+    group_name: str,
+    rollout_engines: list,
+    request_timeout_s: float,
+) -> list:
+    """Dispatch idempotent engine-side communicator destruction."""
+    return [
+        engine.destroy_weights_update_group.remote(
+            group_name,
+            timeout_s=request_timeout_s,
+        )
+        for engine in rollout_engines
+    ]
+
+
+def reset_rollout_engines_from_distributed(
+    *,
+    group_name: str,
+    rollout_engines: list,
+    deadline: SGLangRefitDeadline,
+) -> None:
+    """Require engine-side stale-group cleanup before a reconnect."""
+    refs = _destroy_engine_weight_update_groups(
+        group_name=group_name,
+        rollout_engines=rollout_engines,
+        request_timeout_s=deadline.remaining(
+            "dispatching stale engine communicator cleanup"
+        ),
+    )
+    results = deadline.ray_get(
+        refs,
+        stage="waiting for stale engine communicator cleanup",
+        cancel_on_error=True,
+    )
+    _check_weight_sync_results(results)
+
+
 def connect_rollout_engines_from_distributed(
     *,
     group_name: str,
     rollout_engines: list,
     engine_gpu_counts: list[int],
+    deadline: SGLangRefitDeadline,
 ) -> "torch.distributed.ProcessGroup":
     """Set up the SGLang NCCL weight-update group with trainer rank 0 as rank 0.
 
@@ -899,34 +971,85 @@ def connect_rollout_engines_from_distributed(
     world_size = 1 + sum(engine_gpu_counts)
 
     refs = []
+    group = None
     rank_cursor = 1
-    for engine, gpu_count in zip(rollout_engines, engine_gpu_counts, strict=True):
-        refs.append(
-            engine.init_weights_update_group.remote(
-                master_address,
-                master_port,
-                rank_cursor,
-                world_size,
-                group_name,
-                "nccl",
+    try:
+        for engine, gpu_count in zip(
+            rollout_engines, engine_gpu_counts, strict=True
+        ):
+            refs.append(
+                engine.init_weights_update_group.remote(
+                    master_address,
+                    master_port,
+                    rank_cursor,
+                    world_size,
+                    group_name,
+                    "nccl",
+                    timeout_s=deadline.remaining(
+                        "dispatching engine communicator bootstrap"
+                    ),
+                )
             )
-        )
-        rank_cursor += gpu_count
+            rank_cursor += gpu_count
 
-    group = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-    )
-    ray.get(refs)
-    print(
-        "NRL_SGLANG_REFIT_GROUP_READY "
-        f"world_size={world_size} engines={len(rollout_engines)}",
-        flush=True,
-    )
-    return group
+        group = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            timeout=deadline.remaining_timedelta(
+                "bootstrapping the trainer communicator"
+            ),
+            world_size=world_size,
+            rank=0,
+            group_name=group_name,
+        )
+        results = deadline.ray_get(
+            refs,
+            stage="waiting for engine communicator bootstrap",
+            cancel_on_error=True,
+        )
+        _check_weight_sync_results(results)
+        print(
+            "NRL_SGLANG_REFIT_GROUP_READY "
+            f"world_size={world_size} engines={len(rollout_engines)}",
+            flush=True,
+        )
+        return group
+    except Exception as exc:
+        cancel_ray_refs(refs)
+        abort_error = None
+        if group is not None:
+            try:
+                _abort_process_group(group)
+            except Exception as cleanup_exc:
+                abort_error = cleanup_exc
+                exc.add_note(
+                    "Trainer communicator abort also failed: "
+                    f"{cleanup_exc!r}. The policy worker must not be reused."
+                )
+
+        # The init HTTP handlers may have created only a subset of the engine
+        # groups. Queue idempotent destruction even if the main deadline has
+        # expired; each request remains independently bounded and the caller
+        # records that cleanup must finish before any reconnect.
+        cleanup_timeout_s = max(
+            deadline.remaining_or_zero(), _BEST_EFFORT_REFIT_CLEANUP_TIMEOUT_S
+        )
+        try:
+            _destroy_engine_weight_update_groups(
+                group_name=group_name,
+                rollout_engines=rollout_engines,
+                request_timeout_s=cleanup_timeout_s,
+            )
+        except Exception as cleanup_exc:
+            exc.add_note(
+                "Dispatching engine communicator cleanup also failed: "
+                f"{cleanup_exc!r}"
+            )
+        if abort_error is not None:
+            raise SGLangCommunicatorRecoveryError(
+                "Failed to abort the trainer-side SGLang communicator"
+            ) from abort_error
+        raise
 
 
 def disconnect_rollout_engines_from_distributed(
@@ -934,22 +1057,27 @@ def disconnect_rollout_engines_from_distributed(
     group_name: str,
     model_update_group: "torch.distributed.ProcessGroup",
     rollout_engines: list,
+    deadline: SGLangRefitDeadline,
 ) -> None:
     """Tear down trainer-side and engine-side NCCL state for ``group_name``."""
-    import ray
-
-    refs = [
-        engine.destroy_weights_update_group.remote(group_name)
-        for engine in rollout_engines
-    ]
+    refs = _destroy_engine_weight_update_groups(
+        group_name=group_name,
+        rollout_engines=rollout_engines,
+        request_timeout_s=deadline.remaining(
+            "dispatching engine communicator shutdown"
+        ),
+    )
     try:
         dist.destroy_process_group(model_update_group)
+        results = deadline.ray_get(
+            refs,
+            stage="waiting for engine communicator shutdown",
+            cancel_on_error=True,
+        )
+        _check_weight_sync_results(results)
     except Exception:
-        pass
-    try:
-        ray.get(refs)
-    except Exception:
-        pass
+        cancel_ray_refs(refs)
+        raise
 
 
 def get_sglang_quantization_cfg(policy_generation: Any) -> dict:
@@ -979,22 +1107,43 @@ def invalidate_sglang_kv_cache_for_refit(
         )
 
 
-def fetch_updatable_engines_with_recover(policy_generation: Any) -> tuple:
+def fetch_updatable_engines_with_recover(
+    policy_generation: Any,
+    *,
+    deadline: SGLangRefitDeadline | None = None,
+) -> tuple:
     """Run the design-mandated weight-update prelude.
 
-    1. If ``sglang_cfg.use_fault_tolerance`` is enabled, call
-       ``rollout_manager.recover_updatable_engines`` which internally pauses
-       health monitoring, restarts dead engines, and runs
+    1. Acquire a persistent refit suspension and synchronously quiesce health
+       monitoring.
+    2. If ``sglang_cfg.use_fault_tolerance`` is enabled, call
+       ``rollout_manager.recover_updatable_engines`` to restart dead engines
+       and run
        release/resume_memory_occupation on every recovered node-0 engine.
-    2. Read the current updatable-engine state via
+    3. Read the current updatable-engine state via
        ``get_updatable_engines_and_lock``.
 
     Both calls are idempotent — recover is a no-op when no engines have died.
     """
-    use_ft = policy_generation.sglang_cfg["sglang_cfg"]["use_fault_tolerance"]
-    if use_ft:
-        policy_generation.recover_updatable_engines()
-    return policy_generation.get_updatable_engines_and_lock()
+    monitor_refit_lease = policy_generation.health_monitoring_suspend_for_refit(
+        deadline=deadline
+    )
+    try:
+        use_ft = bool(
+            policy_generation.sglang_cfg["sglang_cfg"].get(
+                "use_fault_tolerance", False
+            )
+        )
+        if use_ft:
+            policy_generation.recover_updatable_engines(deadline=deadline)
+        state = policy_generation.get_updatable_engines_and_lock()
+    except Exception as exc:
+        exc.add_note(
+            "SGLang health monitoring remains suspended because engine "
+            "recovery/topology inspection did not complete safely."
+        )
+        raise
+    return (*state, monitor_refit_lease)
 
 
 def broadcast_hf_buckets_via_distributed_impl(
@@ -1005,6 +1154,7 @@ def broadcast_hf_buckets_via_distributed_impl(
     group_name: str,
     model_update_group: "torch.distributed.ProcessGroup",
     weight_version: int,
+    deadline: SGLangRefitDeadline,
 ) -> None:
     """Broadcast finalized HF tensor buckets to SGLang via NCCL (rank 0 only).
 
@@ -1017,10 +1167,6 @@ def broadcast_hf_buckets_via_distributed_impl(
     NCCL operations (e.g. health-check pings) cannot collide with the
     weight-update broadcast.
     """
-    import time as _time
-
-    import ray
-
     bucket_idx = 0
     for bucket in bucket_iterator:
         if not bucket:
@@ -1034,9 +1180,33 @@ def broadcast_hf_buckets_via_distributed_impl(
         dtypes = [tensor.dtype for _, tensor in bucket]
         shapes = [tensor.shape for _, tensor in bucket]
 
-        while not ray.get(rollout_engine_lock.acquire.remote()):
-            _time.sleep(0.1)
+        lock_owner = uuid.uuid4().hex
+        lock_requested = False
+        lock_acquired = False
+        refs: list = []
         try:
+            while not lock_acquired:
+                lock_requested = True
+                acquire_ref = rollout_engine_lock.acquire.remote(lock_owner)
+                lock_acquired = deadline.ray_get(
+                    acquire_ref,
+                    stage=f"acquiring the rollout-engine lock for bucket {bucket_idx}",
+                    cancel_on_error=True,
+                )
+                if not lock_acquired:
+                    time.sleep(
+                        min(
+                            0.1,
+                            deadline.remaining(
+                                "polling the rollout-engine lock for "
+                                f"bucket {bucket_idx}"
+                            ),
+                        )
+                    )
+
+            request_timeout_s = deadline.remaining(
+                f"dispatching engine receives for bucket {bucket_idx}"
+            )
             refs = [
                 engine.update_weights_from_distributed.remote(
                     names=names,
@@ -1044,18 +1214,63 @@ def broadcast_hf_buckets_via_distributed_impl(
                     shapes=shapes,
                     group_name=group_name,
                     weight_version=str(weight_version),
+                    timeout_s=request_timeout_s,
                 )
                 for engine in rollout_engines
             ]
             handles = []
-            for i, (_, tensor) in enumerate(bucket):
+            for _, tensor in bucket:
                 handles.append(
                     dist.broadcast(
                         tensor.data, 0, group=model_update_group, async_op=True
                     )
                 )
-            for i, handle in enumerate(handles):
-                handle.wait()
-            ray.get(refs)
+            for tensor_idx, handle in enumerate(handles):
+                completed = handle.wait(
+                    timeout=deadline.remaining_timedelta(
+                        "waiting for NCCL broadcast "
+                        f"{tensor_idx + 1}/{len(handles)} in bucket {bucket_idx}"
+                    )
+                )
+                if not completed:
+                    raise SGLangRefitTimeoutError(
+                        "SGLang refit timed out while waiting for NCCL "
+                        f"broadcast {tensor_idx + 1}/{len(handles)} in "
+                        f"bucket {bucket_idx}"
+                    )
+            results = deadline.ray_get(
+                refs,
+                stage=f"waiting for engine receives for bucket {bucket_idx}",
+                cancel_on_error=True,
+            )
+            _check_weight_sync_results(results)
         finally:
-            ray.get(rollout_engine_lock.release.remote())
+            active_error = sys.exception()
+            if active_error is not None:
+                cancel_ray_refs(refs)
+            if lock_requested:
+                # Always enqueue the matching lease release. Actor ordering
+                # guarantees that it follows any acquire whose result raced
+                # with the deadline.
+                release_ref = rollout_engine_lock.release.remote(lock_owner)
+                try:
+                    released = deadline.ray_get(
+                        release_ref,
+                        stage=(
+                            "releasing the rollout-engine lock for "
+                            f"bucket {bucket_idx}"
+                        ),
+                    )
+                    if lock_acquired and not released:
+                        raise RuntimeError(
+                            "SGLang refit lost ownership of the rollout-engine "
+                            f"lock for bucket {bucket_idx}"
+                        )
+                except Exception as cleanup_exc:
+                    if active_error is None:
+                        raise
+                    active_error.add_note(
+                        "Rollout-engine lock release did not finish before the "
+                        f"deadline: {cleanup_exc!r}. The matching release remains "
+                        "queued on the lock actor."
+                    )

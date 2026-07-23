@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import sys
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -1427,31 +1428,32 @@ def refit_sglang_colocated(
         invalidate_sglang_kv_cache_for_refit,
     )
 
-    (
-        rollout_engines,
-        _rollout_engine_lock,
-        num_new_engines,
-        engine_gpu_counts,
-        engine_gpu_offsets,
-    ) = fetch_updatable_engines_with_recover(policy_generation)
-
-    if num_new_engines > 0:
-        policy.connect_sglang_rollout_engines(
-            engine_gpu_counts=engine_gpu_counts,
-            engine_gpu_offsets=engine_gpu_offsets,
-        )
-        policy_generation.clear_updatable_num_new_engines()
-        assert policy_generation.num_new_engines == 0, (
-            "clear_updatable_num_new_engines did not zero num_new_engines"
-        )
-
-    # Pause with the configured mode, but only invalidate the KV cache when
-    # the mode actually drops generation state. "in_place" leaves the engine
-    # paused without dropping its KV cache, so flushing would clobber the
-    # still-valid in-place state.
-    pause_mode = policy_generation.pause_generation_mode
-    policy_generation.pause_generation(mode=pause_mode)
+    monitor_refit_lease = None
+    generation_pause_attempted = False
+    generation_continue_succeeded = False
     try:
+        (
+            rollout_engines,
+            _rollout_engine_lock,
+            num_new_engines,
+            engine_gpu_counts,
+            engine_gpu_offsets,
+            monitor_refit_lease,
+        ) = fetch_updatable_engines_with_recover(policy_generation)
+
+        if num_new_engines > 0:
+            policy.connect_sglang_rollout_engines(
+                engine_gpu_counts=engine_gpu_counts,
+                engine_gpu_offsets=engine_gpu_offsets,
+            )
+            policy_generation.clear_updatable_num_new_engines()
+            assert policy_generation.num_new_engines == 0, (
+                "clear_updatable_num_new_engines did not zero num_new_engines"
+            )
+
+        pause_mode = policy_generation.pause_generation_mode
+        generation_pause_attempted = True
+        policy_generation.pause_generation(mode=pause_mode)
         invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
         futures = policy.update_weights_to_sglang_colocated(
             rollout_engines=rollout_engines,
@@ -1460,7 +1462,25 @@ def refit_sglang_colocated(
         ray.get(futures)
         policy_generation.post_process_weights()
     finally:
-        policy_generation.continue_generation()
+        active_error = sys.exception()
+        if generation_pause_attempted:
+            try:
+                policy_generation.continue_generation()
+            except Exception as cleanup_exc:
+                if active_error is None:
+                    raise
+                active_error.add_note(
+                    "Generation resume after SGLang refit failure also failed: "
+                    f"{cleanup_exc!r}. Health monitoring remains suspended."
+                )
+            else:
+                generation_continue_succeeded = True
+        if monitor_refit_lease is not None and (
+            not generation_pause_attempted or generation_continue_succeeded
+        ):
+            policy_generation.health_monitoring_release_refit(
+                monitor_refit_lease
+            )
     return True
 
 
