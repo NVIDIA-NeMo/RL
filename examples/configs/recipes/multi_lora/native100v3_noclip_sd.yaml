@@ -1,0 +1,382 @@
+# Native V3 parity config: tokenizer default + explicit campaign COT prompt + fresh checkpoint.
+sft:
+  max_num_epochs: 200
+  max_num_steps: 100
+  val_period: 0
+  val_batches: 8
+  val_global_batch_size: 4
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 42
+  save_freq: 100
+checkpointing:
+  enabled: true
+  checkpoint_dir: /home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native/results/native100v3_noclip_sd_ckpt
+  metric_name: null
+  higher_is_better: false
+  keep_top_k: 100
+  save_period: 100
+  checkpoint_must_save_by: null
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  train_micro_batch_size: 2
+  max_total_sequence_length: 512
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    env_vars: {}
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    lora_cfg:
+      enabled: true
+      target_modules:
+      - '*q_proj'
+      - '*k_proj'
+      - '*v_proj'
+      - '*o_proj'
+      - '*in_proj'
+      - '*out_proj'
+      - '*up_proj'
+      - '*down_proj'
+      exclude_modules: []
+      match_all_linear: false
+      dim: 64
+      alpha: 128
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init: xavier
+      use_triton: false
+    expert_parallel_size: 1
+    automodel_kwargs:
+      force_hf: false
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 208
+  max_grad_norm: null
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 0.0005
+      weight_decay: 0.01
+      betas:
+      - 0.9
+      - 0.98
+      eps: 1.0e-05
+      foreach: false
+      fused: true
+  megatron_cfg:
+    enabled: false
+    env_vars: {}
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: false
+    freeze_moe_router: false
+    moe_router_dtype: null
+    moe_router_load_balancing_type: aux_loss
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: false
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: false
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: allgather
+    moe_shared_expert_overlap: false
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: None
+    optimizer:
+      optimizer: adam
+      lr: 5.0e-06
+      min_lr: 4.9999e-06
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-5
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 1000
+      lr_warmup_iters: 50
+      lr_warmup_init: 4.9999e-06
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      data_parallel_sharding_strategy: optim_grads_params
+      use_custom_fsdp: false
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+  seq_length: 512
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      total_iters: 10
+  - milestones:
+    - 10
+  - name: torch.optim.lr_scheduler.CosineAnnealingLR
+    kwargs:
+      T_max: 1490
+      eta_min: 5.0e-05
+data:
+  max_input_seq_length: 512
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: false
+  num_workers: 1
+  train:
+    dataset_name: openai_format
+    split: train
+    data_path: /home/phuc/multi_lora_data/hellaswag_train_d.jsonl
+    chat_key: messages
+    use_preserving_dataset: false
+  validation:
+    dataset_name: openai_format
+    split: validation
+    data_path: /home/phuc/multi_lora_data/hellaswag_val.jsonl
+    chat_key: messages
+    use_preserving_dataset: false
+  default:
+    # Previous nousnet campaign implicitly inherited this from the GRPO base
+    # through model_registry._default_config; make it explicit in native NeMo-RL.
+    prompt_file: examples/prompts/cot.txt
+    system_prompt_file: null
+    processor: sft_processor
+logger:
+  log_dir: /home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native/results/native100v3_noclip_sd_logs
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+  wandb:
+    project: nous-multi-lora-equivalence
+    name: code7x_pre10_single_d
+  swanlab:
+    project: sft-dev
+    name: sft-dev-${data.train.dataset_name}
+  tensorboard:
+    log_dir: tb_logs-sft-dev-${data.train.dataset_name}
+  mlflow:
+    experiment_name: sft-dev
+    run_name: sft-dev-${data.train.dataset_name}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+multi_lora:
+  enabled: false
+  schedule: round_robin
+  global_batch_size: 64
+  batch_size_per_adapter: 16
+  storage_device: cuda
+  execution_mode: concurrent
+  adapters:
+  - name: adapter_a
+    pin: auto
+    lora_cfg:
+      enabled: true
+      dim: 64
+      alpha: 128
+      match_all_linear: false
+      target_modules:
+      - '*q_proj'
+      - '*k_proj'
+      - '*v_proj'
+      - '*o_proj'
+      - '*in_proj'
+      - '*out_proj'
+      - '*up_proj'
+      - '*down_proj'
+      dropout: 0.0
+    optimizer:
+      name: torch.optim.AdamW
+      kwargs:
+        lr: 0.0005
+        weight_decay: 0.01
+        betas:
+        - 0.9
+        - 0.98
+        eps: 1.0e-05
+        foreach: false
+        fused: true
+    data:
+      train:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_train_d.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+      validation:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_val.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+  - name: adapter_b
+    pin: auto
+    lora_cfg:
+      enabled: true
+      dim: 64
+      alpha: 128
+      match_all_linear: false
+      target_modules:
+      - '*q_proj'
+      - '*k_proj'
+      - '*v_proj'
+      - '*o_proj'
+      - '*in_proj'
+      - '*out_proj'
+      - '*up_proj'
+      - '*down_proj'
+      dropout: 0.0
+    optimizer:
+      name: torch.optim.AdamW
+      kwargs:
+        lr: 0.0005
+        weight_decay: 0.01
+        betas:
+        - 0.9
+        - 0.98
+        eps: 1.0e-05
+        foreach: false
+        fused: true
+    data:
+      train:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_train_b.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+      validation:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_val.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+  - name: adapter_c
+    pin: auto
+    lora_cfg:
+      enabled: true
+      dim: 64
+      alpha: 128
+      match_all_linear: false
+      target_modules:
+      - '*q_proj'
+      - '*k_proj'
+      - '*v_proj'
+      - '*o_proj'
+      - '*in_proj'
+      - '*out_proj'
+      - '*up_proj'
+      - '*down_proj'
+      dropout: 0.0
+    optimizer:
+      name: torch.optim.AdamW
+      kwargs:
+        lr: 0.0005
+        weight_decay: 0.01
+        betas:
+        - 0.9
+        - 0.98
+        eps: 1.0e-05
+        foreach: false
+        fused: true
+    data:
+      train:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_train_c.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+      validation:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_val.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+  - name: adapter_d
+    pin: auto
+    lora_cfg:
+      enabled: true
+      dim: 64
+      alpha: 128
+      match_all_linear: false
+      target_modules:
+      - '*q_proj'
+      - '*k_proj'
+      - '*v_proj'
+      - '*o_proj'
+      - '*in_proj'
+      - '*out_proj'
+      - '*up_proj'
+      - '*down_proj'
+      dropout: 0.0
+    optimizer:
+      name: torch.optim.AdamW
+      kwargs:
+        lr: 0.0005
+        weight_decay: 0.01
+        betas:
+        - 0.9
+        - 0.98
+        eps: 1.0e-05
+        foreach: false
+        fused: true
+    data:
+      train:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_train_d.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
+      validation:
+        dataset_name: openai_format
+        data_path: /home/phuc/multi_lora_data/hellaswag_val.jsonl
+        chat_key: messages
+        use_preserving_dataset: false
