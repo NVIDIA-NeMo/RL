@@ -640,10 +640,41 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
+    backend = generation_config["backend"]
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    if backend == "vllm":
+        vllm_config = generation_config.get("vllm_cfg")
+        if vllm_config is None:
+            raise ValueError(
+                "NeMo Gym with the vLLM backend requires policy.generation.vllm_cfg."
+            )
+        vllm_config["async_engine"] = True
+        vllm_config["expose_http_server"] = True
+    elif backend == "sglang":
+        if generation_config.get("sglang_cfg") is None:
+            raise ValueError(
+                "NeMo Gym with the SGLang backend requires "
+                "policy.generation.sglang_cfg."
+            )
+        # SGLang engines are native HTTP servers, so only the async rollout
+        # control-flow switch needs to be enabled.
+        generation_config["use_async_rollouts"] = True
+    elif backend == "megatron":
+        mcore_config = generation_config.get("mcore_generation_config")
+        if mcore_config is None:
+            raise ValueError(
+                "NeMo Gym with the Megatron backend requires "
+                "policy.generation.mcore_generation_config."
+            )
+        mcore_config["async_engine"] = True
+        mcore_config["expose_http_server"] = True
+    elif backend == "trtllm":
+        raise NotImplementedError(
+            "NeMo Gym is not supported with the TRT-LLM generation backend "
+            "(the TRT-LLM OpenAI-compatible HTTP server was removed)."
+        )
+    else:
+        raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

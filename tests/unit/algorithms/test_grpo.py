@@ -33,6 +33,8 @@ from nemo_rl.algorithms.grpo import (
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
+    _get_generation_gpus_per_instance,
+    _init_inference_cluster_placement_groups,
     _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_message_level_advantage_penalties,
@@ -1073,6 +1075,14 @@ def mock_async_grpo_infrastructure(
         ),
         (
             {
+                "backend": "sglang",
+                "use_async_rollouts": True,
+                "vllm_cfg": None,
+            },
+            True,
+        ),
+        (
+            {
                 "backend": "megatron",
                 "mcore_generation_config": {"async_engine": True},
                 "vllm_cfg": {"async_engine": False},
@@ -1087,6 +1097,14 @@ def mock_async_grpo_infrastructure(
             },
             False,
         ),
+        (
+            {
+                "backend": "trtllm",
+                "trtllm_cfg": {"async_engine": True},
+                "vllm_cfg": {"async_engine": False},
+            },
+            True,
+        ),
     ],
 )
 def test_should_use_async_rollouts_selects_backend_specific_config(
@@ -1096,6 +1114,70 @@ def test_should_use_async_rollouts_selects_backend_specific_config(
     master_config.policy = {"generation": generation_config}
 
     assert _should_use_async_rollouts(master_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("generation_config", "policy_config", "expected"),
+    [
+        (
+            {
+                "backend": "vllm",
+                "vllm_cfg": {
+                    "tensor_parallel_size": 4,
+                    "pipeline_parallel_size": 2,
+                },
+            },
+            {},
+            8,
+        ),
+        (
+            {
+                "backend": "sglang",
+                "sglang_cfg": {"sglang_server_config": {"num_gpus_per_engine": 4}},
+            },
+            {},
+            4,
+        ),
+        (
+            {
+                "backend": "trtllm",
+                "trtllm_cfg": {"tensor_parallel_size": 2},
+            },
+            {},
+            2,
+        ),
+        (
+            {"backend": "megatron"},
+            {
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 4,
+                    "pipeline_model_parallel_size": 2,
+                    "context_parallel_size": 2,
+                }
+            },
+            16,
+        ),
+    ],
+)
+def test_get_generation_gpus_per_instance(generation_config, policy_config, expected):
+    assert (
+        _get_generation_gpus_per_instance(generation_config, policy_config) == expected
+    )
+
+
+def test_init_inference_cluster_placement_groups_uses_sglang_contract():
+    inference_cluster = MagicMock()
+
+    _init_inference_cluster_placement_groups(
+        inference_cluster,
+        {"backend": "sglang"},
+        {},
+    )
+
+    inference_cluster._init_placement_groups.assert_called_once_with(
+        strategy="PACK",
+        use_unified_pg=True,
+    )
 
 
 @contextmanager
@@ -2415,6 +2497,164 @@ def test_sglang_async_grpo_reaches_training_and_refit(mock_grpo_components):
 
     policy.train.assert_called_once()
     assert refit.call_count >= 1
+
+
+def test_async_initial_refit_failure_propagates_after_cleanup(mock_grpo_components):
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    policy_generation = _mock_policy_generation()
+    policy_generation.weight_synchronizer = None
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["val_at_start"] = False
+    master_config.policy["generation"].update(
+        {
+            "backend": "sglang",
+            "use_async_rollouts": True,
+            "vllm_cfg": None,
+            "colocated": {"enabled": False},
+        }
+    )
+    mock_grpo_components["checkpointer"].get_latest_checkpoint_path.return_value = None
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            side_effect=RuntimeError("initial refit failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
+    ):
+        with pytest.raises(RuntimeError, match="initial refit failed"):
+            async_grpo_train(
+                policy,
+                policy_generation,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _default_grpo_save_state(),
+                master_config,
+            )
+
+    assert ray_kill.call_count >= 2
+    mock_grpo_components["checkpointer"].shutdown.assert_called()
+    policy_generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+    for env_dict in (
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+    ):
+        for env in env_dict.values():
+            env.shutdown.remote.assert_called_once()
+
+
+def test_async_replay_buffer_start_failure_propagates_after_cleanup(
+    mock_grpo_components,
+):
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    policy_generation = _mock_policy_generation()
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+
+    failing_buffer_cls = MagicMock()
+    failing_buffer_cls.options.return_value.remote.side_effect = RuntimeError(
+        "replay buffer start failed"
+    )
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        patch(
+            "nemo_rl.algorithms.async_utils.ReplayBuffer",
+            failing_buffer_cls,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="replay buffer start failed"):
+            async_grpo_train(
+                policy,
+                policy_generation,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _default_grpo_save_state(),
+                master_config,
+            )
+
+    mock_grpo_components["checkpointer"].shutdown.assert_called()
+    policy_generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+    for env_dict in (
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+    ):
+        for env in env_dict.values():
+            env.shutdown.remote.assert_called_once()
+
+
+def test_async_midloop_refit_failure_propagates_after_cleanup(mock_grpo_components):
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    policy_generation = _mock_policy_generation()
+    policy_generation.weight_synchronizer = None
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.policy["generation"].update(
+        {
+            "backend": "sglang",
+            "use_async_rollouts": True,
+            "vllm_cfg": None,
+            "colocated": {"enabled": False},
+        }
+    )
+    mock_grpo_components["checkpointer"].get_latest_checkpoint_path.return_value = None
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            side_effect=[None, RuntimeError("mid-loop refit failed")],
+        ),
+        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
+    ):
+        with pytest.raises(RuntimeError, match="mid-loop refit failed"):
+            async_grpo_train(
+                policy,
+                policy_generation,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _default_grpo_save_state(),
+                master_config,
+            )
+
+    policy.train.assert_called_once()
+    assert ray_kill.call_count >= 2
+    mock_grpo_components["checkpointer"].shutdown.assert_called()
+    policy_generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

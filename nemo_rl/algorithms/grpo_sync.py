@@ -64,6 +64,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    get_active_vllm_config,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
@@ -1217,23 +1218,20 @@ def grpo_train_sync(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
-            if master_config.policy["generation"].get("vllm_cfg", {}).get(
-                "enable_vllm_metrics_logger", False
-            ) and master_config.logger.get("wandb_enabled", False):
+            vllm_config = get_active_vllm_config(master_config.policy["generation"])
+            if (
+                vllm_config is not None
+                and vllm_config.get("enable_vllm_metrics_logger")
+                and master_config.logger.get("wandb_enabled", False)
+            ):
                 log_generation_metrics_to_wandb(
                     generation_logger_metrics,
                     total_steps + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    vllm_config["vllm_metrics_logger_interval"],
                     logger,
                 )
 
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
+            if vllm_config is not None and vllm_config["async_engine"]:
                 for metric_name in metrics.keys():
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(

@@ -152,6 +152,107 @@ def test_validate_reward_components_match_scalar():
         )
 
 
+def test_setup_nemo_gym_config_enables_vllm_http_async_mode():
+    generation_config = {
+        "backend": "vllm",
+        "vllm_cfg": {
+            "async_engine": False,
+            "expose_http_server": False,
+        },
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer=None)
+
+    assert generation_config["vllm_cfg"]["async_engine"] is True
+    assert generation_config["vllm_cfg"]["expose_http_server"] is True
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_enables_sglang_async_rollouts_with_null_vllm():
+    generation_config = {
+        "backend": "sglang",
+        "use_async_rollouts": False,
+        "vllm_cfg": None,
+        "sglang_cfg": {},
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer=None)
+
+    assert generation_config["use_async_rollouts"] is True
+    assert generation_config["vllm_cfg"] is None
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_enables_megatron_http_async_mode_only():
+    inherited_vllm_config = {
+        "async_engine": False,
+        "expose_http_server": False,
+    }
+    generation_config = {
+        "backend": "megatron",
+        "vllm_cfg": inherited_vllm_config,
+        "mcore_generation_config": {
+            "async_engine": False,
+            "expose_http_server": False,
+        },
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer=None)
+
+    assert generation_config["mcore_generation_config"]["async_engine"] is True
+    assert generation_config["mcore_generation_config"]["expose_http_server"] is True
+    assert inherited_vllm_config == {
+        "async_engine": False,
+        "expose_http_server": False,
+    }
+
+
+def test_setup_nemo_gym_config_rejects_trtllm():
+    master_config = MasterConfig.model_construct(
+        policy={"generation": {"backend": "trtllm", "trtllm_cfg": {}}}
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="NeMo Gym is not supported with the TRT-LLM generation backend",
+    ):
+        setup_nemo_gym_config(master_config, tokenizer=None)
+
+
+@pytest.mark.parametrize(
+    ("backend", "required_config"),
+    [
+        ("vllm", "vllm_cfg"),
+        ("sglang", "sglang_cfg"),
+        ("megatron", "mcore_generation_config"),
+    ],
+)
+def test_setup_nemo_gym_config_requires_active_backend_config(backend, required_config):
+    master_config = MasterConfig.model_construct(
+        policy={"generation": {"backend": backend}}
+    )
+
+    with pytest.raises(ValueError, match=required_config):
+        setup_nemo_gym_config(master_config, tokenizer=None)
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_stub_module():
     from nemo_gym import config_types

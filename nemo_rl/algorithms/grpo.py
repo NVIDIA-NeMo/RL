@@ -53,6 +53,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    get_active_vllm_config,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
     print_efficiency_summary,
@@ -337,6 +338,77 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+
+
+def _get_generation_gpus_per_instance(
+    generation_config: GenerationConfig,
+    policy_config: PolicyConfig,
+) -> int:
+    """Return the active generation backend's model-parallel GPU count."""
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        backend_config = generation_config["vllm_cfg"]
+        gpus_per_instance = backend_config["tensor_parallel_size"] * backend_config.get(
+            "pipeline_parallel_size", 1
+        )
+    elif backend == "sglang":
+        gpus_per_instance = generation_config["sglang_cfg"]["sglang_server_config"][
+            "num_gpus_per_engine"
+        ]
+    elif backend == "trtllm":
+        gpus_per_instance = generation_config["trtllm_cfg"]["tensor_parallel_size"]
+    elif backend == "megatron":
+        megatron_config = policy_config["megatron_cfg"]
+        gpus_per_instance = (
+            megatron_config["tensor_model_parallel_size"]
+            * megatron_config["pipeline_model_parallel_size"]
+            * megatron_config.get("context_parallel_size", 1)
+        )
+    else:
+        raise ValueError(
+            f"Unsupported generation backend for topology placement: {backend!r}"
+        )
+
+    if gpus_per_instance <= 0:
+        raise ValueError(
+            f"Generation GPUs per instance must be positive, got {gpus_per_instance} "
+            f"for backend {backend!r}."
+        )
+    return gpus_per_instance
+
+
+def _init_inference_cluster_placement_groups(
+    inference_cluster: RayVirtualCluster,
+    generation_config: GenerationConfig,
+    policy_config: PolicyConfig,
+) -> None:
+    """Pre-create topology-constrained placement groups for the active backend."""
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        VllmGeneration.init_cluster_placement_groups(
+            inference_cluster, cast(VllmConfig, generation_config)
+        )
+    elif backend == "sglang":
+        # Match SGLangGeneration.__init__: its engines share one unified PG.
+        inference_cluster._init_placement_groups(
+            strategy="PACK",
+            use_unified_pg=True,
+        )
+    elif backend == "megatron":
+        MegatronGeneration.init_cluster_placement_groups(
+            inference_cluster, policy_config
+        )
+    elif backend == "trtllm":
+        # TRT-LLM currently rejects cross-node TP, so its non-colocated
+        # constructor uses PACK with one PG per node.
+        inference_cluster._init_placement_groups(
+            strategy="PACK",
+            use_unified_pg=False,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported generation backend for topology placement: {backend!r}"
+        )
 
 
 # ===============================================================================
@@ -864,23 +936,13 @@ def setup(
                         flush=True,
                     )
 
-                # Inference topology: each vLLM/SGLang instance spans
+                # Inference topology: each generation instance spans
                 # nodes_per_instance nodes; keep those within one domain
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
-                #
-                # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: num_gpus_per_engine already includes all
-                # parallelism dimensions, so use it directly.
-                if generation_config["backend"] == "vllm":
-                    vllm_cfg = generation_config.get("vllm_cfg", {})
-                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                        "pipeline_parallel_size", 1
-                    )
-                else:
-                    sglang_cfg = generation_config["sglang_cfg"]
-                    gpus_per_instance = sglang_cfg["sglang_server_config"][
-                        "num_gpus_per_engine"
-                    ]
+                gpus_per_instance = _get_generation_gpus_per_instance(
+                    generation_config,
+                    policy_config,
+                )
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node
@@ -946,8 +1008,10 @@ def setup(
             node_resource_constraints=inference_node_resource_constraints,
         )
         if inference_node_resource_constraints is not None:
-            VllmGeneration.init_cluster_placement_groups(
-                inference_cluster, generation_config
+            _init_inference_cluster_placement_groups(
+                inference_cluster,
+                generation_config,
+                policy_config,
             )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
@@ -1958,7 +2022,9 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return bool(generation_config.get("use_async_rollouts", False))
 
     if backend == "vllm":
-        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+        vllm_config = get_active_vllm_config(generation_config)
+        assert vllm_config is not None
+        return bool(vllm_config["async_engine"])
 
     if backend == "trtllm":
         assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
@@ -3529,27 +3595,21 @@ def grpo_train(
                     name="train/token_mult_prob_error_plot_sample",
                 )
             del train_data
+            vllm_config = get_active_vllm_config(master_config.policy["generation"])
             if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
+                vllm_config is not None
+                and vllm_config.get("enable_vllm_metrics_logger")
                 and master_config.logger["wandb_enabled"]
             ):
                 log_generation_metrics_to_wandb(
                     generation_logger_metrics,
                     total_steps + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    vllm_config["vllm_metrics_logger_interval"],
                     logger,
                 )
 
             # Plot ISL/OSL/ISL+OSL histograms to wandb
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
+            if vllm_config is not None and vllm_config["async_engine"]:
                 for metric_name in metrics.keys():
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(
@@ -4020,240 +4080,249 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
-    replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
-    )
+    replay_buffer = None
+    trajectory_collector = None
+    try:
+        replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
+            max_size=optimal_buffer_size
+        )
 
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    replay_buffer_state = None
-    rollouts_state = None
-    if last_checkpoint_path is not None:
-        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
-        if os.path.exists(replay_buffer_path):
-            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
-            # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
-            # not plain tensors. The checkpoint is a trusted same-job artifact.
-            replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
-            ray.get(
-                replay_buffer.load_state_dict.remote(
-                    replay_buffer_state,
-                    num_prompts_per_step=num_prompts_per_step,
-                    current_training_step=step,
-                    max_age_steps=max_trajectory_age_steps,
+        last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+        replay_buffer_state = None
+        rollouts_state = None
+        if last_checkpoint_path is not None:
+            replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
+            if os.path.exists(replay_buffer_path):
+                print(
+                    f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}"
                 )
-            )
-            print("✅ Replay buffer restored from checkpoint")
-        else:
-            print(
-                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
-                "Starting with an empty replay buffer."
-            )
+                # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
+                # not plain tensors. The checkpoint is a trusted same-job artifact.
+                replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
+                ray.get(
+                    replay_buffer.load_state_dict.remote(
+                        replay_buffer_state,
+                        num_prompts_per_step=num_prompts_per_step,
+                        current_training_step=step,
+                        max_age_steps=max_trajectory_age_steps,
+                    )
+                )
+                print("✅ Replay buffer restored from checkpoint")
+            else:
+                print(
+                    f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+                    "Starting with an empty replay buffer."
+                )
 
-        rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
-        if os.path.exists(rollouts_path):
-            # weights_only=False: this is a trusted same-job checkpoint artifact.
-            rollouts_state = torch.load(rollouts_path, weights_only=False)
+            rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
+            if os.path.exists(rollouts_path):
+                # weights_only=False: this is a trusted same-job checkpoint artifact.
+                rollouts_state = torch.load(rollouts_path, weights_only=False)
 
-    next_nemo_gym_task_index = _get_next_nemo_gym_task_index(
-        rollouts_state=rollouts_state,
-        replay_buffer_state=replay_buffer_state,
-    )
-
-    _tc_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-    )
-    if _tc_py_exec.startswith("uv"):
-        _tc_py_exec = create_local_venv_on_each_node(
-            _tc_py_exec,
-            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+        next_nemo_gym_task_index = _get_next_nemo_gym_task_index(
+            rollouts_state=rollouts_state,
+            replay_buffer_state=replay_buffer_state,
         )
 
-    _tc_py_venv = os.path.dirname(
-        os.path.dirname(_tc_py_exec)
-    )  # to remove the "bin/python" suffix
-
-    _tc_runtime_env = {
-        "py_executable": _tc_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _tc_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
-        },
-    }
-
-    # Initialize trajectory collector with synchronized collection
-    trajectory_collector = AsyncTrajectoryCollector.options(
-        runtime_env=_tc_runtime_env
-    ).remote(
-        policy_generation=policy_generation,
-        tokenizer=tokenizer,
-        task_to_env=task_to_env,
-        master_config=master_config,
-        replay_buffer=replay_buffer,
-        start_step=step,
-        teacher_worker_groups=teacher_worker_groups,
-        alias_to_group_alias=alias_to_group_alias,
-        on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
-        next_nemo_gym_task_index=next_nemo_gym_task_index,
-    )
-
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
-
-    print(
-        f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
-    )
-
-    print("⏳ Preparing policy generation for training...")
-    if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...")
-        try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            print("✅ Policy generation refit completed successfully")
-            POLICY_GENERATION_STALE = False
-        except Exception as e:
-            print(f"❌ Policy generation refit failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-    else:
-        print("🔄 Preparing policy generation for inference...")
-        try:
-            policy_generation.prepare_for_generation()
-            print("✅ Policy generation preparation completed successfully")
-        except Exception as e:
-            print(f"❌ Policy generation preparation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-
-    print("✅ Policy generation setup complete, proceeding to validation...")
-
-    # Run validation at start if configured
-    if val_at_start and step == 0:
-        print("\n🔍 Running initial validation...")
-        # Pause trajectory collection during initial validation
-        trajectory_collector.pause.remote()
-
-        try:
-            val_metrics, validation_timings = validate(
-                policy_generation,
-                val_dataloader,
-                tokenizer,
-                val_task_to_env,
-                step=0,
-                master_config=master_config,
-                logger=logger,
-            )
-            policy_generation.finish_generation()
-            logger.log_metrics(val_metrics, step, prefix="validation")
-            logger.log_metrics(validation_timings, step, prefix="timing/validation")
-            print("✅ Initial validation completed successfully")
-        except Exception as e:
-            print(f"❌ Initial validation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            # Continue anyway since validation is optional
-        finally:
-            # Resume trajectory collection after initial validation
-            trajectory_collector.resume.remote()
-
-    print("✅ All setup complete, starting buffer wait...")
-    # Clear logger metrics at start of training
-    if policy_generation is not None:
-        policy_generation.clear_logger_metrics()
-
-    # Wait for initial buffer fill for the current training step.
-    print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
-    )
-    timer.start("init/total")
-    wait_iterations = 0
-    while True:
-        buffer_size_current = ray.get(replay_buffer.size.remote())
-        current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
+        _tc_py_exec = get_actor_python_env(
+            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
         )
+        if _tc_py_exec.startswith("uv"):
+            _tc_py_exec = create_local_venv_on_each_node(
+                _tc_py_exec,
+                "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+            )
+
+        _tc_py_venv = os.path.dirname(
+            os.path.dirname(_tc_py_exec)
+        )  # to remove the "bin/python" suffix
+
+        _tc_runtime_env = {
+            "py_executable": _tc_py_exec,
+            "env_vars": {
+                **os.environ,
+                "VIRTUAL_ENV": _tc_py_venv,
+                "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
+            },
+        }
+
+        # Initialize trajectory collector with synchronized collection
+        trajectory_collector = AsyncTrajectoryCollector.options(
+            runtime_env=_tc_runtime_env
+        ).remote(
+            policy_generation=policy_generation,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=replay_buffer,
+            start_step=step,
+            teacher_worker_groups=teacher_worker_groups,
+            alias_to_group_alias=alias_to_group_alias,
+            on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
+        )
+
+        # Start trajectory collection in background
+        collection_task = trajectory_collector.start_collection.remote(dataloader)
+
+        # Ensure collector knows initial weight version
+        trajectory_collector.set_weight_version.remote(weight_version)
+
+        print("📦 Started continuous background trajectory collection")
 
         print(
-            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
+            f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
         )
 
-        if current_step_ready:
-            # Keep the async pipeline one step ahead before entering training.
+        print("⏳ Preparing policy generation for training...")
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            print("🔄 Refitting policy generation with actual model weights...")
+            try:
+                refit_policy_generation(policy, policy_generation, colocated_inference)
+                print("✅ Policy generation refit completed successfully")
+                POLICY_GENERATION_STALE = False
+            except Exception as e:
+                print(f"❌ Policy generation refit failed: {e}")
+                import traceback
 
-            # A restored buffer may already contain `step`, allowing startup to
-            # consume it before the collector generates `step + 1`. After refit,
-            # the collector advances to targets starting at `step + 2`, leaving
-            # `step + 1` permanently missing. Wait for the initial collector,
-            # whose range includes both steps, to complete the lookahead first.
-            max_num_steps = master_config.grpo["max_num_steps"]
-            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
-            if need_lookahead:
-                next_step_ready = ray.get(
-                    replay_buffer.has_complete_batch.remote(
-                        step + 1, num_prompts_per_step, max_trajectory_age_steps
-                    )
+                traceback.print_exc()
+                raise
+        else:
+            print("🔄 Preparing policy generation for inference...")
+            try:
+                policy_generation.prepare_for_generation()
+                print("✅ Policy generation preparation completed successfully")
+            except Exception as e:
+                print(f"❌ Policy generation preparation failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+                raise
+
+        print("✅ Policy generation setup complete, proceeding to validation...")
+
+        # Run validation at start if configured
+        if val_at_start and step == 0:
+            print("\n🔍 Running initial validation...")
+            # Pause trajectory collection during initial validation
+            trajectory_collector.pause.remote()
+
+            try:
+                val_metrics, validation_timings = validate(
+                    policy_generation,
+                    val_dataloader,
+                    tokenizer,
+                    val_task_to_env,
+                    step=0,
+                    master_config=master_config,
+                    logger=logger,
                 )
-                if not next_step_ready:  # pragma: no cover
-                    print(
-                        f"  Pipeline barrier: step {step} ready but "
-                        f"step {step + 1} not yet — waiting for lookahead fill "
-                        f"to prevent resume deadlock"
-                    )
-                    wait_iterations += 1
-                    time.sleep(1.0)
-                    continue
-            break
+                policy_generation.finish_generation()
+                logger.log_metrics(val_metrics, step, prefix="validation")
+                logger.log_metrics(validation_timings, step, prefix="timing/validation")
+                print("✅ Initial validation completed successfully")
+            except Exception as e:
+                print(f"❌ Initial validation failed: {e}")
+                import traceback
 
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
+                traceback.print_exc()
+                # Continue anyway since validation is optional
+            finally:
+                # Resume trajectory collection after initial validation
+                trajectory_collector.resume.remote()
+
+        print("✅ All setup complete, starting buffer wait...")
+        # Clear logger metrics at start of training
+        if policy_generation is not None:
+            policy_generation.clear_logger_metrics()
+
+        # Wait for initial buffer fill for the current training step.
+        print(
+            f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
         )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
+        timer.start("init/total")
+        wait_iterations = 0
+        while True:
+            buffer_size_current = ray.get(replay_buffer.size.remote())
+            current_step_ready = ray.get(
+                replay_buffer.has_complete_batch.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
+            )
+
             print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+                f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+                f"step {step} ready={current_step_ready}"
             )
 
-        collector_status = ray.get(trajectory_collector.get_status.remote())
-        if (
-            (
-                collector_status["data_exhausted"]
-                or collector_status.get("errored", False)
+            if current_step_ready:
+                # Keep the async pipeline one step ahead before entering training.
+
+                # A restored buffer may already contain `step`, allowing startup to
+                # consume it before the collector generates `step + 1`. After refit,
+                # the collector advances to targets starting at `step + 2`, leaving
+                # `step + 1` permanently missing. Wait for the initial collector,
+                # whose range includes both steps, to complete the lookahead first.
+                max_num_steps = master_config.grpo["max_num_steps"]
+                need_lookahead = (
+                    max_trajectory_age_steps > 0 and step + 1 < max_num_steps
+                )
+                if need_lookahead:
+                    next_step_ready = ray.get(
+                        replay_buffer.has_complete_batch.remote(
+                            step + 1, num_prompts_per_step, max_trajectory_age_steps
+                        )
+                    )
+                    if not next_step_ready:  # pragma: no cover
+                        print(
+                            f"  Pipeline barrier: step {step} ready but "
+                            f"step {step + 1} not yet — waiting for lookahead fill "
+                            f"to prevent resume deadlock"
+                        )
+                        wait_iterations += 1
+                        time.sleep(1.0)
+                        continue
+                break
+
+            trajectories_needed = ray.get(
+                replay_buffer.get_trajectories_needed.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
             )
-            and not collector_status["running"]
-            and collector_status["inflight_workers"] == 0
-        ):
-            raise RuntimeError(
-                f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
-                f"The dataset ran out of data before training could start. "
-                f"Collector status: {collector_status}. "
-                f"Increase data.train.max_num_epochs or use a larger dataset."
-            )
+            if (
+                buffer_size_current >= min_trajectories_needed
+                and trajectories_needed > 0
+            ):
+                print(
+                    f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                    f"trajectories for step {step}"
+                )
 
-        wait_iterations += 1
-        time.sleep(1.0)
+            collector_status = ray.get(trajectory_collector.get_status.remote())
+            if (
+                (
+                    collector_status["data_exhausted"]
+                    or collector_status.get("errored", False)
+                )
+                and not collector_status["running"]
+                and collector_status["inflight_workers"] == 0
+            ):
+                raise RuntimeError(
+                    f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
+                    f"The dataset ran out of data before training could start. "
+                    f"Collector status: {collector_status}. "
+                    f"Increase data.train.max_num_epochs or use a larger dataset."
+                )
 
-    timer.stop("init/total")
-    print(f"✅ Buffer ready for step {step}! Starting training loop...")
+            wait_iterations += 1
+            time.sleep(1.0)
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+        timer.stop("init/total")
+        print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
-    # Main training loop
-    try:
+        ft_save_period = master_config.checkpointing.get("ft_save_period")
+
+        # Main training loop
         while step < master_config.grpo["max_num_steps"]:
             refit_metrics: dict[str, float] = {}
             print(
@@ -4943,27 +5012,21 @@ def async_grpo_train(
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
 
+            vllm_config = get_active_vllm_config(master_config.policy["generation"])
             if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
+                vllm_config is not None
+                and vllm_config.get("enable_vllm_metrics_logger")
                 and master_config.logger["wandb_enabled"]
             ):
                 log_generation_metrics_to_wandb(
                     generation_logger_metrics,
                     step + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    vllm_config["vllm_metrics_logger_interval"],
                     logger,
                 )
 
             # Plot ISL/OSL/ISL+OSL histograms to wandb
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
+            if vllm_config is not None and vllm_config["async_engine"]:
                 for metric_name in metrics.keys():
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(
@@ -5056,6 +5119,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         # Finalize any pending async checkpoint before tearing down workers.
@@ -5066,15 +5130,17 @@ def async_grpo_train(
 
         # Clean up
         print("🛑 Stopping trajectory collection...")
-        try:
-            ray.kill(trajectory_collector)
-        except Exception as e:
-            print(f"Error stopping trajectory collector: {e}")
+        if trajectory_collector is not None:
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
 
-        try:
-            ray.kill(replay_buffer)
-        except Exception as e:
-            print(f"Error stopping replay buffer: {e}")
+        if replay_buffer is not None:
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
 
         # Environments must be shut down before generation workers because
         # they may have in-flight HTTP requests to vLLM HTTP endpoints.
