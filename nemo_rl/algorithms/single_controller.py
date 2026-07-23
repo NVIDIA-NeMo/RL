@@ -131,13 +131,10 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # epoch = one pass over the dataloader. None = unbounded: the dataloader
     # is iterated indefinitely until _train_pump reaches max_train_steps.
     max_num_epochs: Optional[int] = None
-    # Worker-side optimizer mini-batch size, in samples. SC opens one
-    # begin / microbatch×K / finish cycle (= one opt.step) per
-    # ``train_global_batch_size`` worth of samples. Number of opt.steps per
-    # outer SC step is
-    # ``target_groups_per_step * group_size // train_global_batch_size``.
-    # If None, coerced at __init__ to one mini-batch per outer step
-    # (samples_per_step), preserving single-opt.step-per-outer-step behavior.
+    # Worker-side global batch size, in samples. SC currently supports exactly
+    # one optimizer step per outer RL step, so an explicit value must equal
+    # ``target_groups_per_step * group_size``. If None, it is set to that value
+    # during initialization.
     train_global_batch_size: Optional[int] = None
 
     # DataPlane partition
@@ -163,7 +160,6 @@ class SingleControllerConfig(BaseModel, extra="allow"):
 
     # Logger
     logger: GRPOLoggerConfig
-
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -229,11 +225,10 @@ class SingleControllerActor:
                 f"must be >= min_groups_per_batch ({cfg.min_groups_per_batch})"
             )
 
-        # Mini-batching contract: SC opens one begin / microbatch×N / finish
-        # cycle (= one opt.step) per train_global_batch_size worth of samples.
-        # Matches the sync path's gb_idx loop in the worker (one opt.step
-        # per gbs slice). When unset, coerce to a single mini-batch per
-        # outer step so behavior matches the pre-mini-batch design.
+        # SC opens exactly one begin / microbatch×N / finish cycle
+        # (= one optimizer step) per outer RL step. Until multiple optimizer
+        # steps per RL step are supported, the global batch must contain every
+        # sample selected for that step.
         samples_per_step = cfg.target_groups_per_step * cfg.group_size
         if cfg.train_global_batch_size is None:
             cfg.train_global_batch_size = samples_per_step
@@ -242,19 +237,12 @@ class SingleControllerActor:
                 f"train_global_batch_size must be > 0, "
                 f"got {cfg.train_global_batch_size}"
             )
-        if samples_per_step % cfg.train_global_batch_size != 0:
-            raise ValueError(
-                f"target_groups_per_step ({cfg.target_groups_per_step}) "
-                f"* group_size ({cfg.group_size}) "
-                f"= {samples_per_step} samples must be divisible by "
-                f"train_global_batch_size ({cfg.train_global_batch_size})"
-            )
-        if cfg.train_global_batch_size % cfg.group_size != 0:
+        if cfg.train_global_batch_size != samples_per_step:
             raise ValueError(
                 f"train_global_batch_size ({cfg.train_global_batch_size}) must "
-                f"be divisible by group_size "
-                f"({cfg.group_size}) so a mini-batch contains "
-                f"whole prompt groups"
+                f"equal target_groups_per_step ({cfg.target_groups_per_step}) "
+                f"* group_size ({cfg.group_size}) = {samples_per_step}; multiple "
+                f"optimizer steps per RL step are not supported"
             )
         # Staleness policy owns admit (rollout side) + select/evict (train side)
         # + is_on_policy / required_buffer_capacity (derived facts). ``name`` in
@@ -283,6 +271,11 @@ class SingleControllerActor:
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
+
+        # Set only after _rollout_pump exhausts its configured epochs and all
+        # dispatched tasks finish successfully. Rollout failures propagate
+        # through run() instead of being reported as normal exhaustion.
+        self._rollout_exhausted: asyncio.Event = asyncio.Event()
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
@@ -395,6 +388,7 @@ class SingleControllerActor:
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
+        self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -478,6 +472,7 @@ class SingleControllerActor:
 
                 self._current_epoch += 1
 
+        self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
@@ -541,6 +536,22 @@ class SingleControllerActor:
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
+                            if self._rollout_exhausted.is_set():
+                                buffered_groups = len(self._buffer)
+                                if groups_dispatched == 0 and buffered_groups == 0:
+                                    print(
+                                        "train_pump: rollout exhausted and "
+                                        "buffer drained",
+                                        flush=True,
+                                    )
+                                    return
+                                raise RuntimeError(
+                                    "rollout exhausted before a complete training "
+                                    f"step was assembled: dispatched "
+                                    f"{groups_dispatched}/{target_groups} prompt "
+                                    f"groups with {buffered_groups} group(s) "
+                                    f"remaining in the buffer"
+                                )
                             await asyncio.sleep(0.005)
                             continue
 
@@ -606,13 +617,6 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
-
-                if not step_open:
-                    print(
-                        "train_pump: rollout exhausted before any group ready",
-                        flush=True,
-                    )
-                    break
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)

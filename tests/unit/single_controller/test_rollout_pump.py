@@ -106,6 +106,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._dataloader = [prompt_batch, prompt_batch]
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
@@ -115,6 +116,7 @@ def test_rollout_pump_stamps_target_steps(
     asyncio.run(ctrl._rollout_pump())
 
     assert buffer.target_step_list == expected_target_steps
+    assert ctrl._rollout_exhausted.is_set()
 
 
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
@@ -167,6 +169,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ]
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
@@ -181,6 +184,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         assert ctrl._inflight_rollouts == 0
         assert ctrl._buffer_capacity._value == 2
         assert ctrl._dispatched_rollouts == set()
+        assert not ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
 
@@ -237,6 +241,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ]
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = real_semaphore(1)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
@@ -250,6 +255,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert created_semaphores[0]._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
+        assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
 
