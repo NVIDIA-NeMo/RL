@@ -246,10 +246,14 @@ RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
-# Correctness guard: the preceding dependency layer intentionally omits the
-# TRT-LLM workspace. Validate the complete project here so a stale uv.lock
-# fails before we compile or cache a TRT-LLM wheel. Do not remove this check or
-# move it after the build.
+# Lock/pyproject consistency is verified LATE here, for the whole image. The
+# dependency syncs above run --frozen (read-only on uv.lock: they neither update
+# nor validate it), so this uv lock --check is the ONLY place a stale lock is
+# caught. It can't move earlier: it needs the full workspace, but the tensorrt-llm
+# path-source member isn't copied until the COPY just above (kept late so a
+# TRT-LLM ref bump doesn't bust the cached TE/backend build).
+# WARNING: removing this check (or this layer) without also reverting --frozen
+# above would let an out-of-date lock ship silently. Keep it before the SKIP exit.
 uv lock --check
 
 if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
