@@ -16,6 +16,7 @@ import asyncio
 import copy
 import inspect
 import json
+import logging
 import math
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -49,6 +50,7 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 SiblingCompleteCallback = Callable[[int, Completion], Coroutine[Any, Any, None]]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -967,13 +969,23 @@ class RolloutManager:
             work,
             checkpoint_writer,
         )
-        return await self._impl.run_rollout(
+        result = await self._impl.run_rollout(
             input_sample,
             env_handles=env_handles,
             num_generations_per_prompt=num_generations_per_prompt,
             on_sibling_complete=_persist,
             restored_completions=restored_completions,
         )
+        logger.info(
+            "Completed rollout checkpoint group group_id=%s policy_version=%d "
+            "restored=%d persisted=%d total=%d",
+            work.group_id,
+            work.policy_version,
+            len(restored_completions),
+            work.num_generations - len(restored_completions),
+            work.num_generations,
+        )
+        return result
 
     async def _load_completed_siblings(
         self,
@@ -1006,6 +1018,25 @@ class RolloutManager:
                 self._validate_loaded_record(record, work)
                 completions[generation_index] = _copy_completion_to_cpu(
                     record.completion
+                )
+            if completions:
+                print(
+                    "ROLLOUT_CHECKPOINT_RECOVERY "
+                    f"restored={len(completions)} "
+                    f"total={work.num_generations} "
+                    f"group_id={work.group_id} "
+                    f"policy_version={work.policy_version} "
+                    f"generation_indices={sorted(completions)}",
+                    flush=True,
+                )
+                logger.info(
+                    "Restored %d/%d completed rollout sibling(s) from checkpoint "
+                    "for group_id=%s policy_version=%d generation_indices=%s",
+                    len(completions),
+                    work.num_generations,
+                    work.group_id,
+                    work.policy_version,
+                    sorted(completions),
                 )
             return completions
 
@@ -1159,6 +1190,18 @@ class RolloutManager:
                     "checkpoint acknowledgement key does not match the record: "
                     f"{ack.logical_key!r} != {record.logical_key!r}"
                 )
+            logger.debug(
+                "Durably persisted rollout sibling group_id=%s generation_index=%d "
+                "policy_version=%d attempt_id=%d path=%s already_existed=%s "
+                "checksum=%s",
+                record.group_id,
+                record.generation_index,
+                record.policy_version,
+                record.attempt_id,
+                ack.path,
+                ack.already_existed,
+                ack.record_checksum,
+            )
             return
 
         assert last_error is not None

@@ -249,6 +249,13 @@ run_recovery_phase() {
   echo "Recovery log: ${RECOVERY_LOG}"
   run_foreground "${RECOVERY_LOG}"
 
+  if ! grep -Eq \
+    'ROLLOUT_CHECKPOINT_RECOVERY restored=[1-9][0-9]* ' \
+    "${RECOVERY_LOG}"; then
+    echo "ERROR: recovery completed without restoring a rollout sibling." >&2
+    exit 1
+  fi
+
   sha256sum --check "${PHASE1_CHECKSUMS}"
 
   if ! find "${MODEL_CHECKPOINT_DIR}" -maxdepth 1 -type d -name 'step_*' \

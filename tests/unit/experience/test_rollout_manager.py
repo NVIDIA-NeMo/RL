@@ -628,7 +628,9 @@ def test_nemo_gym_stream_drains_all_persistence_tasks_before_raising():
     _run(_drive())
 
 
-def test_rollout_manager_builds_completed_sibling_record_and_gates_group_return():
+def test_rollout_manager_builds_completed_sibling_record_and_gates_group_return(
+    caplog,
+):
     completion = Completion(
         message_log=[
             {
@@ -700,10 +702,19 @@ def test_rollout_manager_builds_completed_sibling_record_and_gates_group_return(
         )
         await writer.started.wait()
         assert not task.done()
+        assert not any(
+            "Durably persisted rollout sibling" in message
+            for message in caplog.messages
+        )
+        assert not any(
+            "Completed rollout checkpoint group" in message
+            for message in caplog.messages
+        )
         writer.release.set()
         return await task
 
-    record = _run(_drive())
+    with caplog.at_level("DEBUG", logger="nemo_rl.experience.rollout_manager"):
+        record = _run(_drive())
 
     assert len(record.completions) == 1
     assert len(writer.records) == 1
@@ -711,6 +722,15 @@ def test_rollout_manager_builds_completed_sibling_record_and_gates_group_return(
     assert persisted.logical_key == ("run-1", "group-1", 0)
     assert persisted.policy_version == 0
     assert persisted.completion.message_log[0]["token_ids"].device.type == "cpu"
+    assert (
+        "Durably persisted rollout sibling group_id=group-1 generation_index=0 "
+        "policy_version=0 attempt_id=0 path=/checkpoint/g00000.pt "
+        f"already_existed=False checksum={'0' * 64}"
+    ) in caplog.messages
+    assert (
+        "Completed rollout checkpoint group group_id=group-1 policy_version=0 "
+        "restored=0 persisted=1 total=1"
+    ) in caplog.messages
 
 
 def test_rollout_manager_retries_transient_checkpoint_storage_failure():
@@ -914,7 +934,10 @@ def test_nemo_gym_fully_restored_group_skips_generation():
     assert metrics["completion_count"] == 2
 
 
-def test_rollout_manager_loads_checkpoint_before_starting_gym_rollout():
+def test_rollout_manager_loads_checkpoint_before_starting_gym_rollout(
+    caplog,
+    capsys,
+):
     events: list[str] = []
     loaded_record = _completed_sibling_record(0)
 
@@ -959,17 +982,30 @@ def test_rollout_manager_loads_checkpoint_before_starting_gym_rollout():
     manager._checkpoint_io_policy = _checkpoint_io_policy()
     manager._checkpoint_io_semaphore = None
 
-    result = _run(
-        manager.run_rollout(
-            {"idx": 1},
-            num_generations_per_prompt=1,
-            checkpoint_work=_checkpoint_work(),
-            checkpoint_writer=_Writer(),
+    with caplog.at_level("INFO", logger="nemo_rl.experience.rollout_manager"):
+        result = _run(
+            manager.run_rollout(
+                {"idx": 1},
+                num_generations_per_prompt=1,
+                checkpoint_work=_checkpoint_work(),
+                checkpoint_writer=_Writer(),
+            )
         )
-    )
 
     assert events == ["load", "run"]
     assert result.completions[0].reward == 0.0
+    assert (
+        "Restored 1/1 completed rollout sibling(s) from checkpoint "
+        "for group_id=group-1 policy_version=0 generation_indices=[0]"
+    ) in caplog.messages
+    assert (
+        "Completed rollout checkpoint group group_id=group-1 policy_version=0 "
+        "restored=1 persisted=0 total=1"
+    ) in caplog.messages
+    assert (
+        "ROLLOUT_CHECKPOINT_RECOVERY restored=1 total=1 group_id=group-1 "
+        "policy_version=0 generation_indices=[0]"
+    ) in capsys.readouterr().out
 
 
 def test_rollout_manager_retries_transient_checkpoint_load_failure():
