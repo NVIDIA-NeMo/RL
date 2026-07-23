@@ -105,6 +105,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
@@ -1292,6 +1293,29 @@ def setup(
             flush=True,
         )
 
+    elif backend == "trtllm":
+        generation_config = cast(TrtllmConfig, generation_config)
+
+        def init_trtllm():
+            """Initialize TRT-LLM generation workers."""
+            t0 = time.perf_counter()
+            pg = TrtllmGeneration(cluster=inference_cluster, config=generation_config)
+            pg.finish_generation()
+            return pg, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_trtllm,
+            generation_name="TRT-LLM",
+            init_time_key="trtllm_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using TRT-LLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -1901,6 +1925,13 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     if backend == "vllm":
         return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
 
+    if backend == "trtllm":
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        return True
+
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
         return mcore_cfg.get("async_engine", False)
@@ -1977,6 +2008,11 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     elif generation_config["backend"] == "megatron":
         should_expose_http_server = generation_config["mcore_generation_config"].get(
             "expose_http_server"
+        )
+    elif generation_config["backend"] == "trtllm":
+        raise NotImplementedError(
+            "NeMo-Gym is not supported with the TRT-LLM generation backend "
+            "(the TRT-LLM OpenAI-compatible HTTP server was removed)."
         )
     else:
         should_expose_http_server = False
@@ -2220,7 +2256,10 @@ def refit_policy_generation(
                 ray.get(futures_train)
                 update_success = True
             else:
-                # Original ZMQ IPC path for vLLM
+                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+                # streams CUDA IPC handles in chunks; receiver reconstructs
+                # tensors in-place and feeds them into the inference engine's
+                # loader.
                 futures_train = policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes,
                     kv_scales=kv_scales,
@@ -3725,16 +3764,17 @@ def async_grpo_train(
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
+    # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
+    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
         master_config
     ), (
-        "Async GRPO requires an async vLLM or Megatron generation engine. "
+        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
+        "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
+        "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"

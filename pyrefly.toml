@@ -166,6 +166,8 @@ project-includes = [
   "nemo_rl/models/generation/sglang/utils/ip_port_utils.py",
   "nemo_rl/models/generation/sglang/utils/patches.py",
   "nemo_rl/models/generation/sglang/utils/ray_utils.py",
+  "nemo_rl/models/generation/trtllm/__init__.py",
+  "nemo_rl/models/generation/trtllm/config.py",
   "nemo_rl/models/generation/vllm/__init__.py",
   "nemo_rl/models/generation/vllm/checkpoint_engine.py",
   "nemo_rl/models/generation/vllm/collective_rpc.py",
