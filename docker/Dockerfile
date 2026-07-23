@@ -246,7 +246,10 @@ RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
-# Validate the complete project before any TRT-LLM compilation starts.
+# Correctness guard: the preceding dependency layer intentionally omits the
+# TRT-LLM workspace. Validate the complete project here so a stale uv.lock
+# fails before we compile or cache a TRT-LLM wheel. Do not remove this check or
+# move it after the build.
 uv lock --check
 
 if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
