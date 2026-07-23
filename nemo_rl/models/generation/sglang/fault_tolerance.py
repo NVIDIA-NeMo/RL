@@ -48,6 +48,8 @@ class RolloutHealthMonitor:
         ]
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
+        self._check_condition = threading.Condition()
+        self._checks_in_flight = 0
 
     def start(self) -> bool:
         """Start the health monitor thread. Called once during initialization.
@@ -100,26 +102,47 @@ class RolloutHealthMonitor:
         self._pause_event = None
         self._is_checking_enabled = False
 
-    def pause(self) -> None:
-        """Pause health checking. Called when engines are offloaded."""
+    def pause(self, timeout_s: float | None = None) -> None:
+        """Pause health checks and synchronously drain any in-flight check.
+
+        Setting the pause event and admitting a new check use the same
+        condition, so once this method returns no health check can overlap a
+        refit, recovery, or memory transition.
+        """
         if self._pause_event is None:
             return
-        logger.info("Pausing health monitor...")
-        self._pause_event.set()
-        self._is_checking_enabled = False
+        with self._check_condition:
+            logger.info("Pausing health monitor...")
+            self._pause_event.set()
+            self._is_checking_enabled = False
+            drained = self._check_condition.wait_for(
+                lambda: self._checks_in_flight == 0,
+                timeout=timeout_s,
+            )
+        if not drained:
+            raise TimeoutError(
+                "Timed out waiting for an in-flight rollout health check to "
+                "finish; health monitoring remains paused."
+            )
 
     def resume(self) -> None:
         """Resume health checking. Called when engines are onloaded."""
         if self._pause_event is None:
             return
-        logger.info("Resuming health monitor...")
-        self._need_first_wait = True  # Need to wait after each resume
-        self._pause_event.clear()
-        self._is_checking_enabled = True
+        with self._check_condition:
+            logger.info("Resuming health monitor...")
+            self._need_first_wait = True  # Need to wait after each resume
+            self._pause_event.clear()
+            self._is_checking_enabled = True
 
     def is_checking_enabled(self) -> bool:
         """Return whether health checking is currently enabled (not paused)."""
         return self._is_checking_enabled
+
+    @property
+    def default_quiesce_timeout_s(self) -> float:
+        """Bound a drain across one health RPC and its failure cleanup."""
+        return 2 * self._check_timeout + 5
 
     def _health_monitor_loop(self) -> None:
         assert self._stop_event is not None
@@ -170,15 +193,39 @@ class RolloutHealthMonitor:
             logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
             return
 
+        with self._check_condition:
+            if (
+                self._stop_event is None
+                or self._stop_event.is_set()
+                or self._pause_event is None
+                or self._pause_event.is_set()
+            ):
+                return
+            self._checks_in_flight += 1
+
         try:
-            ray.get(engine.health_generate.remote(timeout=self._check_timeout))
-        except Exception as e:
-            logger.error(
-                f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
-            )
-            self._kill_engine(rollout_engine_id=rollout_engine_id)
-        else:
-            logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
+            try:
+                ray.get(
+                    engine.health_generate.remote(timeout=self._check_timeout),
+                    # Leave a small scheduling margin beyond the worker's
+                    # own HTTP timeout so a timely HTTP failure is observed
+                    # instead of misclassified as a Ray timeout.
+                    timeout=self._check_timeout + 1,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Health check failed for rollout engine {rollout_engine_id} "
+                    f"(ray timeout or error). Killing actor. Exception: {e}"
+                )
+                self._kill_engine(rollout_engine_id=rollout_engine_id)
+            else:
+                logger.debug(
+                    f"Health check passed for rollout engine {rollout_engine_id}"
+                )
+        finally:
+            with self._check_condition:
+                self._checks_in_flight -= 1
+                self._check_condition.notify_all()
 
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")
@@ -190,11 +237,19 @@ class RolloutHealthMonitor:
             if engine:
                 logger.info(f"Shutting down and killing engine at index {i}")
                 try:
-                    ray.get(engine.shutdown.remote())
+                    ray.get(
+                        engine.shutdown.remote(),
+                        timeout=self._check_timeout,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to shut down engine at index {i} cleanly (e: {e})"
+                    )
+                try:
                     ray.kill(engine)
                     logger.info(f"Successfully killed engine at index {i}")
                 except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
+                    logger.warning(f"Failed to kill engine at index {i} (e: {e})")
             else:
                 logger.info(f"Engine at index {i} is already None")
             self._sglang_generation.all_engines[i] = None

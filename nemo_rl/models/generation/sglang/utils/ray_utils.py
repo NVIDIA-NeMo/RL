@@ -34,26 +34,39 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
 ]
 
 
-@ray.remote
-class Lock:
+class _OwnerTokenLock:
+    """In-process owner-token lock state used by the Ray actor."""
+
     def __init__(self):
-        self._locked = False  # False: unlocked, True: locked
+        self._owner: str | None = None
 
-    def acquire(self):
-        """Try to acquire the lock.
+    def acquire(self, owner: str) -> bool:
+        """Try to acquire the lock for ``owner``.
 
-        Returns True if acquired, False otherwise. Caller should retry until
-        it returns True.
+        Repeated acquisition by the same owner is idempotent. This lets a
+        timed-out caller enqueue a matching ``release`` even when the final
+        acquire result raced with its deadline.
         """
-        if not self._locked:
-            self._locked = True
+        if self._owner is None:
+            self._owner = owner
             return True
-        return False
+        return self._owner == owner
 
-    def release(self):
-        """Release the lock, allowing others to acquire."""
-        assert self._locked, "Lock is not acquired, cannot release."
-        self._locked = False
+    def release(self, owner: str) -> bool:
+        """Release the lock iff it is held by ``owner``.
+
+        Returning ``False`` for a different/no owner makes delayed cleanup
+        safe without allowing one refit to unlock another refit's lease.
+        """
+        if self._owner != owner:
+            return False
+        self._owner = None
+        return True
+
+
+@ray.remote  # pragma: no cover
+class Lock(_OwnerTokenLock):
+    pass
 
 
 def get_host_info():

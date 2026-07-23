@@ -105,6 +105,11 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
+    # One orchestration timeout in seconds for disaggregated Megatron refit
+    # bootstrap, SGLang transport, post-processing, and cleanup. Synchronous
+    # Megatron/AutoBridge collectives remain governed by their process-group
+    # timeout. The normalization boundary materializes the default.
+    refit_timeout_s: NotRequired[float]
     # Weight precision and (when scheme=mxfp8) offline-conversion knobs.
     quantization: NotRequired[SglangQuantizationConfig]
     sglang_router_config: SGLangRouterConfig
@@ -317,6 +322,7 @@ class SGLangRuntimeConfig(BaseModel, extra="allow"):
     rollout_health_check_interval: PositiveFloat | None = None
     rollout_health_check_timeout: PositiveFloat | None = None
     rollout_health_check_first_wait: float | None = Field(default=None, ge=0)
+    refit_timeout_s: PositiveFloat = 1800
     quantization: SGLangQuantizationRuntimeConfig = Field(
         default_factory=SGLangQuantizationRuntimeConfig
     )
