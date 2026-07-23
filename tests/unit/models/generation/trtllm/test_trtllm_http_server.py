@@ -129,7 +129,7 @@ def _tool_call_messages():
 def _parse_with_trtllm(messages):
     chat_utils = pytest.importorskip("tensorrt_llm.serve.chat_utils")
     transformers = pytest.importorskip("transformers")
-    conversation, mm_coroutine, _ = chat_utils.parse_chat_messages_coroutines(
+    conversation, mm_coroutine, *_ = chat_utils.parse_chat_messages_coroutines(
         messages, transformers.PretrainedConfig()
     )
     assert asyncio.run(mm_coroutine) == (None, None)
