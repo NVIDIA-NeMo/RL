@@ -1,0 +1,90 @@
+# Two-node SGLang refit smoke:
+#   - one 4-GPU node for Megatron training
+#   - one 4-GPU node for four independent TP1 SGLang engines
+#
+# The resulting weight-update group has five ranks (trainer rank 0 plus four
+# engine leaders), which exercises the non-colocated NCCL broadcast path.
+defaults: ../../grpo_math_1B_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 3
+  val_period: 1000
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatron-sglang-noncolocated-quick
+
+policy:
+  model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  make_sequence_length_divisible_by: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+  generation:
+    backend: sglang
+    refit_transport: null
+    use_async_rollouts: false
+    max_new_tokens: 512
+    vllm_cfg: null
+    sglang_cfg:
+      model_path: ${policy.model_name}
+      dtype: ${policy.precision}
+      context_length: ${policy.max_total_sequence_length}
+      allow_auto_truncate: true
+      tp_size: 1
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      random_seed: 42
+      max_running_requests: null
+      mem_fraction_static: 0.8
+      skip_server_warmup: true
+      disable_piecewise_cuda_graph: true
+      disable_cuda_graph: false
+      use_fault_tolerance: false
+      refit_timeout_s: 300
+      quantization:
+        scheme: bf16
+      sglang_server_config:
+        needs_offload: false
+        cpu_weight_backup: false
+        sglang_server_concurrency: 64
+        pause_generation_mode: retract
+        num_gpus: 4
+        num_gpus_per_engine: 1
+        weight_transfer_mode: broadcast
+      sglang_router_config:
+        use_external_router: false
+        use_distributed_post: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+data:
+  max_input_seq_length: 512
+
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatron-sglang-noncolocated-quick
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
