@@ -426,14 +426,10 @@ def ensure_mxfp8_checkpoint(
         return save_dir
 
     extra_high_precision_layers_hf = tuple(
-        quantization_cfg.get("extra_high_precision_layers_hf", ()) or ()
+        quantization_cfg["extra_high_precision_layers_hf"]
     )
-    num_layers_at_start_in_bf16 = int(
-        quantization_cfg.get("num_layers_at_start_in_bf16", 0) or 0
-    )
-    num_layers_at_end_in_bf16 = int(
-        quantization_cfg.get("num_layers_at_end_in_bf16", 0) or 0
-    )
+    num_layers_at_start_in_bf16 = int(quantization_cfg["num_layers_at_start_in_bf16"])
+    num_layers_at_end_in_bf16 = int(quantization_cfg["num_layers_at_end_in_bf16"])
 
     logger.info(
         f"[mxfp8] Converting {model_path} -> {save_dir} "

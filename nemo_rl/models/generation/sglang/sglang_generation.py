@@ -35,7 +35,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    normalize_sglang_config,
+)
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_router import _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
@@ -74,6 +77,7 @@ class SGLangGeneration(GenerationInterface):
         cluster: RayVirtualCluster,
         sglang_cfg: SGLangConfig,
     ):
+        normalize_sglang_config(sglang_cfg)
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
         self._owns_runtime = True
@@ -135,7 +139,7 @@ class SGLangGeneration(GenerationInterface):
         # Serializes weight refits against engine recovery across processes.
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
-        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
+        if sglang_cfg["sglang_cfg"]["use_fault_tolerance"]:
             monitor = RolloutHealthMonitor(self, sglang_cfg)
             monitor.start()
             self._health_monitor = monitor
@@ -574,14 +578,14 @@ class SGLangGeneration(GenerationInterface):
             Dictionary of sampling parameters compatible with SGLang API.
         """
         temperature = 0.0 if greedy else self.sglang_cfg["temperature"]
-        top_k_cfg = self.sglang_cfg.get("top_k")
+        top_k_cfg = self.sglang_cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
 
         # Build sampling params dict first, then patch in optional fields so we
         # never reference ``sampling_params`` before it's bound.
         sampling_params: dict[str, Any] = {
             "temperature": temperature,
-            "top_p": self.sglang_cfg.get("top_p", 1.0),
+            "top_p": self.sglang_cfg["top_p"],
             "max_new_tokens": max_new_tokens,
             "no_stop_trim": True,
             "spaces_between_special_tokens": False,
@@ -812,7 +816,7 @@ class SGLangGeneration(GenerationInterface):
 
         # Clamp max_new_tokens against the per-sample remaining context window,
         # mirroring the logic in ``generate``.
-        context_length = self.sglang_cfg["sglang_cfg"].get("context_length")
+        context_length = self.sglang_cfg["sglang_cfg"]["context_length"]
         if context_length is not None:
             max_new_tokens = min(
                 self.sglang_cfg["max_new_tokens"],

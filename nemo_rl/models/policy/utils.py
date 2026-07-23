@@ -955,10 +955,10 @@ def disconnect_rollout_engines_from_distributed(
 def get_sglang_quantization_cfg(policy_generation: Any) -> dict:
     """Read the active SGLang quantization block from the generation handle.
 
-    Returns an empty dict when no quantization config is set, so callers can
-    treat the result as a stable mapping without ``None`` checks.
+    The configuration boundary materializes the BF16 defaults, so callers can
+    read the selected scheme directly without adding local fallbacks.
     """
-    return dict(policy_generation.sglang_cfg["sglang_cfg"].get("quantization") or {})
+    return dict(policy_generation.sglang_cfg["sglang_cfg"]["quantization"])
 
 
 def invalidate_sglang_kv_cache_for_refit(
@@ -991,9 +991,7 @@ def fetch_updatable_engines_with_recover(policy_generation: Any) -> tuple:
 
     Both calls are idempotent — recover is a no-op when no engines have died.
     """
-    use_ft = bool(
-        policy_generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance", False)
-    )
+    use_ft = policy_generation.sglang_cfg["sglang_cfg"]["use_fault_tolerance"]
     if use_ft:
         policy_generation.recover_updatable_engines()
     return policy_generation.get_updatable_engines_and_lock()

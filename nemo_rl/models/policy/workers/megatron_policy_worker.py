@@ -2868,7 +2868,7 @@ def refit_sglang_colocated(
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
-    target_precision = sglang_quant.get("scheme", "bf16")
+    target_precision = sglang_quant["scheme"]
 
     (
         rollout_engines,
@@ -2932,7 +2932,7 @@ def refit_sglang_distributed(
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
-    target_precision = sglang_quant.get("scheme", "bf16")
+    target_precision = sglang_quant["scheme"]
 
     (
         rollout_engines,

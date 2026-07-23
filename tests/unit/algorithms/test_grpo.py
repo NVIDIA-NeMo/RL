@@ -1894,10 +1894,20 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
         "resources": {"gpus_per_node": None, "num_nodes": None},
     }
     master_config.policy["generation"]["sglang_cfg"] = {
-        "gpus_per_server": 1,
+        "random_seed": 42,
+        "tp_size": 1,
         "dp_size": 1,
         "pp_size": 1,
         "ep_size": 1,
+        "skip_server_warmup": True,
+        "sglang_server_config": {
+            "needs_offload": True,
+            "cpu_weight_backup": False,
+            "sglang_server_concurrency": 64,
+            "pause_generation_mode": "retract",
+            "num_gpus": 1,
+            "num_gpus_per_engine": 1,
+        },
     }
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo["val_period"] = 0
