@@ -93,7 +93,7 @@ loss_fn:
   use_kl_in_reward: false
 
 policy:
-  model_name: "Qwen/Qwen3-30B-A3B-Thinking-2507"
+  model_name: "/lustre/fsw/portfolios/llmservice/users/igitman/hf_models/Qwen3-30B-A3B-Thinking-2507"
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs:
@@ -391,11 +391,11 @@ env:
           # datasets, tried in order per instance. Point these at your local
           # copies of the swe-bench / sweap image sets.
           container_formatter:
-          - "/path/to/swe-bench-images/swebench_sweb.eval.x86_64.{instance_id}.sif"
-          - "/path/to/sweap-images/sweap.{instance_id}.sif"
-          - "/path/to/swe-bench-images/namanjain12_{instance_id}.sif"
-          - "/path/to/sweap-images/sweap.{instance_id}.sif"
-          - "/path/to/swe-bench-images/swebench_sweb.eval.x86_64{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
@@ -405,11 +405,11 @@ env:
           dataset_path: ${data.validation.data_path}
           # Site-specific: see the note on swe_agents_train.container_formatter.
           container_formatter:
-          - "/path/to/swe-bench-images/swebench_sweb.eval.x86_64.{instance_id}.sif"
-          - "/path/to/sweap-images/sweap.{instance_id}.sif"
-          - "/path/to/swe-bench-images/namanjain12_{instance_id}.sif"
-          - "/path/to/sweap-images/sweap.{instance_id}.sif"
-          - "/path/to/swe-bench-images/swebench_sweb.eval.x86_64{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
     use_absolute_ip: true
 
 logger:
