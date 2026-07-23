@@ -62,9 +62,14 @@ def main() -> None:
     from nemo_rl.algorithms.sft import setup, sft_train
     from nemo_rl.algorithms.utils import get_tokenizer
     from nemo_rl.distributed.virtual_cluster import init_ray
-    from nemo_rl.utils.config import load_config, parse_hydra_overrides
+    from nemo_rl.utils.config import (
+        load_config,
+        parse_hydra_overrides,
+        register_omegaconf_resolvers,
+    )
     from nemo_rl.utils.logger import get_next_experiment_dir
 
+    register_omegaconf_resolvers()
     master_config = load_config(args.config)
     if overrides:
         master_config = parse_hydra_overrides(master_config, overrides)
