@@ -758,7 +758,7 @@ reward_penalties:
 # until those recipes are ready they fall back to `general` here.
 # =============================================================================
 _teachers:
-  general: ???   # Required — set by launcher via NRL_GENERAL_TEACHER_PATH
+  general: /path/to/general_teacher   # Placeholder so the config resolves; required at runtime — set by launcher via NRL_GENERAL_TEACHER_PATH
   rlhf:      ${_teachers.general}
   ifbench:   ${_teachers.general}
   reasoning: ${_teachers.general}

@@ -17,7 +17,7 @@ set -euo pipefail
 # Usage:
 #
 #   EXP_NAME=ultra-student-rlvr-001 \
-#   CONFIG_PATH=examples/configs/ultra/student_rlvr.yaml \
+#   CONFIG_PATH=examples/configs/ultra/student_rlvr1.yaml \
 #   MODEL_PATH=/path/to/sft_checkpoint \
 #   TRAIN_PATH=/path/to/train.jsonl \
 #   VAL_PATH=/path/to/val.jsonl \
@@ -72,7 +72,7 @@ set -euo pipefail
 # Required environment
 # =============================================================================
 : "${EXP_NAME:?EXP_NAME is required (used for job name, W&B run, checkpoint/log dirs)}"
-: "${CONFIG_PATH:?CONFIG_PATH is required (e.g. examples/configs/ultra/student_rlvr.yaml)}"
+: "${CONFIG_PATH:?CONFIG_PATH is required (e.g. examples/configs/ultra/student_rlvr1.yaml)}"
 : "${MODEL_PATH:?MODEL_PATH is required (initial policy checkpoint, HF repo id or local path)}"
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
@@ -104,6 +104,13 @@ SIF_DIR="${SIF_DIR:-}"
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "ERROR: CONFIG_PATH does not exist: ${CONFIG_PATH}" >&2
   exit 1
+fi
+
+# The SWE teacher recipe interpolates `${sif_dir}/...` paths at runtime. The
+# exemplar config carries only a placeholder, so hard-require SIF_DIR whenever
+# the selected config actually uses it (mirrors the mopd teacher-path guard).
+if grep -q '${sif_dir}' "${CONFIG_PATH}"; then
+  : "${SIF_DIR:?SIF_DIR is required for the SWE recipe (directory of apptainer .sif images)}"
 fi
 
 # =============================================================================
@@ -266,7 +273,7 @@ if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
 fi
 
 # =============================================================================
-# Job shape — defaults match the 256-node student_rlvr.yaml
+# Job shape — defaults match the 256-node student_rlvr1.yaml
 #
 #   Training:  64 nodes ( 256 GPUs) — Megatron training backend
 #   vLLM:     172 nodes ( 688 GPUs) — async generation, EP=8 instances at TP=8
@@ -834,7 +841,7 @@ SBATCH_OUTPUT=$(sbatch \
   ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
   ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
   ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"interactive","description":"interactive debugging"}}' \
+  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"batch","description":"batch training run"}}' \
   "${RAY_SUB}")
 
 echo "${SBATCH_OUTPUT}"
