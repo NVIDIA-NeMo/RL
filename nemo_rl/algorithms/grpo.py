@@ -104,7 +104,10 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    normalize_sglang_config,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -395,6 +398,14 @@ def setup(
     )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+    elif generation_config["backend"] == "sglang":
+        sglang_config = cast(SGLangConfig, generation_config)
+        if "model_path" not in sglang_config["sglang_cfg"]:
+            sglang_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
+        normalize_sglang_config(
+            sglang_config,
+            colocated_inference=generation_config["colocated"]["enabled"],
+        )
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -858,17 +869,18 @@ def setup(
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
                 #
                 # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: gpus_per_server already includes all parallelism
-                #   dimensions (TP, DP-attention, PP are internal subdivisions),
-                #   so we use it directly without multiplying by pp_size.
+                # For SGLang: num_gpus_per_engine already includes all
+                # parallelism dimensions, so use it directly.
                 if generation_config["backend"] == "vllm":
                     vllm_cfg = generation_config.get("vllm_cfg", {})
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
                     )
                 else:
-                    sglang_cfg = generation_config.get("sglang_cfg", {})
-                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                    sglang_cfg = generation_config["sglang_cfg"]
+                    gpus_per_instance = sglang_cfg["sglang_server_config"][
+                        "num_gpus_per_engine"
+                    ]
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node
@@ -1276,17 +1288,11 @@ def setup(
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
 
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
-
         # If MXFP8 is requested, ensure SGLang boots from an MXFP8 HF
         # checkpoint. This must happen before ``init_sglang`` so the engine
         # loads quantized weights.
-        sglang_quantization_cfg = (
-            generation_config["sglang_cfg"].get("quantization") or {}
-        )
-        if sglang_quantization_cfg.get("scheme", "bf16") == "mxfp8":
+        sglang_quantization_cfg = generation_config["sglang_cfg"]["quantization"]
+        if sglang_quantization_cfg["scheme"] == "mxfp8":
             from nemo_rl.models.generation.sglang.mxfp8_setup import (
                 ensure_mxfp8_checkpoint,
             )
@@ -1403,18 +1409,6 @@ def setup(
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
-    if backend == "sglang" and isinstance(policy_generation, SGLangGeneration):
-        weight_transfer_mode = generation_config["sglang_cfg"][
-            "sglang_server_config"
-        ].get("weight_transfer_mode", "ipc" if colocated_inference else "broadcast")
-        expected = "ipc" if colocated_inference else "broadcast"
-        if weight_transfer_mode != expected:
-            raise ValueError(
-                f"sglang_server_config.weight_transfer_mode={weight_transfer_mode!r} "
-                f"is inconsistent with colocated.enabled={colocated_inference}: "
-                f"expected {expected!r}."
-            )
-
     if remote_transport is not None:
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)

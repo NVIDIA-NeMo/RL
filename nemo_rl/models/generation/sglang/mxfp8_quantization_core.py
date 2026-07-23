@@ -165,17 +165,13 @@ def build_dynamic_skip_substrings(
     BF16-band layers.
     """
     extra_high_precision_layers_hf = tuple(
-        quantization_config.get("extra_high_precision_layers_hf", ()) or ()
+        quantization_config["extra_high_precision_layers_hf"]
     )
-    modules_to_not_convert = tuple(
-        quantization_config.get("modules_to_not_convert", ()) or ()
-    )
+    modules_to_not_convert = tuple(quantization_config["modules_to_not_convert"])
     num_layers_at_start_in_bf16 = int(
-        quantization_config.get("num_layers_at_start_in_bf16", 0) or 0
+        quantization_config["num_layers_at_start_in_bf16"]
     )
-    num_layers_at_end_in_bf16 = int(
-        quantization_config.get("num_layers_at_end_in_bf16", 0) or 0
-    )
+    num_layers_at_end_in_bf16 = int(quantization_config["num_layers_at_end_in_bf16"])
 
     head_end_idx = num_layers_at_start_in_bf16
     tail_start_idx = num_hidden_layers - num_layers_at_end_in_bf16

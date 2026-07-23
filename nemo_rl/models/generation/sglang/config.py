@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
+
+from pydantic import (
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -25,7 +34,7 @@ class SglangQuantizationConfig(TypedDict, total=False):
     MXFP8 HF tensors during online refit.
     """
 
-    scheme: str  # "bf16" | "mxfp8"
+    scheme: Literal["bf16", "mxfp8"]
     weight_block_size: list[int]
     scale_fmt: str
     modules_to_not_convert: list[str]
@@ -49,10 +58,9 @@ class SGLangServerConfig(TypedDict):
     # How to handle in-flight requests on pause: "retract" (preempt) or "kill". Required in YAML.
     pause_generation_mode: str
     # Total number of GPUs allocated to inference across all engines.
-    num_gpus: NotRequired[int]
-    # "ipc" -> CUDA-IPC to the colocated SGLang HTTP server (default for
-    # colocated inference). "broadcast" -> NCCL broadcast over a shared
-    # weight-update group (used when SGLang engines run on disaggregate GPUs).
+    num_gpus: int
+    # Optional compatibility hint. The effective mode is derived from
+    # colocated.enabled: "ipc" when colocated and "broadcast" otherwise.
     weight_transfer_mode: NotRequired[str]
     # GPUs per SGLang engine
     # num_gpus_per_engine = tp_size * pp_size; set ep, dp-attn are not orthgonal to those
@@ -61,7 +69,7 @@ class SGLangServerConfig(TypedDict):
     # num_gpu_per_engine_local = min(num_gpus_per_engine, num_gpus_per_node)
     # num_engines = num_gpus // num_gpu_per_engine_local
     # num_gpus_per_engine = nodes_per_engine * num_gpu_per_engine_local
-    num_gpus_per_engine: NotRequired[int]
+    num_gpus_per_engine: int
 
 
 class SGLangRouterConfig(TypedDict):
@@ -104,7 +112,7 @@ class SglangSpecificArgs(TypedDict):
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
     # Random seed for the engine; if None, SGLang picks one.
-    random_seed: NotRequired[int]
+    random_seed: int
     # Skip tokenizer init; callers must pass `input_ids` in generate requests.
     skip_tokenizer_init: NotRequired[bool]
     # Disable CUDA graphs entirely (use eager execution).
@@ -183,14 +191,14 @@ class SglangSpecificArgs(TypedDict):
     kv_cache_dtype: NotRequired[str]
     # Tensor parallelism size. Must satisfy tp_size == num_gpus_per_engine // pp_size.
     # Current pp_size set to 1, therefore, tp_size == num_gpus_per_engine
-    tp_size: NotRequired[int]
+    tp_size: int
     # Data parallelism size; only used when enable_dp_attention=True.
-    dp_size: NotRequired[int]
+    dp_size: int
     # Pipeline parallelism size.
     # PP > 1 does not support in current version, therefore, pp_size == 1
-    pp_size: NotRequired[int]
+    pp_size: int
     # Expert parallelism size (MoE).
-    ep_size: NotRequired[int]
+    ep_size: int
     # --- LoRA ---
     # Enable LoRA support; auto-set when `lora_paths` is provided.
     enable_lora: NotRequired[bool | None]
@@ -228,7 +236,7 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # --- Server warmup ---
     # Skip the post-startup warmup pass.
-    skip_server_warmup: NotRequired[bool]
+    skip_server_warmup: bool
 
 
 class SGLangConfig(GenerationConfig):
@@ -236,3 +244,159 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
+
+
+class SGLangQuantizationRuntimeConfig(BaseModel, extra="allow"):
+    """Normalized SGLang rollout/refit precision settings."""
+
+    scheme: Literal["bf16", "mxfp8"] = "bf16"
+    weight_block_size: list[int] | None = None
+    scale_fmt: str | None = None
+    modules_to_not_convert: list[str] = Field(default_factory=list)
+    extra_high_precision_layers_hf: list[str] = Field(default_factory=list)
+    num_layers_at_start_in_bf16: NonNegativeInt = 0
+    num_layers_at_end_in_bf16: NonNegativeInt = 0
+    converted_model_path: str | None = None
+    cache_root: str | None = None
+
+
+class SGLangServerRuntimeConfig(BaseModel, extra="allow"):
+    """NeMo-RL-owned SGLang server topology and lifecycle settings."""
+
+    needs_offload: bool
+    cpu_weight_backup: bool
+    sglang_server_concurrency: PositiveInt
+    pause_generation_mode: str = Field(min_length=1)
+    num_gpus: PositiveInt
+    num_gpus_per_engine: PositiveInt
+    weight_transfer_mode: Literal["ipc", "broadcast"] | None = None
+
+
+class SGLangRouterRuntimeConfig(BaseModel, extra="allow"):
+    """SGLang router settings normalized before actor startup."""
+
+    use_external_router: bool = False
+    sglang_router_ip: str | None = None
+    sglang_router_port: PositiveInt | None = None
+    router_policy: str | None = None
+    use_distributed_post: bool = False
+    sglang_router_request_timeout_secs: PositiveInt | None = None
+
+    @model_validator(mode="after")
+    def validate_external_router_endpoint(self) -> "SGLangRouterRuntimeConfig":
+        if self.use_external_router and (
+            self.sglang_router_ip is None or self.sglang_router_port is None
+        ):
+            raise ValueError(
+                "sglang_router_ip and sglang_router_port are required when "
+                "use_external_router is true."
+            )
+        return self
+
+
+class SGLangRuntimeConfig(BaseModel, extra="allow"):
+    """Validated SGLang settings consumed by NeMo-RL.
+
+    Unknown fields are preserved because the remaining keys are passed through
+    to SGLang's evolving ``ServerArgs`` API.
+    """
+
+    sglang_server_config: SGLangServerRuntimeConfig
+    sglang_router_config: SGLangRouterRuntimeConfig = Field(
+        default_factory=SGLangRouterRuntimeConfig
+    )
+    model_path: str = Field(min_length=1)
+    random_seed: int
+    skip_server_warmup: bool
+    tp_size: PositiveInt
+    dp_size: PositiveInt
+    pp_size: PositiveInt
+    ep_size: PositiveInt
+    context_length: PositiveInt | None = None
+    use_fault_tolerance: bool = False
+    rollout_health_check_interval: PositiveFloat | None = None
+    rollout_health_check_timeout: PositiveFloat | None = None
+    rollout_health_check_first_wait: float | None = Field(default=None, ge=0)
+    quantization: SGLangQuantizationRuntimeConfig = Field(
+        default_factory=SGLangQuantizationRuntimeConfig
+    )
+
+    @model_validator(mode="after")
+    def validate_runtime_invariants(self) -> "SGLangRuntimeConfig":
+        server = self.sglang_server_config
+        if self.pp_size != 1:
+            raise ValueError(
+                "SGLang pipeline parallelism is not supported; pp_size must be 1."
+            )
+        expected_gpus_per_engine = self.tp_size * self.pp_size
+        if server.num_gpus_per_engine != expected_gpus_per_engine:
+            raise ValueError(
+                "sglang_server_config.num_gpus_per_engine must equal "
+                f"tp_size * pp_size ({expected_gpus_per_engine}), got "
+                f"{server.num_gpus_per_engine}."
+            )
+        if server.num_gpus % server.num_gpus_per_engine != 0:
+            raise ValueError(
+                "sglang_server_config.num_gpus must be divisible by "
+                "sglang_server_config.num_gpus_per_engine."
+            )
+
+        if self.use_fault_tolerance:
+            missing = [
+                field
+                for field in (
+                    "rollout_health_check_interval",
+                    "rollout_health_check_timeout",
+                    "rollout_health_check_first_wait",
+                )
+                if getattr(self, field) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "SGLang fault tolerance requires explicit values for "
+                    + ", ".join(missing)
+                    + "."
+                )
+        return self
+
+
+def normalize_sglang_config(
+    config: SGLangConfig,
+    *,
+    colocated_inference: bool | None = None,
+) -> SGLangRuntimeConfig:
+    """Validate SGLang settings and materialize centralized defaults.
+
+    ``weight_transfer_mode`` is not an independent runtime choice: refit
+    dispatch derives IPC versus NCCL broadcast from the placement topology.
+    A supplied value is accepted as a compatibility assertion and rejected
+    when it conflicts with ``colocated_inference``.
+
+    Args:
+        config: Full generation configuration. Its ``sglang_cfg`` block is
+            replaced with the normalized, dict-shaped representation.
+        colocated_inference: Whether generation shares trainer GPUs. ``None``
+            skips transfer-mode resolution for topology-agnostic callers.
+
+    Returns:
+        The validated runtime model.
+    """
+    normalized = SGLangRuntimeConfig.model_validate(config["sglang_cfg"])
+    if colocated_inference is not None:
+        derived_mode: Literal["ipc", "broadcast"] = (
+            "ipc" if colocated_inference else "broadcast"
+        )
+        configured_mode = normalized.sglang_server_config.weight_transfer_mode
+        if configured_mode is not None and configured_mode != derived_mode:
+            raise ValueError(
+                "sglang_server_config.weight_transfer_mode="
+                f"{configured_mode!r} conflicts with colocated.enabled="
+                f"{colocated_inference}; the topology requires {derived_mode!r}."
+            )
+        normalized.sglang_server_config.weight_transfer_mode = derived_mode
+
+    config["sglang_cfg"] = cast(
+        SglangSpecificArgs,
+        normalized.model_dump(mode="python"),
+    )
+    return normalized
