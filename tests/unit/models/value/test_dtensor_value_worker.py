@@ -461,6 +461,122 @@ def test_value_worker_parallelism_equivalence(
             cluster.shutdown()
 
 
+def _summarize_train_metrics(results: dict[str, Any]) -> dict[str, float]:
+    """Reduce train results to scalars independent of microbatch ordering."""
+    mb = results["all_mb_metrics"]
+    return {
+        "loss": float(torch.as_tensor(results["loss"]).sum().item()),
+        "values_mean": float(sum(mb["values_mean"])),
+        "returns_mean": float(sum(mb["returns_mean"])),
+        "residual_sq_mean": float(sum(mb["residual_sq_mean"])),
+    }
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    ("tp", "feature_updates"),
+    [
+        (1, {"dynamic_batching": True}),
+        (2, {"sequence_parallel": True, "dynamic_batching": True}),
+    ],
+    ids=["dynamic_batching", "sequence_parallel_dynamic_batching"],
+)
+def test_value_worker_dynamic_batching_train_forward_equivalence(
+    tiny_qwen2_model_path, tmp_path, tp, feature_updates
+):
+    """Dynamic batching must preserve the pinned train-forward value signal.
+
+    ``get_values`` coverage alone cannot detect a bug in the value-loss path.
+    This test pins one value-head initialization, reloads it into feature-OFF
+    and feature-ON workers, and compares the deterministic train forward,
+    right-shift, loss, reorder, and normalization chain on variable-length
+    samples. ``eval_mode=True`` disables dropout so different microbatch orders
+    do not confound the equivalence assertion.
+    """
+    feature_id = "-".join(key for key, enabled in feature_updates.items() if enabled)
+    equiv_gpus = max(tp, 1)
+    weights_path = os.path.join(str(tmp_path), "value", "weights")
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=0.5))
+
+    def _base_config() -> ValueConfig:
+        return _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+
+    torch.manual_seed(42)
+    batch, max_seq_len = 8, 64
+    input_lengths = torch.randint(
+        max_seq_len // 2, max_seq_len + 1, (batch,), dtype=torch.int32
+    )
+    attention_mask = (torch.arange(max_seq_len)[None, :] < input_lengths[:, None]).to(
+        torch.float32
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 151000, (batch, max_seq_len)),
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "returns": torch.randn(batch, max_seq_len) * 0.1,
+            "values": torch.randn(batch, max_seq_len) * 0.1,
+            "token_mask": attention_mask.clone(),
+            "sample_mask": torch.ones(batch),
+        }
+    )
+
+    def _run(config: ValueConfig, cluster, tokenizer, *, load: bool):
+        worker = Value(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            weights_path=Path(weights_path) if load else None,
+            name_prefix=f"lm_value_{'test' if load else 'source'}",
+        )
+        try:
+            if not load:
+                worker.prepare_for_inference()
+                worker.save_checkpoint(
+                    weights_path=weights_path,
+                    checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
+                )
+                return None
+            worker.prepare_for_training()
+            results = worker.train(data, loss_fn, eval_mode=True)
+            worker.finish_training()
+            return _summarize_train_metrics(results)
+        finally:
+            worker.shutdown()
+
+    cluster = None
+    try:
+        cluster = RayVirtualCluster(
+            name=f"test-dtensor-value-train-equiv-{feature_id}",
+            bundle_ct_per_node_list=[equiv_gpus],
+            use_gpus=True,
+            num_gpus_per_node=equiv_gpus,
+            max_colocated_worker_groups=1,
+        )
+        tokenizer = get_tokenizer(_base_config()["tokenizer"])
+
+        _run(_base_config(), cluster, tokenizer, load=False)
+        metrics_off = _run(_base_config(), cluster, tokenizer, load=True)
+
+        config_on = _base_config()
+        _apply_config_updates(config_on, feature_updates)
+        metrics_on = _run(config_on, cluster, tokenizer, load=True)
+    finally:
+        if cluster is not None:
+            cluster.shutdown()
+
+    for key in ("returns_mean", "values_mean", "residual_sq_mean", "loss"):
+        torch.testing.assert_close(
+            torch.tensor(metrics_on[key]),
+            torch.tensor(metrics_off[key]),
+            rtol=1e-2,
+            atol=1e-3,
+            msg=f"{feature_id}: train-forward {key} diverged "
+            f"(on={metrics_on[key]}, off={metrics_off[key]})",
+        )
+
+
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
