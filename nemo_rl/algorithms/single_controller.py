@@ -50,7 +50,11 @@ import ray
 import torch
 from pydantic import BaseModel, Field
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSamplerConfig,
+    SamplerConfig,
+    create_sampler,
+)
 from nemo_rl.algorithms.grpo import GRPOLoggerConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
@@ -100,29 +104,26 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     are validated at construction by pydantic — no runtime assert needed.
     """
 
-    # Staleness. A "group" is the atomic training unit: group_size
+    # Group geometry. A "group" is the atomic training unit: group_size
     # samples sharing one source prompt. GRPO consumers set group_size =
     # num generations per prompt; SFT/OPD-style consumers degenerate
     # cleanly to group_size=1 (every sample its own group).
-    max_weight_staleness_versions: int = 1
     min_groups_per_batch: int = 2
     target_groups_per_step: Optional[int] = None
     group_size: int = 4
-    batch_selection_strategy: Literal[
-        "strict_on_policy",
-        "staleness_window",
-    ] = "strict_on_policy"
 
     # Concurrency limits
     max_inflight_prompts: int = 8
     max_buffered_rollouts: int = 8  # _buffer_capacity semaphore size
 
-    # Rollout dispatch gating (read by _rollout_pump). over_sampling=False
-    # gates each batch on max_rollout_version vs trainer_version; force_in_order
-    # stamps target_step on each dispatch so downstream consumers can match
-    # rollout batches to trainer steps exactly.
-    over_sampling: bool = False
-    force_in_order: bool = False
+    # Staleness policy — the single source of truth for how rollouts are gated
+    # (rollout pump) and selected/evicted (train pump). Discriminated on
+    # ``name`` (windowed | weight_fifo | in_order | custom); each variant carries
+    # only its own args, so invalid combinations are unrepresentable and there
+    # are no cross-field knobs to validate at runtime. ``custom`` takes a
+    # ``module:ClassName`` target to load a PromptGroupSampler from outside this
+    # repo. Default mirrors the exemplar (exact batch->step matching).
+    sampler: SamplerConfig = Field(default_factory=InOrderSamplerConfig)
 
     # Training
     max_train_steps: int = 10
@@ -163,57 +164,6 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # Logger
     logger: GRPOLoggerConfig
 
-
-def warn_if_staleness_window_below_minibatches(
-    cfg: SingleControllerConfig,
-) -> None:
-    """Warn when the staleness window is too small to cover one outer step.
-
-    ``_train_pump`` runs ``num_minibatches`` begin/finish cycles per outer
-    step, bumping ``_trainer_version`` after each ``finish_train_step``
-    (one opt.step) but refreshing generation weights (``_sync_weights``)
-    only once, at the end of the outer step. A group produced at the version
-    the step started on therefore ages by up to ``num_minibatches - 1``
-    versions before the next sync. When the effective staleness window is
-    smaller than that, such groups become unselectable mid-step — the
-    sampler skips them and ``sampler.evict`` may drop them as stale —
-    so the pump can spin or thrash instead of consuming them.
-
-    Warns rather than raises: a run may intentionally accept the resulting
-    eviction churn. Self-contained (does not assume ``cfg`` has been coerced
-    by ``__init__``) so it is unit-testable without constructing the actor.
-
-    Args:
-        cfg: SingleController config. ``strict_on_policy`` pins the effective
-            window to 0 regardless of ``max_weight_staleness_versions``.
-    """
-    effective_window = (
-        0
-        if cfg.batch_selection_strategy == "strict_on_policy"
-        else cfg.max_weight_staleness_versions
-    )
-    target_groups = cfg.target_groups_per_step or cfg.min_groups_per_batch
-    samples_per_step = target_groups * cfg.group_size
-    train_global_batch_size = cfg.train_global_batch_size or samples_per_step
-    groups_per_minibatch = train_global_batch_size // cfg.group_size
-    if groups_per_minibatch <= 0:
-        return
-    num_minibatches = target_groups // groups_per_minibatch
-    if num_minibatches > 1 and effective_window < num_minibatches - 1:
-        print(
-            f"WARNING: max_weight_staleness_versions (effective window "
-            f"{effective_window}) is smaller than num_minibatches - 1 "
-            f"({num_minibatches - 1}): each outer step runs {num_minibatches} "
-            f"optimizer steps but syncs generation weights only once, at the "
-            f"end, so groups produced at the version the step began on age by "
-            f"up to {num_minibatches - 1} versions before the next sync and "
-            f"become unselectable (skipped, then evicted as stale) mid-step "
-            f"— the train pump may spin or thrash. Remedy: raise "
-            f"max_weight_staleness_versions to at least {num_minibatches - 1}, "
-            f"or lower target_groups_per_step * group_size / "
-            f"train_global_batch_size to reduce num_minibatches.",
-            flush=True,
-        )
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -266,27 +216,10 @@ class SingleControllerActor:
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
 
-        # batch_selection_strategy is Literal-typed; pydantic rejects unknown
-        # values at config construction, so no runtime assert is needed here.
-        if cfg.batch_selection_strategy == "strict_on_policy":
-            cfg.max_weight_staleness_versions = 0
-            cfg.over_sampling = False
-            print(
-                "Using strict_on_policy, auto setting max_weight_staleness_versions "
-                "to 0 and over_sampling to False.",
-                flush=True,
-            )
-        if cfg.max_weight_staleness_versions == 0 and cfg.over_sampling:
-            raise ValueError(
-                "max_weight_staleness_versions=0 requires over_sampling=False: "
-                "with zero staleness the dispatch gate needs to advance one batch "
-                "per trainer_version, which over_sampling=True bypasses."
-            )
-        if cfg.force_in_order and cfg.over_sampling:
-            raise ValueError(
-                "force_in_order=True requires over_sampling=False so that each "
-                "dispatched batch corresponds to exactly one target training step."
-            )
+        # Staleness-mode validation that used to live here (strict_on_policy
+        # coercion, over_sampling/force_in_order mutual-exclusion raises) is gone:
+        # the sampler config's discriminated union makes those states
+        # unrepresentable — see ``cfg.sampler`` / ``create_sampler``.
 
         if cfg.target_groups_per_step is None:
             cfg.target_groups_per_step = cfg.min_groups_per_batch
@@ -323,17 +256,28 @@ class SingleControllerActor:
                 f"({cfg.group_size}) so a mini-batch contains "
                 f"whole prompt groups"
             )
-        # num_minibatches > 1 runs multiple opt.steps (each bumps
-        # trainer_version) between weight syncs; warn if the staleness window
-        # cannot keep same-step groups selectable across those bumps.
-        warn_if_staleness_window_below_minibatches(cfg)
+        # Staleness policy owns admit (rollout side) + select/evict (train side)
+        # + is_on_policy / required_buffer_capacity (derived facts). ``name`` in
+        # the config is the single switch for which behavior runs.
+        self._sampler = create_sampler(self._buffer, cfg.sampler)
 
-        self._sampler = StalenessSampler(
-            self._buffer,
-            max_staleness_versions=cfg.max_weight_staleness_versions,
-            strict_weight_fifo=not cfg.over_sampling,
-            force_in_order=cfg.force_in_order,
+        # Capacity requirement is a derived fact the sampler owns, so this check
+        # can't drift from the admission logic. None means the policy self-bounds
+        # via backpressure (e.g. the over-sampled windowed policy).
+        required_capacity = self._sampler.required_buffer_capacity(
+            cfg.target_groups_per_step
         )
+        if (
+            required_capacity is not None
+            and cfg.max_buffered_rollouts < required_capacity
+        ):
+            raise ValueError(
+                f"max_buffered_rollouts ({cfg.max_buffered_rollouts}) is below "
+                f"the {type(self._sampler).__name__}'s required capacity "
+                f"({required_capacity} = target_groups_per_step "
+                f"{cfg.target_groups_per_step} * (lookahead + 1)); the rollout "
+                f"pump would deadlock waiting for buffer slots."
+            )
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
@@ -343,9 +287,9 @@ class SingleControllerActor:
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
 
-        # Rollout batch counter — pre-incremented before each dispatch, so start
-        # at -1 to allow the first batch through the strict_on_policy gate.
-        self._max_rollout_version: int = -1
+        # The rollout batch counter (dispatch index) is now owned by the sampler
+        # (``BaseSampler._dispatch_index``), which gates admission and stamps
+        # target_step — see ``_rollout_pump`` / ``PromptGroupSampler.admit``.
 
         # Active rollout tasks used by downstream synchronization/drain paths.
         # TaskGroup remains responsible for task ownership and cancellation.
@@ -370,8 +314,7 @@ class SingleControllerActor:
         self._current_epoch: int = 0
 
         print(
-            f"SingleControllerActor: staleness_cap="
-            f"{cfg.max_weight_staleness_versions} "
+            f"SingleControllerActor: sampler={cfg.sampler.name} "
             f"buffer={cfg.max_buffered_rollouts} "
             f"inflight={cfg.max_inflight_prompts} "
             f"transport={cfg.refit_cfg.impl}",
@@ -437,9 +380,10 @@ class SingleControllerActor:
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
-        Per batch (over_sampling=False):
-          0. Wait while _max_rollout_version >= trainer_version + max_staleness,
-             then claim the next step by incrementing _max_rollout_version.
+        Per batch:
+          0. await sampler.admit(...) — blocks until the batch may dispatch and
+             returns the target_step stamp (the staleness gate lives in the
+             sampler, not here).
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
@@ -451,9 +395,6 @@ class SingleControllerActor:
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
-        over_sampling = self._cfg.over_sampling
-        max_staleness = self._cfg.max_weight_staleness_versions
-        force_in_order = self._cfg.force_in_order
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -497,17 +438,15 @@ class SingleControllerActor:
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
-                    # over_sampling=False: batch-level gate on max_rollout_version.
-                    if not over_sampling:
-                        while (
-                            self._max_rollout_version
-                            >= self._trainer_version + max_staleness
-                        ):
-                            await asyncio.sleep(0.005)
-                        self._max_rollout_version += 1
-
-                    # target_step = batch dispatch index when force_in_order is on.
-                    target_step = self._max_rollout_version if force_in_order else None
+                    # The sampler owns admission: it blocks until this batch may
+                    # dispatch (per its own staleness algorithm) and returns the
+                    # target_step to stamp (None when the policy doesn't stamp).
+                    # Keeping the gate here means the rollout pump follows
+                    # whichever sampler is selected without a second copy of the
+                    # gating logic to keep in sync.
+                    target_step = await self._sampler.admit(
+                        trainer_version_fn=lambda: self._trainer_version
+                    )
 
                     for prompt_idx in range(prompt_batch.size):
                         prompt: DatumSpec = {  # type: ignore
