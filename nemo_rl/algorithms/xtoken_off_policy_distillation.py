@@ -174,24 +174,31 @@ class TeacherConfig(BaseModel, extra="allow"):
         weight: Static loss weight for this teacher when several teachers are
             aggregated (``kd_loss_mode="sum"`` / the convex ``"averaged_logits"``
             mix). Single-teacher runs leave it at ``1.0``.
-        gold_loss: Optional per-teacher override of ``loss_fn.gold_loss``.
-            ``None`` falls back to the global value. Honored only in
-            ``kd_loss_mode="sum"`` (other modes use the global).
-        xtoken_loss: Optional per-teacher override of ``loss_fn.xtoken_loss``,
-            same semantics as ``gold_loss``.
+        pseudo_target_path: Path to this teacher's forward pseudo-target table
+            (student->teacher sub-token chains, ``subtoks`` / ``lengths`` keys),
+            consumed by the v6 prefix-support index and (when
+            ``common_indices_from_subtoks``) the common-vocab set. ``None`` for a
+            same-tokenizer teacher.
+        reverse_pseudo_target_path: Path to the reverse pseudo-target table
+            (teacher->student chains). ``None`` for a same-tokenizer teacher.
     """
 
     projection_matrix_path: Optional[str] = None
     weight: float = 1.0
-    gold_loss: Optional[bool] = None
-    xtoken_loss: Optional[bool] = None
+    pseudo_target_path: Optional[str] = None
+    reverse_pseudo_target_path: Optional[str] = None
 
     def policy_config(self) -> PolicyConfig:
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
         return cast(
             PolicyConfig,
             self.model_dump(
-                exclude={"projection_matrix_path", "weight", "gold_loss", "xtoken_loss"}
+                exclude={
+                    "projection_matrix_path",
+                    "weight",
+                    "pseudo_target_path",
+                    "reverse_pseudo_target_path",
+                }
             ),
         )
 
@@ -482,8 +489,12 @@ def setup(
         "teacher_vocab_sizes": [len(tok) for tok in teacher_tokenizers],
         "projection_matrix_paths": [t.projection_matrix_path for t in teachers],
         "teacher_weights": [t.weight for t in teachers],
-        "teacher_gold_loss": [t.gold_loss for t in teachers],
-        "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
+        # v6 pseudo-target tables (student<->teacher sub-token chains) per
+        # cross-tokenizer teacher; None for same-tokenizer teachers.
+        "pseudo_target_paths": [t.pseudo_target_path for t in teachers],
+        "reverse_pseudo_target_paths": [
+            t.reverse_pseudo_target_path for t in teachers
+        ],
     }
     loss_fn = CrossTokenizerDistillationLossFn(loss_config)
 
