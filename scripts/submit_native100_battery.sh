@@ -19,13 +19,13 @@ for MODE in noclip clip1; do
   PAC=0; [[ "$MODE" == "clip1" ]] && PAC=1
   J=$(sbatch --parsable \
       --export=ALL,CFG=${CFGDIR}/native100_${MODE}_multi.yaml,${BASE_ENV},NOUSNET_INIT_IMPORT_SLOT=,NOUSNET_PER_ADAPTER_GRAD_CLIP=${PAC} \
-      -J n100-${MODE}-m ${LAUNCHER})
+      -J n100v2-${MODE}-m ${LAUNCHER})
   SUBMITTED+="${MODE}/multi=${J} "
   for AD in sa sb sc sd; do
     WHO="single_${AD#s}"
     J=$(sbatch --parsable \
         --export=ALL,CFG=${CFGDIR}/native100_${MODE}_${AD}.yaml,${BASE_ENV},NOUSNET_INIT_IMPORT_SLOT=${SLOT[$AD]},NOUSNET_DIAG_WHO=${WHO},NOUSNET_PER_ADAPTER_GRAD_CLIP=0 \
-        -J n100-${MODE}-${AD} ${LAUNCHER})
+        -J n100v2-${MODE}-${AD} ${LAUNCHER})
     SUBMITTED+="${MODE}/${AD}=${J} "
   done
 done
