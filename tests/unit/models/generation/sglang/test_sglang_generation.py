@@ -27,6 +27,7 @@ Model: Qwen/Qwen3-0.6B
 
 import asyncio
 import gc
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -232,20 +233,45 @@ def _make_minimal_sglang_gen_for_clamp_test(
 
 
 def test_pickle_hooks_drop_and_rebuild_driver_runtime_state(monkeypatch):
+    class _RebuiltLoop:
+        def __init__(self):
+            self.closed = False
+
+        def run(self, coro):
+            return asyncio.run(coro)
+
+        def close(self):
+            self.closed = True
+
+    class _RebuiltClient:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
     generation = SGLangGeneration.__new__(SGLangGeneration)
     generation.sglang_cfg = _make_sglang_generation_cfg()
+    generation._owns_runtime = True
     generation._http_client = object()
     generation._async_loop = object()
     generation._health_monitor = object()
+    generation.all_engines = [MagicMock()]
+    generation._router_actor = MagicMock()
 
     state = generation.__getstate__()
 
+    assert state["_owns_runtime"] is False
     assert state["_http_client"] is None
     assert state["_async_loop"] is None
     assert state["_health_monitor"] is None
+    assert generation._owns_runtime is True
+    assert generation._http_client is not None
+    assert generation._async_loop is not None
+    assert generation._health_monitor is not None
 
-    rebuilt_loop = object()
-    rebuilt_client = object()
+    rebuilt_loop = _RebuiltLoop()
+    rebuilt_client = _RebuiltClient()
     monkeypatch.setattr(
         sglang_generation_module,
         "AsyncLoopThread",
@@ -263,6 +289,42 @@ def test_pickle_hooks_drop_and_rebuild_driver_runtime_state(monkeypatch):
     assert restored._async_loop is rebuilt_loop
     assert restored._http_client is rebuilt_client
     assert restored._health_monitor is None
+    assert restored._owns_runtime is False
+
+    assert restored.shutdown()
+    generation.all_engines[0].shutdown.remote.assert_not_called()
+    generation._router_actor.stop.remote.assert_not_called()
+    assert rebuilt_client.closed
+    assert rebuilt_loop.closed
+
+    # Prevent this synthetic owner from touching actor mocks during GC.
+    generation._owns_runtime = False
+    generation._http_client = None
+    generation._async_loop = None
+
+
+def test_runtime_owner_shutdown_stops_driver_resources(monkeypatch):
+    health_monitor = MagicMock()
+    engine = MagicMock()
+    router_actor = MagicMock()
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation._owns_runtime = True
+    generation._health_monitor = health_monitor
+    generation.all_engines = [engine]
+    generation._router_actor = router_actor
+    generation._http_client = None
+    generation._async_loop = None
+    monkeypatch.setattr(sglang_generation_module.ray, "get", MagicMock())
+    monkeypatch.setattr(sglang_generation_module.ray, "kill", MagicMock())
+
+    assert generation.shutdown()
+
+    health_monitor.stop.assert_called_once_with()
+    engine.shutdown.remote.assert_called_once_with()
+    router_actor.stop.remote.assert_called_once_with()
+    sglang_generation_module.ray.kill.assert_called_once_with(router_actor)
+    assert generation.all_engines == [None]
+    assert generation._router_actor is None
 
 
 # ===================================================================
