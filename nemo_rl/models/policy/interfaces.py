@@ -164,12 +164,6 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
-    @property
-    @abstractmethod
-    def data_parallel_size(self) -> int:
-        """Return the policy's realized data-parallel degree."""
-        pass
-
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
