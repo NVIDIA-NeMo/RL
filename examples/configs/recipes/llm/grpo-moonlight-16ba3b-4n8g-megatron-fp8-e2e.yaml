@@ -43,6 +43,14 @@ policy:
       quantization_ignored_layer_kws:
       - a_proj
       - b_proj
+    vllm_kwargs:
+      compilation_config:
+        # vLLM 0.25 defaults to FULL_AND_PIECEWISE cudagraphs, whose capture
+        # memory lives outside the CuMemAllocator sleep pool; on this
+        # colocated fp8 recipe the pool then fails to re-map at wake-up
+        # ("CUDA Error: out of memory at csrc/cumem_allocator.cpp").
+        # PIECEWISE restores the 0.20-era graph footprint.
+        cudagraph_mode: PIECEWISE
 logger:
   monitor_gpus: false
   wandb:

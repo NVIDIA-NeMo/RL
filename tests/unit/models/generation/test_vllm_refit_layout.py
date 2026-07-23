@@ -24,12 +24,12 @@ from nemo_rl.models.generation.vllm.refit_layout import (
 def _layout(*, tp_rank=0, tp_size=1, local_expert_ids=None):
     return {
         "expert_params": {
-            "model.layers.0.mlp.experts.w13_weight": {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": {
                 "tp_rank": tp_rank,
                 "tp_size": tp_size,
                 "local_expert_ids": local_expert_ids,
             },
-            "model.layers.0.mlp.experts.w2_weight": {
+            "model.layers.0.mlp.experts.routed_experts.w2_weight": {
                 "tp_rank": tp_rank,
                 "tp_size": tp_size,
                 "local_expert_ids": local_expert_ids,
@@ -45,14 +45,14 @@ def test_parse_hf_expert_weight_maps_vllm_fused_parameters():
 
     assert gate is not None
     assert (gate.parameter_name, gate.expert_id, gate.shard_id, gate.tp_shard_dim) == (
-        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.routed_experts.w13_weight",
         7,
         "w1",
         0,
     )
     assert down is not None
     assert (down.parameter_name, down.shard_id, down.tp_shard_dim) == (
-        "model.layers.0.mlp.experts.w2_weight",
+        "model.layers.0.mlp.experts.routed_experts.w2_weight",
         "w2",
         1,
     )

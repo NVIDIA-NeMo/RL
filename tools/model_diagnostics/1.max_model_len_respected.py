@@ -18,7 +18,12 @@ parser.add_argument("model", type=str, nargs="?", default="ibm-ai-platform/Bamba
 args = parser.parse_args()
 
 
-from vllm import LLM, SamplingParams
+from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+
+# Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+ensure_vllm_source_compat()
+
+from vllm import LLM, SamplingParams  # noqa: E402
 
 llm = LLM(
     # Examples as of 0.9.0

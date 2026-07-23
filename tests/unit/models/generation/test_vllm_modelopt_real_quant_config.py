@@ -27,7 +27,6 @@ import nemo_rl.modelopt.utils as modelopt_utils
 from nemo_rl.modelopt.models.generation.vllm_modelopt import (
     NEMO_MODELOPT_W4A4,
     NEMO_MODELOPT_W4A16,
-    _pad_nvfp4_moe_for_marlin,
     quantization_method_for_mode,
     register_nemo_modelopt_nvfp4,
 )
@@ -334,6 +333,13 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
             self.moe = moe_config
             self.moe_kernel = None
             self.moe_quant_config = None
+            # Mirror vLLM 0.25: weight-only mode and backend selection are
+            # keyed off the config's quant_method in the base __init__.
+            self.use_a16 = (
+                getattr(quant_config, "quant_method", "NVFP4") == "W4A16_NVFP4"
+            )
+            self.nvfp4_backend = "marlin"
+            self.use_global_sf = False
 
         def create_weights(self, layer, *args, **kwargs):
             events.append(("native_create_weights", layer, args, kwargs))
@@ -372,17 +378,35 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
             else:
                 self.moe_quant_config = types.SimpleNamespace(source="native")
 
+    class FakeModelOptNvFp4W4A16LinearMethod(FakeModelOptNvFp4LinearMethod):
+        pass
+
     class FakeModelOptNvFp4Config:
         LinearMethodCls = FakeModelOptNvFp4LinearMethod
         FusedMoEMethodCls = FakeModelOptNvFp4FusedMoE
 
-        def __init__(self, group_size=16):
+        def __init__(self, quant_method="NVFP4", group_size=16):
+            self.quant_method = quant_method
             self.group_size = group_size
+            # Mirror vLLM 0.25: __init__ installs LinearMethodCls as an
+            # *instance* attribute keyed off quant_method, shadowing any
+            # subclass class attribute.
+            if quant_method == "NVFP4":
+                self.LinearMethodCls = FakeModelOptNvFp4LinearMethod
+            elif quant_method == "W4A16_NVFP4":
+                self.LinearMethodCls = FakeModelOptNvFp4W4A16LinearMethod
+            else:
+                raise ValueError(
+                    f"Unsupported ModelOpt NVFP4 quant_algo: {quant_method}"
+                )
 
         @classmethod
         def from_config(cls, config):
             target = config.get("quantization", config)
-            instance = cls(group_size=target.get("group_size", 16))
+            instance = cls(
+                quant_method=str(target.get("quant_algo", "NVFP4")).upper(),
+                group_size=target.get("group_size", 16),
+            )
             instance.parsed_config = config
             return instance
 
@@ -2325,8 +2349,12 @@ def test_register_nemo_modelopt_nvfp4_uses_public_vllm_registry(monkeypatch):
     source_config = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
     w4a16_config = fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config(source_config)
     assert source_config["quant_algo"] == "W4A16_NVFP4"
-    assert w4a16_config.parsed_config["quant_algo"] == "NVFP4"
+    # vLLM 0.25 understands W4A16_NVFP4 natively; the algo passes through.
+    assert w4a16_config.parsed_config["quant_algo"] == "W4A16_NVFP4"
     assert w4a16_config.get_name() == NEMO_MODELOPT_W4A16
+    # The base __init__ installs its own LinearMethodCls instance attribute;
+    # the NeMo config must rebind it to the refit-friendly Marlin method.
+    assert w4a16_config.LinearMethodCls.__name__ == "NemoModelOptW4A16LinearMethod"
 
     with pytest.raises(ValueError, match="requires quant_algo='W4A16_NVFP4'"):
         fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config({"quant_algo": "NVFP4"})
@@ -2562,63 +2590,6 @@ def test_registered_w4a16_dense_method_uses_marlin_weight_only(monkeypatch):
     assert kernel_args["bias"] is None
 
 
-@pytest.mark.parametrize(
-    ("is_act_and_mul", "packed_hidden_size", "expected_padded_size"),
-    [
-        (False, 64, 192),
-        (True, 32, 256),
-    ],
-)
-def test_pad_nvfp4_moe_for_marlin_uses_hidden_size_tile_alignment(
-    is_act_and_mul,
-    packed_hidden_size,
-    expected_padded_size,
-):
-    num_shards = 2 if is_act_and_mul else 1
-    intermediate_size = 144
-    w13 = torch.ones(
-        1,
-        num_shards * intermediate_size,
-        packed_hidden_size,
-    )
-    w13_scale = torch.ones(1, num_shards * intermediate_size, 2)
-    w2 = torch.ones(1, 2, intermediate_size // 2)
-    w2_scale = torch.ones(1, 2, intermediate_size // 16)
-
-    padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_size = (
-        _pad_nvfp4_moe_for_marlin(
-            w13,
-            w13_scale,
-            w2,
-            w2_scale,
-            is_act_and_mul=is_act_and_mul,
-        )
-    )
-
-    assert padded_size == expected_padded_size
-    assert padded_w13.shape == (
-        1,
-        num_shards * expected_padded_size,
-        packed_hidden_size,
-    )
-    assert padded_w13_scale.shape == (1, num_shards * expected_padded_size, 2)
-    assert padded_w2.shape == (1, 2, expected_padded_size // 2)
-    assert padded_w2_scale.shape == (1, 2, expected_padded_size // 16)
-
-    padded_w13 = padded_w13.view(
-        1, num_shards, expected_padded_size, packed_hidden_size
-    )
-    padded_w13_scale = padded_w13_scale.view(1, num_shards, expected_padded_size, 2)
-    assert torch.all(padded_w13[:, :, :intermediate_size] == 1)
-    assert torch.count_nonzero(padded_w13[:, :, intermediate_size:]) == 0
-    assert torch.all(padded_w13_scale[:, :, :intermediate_size] == 1)
-    assert torch.count_nonzero(padded_w13_scale[:, :, intermediate_size:]) == 0
-    assert torch.all(padded_w2[..., : intermediate_size // 2] == 1)
-    assert torch.count_nonzero(padded_w2[..., intermediate_size // 2 :]) == 0
-    assert torch.all(padded_w2_scale[..., : intermediate_size // 16] == 1)
-    assert torch.count_nonzero(padded_w2_scale[..., intermediate_size // 16 :]) == 0
-
-
 def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(monkeypatch):
     fake_vllm = _install_fake_registered_vllm_modelopt(monkeypatch)
     monkeypatch.setattr(vllm_modelopt, "_registered", False)
@@ -2683,11 +2654,14 @@ def test_registered_w4a16_moe_preserves_kernel_during_reload(monkeypatch):
 
     assert quant_method.moe_kernel is original_kernel
     assert quant_method.moe_quant_config is original_quant_config
+    # vLLM 0.25's native Marlin converter owns tile padding, so the NeMo
+    # override leaves shapes and moe_config untouched and only canonicalizes
+    # the ModelOpt sign-carrying scales in place.
     assert layer.moe_config.intermediate_size_per_partition == 80
-    assert layer.w13_weight.shape == (1, 128, 32)
-    assert layer.w13_weight_scale.shape == (1, 128, 2)
-    assert layer.w2_weight.shape == (1, 2, 64)
-    assert layer.w2_weight_scale.shape == (1, 2, 8)
+    assert layer.w13_weight.shape == (1, 80, 32)
+    assert layer.w13_weight_scale.shape == (1, 80, 2)
+    assert layer.w2_weight.shape == (1, 2, 40)
+    assert layer.w2_weight_scale.shape == (1, 2, 5)
     assert torch.all(layer.w13_weight_scale >= 0)
     assert torch.all(layer.w2_weight_scale >= 0)
-    assert fake_vllm.events == [("native_process_moe", 128)]
+    assert fake_vllm.events == [("native_process_moe", 80)]

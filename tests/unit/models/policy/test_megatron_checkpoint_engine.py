@@ -52,7 +52,7 @@ def test_checkpoint_engine_weight_iterator_filters_for_vllm_layout():
     worker._iter_params_with_optional_kv_scales = lambda kv_scales=None: iter(weights)
     target_layout = {
         "expert_params": {
-            "model.layers.0.mlp.experts.w13_weight": {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": {
                 "tp_rank": 0,
                 "tp_size": 1,
                 "local_expert_ids": [1],
