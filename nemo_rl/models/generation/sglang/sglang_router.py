@@ -28,6 +28,9 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.generation.sglang.config import SGLangRouterConfig
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
+from nemo_rl.models.generation.sglang.utils.startup_deadline import (
+    SGLangStartupDeadline,
+)
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 logger = logging.getLogger(__name__)
@@ -102,6 +105,8 @@ class RouterActor:
 
 def _start_router(
     router_cfg: SGLangRouterConfig,
+    *,
+    deadline: SGLangStartupDeadline,
 ) -> tuple[str, int, ray.actor.ActorHandle | None]:
     """Start sgl router, returning ``(router_ip, router_port, actor_handle)``.
 
@@ -125,6 +130,26 @@ def _start_router(
             "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
         ),
     ).remote()
-    router_ip, router_port = ray.get(router_actor.init.remote(dict(router_cfg)))
+    try:
+        router_ip, router_port = deadline.ray_get(
+            router_actor.init.remote(dict(router_cfg)),
+            stage="starting the rollout router",
+            cancel_on_error=True,
+        )
+    except BaseException:
+        try:
+            ray.get(router_actor.stop.remote(), timeout=5)
+        except Exception as cleanup_exc:
+            logger.warning(
+                f"Router cleanup after startup failure failed: {cleanup_exc}"
+            )
+        finally:
+            try:
+                ray.kill(router_actor, no_restart=True)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    f"Router actor kill after startup failure failed: {cleanup_exc}"
+                )
+        raise
     logger.info(f"Router launched at {router_ip}:{router_port}")
     return router_ip, router_port, router_actor

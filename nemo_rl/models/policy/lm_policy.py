@@ -1083,9 +1083,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "connect_sglang_rollout_engines_distributed",
             rollout_engines=rollout_engines,
             engine_gpu_counts=engine_gpu_counts,
-            timeout_s=deadline.remaining(
-                "dispatching trainer communicator bootstrap"
-            ),
+            timeout_s=deadline.remaining("dispatching trainer communicator bootstrap"),
             group_name=group_name,
         )
         deadline.ray_get(

@@ -98,7 +98,7 @@ def cancel_ray_refs(refs: Any) -> None:
     for ref in refs:
         try:
             ray.cancel(ref, force=False, recursive=True)
-        except (TypeError, ValueError, ray.exceptions.RayError):
+        except BaseException:
             # The ref may already be complete or may not be cancellable (for
             # example, a running actor method). Transport cleanup handles the
             # corresponding external state.

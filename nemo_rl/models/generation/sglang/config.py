@@ -105,6 +105,9 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
+    # End-to-end timeout for initial engine process, HTTP health, cache flush,
+    # and router-registration bootstrap.
+    engine_startup_timeout_s: NotRequired[float]
     # One orchestration timeout in seconds for disaggregated Megatron refit
     # bootstrap, SGLang transport, post-processing, and cleanup. Synchronous
     # Megatron/AutoBridge collectives remain governed by their process-group
@@ -322,6 +325,7 @@ class SGLangRuntimeConfig(BaseModel, extra="allow"):
     rollout_health_check_interval: PositiveFloat | None = None
     rollout_health_check_timeout: PositiveFloat | None = None
     rollout_health_check_first_wait: float | None = Field(default=None, ge=0)
+    engine_startup_timeout_s: PositiveFloat = 1800
     refit_timeout_s: PositiveFloat = 1800
     quantization: SGLangQuantizationRuntimeConfig = Field(
         default_factory=SGLangQuantizationRuntimeConfig

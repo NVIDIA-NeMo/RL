@@ -320,11 +320,27 @@ def test_runtime_owner_shutdown_stops_driver_resources(monkeypatch):
     assert generation.shutdown()
 
     health_monitor.stop.assert_called_once_with()
-    engine.shutdown.remote.assert_called_once_with()
+    engine.shutdown.remote.assert_called_once_with(timeout_s=5.0)
     router_actor.stop.remote.assert_called_once_with()
-    sglang_generation_module.ray.kill.assert_called_once_with(router_actor)
+    sglang_generation_module.ray.kill.assert_any_call(engine, no_restart=True)
+    sglang_generation_module.ray.kill.assert_any_call(router_actor, no_restart=True)
     assert generation.all_engines == [None]
     assert generation._router_actor is None
+
+
+def test_shutdown_reports_an_earlier_unconfirmed_engine_cleanup():
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation._owns_runtime = True
+    generation._health_monitor = None
+    generation.all_engines = [None]
+    generation._engine_cleanup_error = "prior cleanup was not confirmed"
+    generation._router_actor = None
+    generation._http_client = None
+    generation._async_loop = None
+
+    assert not generation.shutdown()
+
+    generation._owns_runtime = False
 
 
 # ===================================================================

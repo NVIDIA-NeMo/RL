@@ -124,8 +124,7 @@ def test_connect_bounds_bootstrap_and_prints_ready_only_after_success(
 
     assert result is group
     assert (
-        "NRL_SGLANG_REFIT_GROUP_READY world_size=3 engines=1"
-        in capsys.readouterr().out
+        "NRL_SGLANG_REFIT_GROUP_READY world_size=3 engines=1" in capsys.readouterr().out
     )
     assert engine.init_weights_update_group.calls[0][1]["timeout_s"] < 20
     assert init.call_args.kwargs["timeout"] < timedelta(seconds=20)
@@ -199,8 +198,7 @@ def test_bucket_broadcast_uses_one_budget_and_matching_lock_lease(monkeypatch):
     assert engine.update_weights_from_distributed.calls[0][1]["timeout_s"] < 20
     assert work.timeouts and work.timeouts[0] < timedelta(seconds=20)
     assert any(
-        "waiting for engine receives" in stage
-        for _, stage, _ in deadline.ray_get_calls
+        "waiting for engine receives" in stage for _, stage, _ in deadline.ray_get_calls
     )
 
 
@@ -229,14 +227,8 @@ def test_bucket_failure_still_queues_matching_lock_release(monkeypatch):
 
 
 @pytest.mark.mcore
-@pytest.mark.parametrize(
-    ("continue_error", "expected_release_count"),
-    [(None, 1), (RuntimeError("resume failed"), 0)],
-)
-def test_distributed_driver_uses_fresh_cleanup_deadline_and_safe_monitor_release(
+def test_distributed_driver_quarantines_partial_update_without_resuming(
     monkeypatch,
-    continue_error,
-    expected_release_count,
 ):
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
 
@@ -247,7 +239,8 @@ def test_distributed_driver_uses_fresh_cleanup_deadline_and_safe_monitor_release
         pause_generation=Mock(),
         invalidate_kv_cache=Mock(return_value=True),
         post_process_weights=Mock(),
-        continue_generation=Mock(side_effect=continue_error),
+        continue_generation=Mock(),
+        quarantine_all_engines=Mock(return_value=True),
         health_monitoring_release_refit=Mock(),
     )
     policy = SimpleNamespace(
@@ -290,7 +283,7 @@ def test_distributed_driver_uses_fresh_cleanup_deadline_and_safe_monitor_release
     )
     monkeypatch.setattr(policy_utils, "cancel_ray_refs", Mock())
 
-    with pytest.raises(RuntimeError, match="transfer failed"):
+    with pytest.raises(RuntimeError, match="transfer failed") as exc_info:
         worker_module.refit_sglang_distributed(
             policy=policy,
             policy_generation=generation,
@@ -302,11 +295,185 @@ def test_distributed_driver_uses_fresh_cleanup_deadline_and_safe_monitor_release
     assert transfer_deadline is not None
     assert cleanup_deadline is not None
     assert cleanup_deadline is not transfer_deadline
-    generation.continue_generation.assert_called_once()
-    assert (
-        generation.health_monitoring_release_refit.call_count
-        == expected_release_count
+    generation.quarantine_all_engines.assert_called_once()
+    generation.continue_generation.assert_not_called()
+    generation.health_monitoring_release_refit.assert_not_called()
+    assert any(
+        "weight stream may have been applied only partially" in note
+        for note in exc_info.value.__notes__
     )
+
+
+@pytest.mark.mcore
+def test_distributed_driver_quarantines_keyboard_interrupt_during_transfer(
+    monkeypatch,
+):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    generation = SimpleNamespace(
+        refit_timeout_s=30.0,
+        pause_generation_mode="retract",
+        num_new_engines=0,
+        pause_generation=Mock(),
+        invalidate_kv_cache=Mock(return_value=True),
+        post_process_weights=Mock(),
+        continue_generation=Mock(),
+        quarantine_all_engines=Mock(return_value=True),
+        health_monitoring_release_refit=Mock(),
+    )
+    policy = SimpleNamespace(
+        connect_sglang_rollout_engines_distributed=Mock(),
+        update_weights_to_sglang_distributed=Mock(return_value=["transfer"]),
+        abort_sglang_rollout_engines_distributed=Mock(return_value=["cleanup"]),
+    )
+    monkeypatch.setattr(
+        policy_utils,
+        "fetch_updatable_engines_with_recover",
+        Mock(
+            return_value=(
+                ["engine"],
+                "lock",
+                0,
+                [1],
+                [0],
+                "refit:lease",
+            )
+        ),
+    )
+
+    def fake_ray_get(self, refs, *, stage, cancel_on_error=False):
+        if stage == "waiting for SGLang weight transfer":
+            raise KeyboardInterrupt
+        if stage == "waiting for SGLang communicator cleanup":
+            return None
+        raise AssertionError(f"unexpected driver wait: {stage}")
+
+    monkeypatch.setattr(worker_module.SGLangRefitDeadline, "ray_get", fake_ray_get)
+    monkeypatch.setattr(policy_utils, "cancel_ray_refs", Mock())
+
+    with pytest.raises(KeyboardInterrupt):
+        worker_module.refit_sglang_distributed(
+            policy=policy,
+            policy_generation=generation,
+            buffer_size_bytes=1024,
+        )
+
+    generation.quarantine_all_engines.assert_called_once()
+    generation.continue_generation.assert_not_called()
+    generation.health_monitoring_release_refit.assert_not_called()
+
+
+@pytest.mark.mcore
+def test_distributed_driver_quarantines_unconfirmed_bootstrap_cleanup(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    generation = SimpleNamespace(
+        refit_timeout_s=30.0,
+        pause_generation_mode="retract",
+        num_new_engines=0,
+        pause_generation=Mock(),
+        invalidate_kv_cache=Mock(return_value=True),
+        post_process_weights=Mock(),
+        continue_generation=Mock(),
+        quarantine_all_engines=Mock(return_value=True),
+        health_monitoring_release_refit=Mock(),
+    )
+    policy = SimpleNamespace(
+        connect_sglang_rollout_engines_distributed=Mock(
+            side_effect=RuntimeError("bootstrap timed out")
+        ),
+        update_weights_to_sglang_distributed=Mock(),
+        abort_sglang_rollout_engines_distributed=Mock(return_value=["cleanup"]),
+    )
+    monkeypatch.setattr(
+        policy_utils,
+        "fetch_updatable_engines_with_recover",
+        Mock(
+            return_value=(
+                ["engine"],
+                "lock",
+                0,
+                [1],
+                [0],
+                "refit:lease",
+            )
+        ),
+    )
+
+    def fail_cleanup(self, refs, *, stage, cancel_on_error=False):
+        assert stage == "waiting for SGLang communicator cleanup"
+        raise TimeoutError("cleanup timed out")
+
+    monkeypatch.setattr(worker_module.SGLangRefitDeadline, "ray_get", fail_cleanup)
+
+    with pytest.raises(RuntimeError, match="bootstrap timed out") as exc_info:
+        worker_module.refit_sglang_distributed(
+            policy=policy,
+            policy_generation=generation,
+            buffer_size_bytes=1024,
+        )
+
+    generation.pause_generation.assert_not_called()
+    generation.quarantine_all_engines.assert_called_once()
+    generation.continue_generation.assert_not_called()
+    generation.health_monitoring_release_refit.assert_not_called()
+    assert any(
+        "bootstrap cleanup was not confirmed" in note
+        for note in exc_info.value.__notes__
+    )
+
+
+@pytest.mark.mcore
+def test_distributed_driver_resumes_only_after_complete_refit(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    generation = SimpleNamespace(
+        refit_timeout_s=30.0,
+        pause_generation_mode="retract",
+        num_new_engines=0,
+        pause_generation=Mock(),
+        invalidate_kv_cache=Mock(return_value=True),
+        post_process_weights=Mock(),
+        continue_generation=Mock(),
+        quarantine_all_engines=Mock(return_value=True),
+        health_monitoring_release_refit=Mock(),
+    )
+    policy = SimpleNamespace(
+        connect_sglang_rollout_engines_distributed=Mock(),
+        update_weights_to_sglang_distributed=Mock(return_value=["transfer"]),
+        abort_sglang_rollout_engines_distributed=Mock(),
+    )
+    monkeypatch.setattr(
+        policy_utils,
+        "fetch_updatable_engines_with_recover",
+        Mock(
+            return_value=(
+                ["engine"],
+                "lock",
+                0,
+                [1],
+                [0],
+                "refit:lease",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module.SGLangRefitDeadline,
+        "ray_get",
+        lambda self, refs, *, stage, cancel_on_error=False: refs,
+    )
+
+    assert worker_module.refit_sglang_distributed(
+        policy=policy,
+        policy_generation=generation,
+        buffer_size_bytes=1024,
+    )
+
+    generation.post_process_weights.assert_called_once()
+    generation.continue_generation.assert_called_once()
+    generation.health_monitoring_release_refit.assert_called_once_with("refit:lease")
+    generation.quarantine_all_engines.assert_not_called()
+    policy.abort_sglang_rollout_engines_distributed.assert_not_called()
 
 
 @pytest.mark.mcore
@@ -319,9 +486,7 @@ def test_worker_broadcast_failure_passes_timeout_to_internal_abort(monkeypatch):
     worker._sglang_dist_group_name = "test_group"
     worker._sglang_dist_engines = ["engine"]
     worker._sglang_weight_version = 0
-    iterator = SimpleNamespace(
-        iter_hf_weight_buckets=Mock(return_value=iter([]))
-    )
+    iterator = SimpleNamespace(iter_hf_weight_buckets=Mock(return_value=iter([])))
     worker._build_sglang_hf_iterator = Mock(return_value=iterator)
     worker.abort_sglang_rollout_engines_distributed = Mock()
     monkeypatch.setattr(
@@ -341,13 +506,10 @@ def test_worker_broadcast_failure_passes_timeout_to_internal_abort(monkeypatch):
         )
 
     cleanup_timeout_s = (
-        worker.abort_sglang_rollout_engines_distributed.call_args.kwargs[
-            "timeout_s"
-        ]
+        worker.abort_sglang_rollout_engines_distributed.call_args.kwargs["timeout_s"]
     )
     assert (
-        cleanup_timeout_s
-        >= worker_module._BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S
+        cleanup_timeout_s >= worker_module._BEST_EFFORT_SGLANG_REFIT_CLEANUP_TIMEOUT_S
     )
 
 
@@ -401,6 +563,74 @@ def test_colocated_in_place_refit_preserves_kv_cache(
 
     generation.invalidate_kv_cache.assert_not_called()
     generation.continue_generation.assert_called_once()
-    generation.health_monitoring_release_refit.assert_called_once_with(
-        "refit:lease"
+    generation.health_monitoring_release_refit.assert_called_once_with("refit:lease")
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "nemo_rl.models.policy.workers.megatron_policy_worker",
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2",
+    ],
+)
+def test_colocated_partial_update_is_quarantined_without_resume(
+    monkeypatch,
+    module_name,
+):
+    worker_module = import_module(module_name)
+    generation = SimpleNamespace(
+        sglang_cfg={
+            "sglang_cfg": {
+                "quantization": {
+                    "scheme": "bf16",
+                }
+            }
+        },
+        pause_generation_mode="retract",
+        num_new_engines=0,
+        pause_generation=Mock(),
+        invalidate_kv_cache=Mock(return_value=True),
+        post_process_weights=Mock(),
+        continue_generation=Mock(),
+        quarantine_all_engines=Mock(return_value=True),
+        health_monitoring_release_refit=Mock(),
+    )
+    policy = SimpleNamespace(
+        update_weights_to_sglang_colocated=Mock(return_value=["transfer"]),
+    )
+    monkeypatch.setattr(
+        policy_utils,
+        "fetch_updatable_engines_with_recover",
+        Mock(
+            return_value=(
+                ["engine"],
+                "lock",
+                0,
+                [1],
+                [0],
+                "refit:lease",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module.ray,
+        "get",
+        Mock(side_effect=RuntimeError("partial IPC update")),
+    )
+    monkeypatch.setattr(policy_utils, "cancel_ray_refs", Mock())
+
+    with pytest.raises(RuntimeError, match="partial IPC update") as exc_info:
+        worker_module.refit_sglang_colocated(
+            policy=policy,
+            policy_generation=generation,
+            buffer_size_bytes=1024,
+        )
+
+    generation.quarantine_all_engines.assert_called_once()
+    generation.continue_generation.assert_not_called()
+    generation.health_monitoring_release_refit.assert_not_called()
+    assert any(
+        "colocated SGLang weight stream may have been applied only partially" in note
+        for note in exc_info.value.__notes__
     )
