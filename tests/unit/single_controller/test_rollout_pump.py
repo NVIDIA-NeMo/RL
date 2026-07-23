@@ -24,14 +24,18 @@ from typing import Any
 import pytest
 import ray
 import torch
-from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    WeightFifoSampler,
+    WindowedSampler,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager
 
@@ -46,123 +50,25 @@ from tests.unit.experience.test_rollouts import (
     rollout_cluster,  # noqa: F401
     rollout_tokenizer,  # noqa: F401
 )
-
-_PARTITION_ID = "rollout_data"
-# TQReplayBuffer.commit tensorizes each PromptGroupRecord and writes
-# ``generations_per_prompt`` training rows directly to TQ.
-_BULK_FIELDS = [
-    "input_ids",
-    "input_lengths",
-    "generation_logprobs",
-    "token_mask",
-    "sample_mask",
-    "prompt_ids_for_adv",
-    "total_reward",
-]
-
-
-@ray.remote(num_cpus=0)
-class _TQActor:
-    """Ray-wrapped NoOpDataPlaneClient for cross-process TQ inspection."""
-
-    def __init__(
-        self,
-        partition_id: str,
-        fields: list[str],
-        num_samples: int,
-        consumer_tasks: list[str],
-    ) -> None:
-        self._client = NoOpDataPlaneClient()
-        self._client.register_partition(
-            partition_id=partition_id,
-            fields=list(fields),
-            num_samples=int(num_samples),
-            consumer_tasks=list(consumer_tasks),
-        )
-
-    def put_samples(
-        self,
-        sample_ids: list[str],
-        partition_id: str,
-        fields: TensorDict | None = None,
-        tags: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        return self._client.put_samples(
-            sample_ids=sample_ids,
-            partition_id=partition_id,
-            fields=fields,
-            tags=tags,
-        )
-
-    def claim_meta(self, **kwargs: Any) -> Any:
-        return self._client.claim_meta(**kwargs)
-
-    def get_samples(
-        self,
-        sample_ids: list[str],
-        partition_id: str,
-        select_fields: list[str],
-    ) -> TensorDict:
-        return self._client.get_samples(
-            sample_ids=sample_ids,
-            partition_id=partition_id,
-            select_fields=list(select_fields),
-        )
-
-    def get_tags(
-        self, partition_id: str, sample_ids: list[str]
-    ) -> list[dict[str, Any]]:
-        rec = self._client._partitions[partition_id]
-        return [dict(rec.tags.get(sid, {})) for sid in sample_ids]
-
-    def peek_count(self, partition_id: str) -> int:
-        return len(self._client._partitions[partition_id].rows)
-
-
-class _SyncDPAdapter:
-    """Sync DataPlaneClient over a Ray actor handle. Pads nested tensors before transport."""
-
-    def __init__(self, handle: Any) -> None:
-        self._handle = handle
-
-    def put_samples(
-        self,
-        sample_ids: list[str],
-        partition_id: str,
-        fields: TensorDict | None = None,
-        tags: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        if fields is not None:
-            fields = self._padded(fields)
-        return ray.get(
-            self._handle.put_samples.remote(
-                sample_ids=sample_ids,
-                partition_id=partition_id,
-                fields=fields,
-                tags=tags,
-            )
-        )
-
-    @staticmethod
-    def _padded(td: TensorDict) -> TensorDict:
-        out: dict[str, torch.Tensor] = {}
-        for k in td.keys():
-            v = td.get(k)
-            if isinstance(v, torch.Tensor) and v.is_nested:
-                v = torch.nested.to_padded_tensor(v, padding=0)
-            out[k] = v
-        return TensorDict(out, batch_size=td.batch_size)
+from tests.unit.single_controller._dp_fakes import (
+    _BULK_FIELDS,
+    _PARTITION_ID,
+    _SyncDPAdapter,
+    _TQActor,
+)
 
 
 @pytest.mark.parametrize(
-    ("force_in_order", "expected_target_steps"),
+    ("make_sampler", "expected_target_steps"),
     [
-        (False, [None, None]),
-        (True, [0, 1]),
+        # weight_fifo gates but does not stamp target_step.
+        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), [None, None]),
+        # in_order stamps the dispatch index as target_step.
+        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), [0, 1]),
     ],
 )
 def test_rollout_pump_stamps_target_steps(
-    force_in_order: bool,
+    make_sampler,
     expected_target_steps: list[int | None],
 ) -> None:
     class _RecordingBuffer:
@@ -187,29 +93,30 @@ def test_rollout_pump_stamps_target_steps(
     ctrl = object.__new__(controller_cls)
     ctrl._cfg = SimpleNamespace(
         max_inflight_prompts=2,
-        over_sampling=False,
-        max_weight_staleness_versions=1,
-        force_in_order=force_in_order,
         diagnostics=False,
         max_num_epochs=1,
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    # The sampler owns admission + target_step stamping (the dispatch counter
+    # lives on the sampler, not the actor).
+    ctrl._sampler = make_sampler(buffer)
     prompt_batch = BatchedDataDict(
         {"message_log": [[{"role": "user", "content": "prompt"}]]}
     )
     ctrl._dataloader = [prompt_batch, prompt_batch]
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
-    ctrl._max_rollout_version = -1
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
 
     asyncio.run(ctrl._rollout_pump())
 
     assert buffer.target_step_list == expected_target_steps
+    assert ctrl._rollout_exhausted.is_set()
 
 
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
@@ -244,13 +151,12 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl = object.__new__(controller_cls)
         ctrl._cfg = SimpleNamespace(
             max_inflight_prompts=2,
-            over_sampling=True,
-            max_weight_staleness_versions=1,
-            force_in_order=False,
             diagnostics=False,
             max_num_epochs=1,
         )
         ctrl._rollout_manager = manager
+        # Over-sampled windowed policy: admit never gates (buffer unused here).
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
             BatchedDataDict(
                 {
@@ -263,10 +169,10 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ]
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
-        ctrl._max_rollout_version = -1
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
 
@@ -278,6 +184,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         assert ctrl._inflight_rollouts == 0
         assert ctrl._buffer_capacity._value == 2
         assert ctrl._dispatched_rollouts == set()
+        assert not ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
 
@@ -323,22 +230,21 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl = object.__new__(controller_cls)
         ctrl._cfg = SimpleNamespace(
             max_inflight_prompts=1,
-            over_sampling=True,
-            max_weight_staleness_versions=1,
-            force_in_order=False,
             diagnostics=False,
             max_num_epochs=1,
         )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
+        # Over-sampled windowed policy: admit never gates (buffer unused here).
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
             BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
         ]
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = real_semaphore(1)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
-        ctrl._max_rollout_version = -1
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
 
@@ -349,6 +255,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert created_semaphores[0]._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
+        assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
 
@@ -359,14 +266,14 @@ def test_rollout_pump_writes_expected_tq_data(
     single_multi_step_calculator_input_sample,  # noqa: F811
     tmp_path,
 ):
-    """SC._rollout_pump writes max_rollout_prompts * num_generations rows to TQ with the expected fields and tags."""
+    """SC._rollout_pump writes num_prompts * num_generations rows to TQ with the expected fields and tags."""
     vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
 
     num_generations = 2
-    max_rollout_prompts = 2
+    num_prompts = 2
     # TQReplayBuffer.commit writes ``num_generations`` training rows per prompt.
-    expected_samples = max_rollout_prompts * num_generations
+    expected_samples = num_prompts * num_generations
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
@@ -379,15 +286,13 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     cfg = SingleControllerConfig.model_construct(
-        batch_selection_strategy="staleness_window",
-        max_weight_staleness_versions=1,
+        sampler=WindowedSamplerConfig(max_staleness_versions=1),
         min_groups_per_batch=1,
         group_size=num_generations,
-        max_inflight_prompts=max_rollout_prompts,
-        max_buffered_rollouts=max_rollout_prompts,
+        max_inflight_prompts=num_prompts,
+        max_buffered_rollouts=num_prompts,
         max_train_steps=1,
         max_num_epochs=None,
-        over_sampling=True,
         partition_id=_PARTITION_ID,
         logger={
             "log_dir": str(tmp_path / "logs"),
@@ -400,7 +305,7 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
-    dataloader = [batched_sample] * max_rollout_prompts
+    dataloader = [batched_sample] * num_prompts
 
     tq_buffer = TQReplayBuffer(
         dp_adapter,
@@ -419,15 +324,15 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     ctrl = SingleControllerActor.remote(
         cfg=cfg,
-        prompts=[],
         dp_client_handle=dp_adapter,
         gen_handle=vllm_generation,
         trainer_handle=object(),
         weight_synchronizer=object(),
         loss_fn=None,
-        advantage_estimator=None,
         rollout_manager=rollout_manager,
+        advantage_estimator=None,
         dataloader=dataloader,
+        tq_buffer=tq_buffer,
     )
 
     vllm_generation.prepare_for_generation()
@@ -468,7 +373,7 @@ def test_rollout_pump_writes_expected_tq_data(
         head, _, tail = sid.rpartition("_g")
         assert head and tail.isdigit(), f"unexpected sample_id: {sid}"
         group_ids.add(head)
-    assert len(group_ids) == max_rollout_prompts
+    assert len(group_ids) == num_prompts
 
     bulk = ray.get(
         tq_actor.get_samples.remote(
