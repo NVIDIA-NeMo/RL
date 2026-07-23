@@ -88,6 +88,12 @@ allocate nodes or start Ray. Their CPU-only preflight attaches with
 `address="auto"` and fails if an existing cluster cannot be found; this prevents
 NeMo RL from silently starting a one-node local Ray instance.
 
+The bare `bash tests/test_suites/...` commands below are only for a shell
+already running inside `NRL_IMAGE_REF` on the Ray head. The image-provided
+`NEMO_RL_COMMIT` must equal `NEMO_RL_SHA`. From a host shell, use the
+`tools/launch` form instead; setting `NRL_IMAGE_REF` alone does not enter or run
+the image.
+
 | Run | Alive GPU nodes | GPUs per node | Total GPUs | Expected refit group |
 |---|---:|---:|---:|---|
 | Two-node smoke | 2 | 4 | 8 | `world_size=5 engines=4` |
@@ -114,8 +120,18 @@ export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export NRL_MEGATRON_CHECKPOINT_DIR="/shared/path/megatron-conversion/${NEMO_RL_SHA}"
 export NRL_RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 export NEMO_GYM_COMMIT="$NEMO_GYM_SHA"
+```
+
+For bare driver execution from the Ray-head image shell, verify the embedded
+source identity and the existing allocation:
+
+```bash
+test "${NEMO_RL_COMMIT:-<unset>}" = "$NEMO_RL_SHA"
 ray status
 ```
+
+When using `tools/launch`, it creates the Slurm allocation and Ray cluster, so
+these two direct-execution checks do not run in the host shell.
 
 The preflight validates alive Ray nodes, per-node GPU capacity, and currently
 available aggregate GPUs without scheduling GPU work. Image identity, shared
@@ -255,7 +271,7 @@ export NRL_DATASET_REVISION=b90f74f1d0bafeec6d1f1321173f6775ba5bda2e
 export SUPER_BLEND_REVISION="$NRL_DATASET_REVISION"
 export SUPER_BLEND_SOURCE="$HF_HOME/superv3_source/$SUPER_BLEND_REVISION"
 export SUPER_BLEND_FILLED="$HF_HOME/superv3_filled/$SUPER_BLEND_REVISION"
-export SWE1_DATA_DIR="$HF_HOME/superv3_data/swe1"
+export SWE1_DATA_DIR="$HF_HOME/superv3_data/swe1/$NRL_DATASET_REVISION"
 
 uvx --from huggingface-hub hf download \
   nvidia/Nemotron-RL-Super-Training-Blends \
@@ -267,8 +283,11 @@ chmod +x "$SUPER_BLEND_SOURCE/fill_placeholders.py"
   --input-dir "$SUPER_BLEND_SOURCE" \
   --output-dir "$SUPER_BLEND_FILLED"
 mkdir -p "$SWE1_DATA_DIR"
-head -n -100 "$SUPER_BLEND_FILLED/swe1.jsonl" \
-  > "$SWE1_DATA_DIR/train-split.jsonl"
+SWE1_LINE_COUNT=$(wc -l < "$SUPER_BLEND_FILLED/swe1.jsonl")
+test "$SWE1_LINE_COUNT" -gt 100
+SWE1_TRAIN_LINE_COUNT=$((SWE1_LINE_COUNT - 100))
+sed -n "1,${SWE1_TRAIN_LINE_COUNT}p" \
+  "$SUPER_BLEND_FILLED/swe1.jsonl" > "$SWE1_DATA_DIR/train-split.jsonl"
 tail -n 100 "$SUPER_BLEND_FILLED/swe1.jsonl" \
   > "$SWE1_DATA_DIR/val-split.jsonl"
 test -s "$SWE1_DATA_DIR/train-split.jsonl"
@@ -299,8 +318,10 @@ PARTITION="<partition>" \
 
 The recipe uses eight training nodes and eight generation nodes. It is a
 three-step integration check, not a convergence run. Its evidence validator
-requires the exact `world_size=65 engines=32` topology and at least one
-non-empty NeMo-Gym `train_data_step*.jsonl` artifact.
+requires `train/loss` through step 3, the exact
+`world_size=65 engines=32` topology, at least two successful refits, no fatal
+refit evidence, and at least one non-empty NeMo-Gym
+`train_data_step*.jsonl` artifact.
 
 In both launcher examples, replace `<shared-root>` with a host path that
 contains `HF_HOME` and `NRL_MEGATRON_CHECKPOINT_DIR`, mounted at the same path
@@ -325,8 +346,9 @@ The SGLang async configuration deliberately sets:
 
 Each driver prints its fresh evidence directory. Retain the whole directory:
 
-- `provenance.txt`: NeMo RL commit, Gym commit, immutable image reference, run
-  ID, and shell-escaped driver arguments.
+- `provenance.txt`: NeMo RL commit, Gym commit, immutable image reference,
+  model revision, run ID, and shell-escaped driver arguments; the Gym driver
+  also records the dataset revision and split SHA-256 digests.
 - `preflight.json`: required and observed Ray node/GPU capacity.
 - `run.log`: complete driver log.
 - `logs/`: TensorBoard events and, for Gym, rollout JSONL files.
