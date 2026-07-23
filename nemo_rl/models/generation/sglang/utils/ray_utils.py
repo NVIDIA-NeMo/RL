@@ -15,6 +15,8 @@
 import os
 import socket
 
+import ray
+
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
 
 # Env vars Ray uses to gate its visible-device manipulation. Setting any of
@@ -30,6 +32,41 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
     "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
 ]
+
+
+class _OwnerTokenLock:
+    """In-process owner-token lock state used by the Ray actor."""
+
+    def __init__(self):
+        self._owner: str | None = None
+
+    def acquire(self, owner: str) -> bool:
+        """Try to acquire the lock for ``owner``.
+
+        Repeated acquisition by the same owner is idempotent. This lets a
+        timed-out caller enqueue a matching ``release`` even when the final
+        acquire result raced with its deadline.
+        """
+        if self._owner is None:
+            self._owner = owner
+            return True
+        return self._owner == owner
+
+    def release(self, owner: str) -> bool:
+        """Release the lock iff it is held by ``owner``.
+
+        Returning ``False`` for a different/no owner makes delayed cleanup
+        safe without allowing one refit to unlock another refit's lease.
+        """
+        if self._owner != owner:
+            return False
+        self._owner = None
+        return True
+
+
+@ray.remote  # pragma: no cover
+class Lock(_OwnerTokenLock):
+    pass
 
 
 def get_host_info():

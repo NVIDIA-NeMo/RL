@@ -16,6 +16,8 @@ policy:
   generation:
     backend: sglang
     max_new_tokens: 512
+    # Clear the inactive block inherited from grpo_math_1B.yaml.
+    vllm_cfg: null
     sglang_cfg:
       model_path: ${policy.model_name}
       dtype: ${policy.precision}

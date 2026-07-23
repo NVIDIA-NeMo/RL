@@ -32,6 +32,27 @@ from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
+def get_active_vllm_config(
+    generation_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return vLLM config only when vLLM is the active generation backend.
+
+    Inherited configs may retain ``vllm_cfg: null`` while selecting another
+    backend. Callers that inspect vLLM-only settings must ignore that inactive
+    block rather than chaining ``.get`` through ``None``.
+    """
+    if generation_config is None or generation_config.get("backend") != "vllm":
+        return None
+
+    vllm_config = generation_config.get("vllm_cfg")
+    if vllm_config is None:
+        raise ValueError(
+            "policy.generation.vllm_cfg must be configured when "
+            "policy.generation.backend='vllm'."
+        )
+    return vllm_config
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(
@@ -660,11 +681,12 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    is_vllm_metrics_logger_enabled = master_config.policy["generation"].get(
-        "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config.policy[
-        "generation"
-    ].get("vllm_cfg", {}).get("async_engine", False)
+    vllm_config = get_active_vllm_config(master_config.policy["generation"])
+    is_vllm_metrics_logger_enabled = (
+        vllm_config is not None
+        and bool(vllm_config.get("enable_vllm_metrics_logger"))
+        and vllm_config["async_engine"]
+    )
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
     if is_vllm_metrics_logger_enabled and generation_logger_metrics:
         vllm_logger_metrics = generation_logger_metrics
@@ -684,9 +706,8 @@ def print_performance_metrics(
             "num_pending_samples must be a dictionary"
         )
 
-        vllm_metrics_logger_interval = master_config.policy["generation"]["vllm_cfg"][
-            "vllm_metrics_logger_interval"
-        ]
+        assert vllm_config is not None
+        vllm_metrics_logger_interval = vllm_config["vllm_metrics_logger_interval"]
         print("  • vLLM Logger Metrics:")
         # Visualize the inflight batch sizes timeline
         if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:

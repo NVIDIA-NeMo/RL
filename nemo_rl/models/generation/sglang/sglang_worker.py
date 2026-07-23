@@ -15,6 +15,7 @@
 import logging
 import multiprocessing
 import os
+import threading
 import time
 from collections.abc import Callable
 
@@ -33,7 +34,31 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
 logger = logging.getLogger(__name__)
 
 
-@ray.remote  # pragma: no cover
+def _is_absent_weight_update_group_response(
+    response: requests.Response | None,
+) -> bool:
+    """Return whether SGLang reports that the requested group is already absent."""
+    if response is None or response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("success") is False
+        and "does not exist" in str(payload.get("message", "")).lower()
+    )
+
+
+def _is_missing_post_process_weights_response(
+    response: requests.Response | None,
+) -> bool:
+    """Return whether this SGLang build lacks ``/post_process_weights``."""
+    return response is not None and response.status_code == 404
+
+
+@ray.remote(concurrency_groups={"control": 1})  # pragma: no cover
 class SGLangGenerationWorker:
     def __init__(
         self,
@@ -49,6 +74,10 @@ class SGLangGenerationWorker:
         self.rank = rank
         self.base_gpu_id = base_gpu_id
         self.num_gpus_per_engine = num_gpus_per_engine
+        self.process = None
+        self._shutdown_requested = threading.Event()
+        self._process_lock = threading.Lock()
+        self._router_registration_lock = threading.Lock()
 
     def init(
         self,
@@ -58,6 +87,7 @@ class SGLangGenerationWorker:
         host,
         router_ip,
         router_port,
+        startup_timeout_s,
     ):
         self.router_ip = router_ip
         self.router_port = router_port
@@ -78,9 +108,17 @@ class SGLangGenerationWorker:
         self.server_port = server_args_dict["port"]
         self.server_base_url = f"http://{self.server_host}:{self.server_port}"
 
-        self._launch_server_process(server_args_dict)
+        self._launch_server_process(
+            server_args_dict,
+            startup_timeout_s=startup_timeout_s,
+        )
 
-    def _launch_server_process(self, server_args_dict):
+    def _launch_server_process(
+        self,
+        server_args_dict,
+        *,
+        startup_timeout_s: float,
+    ):
         from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
 
@@ -88,32 +126,82 @@ class SGLangGenerationWorker:
             f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
         )
 
+        if startup_timeout_s <= 0:
+            raise ValueError(
+                f"SGLang startup timeout must be positive, got {startup_timeout_s}"
+            )
+        startup_deadline = time.monotonic() + startup_timeout_s
+
         server_args = ServerArgs(**server_args_dict)
         multiprocessing.set_start_method("spawn", force=True)
         server_args.host = server_args.host.strip("[]")
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
-        p.start()
+        # Publish the child process atomically with start. ``shutdown`` runs in
+        # a separate Ray concurrency group, so there must be no interval after
+        # p.start() in which cleanup cannot discover the new PID.
+        with self._process_lock:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError(
+                    "SGLang worker shutdown was requested before launch."
+                )
+            p.start()
+            self.process = p
 
         if server_args.node_rank == 0:
             self._wait_server_healthy(
                 base_url=server_args.url(),
                 api_key=server_args.api_key,
                 process_alive_fn=lambda: p.is_alive(),
+                startup_deadline=startup_deadline,
             )
 
-        self.process = p
+        if self._shutdown_requested.is_set():
+            raise RuntimeError("SGLang worker shutdown interrupted engine startup.")
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
-            payload = {
-                "url": self.server_base_url,
-                "worker_type": "regular",
-            }
-            response = requests.post(
-                f"http://{self.router_ip}:{self.router_port}/workers",
-                json=payload,
+            # Serialize registration with shutdown's router cleanup. The event
+            # check prevents a late POST from recreating a stale router entry
+            # after the engine process has been terminated.
+            with self._router_registration_lock:
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError(
+                        "SGLang worker shutdown interrupted router registration."
+                    )
+                payload = {
+                    "url": self.server_base_url,
+                    "worker_type": "regular",
+                }
+                response = requests.post(
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    json=payload,
+                    timeout=min(
+                        2,
+                        self._remaining_startup_time(
+                            startup_deadline,
+                            "registering the engine with the router",
+                        ),
+                    ),
+                )
+                response.raise_for_status()
+            # Do not hold the registration lock while polling. Shutdown can
+            # now acquire it, remove the just-created entry, and signal this
+            # loop to stop rather than waiting for the full poll timeout.
+            self._wait_for_router_registration(
+                timeout=min(
+                    30,
+                    self._remaining_startup_time(
+                        startup_deadline,
+                        "waiting for router registration",
+                    ),
+                )
             )
-            response.raise_for_status()
-            self._wait_for_router_registration()
+
+    @staticmethod
+    def _remaining_startup_time(startup_deadline: float, stage: str) -> float:
+        remaining_s = startup_deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError(f"SGLang engine startup timed out while {stage}")
+        return remaining_s
 
     def _wait_for_router_registration(
         self, timeout: float = 30.0, interval: float = 0.5
@@ -124,8 +212,21 @@ class SGLangGenerationWorker:
         last_error = None
 
         while time.monotonic() < deadline:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError(
+                    "SGLang worker shutdown interrupted router registration."
+                )
             try:
-                response = requests.get(workers_url, timeout=5)
+                response = requests.get(
+                    workers_url,
+                    timeout=min(
+                        5,
+                        self._remaining_startup_time(
+                            deadline,
+                            "waiting for router registration",
+                        ),
+                    ),
+                )
                 response.raise_for_status()
                 workers = response.json().get("workers", [])
                 if any(worker.get("url") == self.server_base_url for worker in workers):
@@ -133,7 +234,15 @@ class SGLangGenerationWorker:
             except Exception as e:
                 last_error = e
 
-            time.sleep(interval)
+            time.sleep(
+                min(
+                    interval,
+                    self._remaining_startup_time(
+                        deadline,
+                        "waiting for router registration",
+                    ),
+                )
+            )
 
         detail = f" Last error: {last_error}" if last_error is not None else ""
         raise RuntimeError(
@@ -141,12 +250,19 @@ class SGLangGenerationWorker:
             f"router {workers_url}.{detail}"
         )
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
+            timeout_s: Optional connect/read timeout in seconds.
 
         Returns:
             The JSON response from the server
@@ -155,7 +271,7 @@ class SGLangGenerationWorker:
             return
 
         url = f"{self.server_base_url}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, timeout=timeout_s)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -227,36 +343,89 @@ class SGLangGenerationWorker:
             payload,
         )
 
-    def shutdown(self):
+    @ray.method(concurrency_group="control")
+    def shutdown(self, *, timeout_s: float = 5.0) -> bool:
+        """Bound router cleanup and always terminate the engine process tree.
+
+        The control concurrency group lets this method run while a default-group
+        HTTP call is stuck behind an engine-side NCCL operation.
+        """
         from sglang.srt.utils import kill_process_tree
 
-        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        if self.node_rank == 0:
-            worker_url = self.server_base_url
-            response = None
+        ok = True
+        server_host = getattr(self, "server_host", "<uninitialized>")
+        server_port = getattr(self, "server_port", "<uninitialized>")
+        logger.info(f"Shutdown engine {server_host}:{server_port}...")
+        timeout_s = max(float(timeout_s), 0.001)
+        deadline = time.monotonic() + timeout_s
+
+        self._shutdown_requested.set()
+        process = None
+        with self._process_lock:
+            process = self.process
+            self.process = None
+
+        process_pid = getattr(process, "pid", None)
+        if process_pid is not None:
             try:
+                kill_process_tree(
+                    process_pid,
+                    wait_timeout=max(deadline - time.monotonic(), 0.001),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to terminate engine process tree {process_pid}: {e}"
+                )
+                ok = False
+
+        router_lock_acquired = False
+        try:
+            if getattr(self, "node_rank", None) == 0:
+                router_lock_acquired = self._router_registration_lock.acquire(
+                    timeout=max(deadline - time.monotonic(), 0.001)
+                )
+                if not router_lock_acquired:
+                    raise TimeoutError(
+                        "Timed out waiting for in-flight router registration."
+                    )
+                worker_url = self.server_base_url
+                response = None
+
+                def remaining_timeout() -> float:
+                    return max(deadline - time.monotonic(), 0.001)
+
                 all_workers = requests.get(
-                    f"http://{self.router_ip}:{self.router_port}/workers"
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    timeout=remaining_timeout(),
                 ).json()["workers"]
                 for worker in all_workers:
                     if worker["url"] == worker_url:
                         worker_id = worker["id"]
                         response = requests.delete(
-                            f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
+                            f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}",
+                            timeout=remaining_timeout(),
                         )
                         break
                 else:
                     logger.warning(
                         f"Worker {worker_url} not found in router during shutdown."
                     )
-            except Exception as e:
-                logger.warning(f"Failed to fetch workers list or remove worker: {e}")
+                if response is not None:
+                    response.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Failed to fetch workers list or remove worker: {e}")
+            ok = False
+        finally:
+            if router_lock_acquired:
+                self._router_registration_lock.release()
+        return ok
 
-            if response is not None:
-                response.raise_for_status()
-        kill_process_tree(self.process.pid)
-
-    def release_memory_occupation(self, tags: list[str] | None = None):
+    def release_memory_occupation(
+        self,
+        tags: list[str] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         """Release memory occupation. Available tags: weights, kv_cache."""
         from sglang.srt.constants import (
             GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -273,13 +442,19 @@ class SGLangGenerationWorker:
         if "kv_cache" in tags:
             sglang_tags.extend([GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
-        self.invalidate_kv_cache()
+        self.invalidate_kv_cache(timeout_s=timeout_s)
         return self._make_request(
             "release_memory_occupation",
             {"tags": sglang_tags},
+            timeout_s=timeout_s,
         )
 
-    def resume_memory_occupation(self, tags: list[str] | None = None):
+    def resume_memory_occupation(
+        self,
+        tags: list[str] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         """Available tags for multi-stage resume: weights, kv_cache."""
         from sglang.srt.constants import (
             GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -299,10 +474,154 @@ class SGLangGenerationWorker:
         return self._make_request(
             "resume_memory_occupation",
             {"tags": sglang_tags},
+            timeout_s=timeout_s,
         )
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
+
+    def get_weight_version(self):
+        if self.node_rank != 0:
+            return
+        # newer sglang moved /get_weight_version into /model_info
+        for endpoint in ("/model_info", "/get_weight_version"):
+            response = requests.get(f"{self.server_base_url}{endpoint}")
+            if response.status_code == 200:
+                return response.json()["weight_version"]
+        response.raise_for_status()
+
+    def init_weights_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend,
+        *,
+        timeout_s: float,
+    ):
+        return self._make_request(
+            "init_weights_update_group",
+            {
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": rank_offset,
+                "world_size": world_size,
+                "group_name": group_name,
+                "backend": backend,
+            },
+            timeout_s=timeout_s,
+        )
+
+    def destroy_weights_update_group(self, group_name, *, timeout_s: float):
+        try:
+            return self._make_request(
+                "destroy_weights_update_group",
+                {
+                    "group_name": group_name,
+                },
+                timeout_s=timeout_s,
+            )
+        except requests.exceptions.HTTPError as exc:
+            if not _is_absent_weight_update_group_response(exc.response):
+                raise
+            # A partial bootstrap or previous best-effort cleanup can leave the
+            # group absent on only some engines. Treat that state as cleaned up.
+            return {
+                "success": True,
+                "message": "Custom process group was already absent.",
+            }
+
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
+        timeout_s: float | None = None,
+    ):
+        payload = {
+            "names": names,
+            "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+            "shapes": shapes,
+            "group_name": group_name,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return self._make_request(
+            "update_weights_from_distributed",
+            payload,
+            timeout_s=timeout_s,
+        )
+
+    def pause_generation(
+        self, mode: str = "retract", *, timeout_s: float | None = None
+    ):
+        response = requests.post(
+            f"{self.server_base_url}/pause_generation",
+            json={"mode": mode},
+            timeout=timeout_s,
+        )
+        response.raise_for_status()
+        return response
+
+    def continue_generation(self, *, timeout_s: float | None = None):
+        response = requests.post(
+            f"{self.server_base_url}/continue_generation",
+            json={},
+            timeout=timeout_s,
+        )
+        response.raise_for_status()
+        return response
+
+    def post_process_weights(
+        self,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = False,
+        timeout_s: float | None = None,
+    ):
+        """Finalize engine-side weights after a distributed/IPC refit.
+
+        The HTTP server only posts metadata; the real weights were already
+        copied on-GPU by the preceding update path.
+        """
+        try:
+            return self._make_request(
+                "post_process_weights",
+                {
+                    "restore_weights_before_load": restore_weights_before_load,
+                    "post_process_quantization": post_process_quantization,
+                },
+                timeout_s=timeout_s,
+            )
+        except requests.exceptions.HTTPError as exc:
+            if not _is_missing_post_process_weights_response(exc.response):
+                raise
+            # SGLang 0.5.12.post1 has no finalization endpoint. Weight loading
+            # is already complete when its update request returns successfully.
+            logger.warning(
+                "SGLang does not expose /post_process_weights; skipping the "
+                "optional finalization request."
+            )
+            return {
+                "success": True,
+                "message": "Weight post-processing is not supported by this build.",
+            }
+
+    def _simulate_crash(self):
+        """Test-only: tear the engine down to simulate a crash.
+
+        Underscore-prefixed to signal this is **not** part of the public
+        worker API; production code should never call it.
+        """
+        logger.info(
+            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
+        )
+        self.shutdown()
 
     def start_profile(
         self,
@@ -351,12 +670,15 @@ class SGLangGenerationWorker:
             return None
         return self.server_base_url
 
-    def invalidate_kv_cache(self) -> None:
+    def invalidate_kv_cache(self, *, timeout_s: float | None = None) -> None:
         """Flush this server's KV cache."""
         if self.node_rank != 0:
             return
 
-        response = requests.get(f"{self.server_base_url}/flush_cache")
+        response = requests.get(
+            f"{self.server_base_url}/flush_cache",
+            timeout=timeout_s,
+        )
         if response.status_code != 200:
             response.raise_for_status()
             raise RuntimeError(
@@ -460,6 +782,7 @@ class SGLangGenerationWorker:
         base_url: str,
         api_key: str | None,
         process_alive_fn: Callable[[], bool],
+        startup_deadline: float,
     ) -> None:
         headers = {
             "Content-Type": "application/json; charset=utf-8",
@@ -470,7 +793,15 @@ class SGLangGenerationWorker:
             while True:
                 try:
                     response = session.get(
-                        f"{base_url}/health_generate", headers=headers
+                        f"{base_url}/health_generate",
+                        headers=headers,
+                        timeout=min(
+                            5,
+                            self._remaining_startup_time(
+                                startup_deadline,
+                                "waiting for the generation health endpoint",
+                            ),
+                        ),
                     )
                     if response.status_code == 200:
                         break
@@ -480,12 +811,30 @@ class SGLangGenerationWorker:
                 if not process_alive_fn():
                     raise Exception("Server process terminated unexpectedly.")
 
-                time.sleep(2)
+                time.sleep(
+                    min(
+                        2,
+                        self._remaining_startup_time(
+                            startup_deadline,
+                            "waiting for the generation health endpoint",
+                        ),
+                    )
+                )
 
             # use flush_cache to make sure the working queue is empty, so that we can do offload
             while True:
                 try:
-                    response = session.get(f"{base_url}/flush_cache", headers=headers)
+                    response = session.get(
+                        f"{base_url}/flush_cache",
+                        headers=headers,
+                        timeout=min(
+                            5,
+                            self._remaining_startup_time(
+                                startup_deadline,
+                                "waiting for the initial cache flush",
+                            ),
+                        ),
+                    )
                     if response.status_code == 200:
                         break
 
@@ -495,4 +844,12 @@ class SGLangGenerationWorker:
                 if not process_alive_fn():
                     raise Exception("Server process terminated unexpectedly.")
 
-                time.sleep(2)
+                time.sleep(
+                    min(
+                        2,
+                        self._remaining_startup_time(
+                            startup_deadline,
+                            "waiting for the initial cache flush",
+                        ),
+                    )
+                )

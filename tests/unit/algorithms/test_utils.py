@@ -23,6 +23,7 @@ from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    get_active_vllm_config,
     get_tokenizer,
     maybe_pad_last_batch,
     print_efficiency_summary,
@@ -225,6 +226,19 @@ def test_maybe_pad_last_batch():
 
 
 # Performance Metrics Tests
+
+
+def test_get_active_vllm_config_dispatches_on_backend():
+    vllm_config = {"async_engine": True}
+
+    assert (
+        get_active_vllm_config({"backend": "vllm", "vllm_cfg": vllm_config})
+        is vllm_config
+    )
+    assert get_active_vllm_config({"backend": "sglang", "vllm_cfg": None}) is None
+
+    with pytest.raises(ValueError, match="vllm_cfg must be configured"):
+        get_active_vllm_config({"backend": "vllm", "vllm_cfg": None})
 
 
 def _base_master_config(colocated: bool):
@@ -437,6 +451,33 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
 
     out = capsys.readouterr().out
     assert "Throughputs (per GPU)" in out
+
+
+def test_performance_metrics_handles_sglang_with_null_vllm_config(capsys):
+    master_config = _base_master_config(colocated=False)
+    master_config.policy["generation"].update(
+        {
+            "backend": "sglang",
+            "vllm_cfg": None,
+        }
+    )
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "exposed_generation": 0.2,
+        "prepare_for_generation/total": 0.5,
+    }
+
+    performance_metrics = print_performance_metrics(
+        {},
+        {"total_num_tokens": 1600.0},
+        timing_metrics,
+        master_config,
+    )
+
+    assert "tokens_per_sec" in performance_metrics
+    assert "vLLM Logger Metrics" not in capsys.readouterr().out
 
 
 def test_empty_per_worker_token_counts_skips_imbalance(capsys):

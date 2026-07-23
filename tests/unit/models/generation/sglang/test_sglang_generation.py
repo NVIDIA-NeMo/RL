@@ -27,6 +27,7 @@ Model: Qwen/Qwen3-0.6B
 
 import asyncio
 import gc
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -34,6 +35,9 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.sglang import (
+    sglang_generation as sglang_generation_module,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
 from .helpers import (
@@ -226,6 +230,117 @@ def _make_minimal_sglang_gen_for_clamp_test(
     ] = 1
     sglang_gen._async_loop = _ImmediateAsyncLoop()
     return sglang_gen
+
+
+def test_pickle_hooks_drop_and_rebuild_driver_runtime_state(monkeypatch):
+    class _RebuiltLoop:
+        def __init__(self):
+            self.closed = False
+
+        def run(self, coro):
+            return asyncio.run(coro)
+
+        def close(self):
+            self.closed = True
+
+    class _RebuiltClient:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation.sglang_cfg = _make_sglang_generation_cfg()
+    generation._owns_runtime = True
+    generation._http_client = object()
+    generation._async_loop = object()
+    generation._health_monitor = object()
+    generation.all_engines = [MagicMock()]
+    generation._router_actor = MagicMock()
+
+    state = generation.__getstate__()
+
+    assert state["_owns_runtime"] is False
+    assert state["_http_client"] is None
+    assert state["_async_loop"] is None
+    assert state["_health_monitor"] is None
+    assert generation._owns_runtime is True
+    assert generation._http_client is not None
+    assert generation._async_loop is not None
+    assert generation._health_monitor is not None
+
+    rebuilt_loop = _RebuiltLoop()
+    rebuilt_client = _RebuiltClient()
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "AsyncLoopThread",
+        lambda: rebuilt_loop,
+    )
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "HttpClient",
+        lambda config: rebuilt_client,
+    )
+
+    restored = SGLangGeneration.__new__(SGLangGeneration)
+    restored.__setstate__(state)
+
+    assert restored._async_loop is rebuilt_loop
+    assert restored._http_client is rebuilt_client
+    assert restored._health_monitor is None
+    assert restored._owns_runtime is False
+
+    assert restored.shutdown()
+    generation.all_engines[0].shutdown.remote.assert_not_called()
+    generation._router_actor.stop.remote.assert_not_called()
+    assert rebuilt_client.closed
+    assert rebuilt_loop.closed
+
+    # Prevent this synthetic owner from touching actor mocks during GC.
+    generation._owns_runtime = False
+    generation._http_client = None
+    generation._async_loop = None
+
+
+def test_runtime_owner_shutdown_stops_driver_resources(monkeypatch):
+    health_monitor = MagicMock()
+    engine = MagicMock()
+    router_actor = MagicMock()
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation._owns_runtime = True
+    generation._health_monitor = health_monitor
+    generation.all_engines = [engine]
+    generation._router_actor = router_actor
+    generation._http_client = None
+    generation._async_loop = None
+    monkeypatch.setattr(sglang_generation_module.ray, "get", MagicMock())
+    monkeypatch.setattr(sglang_generation_module.ray, "kill", MagicMock())
+
+    assert generation.shutdown()
+
+    health_monitor.stop.assert_called_once_with()
+    engine.shutdown.remote.assert_called_once_with(timeout_s=5.0)
+    router_actor.stop.remote.assert_called_once_with()
+    sglang_generation_module.ray.kill.assert_any_call(engine, no_restart=True)
+    sglang_generation_module.ray.kill.assert_any_call(router_actor, no_restart=True)
+    assert generation.all_engines == [None]
+    assert generation._router_actor is None
+
+
+def test_shutdown_reports_an_earlier_unconfirmed_engine_cleanup():
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation._owns_runtime = True
+    generation._health_monitor = None
+    generation.all_engines = [None]
+    generation._engine_cleanup_error = "prior cleanup was not confirmed"
+    generation._router_actor = None
+    generation._http_client = None
+    generation._async_loop = None
+
+    assert not generation.shutdown()
+
+    generation._owns_runtime = False
 
 
 # ===================================================================

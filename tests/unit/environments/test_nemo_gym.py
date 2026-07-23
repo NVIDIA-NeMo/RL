@@ -32,6 +32,7 @@ from nemo_rl.environments.nemo_gym import (
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
+    split_nemo_gym_runtime_options,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -61,6 +62,26 @@ def test_extract_reward_components():
     )
     assert components == {"correctness": 1.0, "format": 0.5}
     assert all(isinstance(v, float) for v in components.values())
+
+
+def test_split_nemo_gym_runtime_options_centralizes_defaults():
+    options, gym_global_config = split_nemo_gym_runtime_options(
+        {
+            "num_servers": 2,
+            "invalid_tool_call_patterns": ["<tool>"],
+            "thinking_tags": ["<think>", "</think>"],
+        }
+    )
+
+    assert options.truncate_noncontiguous_episodes is False
+    assert options.invalid_tool_call_patterns == ["<tool>"]
+    assert options.thinking_tags == ["<think>", "</think>"]
+    assert gym_global_config == {"num_servers": 2}
+
+    enabled, _ = split_nemo_gym_runtime_options(
+        {"truncate_noncontiguous_episodes": True}
+    )
+    assert enabled.truncate_noncontiguous_episodes is True
 
 
 def test_build_reward_component_columns():
@@ -129,6 +150,107 @@ def test_validate_reward_components_match_scalar():
                 },
             ]
         )
+
+
+def test_setup_nemo_gym_config_enables_vllm_http_async_mode():
+    generation_config = {
+        "backend": "vllm",
+        "vllm_cfg": {
+            "async_engine": False,
+            "expose_http_server": False,
+        },
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer=None)
+
+    assert generation_config["vllm_cfg"]["async_engine"] is True
+    assert generation_config["vllm_cfg"]["expose_http_server"] is True
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_enables_sglang_async_rollouts_with_null_vllm():
+    generation_config = {
+        "backend": "sglang",
+        "use_async_rollouts": False,
+        "vllm_cfg": None,
+        "sglang_cfg": {},
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer=None)
+
+    assert generation_config["use_async_rollouts"] is True
+    assert generation_config["vllm_cfg"] is None
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_enables_megatron_http_async_mode_only():
+    inherited_vllm_config = {
+        "async_engine": False,
+        "expose_http_server": False,
+    }
+    generation_config = {
+        "backend": "megatron",
+        "vllm_cfg": inherited_vllm_config,
+        "mcore_generation_config": {
+            "async_engine": False,
+            "expose_http_server": False,
+        },
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer=None)
+
+    assert generation_config["mcore_generation_config"]["async_engine"] is True
+    assert generation_config["mcore_generation_config"]["expose_http_server"] is True
+    assert inherited_vllm_config == {
+        "async_engine": False,
+        "expose_http_server": False,
+    }
+
+
+def test_setup_nemo_gym_config_rejects_trtllm():
+    master_config = MasterConfig.model_construct(
+        policy={"generation": {"backend": "trtllm", "trtllm_cfg": {}}}
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="NeMo Gym is not supported with the TRT-LLM generation backend",
+    ):
+        setup_nemo_gym_config(master_config, tokenizer=None)
+
+
+@pytest.mark.parametrize(
+    ("backend", "required_config"),
+    [
+        ("vllm", "vllm_cfg"),
+        ("sglang", "sglang_cfg"),
+        ("megatron", "mcore_generation_config"),
+    ],
+)
+def test_setup_nemo_gym_config_requires_active_backend_config(backend, required_config):
+    master_config = MasterConfig.model_construct(
+        policy={"generation": {"backend": backend}}
+    )
+
+    with pytest.raises(ValueError, match=required_config):
+        setup_nemo_gym_config(master_config, tokenizer=None)
 
 
 @pytest.mark.nemo_gym
@@ -372,6 +494,64 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     assert "apply_chat_template failed" in msg
     assert "RuntimeError" in msg
     assert "['reasoning']" in msg
+
+
+def _make_noncontiguous_nemo_gym_result():
+    """Two assistant turns where turn 2's prompt breaks token-prefix contiguity.
+
+    After turn 1, seen_token_ids == [1, 2, 3]; turn 2's prompt starts with
+    [1, 99, ...] (99 != 2), e.g. a tokenization/re-render edge case in a long
+    multi-turn rollout.
+    """
+    return {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 99, 3, 4],
+                    "generation_token_ids": [6],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+
+class _JoinTokenizer:
+    def batch_decode(self, batch):
+        return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+
+def test_nemo_gym_postprocess_noncontiguous_asserts_by_default():
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+
+
+def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled():
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": True}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+    )
+
+    # The corrupted second turn is dropped; the contiguous first turn survives
+    # as a trainable (user prompt, assistant generation) pair.
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
 
 
 @pytest.mark.nemo_gym

@@ -24,6 +24,9 @@ import requests
 
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local
 from nemo_rl.models.generation.sglang.sglang_router import RouterActor, _start_router
+from nemo_rl.models.generation.sglang.utils.startup_deadline import (
+    SGLangStartupDeadline,
+)
 
 from . import (
     helpers,  # noqa: F401  — installs env vars + module stubs before nemo_rl imports
@@ -119,7 +122,7 @@ def test_start_router_external_returns_configured_endpoint():
         "sglang_router_ip": "10.0.0.42",
         "sglang_router_port": 12345,
     }
-    ip, port, actor = _start_router(cfg)
+    ip, port, actor = _start_router(cfg, deadline=SGLangStartupDeadline(30))
     assert ip == "10.0.0.42"
     assert port == 12345
     # ``None`` is the contract: SGLangGeneration.shutdown skips terminate
@@ -140,7 +143,7 @@ def test_start_router_external_requires_ip_and_port(cfg):
     """Both ``sglang_router_ip`` and ``sglang_router_port`` must be set
     when ``use_external_router`` is True."""
     with pytest.raises(AssertionError):
-        _start_router(cfg)
+        _start_router(cfg, deadline=SGLangStartupDeadline(30))
 
 
 def test_start_router_external_targets_running_router(ray_cluster):
@@ -154,7 +157,10 @@ def test_start_router_external_targets_running_router(ray_cluster):
             "sglang_router_ip": ext_ip,
             "sglang_router_port": ext_port,
         }
-        ip, port, actor = _start_router(cfg)
+        ip, port, actor = _start_router(
+            cfg,
+            deadline=SGLangStartupDeadline(30),
+        )
         assert (ip, port) == (ext_ip, ext_port)
         assert actor is None
 

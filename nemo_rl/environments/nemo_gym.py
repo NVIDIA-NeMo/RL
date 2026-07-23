@@ -22,6 +22,7 @@ from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, ConfigDict
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -49,6 +50,32 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+class NemoGymRuntimeOptions(BaseModel):
+    """NeMo-RL-owned options nested under ``env.nemo_gym``.
+
+    The remaining keys in that mapping are forwarded to NeMo Gym as its global
+    config. Keeping NeMo-RL's options in a model gives every call site the same
+    defaults without hidden ``dict.get`` fallbacks.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
+
+
+def split_nemo_gym_runtime_options(
+    config: dict[str, Any],
+) -> tuple[NemoGymRuntimeOptions, dict[str, Any]]:
+    """Split NeMo-RL runtime options from the config forwarded to NeMo Gym."""
+    options = NemoGymRuntimeOptions.model_validate(config)
+    gym_global_config = dict(config)
+    for key in NemoGymRuntimeOptions.model_fields:
+        gym_global_config.pop(key, None)
+    return options, gym_global_config
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -108,6 +135,14 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # When true, an episode whose turn breaks token-prefix contiguity (e.g. a
+    # rare tokenization/re-render edge case in a long multi-turn rollout) is
+    # truncated at the last contiguous turn: the corrupted tail is dropped and
+    # the valid prefix stays trainable (same philosophy as overlong filtering).
+    # When absent/false (default), such an episode raises the contiguity
+    # assertion below, which kills the rollout task; under async GRPO a single
+    # such episode can then stall the training step indefinitely.
+    truncate_noncontiguous_episodes: bool
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -364,10 +399,23 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg.get("truncate_noncontiguous_episodes"):
+                # Opt-in resilience: keep the contiguous prefix trainable and
+                # drop the corrupted tail (same philosophy as overlong
+                # filtering) instead of killing the rollout task — under async
+                # GRPO a single asserting episode can stall the step
+                # indefinitely.
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
@@ -592,10 +640,41 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
+    backend = generation_config["backend"]
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    if backend == "vllm":
+        vllm_config = generation_config.get("vllm_cfg")
+        if vllm_config is None:
+            raise ValueError(
+                "NeMo Gym with the vLLM backend requires policy.generation.vllm_cfg."
+            )
+        vllm_config["async_engine"] = True
+        vllm_config["expose_http_server"] = True
+    elif backend == "sglang":
+        if generation_config.get("sglang_cfg") is None:
+            raise ValueError(
+                "NeMo Gym with the SGLang backend requires "
+                "policy.generation.sglang_cfg."
+            )
+        # SGLang engines are native HTTP servers, so only the async rollout
+        # control-flow switch needs to be enabled.
+        generation_config["use_async_rollouts"] = True
+    elif backend == "megatron":
+        mcore_config = generation_config.get("mcore_generation_config")
+        if mcore_config is None:
+            raise ValueError(
+                "NeMo Gym with the Megatron backend requires "
+                "policy.generation.mcore_generation_config."
+            )
+        mcore_config["async_engine"] = True
+        mcore_config["expose_http_server"] = True
+    elif backend == "trtllm":
+        raise NotImplementedError(
+            "NeMo Gym is not supported with the TRT-LLM generation backend "
+            "(the TRT-LLM OpenAI-compatible HTTP server was removed)."
+        )
+    else:
+        raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

@@ -66,7 +66,10 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    normalize_sglang_config,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
@@ -253,6 +256,14 @@ def setup(
                 "support is tracked in "
                 "https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
+    elif generation_config["backend"] == "sglang":
+        sglang_config = cast(SGLangConfig, generation_config)
+        if "model_path" not in sglang_config["sglang_cfg"]:
+            sglang_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
+        normalize_sglang_config(
+            sglang_config,
+            colocated_inference=generation_config["colocated"]["enabled"],
+        )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
@@ -628,10 +639,6 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
-
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_sglang,

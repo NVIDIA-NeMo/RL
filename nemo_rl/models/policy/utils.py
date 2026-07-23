@@ -14,11 +14,14 @@
 
 import gc
 import os
+import sys
+import time
 import traceback
+import uuid
+from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
 
-import requests
 import torch
 import torch.distributed as dist
 import zmq
@@ -54,6 +57,11 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.sglang.utils.refit_deadline import (
+    SGLangRefitDeadline,
+    SGLangRefitTimeoutError,
+    cancel_ray_refs,
+)
 
 # an automodel factory for loading the huggingface models from correct class
 
@@ -521,230 +529,742 @@ def rebuild_cuda_tensor_from_ipc(
     return func(*list_args)
 
 
-def _ensure_ipc_topology(
-    num_engines: int,
-    num_gpus_per_engine: int,
+# ---------------------------------------------------------------------------
+# SGLang weight-update plumbing (colocate IPC gather + disaggregate broadcast)
+# ---------------------------------------------------------------------------
+def _derive_engine_gpu_offsets(engine_gpu_counts: list[int]) -> list[int]:
+    """Cumulative-sum offsets for a dense engine layout."""
+    offsets: list[int] = []
+    cursor = 0
+    for c in engine_gpu_counts:
+        offsets.append(cursor)
+        cursor += c
+    return offsets
+
+
+def connect_colocate_topology(
+    *,
+    engine_gpu_counts: list[int],
+    engine_gpu_offsets: Optional[list[int]] = None,
     worker_state: dict,
 ) -> None:
-    """Lazily create a per-engine Gloo subgroup and cache rank-only routing state.
+    """Generalized colocate rollout-engine connect for FSDP and Megatron.
 
-    Every FSDP rank must call ``dist.new_group`` for every engine's rank range
-    (collective). Only the ranks inside a given range stash ``gather_src`` and
-    ``gather_group`` into ``worker_state``. The engine handle itself is resolved
-    at call time from the caller-provided ``rollout_engines`` list so that
-    post-recover actor swaps are picked up without cache invalidation.
+    Builds a Gloo gather subgroup for each engine's GPU rank range and stashes
+    rank-only routing state into ``worker_state``:
 
-    Note: callers must have already applied ``monkey_patch_torch_reductions``
-    once during worker setup; this function no longer applies it.
+    - ``worker_state["_ipc_gather_group"]``: ``ProcessGroup`` covering this
+      trainer rank's engine, or ``None`` if the rank is a placeholder /
+      not covered by any engine.
+    - ``worker_state["_ipc_gather_src"]``: the source rank inside the gather
+      group (the first GPU index of the covering engine), or ``None``.
+    - ``worker_state["_ipc_engine_index"]``: index into the caller's engine
+      list, or ``None``. The caller is responsible for resolving the actor
+      handle / URL at call time so post-recover actor swaps are picked up.
+    - ``worker_state["_ipc_layout_key"]``: cached topology signature so
+      subsequent connects with the same layout are no-ops.
+
+    All trainer ranks must enter this function collectively (each call to
+    ``dist.new_group`` is collective). When the layout changes (e.g. a
+    recovered engine resizes the topology) the cached subgroup is destroyed
+    and rebuilt for the new layout.
     """
-    if worker_state.get("ready"):
+    if not engine_gpu_counts:
+        raise ValueError("engine_gpu_counts must be non-empty")
+    if engine_gpu_offsets is None:
+        engine_gpu_offsets = _derive_engine_gpu_offsets(engine_gpu_counts)
+    elif len(engine_gpu_offsets) != len(engine_gpu_counts):
+        raise ValueError(
+            "engine_gpu_offsets and engine_gpu_counts must have the same length, "
+            f"got {len(engine_gpu_offsets)} vs {len(engine_gpu_counts)}"
+        )
+
+    layout_key = (tuple(engine_gpu_counts), tuple(engine_gpu_offsets))
+    if worker_state.get("_ipc_layout_key") == layout_key:
         return
 
+    old_group = worker_state.get("_ipc_gather_group")
+    if old_group is not None:
+        try:
+            dist.destroy_process_group(old_group)
+        except Exception:
+            # Some torch builds raise when the group has no peers; safe to
+            # ignore — the new group below replaces it.
+            pass
+
     my_rank = dist.get_rank()
-    for i in range(num_engines):
-        start = i * num_gpus_per_engine
-        group_ranks = list(range(start, start + num_gpus_per_engine))
+    new_group = None
+    new_src: Optional[int] = None
+    new_engine_idx: Optional[int] = None
+    for i, (offset, count) in enumerate(
+        zip(engine_gpu_offsets, engine_gpu_counts, strict=True)
+    ):
+        group_ranks = list(range(offset, offset + count))
         grp = dist.new_group(ranks=group_ranks, backend="gloo")
         if my_rank in group_ranks:
-            worker_state["gather_src"] = start
-            worker_state["gather_group"] = grp
+            new_group = grp
+            new_src = offset
+            new_engine_idx = i
 
+    worker_state["_ipc_gather_group"] = new_group
+    worker_state["_ipc_gather_src"] = new_src
+    worker_state["_ipc_engine_index"] = new_engine_idx
+    worker_state["_ipc_layout_key"] = layout_key
     worker_state.setdefault("weight_version", 0)
-    worker_state["ready"] = True
 
 
-def _flush_bucket(
-    named_tensors,
-    gather_src: int,
-    gather_group,
-    engine_url: str,
-    weight_version: int,
-    flattened_tensor_bucket_cls,
-    multiprocessing_serializer_cls,
-) -> None:
-    """Flatten ``named_tensors`` per dtype, gather to ``gather_src``, and POST to the engine."""
-    # Wait on any async DTensor redistributes.
-    named_tensors = [
-        (n, (t.wait() if hasattr(t, "wait") else t)) for n, t in named_tensors
-    ]
+def _check_weight_sync_results(results: list) -> None:
+    from collections.abc import Mapping
 
-    by_dtype: dict = {}
-    for n, t in named_tensors:
-        by_dtype.setdefault(t.dtype, []).append((n, t))
+    for result in results:
+        if isinstance(result, Mapping):
+            success = result.get("success")
+            error_msg = (
+                result.get("error_message")
+                or result.get("error")
+                or result.get("message")
+                or "unknown error"
+            )
+        elif hasattr(result, "success"):
+            success = result.success
+            error_msg = getattr(result, "error_message", "unknown error")
+        else:
+            continue
 
-    serialized: list[str] = []
-    for _dtype, tensors in by_dtype.items():
-        bkt = flattened_tensor_bucket_cls(named_tensors=tensors)
-        payload = {
-            "flattened_tensor": bkt.get_flattened_tensor(),
-            "metadata": bkt.get_metadata(),
-        }
-        serialized.append(
-            multiprocessing_serializer_cls.serialize(payload, output_str=True)
-        )
-
-    my_rank = dist.get_rank()
-    group_world = dist.get_world_size(gather_group)
-    gathered = [None] * group_world if my_rank == gather_src else None
-    dist.gather_object(
-        serialized,
-        object_gather_list=gathered,
-        dst=gather_src,
-        group=gather_group,
-    )
-
-    if my_rank != gather_src:
-        return
-
-    assert gathered is not None
-    gathered_payloads: list[list[str]] = []
-    for item in gathered:
-        assert item is not None
-        gathered_payloads.append(item)
-
-    num_dtypes = len(gathered_payloads[0])
-    assert num_dtypes > 0
-    for i in range(num_dtypes):
-        body = {
-            "serialized_named_tensors": [g[i] for g in gathered_payloads],
-            "load_format": "flattened_bucket",
-            "flush_cache": False,
-            "weight_version": str(weight_version),
-        }
-        response = requests.post(f"{engine_url}/update_weights_from_tensor", json=body)
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            e.add_note(f"{response.text=}")
-            raise
-        result = response.json()
-        success = result.get("success", True)
-        error_msg = result.get("error_message") or result.get(
-            "message", "unknown error"
-        )
-        if not success:
+        if success is False:
             raise RuntimeError(
-                f"Weight sync failed on rollout engine: {error_msg}. "
-                f"Check SGLang version compatibility."
+                f"SGLang weight sync failed on rollout engine: {error_msg}. "
+                "Check SGLang version compatibility."
             )
 
 
-def stream_weights_via_http_impl(
+def iter_named_tensor_buckets(
     params_generator: Iterable[tuple[str, torch.Tensor]],
-    rollout_engine_urls: Iterable[str],
-    num_gpus_per_engine: int,
-    rank: int,
-    world_size: int,
-    worker_name: str,
     buffer_size_bytes: int,
-    worker_state: dict,
-) -> None:
-    """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
+) -> "Iterable[list[tuple[str, torch.Tensor]]]":
+    """Group ``(name, tensor)`` pairs into buckets of at most ``buffer_size_bytes``.
 
-    Args:
-        params_generator: Iterable yielding ``(name, tensor)`` pairs to stream.
-            Caller is responsible for any pre-processing (LoRA merge, HF
-            adaptation, dtype cast).
-        rollout_engine_urls: ``http://host:port`` base URLs of each engine's
-            ``node_rank=0`` SGLang HTTP server. One entry per engine, in TP
-            rank-range order: engine ``i`` owns global ranks
-            ``[i * num_gpus_per_engine, (i + 1) * num_gpus_per_engine)``.
-        num_gpus_per_engine: TP size per SGLang engine.
-        rank: Global FSDP rank.
-        world_size: Global FSDP world size.
-        worker_name: Human label for logs.
-        buffer_size_bytes: Max bucket size in bytes.
-        worker_state: Mutable dict on the worker used to cache topology and
-            weight version across refits.
+    Waits on async DTensor redistributes (``.wait()``) before sizing, so the
+    yielded tensors are always materialized and safe to serialize.
     """
+    if buffer_size_bytes <= 0:
+        raise ValueError(f"buffer_size_bytes must be positive, got {buffer_size_bytes}")
+
+    bucket: list[tuple[str, torch.Tensor]] = []
+    bucket_size = 0
+    for name, tensor in params_generator:
+        if hasattr(tensor, "wait"):
+            tensor = tensor.wait()
+        tensor_size = tensor.numel() * tensor.element_size()
+        if bucket and bucket_size + tensor_size > buffer_size_bytes:
+            yield bucket
+            bucket = []
+            bucket_size = 0
+        bucket.append((name, tensor))
+        bucket_size += tensor_size
+
+    if bucket:
+        yield bucket
+
+
+def send_hf_buckets_via_ipc_actor_impl(
+    *,
+    bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
+    rollout_engines: list,
+    worker_state: dict,
+    weight_version: Optional[int] = None,
+) -> None:
+    """Send finalized HF tensor buckets to colocated SGLang engines via Ray IPC.
+
+    Per bucket: group by dtype, serialize a ``FlattenedTensorBucket`` per
+    dtype, ``dist.gather_object`` to the gather source rank, then on the
+    source rank call ``ipc_engine.update_weights_from_tensor.remote(...)``
+    once per dtype, **block on ``ray.get(refs)`` per chunk**, validate
+    engine return values, synchronize all trainer ranks, then drop the
+    trainer-side ``flattened_tensor`` references before moving on.
+
+    The trainer-side topology (``_ipc_gather_group`` / ``_ipc_gather_src`` /
+    ``_ipc_engine_index``) must already have been set up by
+    :func:`connect_colocate_topology`. Placeholder ranks (no covering engine)
+    return immediately — they must not call ``gather_object``. Non-source
+    trainer ranks participate in the gather and completion broadcast; they
+    don't issue Ray RPCs and don't ``ray.get``.
+
+    Returns ``None``. Raises ``RuntimeError`` if any chunk fails on the
+    engine side.
+    """
+    import ray
+
     from nemo_rl.models.generation.sglang.utils.train_utils import (
         FlattenedTensorBucket,
         MultiprocessingSerializer,
     )
 
-    rollout_engine_urls = list(rollout_engine_urls)
+    gather_group = worker_state.get("_ipc_gather_group")
+    gather_src = worker_state.get("_ipc_gather_src")
+    engine_idx = worker_state.get("_ipc_engine_index")
 
-    _ensure_ipc_topology(
-        num_engines=len(rollout_engine_urls),
-        num_gpus_per_engine=num_gpus_per_engine,
-        worker_state=worker_state,
-    )
+    if gather_group is None or gather_src is None or engine_idx is None:
+        # Placeholder rank: must not participate in the per-engine gather.
+        return None
 
-    worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
-    weight_version = worker_state["weight_version"]
-    gather_src = worker_state["gather_src"]
-    gather_group = worker_state["gather_group"]
+    if weight_version is None:
+        worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
+        weight_version = worker_state["weight_version"]
 
-    engine_url = None
-    for i, candidate in enumerate(rollout_engine_urls):
-        start = i * num_gpus_per_engine
-        end = start + num_gpus_per_engine
-        if start <= rank < end:
-            engine_url = candidate
-            break
-    if engine_url is None:
-        raise RuntimeError(
-            f"No rollout engine matched rank={rank} with "
-            f"num_gpus_per_engine={num_gpus_per_engine} and "
-            f"{len(rollout_engine_urls)} engine URL(s); "
-            f"rank must fall within [0, {num_gpus_per_engine * len(rollout_engine_urls)})."
-        )
+    ipc_engine = rollout_engines[engine_idx]
+    my_rank = dist.get_rank()
 
     try:
-        bucket: list = []
-        bucket_size = 0
-        for name, param in params_generator:
-            param_size = param.numel() * param.element_size()
-            if bucket and bucket_size + param_size >= buffer_size_bytes:
-                _flush_bucket(
-                    bucket,
-                    gather_src=gather_src,
-                    gather_group=gather_group,
-                    engine_url=engine_url,
-                    weight_version=weight_version,
-                    flattened_tensor_bucket_cls=FlattenedTensorBucket,
-                    multiprocessing_serializer_cls=MultiprocessingSerializer,
+        for bucket in bucket_iterator:
+            if not bucket:
+                continue
+
+            # No async-collective ``.wait()`` here — Megatron's AutoBridge
+            # yields plain ``torch.Tensor``, no DTensor wrapping.
+
+            if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+                by_dtype: dict = {"dtype": list(bucket)}
+            else:
+                by_dtype = {}
+                for name, tensor in bucket:
+                    by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
+
+            serialized: list[str] = []
+            long_lived_tensors: list[dict] = []
+            for _dtype, named_tensors in by_dtype.items():
+                bkt = FlattenedTensorBucket(named_tensors=named_tensors)
+                payload = {
+                    "flattened_tensor": bkt.get_flattened_tensor(),
+                    "metadata": bkt.get_metadata(),
+                }
+                long_lived_tensors.append(payload)
+                serialized.append(
+                    MultiprocessingSerializer.serialize(payload, output_str=True)
                 )
-                bucket = []
-                bucket_size = 0
 
-            param = param.cuda()
-            bucket.append((name, param))
-            bucket_size += param_size
-
-        if bucket:
-            _flush_bucket(
-                bucket,
-                gather_src=gather_src,
-                gather_group=gather_group,
-                engine_url=engine_url,
-                weight_version=weight_version,
-                flattened_tensor_bucket_cls=FlattenedTensorBucket,
-                multiprocessing_serializer_cls=MultiprocessingSerializer,
+            group_world = dist.get_world_size(gather_group)
+            gathered = [None] * group_world if my_rank == gather_src else None
+            dist.gather_object(
+                serialized,
+                object_gather_list=gathered,
+                dst=gather_src,
+                group=gather_group,
             )
 
-        if dist.get_rank() == gather_src:
-            # Mirror SGLangGenerationWorker.invalidate_kv_cache: the endpoint
-            # returns non-200 while requests are still pending, so retry up to 60s.
-            import time
+            refs: list = []
+            if my_rank == gather_src:
+                num_dtypes = len(gathered[0])
+                for i in range(num_dtypes):
+                    refs.append(
+                        ipc_engine.update_weights_from_tensor.remote(
+                            serialized_named_tensors=[g[i] for g in gathered],
+                            load_format="flattened_bucket",
+                            weight_version=str(weight_version),
+                        )
+                    )
 
-            for _ in range(60):
+            # The serialized IPC handles gathered on the source may point at
+            # flattened tensors owned by non-source trainer ranks. Keep every
+            # rank's tensors alive until the source finishes the engine RPCs.
+            sync_error: Optional[str] = None
+            source_exc: Optional[BaseException] = None
+            if my_rank == gather_src:
                 try:
-                    response = requests.get(f"{engine_url}/flush_cache")
-                    if response.status_code == 200:
-                        break
-                except requests.RequestException:
-                    pass
-                time.sleep(1)
-            else:
-                raise TimeoutError(f"Timeout while flushing cache at {engine_url}.")
+                    results = ray.get(refs)
+                    _check_weight_sync_results(results)
+                except BaseException as exc:
+                    source_exc = exc
+                    sync_error = repr(exc)
 
-    except Exception as e:
-        print(
-            f"{worker_name} (rank {rank}): Error during HTTP weight streaming: {e}.\n"
-            f"{traceback.format_exc()}"
-        )
-        raise
+            sync_state = [sync_error]
+            dist.broadcast_object_list(sync_state, src=gather_src, group=gather_group)
+            del long_lived_tensors, refs
+
+            if source_exc is not None:
+                raise source_exc
+            if sync_state[0] is not None:
+                raise RuntimeError(
+                    f"SGLang IPC weight update failed on gather src rank "
+                    f"{gather_src}: {sync_state[0]}"
+                )
     finally:
         gc.collect()
         torch.cuda.empty_cache()
+
+    return None
+
+
+def init_process_group(
+    backend: "str | dist.Backend | None" = None,
+    init_method: Optional[str] = None,
+    timeout: Optional[timedelta] = None,
+    world_size: int = -1,
+    rank: int = -1,
+    store: "Optional[dist.Store]" = None,
+    group_name: Optional[str] = None,
+    pg_options: Any = None,
+) -> "torch.distributed.ProcessGroup":
+    """Create a side-by-side ``ProcessGroup`` without touching the default world.
+
+    ``torch.distributed.init_process_group`` initializes the *default* world
+    process group. Once the Megatron trainer has stood up its own world during
+    Policy construction, calling it again to talk to SGLang either errors with
+    "trying to initialize the default process group twice" or — depending on
+    torch version — silently hangs in rendezvous against a peer that has
+    already finished its own custom-group setup.
+
+    Same approach as SGLang's ``sglang.srt.utils.common.init_custom_process_group``:
+    replay the public API's wiring (rendezvous → ``PrefixStore`` →
+    ``_new_process_group_helper``) but skip the "set as default PG" step, so
+    multiple independent groups can coexist in the same process.
+
+    Only one of ``init_method`` and ``store`` may be set; otherwise the
+    rendezvous source is ambiguous.
+    """
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        PrefixStore,
+        _get_default_group,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
+
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
+
+    if store is not None:
+        assert world_size > 0, "world_size must be positive if using store"
+        assert rank >= 0, "rank must be non-negative if using store"
+    elif init_method is None:
+        init_method = "env://"
+
+    backend = Backend(backend) if backend else Backend("undefined")
+    if timeout is None:
+        timeout = default_pg_timeout
+
+    if store is None:
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+        # PrefixStore so multiple co-tenant groups don't trample each other's keys.
+        store = PrefixStore(group_name or "", store)
+
+    # ``pg_options`` was renamed to ``backend_options`` in PyTorch 2.6:
+    #   https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
+    # Use numeric tuple compare — string compare ``"2.10" >= "2.6"`` returns
+    # False because ``"1"`` sorts before ``"6"`` lexicographically.
+    _torch_mm = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    pg_options_kw = "backend_options" if _torch_mm >= (2, 6) else "pg_options"
+
+    # Disable the ncclCommSplit path (see docstring). Safe to mutate here:
+    # nothing else reads ``bound_device_id`` during group construction, and
+    # refit setup does not create process groups from other threads.
+    default_pg = _get_default_group() if dist.is_initialized() else None
+    saved_bound_device_id = getattr(default_pg, "bound_device_id", None)
+    if saved_bound_device_id is not None:
+        default_pg.bound_device_id = None
+    try:
+        pg, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            backend,
+            store,
+            group_name=group_name,
+            **{pg_options_kw: pg_options},
+            timeout=timeout,
+        )
+    finally:
+        if saved_bound_device_id is not None:
+            default_pg.bound_device_id = saved_bound_device_id
+
+    # Map identity ranks so collective ops can resolve member ranks for ``pg``.
+    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+    return pg
+
+
+_BEST_EFFORT_REFIT_CLEANUP_TIMEOUT_S = 5.0
+
+
+class SGLangCommunicatorRecoveryError(RuntimeError):
+    """Raised when a failed trainer communicator cannot be aborted safely."""
+
+
+def _abort_process_group(
+    model_update_group: "torch.distributed.ProcessGroup",
+) -> None:
+    """Abort and unregister a failed NCCL group without flushing pending work.
+
+    PyTorch 2.11's normal ``destroy_process_group`` path calls ``shutdown()``,
+    which waits for pending kernels and can hang on a failed collective. Its
+    explicit failure path aborts the communicators and removes all Python/C++
+    registry entries, allowing an out-of-band-synchronized reconnect.
+    """
+    from torch.distributed.distributed_c10d import _abort_process_group
+
+    _abort_process_group(model_update_group)
+
+
+def _destroy_engine_weight_update_groups(
+    *,
+    group_name: str,
+    rollout_engines: list,
+    request_timeout_s: float,
+) -> list:
+    """Dispatch idempotent engine-side communicator destruction."""
+    return [
+        engine.destroy_weights_update_group.remote(
+            group_name,
+            timeout_s=request_timeout_s,
+        )
+        for engine in rollout_engines
+    ]
+
+
+def reset_rollout_engines_from_distributed(
+    *,
+    group_name: str,
+    rollout_engines: list,
+    deadline: SGLangRefitDeadline,
+) -> None:
+    """Require engine-side stale-group cleanup before a reconnect."""
+    refs = _destroy_engine_weight_update_groups(
+        group_name=group_name,
+        rollout_engines=rollout_engines,
+        request_timeout_s=deadline.remaining(
+            "dispatching stale engine communicator cleanup"
+        ),
+    )
+    results = deadline.ray_get(
+        refs,
+        stage="waiting for stale engine communicator cleanup",
+        cancel_on_error=True,
+    )
+    _check_weight_sync_results(results)
+
+
+def connect_rollout_engines_from_distributed(
+    *,
+    group_name: str,
+    rollout_engines: list,
+    engine_gpu_counts: list[int],
+    deadline: SGLangRefitDeadline,
+) -> "torch.distributed.ProcessGroup":
+    """Set up the SGLang NCCL weight-update group with trainer rank 0 as rank 0.
+
+    Only trainer rank 0 broadcasts because the AutoBridge path restores
+    full HF weights, not per-PP slices.
+
+    The caller (a trainer) must invoke this only on rank 0; other ranks must
+    not call it.
+    """
+    import ray
+
+    from nemo_rl.distributed.virtual_cluster import _get_free_port_local
+
+    master_address = ray._private.services.get_node_ip_address()
+    master_port = _get_free_port_local()
+    world_size = 1 + sum(engine_gpu_counts)
+
+    refs = []
+    group = None
+    rank_cursor = 1
+    try:
+        for engine, gpu_count in zip(rollout_engines, engine_gpu_counts, strict=True):
+            refs.append(
+                engine.init_weights_update_group.remote(
+                    master_address,
+                    master_port,
+                    rank_cursor,
+                    world_size,
+                    group_name,
+                    "nccl",
+                    timeout_s=deadline.remaining(
+                        "dispatching engine communicator bootstrap"
+                    ),
+                )
+            )
+            rank_cursor += gpu_count
+
+        group = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            timeout=deadline.remaining_timedelta(
+                "bootstrapping the trainer communicator"
+            ),
+            world_size=world_size,
+            rank=0,
+            group_name=group_name,
+        )
+        results = deadline.ray_get(
+            refs,
+            stage="waiting for engine communicator bootstrap",
+            cancel_on_error=True,
+        )
+        _check_weight_sync_results(results)
+        print(
+            "NRL_SGLANG_REFIT_GROUP_READY "
+            f"world_size={world_size} engines={len(rollout_engines)}",
+            flush=True,
+        )
+        return group
+    except Exception as exc:
+        cancel_ray_refs(refs)
+        abort_error = None
+        if group is not None:
+            try:
+                _abort_process_group(group)
+            except Exception as cleanup_exc:
+                abort_error = cleanup_exc
+                exc.add_note(
+                    "Trainer communicator abort also failed: "
+                    f"{cleanup_exc!r}. The policy worker must not be reused."
+                )
+
+        # The init HTTP handlers may have created only a subset of the engine
+        # groups. Queue idempotent destruction even if the main deadline has
+        # expired; each request remains independently bounded and the caller
+        # records that cleanup must finish before any reconnect.
+        cleanup_timeout_s = max(
+            deadline.remaining_or_zero(), _BEST_EFFORT_REFIT_CLEANUP_TIMEOUT_S
+        )
+        try:
+            _destroy_engine_weight_update_groups(
+                group_name=group_name,
+                rollout_engines=rollout_engines,
+                request_timeout_s=cleanup_timeout_s,
+            )
+        except Exception as cleanup_exc:
+            exc.add_note(
+                f"Dispatching engine communicator cleanup also failed: {cleanup_exc!r}"
+            )
+        if abort_error is not None:
+            raise SGLangCommunicatorRecoveryError(
+                "Failed to abort the trainer-side SGLang communicator"
+            ) from abort_error
+        raise
+
+
+def disconnect_rollout_engines_from_distributed(
+    *,
+    group_name: str,
+    model_update_group: "torch.distributed.ProcessGroup",
+    rollout_engines: list,
+    deadline: SGLangRefitDeadline,
+) -> None:
+    """Tear down trainer-side and engine-side NCCL state for ``group_name``."""
+    refs = _destroy_engine_weight_update_groups(
+        group_name=group_name,
+        rollout_engines=rollout_engines,
+        request_timeout_s=deadline.remaining(
+            "dispatching engine communicator shutdown"
+        ),
+    )
+    try:
+        dist.destroy_process_group(model_update_group)
+        results = deadline.ray_get(
+            refs,
+            stage="waiting for engine communicator shutdown",
+            cancel_on_error=True,
+        )
+        _check_weight_sync_results(results)
+    except Exception:
+        cancel_ray_refs(refs)
+        raise
+
+
+def get_sglang_quantization_cfg(policy_generation: Any) -> dict:
+    """Read the active SGLang quantization block from the generation handle.
+
+    The configuration boundary materializes the BF16 defaults, so callers can
+    read the selected scheme directly without adding local fallbacks.
+    """
+    return dict(policy_generation.sglang_cfg["sglang_cfg"]["quantization"])
+
+
+def invalidate_sglang_kv_cache_for_refit(
+    policy_generation: Any, pause_mode: str
+) -> None:
+    """Invalidate generation state before refit, or fail without streaming.
+
+    ``in_place`` intentionally preserves the paused engine's KV cache. Every
+    other pause mode must report successful invalidation before a weight update
+    can begin; continuing after a failed flush could serve cached activations
+    computed with stale weights.
+    """
+    if pause_mode == "in_place":
+        return
+    if not policy_generation.invalidate_kv_cache():
+        raise RuntimeError(
+            "SGLang KV-cache invalidation failed before refit; no weights were sent."
+        )
+
+
+def fetch_updatable_engines_with_recover(
+    policy_generation: Any,
+    *,
+    deadline: SGLangRefitDeadline | None = None,
+) -> tuple:
+    """Run the design-mandated weight-update prelude.
+
+    1. Acquire a persistent refit suspension and synchronously quiesce health
+       monitoring.
+    2. If ``sglang_cfg.use_fault_tolerance`` is enabled, call
+       ``rollout_manager.recover_updatable_engines`` to restart dead engines
+       and run
+       release/resume_memory_occupation on every recovered node-0 engine.
+    3. Read the current updatable-engine state via
+       ``get_updatable_engines_and_lock``.
+
+    Both calls are idempotent — recover is a no-op when no engines have died.
+    """
+    monitor_refit_lease = policy_generation.health_monitoring_suspend_for_refit(
+        deadline=deadline
+    )
+    try:
+        use_ft = bool(
+            policy_generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance", False)
+        )
+        if use_ft:
+            policy_generation.recover_updatable_engines(deadline=deadline)
+        state = policy_generation.get_updatable_engines_and_lock()
+    except BaseException as exc:
+        exc.add_note(
+            "SGLang health monitoring remains suspended because engine "
+            "recovery/topology inspection did not complete safely."
+        )
+        raise
+    return (*state, monitor_refit_lease)
+
+
+def broadcast_hf_buckets_via_distributed_impl(
+    *,
+    bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
+    rollout_engines: list,
+    rollout_engine_lock,
+    group_name: str,
+    model_update_group: "torch.distributed.ProcessGroup",
+    weight_version: int,
+    deadline: SGLangRefitDeadline,
+) -> None:
+    """Broadcast finalized HF tensor buckets to SGLang via NCCL (rank 0 only).
+
+    Per-bucket protocol: trainer rank 0 sends per-tensor metadata to every
+    engine via Ray (``update_weights_from_distributed``), then issues one
+    ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
+    refs to confirm engines finished loading the bucket.
+
+    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
+    NCCL operations (e.g. health-check pings) cannot collide with the
+    weight-update broadcast.
+    """
+    bucket_idx = 0
+    for bucket in bucket_iterator:
+        if not bucket:
+            continue
+
+        bucket_idx += 1
+        # No async-collective ``.wait()`` here — AutoBridge yields plain
+        # ``torch.Tensor`` for the Megatron path (no DTensor wrapping).
+
+        names = [name for name, _ in bucket]
+        dtypes = [tensor.dtype for _, tensor in bucket]
+        shapes = [tensor.shape for _, tensor in bucket]
+
+        lock_owner = uuid.uuid4().hex
+        lock_requested = False
+        lock_acquired = False
+        refs: list = []
+        try:
+            while not lock_acquired:
+                lock_requested = True
+                acquire_ref = rollout_engine_lock.acquire.remote(lock_owner)
+                lock_acquired = deadline.ray_get(
+                    acquire_ref,
+                    stage=f"acquiring the rollout-engine lock for bucket {bucket_idx}",
+                    cancel_on_error=True,
+                )
+                if not lock_acquired:
+                    time.sleep(
+                        min(
+                            0.1,
+                            deadline.remaining(
+                                "polling the rollout-engine lock for "
+                                f"bucket {bucket_idx}"
+                            ),
+                        )
+                    )
+
+            request_timeout_s = deadline.remaining(
+                f"dispatching engine receives for bucket {bucket_idx}"
+            )
+            refs = [
+                engine.update_weights_from_distributed.remote(
+                    names=names,
+                    dtypes=dtypes,
+                    shapes=shapes,
+                    group_name=group_name,
+                    weight_version=str(weight_version),
+                    timeout_s=request_timeout_s,
+                )
+                for engine in rollout_engines
+            ]
+            handles = []
+            for _, tensor in bucket:
+                handles.append(
+                    dist.broadcast(
+                        tensor.data, 0, group=model_update_group, async_op=True
+                    )
+                )
+            for tensor_idx, handle in enumerate(handles):
+                completed = handle.wait(
+                    timeout=deadline.remaining_timedelta(
+                        "waiting for NCCL broadcast "
+                        f"{tensor_idx + 1}/{len(handles)} in bucket {bucket_idx}"
+                    )
+                )
+                if not completed:
+                    raise SGLangRefitTimeoutError(
+                        "SGLang refit timed out while waiting for NCCL "
+                        f"broadcast {tensor_idx + 1}/{len(handles)} in "
+                        f"bucket {bucket_idx}"
+                    )
+            results = deadline.ray_get(
+                refs,
+                stage=f"waiting for engine receives for bucket {bucket_idx}",
+                cancel_on_error=True,
+            )
+            _check_weight_sync_results(results)
+        finally:
+            active_error = sys.exception()
+            if active_error is not None:
+                cancel_ray_refs(refs)
+            if lock_requested:
+                # Always enqueue the matching lease release. Actor ordering
+                # guarantees that it follows any acquire whose result raced
+                # with the deadline.
+                release_ref = rollout_engine_lock.release.remote(lock_owner)
+                try:
+                    released = deadline.ray_get(
+                        release_ref,
+                        stage=(
+                            f"releasing the rollout-engine lock for bucket {bucket_idx}"
+                        ),
+                    )
+                    if lock_acquired and not released:
+                        raise RuntimeError(
+                            "SGLang refit lost ownership of the rollout-engine "
+                            f"lock for bucket {bucket_idx}"
+                        )
+                except Exception as cleanup_exc:
+                    if active_error is None:
+                        raise
+                    active_error.add_note(
+                        "Rollout-engine lock release did not finish before the "
+                        f"deadline: {cleanup_exc!r}. The matching release remains "
+                        "queued on the lock actor."
+                    )
