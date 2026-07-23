@@ -2481,3 +2481,34 @@ class TestDraftSetup:
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
         )
+
+
+@pytest.mark.mcore
+def test_zero_train_gen_mismatch_forces_te_generation_spec():
+    """Zero train/gen mismatch must keep generation on the train-side TE MoE path."""
+    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
+
+    config = {
+        "megatron_cfg": {"zero_train_gen_mismatch": True},
+        "generation": {
+            "mcore_generation_config": {
+                "transformer_impl": "inference_optimized",
+            }
+        },
+    }
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.moe_determinism_patches."
+            "apply_moe_unpermute_determinism_patch"
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.patches.apply_te_gemm_cublas_pinned_patch"
+        ),
+    ):
+        _apply_zero_train_gen_mismatch(config)
+
+    assert (
+        config["generation"]["mcore_generation_config"]["transformer_impl"]
+        == "transformer_engine"
+    )

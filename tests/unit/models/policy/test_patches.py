@@ -21,7 +21,9 @@ import pytest
 
 from nemo_rl.models.policy.workers.patches import (
     _get_transformer_engine_file,
+    apply_te_gemm_cublas_pinned_patch,
     apply_transformer_engine_patch,
+    restore_te_gemm_cublas_pinned_patch,
 )
 
 
@@ -445,3 +447,58 @@ def permutation_kernel(x):
                 assert captured.out.count("Successfully patched") == 1
         finally:
             os.unlink(tmp_path)
+
+
+class TestApplyTeGemmCublasPinnedPatch:
+    """Tests for apply_te_gemm_cublas_pinned_patch."""
+
+    def setup_method(self):
+        restore_te_gemm_cublas_pinned_patch()
+
+    def teardown_method(self):
+        restore_te_gemm_cublas_pinned_patch()
+
+    def test_shrinks_workspace_and_is_idempotent(self, capsys):
+        orig_fn = MagicMock(return_value=4096)
+        mock_ws_fn = MagicMock()
+        mock_ws_fn.cache_clear = MagicMock()
+        mock_gemm_mod = MagicMock()
+        mock_gemm_mod.get_cublas_workspace_size_bytes = orig_fn
+        mock_gemm_mod.get_cublas_workspace = mock_ws_fn
+
+        with patch(
+            "nemo_rl.models.policy.workers.patches.importlib.import_module",
+            return_value=mock_gemm_mod,
+        ):
+            apply_te_gemm_cublas_pinned_patch()
+            apply_te_gemm_cublas_pinned_patch()
+
+        assert mock_gemm_mod.get_cublas_workspace_size_bytes() == 4
+        mock_ws_fn.cache_clear.assert_called_once()
+        captured = capsys.readouterr()
+        assert captured.out.count("[zero_train_gen_mismatch] shrunk TE cuBLAS workspace") == 1
+
+    def test_skips_when_te_gemm_module_missing(self, capsys):
+        with patch(
+            "nemo_rl.models.policy.workers.patches.importlib.import_module",
+            side_effect=ImportError("no te"),
+        ):
+            apply_te_gemm_cublas_pinned_patch()
+
+        captured = capsys.readouterr()
+        assert "is not importable" in captured.out
+
+    def test_restore_puts_back_original(self):
+        orig_fn = MagicMock(return_value=4096)
+        mock_gemm_mod = MagicMock()
+        mock_gemm_mod.get_cublas_workspace_size_bytes = orig_fn
+        mock_gemm_mod.get_cublas_workspace = MagicMock()
+
+        with patch(
+            "nemo_rl.models.policy.workers.patches.importlib.import_module",
+            return_value=mock_gemm_mod,
+        ):
+            apply_te_gemm_cublas_pinned_patch()
+            restore_te_gemm_cublas_pinned_patch()
+
+        assert mock_gemm_mod.get_cublas_workspace_size_bytes is orig_fn

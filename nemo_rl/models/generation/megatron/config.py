@@ -37,6 +37,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # Layer spec used by Megatron generation.
+    # Options are "transformer_engine" and "inference_optimized".
+    transformer_impl: NotRequired[Literal["transformer_engine", "inference_optimized"]]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).

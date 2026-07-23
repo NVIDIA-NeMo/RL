@@ -1170,30 +1170,38 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
 
     When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False,
-    attention_backend=flash (FA4 via TE), applies TE cuBLAS workspace shrink via
-    patches.py, and defaults env vars for cuBLAS/MoE/Mamba determinism if not
-    already set by the environment. Router replay and moe_grouped_gemm must be
-    configured explicitly.
+    attention_backend=flash (FA4 via TE), and the Transformer Engine generation
+    layer spec so generation and scoring share the patched MoE unpermute path.
+    Also applies TE cuBLAS workspace shrink via patches.py, MoE fixed-order
+    unpermute via moe_determinism_patches.py, and defaults env vars for
+    cuBLAS/MoE determinism if not already set by the environment. Router
+    replay and moe_grouped_gemm must be configured explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
     import os
 
+    from nemo_rl.models.policy.workers.moe_determinism_patches import (
+        apply_moe_unpermute_determinism_patch,
+    )
     from nemo_rl.models.policy.workers.patches import apply_te_gemm_cublas_pinned_patch
 
     mc = config["megatron_cfg"]
     mc["batch_invariant_mode"] = True
-    mc.setdefault("use_mamba_mem_eff_path", False)
     mc.setdefault("attention_backend", "flash")
+    generation = config.get("generation")
+    if generation is not None and "mcore_generation_config" in generation:
+        generation["mcore_generation_config"]["transformer_impl"] = (
+            "transformer_engine"
+        )
     apply_te_gemm_cublas_pinned_patch()
+    apply_moe_unpermute_determinism_patch()
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
     os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
-    # Force fixed-order MoE unpermute+index_put to eliminate scatter_add nondeterminism.
-    os.environ.setdefault("NRL_FIXED_ORDER_MOE_COMBINE", "1")
-    # Pin Triton autotune config for Mamba SSM/conv kernels across train and gen.
-    os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
+    # Force fixed-order MoE unpermute to eliminate scatter_add nondeterminism.
+
 
 
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False
