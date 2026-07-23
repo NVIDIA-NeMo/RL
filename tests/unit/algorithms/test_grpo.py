@@ -1055,6 +1055,38 @@ def mock_async_grpo_infrastructure(
             },
             False,
         ),
+        (
+            {
+                "backend": "sglang",
+                "use_async_rollouts": True,
+                "vllm_cfg": {"async_engine": False},
+            },
+            True,
+        ),
+        (
+            {
+                "backend": "sglang",
+                "use_async_rollouts": False,
+                "vllm_cfg": {"async_engine": True},
+            },
+            False,
+        ),
+        (
+            {
+                "backend": "megatron",
+                "mcore_generation_config": {"async_engine": True},
+                "vllm_cfg": {"async_engine": False},
+            },
+            True,
+        ),
+        (
+            {
+                "backend": "megatron",
+                "mcore_generation_config": {"async_engine": False},
+                "vllm_cfg": {"async_engine": True},
+            },
+            False,
+        ),
     ],
 )
 def test_should_use_async_rollouts_selects_backend_specific_config(
@@ -2323,6 +2355,56 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
                 _default_grpo_save_state(),
                 master_config,
             )
+
+
+def test_sglang_async_grpo_reaches_training_and_refit(mock_grpo_components):
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.policy["generation"].update(
+        {
+            "backend": "sglang",
+            "use_async_rollouts": True,
+            # An inherited inactive block must not select vLLM behavior.
+            "vllm_cfg": {"async_engine": False},
+            "colocated": {"enabled": False},
+        }
+    )
+
+    policy_generation = MagicMock(spec=SGLangGeneration)
+    policy_generation.weight_synchronizer = None
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        _patched_logprob_phase(policy),
+        patch("nemo_rl.algorithms.grpo.refit_policy_generation") as refit,
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    policy.train.assert_called_once()
+    assert refit.call_count >= 1
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
