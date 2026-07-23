@@ -1,4 +1,4 @@
-# Two-node SGLang refit smoke:
+# Two-node GB200 nightly SGLang refit smoke:
 #   - one 4-GPU node for Megatron training
 #   - one 4-GPU node for four independent TP1 SGLang engines
 #
@@ -19,7 +19,8 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatron-sglang-noncolocated-quick
 
 policy:
-  model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  # Set NRL_MODEL_PATH to an immutable shared snapshot for exact reproduction.
+  model_name: ${oc.env:NRL_MODEL_PATH,Qwen/Qwen2.5-Math-1.5B-Instruct}
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 8
@@ -56,6 +57,7 @@ policy:
       disable_piecewise_cuda_graph: true
       disable_cuda_graph: false
       use_fault_tolerance: false
+      engine_startup_timeout_s: 300
       refit_timeout_s: 300
       quantization:
         scheme: bf16

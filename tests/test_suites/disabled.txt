@@ -7,3 +7,9 @@ tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
 
 # Disable this due to know vLLM bug with Qwen3.5: https://github.com/vllm-project/vllm/issues/37856
 tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh
+
+# Manual-only SGLang refit reproducers require immutable source/model inputs
+# that the generic nightly launcher does not inject.
+tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatron-sglang-noncolocated-quick.sh
+# The 16-node async-GRPO + Gym integration run is also too costly for nightly CI.
+tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-async-gym-sglang.sh
