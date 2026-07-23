@@ -55,6 +55,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import log_generation_metrics_to_wandb
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -207,6 +208,12 @@ class SingleControllerActor:
             "masked_advantages": [],
             "sequence_lengths": [],
         }
+
+        # vLLM generation telemetry (inflight_batch_sizes, num_pending_samples,
+        # ...) accumulated by the generation workers since the last weight sync.
+        # Snapshotted + reset in _sync_weights (window = sync-to-sync) and emitted
+        # in _train_pump. Empty dict unless enable_vllm_metrics_logger is on.
+        self._pending_generation_logger_metrics: dict[str, Any] = {}
 
         print(
             f"SingleControllerActor: "
@@ -533,9 +540,9 @@ class SingleControllerActor:
 
             # TODO: checkpointing (save_period/top-k metric_name,
             #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
-            #   pretty-print "Training Results" block, print_performance_metrics.
+            # TODO: per-step train_data jsonl dump, histogram log,
+            #   rollout_metrics, seq_logprob_error_metrics, pretty-print
+            #   "Training Results" block, print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
@@ -543,6 +550,23 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
+
+            # Per-worker vLLM generation timeline metrics (inflight batch sizes,
+            # num pending samples) snapshotted in the _sync_weights that just ran
+            # for this step. Gated + logged the same way as the legacy path.
+            vllm_cfg = self._master_config.policy["generation"].get("vllm_cfg", {})
+            if (
+                vllm_cfg.get("enable_vllm_metrics_logger", False)
+                and self._master_config.logger["wandb_enabled"]
+                and self._pending_generation_logger_metrics
+            ):
+                log_generation_metrics_to_wandb(
+                    self._pending_generation_logger_metrics,
+                    self._train_steps,
+                    vllm_cfg["vllm_metrics_logger_interval"],
+                    self._logger,
+                )
+
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -583,11 +607,25 @@ class SingleControllerActor:
         #     flush=True,
         # )
 
+        # Snapshot vLLM generation telemetry accumulated under the current
+        # weights before swapping them, then reset the workers for the next
+        # sync-to-sync window. Mirrors the legacy async path, which snapshots at
+        # prepare_for_refit and clears after refit. run() calls _sync_weights
+        # once before the pumps start, which just establishes a clean baseline.
+        # Safe no-op / {} on backends without vLLM metrics logging
+        # (GenerationInterface defaults).
+        self._pending_generation_logger_metrics = await asyncio.to_thread(
+            self._gen.get_logger_metrics
+        )
+
         t0 = time.monotonic()
         await asyncio.to_thread(self._weight_synchronizer.sync_weights)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
+
+        await asyncio.to_thread(self._gen.clear_logger_metrics)
+
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
 
