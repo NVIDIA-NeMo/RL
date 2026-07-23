@@ -921,6 +921,11 @@ def connect_rollout_engines_from_distributed(
         group_name=group_name,
     )
     ray.get(refs)
+    print(
+        "NRL_SGLANG_REFIT_GROUP_READY "
+        f"world_size={world_size} engines={len(rollout_engines)}",
+        flush=True,
+    )
     return group
 
 

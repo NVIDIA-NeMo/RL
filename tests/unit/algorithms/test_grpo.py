@@ -60,6 +60,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
@@ -99,6 +100,49 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+
+
+def test_sglang_refit_emits_success_marker_and_increments_refit(capsys):
+    policy_generation = SGLangGeneration.__new__(SGLangGeneration)
+
+    with patch(
+        "nemo_rl.algorithms.grpo._refit_policy_generation_impl",
+        return_value={"bytes": 1.0},
+    ):
+        metrics = refit_policy_generation(
+            MagicMock(), policy_generation, colocated_inference=False
+        )
+
+    output = capsys.readouterr().out
+    assert metrics == {"bytes": 1.0}
+    assert "NRL_SGLANG_REFIT_START transfer=broadcast refit=1" in output
+    assert "NRL_SGLANG_REFIT_SUCCESS transfer=broadcast refit=1" in output
+    assert "NRL_SGLANG_REFIT_FAILURE" not in output
+    assert policy_generation._nrl_completed_refits == 1
+
+
+def test_sglang_refit_emits_failure_marker_without_advancing_refit(capsys):
+    policy_generation = SGLangGeneration.__new__(SGLangGeneration)
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo._refit_policy_generation_impl",
+            side_effect=TimeoutError("deadline"),
+        ),
+        pytest.raises(TimeoutError, match="deadline"),
+    ):
+        refit_policy_generation(
+            MagicMock(), policy_generation, colocated_inference=True
+        )
+
+    output = capsys.readouterr().out
+    assert "NRL_SGLANG_REFIT_START transfer=ipc refit=1" in output
+    assert (
+        "NRL_SGLANG_REFIT_FAILURE transfer=ipc refit=1 "
+        "phase=prepare_or_transfer error_type=TimeoutError"
+    ) in output
+    assert "NRL_SGLANG_REFIT_SUCCESS" not in output
+    assert not hasattr(policy_generation, "_nrl_completed_refits")
 
 
 class TestMaskSampleFilter:
