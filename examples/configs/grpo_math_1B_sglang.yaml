@@ -7,6 +7,8 @@ policy:
   generation:
     backend: "sglang"
     use_async_rollouts: false
+    # Clear the inactive block inherited from grpo_math_1B.yaml.
+    vllm_cfg: null
     sglang_cfg:
       model_path: ${policy.model_name}
       dtype: ${policy.precision}
