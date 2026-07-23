@@ -842,10 +842,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             output_is_replicated=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"greedy": greedy},
         )
-        result = BatchedDataDict.from_batches(
-            self.worker_group.get_all_worker_results(futures),
-            pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
-        )
+        assert self.cfg["generation"] is not None, "Generation config is not set"
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        if self.cfg["generation"]["backend"] == "megatron":
+            # Coordinator-based Megatron inference: only the DP=0 submitter returns
+            # tensors; other ranks return empty shells. Take the submitter's result
+            # directly — from_batches would also flatten any ndim>3 output tensors
+            # (e.g. routed_experts [B, S, L, K] for router replay).
+            result: BatchedDataDict[GenerationOutputSpec] = next(
+                wb
+                for wb in worker_batches
+                if wb.get("output_ids") is not None and wb["output_ids"].numel() > 0
+            )
+        else:
+            result = BatchedDataDict.from_batches(
+                worker_batches,
+                pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
+            )
 
         required_keys = [
             "output_ids",

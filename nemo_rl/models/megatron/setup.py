@@ -227,6 +227,7 @@ from nemo_rl.models.megatron.draft.utils import (
 )
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
+    rebuild_global_router_replay_registry,
     router_replay_enabled,
     validate_router_replay_config,
 )
@@ -368,6 +369,8 @@ def validate_and_set_config(
             f"{missing}. Please specify all of {list(_YARN_REQUIRED_FIELDS)} in "
             f"policy.hf_config_overrides.rope_scaling."
         )
+
+    _apply_zero_train_gen_mismatch(config)
 
     megatron_cfg, model_cfg = setup_model_config(
         config,
@@ -830,9 +833,17 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    if "use_mamba_mem_eff_path" in config["megatron_cfg"]:
+        model_cfg.use_mamba_mem_eff_path = config["megatron_cfg"]["use_mamba_mem_eff_path"]
+
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+
+    # Enable the dynamic-inference engine's MoE routing recorder when router replay (R3)
+    # is on, so the Megatron-inference generate path produces routing_indices to replay.
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
+    if router_replay_enabled(config):
+        model_cfg.moe_router_fusion = False
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -955,6 +966,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             and generation_cfg["mcore_generation_config"]["cuda_graph_impl"] != "none"
         ):
             model_cfg.use_te_rng_tracker = True
+
+    if config["megatron_cfg"].get("batch_invariant_mode"):
+        model_cfg.batch_invariant_mode = True
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1257,6 +1271,59 @@ def _create_draft_pre_wrap_hook(
     return draft_pre_wrap_hook
 
 
+def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
+    """Enable global batch-invariant kernel patches (cuBLAS workspace shrink, FA num_splits=1, TE GEMM pin).
+
+    Bridge's initialize_megatron() does not call megatron.training.initialize, so we
+    mirror the legacy ``if args.batch_invariant_mode: enable_batch_invariant_mode()``
+    hook here, calling it before initialize_megatron so the patches are active from the
+    start of the worker lifetime.
+
+    ``zero_train_gen_mismatch`` applies TE cuBLAS workspace shrink via
+    ``patches.apply_te_gemm_cublas_pinned_patch`` instead of Megatron BIK.
+    """
+    if config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
+    if not config["megatron_cfg"].get("batch_invariant_mode"):
+        return
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        enable_batch_invariant_mode,
+    )
+
+    print("Enabling batch invariant mode globally", flush=True)
+    enable_batch_invariant_mode()
+
+
+def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
+    """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
+
+    When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False,
+    attention_backend=flash (FA4 via TE), applies TE cuBLAS workspace shrink via
+    patches.py, and defaults env vars for cuBLAS/MoE/Mamba determinism if not
+    already set by the environment. Router replay and moe_grouped_gemm must be
+    configured explicitly.
+    """
+    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
+    import os
+
+    from nemo_rl.models.policy.workers.patches import apply_te_gemm_cublas_pinned_patch
+
+    mc = config["megatron_cfg"]
+    mc["batch_invariant_mode"] = True
+    mc.setdefault("use_mamba_mem_eff_path", False)
+    mc.setdefault("attention_backend", "flash")
+    apply_te_gemm_cublas_pinned_patch()
+    # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
+    # pick workspace-free (splitK=1, reduction=NONE) algorithms.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
+    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
+    # Force fixed-order MoE unpermute+index_put to eliminate scatter_add nondeterminism.
+    os.environ.setdefault("NRL_FIXED_ORDER_MOE_COMBINE", "1")
+    # Pin Triton autotune config for Mamba SSM/conv kernels across train and gen.
+    os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
+
+
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False
 
 
@@ -1298,6 +1365,8 @@ def setup_model_and_optimizer(
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
+    _apply_zero_train_gen_mismatch(policy_cfg)
+    _enable_batch_invariant_kernels_if_requested(policy_cfg)
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
@@ -1627,6 +1696,7 @@ def setup_reference_model_state(
     megatron_cfg: ConfigContainer,
     pretrained_path: str,
     pre_load_checkpoint_hook: Optional[Callable] = None,
+    policy_model: Optional[Any] = None,
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
     # Create reference checkpoint config
@@ -1756,7 +1826,10 @@ def setup_reference_model_state(
         else:
             print("Reference model not loaded")
     finally:
-        clear_global_router_replay_instances()
+        if policy_model is not None:
+            rebuild_global_router_replay_registry(policy_model)
+        else:
+            clear_global_router_replay_instances()
 
     return reference_state_dict
 

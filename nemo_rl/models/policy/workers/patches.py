@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 from importlib.util import find_spec
+from typing import Callable, Optional
+
+# Original TE cuBLAS workspace sizer, saved by apply_te_gemm_cublas_pinned_patch().
+_TE_CUBLAS_WS_SIZE_FN_ORIG: Optional[Callable[[], int]] = None
+
+# Minimum workspace that satisfies TE's NVFP4 alpha-scratch guard in cublaslt_gemm.cu.
+_TE_CUBLAS_WS_PINNED_BYTES: int = 4
 
 
 def _get_transformer_engine_file(relative_path: str) -> str:
@@ -104,3 +112,71 @@ def apply_transformer_engine_patch():
 
     except Exception as e:
         print(f"Error checking/patching transformer_engine: {e}")
+
+
+def apply_te_gemm_cublas_pinned_patch(
+    target_bytes: int = _TE_CUBLAS_WS_PINNED_BYTES,
+) -> None:
+    """Shrink TE's cuBLAS workspace so cuBLASLt picks workspace-free algorithms.
+
+    Mirrors megatron.core.transformer.custom_layers.batch_invariant_kernels.
+    ``_shrink_te_cublas_workspace_for_invariance``. Intended for zero-KL /
+    ``zero_train_gen_mismatch`` only — call from ``_apply_zero_train_gen_mismatch``
+    in setup.py, not from generic batch-invariant mode.
+    """
+    global _TE_CUBLAS_WS_SIZE_FN_ORIG
+    if _TE_CUBLAS_WS_SIZE_FN_ORIG is not None:
+        return
+    try:
+        te_gemm_mod = importlib.import_module(
+            "transformer_engine.pytorch.cpp_extensions.gemm"
+        )
+    except ImportError:
+        print(
+            "te_gemm_cublas_pinned: transformer_engine.pytorch.cpp_extensions.gemm "
+            "is not importable; skipping workspace shrink."
+        )
+        return
+    if not hasattr(te_gemm_mod, "get_cublas_workspace_size_bytes"):
+        print(
+            "te_gemm_cublas_pinned: TE gemm module has no get_cublas_workspace_size_bytes "
+            "(TE version mismatch?); skipping workspace shrink."
+        )
+        return
+
+    _TE_CUBLAS_WS_SIZE_FN_ORIG = te_gemm_mod.get_cublas_workspace_size_bytes
+    te_gemm_mod.get_cublas_workspace_size_bytes = lambda: int(target_bytes)
+    ws_fn = getattr(te_gemm_mod, "get_cublas_workspace", None)
+    if ws_fn is not None and hasattr(ws_fn, "cache_clear"):
+        try:
+            ws_fn.cache_clear()
+        except Exception:  # pylint: disable=broad-except
+            pass
+    print(
+        f"[zero_train_gen_mismatch] shrunk TE cuBLAS workspace to {target_bytes} bytes "
+        "(te_gemm_cublas_pinned via patches.py). "
+        "Set CUBLASLT_LOG_LEVEL=5 to verify cuBLASLt picks a stable algo across batch sizes."
+    )
+
+
+def restore_te_gemm_cublas_pinned_patch() -> None:
+    """Restore TE's original cuBLAS workspace sizer (for tests)."""
+    global _TE_CUBLAS_WS_SIZE_FN_ORIG
+    if _TE_CUBLAS_WS_SIZE_FN_ORIG is None:
+        return
+    try:
+        te_gemm_mod = importlib.import_module(
+            "transformer_engine.pytorch.cpp_extensions.gemm"
+        )
+    except ImportError:
+        _TE_CUBLAS_WS_SIZE_FN_ORIG = None
+        return
+    if hasattr(te_gemm_mod, "get_cublas_workspace_size_bytes"):
+        te_gemm_mod.get_cublas_workspace_size_bytes = _TE_CUBLAS_WS_SIZE_FN_ORIG
+    ws_fn = getattr(te_gemm_mod, "get_cublas_workspace", None)
+    if ws_fn is not None and hasattr(ws_fn, "cache_clear"):
+        try:
+            ws_fn.cache_clear()
+        except Exception:  # pylint: disable=broad-except
+            pass
+    _TE_CUBLAS_WS_SIZE_FN_ORIG = None
