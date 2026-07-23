@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     SamplerConfig,
+    required_buffer_capacity_for_config,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -60,6 +61,60 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+
+
+def validate_sampler_buffer_capacity(
+    async_config: AsyncRLConfig,
+    *,
+    required_capacity: Optional[int],
+    sampler_name: str,
+) -> None:
+    """Validate that backpressure cannot deadlock the selected sampler."""
+    if (
+        required_capacity is not None
+        and async_config.max_buffered_rollouts < required_capacity
+    ):
+        raise ValueError(
+            f"max_buffered_rollouts ({async_config.max_buffered_rollouts}) is below "
+            f"the {sampler_name} sampler's required capacity "
+            f"({required_capacity}); the rollout pump would deadlock waiting for "
+            f"buffer slots."
+        )
+
+
+def validate_single_controller_config(master_config: MasterConfig) -> None:
+    """Validate cross-section SingleController constraints before setup."""
+    async_config = master_config.async_rl
+    num_prompts_per_step = master_config.grpo["num_prompts_per_step"]
+    if num_prompts_per_step < async_config.min_groups_for_streaming_train:
+        raise ValueError(
+            f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
+            f"must be >= async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train})"
+        )
+
+    rl_step_samples = (
+        num_prompts_per_step * master_config.grpo["num_generations_per_prompt"]
+    )
+    train_global_batch_size = master_config.policy["train_global_batch_size"]
+    if rl_step_samples != train_global_batch_size:
+        raise ValueError(
+            "num_prompts_per_step * num_generations_per_prompt "
+            f"({rl_step_samples}) must equal policy.train_global_batch_size "
+            f"({train_global_batch_size}) so that one RL step maps to exactly one "
+            "optimizer.step. Multi-mini-step inside a single RL step is not "
+            "supported on the SC split path."
+        )
+
+    required_capacity = required_buffer_capacity_for_config(
+        async_config.sampler,
+        num_prompts_per_step,
+    )
+    validate_sampler_buffer_capacity(
+        async_config,
+        required_capacity=required_capacity,
+        sampler_name=async_config.sampler.name,
+    )
 
 
 # ── Internal SingleController configs ────────────────────────────────────

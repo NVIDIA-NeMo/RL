@@ -46,6 +46,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
+    validate_sampler_buffer_capacity,
+    validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
@@ -90,6 +92,8 @@ class SingleControllerActor:
             master_config: SC MasterConfig.
             actor_args: Pre-built actor args from setup_single_controller.
         """
+        validate_single_controller_config(master_config)
+
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
@@ -118,47 +122,16 @@ class SingleControllerActor:
         self._inference_cluster = actor_args.inference_cluster
 
         num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
-        if num_prompts_per_step < self._async_cfg.min_groups_for_streaming_train:
-            raise ValueError(
-                f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
-                f"must be >= async_rl.min_groups_for_streaming_train "
-                f"({self._async_cfg.min_groups_for_streaming_train})"
-            )
-
-        # SC split path does one optimizer.step per RL step.
-        # TODO: support multi-mini-step (legacy train() does gbs-sized
-        # mini-steps with shared prev_logprobs).
-        rl_step_samples = (
-            num_prompts_per_step
-            * self._master_config.grpo["num_generations_per_prompt"]
-        )
-        train_gbs = self._master_config.policy["train_global_batch_size"]
-        if rl_step_samples != train_gbs:
-            raise ValueError(
-                f"num_prompts_per_step * num_generations_per_prompt "
-                f"({rl_step_samples}) must equal policy.train_global_batch_size "
-                f"({train_gbs}) so that one RL step maps to exactly one "
-                f"optimizer.step. Multi-mini-step inside a single RL step is "
-                f"not supported on the SC split path."
-            )
-
         self._sampler = create_sampler(
             self._buffer,
             self._async_cfg.sampler,
         )
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
-        if (
-            required_capacity is not None
-            and self._async_cfg.max_buffered_rollouts < required_capacity
-        ):
-            raise ValueError(
-                f"max_buffered_rollouts "
-                f"({self._async_cfg.max_buffered_rollouts}) is below the "
-                f"{type(self._sampler).__name__}'s required capacity "
-                f"({required_capacity} = num_prompts_per_step "
-                f"{num_prompts_per_step} * (lookahead + 1)); the rollout "
-                f"pump would deadlock waiting for buffer slots."
-            )
+        validate_sampler_buffer_capacity(
+            self._async_cfg,
+            required_capacity=required_capacity,
+            sampler_name=type(self._sampler).__name__,
+        )
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed

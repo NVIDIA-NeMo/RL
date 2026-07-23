@@ -23,6 +23,7 @@ import pytest
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
+    AsyncRLConfig,
     MasterConfig,
     SingleControllerActorArgs,
     setup_single_controller,
@@ -67,6 +68,7 @@ def _make_master_config(
             "val_at_end": False,
         },
         policy={
+            "train_global_batch_size": num_prompts_per_step * 2,
             "max_total_sequence_length": 32,
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
@@ -77,6 +79,10 @@ def _make_master_config(
         checkpointing={"enabled": False},
         loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=num_prompts_per_step,
+            max_buffered_rollouts=num_prompts_per_step * 2,
+        ),
     )
 
 
@@ -192,6 +198,38 @@ class TestSetup:
         mc = _make_master_config(use_multiple_dataloader=True)
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("invalid_case", "match"),
+        [
+            ("min_groups", "must be >="),
+            ("global_batch_size", "must equal policy.train_global_batch_size"),
+            ("buffer_capacity", "required capacity"),
+        ],
+    )
+    def test_invalid_config_fails_before_setup_factories(
+        self,
+        invalid_case: str,
+        match: str,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        if invalid_case == "min_groups":
+            mc.async_rl.min_groups_for_streaming_train = 5
+        elif invalid_case == "global_batch_size":
+            mc.policy["train_global_batch_size"] = 7
+        elif invalid_case == "buffer_capacity":
+            mc.async_rl.max_buffered_rollouts = 7
+        else:  # pragma: no cover
+            raise AssertionError(f"unknown test case {invalid_case}")
+
+        with pytest.raises(ValueError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config(colocated=True)

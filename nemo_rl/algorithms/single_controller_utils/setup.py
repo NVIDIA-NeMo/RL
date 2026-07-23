@@ -33,7 +33,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import _create_advantage_estimator, _should_use_nemo_gym
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    MasterConfig,
+    validate_single_controller_config,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
@@ -257,6 +260,8 @@ def setup_single_controller(
     Returns:
         SingleControllerActorArgs ready to be passed to SingleControllerActor.
     """
+    validate_single_controller_config(master_config)
+
     # short names for config sections
     grpo_config = master_config.grpo
     dp_config = master_config.data_plane
