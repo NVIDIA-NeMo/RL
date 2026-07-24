@@ -440,7 +440,7 @@ class TrtllmGeneration(GenerationInterface):
         ray.get(futures)
 
     def start_gpu_profiling(self) -> None:
-        """grpo profiling protocol: start nsys capture on the GPU workers."""
+        """Grpo profiling protocol: start nsys capture on the GPU workers."""
         if not self.worker_group or not self.worker_group.workers:
             return
         futures = self.worker_group.run_all_workers_single_data(
@@ -450,7 +450,7 @@ class TrtllmGeneration(GenerationInterface):
         ray.get(futures)
 
     def stop_gpu_profiling(self) -> None:
-        """grpo profiling protocol: stop nsys capture on the GPU workers."""
+        """Grpo profiling protocol: stop nsys capture on the GPU workers."""
         if not self.worker_group or not self.worker_group.workers:
             return
         futures = self.worker_group.run_all_workers_single_data(
