@@ -11,15 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PR #2508 review-fix verifications for ``TokenAligner`` and friends."""
+"""Unit tests for the offset-based cross-tokenizer ``TokenAligner``.
+
+The aligner pairs student and teacher tokens by the character spans they cover
+in the shared source text. These tests exercise the single-sample kernel
+(:func:`align_by_offsets_cluster`) and the batched :meth:`TokenAligner.align`
+entry point with hand-built offsets, plus the invariants downstream loss code
+relies on (chunk-id sentinels for padding, the 1-1 exact partition).
+"""
 
 from __future__ import annotations
 
-import inspect
+from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
-from typing import List
 
-import pytest
 import torch
 
 from nemo_rl.algorithms.x_token import token_aligner as ta
@@ -28,173 +33,243 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     valid_chunk_mask,
 )
 from nemo_rl.algorithms.x_token.token_aligner import (
+    AlignmentPair,
     TokenAligner,
-    _canonicalize_sequence,
+    align_by_offsets_cluster,
 )
 
 # ---------------------------------------------------------------------------
-# Test scaffolding — barebones aligner without real tokenizers / projection.
+# Test scaffolding — barebones tokenizer + aligner, no real HF / projection.
 # ---------------------------------------------------------------------------
 
 
 class _FakeTokenizer:
-    """Map id -> token string via a precomputed dict; minimal HF stand-in."""
+    """Minimal HF stand-in: id -> token string plus special-token role attrs.
 
-    def __init__(self, id_to_tok: dict[int, str]):
+    The offset kernel only needs ``convert_ids_to_tokens`` (for the returned
+    token strings) and the ``*_token_id`` / ``all_special_ids`` attributes
+    used to classify ``(0, 0)``-offset positions by role.
+    """
+
+    def __init__(
+        self,
+        id_to_tok: dict[int, str],
+        *,
+        bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
+        pad_token_id: int | None = 0,
+    ):
         self._id_to_tok = id_to_tok
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.unk_token_id = None
+        self.sep_token_id = None
+        self.cls_token_id = None
+        self.mask_token_id = None
+        self.all_special_ids = [
+            i for i in (bos_token_id, eos_token_id, pad_token_id) if i is not None
+        ]
 
     def convert_ids_to_tokens(self, ids):
         return [self._id_to_tok.get(int(i), f"<unk{i}>") for i in ids]
 
 
 def _make_aligner(
-    student_vocab: dict[int, str], teacher_vocab: dict[int, str]
+    student_vocab: dict[int, str],
+    teacher_vocab: dict[int, str],
+    *,
+    bos_token_id: int | None = None,
+    eos_token_id: int | None = None,
+    pad_token_id: int | None = 0,
 ) -> TokenAligner:
-    """Bypass projection loading and produce a TokenAligner suitable for align()."""
+    """Bypass projection loading and produce a TokenAligner for align()."""
     aligner = TokenAligner.__new__(TokenAligner)
-    aligner.student_tokenizer = _FakeTokenizer(student_vocab)
-    aligner.teacher_tokenizer = _FakeTokenizer(teacher_vocab)
-    aligner.max_combination_len = 4
+    aligner.student_tokenizer = _FakeTokenizer(
+        student_vocab,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    )
+    aligner.teacher_tokenizer = _FakeTokenizer(
+        teacher_vocab,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    )
     return aligner
 
 
 # ---------------------------------------------------------------------------
-# T1 — TokenAligner-coupled helpers should live on the class (or be public).
+# AlignmentPair dataclass shape (call sites unpack these fields by name).
 # ---------------------------------------------------------------------------
 
 
-def test_T1_align_dp_is_addressable_from_token_aligner_namespace():
-    """Class B. The DP kernel and canonicalize-sequence helpers should be
-    reachable from the public alignment surface — either as
-    ``TokenAligner`` methods or as documented module-level helpers — not
-    accessed by name-mangling from outside callers.
-    """
-    # The plan acknowledges these may remain module-level. The test asserts
-    # the contract that a caller can refer to them via the package without
-    # poking at private leading-underscore module attributes — i.e., they
-    # must show up either as TokenAligner attributes OR exported from the
-    # package's __init__. This catches a refactor that hides them entirely.
-    has_on_class = hasattr(TokenAligner, "_align_dp") or hasattr(
-        TokenAligner, "align_dp"
-    )
-    has_at_module = hasattr(ta, "_align_dp") or hasattr(ta, "align_dp")
-    assert has_on_class or has_at_module, (
-        "Neither TokenAligner nor the token_aligner module exposes the "
-        "DP kernel; the helper-scope refactor has hidden it."
-    )
-
-
-# ---------------------------------------------------------------------------
-# T2 — canonicalization should preserve sequence length OR the consumer must
-# track the length change. The chunk_id math indexes into the ORIGINAL token
-# axis, so a shrinking canonicalization silently misaligns spans.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "seq",
-    [
-        ["Hello", "Ġworld", "!"],
-        ["abc", "def", "ghi", "jkl"],
-        ["The", "Ġquick", "Ġbrown", "Ġfox"],
-        ["<bos>", "Hello"],
-        ["a", "b", "c"],
-    ],
-    ids=["short", "ascii", "spaced", "with-bos", "single-chars"],
+EXPECTED_ALIGNMENT_PAIR_FIELDS = (
+    "s_tokens",
+    "t_tokens",
+    "s_start",
+    "s_end",
+    "t_start",
+    "t_end",
+    "is_correct",
 )
-def test_T2_canonicalize_sequence_preserves_length_for_clean_inputs(
-    seq: List[str],
-):
-    """Class A. For inputs that don't contain multi-token mojibake patterns,
-    canonicalization MUST preserve length AND emit an identity index map
-    so the alignment spans (computed over canonical tokens) trivially
-    round-trip back to the original token axis.
-    """
-    canon, ranges = _canonicalize_sequence(seq)
-    assert len(canon) == len(seq), (
-        f"_canonicalize_sequence shrunk a clean input: "
-        f"{len(seq)} -> {len(canon)} (seq={seq}, canon={canon})"
-    )
-    assert ranges == [(i, i + 1) for i in range(len(seq))], (
-        f"canon_to_orig map is not the identity for a clean input: {ranges}"
-    )
 
 
-def test_T2_canonicalization_artifact_merge_emits_remappable_ranges():
-    """Class A. The multi-token-artifact and consecutive-byte merges
-    SHRINK the canonical sequence. The fix is to expose a parallel
-    ``canon_to_orig`` map so DP-output indices over the canonical tokens
-    can be remapped to the original token axis before chunk-id writes.
-    This test pins the shrink-and-remap shape.
-    """
-    # The first entry in _MULTI_TOKEN_ARTIFACT_FIXES collapses two tokens
-    # into one: ["ĠâĪ", "ĳ"] -> ["Ġ∑"].
-    seq = ["ĠâĪ", "ĳ"]
-    canon, ranges = _canonicalize_sequence(seq)
-    assert len(canon) == 1, f"expected merge to length 1, got {canon!r}"
-    assert ranges == [(0, 2)], (
-        f"merged canonical token should cover the original [0, 2) range; got {ranges}"
-    )
+def test_alignment_pair_dataclass_has_expected_fields():
+    """``AlignmentPair`` pins the 7-field record ``_pairs_to_batch`` reads."""
+    assert is_dataclass(AlignmentPair)
+    field_names = tuple(f.name for f in dc_fields(AlignmentPair))
+    assert set(field_names) == set(EXPECTED_ALIGNMENT_PAIR_FIELDS), field_names
 
 
 # ---------------------------------------------------------------------------
-# T3 — padding tokens must NOT receive a valid chunk_id.
+# Single-sample offset kernel.
 # ---------------------------------------------------------------------------
 
 
-def test_T3_padding_tokens_receive_sentinel_chunk_id():
-    """Class A (RayenTian review). Tail-padded positions must keep
-    ``chunk_id == -1`` once the attention mask is supplied.
+def test_kernel_one_to_one_identical_tokenization():
+    """Same tokenization on both sides → one 1-1 content pair per token."""
+    tok = _FakeTokenizer({1: "Hello", 2: "Ġworld"})
+    ids = [1, 2]
+    offs = [(0, 5), (5, 11)]
+    pairs = align_by_offsets_cluster(ids, offs, tok, ids, offs, tok)
 
-    ``align`` runs the DP over the fully padded id tensors, so the pad run
-    on each side aligns against itself (``<pad>`` canonicalizes to ``""`` on
-    both sides) and inherits a chunk index — which then survives
-    :func:`valid_chunk_mask` and leaks into the loss. The fix threads the
-    attention masks into ``align`` and resets ``chunk_id`` /
-    ``exact_partition_mask`` at padded positions. Pad-token-id filtering is
-    *not* sufficient: the collator falls back to ``pad_token = eos_token``,
-    so a real end-of-doc ``eos`` (mid-sequence under packing) would be
-    dropped too; only the attention mask separates pad-eos from real-eos.
+    assert len(pairs) == 2
+    for s_toks, t_toks, s0, s1, t0, t1, ok in pairs:
+        assert len(s_toks) == 1 and len(t_toks) == 1
+        assert (s1 - s0) == 1 and (t1 - t0) == 1
+        assert ok is True
+
+
+def test_kernel_many_student_tokens_to_one_teacher_token():
+    """Student splits a word the teacher keeps whole → one N-to-1 group whose
+    char spans reconcile (student ``[0,2)+[2,5)`` covers teacher ``[0,5)``).
     """
-    student_vocab = {1: "Hello", 2: "Ġworld", 3: "!", 0: "<pad>"}
-    teacher_vocab = {1: "Hello", 2: "Ġworld", 3: "!", 0: "<pad>"}
-    aligner = _make_aligner(student_vocab, teacher_vocab)
+    s_tok = _FakeTokenizer({1: "He", 2: "llo"})
+    t_tok = _FakeTokenizer({3: "Hello"})
+    pairs = align_by_offsets_cluster(
+        [1, 2], [(0, 2), (2, 5)], s_tok, [3], [(0, 5)], t_tok
+    )
+
+    assert len(pairs) == 1
+    s_toks, t_toks, s0, s1, t0, t1, ok = pairs[0]
+    assert s_toks == ["He", "llo"] and t_toks == ["Hello"]
+    assert (s0, s1, t0, t1) == (0, 2, 0, 1)
+    assert ok is True
+
+
+def test_kernel_coverage_divergence_emits_orphans():
+    """When char coverage can't reconcile, each side is emitted as an orphan
+    group (empty on the other side, ``is_correct=False``).
+    """
+    s_tok = _FakeTokenizer({1: "ab"})
+    t_tok = _FakeTokenizer({2: "abc"})
+    pairs = align_by_offsets_cluster([1], [(0, 2)], s_tok, [2], [(0, 3)], t_tok)
+
+    assert len(pairs) == 2
+    sidedness = {(bool(s), bool(t)) for s, t, *_ in pairs}
+    assert sidedness == {(True, False), (False, True)}
+    assert all(ok is False for *_, ok in pairs)
+
+
+def test_kernel_leading_specials_paired_by_role():
+    """Leading BOS tokens with different surface forms pair 1-1 by role."""
+    s_tok = _FakeTokenizer({7: "<bos>", 1: "Hi"}, bos_token_id=7)
+    t_tok = _FakeTokenizer({8: "<s>", 1: "Hi"}, bos_token_id=8)
+    pairs = align_by_offsets_cluster(
+        [7, 1], [(0, 0), (0, 2)], s_tok, [8, 1], [(0, 0), (0, 2)], t_tok
+    )
+
+    assert pairs[0][0] == ["<bos>"] and pairs[0][1] == ["<s>"]
+    assert pairs[1][0] == ["Hi"] and pairs[1][1] == ["Hi"]
+
+
+# ---------------------------------------------------------------------------
+# Batched align(): shapes, padding sentinels, exact partition.
+# ---------------------------------------------------------------------------
+
+
+def test_align_end_to_end_shapes_are_consistent():
+    """``align`` emits a fully-shaped :class:`AlignmentBatch` for trivial input."""
+    vocab = {0: "<pad>", 1: "Hello", 2: "Ġworld", 3: "!"}
+    aligner = _make_aligner(vocab, vocab, pad_token_id=0)
+    student_ids = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+    teacher_ids = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+    offsets = torch.tensor([[[0, 5], [5, 11], [11, 12], [0, 0]]], dtype=torch.long)
+
+    batch = aligner.align(
+        student_ids,
+        teacher_ids,
+        student_offsets=offsets,
+        teacher_offsets=offsets.clone(),
+    )
+    b, t_s = student_ids.shape
+    _, t_t = teacher_ids.shape
+
+    assert batch.student_chunk_id.shape == (b, t_s)
+    assert batch.teacher_chunk_id.shape == (b, t_t)
+    assert batch.pair_valid.dtype == torch.bool
+    assert batch.num_chunks.shape == (b,)
+    assert batch.num_chunks[0] <= batch.pair_valid.shape[1]
+
+
+def test_align_exact_partition_marks_one_to_one_correct_pairs():
+    """Identical 1-1 tokenization → every content position sits in the
+    gold-loss exact partition on both sides.
+    """
+    vocab = {1: "Hello", 2: "Ġworld", 3: "!"}
+    aligner = _make_aligner(vocab, vocab, pad_token_id=0)
+    ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    offsets = torch.tensor([[[0, 5], [5, 11], [11, 12]]], dtype=torch.long)
+
+    batch = aligner.align(
+        ids, ids.clone(), student_offsets=offsets, teacher_offsets=offsets.clone()
+    )
+
+    assert batch.student_exact_partition_mask[0].tolist() == [True, True, True]
+    assert batch.teacher_exact_partition_mask[0].tolist() == [True, True, True]
+    assert (batch.student_chunk_id[0] != -1).all()
+    assert (batch.teacher_chunk_id[0] != -1).all()
+
+
+def test_align_padding_positions_receive_sentinel_chunk_id():
+    """Tail-padded positions must keep ``chunk_id == -1`` once the attention
+    mask is supplied; real content is untouched, and no surviving chunk draws
+    only from padding.
+    """
+    vocab = {0: "<pad>", 1: "Hello", 2: "Ġworld", 3: "!"}
+    aligner = _make_aligner(vocab, vocab, pad_token_id=0)
 
     # Sample 0: 3 content + 3 pad. Sample 1: 6 content (no padding).
     student_ids = torch.tensor(
         [[1, 2, 3, 0, 0, 0], [1, 2, 3, 2, 3, 1]], dtype=torch.long
     )
     teacher_ids = student_ids.clone()
+    content_offsets = [[0, 5], [5, 11], [11, 12], [12, 18], [18, 19], [19, 24]]
+    pad_offsets = [[0, 5], [5, 11], [11, 12], [0, 0], [0, 0], [0, 0]]
+    offsets = torch.tensor([pad_offsets, content_offsets], dtype=torch.long)
     attention_mask = torch.tensor(
         [[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.long
-    )
-
-    # Without masks the leak is present: padding gets a real chunk_id. This
-    # asserts the fixture actually exercises the bug being fixed.
-    unmasked = aligner.align(student_ids, teacher_ids)
-    assert (unmasked.student_chunk_id[0, -3:] != -1).any(), (
-        "expected the unmasked path to assign padded positions a chunk_id; "
-        "if this no longer holds the fixture no longer exercises the leak"
     )
 
     masked = aligner.align(
         student_ids,
         teacher_ids,
+        student_offsets=offsets,
+        teacher_offsets=offsets.clone(),
         student_attention_mask=attention_mask,
         teacher_attention_mask=attention_mask,
     )
+
     # Pad positions of sample 0 are not-in-any-chunk on both sides.
-    assert (masked.student_chunk_id[0, -3:] == -1).all(), masked.student_chunk_id[
-        0
-    ].tolist()
-    assert (masked.teacher_chunk_id[0, -3:] == -1).all(), masked.teacher_chunk_id[
-        0
-    ].tolist()
+    assert (masked.student_chunk_id[0, -3:] == -1).all(), masked.student_chunk_id[0]
+    assert (masked.teacher_chunk_id[0, -3:] == -1).all(), masked.teacher_chunk_id[0]
     assert not masked.student_exact_partition_mask[0, -3:].any()
-    # Real content is untouched: sample 0's first 3 positions keep their
-    # alignment, and the fully-real sample 1 is unchanged.
+    # Real content is untouched: sample 0's first 3 positions keep a chunk,
+    # and the fully-real sample 1 is all-chunked.
     assert (masked.student_chunk_id[0, :3] != -1).all()
-    assert torch.equal(masked.student_chunk_id[1], unmasked.student_chunk_id[1])
+    assert (masked.student_chunk_id[1] != -1).all()
 
     # Downstream gate: no surviving chunk may draw only from padding.
     max_chunks = int(masked.pair_valid.shape[1])
@@ -207,195 +282,123 @@ def test_T3_padding_tokens_receive_sentinel_chunk_id():
     assert bool((t_sizes[chunk_mask] > 0).all())
 
 
-# ---------------------------------------------------------------------------
-# T4 — ``_align_with_anchors`` should accept explicit kwargs.
-# ---------------------------------------------------------------------------
-
-
-def test_T4_align_with_anchors_signature_is_explicit():
-    """Class B. After the fix, ``_align_with_anchors`` must not accept
-    ``**kwargs`` — its scoring options should be enumerated so the call
-    surface is grep-able and silent typos at call sites raise.
+def test_module_exposes_alignment_kernel():
+    """The offset kernel is reachable from the package namespace (callers use
+    it directly instead of poking at name-mangled internals).
     """
-    sig = inspect.signature(TokenAligner._align_with_anchors)
-    var_keyword_params = [
-        p for p in sig.parameters.values() if p.kind is inspect.Parameter.VAR_KEYWORD
-    ]
-    assert not var_keyword_params, (
-        f"_align_with_anchors still accepts **kwargs "
-        f"(params: {[p.name for p in var_keyword_params]}). The reviewer "
-        "asked for explicit parameters."
-    )
-
-
-def test_T4_align_dp_signature_is_explicit():
-    """Class B. Same invariant on ``_align_dp`` — both functions are paired
-    in the kwargs forwarding chain.
-    """
-    sig = inspect.signature(TokenAligner._align_dp)
-    var_keyword_params = [
-        p for p in sig.parameters.values() if p.kind is inspect.Parameter.VAR_KEYWORD
-    ]
-    assert not var_keyword_params, (
-        f"_align_dp still accepts **kwargs "
-        f"(params: {[p.name for p in var_keyword_params]})."
-    )
+    assert hasattr(ta, "align_by_offsets_cluster")
 
 
 # ---------------------------------------------------------------------------
-# T5 — ``AlignmentPair`` dataclass for tuple-unpack call sites.
+# Chat path: align_one_offset_per_asst (per-assistant-message alignment).
 # ---------------------------------------------------------------------------
 
 
-# Field name set the pair tuple is unpacked into at token_aligner.py:302 — the
-# fix should introduce a dataclass with these exact field names.
-EXPECTED_ALIGNMENT_PAIR_FIELDS = (
-    "s_tokens",
-    "t_tokens",
-    "s_start",
-    "s_end",
-    "t_start",
-    "t_end",
-    "is_correct",
-)
-
-
-def test_T5_alignment_pair_dataclass_exists_with_expected_fields():
-    """Class B. The tuple ``(s_tokens, t_tokens, s_start, s_end, t_start,
-    t_end, is_correct)`` returned by ``_align_single`` is now an
-    :class:`AlignmentPair` dataclass so call sites stop unpacking
-    positionally. This test pins the dataclass's field set.
-    """
-    pair_cls = getattr(ta, "AlignmentPair", None)
-    assert pair_cls is not None, (
-        "AlignmentPair dataclass missing from nemo_rl.algorithms.x_token."
-        "token_aligner; the reviewer requested a named record to replace "
-        "the 7-tuple at the _pairs_to_batch unpack site."
-    )
-    assert is_dataclass(pair_cls)
-    from dataclasses import fields as dc_fields
-
-    field_names = tuple(f.name for f in dc_fields(pair_cls))
-    assert set(field_names) == set(EXPECTED_ALIGNMENT_PAIR_FIELDS), (
-        f"AlignmentPair fields drift from the tuple shape: "
-        f"got {field_names}, expected {EXPECTED_ALIGNMENT_PAIR_FIELDS}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# T6 — alignment spans must index the ORIGINAL token axis even when
-# canonicalization shrinks the sequence (multi-token artifact merge AND
-# consecutive-byte merge).
-# ---------------------------------------------------------------------------
-
-
-def test_T6_artifact_merge_remaps_spans_to_original_axis():
-    """Class A. Student tokens ``["Hello", "ĠâĪ", "ĳ", "."]`` canonicalize
-    to ``["Hello", "Ġ∑", "."]`` via the first ``_MULTI_TOKEN_ARTIFACT_FIXES``
-    entry. After ``align``, the two merged original-axis positions (1, 2)
-    must share a chunk_id, and that chunk_id must match the teacher-side
-    position of ``Ġ∑``. Without the canonical→original remap, DP indices
-    would land in canonical coordinates and the chunk_id at original
-    position 3 would be ``-1`` (and position 2 would carry the ``.``
-    chunk_id from canonical position 2).
-    """
-    student_vocab = {1: "Hello", 2: "ĠâĪ", 3: "ĳ", 4: "."}
-    teacher_vocab = {1: "Hello", 2: "Ġ∑", 3: "."}
+def _chat_aligner(student_vocab, teacher_vocab):
     aligner = _make_aligner(student_vocab, teacher_vocab)
+    aligner.alignment_method = "offset_cluster_decode_fix"
+    return aligner
 
-    student_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)  # T_s = 4
-    teacher_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)  # T_t = 3
 
-    batch = aligner.align(student_ids, teacher_ids)
-
-    assert batch.student_chunk_id.shape == (1, 4)
-    assert batch.teacher_chunk_id.shape == (1, 3)
-
-    student_ids_row = batch.student_chunk_id[0].tolist()
-    teacher_ids_row = batch.teacher_chunk_id[0].tolist()
-
-    # Every original position belongs to some chunk.
-    assert all(cid != -1 for cid in student_ids_row), student_ids_row
-    assert all(cid != -1 for cid in teacher_ids_row), teacher_ids_row
-
-    # Original-axis positions 1 and 2 (the merged pair) share a chunk_id,
-    # and it matches the teacher-side ``Ġ∑`` chunk.
-    assert student_ids_row[1] == student_ids_row[2], student_ids_row
-    assert student_ids_row[1] == teacher_ids_row[1], (
-        student_ids_row,
-        teacher_ids_row,
+def test_per_asst_whole_message_plus_eot():
+    """One assistant turn: content tokens align (per-message rebased) and the
+    end-of-turn marker gets a synthetic 1-1 pair. Positions are full-sequence.
+    """
+    aligner = _chat_aligner(
+        {1: "<s>", 10: "Hello", 11: "Ġworld", 99: "<eot>"},
+        {2: "<s>", 20: "Hello", 21: "Ġworld", 98: "<eot>"},
     )
-    # The flanking "Hello" / "." pairs are intact and match across sides.
-    assert student_ids_row[0] == teacher_ids_row[0]
-    assert student_ids_row[3] == teacher_ids_row[2]
+    # scaffold [0,10) / Hello [10,15) / world [15,21) / eot [21,28)
+    s_ids = [1, 10, 11, 99]
+    s_off = [(0, 10), (10, 15), (15, 21), (21, 28)]
+    # teacher renders in its own coordinates
+    t_ids = [2, 20, 21, 98]
+    t_off = [(0, 8), (8, 13), (13, 19), (19, 25)]
 
-    # Chunk-id values stay inside the per-sample chunk count.
-    n = int(batch.num_chunks[0])
-    assert all(0 <= cid < n for cid in student_ids_row + teacher_ids_row)
-
-    # The merged pair is correct-by-canonical-text but is NOT a single-
-    # original-token-to-single-original-token pair, so the gold-loss
-    # exact-partition mask must be False at original positions 1, 2 on
-    # the student side (and at teacher position 1). The 1-1 flanks stay
-    # in the partition.
-    s_part = batch.student_exact_partition_mask[0].tolist()
-    t_part = batch.teacher_exact_partition_mask[0].tolist()
-    assert s_part == [True, False, False, True], s_part
-    assert t_part == [True, False, True], t_part
+    pairs = aligner.align_one_offset_per_asst(
+        s_ids, s_off, [(10, 21)], t_ids, t_off, [(8, 19)]
+    )
+    positions = [(p[2], p[3], p[4], p[5]) for p in pairs]
+    assert positions == [(1, 2, 1, 2), (2, 3, 2, 3), (3, 4, 3, 4)], positions
+    assert pairs[-1][6] is True  # EOT pair is correct
 
 
-def test_T6_byte_fallback_merge_remaps_spans_to_original_axis():
-    """Class A. Latin-1 byte tokens ``["Ã", "©"]`` decode to ``"é"`` via
-    ``_try_merge_byte_buffer`` (ord 233 > 127, 2-byte UTF-8). The same
-    shared-chunk_id invariant must hold for this code path.
+def test_per_asst_drop_first_content_pair():
+    """``drop_first_content_pair`` removes the opener content pair, keeping the
+    rest of the message (and the EOT) intact.
     """
-    student_vocab = {1: "Ã", 2: "©", 3: "中"}
-    teacher_vocab = {1: "é", 2: "中"}
-    aligner = _make_aligner(student_vocab, teacher_vocab)
+    aligner = _chat_aligner(
+        {1: "<s>", 10: "Hello", 11: "Ġworld", 99: "<eot>"},
+        {2: "<s>", 20: "Hello", 21: "Ġworld", 98: "<eot>"},
+    )
+    s_ids = [1, 10, 11, 99]
+    s_off = [(0, 10), (10, 15), (15, 21), (21, 28)]
+    t_ids = [2, 20, 21, 98]
+    t_off = [(0, 8), (8, 13), (13, 19), (19, 25)]
 
-    student_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)  # T_s = 3
-    teacher_ids = torch.tensor([[1, 2]], dtype=torch.long)  # T_t = 2
-
-    batch = aligner.align(student_ids, teacher_ids)
-
-    assert batch.student_chunk_id.shape == (1, 3)
-    assert batch.teacher_chunk_id.shape == (1, 2)
-
-    s_row = batch.student_chunk_id[0].tolist()
-    t_row = batch.teacher_chunk_id[0].tolist()
-
-    assert all(cid != -1 for cid in s_row), s_row
-    assert all(cid != -1 for cid in t_row), t_row
-
-    # Original positions 0 and 1 (the two byte tokens) share a chunk_id
-    # that matches the teacher ``é`` chunk.
-    assert s_row[0] == s_row[1], s_row
-    assert s_row[0] == t_row[0], (s_row, t_row)
-    # The trailing ``中`` aligns 1-1.
-    assert s_row[2] == t_row[1]
+    pairs = aligner.align_one_offset_per_asst(
+        s_ids,
+        s_off,
+        [(10, 21)],
+        t_ids,
+        t_off,
+        [(8, 19)],
+        drop_first_content_pair=True,
+    )
+    positions = [(p[2], p[3], p[4], p[5]) for p in pairs]
+    # first content pair (1,2,1,2) dropped; second content + EOT remain
+    assert positions == [(2, 3, 2, 3), (3, 4, 3, 4)], positions
 
 
-# ---------------------------------------------------------------------------
-# Bonus regression: ``align()`` produces well-shaped tensors end-to-end.
-# Guards against shape regressions from any of the fixes above.
-# ---------------------------------------------------------------------------
-
-
-def test_align_end_to_end_shapes_are_consistent():
-    """Regression: ``align`` must always emit a fully-shaped
-    :class:`AlignmentBatch` even for trivial inputs.
+def test_per_asst_native_regions_and_included_regions():
+    """Native reasoning/answer regions align independently; ``included_regions``
+    restricts KD without touching the others.
     """
-    vocab = {0: "<pad>", 1: "Hello", 2: "Ġworld", 3: "!", 4: "Ġfoo"}
-    aligner = _make_aligner(vocab, vocab)
-    student_ids = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
-    teacher_ids = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+    aligner = _chat_aligner(
+        {1: "<s>", 50: "R", 60: "A", 99: "<eot>"},
+        {2: "<s>", 51: "R", 61: "A", 98: "<eot>"},
+    )
+    # scaffold [0,3) / R [3,4) / A [9,10) / eot [10,17)
+    s_ids = [1, 50, 60, 99]
+    s_off = [(0, 3), (3, 4), (9, 10), (10, 17)]
+    t_ids = [2, 51, 61, 98]
+    t_off = [(0, 2), (2, 3), (7, 8), (8, 15)]
+    s_regions = [{"reasoning": (3, 4), "answer": (9, 10)}]
+    t_regions = [{"reasoning": (2, 3), "answer": (7, 8)}]
 
-    batch = aligner.align(student_ids, teacher_ids)
-    B, T_s = student_ids.shape
-    _, T_t = teacher_ids.shape
+    all_pairs = aligner.align_one_offset_per_asst(
+        s_ids,
+        s_off,
+        [(3, 10)],
+        t_ids,
+        t_off,
+        [(2, 8)],
+        student_alignment_regions=s_regions,
+        teacher_alignment_regions=t_regions,
+        student_eot_indices=[3],
+        teacher_eot_indices=[3],
+    )
+    assert [(p[2], p[3], p[4], p[5]) for p in all_pairs] == [
+        (1, 2, 1, 2),  # reasoning
+        (2, 3, 2, 3),  # answer
+        (3, 4, 3, 4),  # eot
+    ]
 
-    assert batch.student_chunk_id.shape == (B, T_s)
-    assert batch.teacher_chunk_id.shape == (B, T_t)
-    assert batch.pair_valid.dtype == torch.bool
-    assert batch.num_chunks.shape == (B,)
-    assert batch.num_chunks[0] <= batch.pair_valid.shape[1]
+    # Restrict KD to answer + eot: reasoning pair drops out.
+    subset = aligner.align_one_offset_per_asst(
+        s_ids,
+        s_off,
+        [(3, 10)],
+        t_ids,
+        t_off,
+        [(2, 8)],
+        student_alignment_regions=s_regions,
+        teacher_alignment_regions=t_regions,
+        student_eot_indices=[3],
+        teacher_eot_indices=[3],
+        included_regions=["answer", "eot"],
+    )
+    assert [(p[2], p[3], p[4], p[5]) for p in subset] == [
+        (2, 3, 2, 3),  # answer
+        (3, 4, 3, 4),  # eot
+    ]
