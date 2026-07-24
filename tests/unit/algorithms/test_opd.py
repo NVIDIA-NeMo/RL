@@ -393,6 +393,131 @@ def test_teacher_seq_pad_multiple_non_packed_incompatible_divisor_raises():
 
 
 # ---------------------------------------------------------------------------
+# Teacher placement-group reservation
+# ---------------------------------------------------------------------------
+
+
+def _teacher_setup_config():
+    """Return a minimal config with two distinct non-colocated teachers."""
+    return {
+        "on_policy_distillation": {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "math": "/checkpoints/math",
+                "code": "/checkpoints/code",
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "num_nodes": 2,
+                    "gpus_per_node": 4,
+                },
+            },
+        }
+    }
+
+
+def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
+    """Every teacher placement group is claimed before planning the next one."""
+    from nemo_rl.algorithms import opd
+
+    events = []
+
+    class FakeRayVirtualCluster:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.kwargs = kwargs
+            events.append(("create", self.name))
+
+        def get_placement_groups(self):
+            events.append(("reserve", self.name))
+            return [object()]
+
+        def shutdown(self):
+            events.append(("shutdown", self.name))
+
+    def fake_prepare_segment_topology(segment_size, num_nodes, *, topology, role):
+        assert segment_size == num_nodes == 2
+        events.append(("prepare", role, tuple(topology)))
+        selected_ids = list(topology)[:num_nodes]
+        remaining_ids = [node_id for node_id in topology if node_id not in selected_ids]
+        constraints = [{"nvlink_domain_0": 0.001}] * num_nodes
+        return constraints, remaining_ids, topology
+
+    monkeypatch.setattr(opd, "RayVirtualCluster", FakeRayVirtualCluster)
+    monkeypatch.setattr(opd, "prepare_segment_topology", fake_prepare_segment_topology)
+
+    topology = {f"node_{index}": ("nvlink_domain_0", index) for index in range(4)}
+    clusters = opd.reserve_teacher_clusters(
+        _teacher_setup_config(),
+        segment_size=16,
+        teacher_segment_topology=topology,
+    )
+
+    assert list(clusters) == ["math", "code"]
+    assert events == [
+        (
+            "prepare",
+            "teacher:math",
+            ("node_0", "node_1", "node_2", "node_3"),
+        ),
+        ("create", "teacher_math"),
+        ("reserve", "teacher_math"),
+        ("prepare", "teacher:code", ("node_2", "node_3")),
+        ("create", "teacher_code"),
+        ("reserve", "teacher_code"),
+    ]
+    assert clusters["math"].kwargs["segment_size"] == 2
+    assert clusters["code"].kwargs["node_resource_constraints"] == [
+        {"nvlink_domain_0": 0.001},
+        {"nvlink_domain_0": 0.001},
+    ]
+
+
+def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
+    """Deferred worker initialization uses the already claimed clusters."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy import teacher_worker_group
+
+    math_cluster = object()
+    code_cluster = object()
+    reserved_clusters = {"math": math_cluster, "code": code_cluster}
+    initialized_clusters = []
+
+    class FakeTeacherWorkerGroup:
+        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+            initialized_clusters.append((teacher_cfg.alias, cluster))
+            self.worker_group = SimpleNamespace(workers=[])
+            self.use_sequence_packing = True
+            self.sequence_length_pad_multiple = 1
+
+    def fail_if_reservation_repeats(*args, **kwargs):
+        raise AssertionError("teacher placement groups must not be reserved twice")
+
+    monkeypatch.setattr(
+        teacher_worker_group, "TeacherWorkerGroup", FakeTeacherWorkerGroup
+    )
+    monkeypatch.setattr(opd, "reserve_teacher_clusters", fail_if_reservation_repeats)
+    monkeypatch.setattr(opd.ray, "get", lambda refs, timeout: [])
+
+    worker_groups, alias_to_group_alias = opd.create_teacher_worker_groups(
+        _teacher_setup_config(),
+        {"make_sequence_length_divisible_by": 8},
+        tokenizer=object(),
+        teacher_clusters=reserved_clusters,
+    )
+
+    assert initialized_clusters == [
+        ("math", math_cluster),
+        ("code", code_cluster),
+    ]
+    assert list(worker_groups) == ["math", "code"]
+    assert alias_to_group_alias == {"math": "math", "code": "code"}
+
+
+# ---------------------------------------------------------------------------
 # Teacher-logprob seq-length padding + the "opd" advantage-estimator branch
 # ---------------------------------------------------------------------------
 

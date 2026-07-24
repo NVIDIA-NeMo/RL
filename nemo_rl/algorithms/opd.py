@@ -26,6 +26,11 @@ from typing import Any, Optional
 import ray
 from pydantic import BaseModel, Field
 
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    prepare_segment_topology,
+)
+
 # ---------------------------------------------------------------------------
 # Config schemas
 # ---------------------------------------------------------------------------
@@ -227,40 +232,9 @@ def teacher_seq_pad_multiple(
     return policy_make_seq_div_by
 
 
-def create_teacher_worker_groups(
-    master_config: Any,
-    policy_config: dict[str, Any],
-    tokenizer: Any,
-    *,
-    segment_size: Optional[int] = None,
-    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """Create TeacherWorkerGroup instances for non-colocated teachers.
-
-    Args:
-        segment_size: NVLink-domain segment size from the cluster config; when
-            set, each teacher is placed topology-aware so its TP/PP/CP stays
-            within an NVLink domain.
-        teacher_segment_topology: Topology of the nodes left after policy /
-            inference placement, used to pin teacher nodes (see
-            ``prepare_segment_topology``).
-
-    Returns (teacher_worker_groups, alias_to_group_alias).
-    """
-    from nemo_rl.distributed.virtual_cluster import (
-        RayVirtualCluster,
-        prepare_segment_topology,
-    )
-    from nemo_rl.models.policy.teacher_worker_group import (
-        TeacherWorkerGroup,
-        create_teacher_configs_from_opd_config,
-    )
-
-    opd_cfg = _opd_cfg(master_config)
+def _validate_default_teacher_alias(opd_cfg: dict[str, Any]) -> None:
+    """Validate the fallback teacher alias before reserving resources."""
     teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
-
-    # A non-strict run falls back to default_teacher_alias for unmapped agents, so
-    # it must itself be a mapped agent.
     default_teacher_alias = opd_cfg.get("default_teacher_alias")
     if (
         not opd_cfg.get("strict_agent_name_match", False)
@@ -273,6 +247,44 @@ def create_teacher_worker_groups(
             f"{sorted(teacher_model_by_agent_name.keys())})."
         )
 
+
+def reserve_teacher_clusters(
+    master_config: Any,
+    *,
+    segment_size: Optional[int] = None,
+    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
+) -> dict[str, RayVirtualCluster]:
+    """Create and reserve topology-aware clusters for non-colocated teachers.
+
+    This reserves the teachers' Ray placement groups without starting teacher
+    workers or loading model checkpoints. Call it before starting other
+    opportunistically placed GPU services, then pass the result to
+    :func:`create_teacher_worker_groups` after policy initialization.
+
+    Args:
+        master_config: Full training configuration containing the OPD settings.
+        segment_size: NVLink-domain segment size from the cluster config. When
+            set, every teacher is constrained to one NVLink domain.
+        teacher_segment_topology: Topology remaining after policy and inference
+            placement.
+
+    Returns:
+        A mapping from each deduplicated teacher alias to its reserved cluster.
+
+    Raises:
+        ValueError: If the configured fallback teacher alias is invalid.
+        ResourceInsufficientError: If the requested topology segments cannot
+            be formed.
+        TimeoutError: If Ray cannot reserve a teacher placement group.
+    """
+    # Imported lazily to break the cycle: teacher_worker_group imports the OPD
+    # config schemas defined in this module.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    opd_cfg = _opd_cfg(master_config)
+    _validate_default_teacher_alias(opd_cfg)
     teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
 
     # Running topology of still-free nodes; each teacher consumes a segment and
@@ -281,48 +293,135 @@ def create_teacher_worker_groups(
         dict(teacher_segment_topology) if teacher_segment_topology else None
     )
 
-    teacher_worker_groups: dict[str, Any] = {}
-    for tcfg in teacher_configs:
-        alias = tcfg.alias
-        num_nodes = tcfg.num_nodes
-        gpus_per_node = tcfg.gpus_per_node
+    teacher_clusters: dict[str, RayVirtualCluster] = {}
+    try:
+        for teacher_config in teacher_configs:
+            alias = teacher_config.alias
+            num_nodes = teacher_config.num_nodes
+            gpus_per_node = teacher_config.gpus_per_node
 
-        # Pin each teacher within one NVLink domain (its whole node span is one
-        # segment) so its TP/PP/CP collectives stay on NVLink, not InfiniBand.
-        teacher_segment_size = None
-        node_resource_constraints = None
-        if segment_size is not None:
-            teacher_segment_size = num_nodes
-            node_resource_constraints, remaining_ids, _ = prepare_segment_topology(
-                num_nodes,
-                num_nodes,
-                topology=running_topology,
-                role=f"teacher:{alias}",
+            # Pin each teacher within one NVLink domain (its whole node span is
+            # one segment) so its TP/PP/CP collectives stay on NVLink.
+            teacher_segment_size = None
+            node_resource_constraints = None
+            if segment_size is not None:
+                teacher_segment_size = num_nodes
+                (
+                    node_resource_constraints,
+                    remaining_ids,
+                    _,
+                ) = prepare_segment_topology(
+                    num_nodes,
+                    num_nodes,
+                    topology=running_topology,
+                    role=f"teacher:{alias}",
+                )
+                if running_topology is not None:
+                    running_topology = {
+                        node_id: running_topology[node_id] for node_id in remaining_ids
+                    }
+
+            teacher_cluster = RayVirtualCluster(
+                name=f"teacher_{alias}",
+                bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
+                use_gpus=True,
+                num_gpus_per_node=gpus_per_node,
+                max_colocated_worker_groups=1,
+                segment_size=teacher_segment_size,
+                node_resource_constraints=node_resource_constraints,
             )
-            if running_topology is not None:
-                running_topology = {nid: running_topology[nid] for nid in remaining_ids}
+            teacher_clusters[alias] = teacher_cluster
 
-        teacher_cluster = RayVirtualCluster(
-            name=f"teacher_{alias}",
-            bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
-            use_gpus=True,
-            num_gpus_per_node=gpus_per_node,
-            max_colocated_worker_groups=1,
-            segment_size=teacher_segment_size,
-            node_resource_constraints=node_resource_constraints,
-        )
-        # Eagerly claim domain-aligned nodes before the next teacher selects.
-        if node_resource_constraints is not None:
+            # Claim the resources now. Teacher workers are deliberately created
+            # later so model loading cannot race with the policy checkpoint
+            # conversion.
             teacher_cluster.get_placement_groups()
+            print(
+                f"  ✓ Reserved teacher '{alias}' cluster: "
+                f"{num_nodes} node(s), {gpus_per_node} GPUs/node",
+                flush=True,
+            )
+    except Exception:
+        for teacher_cluster in teacher_clusters.values():
+            teacher_cluster.shutdown()
+        raise
+
+    return teacher_clusters
+
+
+def create_teacher_worker_groups(
+    master_config: Any,
+    policy_config: dict[str, Any],
+    tokenizer: Any,
+    *,
+    segment_size: Optional[int] = None,
+    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
+    teacher_clusters: Optional[dict[str, RayVirtualCluster]] = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Create TeacherWorkerGroup instances for non-colocated teachers.
+
+    Args:
+        master_config: Full training configuration containing the OPD settings.
+        policy_config: Student policy configuration used as the teacher worker
+            configuration template.
+        tokenizer: Tokenizer passed to every teacher worker.
+        segment_size: NVLink-domain segment size from the cluster config; when
+            set, each teacher is placed topology-aware so its TP/PP/CP stays
+            within an NVLink domain.
+        teacher_segment_topology: Topology of the nodes left after policy /
+            inference placement, used to pin teacher nodes (see
+            ``prepare_segment_topology``).
+        teacher_clusters: Clusters already reserved by
+            :func:`reserve_teacher_clusters`. When omitted, this function
+            reserves the clusters itself for backward compatibility.
+
+    Returns:
+        A tuple containing the worker groups by primary teacher alias and the
+        mapping from every configured alias to its primary group alias.
+
+    Raises:
+        ValueError: If teacher routing or the supplied cluster aliases are
+            invalid, or teacher sequence-packing settings are incompatible.
+        RuntimeError: If any teacher worker fails during initialization.
+    """
+    # Imported lazily to break the cycle: teacher_worker_group imports the OPD
+    # config schemas defined in this module.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherWorkerGroup,
+        create_teacher_configs_from_opd_config,
+    )
+
+    opd_cfg = _opd_cfg(master_config)
+    teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
+    _validate_default_teacher_alias(opd_cfg)
+
+    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+    if teacher_clusters is None:
+        teacher_clusters = reserve_teacher_clusters(
+            master_config,
+            segment_size=segment_size,
+            teacher_segment_topology=teacher_segment_topology,
+        )
+    expected_aliases = {teacher_config.alias for teacher_config in teacher_configs}
+    if set(teacher_clusters) != expected_aliases:
+        raise ValueError(
+            "Reserved teacher cluster aliases do not match the resolved teacher "
+            f"configs: expected {sorted(expected_aliases)}, "
+            f"got {sorted(teacher_clusters)}."
+        )
+
+    teacher_worker_groups: dict[str, Any] = {}
+    for teacher_config in teacher_configs:
+        alias = teacher_config.alias
         twg = TeacherWorkerGroup(
-            teacher_cfg=tcfg,
-            cluster=teacher_cluster,
+            teacher_cfg=teacher_config,
+            cluster=teacher_clusters[alias],
             policy_config=policy_config,
             tokenizer=tokenizer,
         )
         teacher_worker_groups[alias] = twg
         print(
-            f"  ✓ Teacher '{alias}' cluster: {num_nodes} node(s), {gpus_per_node} GPUs/node",
+            f"  ✓ Initialized teacher '{alias}' workers",
             flush=True,
         )
 
@@ -350,8 +449,8 @@ def create_teacher_worker_groups(
     # Build alias -> group_alias mapping for deduplication
     alias_to_group_alias: dict[str, str] = {}
     model_to_primary: dict[str, str] = {}
-    for tcfg in teacher_configs:
-        model_to_primary[tcfg.model_name] = tcfg.alias
+    for teacher_config in teacher_configs:
+        model_to_primary[teacher_config.model_name] = teacher_config.alias
     for alias, model_name in teacher_model_by_agent_name.items():
         alias_to_group_alias[alias] = model_to_primary.get(model_name, alias)
 
