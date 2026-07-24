@@ -575,7 +575,7 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.8.1,<5.9.0",
+  "transformers>=5.8,<=5.12.1",
   "mistral-common>=1.10.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
