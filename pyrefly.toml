@@ -162,6 +162,7 @@ project-includes = [
   "nemo_rl/models/generation/megatron/__init__.py",
   "nemo_rl/models/generation/megatron/config.py",
   "nemo_rl/models/generation/megatron/utils.py",
+  "nemo_rl/models/generation/openai_server_utils.py",
   "nemo_rl/models/generation/sglang/config.py",
   "nemo_rl/models/generation/sglang/utils/http_utils.py",
   "nemo_rl/models/generation/sglang/utils/ip_port_utils.py",
