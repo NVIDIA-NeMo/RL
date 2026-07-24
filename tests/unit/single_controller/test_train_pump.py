@@ -303,6 +303,7 @@ def test_train_pump_drives_mcore_training_step(
                 "max_num_steps": train_steps,
                 "max_num_epochs": None,
             },
+            loss_fn=SimpleNamespace(force_on_policy_ratio=False),
             async_rl=AsyncRLConfig(
                 sampler=WindowedSamplerConfig(max_staleness_versions=1),
                 min_groups_for_streaming_train=num_prompts,

@@ -53,7 +53,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         self,
         policy: Any,
         generation: Any,
-        refit_buffer_size_gb: Optional[int] = None,
+        refit_buffer_size_gb: Optional[float | int] = None,
     ):
         self._policy = policy
         self._generation = generation
@@ -114,7 +114,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         if self._refit_buffer_size_gb is not None:
             if self._refit_buffer_size_gb <= 0:
                 raise ValueError("refit_buffer_size_gb must be > 0")
-            return self._refit_buffer_size_gb * (1024**3)
+            return int(self._refit_buffer_size_gb * (1024**3))
 
         memory_ratio_raw = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
         try:

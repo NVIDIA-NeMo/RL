@@ -124,11 +124,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
 @dataclass
 class AdvantageConfig:
+    """Internal DataPlane field mapping for advantage calculation."""
+
     output_field: str = "advantages"
     prompt_ids_field: str = "prompt_ids_for_adv"
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
     repeated_batch_fields: list[str] = field(default_factory=list)
-    policy_logprobs_field: Optional[str] = "prev_logprobs"
-    reference_logprobs_field: Optional[str] = "reference_policy_logprobs"
+    policy_logprobs_field: str = "prev_logprobs"
+    reference_logprobs_field: str = "reference_policy_logprobs"

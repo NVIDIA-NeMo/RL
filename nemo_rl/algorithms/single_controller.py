@@ -101,6 +101,13 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
+        self._policy_logprobs_required = not (
+            master_config.loss_fn.force_on_policy_ratio
+            and master_config.grpo.get("seq_logprob_error_threshold") is None
+        )
+        self._reference_logprobs_required = not bool(
+            master_config.grpo.get("skip_reference_policy_logprobs_calculation")
+        )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
@@ -195,11 +202,11 @@ class SingleControllerActor:
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
-            self._logger.finish()
         finally:
             rollout_task.cancel()
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            self._logger.finish()
 
         return {
             "train_steps": self._train_steps,
@@ -352,12 +359,7 @@ class SingleControllerActor:
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
-        adv_cfg = self._advantage_cfg
         grpo_cfg = self._master_config.grpo
-
-        # TODO: fix the prev_logprobs_required and reference_logprobs_required logic
-        prev_logprobs_required = adv_cfg.policy_logprobs_field is not None
-        reference_logprobs_required = adv_cfg.reference_logprobs_field is not None
 
         while self._train_steps < grpo_cfg["max_num_steps"]:
             version_during_step = self._trainer_version
@@ -425,18 +427,24 @@ class SingleControllerActor:
                             self._buffer_capacity.release()
 
                     # Compute prev_logprobs / ref_logprobs
-                    with self._timer.time("logprob_inference_prep"):
-                        await asyncio.to_thread(self._trainer.prepare_for_lp_inference)
-                    with self._timer.time("policy_and_reference_logprobs"):
-                        if prev_logprobs_required:
+                    if (
+                        self._policy_logprobs_required
+                        or self._reference_logprobs_required
+                    ):
+                        with self._timer.time("logprob_inference_prep"):
                             await asyncio.to_thread(
-                                self._trainer.get_logprobs_from_meta, train_meta
+                                self._trainer.prepare_for_lp_inference
                             )
-                        if reference_logprobs_required:
-                            await asyncio.to_thread(
-                                self._trainer.get_reference_policy_logprobs_from_meta,
-                                train_meta,
-                            )
+                        with self._timer.time("policy_and_reference_logprobs"):
+                            if self._policy_logprobs_required:
+                                await asyncio.to_thread(
+                                    self._trainer.get_logprobs_from_meta, train_meta
+                                )
+                            if self._reference_logprobs_required:
+                                await asyncio.to_thread(
+                                    self._trainer.get_reference_policy_logprobs_from_meta,
+                                    train_meta,
+                                )
 
                     # Compute advantages
                     with self._timer.time("advantage_calculation"):
@@ -584,20 +592,7 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        # TODO: currently drain is not implemented, comment out for now
-        # # Drain: wait for all in-flight rollouts to complete before NCCL
-        # # Critical: if GenWorker has queued calls when NCCL init is dispatched,
-        # # the init sits behind them — trainer blocks in rendezvous → deadlock
-        # drain_start = time.monotonic()
-        # while self._inflight_rollouts > 0:
-        #     await asyncio.sleep(0.005)
-
-        # drain_elapsed = time.monotonic() - drain_start
-        # print(
-        #     f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
-        #     f"syncing weights v{self._trainer_version}",
-        #     flush=True,
-        # )
+        # TODO(#2625): Add drain-gate support during refit.
 
         t0 = time.monotonic()
         kv_scales = None
@@ -649,7 +644,6 @@ class SingleControllerActor:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
-        self._step_log_dict["rewards"].append(rewards.detach())
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -665,12 +659,12 @@ class SingleControllerActor:
             )
 
         kwargs: dict[str, torch.Tensor] = {}
-        if adv_cfg.policy_logprobs_field is not None:
+        if self._policy_logprobs_required:
             kwargs["logprobs_policy"] = tensor_field(
                 data,
                 adv_cfg.policy_logprobs_field,
             )
-        if adv_cfg.reference_logprobs_field is not None:
+        if self._reference_logprobs_required:
             kwargs["logprobs_reference"] = tensor_field(
                 data,
                 adv_cfg.reference_logprobs_field,
@@ -711,8 +705,8 @@ class SingleControllerActor:
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
         ]
-        if adv_cfg.policy_logprobs_field is not None:
+        if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
-        if adv_cfg.reference_logprobs_field is not None:
+        if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))

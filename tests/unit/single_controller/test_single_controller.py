@@ -88,6 +88,7 @@ def test_logs_concrete_weight_synchronizer(
             "num_prompts_per_step": 2,
             "num_generations_per_prompt": 4,
         },
+        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=1,
             max_buffered_rollouts=4,
@@ -242,10 +243,9 @@ def _train_pump_controller(*, sampler) -> object:
         }
     )
     ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
-    ctrl._advantage_cfg = AdvantageConfig(
-        policy_logprobs_field=None,
-        reference_logprobs_field=None,
-    )
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler

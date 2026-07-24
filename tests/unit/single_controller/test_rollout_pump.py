@@ -294,6 +294,7 @@ def test_rollout_pump_writes_expected_tq_data(
             "max_num_steps": 1,
             "max_num_epochs": 1,
         },
+        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             sampler=WindowedSamplerConfig(max_staleness_versions=1),
             min_groups_for_streaming_train=1,
