@@ -176,6 +176,18 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def get_refit_grow_unique_id(self) -> ray.ObjectRef:
+        """Generate the identifier used to add ranks to the refit communicator."""
+        pass
+
+    @abstractmethod
+    def grow_refit_comm_group(
+        self, new_world_size: int, grow_unique_id: bytes
+    ) -> list[ray.ObjectRef]:
+        """Grow the refit communicator on every training worker."""
+        pass
+
+    @abstractmethod
     def offload_before_refit(self) -> None:
         pass
 

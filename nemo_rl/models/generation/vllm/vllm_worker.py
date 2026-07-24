@@ -657,6 +657,21 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.collective_rpc("adjust_refit_comm_group", args=(exclude_ranks,)),
         )
 
+    def grow_refit_comm_group(
+        self,
+        new_world_size: int,
+        grow_unique_id: bytes | None,
+        new_rank_start: int | None,
+    ) -> list[tuple[int, int, int]]:
+        """Grow the refit communicator on every internal vLLM rank."""
+        return cast(
+            list[tuple[int, int, int]],
+            self.llm.collective_rpc(
+                "grow_refit_comm_group",
+                args=(new_world_size, grow_unique_id, new_rank_start),
+            ),
+        )
+
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

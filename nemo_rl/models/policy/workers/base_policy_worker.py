@@ -48,6 +48,20 @@ class AbstractPolicyWorker:
         """Remove failed generation ranks from the refit communicator."""
         return self.model_update_group.shrink(exclude_ranks)
 
+    def get_refit_grow_unique_id(self) -> bytes:
+        """Generate the identifier used to add ranks to the refit communicator."""
+        return self.model_update_group.get_grow_unique_id()
+
+    def grow_refit_comm_group(
+        self, new_world_size: int, grow_unique_id: bytes
+    ) -> tuple[int, int, int]:
+        """Grow the refit communicator on an existing training rank."""
+        unique_id_bytes = grow_unique_id if self.model_update_group.rank == 0 else None
+        return self.model_update_group.grow(
+            new_world_size,
+            unique_id_bytes=unique_id_bytes,
+        )
+
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
         return True

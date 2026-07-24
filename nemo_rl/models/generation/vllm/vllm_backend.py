@@ -135,6 +135,21 @@ class VllmInternalWorkerExtension:
         """Remove failed generation ranks from the refit communicator."""
         return self.model_update_group.shrink(exclude_ranks)
 
+    def grow_refit_comm_group(
+        self,
+        new_world_size: int,
+        grow_unique_id: bytes | None,
+        new_rank_start: int | None,
+    ) -> tuple[int, int, int]:
+        """Grow the refit communicator on an internal vLLM rank."""
+        local_rank = torch.distributed.get_rank()
+        new_rank = new_rank_start + local_rank if new_rank_start is not None else None
+        return self.model_update_group.grow(
+            new_world_size,
+            unique_id_bytes=grow_unique_id,
+            new_rank=new_rank,
+        )
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid

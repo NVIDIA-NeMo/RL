@@ -410,6 +410,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             exclude_ranks=exclude_ranks,
         )
 
+    def get_refit_grow_unique_id(self) -> ray.ObjectRef:
+        """Generate a grow identifier on training rank zero."""
+        return self.worker_group.run_single_worker_single_data(
+            "get_refit_grow_unique_id",
+            worker_idx=0,
+        )
+
+    def grow_refit_comm_group(
+        self, new_world_size: int, grow_unique_id: bytes
+    ) -> list[ray.ObjectRef]:
+        """Grow every training worker's refit communicator."""
+        return self.worker_group.run_all_workers_single_data(
+            "grow_refit_comm_group",
+            new_world_size=new_world_size,
+            grow_unique_id=grow_unique_id,
+        )
+
     def init_collective_mcore_generation(
         self,
         ip: str,

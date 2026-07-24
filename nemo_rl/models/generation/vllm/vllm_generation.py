@@ -256,10 +256,10 @@ class VllmGeneration(GenerationInterface):
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
 
-        # Generation keeps using every instance after the demo fault, but refit
-        # collectives use only these active instance IDs.
+        # Generation keeps using every instance during the demo fault, but
+        # refit collectives use only these active instance IDs.
         self._active_refit_instance_ids = list(range(self.dp_size))
-        self._refit_train_world_size: Optional[int] = None
+        self._refit_train_world_size = 0
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -635,14 +635,6 @@ class VllmGeneration(GenerationInterface):
         longer participates in weight updates and therefore generates with
         stale weights after the communicator is shrunk.
         """
-        if self._refit_train_world_size is None:
-            raise RuntimeError("Refit collective is not initialized")
-        if faulty_instance_id not in self._active_refit_instance_ids:
-            raise ValueError(
-                f"Generation instance {faulty_instance_id} is not in the active "
-                f"refit set {self._active_refit_instance_ids}"
-            )
-
         active_position = self._active_refit_instance_ids.index(faulty_instance_id)
         first_rank = (
             self._refit_train_world_size + active_position * self.model_parallel_size
@@ -669,6 +661,42 @@ class VllmGeneration(GenerationInterface):
             len(surviving_instance_ids) * self.model_parallel_size
         )
         return exclude_ranks, new_world_size, futures
+
+    def grow_refit_comm_group(
+        self,
+        new_instance_id: int,
+        grow_unique_id: bytes,
+    ) -> tuple[list[int], int, list[ray.ObjectRef]]:
+        """Add one new generation instance to the refit communicator."""
+        current_world_size = self._refit_train_world_size + (
+            len(self._active_refit_instance_ids) * self.model_parallel_size
+        )
+        new_world_size = current_world_size + self.model_parallel_size
+        new_ranks = list(range(current_world_size, new_world_size))
+        method_name = (
+            "grow_refit_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "grow_refit_comm_group"
+        )
+
+        futures = self._run_refit_method_on_instances(
+            method_name,
+            self._active_refit_instance_ids,
+            new_world_size=new_world_size,
+            grow_unique_id=None,
+            new_rank_start=None,
+        )
+        futures.extend(
+            self._run_refit_method_on_instances(
+                method_name,
+                [new_instance_id],
+                new_world_size=new_world_size,
+                grow_unique_id=grow_unique_id,
+                new_rank_start=current_world_size,
+            )
+        )
+        self._active_refit_instance_ids.append(new_instance_id)
+        return new_ranks, new_world_size, futures
 
     def _run_refit_method_on_instances(
         self,

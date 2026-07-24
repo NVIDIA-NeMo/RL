@@ -25,6 +25,7 @@ class StatelessProcessGroup:
         self.port = port
         self.rank = rank
         self.world_size = world_size
+        self.device = 0
         self._retired_nccl_communicators: list[Communicator] = []
         self.tcp_store = torch.distributed.TCPStore(
             host_name=self.master_address,
@@ -35,6 +36,7 @@ class StatelessProcessGroup:
 
     def init_nccl_communicator(self, device: int):
         UNIQUE_ID_KEY = "nccl_unique_id"
+        self.device = device
 
         if self.rank == 0:
             unique_id = get_unique_id()
@@ -64,50 +66,71 @@ class StatelessProcessGroup:
             assert torch.allclose(data, torch.ones(1, device=device))
 
     def shrink(self, exclude_ranks: list[int]) -> tuple[int, int, int]:
-        """Shrink the NCCL communicator around failed ranks.
-
-        Every rank that remains in the communicator must call this method with
-        the same ``exclude_ranks``. Excluded ranks must not call it.
-
-        Args:
-            exclude_ranks: Ranks in the current communicator to remove.
-
-        Returns:
-            The old rank, compacted new rank, and new communicator world size.
-        """
-        if not exclude_ranks:
-            raise ValueError("exclude_ranks must contain at least one rank")
-
-        excluded = sorted(set(exclude_ranks))
-        if len(excluded) != len(exclude_ranks):
-            raise ValueError(f"exclude_ranks contains duplicates: {exclude_ranks}")
-        if excluded[0] < 0 or excluded[-1] >= self.world_size:
-            raise ValueError(
-                f"exclude_ranks must be in [0, {self.world_size}), got {excluded}"
-            )
-        if self.rank in excluded:
-            raise ValueError(
-                f"Excluded rank {self.rank} must not call communicator shrink"
-            )
-
+        """Shrink the NCCL communicator around failed ranks."""
         # CommShrinkFlag.DEFAULT requires all outstanding communicator work to
         # be complete. packed_tensor uses multiple CUDA streams, so quiesce the
         # device before entering this collective operation.
         torch.cuda.synchronize()
 
         old_rank = self.rank
-        old_communicator = self.nccl_communicator
-        self.nccl_communicator = old_communicator.shrink(
-            exclude_ranks=excluded,
+        existing_communicator = self.nccl_communicator
+        self.nccl_communicator = existing_communicator.shrink(
+            exclude_ranks=exclude_ranks,
             config=NCCLConfig(shrink_share=True),
         )
 
         # The child shares resources with its parent. Keep the parent alive for
         # the process lifetime instead of destroying and recreating resources.
-        self._retired_nccl_communicators.append(old_communicator)
-        self.rank -= sum(excluded_rank < old_rank for excluded_rank in excluded)
-        self.world_size -= len(excluded)
+        self._retired_nccl_communicators.append(existing_communicator)
+        self.rank -= sum(excluded_rank < old_rank for excluded_rank in exclude_ranks)
+        self.world_size -= len(exclude_ranks)
 
+        return old_rank, self.rank, self.world_size
+
+    def get_grow_unique_id(self) -> bytes:
+        """Generate a one-use identifier for growing this communicator."""
+        torch.cuda.synchronize()
+        return self.nccl_communicator.get_unique_id().as_bytes
+
+    def grow(
+        self,
+        new_world_size: int,
+        *,
+        unique_id_bytes: bytes | None = None,
+        new_rank: int | None = None,
+    ) -> tuple[int, int, int]:
+        """Grow the communicator with existing or newly added ranks."""
+        torch.cuda.synchronize()
+        unique_id = (
+            UniqueId.from_bytes(unique_id_bytes)
+            if unique_id_bytes is not None
+            else None
+        )
+        old_rank = self.rank
+        existing_communicator = self.nccl_communicator
+
+        with torch.cuda.device(self.device):
+            # newly added ranks
+            if new_rank is not None:
+                self.nccl_communicator = Communicator().grow(
+                    nranks=new_world_size,
+                    unique_id=unique_id,
+                    rank=new_rank,
+                )
+            else:
+                # existing ranks
+                self.nccl_communicator = existing_communicator.grow(
+                    nranks=new_world_size,
+                    unique_id=unique_id,
+                )
+
+        if new_rank is not None:
+            self._retired_nccl_communicators.append(existing_communicator)
+            self.rank = new_rank
+        else:
+            existing_communicator.destroy()
+
+        self.world_size = new_world_size
         return old_rank, self.rank, self.world_size
 
     def broadcast(

@@ -2125,38 +2125,47 @@ def adjust_refit_comm_group(
     faulty_instance_id: int,
 ) -> None:
     """Shrink a non-colocated vLLM refit group around one failed instance."""
-    if not isinstance(policy_generation, VllmGeneration):
-        raise NotImplementedError(
-            "Refit communicator shrink is implemented only for vLLM generation"
-        )
-    if policy_generation.cfg["colocated"]["enabled"]:
-        raise ValueError("Refit communicator shrink requires non-colocated generation")
-
     (
         exclude_ranks,
         expected_world_size,
         futures_inference,
     ) = policy_generation.adjust_refit_comm_group(faulty_instance_id)
     futures_train = policy.adjust_refit_comm_group(exclude_ranks)
-    results = ray.get(futures_train + futures_inference)
-
-    rank_updates = []
-    for result in results:
-        if isinstance(result, list):
-            rank_updates.extend(result)
-        else:
-            rank_updates.append(result)
-    actual_world_sizes = {world_size for _, _, world_size in rank_updates}
-    if actual_world_sizes != {expected_world_size}:
-        raise RuntimeError(
-            "Inconsistent refit communicator sizes after shrink: "
-            f"expected={expected_world_size}, actual={sorted(actual_world_sizes)}"
-        )
+    ray.get(futures_train + futures_inference)
 
     print(
         "[FAULTY STEP] Shrunk refit communicator: "
         f"faulty_instance_id={faulty_instance_id}, "
         f"excluded_ranks={exclude_ranks}, new_world_size={expected_world_size}",
+        flush=True,
+    )
+
+
+def expand_refit_comm_group(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    new_instance_id: int,
+) -> None:
+    """Grow a non-colocated vLLM refit group with one new instance."""
+    grow_unique_id = ray.get(policy.get_refit_grow_unique_id())
+    (
+        new_ranks,
+        expected_world_size,
+        futures_inference,
+    ) = policy_generation.grow_refit_comm_group(
+        new_instance_id,
+        grow_unique_id,
+    )
+    futures_train = policy.grow_refit_comm_group(
+        expected_world_size,
+        grow_unique_id,
+    )
+    ray.get(futures_train + futures_inference)
+
+    print(
+        "[RECOVERY STEP] Grew refit communicator: "
+        f"new_instance_id={new_instance_id}, "
+        f"new_ranks={new_ranks}, new_world_size={expected_world_size}",
         flush=True,
     )
 
@@ -3589,7 +3598,9 @@ def async_grpo_train(
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
     faulty_step = 5
+    recovery_step = 7
     faulty_instance_id = 3
+    new_instance_id = 3
 
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
@@ -3925,6 +3936,22 @@ def async_grpo_train(
                             faulty_instance_id,
                         )
                         print("[FAULTY STEP] Fault handling completed", flush=True)
+                    elif step == recovery_step:
+                        print(
+                            "[RECOVERY STEP] Assuming generation instance "
+                            f"{new_instance_id} recovered at step "
+                            f"{recovery_step}",
+                            flush=True,
+                        )
+                        expand_refit_comm_group(
+                            policy,
+                            policy_generation,
+                            new_instance_id,
+                        )
+                        print(
+                            "[RECOVERY STEP] Recovery handling completed",
+                            flush=True,
+                        )
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
