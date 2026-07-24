@@ -22,9 +22,11 @@ tests at the bottom of this file (skipped when < 2 GPUs are available).
 from __future__ import annotations
 
 import os
+import socket
 import traceback
 from dataclasses import fields
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -45,6 +47,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     get_topk_projection,
     localize_alignment,
     parse_projection_file,
+    rebuild_teacher_full_logits_from_nccl,
     valid_chunk_mask,
 )
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
@@ -660,6 +663,93 @@ class TestAssembleTeacherLogitsFromShards:
         with pytest.raises(AssertionError):
             assemble_teacher_logits_from_shards(
                 shards, student_cp_rank=0, student_cp_size=2, device="cpu"
+            )
+
+
+class TestRebuildTeacherLogitsFromNccl:
+    def test_hybrid_ipc_and_nccl_shards_are_assembled(self, monkeypatch):
+        full = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 6)
+        ipc_payload = ("local",)
+        ipc_storage = full[:, :3].reshape(1, 1, 4, 3)
+        transfer_key = "teacher0:sample0:src1:dst7"
+        common = {
+            "buf_idx": 0,
+            "sample_index_in_buf": 0,
+            "actual_shape": (4, 3),
+            "full_seq_len": 4,
+            "full_vocab_size": 6,
+            "global_seq_start": 0,
+            "world_rank": 1,
+            "transport": "hybrid",
+        }
+        handles = [
+            {
+                "teacher_shards": [
+                    {
+                        **common,
+                        "payload_ipc": ipc_payload,
+                        "hostname": socket.gethostname(),
+                        "vocab_start_index": 0,
+                        "vocab_end_index": 3,
+                    },
+                    {
+                        **common,
+                        "payload_ipc": ("remote",),
+                        "hostname": "remote-node",
+                        "vocab_start_index": 3,
+                        "vocab_end_index": 6,
+                        "nccl_keys": {7: transfer_key},
+                    },
+                ]
+            }
+        ]
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.rebuild_cuda_tensor_from_ipc",
+            lambda payload, device: ipc_storage,
+        )
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda: SimpleNamespace(synchronize=lambda: None),
+        )
+
+        out = rebuild_teacher_full_logits_from_nccl(
+            handles,
+            cp_group=None,
+            device="cpu",
+            xtoken_transport=({transfer_key: full[:, 3:].clone()}, 7),
+        )
+
+        assert torch.equal(out, full.unsqueeze(0))
+
+    def test_missing_receive_buffer_fails_loudly(self, monkeypatch):
+        shard = {
+            "payload_ipc": ("remote",),
+            "buf_idx": 0,
+            "sample_index_in_buf": 0,
+            "actual_shape": (4, 6),
+            "full_seq_len": 4,
+            "full_vocab_size": 6,
+            "global_seq_start": 0,
+            "world_rank": 1,
+            "hostname": "remote-node",
+            "vocab_start_index": 0,
+            "vocab_end_index": 6,
+            "transport": "nccl",
+            "nccl_keys": {0: "missing"},
+        }
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda: SimpleNamespace(synchronize=lambda: None),
+        )
+
+        with pytest.raises(RuntimeError, match="was not populated"):
+            rebuild_teacher_full_logits_from_nccl(
+                [{"teacher_shards": [shard]}],
+                cp_group=None,
+                device="cpu",
+                xtoken_transport=({}, 0),
             )
 
 
