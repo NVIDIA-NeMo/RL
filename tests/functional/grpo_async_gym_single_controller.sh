@@ -81,6 +81,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
     loss_fn.reference_policy_kl_penalty=0.01 \
+    grpo.skip_reference_policy_logprobs_calculation=false \
     loss_fn.use_importance_sampling_correction=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
