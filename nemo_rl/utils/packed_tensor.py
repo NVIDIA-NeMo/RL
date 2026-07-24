@@ -36,6 +36,42 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
+def _normalize_packing_tensors_for_broadcast(
+    tensors: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Move packed tensor pieces to one CUDA device before NCCL broadcast.
+
+    The producer iterator can yield tensors from mixed CPU/CUDA devices during
+    weight sync or refit flows. `torch.cat` requires all pieces on one device,
+    and NCCL broadcast requires CUDA. Normalizing here keeps the packing loop
+    robust to mixed-device inputs.
+
+    The `non_blocking=True` copies enqueue on the current CUDA stream. Callers
+    must consume the returned tensors on that same stream or synchronize before
+    reading results. The producer satisfies this by calling this helper inside
+    `torch.cuda.stream(streams[buffer_idx])` and running the following
+    `torch.cat` and `group.broadcast` in the same stream context.
+    """
+    if not tensors:
+        return tensors
+
+    if not torch.cuda.is_available():
+        return tensors
+    target_device = next(
+        (tensor.device for tensor in tensors if tensor.is_cuda),
+        None,
+    )
+    if target_device is None:
+        target_device = torch.device("cuda", torch.cuda.current_device())
+
+    return [
+        tensor
+        if tensor.device == target_device
+        else tensor.to(target_device, non_blocking=True)
+        for tensor in tensors
+    ]
+
+
 def packed_broadcast_producer(iterator, group, src, post_iter_func):
     """Broadcast a list of tensors in a packed manner.
 
@@ -88,6 +124,11 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
+                packing_tensor_list[buffer_idx] = (
+                    _normalize_packing_tensors_for_broadcast(
+                        packing_tensor_list[buffer_idx]
+                    )
+                )
                 packed_tensors[buffer_idx] = torch.cat(
                     packing_tensor_list[buffer_idx], dim=0
                 )
@@ -95,6 +136,11 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
             except StopIteration:
                 # do the last broadcast if there are remaining tensors
                 if len(packing_tensor_list[buffer_idx]) > 0:
+                    packing_tensor_list[buffer_idx] = (
+                        _normalize_packing_tensors_for_broadcast(
+                            packing_tensor_list[buffer_idx]
+                        )
+                    )
                     packed_tensors[buffer_idx] = torch.cat(
                         packing_tensor_list[buffer_idx], dim=0
                     )
