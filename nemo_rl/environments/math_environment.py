@@ -95,6 +95,13 @@ class HFVerifyWorker:
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
+            # Preset the per-response outputs and append them exactly once at
+            # the end of the iteration, so a failure anywhere below degrades
+            # to score 0.0 / no extracted answer without misaligning the
+            # lists, and a failure in the optional answer extraction keeps
+            # the already-computed score.
+            ret_score = 0.0
+            selected_answer: str | None = None
             try:
                 with _mute_output():
                     math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
@@ -102,7 +109,8 @@ class HFVerifyWorker:
                         # This compute_score is from the DAPO Math Verifier from Verl
                         reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
-                        extracted_answer = reward_dict["pred"]
+                        # dapo's pred is already the final normalized answer.
+                        selected_answer = reward_dict["pred"]
                     elif kwargs.get("math_verify_impl") == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
@@ -113,9 +121,7 @@ class HFVerifyWorker:
                             f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
                         )
 
-                results.append(float(ret_score))
-
-                if return_extracted_answer:
+                if return_extracted_answer and math_verify_impl == "hf_math_verify":
                     # Make sure the extracted answer is not None and is a list of two elements
                     assert extracted_answer is not None
                     assert len(extracted_answer) == 2
@@ -123,18 +129,21 @@ class HFVerifyWorker:
                     # Get the extracted answer with the same logic as in the HFVerifyWorker
                     for pred in extracted_prediction:
                         if any(grader.verify(gold, pred) for gold in extracted_gold):
-                            extracted_answers.append(pred)
+                            selected_answer = pred
                             break
                     else:
                         # If no match is found, means all answers are incorrect, just use the first prediction
-                        extracted_answers.append(extracted_prediction[0][0])
+                        selected_answer = extracted_prediction[0][0]
 
             # It's possible to emit a TimeoutException and that wouldn't be caught since
             # it actually subclasses from BaseException and math-verify itself does not
             # to catch it.
             except (Exception, TimeoutException):
-                results.append(0.0)
-                extracted_answers.append(None)
+                pass
+
+            results.append(float(ret_score))
+            if return_extracted_answer:
+                extracted_answers.append(selected_answer)
 
         if return_extracted_answer:
             return results, extracted_answers
