@@ -426,6 +426,60 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
+def _derive_turn_markers(tokenizer: TokenizerType) -> list[str]:
+    """Per-role turn-opening markers of a chat template, longest-first.
+
+    Each role's opener is recovered by rendering it after a stable anchor and diffing;
+    its first token is the boundary marker. Uniform templates (ChatML, Llama-3) yield
+    one marker (``<|im_start|>``, ``<|start_header_id|>``), per-role templates (e.g.
+    DeepSeek) yield several. Cached on the tokenizer; empty if none can be derived.
+    """
+    cached = getattr(tokenizer, "_nemo_rl_turn_markers", None)
+    if cached is not None:
+        return cached
+    anchor = [
+        {"role": "user", "content": "anchor"},
+        {"role": "assistant", "content": "prior"},
+    ]
+    markers: set[str] = set()
+    for role in ("system", "user", "assistant", "tool"):
+        probe: dict[str, Any] = {"role": role, "content": "probe"}
+        if role == "tool":
+            probe.update(tool_call_id="c", name="f")
+        try:
+            base = tokenizer.apply_chat_template(  # type: ignore
+                anchor,
+                tokenize=False,
+                add_generation_prompt=False,
+                add_special_tokens=False,
+            )
+            full = tokenizer.apply_chat_template(  # type: ignore
+                anchor + [probe],
+                tokenize=False,
+                add_generation_prompt=False,
+                add_special_tokens=False,
+            )
+        except Exception:
+            continue
+        ## opener = the text the probe turn prepends before its content; its first
+        ## token is the role-opening boundary marker (skip if render isn't stable)
+        if not full.startswith(base):
+            continue
+        content_at = full.find("probe", len(base))
+        if content_at <= len(base):
+            continue
+        opener = full[len(base) : content_at]
+        tid = tokenizer.encode(opener, add_special_tokens=False)
+        if tid:
+            markers.add(tokenizer.decode([tid[0]]))
+    result = sorted(markers, key=len, reverse=True)
+    try:
+        tokenizer._nemo_rl_turn_markers = result  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return result
+
+
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
@@ -452,6 +506,11 @@ def get_formatted_message_log(
     """
     new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
+    ## running concat of the chunks actually emitted; used by the overlap fallback
+    ## when re-anchoring duplicated history (see the loop below)
+    emitted_text = ""
+    ## per-role turn markers, derived lazily on the first non-monotonic render
+    turn_markers: Optional[list[str]] = None
     message_log_strs: list[dict[str, str]] = cast(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
@@ -540,6 +599,33 @@ def get_formatted_message_log(
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
+        ## reasoning templates (Qwen3, DeepSeek-R1, ...) strip <think> from history
+        ## turns, so prev render is not a prefix of the current one and the diff
+        ## re-includes the previous turn's content, duplicating it. This turn is the
+        ## last message turn and keeps its own <think>, so recover just it via the
+        ## suffix after its turn marker. A trailing generation prompt opens its own
+        ## marker, so step back past it. No marker (non-ChatML) -> strip the overlap
+        ## with the emitted text.
+        if prev_message_len_no_eos < len(prev_formatted_message) and message_chunk:
+            if turn_markers is None:
+                turn_markers = _derive_turn_markers(tokenizer)
+            anchor = max((formatted_message.rfind(m) for m in turn_markers), default=-1)
+            if anchor > 0 and template_kwargs["add_generation_prompt"]:
+                before = max(
+                    (formatted_message.rfind(m, 0, anchor) for m in turn_markers),
+                    default=-1,
+                )
+                if before != -1:
+                    anchor = before
+            if anchor != -1:
+                message_chunk = formatted_message[anchor:]
+            elif emitted_text:
+                max_overlap = min(len(emitted_text), len(message_chunk))
+                for overlap in range(max_overlap, 0, -1):
+                    if emitted_text[-overlap:] == message_chunk[:overlap]:
+                        message_chunk = message_chunk[overlap:]
+                        break
+
         # Debug: Print each message turn separately
         if debug:
             if i == 0:
@@ -591,6 +677,8 @@ def get_formatted_message_log(
                     )
                 elif not stripped_message_chunk.endswith(tokenizer.eos_token):
                     message_chunk += tokenizer.eos_token
+
+        emitted_text += message_chunk
 
         # get images too (extend this for other modalities)
         media_cur_message = load_media_from_message(
