@@ -527,6 +527,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        # Multi-LoRA batches arrive block-contiguous by adapter
+        # ([A..A, B..B, ...]). Re-stripe rows rank-major before DP sharding so
+        # every rank receives an equal contiguous slice of every adapter, the
+        # same placement N independent single-adapter runs would produce.
+        if "adapter_ids" in data:
+            from nousnet.rl.lora.multi.sharding import rank_striped_indices
+
+            reorder = rank_striped_indices(data["adapter_ids"], dp_size)
+            data = data.select_indices(reorder)
+
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[

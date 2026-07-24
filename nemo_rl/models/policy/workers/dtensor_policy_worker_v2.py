@@ -124,6 +124,17 @@ def _maybe_merge_lora_weight(
         return tensor
     module_name = fqn[: -len(".weight")]
     module = module_map.get(module_name)
+
+    # A stacked adapter cannot be folded into one base weight because each row
+    # can select a different adapter. Multi-LoRA checkpoints are exported one
+    # adapter at a time by the downstream splitter.
+    try:
+        from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+    except ImportError:
+        MultiLinearLoRA = None
+    if MultiLinearLoRA is not None and isinstance(module, MultiLinearLoRA):
+        return tensor
+
     if not isinstance(module, LinearLoRA):
         return tensor
     if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
@@ -149,6 +160,52 @@ def _maybe_merge_lora_weight(
         scale = 1.0
 
     return tensor + torch.matmul(lora_b, lora_a) * scale
+
+
+@torch.no_grad()
+def _clip_grad_norm_per_adapter(
+    model: nn.Module, max_grad_norm: float, norm_type: float = 2.0
+) -> float:
+    """Clip each stacked Multi-LoRA adapter's gradients independently.
+
+    N independent single-LoRA runs each clip their own adapter's norm, so a
+    packed Multi-LoRA run must clip every ``[N, ...]`` adapter slice
+    separately — one global norm would apply a different clip coefficient
+    than any of the equivalent single runs. Matches stock semantics per
+    slice: ``get_total_norm`` then in-place scaling by
+    ``min(max_norm / (norm + 1e-6), 1.0)``. Indexing a DTensor gradient
+    keeps its placements; ``full_tensor()`` reduces the sharded norm.
+
+    Returns the max per-adapter norm as the reported grad norm.
+    """
+    from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+
+    multi_modules = [m for m in model.modules() if isinstance(m, MultiLinearLoRA)]
+    all_norms: list[float] = []
+    for adapter_idx in range(multi_modules[0].n_adapters):
+        grads = []
+        for module in multi_modules:
+            if module.lora_A.grad is not None:
+                grads.append(module.lora_A.grad[adapter_idx])
+            if module.lora_B.grad is not None:
+                grads.append(module.lora_B.grad[adapter_idx])
+        if not grads:
+            continue
+
+        total_norm = torch.nn.utils.get_total_norm(
+            grads, norm_type=norm_type, error_if_nonfinite=False, foreach=True
+        )
+        if isinstance(total_norm, DTensor):
+            total_norm = total_norm.full_tensor()
+        total_norm = total_norm.float()
+        all_norms.append(total_norm.item())
+
+        clip_coef = torch.clamp(max_grad_norm / (total_norm + 1e-6), max=1.0)
+        for grad in grads:
+            local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+            local_grad.mul_(clip_coef)
+
+    return max(all_norms) if all_norms else 0.0
 
 
 def _maybe_adapt_tensor_to_hf(
@@ -323,6 +380,50 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
+    def _attach_global_adapter_token_counts(
+        self, batch: BatchedDataDict[Any]
+    ) -> None:
+        """Attach per-adapter global valid-token counts for Multi-LoRA loss.
+
+        Each adapter's loss must normalize by that adapter's valid-token count
+        across ALL DP ranks — exactly like standalone NLLLoss divides by
+        ``global_valid_toks``. Stores one denominator per row (under the key
+        exported by ``nousnet.rl.lora.multi.loss``) so BatchedDataDict slicing
+        carries the correct value through microbatching. Runs two collectives;
+        every DP rank must call this on every global batch.
+        """
+        from nousnet.rl.lora.multi.loss import GLOBAL_ADAPTER_TOKEN_COUNTS_KEY
+
+        token_mask = batch.get("token_mask")
+        sample_mask = batch.get("sample_mask")
+        adapter_ids = batch.get("adapter_ids")
+        if token_mask is None or sample_mask is None or adapter_ids is None:
+            return
+
+        dp_group = self.dp_mesh.get_group()
+        adapter_ids = adapter_ids.to(torch.long)
+        row_counts = (
+            (token_mask[:, 1:] * sample_mask.unsqueeze(-1))
+            .sum(dim=-1)
+            .to(torch.float32)
+        )
+        num_adapters = adapter_ids.max().clone()
+        torch.distributed.all_reduce(
+            num_adapters, op=torch.distributed.ReduceOp.MAX, group=dp_group
+        )
+        global_counts = torch.zeros(
+            int(num_adapters.item()) + 1,
+            dtype=torch.float32,
+            device=adapter_ids.device,
+        )
+        global_counts.scatter_add_(0, adapter_ids, row_counts)
+        torch.distributed.all_reduce(
+            global_counts, op=torch.distributed.ReduceOp.SUM, group=dp_group
+        )
+        batch[GLOBAL_ADAPTER_TOKEN_COUNTS_KEY] = global_counts.index_select(
+            0, adapter_ids
+        )
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -333,6 +434,13 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        # Multi-LoRA: write per-row adapter routing onto every MultiLinearLoRA
+        # layer before forward. Stock batches carry no adapter_ids — no-op.
+        if "adapter_ids" in data:
+            from nousnet.rl.lora.multi.routing import seed_microbatch_routing
+
+            seed_microbatch_routing(self.model, data["adapter_ids"])
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -412,6 +520,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Multi-LoRA: attach each adapter's global valid-token count
+                # (the per-adapter analogue of global_valid_toks) so the loss
+                # normalizes each adapter exactly like its standalone run.
+                # Row-aligned storage survives microbatch slicing. Collective —
+                # every DP rank participates.
+                if "adapter_ids" in batch:
+                    self._attach_global_adapter_token_counts(batch)
+
                 self.optimizer.zero_grad()
 
                 # Get microbatch iterator based on batching strategy
@@ -460,22 +576,27 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
+                    if "adapter_ids" in batch and self.max_grad_norm is not None:
+                        grad_norm = _clip_grad_norm_per_adapter(
+                            self.model, self.max_grad_norm
+                        )
+                    else:
+                        grad_norm = scale_grads_and_clip_grad_norm(
+                            self.max_grad_norm,
+                            [self.model],
+                            norm_type=2.0,
+                            pp_enabled=False,
+                            device_mesh=self.device_mesh,
+                            moe_mesh=self.moe_mesh,
+                            ep_axis_name="ep"
+                            if self.moe_mesh is not None
+                            and "ep" in self.moe_mesh.mesh_dim_names
+                            else None,
+                            pp_axis_name=None,
+                            foreach=True,
+                            num_label_tokens=1,
+                            dp_group_size=self.dp_size * self.cp_size,
+                        )
                     grad_norm = torch.tensor(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
