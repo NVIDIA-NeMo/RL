@@ -2,8 +2,7 @@
 """Multi-LoRA SFT runner — NeMo-RL native (no external packages).
 
 Trains N LoRA adapters in ONE job on a shared frozen base with per-microbatch
-adapter routing, using the multi-LoRA modules vendored at
-``nemo_rl.models.multi_lora`` (originally developed in nousnet).
+adapter routing, using the native ``nemo_rl.models.multi_lora`` modules.
 
 Usage (mirrors examples/run_sft.py):
     uv run python examples/run_sft_multi_lora.py --config <full_nemo_rl_config.yaml> [hydra.overrides ...]

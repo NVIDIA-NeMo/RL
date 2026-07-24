@@ -1,1 +1,1 @@
-"""Debug helpers for nousnet (env-var-gated)."""
+"""Debug helpers for NeMo-RL Multi-LoRA (env-var-gated)."""

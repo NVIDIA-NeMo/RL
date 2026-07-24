@@ -31,8 +31,8 @@ def resolve_config_path(config: str | Path) -> Path:
 
     Search order:
         1. As-is (absolute or relative to cwd)
-        2. Relative to nousnet package root (src/../)
-        3. Relative to /workspace/nousnet/ (inside NGC container)
+        2. Relative to the NeMo-RL repository/package root
+        3. Relative to /opt/nemo-rl/ (the standard NeMo-RL container root)
 
     Args:
         config: Path string or Path object.
@@ -44,14 +44,14 @@ def resolve_config_path(config: str | Path) -> Path:
     if config_path.is_absolute() or config_path.exists():
         return config_path
 
-    # Search relative to nousnet package root
+    # Search relative to the NeMo-RL repository/package root.
     pkg_root = Path(__file__).resolve().parent.parent.parent.parent
     candidate = pkg_root / config_path
     if candidate.exists():
         return candidate
 
-    # Search relative to /workspace/nousnet/ (container mount)
-    workspace = Path("/workspace/nousnet") / config_path
+    # Standard location in NeMo-RL containers.
+    workspace = Path("/opt/nemo-rl") / config_path
     if workspace.exists():
         return workspace
 

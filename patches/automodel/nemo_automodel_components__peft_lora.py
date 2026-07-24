@@ -396,8 +396,8 @@ def apply_lora_to_linear_modules(
                 except ImportError as e:
                     raise RuntimeError(
                         "peft_config.n_adapters > 1 requires nemo_rl.models.multi_lora "
-                        "package providing MultiLinearLoRA. Install nousnet "
-                        "or set n_adapters=1."
+                        "package providing MultiLinearLoRA; initialize/run from "
+                        "the matching NeMo-RL checkout or set n_adapters=1."
                     ) from e
                 if isinstance(lora_dtype, str):
                     lora_dtype = dtype_from_str(lora_dtype)

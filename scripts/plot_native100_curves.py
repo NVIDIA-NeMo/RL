@@ -5,6 +5,7 @@ Plus per-mode match-check figures: native |delta| trace vs campaign |delta| trac
 """
 from __future__ import annotations
 
+import argparse
 import csv
 from collections import defaultdict
 from pathlib import Path
@@ -13,13 +14,27 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-NAT = Path("/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native/results")
-CAMP = Path("/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/nousnet_pre_multilora_8178f9c/results")
-OUT = NAT.parent / "charts_native100"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument("--native-results", type=Path, default=REPO_ROOT / "results")
+ap.add_argument(
+    "--reference-results",
+    type=Path,
+    default=None,
+    help="Optional prior-campaign results directory for match-vs-reference charts",
+)
+ap.add_argument("--output", type=Path, default=REPO_ROOT / "charts_native100")
+args = ap.parse_args()
+
+NAT = args.native_results
+CAMP = args.reference_results
+OUT = args.output
 OUT.mkdir(exist_ok=True)
 
-CAMP_CSV = {"noclip": CAMP / "code7x_100_noclip_pairwise_loss.csv",
-            "clip1": CAMP / "code7x_100_clip1_pairwise_loss.csv"}
+CAMP_CSV = None if CAMP is None else {
+    "noclip": CAMP / "code7x_100_noclip_pairwise_loss.csv",
+    "clip1": CAMP / "code7x_100_clip1_pairwise_loss.csv",
+}
 NAT_CSV = {"noclip": NAT / "native100_noclip_pairwise.csv",
            "clip1": NAT / "native100_clip1_pairwise.csv"}
 
@@ -35,7 +50,7 @@ def load(path):
 
 for mode in ("noclip", "clip1"):
     nat = load(NAT_CSV[mode])
-    camp = load(CAMP_CSV[mode])
+    camp = load(CAMP_CSV[mode]) if CAMP_CSV is not None else None
     for ad in "abcd":
         steps = sorted(nat[ad])
         s = [nat[ad][t][0] for t in steps]
@@ -63,16 +78,19 @@ for mode in ("noclip", "clip1"):
         fig.savefig(OUT / f"native100_{mode}_{ad}.png", dpi=140, bbox_inches="tight")
         plt.close(fig)
 
-    # match-check: native |delta| vs campaign |delta| per adapter
+    if camp is None:
+        continue
+
+    # Optional match-check: native |delta| vs prior reference |delta| per adapter
     fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
-    fig.suptitle(f"Match check vs campaign — {mode}: |Δ(single,multi)| per step — NATIVE (purple) vs CAMPAIGN (gray)", fontsize=12)
+    fig.suptitle(f"Match check vs reference — {mode}: |Δ(single,multi)| per step — NATIVE (purple) vs REFERENCE (gray)", fontsize=12)
     for i, ad in enumerate("abcd"):
         ax = axes[i // 2][i % 2]
         steps_n = sorted(nat[ad]); dn = [max(nat[ad][t][2], 1e-8) for t in steps_n]
         steps_c = sorted(camp[ad]); dc = [max(camp[ad][t][2], 1e-8) for t in steps_c]
         mn = sum(dn) / len(dn); mc = sum(dc) / len(dc)
         ax.semilogy(steps_n, dn, color="#7d3fc9", lw=1.2, label=f"native (mean {mn:.4f})")
-        ax.semilogy(steps_c, dc, color="#888888", lw=1.2, alpha=0.85, label=f"campaign (mean {mc:.4f})")
+        ax.semilogy(steps_c, dc, color="#888888", lw=1.2, alpha=0.85, label=f"reference (mean {mc:.4f})")
         ax.axhline(0.1, color="#d62728", ls=":", lw=1.1)
         ax.set_title(f"adapter {ad.upper()}", fontsize=10)
         ax.grid(alpha=0.25, which="both")
@@ -92,6 +110,6 @@ for mode in ("noclip", "clip1"):
         dc = [camp[ad][t][2] for t in sorted(camp[ad])]
         dn_s, dc_s = sorted(dn), sorted(dc)
         print(f"  {ad}: native mean={sum(dn)/len(dn):.4f} med={dn_s[50]:.4f} max={max(dn):.3f} | "
-              f"campaign mean={sum(dc)/len(dc):.4f} med={dc_s[50]:.4f} max={max(dc):.3f} | "
-              f"native step1 s==m: {nat[ad][1][2] == 0.0} campaign: {camp[ad][1][2] == 0.0}")
+              f"reference mean={sum(dc)/len(dc):.4f} med={dc_s[50]:.4f} max={max(dc):.3f} | "
+              f"native step1 s==m: {nat[ad][1][2] == 0.0} reference: {camp[ad][1][2] == 0.0}")
 print("charts ->", OUT)

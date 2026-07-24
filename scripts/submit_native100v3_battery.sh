@@ -3,12 +3,22 @@
 # V3 explicitly restores the previous nousnet campaign's COT prompt inherited
 # from the GRPO base, while keeping tokenizer model-default and fresh checkpoints.
 set -euo pipefail
-cd /home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
 
-CANON=/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/nousnet_pre_multilora_8178f9c/results/code7x_exactinit_canonical
+CANON="${CANON:-${REPO_ROOT}/results/code7x_exactinit_canonical}"
 LAUNCHER=examples/configs/recipes/multi_lora/sft_8gpu_native.slurm
 CFGDIR=examples/configs/recipes/multi_lora
 BASE_ENV="NOUSNET_DIAG_ENABLED=1,NOUSNET_DIAG_LOSS_TRACE=1,NOUSNET_DIAG_TRACE_ONLY=1,NOUSNET_DIAG_LORA_STEP=0,NOUSNET_FORCE_PAD_TO=1024,NOUSNET_INIT_IMPORT_DIR=${CANON}"
+
+if [[ ! -d "${CANON}" ]]; then
+  cat >&2 <<EOF
+ERROR: canonical exact-init shards not found: ${CANON}
+Generate them with a native export run (NOUSNET_INIT_EXPORT_DIR=<path>) or set
+CANON=/path/to/rank_RR_slot_II.pt shards. No nousnet checkout is required.
+EOF
+  exit 1
+fi
 
 for CKPT in results/native100v3_{noclip,clip1}_{multi,sa,sb,sc,sd}_ckpt; do
   if [[ -e "${CKPT}" ]]; then

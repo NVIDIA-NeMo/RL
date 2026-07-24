@@ -226,7 +226,7 @@ def _maybe_merge_lora_weight(
     try:
         from nemo_rl.models.multi_lora.adapter import MultiLinearLoRA
     except ImportError:
-        MultiLinearLoRA = None  # nousnet not installed — no multi-LoRA modules exist
+        MultiLinearLoRA = None  # native multi-LoRA package unavailable
     if MultiLinearLoRA is not None and isinstance(module, MultiLinearLoRA):
         return tensor
 
@@ -504,9 +504,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # this is a misconfiguration. Fail loudly rather than train
                 # silently against the wrong adapter slot.
                 raise RuntimeError(
-                    "Batch carries `adapter_ids` but nousnet multi-LoRA "
-                    "routing helpers are not importable. This NeMo-RL build vendors multi-LoRA natively; "
-                    "remove `adapter_ids` from the batch."
+                    "Batch carries `adapter_ids` but NeMo-RL native Multi-LoRA "
+                    "routing helpers are not importable. Use the matching "
+                    "NeMo-RL checkout or remove `adapter_ids` from the batch."
                 )
             seed_microbatch_routing(self.model, adapter_ids)
 
