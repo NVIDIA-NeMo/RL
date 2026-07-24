@@ -2116,7 +2116,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
     loss_config = master_config.loss_fn
 
     assert not (
-        loss_config.use_kl_in_reward and opd_module._skip_prev_logprobs(master_config)
+        getattr(loss_config, "use_kl_in_reward", False)
+        and opd_module._skip_prev_logprobs(master_config)
     ), (
         "loss_fn.use_kl_in_reward requires real prev_logprobs but force_on_policy_ratio "
         "with no grpo.seq_logprob_error_threshold zeros them (KL would be computed against a zero placeholder)."
