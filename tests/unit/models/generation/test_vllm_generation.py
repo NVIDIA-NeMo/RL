@@ -492,6 +492,82 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
+def test_configure_generation_config_keeps_real_quant_export_on_cpu() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = True
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_export_cpu_offload"] is True
+
+
+def test_configure_generation_config_keeps_colocated_real_quant_export_on_gpu() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_export_cpu_offload"] is False
+
+
+def test_configure_generation_config_rejects_missing_real_quant_export_placement() -> (
+    None
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_rejects_non_boolean_real_quant_export() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = "false"
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_rejects_gpu_export_for_non_colocated_refit() -> (
+    None
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+    vllm_config["colocated"]["enabled"] = False
+
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+@pytest.mark.parametrize("refit_transport", ["vllm_zmq_sparse", "nixl"])
+def test_configure_generation_config_rejects_gpu_export_for_explicit_refit_transport(
+    refit_transport: str,
+) -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+    vllm_config["refit_transport"] = refit_transport
+
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
 @pytest.mark.parametrize("method", ["deepseek_mtp", "mtp"])
 def test_configure_generation_config_keeps_dummy_startup_weights_for_mtp(method):
     """MTP keeps dummy startup weights even without draft refit.
