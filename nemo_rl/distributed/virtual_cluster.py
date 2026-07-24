@@ -262,6 +262,22 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     # Set up runtime environment
     env_vars = dict(os.environ)
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    # CI=true causes PyTorch to set error_on_custom_op_aliasing=True (see
+    # torch/_functorch/config.py), which raises RuntimeError in vLLM custom ops
+    # such as sequence_parallel_chunk_impl. Strip it from the worker runtime_env
+    # so Ray actors see the same environment as a local non-CI run. ray.sub also
+    # unsets CI before starting the Ray daemons for the same reason.
+    if env_vars.pop("CI", None):
+        import warnings
+
+        warnings.warn(
+            "CI environment variable was detected and has been cleared for Ray workers. "
+            "PyTorch enables strict custom-op aliasing checks (error_on_custom_op_aliasing) "
+            "when CI=true, which can cause RuntimeError in some vLLM custom ops. "
+            "To suppress this warning, unset CI before launching (ray.sub already does this).",
+            UserWarning,
+            stacklevel=2,
+        )
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
