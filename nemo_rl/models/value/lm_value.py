@@ -392,7 +392,21 @@ class Value(ValueInterface):
         from collections import defaultdict
 
         all_mb_metrics = defaultdict(list)
+        dtensor_model_parallel_size = None
+        if self.cfg.get("dtensor_cfg", {}).get("enabled", False):
+            # DTensor value workers have PP=1, so each contiguous CP*TP rank
+            # block corresponds to one DP shard.
+            dtensor_model_parallel_size = self.sharding_annotations.get_axis_size(
+                "context_parallel"
+            ) * self.sharding_annotations.get_axis_size("tensor_parallel")
         for r in results:
+            # DTensor CP/TP outputs are replicated. Aggregate one representative
+            # per DP shard so full-sequence CP metrics are not double-counted.
+            if (
+                dtensor_model_parallel_size is not None
+                and r["rank"] % dtensor_model_parallel_size != 0
+            ):
+                continue
             for k, v in r["all_mb_metrics"].items():
                 all_mb_metrics[k].extend(v)
         aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)

@@ -181,7 +181,7 @@ class TestModelForward:
         # Flash attention should be removed for multimodal
         assert "flash_attn_kwargs" not in call_kwargs
 
-    def test_forward_reward_model_removes_flash_attn(
+    def test_forward_reward_model_allows_flash_attn(
         self, mock_model, processed_inputs_with_flash
     ):
         result = model_forward(
@@ -190,8 +190,7 @@ class TestModelForward:
 
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
-        # Flash attention should be removed for reward models
-        assert "flash_attn_kwargs" not in call_kwargs
+        assert "flash_attn_kwargs" in call_kwargs
 
     def test_forward_disallow_flash_attn_args(
         self, mock_model, processed_inputs_with_flash
@@ -503,6 +502,47 @@ class TestScorePostProcessor:
 
         assert result.shape == (4, 64)
         assert result.dtype == torch.float32
+
+    def test_scoring_with_sequence_packing(self, base_cfg):
+        processor = ScorePostProcessor(cfg=base_cfg, enable_seq_packing=True)
+        logits = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
+        input_lengths = torch.tensor([3, 5, 2])
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
+
+        @dataclass
+        class MockFlashAttnKwargs:
+            cu_seqlens_q: torch.Tensor
+
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.zeros(1, 10, dtype=torch.long),
+            seq_len=10,
+            attention_mask=None,
+            position_ids=torch.arange(10).unsqueeze(0),
+            flash_attn_kwargs=MockFlashAttnKwargs(
+                cu_seqlens_q=torch.tensor([0, 3, 8, 10])
+            ),
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+        )
+
+        result = processor(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=3,
+            original_seq_len=5,
+        )
+
+        expected = torch.tensor(
+            [
+                [0, 1, 2, 0, 0],
+                [3, 4, 5, 6, 7],
+                [8, 9, 0, 0, 0],
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(result, expected)
 
 
 # =====================
