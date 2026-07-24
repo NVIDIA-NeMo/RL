@@ -118,6 +118,26 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         sampler_name=async_config.sampler.name,
     )
 
+    # A non-zero reference-policy KL penalty makes the loss read
+    # ``reference_policy_logprobs``, but the SC train pump only computes them
+    # when ``skip_reference_policy_logprobs_calculation`` is false (see
+    # SingleControllerActor._reference_logprobs_required). Catch the
+    # inconsistent pair at setup instead of a mid-training KeyError.
+    reference_policy_kl_penalty = getattr(
+        master_config.loss_fn, "reference_policy_kl_penalty", 0
+    )
+    if reference_policy_kl_penalty and master_config.grpo.get(
+        "skip_reference_policy_logprobs_calculation"
+    ):
+        raise ValueError(
+            "loss_fn.reference_policy_kl_penalty="
+            f"{reference_policy_kl_penalty} requires reference_policy_logprobs, "
+            "but grpo.skip_reference_policy_logprobs_calculation=true skips "
+            "computing them on the SingleController path. Set "
+            "grpo.skip_reference_policy_logprobs_calculation=false, or set "
+            "loss_fn.reference_policy_kl_penalty=0."
+        )
+
 
 # ── Internal SingleController configs ────────────────────────────────────
 

@@ -282,15 +282,6 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
 
-    def test_nemo_gym_not_supported(self):
-        """SC path trips the nemo-gym guard until PR #3267 lands."""
-        mc = _make_master_config()
-        with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
-            pytest.raises(NotImplementedError, match="NeMo-Gym"),
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""
         math_env_cfg = {"some": "value"}
@@ -400,3 +391,52 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
+
+    def test_nemo_gym_wires_env_handle(self, patched_factories):
+        """When _should_use_nemo_gym is True the nemo-gym actor is spun up and stored."""
+        mc = _make_master_config(colocated=True, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        mock_spinup.assert_called_once_with(
+            env_configs=mc.env,
+            base_urls=patched_factories[
+                "_build_generation"
+            ].return_value.dp_openai_server_base_urls,
+            model_name="test-model",
+            enable_router_replay=False,
+        )
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    @pytest.mark.parametrize("backend", ["sglang", "megatron"])
+    def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
+        """SC nemo-gym wiring only supports vLLM; every other backend must raise."""
+        mc = _make_master_config(colocated=True, backend=backend)
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            pytest.raises(NotImplementedError, match="vllm"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        mock_spinup.assert_not_called()

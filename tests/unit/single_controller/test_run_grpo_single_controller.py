@@ -31,6 +31,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "draft": {"enabled": False},
             "megatron_cfg": {"mtp_num_layers": 2},
         },
+        env={},
         data_plane={"enabled": True},
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
