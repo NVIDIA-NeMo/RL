@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
@@ -414,7 +415,13 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    POLICY_GENERATION_STALE = True
+    # Skip a redundant iter-1 refit when setup() already synced weights
+    # (synchronizer not stale, fresh run). The redundant refit resets
+    # vLLM CUDA-graph / KV-cache state and yields a step-1
+    # token_mult_prob_error spike that converges by step 3.
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(
+        policy_generation, grpo_save_state["current_step"]
+    )
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
