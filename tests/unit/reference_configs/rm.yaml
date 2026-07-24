@@ -38,6 +38,8 @@ policy:
   activation_checkpointing_enabled: false
 
   offload_optimizer_for_logprob: false
+  use_pinned_optimizer_offload: false
+  use_coalesced_optimizer_offload: false
 
   reward_model_cfg:
     enabled: true  # loads model as a Reward Model (do not change)

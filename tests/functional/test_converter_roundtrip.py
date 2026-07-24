@@ -87,6 +87,8 @@ def create_test_config() -> Dict[str, Any]:
             "max_total_sequence_length": 128,
             "precision": "bfloat16",
             "offload_optimizer_for_logprob": False,
+            "use_pinned_optimizer_offload": False,
+            "use_coalesced_optimizer_offload": False,
             "dtensor_cfg": {
                 "_v2": False,
                 "enabled": True,
