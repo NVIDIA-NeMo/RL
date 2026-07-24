@@ -1768,12 +1768,11 @@ def _rolebinding_exists(name: str, namespace: str) -> bool | None:
 
 
 def _check_dev_pod_rbac(namespace: str) -> None:
-    """Verify the default SA has edit access so kubectl works inside the dev pod."""
+    """Verify the current user has edit access in the namespace."""
     import subprocess
 
-    sa = f"system:serviceaccount:{namespace}:default"
     result = subprocess.run(
-        ["kubectl", "auth", "can-i", "get", "pods", f"--as={sa}", "-n", namespace],
+        ["kubectl", "auth", "can-i", "get", "pods", "-n", namespace],
         capture_output=True,
         text=True,
     )
