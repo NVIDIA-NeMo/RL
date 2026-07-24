@@ -3047,6 +3047,15 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 
         # Verify metrics are computed
         assert result["max_seq_mult_prob_error"] > 0.0, "Should compute max error"
+        assert result["seq_mult_prob_error_p99"] > 1.0
+        assert result["token_abs_logprob_error_max"] == 2.0
+        assert result["token_abs_logprob_error_p50"] == 0.0
+        assert result["token_abs_logprob_error_p99"] == 2.0
+        assert result["token_abs_logprob_error_gt_0_1_pct"] == pytest.approx(
+            12 / 36 * 100
+        )
+        assert result["token_abs_logprob_error_gt_1_pct"] == pytest.approx(4 / 36 * 100)
+        assert result["token_abs_logprob_error_gt_2_pct"] == 0.0
         assert result["num_masked_seqs"] == 0, (
             "Should not mask any sequences when threshold is None"
         )
@@ -3432,6 +3441,37 @@ class TestAggregateRolloutMetrics:
         assert result["refine/round_1/truncation_rate"] == pytest.approx(1 / 3)
         assert result["refine/round_1/tool_call_success_rate"] == pytest.approx(3 / 5)
         assert result["refine/round_1/gen_tokens_per_sample/mean"] == 20.0
+
+    def test_tool_call_metrics_use_summed_denominators(self):
+        metrics = {
+            "tool_calls/sample_count": [2, 3],
+            "tool_calls/attempt_count": [2, 4],
+            "tool_calls/output_token_count": [10, 50],
+            "tool_calls/payload_count": [2, 4],
+            "tool_calls/payload_char_count": [20, 100],
+            "tool_calls/tool_result_count": [1, 3],
+            "tool_calls/tool_result_token_count": [8, 42],
+            "tool_calls/empty_count": [1, 1],
+            "tool_calls/invalid_count": [1, 2],
+            "tool_calls/samples_with_empty_count": [1, 1],
+            "tool_calls/empty_rate": [0.5, 0.25],
+            "tool_calls/invalid_rate": [0.5, 0.5],
+            "tool_calls/samples_with_empty_rate": [0.5, 1 / 3],
+            "tool_calls/output_tokens/mean": [5.0, 12.5],
+            "tool_calls/payload_chars/mean": [10.0, 25.0],
+            "tool_calls/tool_result_tokens/mean": [8.0, 14.0],
+            "tool_calls/empty_calls_per_sample/mean": [0.5, 1 / 3],
+            "tool_calls/invalid_calls_per_sample/mean": [0.5, 2 / 3],
+        }
+
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["tool_calls/empty_rate"] == pytest.approx(2 / 6)
+        assert result["tool_calls/invalid_rate"] == pytest.approx(3 / 6)
+        assert result["tool_calls/samples_with_empty_rate"] == pytest.approx(2 / 5)
+        assert result["tool_calls/output_tokens/mean"] == 10
+        assert result["tool_calls/tool_result_tokens/mean"] == 12.5
+        assert result["tool_calls/empty_calls_per_sample/mean"] == 0.4
 
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}

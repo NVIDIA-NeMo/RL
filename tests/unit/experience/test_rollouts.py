@@ -43,6 +43,7 @@ from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     _calculate_refine_metrics,
     _extract_mask_sample_flags,
+    _tool_call_metrics,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -187,13 +188,62 @@ def test_calculate_refine_metrics_excludes_padding_and_attributes_round_passes()
     assert metrics["refine/round_1/truncation_rate"] == 1.0
 
 
+def test_tool_call_metrics_track_lengths_empty_calls_and_concentration():
+    results = [
+        {
+            "message_log": [
+                {"role": "user", "token_ids": torch.tensor([1, 2])},
+                _assistant_message(
+                    4,
+                    is_tool_call=True,
+                    is_empty_tool_call=False,
+                    tool_call_payload_chars=18,
+                ),
+                {"role": "user", "token_ids": torch.tensor([3, 4, 5])},
+                _assistant_message(
+                    6,
+                    is_invalid_tool_call=True,
+                    is_empty_tool_call=True,
+                    tool_call_payload_chars=0,
+                ),
+                {"role": "user", "token_ids": torch.tensor([6])},
+                _assistant_message(
+                    8,
+                    is_invalid_tool_call=True,
+                    is_empty_tool_call=True,
+                    tool_call_payload_chars=0,
+                ),
+            ]
+        },
+        {
+            "message_log": [
+                {"role": "user", "token_ids": torch.tensor([1])},
+                _assistant_message(2),
+            ]
+        },
+    ]
+
+    metrics = _tool_call_metrics(results, "tool_calls")
+
+    assert metrics["tool_calls/attempt_count"] == 3
+    assert metrics["tool_calls/output_tokens/mean"] == 6
+    assert metrics["tool_calls/output_tokens/min"] == 4
+    assert metrics["tool_calls/output_tokens/max"] == 8
+    assert metrics["tool_calls/tool_result_tokens/mean"] == 2
+    assert metrics["tool_calls/empty_count"] == 2
+    assert metrics["tool_calls/empty_rate"] == pytest.approx(2 / 3)
+    assert metrics["tool_calls/empty_calls_per_sample/mean"] == 1
+    assert metrics["tool_calls/samples_with_empty_rate"] == 0.5
+    assert metrics["tool_calls/max_consecutive_empty_calls/max"] == 2
+
+
 def test_calculate_refine_metrics_ignores_non_refine_results():
     assert (
         _calculate_refine_metrics(
             [{"full_result": {"reward": 1.0}, "message_log": []}], 100
         )
         == {}
-)
+    )
 
 
 def test_extract_mask_sample_flags():
@@ -208,9 +258,7 @@ def test_extract_mask_sample_flags():
     mask_sample = _extract_mask_sample_flags(results)
 
     assert mask_sample.dtype == torch.bool
-    assert torch.equal(
-        mask_sample, torch.tensor([True, False, False, False, False])
-    )
+    assert torch.equal(mask_sample, torch.tensor([True, False, False, False, False]))
 
 
 @pytest.fixture(scope="function")

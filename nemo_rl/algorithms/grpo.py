@@ -90,6 +90,8 @@ from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
+MAX_LOGPROB_QUANTILE_SAMPLES = 200_000
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
@@ -1593,10 +1595,45 @@ def compute_and_apply_seq_logprob_error_masking(
         max_seq_mult_prob_error = valid_errors.max().item()
         mean_seq_mult_prob_error = valid_errors.mean().item()
         min_seq_mult_prob_error = valid_errors.min().item()
+        seq_mult_prob_error_p50 = torch.quantile(valid_errors.float(), 0.50).item()
+        seq_mult_prob_error_p95 = torch.quantile(valid_errors.float(), 0.95).item()
+        seq_mult_prob_error_p99 = torch.quantile(valid_errors.float(), 0.99).item()
     else:
         max_seq_mult_prob_error = 0.0
         mean_seq_mult_prob_error = 0.0
         min_seq_mult_prob_error = 0.0
+        seq_mult_prob_error_p50 = 0.0
+        seq_mult_prob_error_p95 = 0.0
+        seq_mult_prob_error_p99 = 0.0
+
+    valid_token_errors = lp_error[mask.bool()].float()
+    if valid_token_errors.numel() > 0:
+        token_abs_logprob_error_max = valid_token_errors.max().item()
+        quantile_stride = max(
+            math.ceil(valid_token_errors.numel() / MAX_LOGPROB_QUANTILE_SAMPLES),
+            1,
+        )
+        quantile_errors = valid_token_errors[::quantile_stride]
+        token_abs_logprob_error_p50 = torch.quantile(quantile_errors, 0.50).item()
+        token_abs_logprob_error_p95 = torch.quantile(quantile_errors, 0.95).item()
+        token_abs_logprob_error_p99 = torch.quantile(quantile_errors, 0.99).item()
+        token_abs_logprob_error_gt_0_1_pct = (
+            100 * (valid_token_errors > 0.1).float().mean().item()
+        )
+        token_abs_logprob_error_gt_1_pct = (
+            100 * (valid_token_errors > 1.0).float().mean().item()
+        )
+        token_abs_logprob_error_gt_2_pct = (
+            100 * (valid_token_errors > 2.0).float().mean().item()
+        )
+    else:
+        token_abs_logprob_error_max = 0.0
+        token_abs_logprob_error_p50 = 0.0
+        token_abs_logprob_error_p95 = 0.0
+        token_abs_logprob_error_p99 = 0.0
+        token_abs_logprob_error_gt_0_1_pct = 0.0
+        token_abs_logprob_error_gt_1_pct = 0.0
+        token_abs_logprob_error_gt_2_pct = 0.0
 
     # Apply sequence-level masking if configured
     num_masked_seqs = 0
@@ -1661,6 +1698,16 @@ def compute_and_apply_seq_logprob_error_masking(
         "max_seq_mult_prob_error": max_seq_mult_prob_error,
         "mean_seq_mult_prob_error": mean_seq_mult_prob_error,
         "min_seq_mult_prob_error": min_seq_mult_prob_error,
+        "seq_mult_prob_error_p50": seq_mult_prob_error_p50,
+        "seq_mult_prob_error_p95": seq_mult_prob_error_p95,
+        "seq_mult_prob_error_p99": seq_mult_prob_error_p99,
+        "token_abs_logprob_error_max": token_abs_logprob_error_max,
+        "token_abs_logprob_error_p50": token_abs_logprob_error_p50,
+        "token_abs_logprob_error_p95": token_abs_logprob_error_p95,
+        "token_abs_logprob_error_p99": token_abs_logprob_error_p99,
+        "token_abs_logprob_error_gt_0_1_pct": token_abs_logprob_error_gt_0_1_pct,
+        "token_abs_logprob_error_gt_1_pct": token_abs_logprob_error_gt_1_pct,
+        "token_abs_logprob_error_gt_2_pct": token_abs_logprob_error_gt_2_pct,
         "max_seq_mult_prob_error_after_mask": max_seq_mult_prob_error_after_mask,
         "mean_seq_mult_prob_error_after_mask": mean_seq_mult_prob_error_after_mask,
         "min_seq_mult_prob_error_after_mask": min_seq_mult_prob_error_after_mask,
@@ -2878,6 +2925,48 @@ def aggregate_rollout_metrics(
             aggregated[f"{prefix}/{metric_name}/mean"] = (
                 aggregated[f"{prefix}/{count_name}"] / active_count
                 if active_count
+                else math.nan
+            )
+
+    # Tool-call diagnostics use counts as stable cross-group denominators. This
+    # avoids averaging per-group rates when refine rounds have different active
+    # sample counts.
+    tool_call_prefixes = {
+        key.removesuffix("/attempt_count")
+        for key in aggregated
+        if key.endswith("/tool_calls/attempt_count")
+        or key == "tool_calls/attempt_count"
+    }
+    for prefix in tool_call_prefixes:
+        attempt_count = aggregated[f"{prefix}/attempt_count"]
+        sample_count = aggregated[f"{prefix}/sample_count"]
+        payload_count = aggregated[f"{prefix}/payload_count"]
+        tool_result_count = aggregated[f"{prefix}/tool_result_count"]
+        aggregated[f"{prefix}/empty_rate"] = (
+            aggregated[f"{prefix}/empty_count"] / attempt_count
+            if attempt_count
+            else math.nan
+        )
+        aggregated[f"{prefix}/invalid_rate"] = (
+            aggregated[f"{prefix}/invalid_count"] / attempt_count
+            if attempt_count
+            else math.nan
+        )
+        aggregated[f"{prefix}/samples_with_empty_rate"] = (
+            aggregated[f"{prefix}/samples_with_empty_count"] / sample_count
+            if sample_count
+            else math.nan
+        )
+        for metric_name, numerator, denominator in (
+            ("output_tokens", "output_token_count", attempt_count),
+            ("payload_chars", "payload_char_count", payload_count),
+            ("tool_result_tokens", "tool_result_token_count", tool_result_count),
+            ("empty_calls_per_sample", "empty_count", sample_count),
+            ("invalid_calls_per_sample", "invalid_count", sample_count),
+        ):
+            aggregated[f"{prefix}/{metric_name}/mean"] = (
+                aggregated[f"{prefix}/{numerator}"] / denominator
+                if denominator
                 else math.nan
             )
     return aggregated

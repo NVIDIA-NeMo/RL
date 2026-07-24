@@ -1106,6 +1106,118 @@ def _calculate_single_metric(
     }
 
 
+def _tool_call_metrics(results: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    """Summarize tool-call shape and empty-call concentration.
+
+    Tool-call output length measures model-emitted assistant tokens. Tool-result
+    length measures the next prompt delta after a call, which includes the tool
+    observation and its chat-template framing.
+    """
+    sample_observations = []
+    for result in results:
+        output_tokens = []
+        payload_chars = []
+        tool_result_tokens = []
+        empty_count = 0
+        invalid_count = 0
+        consecutive_empty = 0
+        max_consecutive_empty = 0
+        awaiting_tool_result = False
+
+        for message in result["message_log"]:
+            if message["role"] != "assistant":
+                if awaiting_tool_result:
+                    tool_result_tokens.append(len(message["token_ids"]))
+                    awaiting_tool_result = False
+                continue
+
+            is_tool_call = bool(message.get("is_tool_call")) or bool(
+                message.get("is_invalid_tool_call")
+            )
+            if not is_tool_call:
+                consecutive_empty = 0
+                continue
+
+            output_tokens.append(len(message["token_ids"]))
+            payload_size = message.get("tool_call_payload_chars")
+            if payload_size is not None:
+                payload_chars.append(int(payload_size))
+
+            is_empty = bool(message.get("is_empty_tool_call"))
+            empty_count += int(is_empty)
+            invalid_count += int(bool(message.get("is_invalid_tool_call")))
+            consecutive_empty = consecutive_empty + 1 if is_empty else 0
+            max_consecutive_empty = max(max_consecutive_empty, consecutive_empty)
+            awaiting_tool_result = True
+
+        sample_observations.append(
+            {
+                "output_tokens": output_tokens,
+                "payload_chars": payload_chars,
+                "tool_result_tokens": tool_result_tokens,
+                "empty_count": empty_count,
+                "invalid_count": invalid_count,
+                "max_consecutive_empty": max_consecutive_empty,
+            }
+        )
+
+    sample_count = len(sample_observations)
+    all_output_tokens = [
+        value for obs in sample_observations for value in obs["output_tokens"]
+    ]
+    all_payload_chars = [
+        value for obs in sample_observations for value in obs["payload_chars"]
+    ]
+    all_tool_result_tokens = [
+        value for obs in sample_observations for value in obs["tool_result_tokens"]
+    ]
+    empty_counts = [obs["empty_count"] for obs in sample_observations]
+    invalid_counts = [obs["invalid_count"] for obs in sample_observations]
+    max_consecutive_empty = [
+        obs["max_consecutive_empty"] for obs in sample_observations
+    ]
+
+    attempt_count = len(all_output_tokens)
+    empty_count = sum(empty_counts)
+    invalid_count = sum(invalid_counts)
+    samples_with_empty_count = sum(count > 0 for count in empty_counts)
+    metrics: dict[str, Any] = {
+        f"{prefix}/sample_count": sample_count,
+        f"{prefix}/attempt_count": attempt_count,
+        f"{prefix}/output_token_count": sum(all_output_tokens),
+        f"{prefix}/payload_count": len(all_payload_chars),
+        f"{prefix}/payload_char_count": sum(all_payload_chars),
+        f"{prefix}/tool_result_count": len(all_tool_result_tokens),
+        f"{prefix}/tool_result_token_count": sum(all_tool_result_tokens),
+        f"{prefix}/empty_count": empty_count,
+        f"{prefix}/invalid_count": invalid_count,
+        f"{prefix}/samples_with_empty_count": samples_with_empty_count,
+        f"{prefix}/empty_rate": (
+            empty_count / attempt_count if attempt_count else math.nan
+        ),
+        f"{prefix}/invalid_rate": (
+            invalid_count / attempt_count if attempt_count else math.nan
+        ),
+        f"{prefix}/samples_with_empty_rate": (
+            samples_with_empty_count / sample_count if sample_count else math.nan
+        ),
+    }
+
+    for values, metric_name in (
+        (all_output_tokens, "output_tokens"),
+        (all_payload_chars, "payload_chars"),
+        (all_tool_result_tokens, "tool_result_tokens"),
+        (empty_counts, "empty_calls_per_sample"),
+        (invalid_counts, "invalid_calls_per_sample"),
+        (max_consecutive_empty, "max_consecutive_empty_calls"),
+    ):
+        if values:
+            metrics.update(
+                _calculate_single_metric(values, len(values), f"{prefix}/{metric_name}")
+            )
+    return metrics
+
+
 def _calculate_refine_metrics(
     results: list[dict[str, Any]], max_total_tokens_per_sample: int
 ) -> dict[str, Any]:
@@ -1165,6 +1277,7 @@ def _calculate_refine_metrics(
                 f"{prefix}/tool_call_success_rate": math.nan,
             }
         )
+        metrics.update(_tool_call_metrics(active_results, f"{prefix}/tool_calls"))
 
         if not active_results:
             continue
@@ -1393,6 +1506,7 @@ def run_async_nemo_gym_rollout(
             # )
             # / batch_size,
         }
+        rollout_metrics.update(_tool_call_metrics(results, "tool_calls"))
         rollout_metrics.update(
             _calculate_refine_metrics(results, max_total_tokens_per_sample)
         )
