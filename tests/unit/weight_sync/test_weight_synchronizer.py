@@ -230,9 +230,7 @@ class TestIPCWeightSynchronizer:
 # SGLangColocatedWeightSynchronizer
 # ---------------------------------------------------------------------------
 
-_SGLANG_REFIT_DRIVER = (
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.refit_sglang_colocated"
-)
+_SGLANG_REFIT_DRIVER = "nemo_rl.weight_sync.dtensor_sglang_refit.refit_sglang_colocated"
 
 
 class TestSGLangColocatedWeightSynchronizer:
