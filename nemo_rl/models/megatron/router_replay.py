@@ -67,6 +67,86 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     _install_missing_route_fallback_patch()
 
 
+def validate_router_replay_startup(
+    policy_config: PolicyConfig,
+    *,
+    data_plane_enabled: bool = False,
+    using_nemo_gym: bool = False,
+    async_rollouts: bool = False,
+) -> None:
+    """Fail-fast, driver-side router-replay validation (config only, no mcore).
+
+    validate_router_replay_config runs only inside the Megatron worker setup, so
+    configurations that never reach it fail silently or deep into the run. This
+    catches them at startup instead:
+      - a non-Megatron policy backend captures and transports routes but never
+        replays them (silent no-op R3 at full cost);
+      - MTP inner routers reuse main-model layer numbers and would silently
+        receive main-layer replay payloads;
+      - NeMo-Gym over the sync TQ dataplane is an untested route transport;
+      - a dense (non-MoE) model can never produce routed experts and previously
+        only failed at first generation.
+    """
+    if not router_replay_enabled(policy_config):
+        return
+
+    generation = policy_config.get("generation") or {}
+    megatron_cfg = policy_config.get("megatron_cfg") or {}
+    dtensor_cfg = policy_config.get("dtensor_cfg") or {}
+
+    if generation.get("backend") != "vllm":
+        raise ValueError("router_replay.enabled requires vLLM generation.")
+    if dtensor_cfg.get("enabled", False) or not megatron_cfg.get("enabled", False):
+        raise ValueError(
+            "router_replay.enabled requires the Megatron policy backend. With the "
+            "DTensor/automodel backend, routed experts are captured and "
+            "transported but never replayed, so R3 silently does nothing while "
+            "paying its full cost."
+        )
+    if int(megatron_cfg.get("mtp_num_layers") or 0) > 0:
+        raise ValueError(
+            "router_replay.enabled does not support MTP (mtp_num_layers>0): MTP "
+            "inner routers reuse main-model layer numbers and would silently "
+            "replay main-layer routes."
+        )
+    if using_nemo_gym and data_plane_enabled and not async_rollouts:
+        raise NotImplementedError(
+            "router_replay.enabled with NeMo-Gym over the sync TQ dataplane "
+            "(data_plane.enabled=true) is not a tested transport for routed "
+            "experts. Use data_plane.enabled=false with NeMo-Gym."
+        )
+    _validate_model_is_moe(policy_config)
+
+
+def _validate_model_is_moe(policy_config: PolicyConfig) -> None:
+    """Raise if the policy model config is loadable and clearly has no routed experts."""
+    model_name = policy_config.get("model_name")
+    if not model_name:
+        return
+    # Deferred import: transformers config loading is only needed for this check.
+    from transformers import AutoConfig
+
+    try:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except (OSError, ValueError):
+        # Best-effort check: an unloadable config here will fail loudly later in
+        # model setup, with better context than we could add now.
+        return
+    for owner in (hf_config, getattr(hf_config, "text_config", None)):
+        if owner is None:
+            continue
+        for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+            value = getattr(owner, attr, None)
+            if isinstance(value, int) and value > 0:
+                return
+    raise ValueError(
+        f"router_replay.enabled requires a MoE model, but '{model_name}' has no "
+        "routed-expert count in its config (checked num_experts, "
+        "n_routed_experts, num_local_experts). Disable policy.router_replay for "
+        "dense models."
+    )
+
+
 def _iter_model_modules(model: Any) -> Iterable[Any]:
     if isinstance(model, (list, tuple)):
         for item in model:

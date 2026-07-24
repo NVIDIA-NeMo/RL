@@ -119,3 +119,102 @@ def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
     for message in result["message_log"]:
         if "routed_experts" in message:
             assert message["routed_experts"].dtype == torch.int8
+
+
+def _routes_from(num_tokens: int, base: int) -> list[list[list[int]]]:
+    return [
+        [[base + token_idx, base + token_idx + 100]] for token_idx in range(num_tokens)
+    ]
+
+
+def _two_turn_result() -> dict:
+    return {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                    "routed_experts": _routes_from(3, 0),
+                },
+                {
+                    "prompt_token_ids": [1, 2, 3, 4, 5],
+                    "generation_token_ids": [6, 7],
+                    "generation_log_probs": [-0.2, -0.3],
+                    "routed_experts": _routes_from(7, 1000),
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+
+class _R3MockSelf:
+    cfg = {"require_routed_experts": True}
+
+
+def _postprocess(result):
+    return (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _R3MockSelf(), result, _Tokenizer()
+        )
+    )
+
+
+def test_prev_turn_final_token_route_spliced_from_next_turn_prefill():
+    message_log = _postprocess(_two_turn_result())["message_log"]
+
+    turn1_assistant = message_log[1]
+    # Turn-1 assistant covers global position 2 only (token id 3). Its route row
+    # was the placeholder from turn 1; the splice must replace it with turn 2's
+    # real prefill row at global position 2.
+    assert turn1_assistant["routed_experts"].tolist() == _routes_from(7, 1000)[2:3]
+    # Turn-2 assistant (final turn) keeps its own rows untouched — the last
+    # position placeholder is unavoidable for the final turn.
+    turn2_assistant = message_log[3]
+    assert turn2_assistant["routed_experts"].tolist() == _routes_from(7, 1000)[5:7]
+
+
+def test_single_turn_final_token_route_unchanged():
+    result = _two_turn_result()
+    result["response"]["output"] = result["response"]["output"][:1]
+    message_log = _postprocess(result)["message_log"]
+    assert message_log[1]["routed_experts"].tolist() == _routes_from(3, 0)[2:3]
+
+
+def test_surplus_route_rows_raise():
+    # expected tokens for turn 2 = 7; any surplus is an exact-count mismatch.
+    result = _two_turn_result()
+    result["response"]["output"][1]["routed_experts"] = _routes_from(8, 1000)
+    with pytest.raises(ValueError, match="row count does not match"):
+        _postprocess(result)
+
+
+def test_too_few_route_rows_raise():
+    result = _two_turn_result()
+    result["response"]["output"][1]["routed_experts"] = _routes_from(6, 1000)
+    with pytest.raises(ValueError, match="row count does not match"):
+        _postprocess(result)
+
+
+def test_missing_routes_on_one_item_are_sentinel_filled_not_fatal():
+    # One healthy item (provides the [layers, topk] shape) plus one trace-less
+    # item (Gym's error-recovery dummy). The dummy must be sentinel-filled, not
+    # crash the run.
+    result = _two_turn_result()
+    result["response"]["output"][1].pop("routed_experts")
+    message_log = _postprocess(result)["message_log"]
+    # turn-2 (dummy) assistant message: routes are all the -1 sentinel.
+    dummy_assistant = message_log[3]
+    routes = dummy_assistant["routed_experts"]
+    assert (routes == -1).all()
+    # shape borrowed from the healthy sibling: [layers=1, topk=2] per _routes_from.
+    assert routes.shape[1:] == (1, 2)
+
+
+def test_all_items_missing_routes_still_raises():
+    result = _two_turn_result()
+    for item in result["response"]["output"]:
+        item.pop("routed_experts")
+    with pytest.raises(ValueError, match="no item in the batch carried them"):
+        _postprocess(result)
