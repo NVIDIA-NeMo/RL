@@ -89,9 +89,6 @@ class _TQActor:
             sample_ids=sample_ids, partition_id=partition_id
         )
 
-    def claim_meta(self, **kwargs: Any) -> Any:
-        return self._client.claim_meta(**kwargs)
-
     def get_tags(
         self, partition_id: str, sample_ids: list[str]
     ) -> list[dict[str, Any]]:
@@ -100,6 +97,9 @@ class _TQActor:
 
     def peek_count(self, partition_id: str) -> int:
         return len(self._client._partitions[partition_id].rows)
+
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        return list(self._client._partitions[partition_id].rows.keys())
 
 
 class _SyncDPAdapter:
