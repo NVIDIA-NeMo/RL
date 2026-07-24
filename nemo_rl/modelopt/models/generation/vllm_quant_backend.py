@@ -178,16 +178,24 @@ def _batch_fused_modelopt_moe_weights(
                     f"Expected fused gate/up tensor with an even projection "
                     f"dimension for {name}, got {tuple(tensor.shape)}"
                 )
+            # Emit per-expert 2-D shards rather than batched 3-D tensors:
+            # gated models (e.g. Qwen3-MoE) route batched tensors through
+            # vLLM 0.25's RoutedExperts.load_weights fused branch, whose
+            # orientation heuristic compares the last dim against the
+            # unpacked hidden size and mis-transposes packed NVFP4 weights
+            # (K/2 uint8) and block scales (K/16). Per-expert 2-D loads take
+            # the same weight_loader path as the initial disk load.
             gate, up = tensor.chunk(2, dim=1)
             batched.extend(
                 (
-                    f"{prefix}.experts.0.{projection}.{target_suffix}",
-                    shard,
+                    f"{prefix}.experts.{expert_id}.{projection}.{target_suffix}",
+                    expert_weight,
                 )
                 for projection, shard in (
                     ("gate_proj", gate),
                     ("up_proj", up),
                 )
+                for expert_id, expert_weight in enumerate(shard.unbind(0))
             )
             continue
 

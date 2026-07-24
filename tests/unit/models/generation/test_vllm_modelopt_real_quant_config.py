@@ -1195,6 +1195,74 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
         extension.prepare_refit_info(state_dict_info)
 
 
+def test_real_quant_load_weights_expands_gated_experts_per_expert(monkeypatch):
+    """Gated fused W13 tensors must be split into per-expert 2-D shards.
+
+    Batched 3-D tensors would route through vLLM 0.25's
+    RoutedExperts.load_weights fused branch, whose orientation heuristic
+    mis-transposes packed NVFP4 weights and block scales.
+    """
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    class ModelOptNvFp4FusedMoE:
+        quant_config = types.SimpleNamespace(get_name=lambda: NEMO_MODELOPT_W4A16)
+
+    model = torch.nn.Module()
+    model.moe = torch.nn.Module()
+    model.moe.quant_method = ModelOptNvFp4FusedMoE()
+    model.moe._expert_map = None
+    model.moe.local_num_experts = 2
+    model.moe.global_num_experts = 2
+
+    prefix = "model.layers.0.mlp"
+    w13_weight = torch.arange(24, dtype=torch.uint8).reshape(2, 4, 3)
+    w13_scale = torch.arange(8, dtype=torch.uint8).reshape(2, 4, 1)
+    state_dict_info = {
+        f"{prefix}.experts.w13_weight": ((2, 4, 3), torch.uint8),
+        f"{prefix}.experts.w13_weight_scale": ((2, 4, 1), torch.uint8),
+        f"{prefix}.experts.w13_weight_scale_2": ((2, 2), torch.float32),
+        f"{prefix}.experts.w2_weight": ((2, 3, 2), torch.uint8),
+        f"{prefix}.experts.w2_weight_scale": ((2, 3, 1), torch.uint8),
+        f"{prefix}.experts.w2_weight_scale_2": ((2,), torch.float32),
+    }
+
+    assert backend._w13_num_shards_from_state_dict_info(state_dict_info) == {prefix: 2}
+
+    forwarded = []
+    extension = _make_real_quant_extension(backend, model, [])
+    extension.prepare_refit_info(state_dict_info)
+    extension._nrl_w13_num_shards_by_prefix = {prefix: 2}
+    _patch_real_quant_load(monkeypatch, backend, forwarded)
+    assert (
+        extension._load_weights(
+            [
+                (f"{prefix}.experts.w13_weight", w13_weight),
+                (f"{prefix}.experts.w13_weight_scale", w13_scale),
+            ]
+        )
+        == "loaded"
+    )
+
+    assert [name for name, _ in forwarded] == [
+        f"{prefix}.experts.0.gate_proj.weight",
+        f"{prefix}.experts.1.gate_proj.weight",
+        f"{prefix}.experts.0.up_proj.weight",
+        f"{prefix}.experts.1.up_proj.weight",
+        f"{prefix}.experts.0.gate_proj.weight_scale",
+        f"{prefix}.experts.1.gate_proj.weight_scale",
+        f"{prefix}.experts.0.up_proj.weight_scale",
+        f"{prefix}.experts.1.up_proj.weight_scale",
+    ]
+    for _, tensor in forwarded:
+        assert tensor.ndim == 2
+    torch.testing.assert_close(forwarded[0][1], w13_weight[0, :2])
+    torch.testing.assert_close(forwarded[1][1], w13_weight[1, :2])
+    torch.testing.assert_close(forwarded[2][1], w13_weight[0, 2:])
+    torch.testing.assert_close(forwarded[3][1], w13_weight[1, 2:])
+    torch.testing.assert_close(forwarded[4][1], w13_scale[0, :2])
+    torch.testing.assert_close(forwarded[7][1], w13_scale[1, 2:])
+
+
 def test_real_quant_load_weights_forwards_ignored_float_weights(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
