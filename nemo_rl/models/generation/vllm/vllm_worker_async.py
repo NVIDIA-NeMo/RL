@@ -466,6 +466,10 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.openai.responses.api_router import (
+            attach_router as attach_responses_router,
+        )
+        from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -817,6 +821,45 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        ########################################
+        # /v1/responses endpoints
+        ########################################
+
+        class NeMoRLOpenAIServingResponses(OpenAIServingResponses):
+            async def create_responses(self, request, raw_request=None):
+                # Match BaseVllmGenerationWorker._build_sampling_params and the
+                # Chat Completions endpoint above. Divergent sampling parameters
+                # make rollouts off-policy and can destabilize training.
+                assert request.top_k in (None, -1), (
+                    "Top k sampling parameter must be unset, empty, or -1. "
+                    f"Got `{request.top_k}`"
+                )
+                request.top_k = -1
+                assert request.temperature == generation_config["temperature"]
+                assert request.top_p == generation_config["top_p"]
+
+                return await super().create_responses(request, raw_request)
+
+        serving_responses_kwargs = dict(
+            engine_client=engine_client,
+            models=openai_serving_models,
+            openai_serving_render=openai_serving_render,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+            return_tokens_as_token_ids=True,
+            reasoning_parser=serving_chat_kwargs.get("reasoning_parser") or "",
+            enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
+            tool_parser=serving_chat_kwargs.get("tool_parser"),
+        )
+        openai_serving_responses = NeMoRLOpenAIServingResponses(
+            **serving_responses_kwargs
+        )
+        app.state.openai_serving_responses = openai_serving_responses
+        attach_responses_router(app)
 
         ########################################
         # /tokenize endpoint

@@ -134,10 +134,17 @@ The flow is:
 |--------|---------------------|----------------------|
 | **Engine** | Runs actual vLLM `AsyncLLM` | No engine - HTTP proxy only |
 | **GPU** | Holds model weights | No GPU required |
-| **Endpoints** | `/v1/chat/completions`, `/tokenize` | `/v1/responses` |
+| **Endpoints** | `/v1/chat/completions`, `/v1/responses`, `/tokenize` | `/v1/responses` |
 | **Role** | Inference | API translation, forwards requests |
 
 Data parallel vLLM workers each expose their own HTTP server. NeMo Gym's Model Server load-balances requests across them.
+
+The vLLM worker mounts vLLM's native Responses API, including create,
+retrieve, and cancel routes. The default NeMo Gym training path still translates
+Responses requests to Chat Completions because its on-policy correction contract
+requires selected-token logprobs. In vLLM 0.20, GPT-OSS Responses requests do not
+support output logprobs, so native GPT-OSS Responses serving cannot yet provide
+the complete token-ID and logprob payload required for GRPO training.
 
 ## Initialization Sequence
 
