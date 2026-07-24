@@ -47,6 +47,10 @@ if [[ "${NEMO_RL_COMMIT:-<unknown>}" != "$ROOT_COMMIT" ]]; then
     echo "[ERROR] Container commit ${NEMO_RL_COMMIT:-<unknown>} does not match checkout $ROOT_COMMIT"
     exit 1
 fi
+if [[ "$ROOT_COMMIT" == "<unknown>" ]]; then
+    echo "[ERROR] Set NEMO_RL_COMMIT when running a source snapshot without git metadata"
+    exit 1
+fi
 if [[ "$PINNED_GYM_COMMIT" == "<unknown>" ]]; then
     echo "[ERROR] Set NEMO_GYM_COMMIT when running a source snapshot without git metadata"
     exit 1

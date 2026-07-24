@@ -340,6 +340,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = args.handler(args)
     except (CheckError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
+        if exc.__cause__ is not None:
+            print(f"[ERROR] cause: {exc.__cause__!r}", file=sys.stderr)
         return 1
     _write_summary(summary, args.output)
     return 0
