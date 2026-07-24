@@ -355,6 +355,17 @@ class SingleControllerActor:
                     # wait for rollout to be permitted
                     await self._rollout_permitted.wait()
 
+                    print(
+                        f"pump_dispatch: t={time.monotonic():.3f} "
+                        f"inflight={self._inflight_rollouts} "
+                        f"sem_avail={sem._value} "
+                        f"buf_cap_avail={self._buffer_capacity._value} "
+                        f"max_rollout_v={self._max_rollout_version} "
+                        f"trainer_v={self._trainer_version} "
+                        f"weight_v={self._rollout_manager._weight_version}",
+                        flush=True,
+                    )
+                    
                     # dispatch rollout
                     task = asyncio.create_task(
                         _dispatch_one_prompt(prompt, target_step)
