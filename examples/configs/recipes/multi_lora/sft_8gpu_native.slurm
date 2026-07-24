@@ -1,13 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# 2026-07-23 — Multi-LoRA SFT, NeMo-RL NATIVE launcher (no nousnet anywhere)
-# 1 node x 8 GPUs, DTensor v2. The multi-adapter implementation is the package
-# vendored at nemo_rl/models/multi_lora in this worktree (RL_multilora_native,
-# branch phuc/multilora-native-nemorl); entry = examples/run_sft_multi_lora.py.
+# Standalone Multi-LoRA SFT launcher for NeMo-RL (1 node x 8 GPUs, DTensor v2).
+# All source and launch infrastructure come from this checkout. NeMo Automodel
+# remains NeMo-RL's normal package/submodule dependency; the four required
+# Multi-LoRA integration files are carried under patches/automodel in this repo.
 # Usage: sbatch --export=ALL,CFG=<abs-or-rel-config> [-J name] this.slurm
 # =============================================================================
 #SBATCH --partition=batch
-#SBATCH --chdir=/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
@@ -23,26 +22,45 @@ if [[ -z "${CFG:-}" ]]; then
     exit 1
 fi
 
-NATIVE_DIR="${NATIVE_DIR:-/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/RL_multilora_native}"
-HOST_AUTOMODEL_DIR="${HOST_AUTOMODEL_DIR:-/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/Automodel_container_base}"
+# Resolve the checkout from the submitted script path. SLURM copies scripts to
+# its spool, so BASH_SOURCE alone is not stable after submission; NATIVE_DIR is
+# an explicit override for nonstandard launchers.
+if [[ -n "${NATIVE_DIR:-}" ]]; then
+    REPO_ROOT="$(cd -- "${NATIVE_DIR}" && pwd)"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/nemo_rl/__init__.py" ]]; then
+    REPO_ROOT="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd)"
+else
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
+fi
+NATIVE_DIR="${REPO_ROOT}"
 cd "${NATIVE_DIR}"
 case "${CFG}" in
   /*) CFG_ABS="${CFG}" ;;
   *)  CFG_ABS="${NATIVE_DIR}/${CFG}" ;;
 esac
 
-NEMO_RL_SOURCE="${NEMO_RL_SOURCE:-/home/phuc/workspace/rl/small_prs/pr001_tinker_mvp/nousnet_pre_multilora_8178f9c/slurm_helpers}"
-CONTAINER="${NOUSNET_CONTAINER:-/home/shared/containers/nemo-rl-super-v3.sqsh}"
+# The stock repo-root ray.sub assumes an --mpi=pmix cluster; this recipe ships
+# a cluster-adapted copy (pmi2, dynamic Ray ports, NCCL IB env) next to the
+# launcher so the whole launch path is tracked in this repository.
+RAY_SUB="${RAY_SUB:-${NATIVE_DIR}/examples/configs/recipes/multi_lora/ray.sub}"
+CONTAINER="${CONTAINER:-/home/shared/containers/nemo-rl-super-v3.sqsh}"
+HF_HOME_HOST="${HF_HOME_HOST:-${HOME}/.cache/huggingface}"
 RUN_TAG="${SLURM_JOB_NAME:-mlnative}-${SLURM_JOB_ID:-local}"
 EXP_DIR="${NATIVE_DIR}/results/${RUN_TAG}"
 mkdir -p "${EXP_DIR}"
+
+for required in "${RAY_SUB}" "${CONTAINER}" "${CFG_ABS}"; do
+    [[ -e "${required}" ]] || { echo "ERROR: required path missing: ${required}" >&2; exit 1; }
+done
+mkdir -p "${HF_HOME_HOST}"
 
 cp -f "${CFG_ABS}" "${EXP_DIR}/config.yaml"
 
 INNER_CMD="
 set -eoux pipefail
 cd /opt/nemo-rl
-echo '>>> Overlaying NATIVE multi-lora branch onto container /opt/nemo-rl (no nousnet)'
+echo '>>> Overlaying this NeMo-RL Multi-LoRA checkout onto container /opt/nemo-rl'
 cp -f ${NATIVE_DIR}/nemo_rl/algorithms/sft.py /opt/nemo-rl/nemo_rl/algorithms/sft.py
 cp -f ${NATIVE_DIR}/nemo_rl/algorithms/loss_functions.py /opt/nemo-rl/nemo_rl/algorithms/loss_functions.py
 cp -f ${NATIVE_DIR}/nemo_rl/data/processors.py /opt/nemo-rl/nemo_rl/data/processors.py
@@ -61,10 +79,23 @@ md5sum /opt/nemo-rl/nemo_rl/models/policy/workers/dtensor_policy_worker_v2.py /o
 python - <<'EOF'
 import importlib.util, sys
 assert importlib.util.find_spec('nousnet') is None, 'nousnet is importable inside the container — NOT a clean native run'
-print('CLEAN: nousnet not importable')
+print('STANDALONE_OK: nousnet not importable')
+EOF
+python - <<'EOF'
+from pathlib import Path
+root = Path('/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel')
+checks = {
+    'multi_dispatch': (root / 'components/_peft/lora.py', 'from nemo_rl.models.multi_lora.adapter import MultiLinearLoRA'),
+    'shard_hint': (root / 'components/distributed/parallelizer_utils.py', 'def attr_shard_placement_fn'),
+    'checkpoint_restore': (root / 'components/checkpoint/checkpointing.py', 'missing'),
+}
+for name, (path, marker) in checks.items():
+    text = path.read_text(encoding='utf-8')
+    assert marker in text, f'Automodel integration check failed: {name} ({path})'
+print('AUTOMODEL_INTEGRATION_OK: repo-contained patches active')
 EOF
 pip install 'numpy<2' -q 2>&1 | tail -2 || true
-export HF_HOME=/home/id_ed25519_nous_work/.cache/huggingface
+export HF_HOME=${HF_HOME_HOST}
 export NRL_IGNORE_VERSION_MISMATCH=1
 unset PYTORCH_CUDA_ALLOC_CONF || true
 # --- runtime env kept verbatim from the campaign launcher so native runs stay
@@ -110,10 +141,15 @@ echo 'SFT_DONE_OK'
 
 export COMMAND="${INNER_CMD}"
 export CONTAINER
-export MOUNTS="${NEMO_RL_SOURCE}:${NEMO_RL_SOURCE},${NATIVE_DIR}:${NATIVE_DIR},/home/phuc:/home/phuc,/home/id_ed25519_nous_work:/home/id_ed25519_nous_work,/home/mormio/.cache:/home/mormio/.cache,/home/mormio/RL/data:/home/mormio/RL/data,/home/shared:/home/shared"
+MOUNT_ITEMS=("${NATIVE_DIR}:${NATIVE_DIR}" "${HF_HOME_HOST}:${HF_HOME_HOST}")
+for optional_mount in /home/shared /home/phuc /home/mormio/.cache /home/mormio/RL/data; do
+    [[ -e "${optional_mount}" ]] && MOUNT_ITEMS+=("${optional_mount}:${optional_mount}")
+done
+MOUNTS="$(IFS=,; echo "${MOUNT_ITEMS[*]}")"
+export MOUNTS
 export NOUSNET_RAY_DYNAMIC_PORTS="${NOUSNET_RAY_DYNAMIC_PORTS:-1}"
 export GPUS_PER_NODE=8
 export CPUS_PER_WORKER=64
 export BASE_LOG_DIR="${EXP_DIR}"
 
-bash "${NEMO_RL_SOURCE}/ray.sub"
+bash "${RAY_SUB}"
