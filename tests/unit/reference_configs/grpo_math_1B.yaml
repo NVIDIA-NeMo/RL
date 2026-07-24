@@ -16,6 +16,7 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  use_generation_logprobs_as_prev: false
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1

@@ -793,8 +793,9 @@ class StubReplayBuffer:
         """Return a mock that reports whether the current step can train."""
         mock = MagicMock()
         mock.remote = MagicMock(
-            side_effect=lambda _target_step, num_prompts_per_step, *_args: self._size
-            >= num_prompts_per_step
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: (
+                self._size >= num_prompts_per_step
+            )
         )
         return mock
 
@@ -2439,6 +2440,123 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     assert not policy.get_logprobs.called, (
         "policy.get_logprobs was called even though force_on_policy_ratio=True. "
         "This indicates a regression of PR #2177."
+    )
+
+
+def test_grpo_train_reuses_generation_logprobs_as_prev(mock_grpo_components):
+    """Regression test for PR #3295.
+
+    When ``grpo.use_generation_logprobs_as_prev=True``, the vLLM engine's
+    returned generation logprobs already are the importance-sampling behavior
+    policy, so ``grpo_train`` MUST reuse them as ``prev_logprobs`` instead of
+    calling ``policy.get_logprobs`` (which would be a wasted full-batch trainer
+    forward). ``prev_logprobs`` must equal ``generation_logprobs``.
+
+    The reuse path is sync-only; ``async_grpo_train`` does not implement it, so
+    this test is not parametrized over the async trainer.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["use_generation_logprobs_as_prev"] = True
+    # Reuse is only valid in the on-policy, IS-correction-off regime (see the
+    # _validate_generation_logprobs_as_prev guard).
+    master_config.loss_fn.use_importance_sampling_correction = False
+    master_config.grpo["seq_logprob_error_threshold"] = None
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+
+    grpo_save_state = _default_grpo_save_state()
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    policy = mock_grpo_components["policy"]
+
+    with (
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+    ):
+        grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            grpo_save_state,
+            master_config,
+        )
+
+    assert not policy.get_logprobs.called, (
+        "policy.get_logprobs was called even though "
+        "use_generation_logprobs_as_prev=True. The engine's generation logprobs "
+        "should be reused as prev_logprobs. This is a regression of PR #3295."
+    )
+    policy.train.assert_called_once()
+    trained_data = policy.train.call_args[0][0]
+    assert torch.equal(
+        trained_data["prev_logprobs"], trained_data["generation_logprobs"]
+    )
+
+
+def test_validate_generation_logprobs_as_prev_rejects_importance_sampling():
+    """PR #3295 guard: prev==generation collapses the IS weight, so the flag is
+    incompatible with use_importance_sampling_correction (and thus TIS)."""
+    with pytest.raises(AssertionError, match="use_importance_sampling_correction"):
+        _validate_generation_logprobs_as_prev(
+            {"use_generation_logprobs_as_prev": True},
+            ClippedPGLossConfig(use_importance_sampling_correction=True),
+        )
+
+
+def test_validate_generation_logprobs_as_prev_rejects_force_on_policy_ratio():
+    """PR #3295 guard: force_on_policy_ratio overrides prev in the loss, so the
+    reused generation logprobs would be silently ignored."""
+    with pytest.raises(AssertionError, match="force_on_policy_ratio"):
+        _validate_generation_logprobs_as_prev(
+            {"use_generation_logprobs_as_prev": True},
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=False,
+                force_on_policy_ratio=True,
+            ),
+        )
+
+
+def test_validate_generation_logprobs_as_prev_allows_on_policy_no_is():
+    """The one valid regime: on-policy with IS correction and force_on_policy off."""
+    _validate_generation_logprobs_as_prev(
+        {"use_generation_logprobs_as_prev": True},
+        ClippedPGLossConfig(
+            use_importance_sampling_correction=False,
+            force_on_policy_ratio=False,
+        ),
+    )
+
+
+def test_validate_generation_logprobs_as_prev_noop_when_flag_unset():
+    """Guard must not fire when the flag is absent, even with IS correction on."""
+    _validate_generation_logprobs_as_prev(
+        {},
+        ClippedPGLossConfig(use_importance_sampling_correction=True),
     )
 
 
