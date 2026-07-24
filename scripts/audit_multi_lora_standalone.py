@@ -8,11 +8,12 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SELF = Path(__file__).resolve()
 FORBIDDEN_PATHS = (
-    "nousnet_pre_multilora",
-    "Automodel_container_base",
-    "RL_super_v3",
-    "/workspace/nousnet",
+    "nousnet_pre" + "_multilora",
+    "Automodel_container" + "_base",
+    "RL_super" + "_v3",
+    "/workspace/" + "nousnet",
 )
 IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+nousnet(?:\.|\s|$)")
 TEXT_SUFFIXES = {
