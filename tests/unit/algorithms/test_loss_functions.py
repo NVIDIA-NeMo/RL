@@ -38,6 +38,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     cp_load_balanced_to_contiguous,
     cp_shift_next,
+    vocab_parallel_gather_columns,
 )
 
 
@@ -2834,3 +2835,89 @@ def test_split_rescale_matches_sync_normalization():
     assert raw_totals["num_valid_samples"] == pytest.approx(
         sync_totals["num_valid_samples"]
     )
+
+
+# ---------------------------------------------------------------------------
+# vocab_parallel_gather_columns / _direct_topk_kl subset-softmax equivalence
+# (issue #3272): the K-subset renormalization cancels the full-vocab
+# partition function, so gathering K columns and softmaxing within the
+# subset must reproduce the previous full-vocab-log-softmax-then-renorm
+# form exactly — values and gradients.
+# ---------------------------------------------------------------------------
+
+
+def test_vocab_parallel_gather_columns_no_tp():
+    """No-TP path: plain column slice, upcast to fp32."""
+    logits = torch.randn(2, 3, 10, dtype=torch.bfloat16)
+    idx = torch.tensor([1, 4, 7])
+    out = vocab_parallel_gather_columns(logits, idx, tp_group=None)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, logits[..., idx].float())
+
+
+@pytest.mark.parametrize("temperature", [1.0, 2.0])
+def test_subset_softmax_matches_full_vocab_reference(temperature):
+    """log_softmax_K(logits[..., idx] / T) == full log_softmax -> slice ->
+    renorm, for both the forward value and the gradient w.r.t. logits."""
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 2, 6, 64, 8
+    idx = torch.randperm(vocab)[:k].sort().values
+    base = torch.randn(batch, seq, vocab)
+
+    # reference: previous full-vocab formulation
+    ref_logits = base.clone().requires_grad_(True)
+    full = torch.log_softmax(ref_logits.float() / temperature, dim=-1)
+    gathered = full[..., idx]
+    ref = gathered - torch.logsumexp(gathered, dim=-1, keepdim=True)
+
+    # new: subset softmax over gathered columns
+    new_logits = base.clone().requires_grad_(True)
+    new = torch.log_softmax(
+        vocab_parallel_gather_columns(new_logits, idx, tp_group=None) / temperature,
+        dim=-1,
+    )
+
+    torch.testing.assert_close(new, ref, atol=1e-6, rtol=1e-6)
+    ref.sum().backward()
+    new.sum().backward()
+    torch.testing.assert_close(new_logits.grad, ref_logits.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
+    """TP path via an emulated 2-rank group: running the production code per
+    vocab shard and summing (what ``all_reduce(SUM)`` does — each column is
+    owned by exactly one rank) must reproduce the full-logits column slice,
+    and each shard's backward must receive exactly its own columns' grads."""
+    import nemo_rl.distributed.model_utils as mu
+
+    torch.manual_seed(7)
+    batch, seq, vocab, k = 2, 5, 32, 6
+    full = torch.randn(batch, seq, vocab)
+    idx = torch.randperm(vocab)[:k].sort().values
+    v_local = vocab // 2
+    shards = [
+        full[..., :v_local].clone().requires_grad_(True),
+        full[..., v_local:].clone().requires_grad_(True),
+    ]
+
+    outputs = []
+    for rank in (0, 1):
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda g=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda g=None, _r=rank: _r)
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", lambda t, op=None, group=None: None
+        )
+        outputs.append(
+            mu.vocab_parallel_gather_columns(shards[rank], idx, tp_group=object())
+        )
+    combined = outputs[0] + outputs[1]
+
+    truth = full[..., idx].float()
+    torch.testing.assert_close(combined, truth)
+
+    grad_out = torch.randn_like(combined)
+    combined.backward(grad_out)
+    ref = full.clone().requires_grad_(True)
+    ref[..., idx].float().backward(grad_out)
+    torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
+    torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
