@@ -603,9 +603,12 @@ def test_r3_trace_forward_verifier_records_actual_replayed_topk(tmp_path, monkey
 
 
 @pytest.mark.mcore
-def test_missing_route_fallback_patch_is_idempotent_inside_r3_trace_verifier(
+def test_unified_wrapper_install_is_idempotent_inside_r3_trace_verifier(
     tmp_path, monkeypatch
 ):
+    """Ported from the #2963 regression test: installing the wrapper while a trace
+    verifier stage is active must be a no-op, and the installed wrapper must stay
+    the unified one (the old two-patch composition bug cannot recur by design)."""
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
     from nemo_rl.models.megatron import router_replay
@@ -617,20 +620,14 @@ def test_missing_route_fallback_patch_is_idempotent_inside_r3_trace_verifier(
     RouterReplay.clear_global_router_replay_instances()
 
     try:
-        router_replay._install_missing_route_fallback_patch()
-        assert getattr(
-            RouterReplay.get_replay_topk,
-            router_replay._MISSING_ROUTE_FALLBACK_PATCH_ATTR,
-            False,
-        )
+        router_replay._install_get_replay_topk_wrapper()
+        assert RouterReplay.get_replay_topk is router_replay._wrapped_get_replay_topk
 
         with r3_trace_stage("unit-forward"):
-            assert getattr(
-                RouterReplay.get_replay_topk,
-                router_replay._MISSING_ROUTE_FALLBACK_PATCH_ATTR,
-                False,
+            router_replay._install_get_replay_topk_wrapper()
+            assert (
+                RouterReplay.get_replay_topk is router_replay._wrapped_get_replay_topk
             )
-            router_replay._install_missing_route_fallback_patch()
     finally:
         RouterReplay.clear_global_router_replay_instances()
 
@@ -924,7 +921,7 @@ def test_router_replay_missing_route_sentinel_uses_megatron_topk():
     )
 
     from nemo_rl.models.megatron.router_replay import (
-        _install_missing_route_fallback_patch,
+        _install_get_replay_topk_wrapper,
     )
 
     RouterReplay.clear_global_router_replay_instances()
@@ -945,7 +942,7 @@ def test_router_replay_missing_route_sentinel_uses_megatron_topk():
         expected_default = torch.topk(scores, k=2, dim=1).indices
         expected_mixed = torch.stack([target[0], expected_default[1]])
 
-        _install_missing_route_fallback_patch()
+        _install_get_replay_topk_wrapper()
         replay.set_target_indices(target)
         replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         _, forward_indices = replay.get_replay_topk(
@@ -974,7 +971,7 @@ def test_router_replay_backward_queue_is_fifo_across_replayed_microbatches():
     )
 
     from nemo_rl.models.megatron.router_replay import (
-        _install_missing_route_fallback_patch,
+        _install_get_replay_topk_wrapper,
     )
 
     RouterReplay.clear_global_router_replay_instances()
@@ -983,7 +980,7 @@ def test_router_replay_backward_queue_is_fifo_across_replayed_microbatches():
         return torch.topk(scores, k=topk, dim=1)
 
     try:
-        _install_missing_route_fallback_patch()
+        _install_get_replay_topk_wrapper()
         replay = RouterReplay()
         scores_0 = torch.tensor(
             [
@@ -1077,3 +1074,75 @@ def test_clear_global_router_replay_instances_clears_registry():
         assert RouterReplay.global_router_replay_instances == []
     finally:
         RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_get_replay_topk_wrapper_is_idempotent_and_survives_r3_trace_stage(
+    tmp_path, monkeypatch
+):
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        _install_get_replay_topk_wrapper,
+        _reset_router_replay_wrapper_for_tests,
+        _wrapped_get_replay_topk,
+    )
+    from nemo_rl.utils.r3_trace import r3_trace_stage
+
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_VERIFY_FORWARD", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_DIR", str(tmp_path))
+    RouterReplay.clear_global_router_replay_instances()
+    _reset_router_replay_wrapper_for_tests()
+
+    try:
+        _install_get_replay_topk_wrapper()
+        assert RouterReplay.get_replay_topk is _wrapped_get_replay_topk
+
+        _install_get_replay_topk_wrapper()
+        assert RouterReplay.get_replay_topk is _wrapped_get_replay_topk
+
+        with r3_trace_stage("unit-forward"):
+            assert RouterReplay.get_replay_topk is _wrapped_get_replay_topk
+            _install_get_replay_topk_wrapper()
+            assert RouterReplay.get_replay_topk is _wrapped_get_replay_topk
+
+        assert RouterReplay.get_replay_topk is _wrapped_get_replay_topk
+    finally:
+        _reset_router_replay_wrapper_for_tests()
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_replay_fallback_stats_accumulate_and_reset(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    from nemo_rl.models.megatron import router_replay
+
+    monkeypatch.setattr(router_replay, "G_REPLAY_FALLBACK_ROWS", 0)
+    monkeypatch.setattr(router_replay, "G_REPLAY_TOTAL_ROWS", 0)
+    router_replay._install_get_replay_topk_wrapper()
+
+    scores = torch.rand(4, 8)
+    target = torch.tensor([[0, 1], [-1, -1], [2, 3], [-1, -1]])
+    replay_instance = SimpleNamespace(
+        router_replay_action=RouterReplayAction.REPLAY_FORWARD,
+        target_topk_idx=target,
+        replay_backward_list=[target],
+    )
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        values, indices = torch.topk(scores, k=topk, dim=-1)
+        return values, indices
+
+    probs, indices = router_replay._wrapped_get_replay_topk(
+        replay_instance, scores, 2, None, None, default_compute_topk
+    )
+
+    assert indices.shape == (4, 2)
+    assert not indices.eq(-1).any()
+    assert router_replay.consume_replay_fallback_stats() == (2, 4)
+    # drained -> second read is zeroed
+    assert router_replay.consume_replay_fallback_stats() == (0, 0)
