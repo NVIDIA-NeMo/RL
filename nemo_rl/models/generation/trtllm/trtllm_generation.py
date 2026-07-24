@@ -42,6 +42,33 @@ from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 class TrtllmGeneration(GenerationInterface):
     """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
 
+    @staticmethod
+    def init_cluster_placement_groups(
+        cluster: RayVirtualCluster,
+        config: TrtllmConfig,
+    ) -> None:
+        """Pre-initialize placement groups matching TRT-LLM's topology."""
+        trtllm_cfg = config["trtllm_cfg"]
+        tp = trtllm_cfg["tensor_parallel_size"]
+        pp = trtllm_cfg.get("pipeline_parallel_size", 1)
+        assert pp == 1, (
+            "TRT-LLM backend does not support pipeline parallelism yet "
+            f"(pipeline_parallel_size={pp}, must be 1)."
+        )
+        model_parallel_size = tp * pp
+        colocated = bool(config.get("colocated", {}).get("enabled", False))
+
+        needs_cross_node = model_parallel_size > cluster.num_gpus_per_node
+        assert not (needs_cross_node and colocated), (
+            "TRT-LLM cross-node tensor parallelism is only supported for "
+            "non-colocated generation."
+        )
+
+        cluster._init_placement_groups(
+            strategy=None if colocated else "PACK",
+            use_unified_pg=needs_cross_node,
+        )
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -96,24 +123,7 @@ class TrtllmGeneration(GenerationInterface):
             "synchronous engine path (async_engine=false) is no longer supported."
         )
 
-        # Colocated reuses the policy's placement group → no PACK rearrangement.
-        # Non-colocated uses PACK so inference workers cluster together rather
-        # than interleaving with training bundles (SPREAD would emit something
-        # like [[0,3,6],[1,4,7],[2,5]] across nodes, breaking TP placement).
-        strategy = None if self.colocated_enabled else "PACK"
-        # Cross-node TP needs a single unified placement group so workers can
-        # land on bundles spanning node boundaries (e.g. TP=8 on 2x4 GPUs).
-        needs_cross_node_parallelism = (
-            self.model_parallel_size > cluster.num_gpus_per_node
-        )
-        assert not needs_cross_node_parallelism, (
-            f"TRT-LLM backend does not support cross-node tensor parallelism yet "
-            f"(model_parallel_size={self.model_parallel_size} > GPUs/node={cluster.num_gpus_per_node})."
-        )
-        cluster._init_placement_groups(
-            strategy=strategy,
-            use_unified_pg=needs_cross_node_parallelism,
-        )
+        self.init_cluster_placement_groups(cluster, config)
 
         worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
         worker_builder = RayWorkerBuilder(worker_cls, config)
@@ -144,8 +154,8 @@ class TrtllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        # post-init on workers (finishes async engine setup on each worker's
-        # asyncio loop).
+        # post-init on workers (starts HTTP server when expose_http_server=true,
+        # finishes async engine setup for the async worker variant).
         post_init_method = "post_init_async"
         futures = self.worker_group.run_all_workers_single_data(
             post_init_method,
@@ -155,6 +165,8 @@ class TrtllmGeneration(GenerationInterface):
 
         # Round-robin DP shard used by generate_async for per-sample dispatch.
         self.current_generate_dp_shard_idx = 0
+
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
 
         self.device_uuids = self._report_device_id()
 
@@ -216,18 +228,20 @@ class TrtllmGeneration(GenerationInterface):
                     "Unable to allocate any worker groups with the available resources."
                 )
 
-            sorted_nodes = sorted(node_bundles)
-            node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
-
-            flat: list[int] = []
-            for nid in sorted_nodes:
-                flat.extend(node_bundles[nid])
+            # RayVirtualCluster records the physical-node bundle order when it
+            # builds a unified PG. Preserve it so TP replicas occupy contiguous
+            # nodes in the topology-aware order selected by the cluster.
+            flat = list(cluster._sorted_bundle_indices or [])
+            if not flat:
+                for nid in sorted(node_bundles):
+                    flat.extend(node_bundles[nid])
 
             tied_groups: list[tuple[int, list[int]]] = []
             for i in range(num_groups):
                 slice_ = flat[i * model_parallel_size : (i + 1) * model_parallel_size]
-                first_node = bundle_to_node[slice_[0]]
-                tied_groups.append((node_idx[first_node], slice_))
+                # The first value is a placement-group index.
+                # A unified cluster has exactly one PG (index 0).
+                tied_groups.append((0, slice_))
         else:
             tied_groups = []
             for pg_idx, pg in enumerate(placement_groups):
@@ -245,6 +259,16 @@ class TrtllmGeneration(GenerationInterface):
                 "Unable to allocate any worker groups with the available resources."
             )
         return tied_groups
+
+    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        """Collect HTTP server base URLs from each DP-rank-0 worker."""
+        if not self.cfg["trtllm_cfg"].get("expose_http_server"):
+            return [None] * self.dp_size
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        return ray.get(futures)
 
     def _report_device_id(self) -> list[list[str]]:
         futures = self.worker_group.run_all_workers_single_data(
@@ -411,6 +435,26 @@ class TrtllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_refit_info_async",
             state_dict_info=state_dict_info,
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        ray.get(futures)
+
+    def start_gpu_profiling(self) -> None:
+        """Grpo profiling protocol: start nsys capture on the GPU workers."""
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_gpu_profiling_async" if self.async_engine else "start_gpu_profiling",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """Grpo profiling protocol: stop nsys capture on the GPU workers."""
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "stop_gpu_profiling_async" if self.async_engine else "stop_gpu_profiling",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)

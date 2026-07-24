@@ -19,11 +19,13 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 class TrtllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
+    model_name: NotRequired[str]
     gpu_memory_utilization: NotRequired[float]
     max_model_len: int
     precision: str
     max_batch_size: int
     max_num_tokens: int
+    expose_http_server: NotRequired[bool]
     async_engine: NotRequired[bool]
     # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
     # into moe_tp × moe_ep, so the constraint is
@@ -41,6 +43,12 @@ class TrtllmSpecificArgs(TypedDict):
     # grpo.async_grpo so they cannot diverge).
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    default_chat_template_kwargs: NotRequired[dict[str, Any]]
+    # TRT-LLM's registered parser names:
+    #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
+    #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
+    tool_parser: NotRequired[str]
+    reasoning_parser: NotRequired[str]
 
 
 class TrtllmConfig(GenerationConfig):

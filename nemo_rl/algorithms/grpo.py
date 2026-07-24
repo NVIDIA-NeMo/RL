@@ -864,6 +864,11 @@ def setup(
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
                     )
+                elif generation_config["backend"] == "trtllm":
+                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
+                    gpus_per_instance = trtllm_cfg[
+                        "tensor_parallel_size"
+                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -932,8 +937,12 @@ def setup(
             node_resource_constraints=inference_node_resource_constraints,
         )
         if inference_node_resource_constraints is not None:
-            VllmGeneration.init_cluster_placement_groups(
-                inference_cluster, generation_config
+            {
+                "vllm": VllmGeneration,
+                "trtllm": TrtllmGeneration,
+            }[generation_config["backend"]].init_cluster_placement_groups(
+                inference_cluster,
+                generation_config,
             )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
@@ -1316,6 +1325,13 @@ def setup(
             f"  ✓ Using TRT-LLM backend for generation with {policy_config['model_name']}",
             flush=True,
         )
+
+        if enable_nemo_gym:
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.dp_openai_server_base_urls,
+                generation_config["model_name"],
+            )
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
 
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
@@ -2011,9 +2027,8 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
             "expose_http_server"
         )
     elif generation_config["backend"] == "trtllm":
-        raise NotImplementedError(
-            "NeMo-Gym is not supported with the TRT-LLM generation backend "
-            "(the TRT-LLM OpenAI-compatible HTTP server was removed)."
+        should_expose_http_server = generation_config["trtllm_cfg"].get(
+            "expose_http_server"
         )
     else:
         should_expose_http_server = False
