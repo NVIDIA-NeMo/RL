@@ -13,7 +13,6 @@ The config is a standard NeMo-RL SFT config plus a ``multi_lora:`` block:
       batch_size_per_adapter: 16
       adapters:
         - name: adapter_a
-          lora_cfg: {...}
           data: {train: {data_path: ...}, validation: {data_path: ...}}
         - ...
 
@@ -22,7 +21,7 @@ stock NLLLoss + stock dataloader — same code path as examples/run_sft.py.
 
 Env knobs (kept verbatim from the equivalence campaign so artifacts stay
 comparable): NOUSNET_DIAG_ENABLED, NOUSNET_DIAG_LOSS_TRACE,
-NOUSNET_DETERMINISTIC_SEED, NOUSNET_INIT_IMPORT_DIR, NOUSNET_INIT_SLOT,
+NOUSNET_DETERMINISTIC_SEED, NOUSNET_INIT_IMPORT_DIR, NOUSNET_INIT_IMPORT_SLOT,
 NOUSNET_PER_ADAPTER_GRAD_CLIP.
 """
 

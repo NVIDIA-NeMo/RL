@@ -248,40 +248,9 @@ cluster:
   num_nodes: 1
 multi_lora:
   enabled: true
-  schedule: round_robin
-  global_batch_size: 64
   batch_size_per_adapter: 16
-  storage_device: cuda
-  execution_mode: concurrent
   adapters:
   - name: adapter_a
-    pin: auto
-    lora_cfg:
-      enabled: true
-      dim: 64
-      alpha: 128
-      match_all_linear: false
-      target_modules:
-      - '*q_proj'
-      - '*k_proj'
-      - '*v_proj'
-      - '*o_proj'
-      - '*in_proj'
-      - '*out_proj'
-      - '*up_proj'
-      - '*down_proj'
-      dropout: 0.0
-    optimizer:
-      name: torch.optim.AdamW
-      kwargs:
-        lr: 0.0005
-        weight_decay: 0.01
-        betas:
-        - 0.9
-        - 0.98
-        eps: 1.0e-05
-        foreach: false
-        fused: true
     data:
       train:
         dataset_name: openai_format
@@ -294,33 +263,6 @@ multi_lora:
         chat_key: messages
         use_preserving_dataset: false
   - name: adapter_b
-    pin: auto
-    lora_cfg:
-      enabled: true
-      dim: 64
-      alpha: 128
-      match_all_linear: false
-      target_modules:
-      - '*q_proj'
-      - '*k_proj'
-      - '*v_proj'
-      - '*o_proj'
-      - '*in_proj'
-      - '*out_proj'
-      - '*up_proj'
-      - '*down_proj'
-      dropout: 0.0
-    optimizer:
-      name: torch.optim.AdamW
-      kwargs:
-        lr: 0.0005
-        weight_decay: 0.01
-        betas:
-        - 0.9
-        - 0.98
-        eps: 1.0e-05
-        foreach: false
-        fused: true
     data:
       train:
         dataset_name: openai_format
@@ -333,33 +275,6 @@ multi_lora:
         chat_key: messages
         use_preserving_dataset: false
   - name: adapter_c
-    pin: auto
-    lora_cfg:
-      enabled: true
-      dim: 64
-      alpha: 128
-      match_all_linear: false
-      target_modules:
-      - '*q_proj'
-      - '*k_proj'
-      - '*v_proj'
-      - '*o_proj'
-      - '*in_proj'
-      - '*out_proj'
-      - '*up_proj'
-      - '*down_proj'
-      dropout: 0.0
-    optimizer:
-      name: torch.optim.AdamW
-      kwargs:
-        lr: 0.0005
-        weight_decay: 0.01
-        betas:
-        - 0.9
-        - 0.98
-        eps: 1.0e-05
-        foreach: false
-        fused: true
     data:
       train:
         dataset_name: openai_format
@@ -372,33 +287,6 @@ multi_lora:
         chat_key: messages
         use_preserving_dataset: false
   - name: adapter_d
-    pin: auto
-    lora_cfg:
-      enabled: true
-      dim: 64
-      alpha: 128
-      match_all_linear: false
-      target_modules:
-      - '*q_proj'
-      - '*k_proj'
-      - '*v_proj'
-      - '*o_proj'
-      - '*in_proj'
-      - '*out_proj'
-      - '*up_proj'
-      - '*down_proj'
-      dropout: 0.0
-    optimizer:
-      name: torch.optim.AdamW
-      kwargs:
-        lr: 0.0005
-        weight_decay: 0.01
-        betas:
-        - 0.9
-        - 0.98
-        eps: 1.0e-05
-        foreach: false
-        fused: true
     data:
       train:
         dataset_name: openai_format

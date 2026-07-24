@@ -22,6 +22,8 @@ ckpts/
 coverage.json
 .coverage*
 test_assets/
+tests/unit/unit_results.json
+tests/unit/unit_results/
 .nrl_remote_map.json
 .nrl_remote_state.json
 # Test biproducts

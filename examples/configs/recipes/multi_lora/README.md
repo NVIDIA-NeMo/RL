@@ -32,8 +32,8 @@ policy:
 ```
 
 Key knobs (see header comment in `base.yaml`): `policy.max_grad_norm`,
-`multi_lora.enabled`, `single_dataset`, per-adapter LoRA/optimizer settings
-under `multi_lora.adapters[]`.
+`multi_lora.enabled`, `single_dataset`, shared LoRA/optimizer settings under
+`policy`, and per-adapter datasets under `multi_lora.adapters[]`.
 
 ## Running
 
@@ -85,7 +85,7 @@ NOUSNET_INIT_IMPORT_DIR   read canonical shards (all runs of a battery)
 NOUSNET_INIT_IMPORT_SLOT  which shard slot a single-LoRA run imports (0-3)
 NOUSNET_PER_ADAPTER_GRAD_CLIP  clip each adapter's grads independently (multi)
 NOUSNET_FORCE_PAD_TO      pad every microbatch to a fixed length (parity)
-NOUSNET_DETERMINISTIC(_SEED)   torch deterministic algorithms + seed
+NOUSNET_DETERMINISTIC_SEED     torch/numpy/Python deterministic seed
 ```
 
 Unit tests: `pytest tests/unit/models/multi_lora/ -q` (CPU-only, no GPU
