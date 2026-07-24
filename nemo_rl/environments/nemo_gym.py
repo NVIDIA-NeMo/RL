@@ -616,6 +616,19 @@ def spinup_nemo_gym_actor(
     When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
     scheduled with soft NodeAffinity to the current Ray node so its colocated
     GPU resources land where the caller expects.
+
+    Args:
+        env_configs: The ``master_config.env`` mapping; ``env_configs["nemo_gym"]``
+            supplies the Gym global config plus NeMo-RL detection knobs
+            (``invalid_tool_call_patterns``, ``thinking_tags``, ``num_gpu_nodes``).
+        base_urls: Per-DP-rank OpenAI-compatible server base URLs from the
+            generation backend.
+        model_name: Served model name the Gym rollouts should target.
+        enable_router_replay: Sets ``require_routed_experts`` on the
+            ``NemoGymConfig``.
+
+    Returns:
+        The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 

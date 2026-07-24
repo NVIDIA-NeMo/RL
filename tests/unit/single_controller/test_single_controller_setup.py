@@ -414,7 +414,14 @@ class TestSetup:
         ):
             actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        mock_spinup.assert_called_once()
+        mock_spinup.assert_called_once_with(
+            env_configs=mc.env,
+            base_urls=patched_factories[
+                "_build_generation"
+            ].return_value.dp_openai_server_base_urls,
+            model_name="test-model",
+            enable_router_replay=False,
+        )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])

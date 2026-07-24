@@ -325,6 +325,11 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = _should_use_nemo_gym(cast(GrpoMasterConfig, master_config))
+    if use_nemo_gym and generation_config["backend"] != "vllm":
+        raise NotImplementedError(
+            "SC NeMo-Gym integration currently supports the vllm backend "
+            f"only; got {generation_config['backend']!r}"
+        )
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
@@ -377,11 +382,6 @@ def setup_single_controller(
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
     # ==========================
     if use_nemo_gym:
-        if generation_config["backend"] != "vllm":
-            raise NotImplementedError(
-                "SC NeMo-Gym integration currently supports the vllm backend "
-                f"only; got {generation_config['backend']!r}"
-            )
         enable_router_replay = router_replay_enabled(master_config.policy)
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
             env_configs=master_config.env,
