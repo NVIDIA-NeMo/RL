@@ -4790,14 +4790,7 @@ def async_grpo_train(
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
-                with (
-                    timer.time("exposed_generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
-                        "rl.grpo.collect_rollouts",
-                        tracer=_tracer,
-                    ),
-                ):
+                with timer.time("exposed_generation"):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
                         f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
