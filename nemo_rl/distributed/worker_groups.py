@@ -30,6 +30,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.utils.env_var_serialization import encode_env_list
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
@@ -535,8 +536,8 @@ class RayWorkerGroup:
                         "MASTER_ADDR": self.master_address,
                         "MASTER_PORT": str(self.master_port),
                         "NODE_RANK": str(pg_idx),
-                        "AVAILABLE_ADDR_LIST": str(available_addresses),
-                        "AVAILABLE_PORT_LIST": str(available_ports),
+                        "AVAILABLE_ADDR_LIST": encode_env_list(available_addresses),
+                        "AVAILABLE_PORT_LIST": encode_env_list(available_ports),
                     }
                 )
                 # Remove Ray-specific environment variables, let the worker itself set them.

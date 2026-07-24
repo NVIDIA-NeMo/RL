@@ -55,6 +55,10 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.env_var_serialization import (
+    decode_env_int_list,
+    decode_env_str_list,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -413,8 +417,12 @@ class BaseVllmGenerationWorker:
             )
             # set vLLM DP address and port
             leader_rank = int(os.environ["RANK"]) // world_size * world_size
-            addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
-            port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
+            addr_list = decode_env_str_list(
+                os.environ["AVAILABLE_ADDR_LIST"], "AVAILABLE_ADDR_LIST"
+            )
+            port_list = decode_env_int_list(
+                os.environ["AVAILABLE_PORT_LIST"], "AVAILABLE_PORT_LIST"
+            )
             os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
