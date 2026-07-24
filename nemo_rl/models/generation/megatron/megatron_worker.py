@@ -23,6 +23,7 @@ from typing import AsyncGenerator, Optional
 import requests
 import torch
 from megatron.core.inference.config import (
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingCoordinatorPolicy,
@@ -173,6 +174,13 @@ class MegatronGenerationMixin:
             num_speculative_tokens=num_speculative_tokens,
             max_requests=max_requests,
         )
+
+        if "cuda_graph_sizing_distribution" in mcore_generation_config:
+            inference_config.cuda_graph_sizing_distribution = (
+                CudaGraphSizingDistribution(
+                    mcore_generation_config["cuda_graph_sizing_distribution"]
+                )
+            )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
             self.model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[

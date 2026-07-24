@@ -213,6 +213,7 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       transformer_impl: "inference_optimized"
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: "linear"  # How captured CUDA-graph sizes are spaced. Options: "exponential" (log-spaced), "linear" (denser at the top end).
       inference_cuda_graph_scope: "block"
       activation_checkpointing: false
       mamba_inference_ssm_states_dtype: "float32"
@@ -235,7 +236,7 @@ policy:
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
+      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo", "nccl", "nvshmem".
       async_engine: true
       expose_http_server: true
       enable_prefix_caching: true
