@@ -13,6 +13,7 @@
 # limitations under the License.
 import math
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -172,6 +173,32 @@ def _detect_invalid_tool_call_and_malformed_thinking(
             has_malformed_thinking = True
 
     return is_invalid_tool_call, has_malformed_thinking
+
+
+def _tool_call_payload_char_count(
+    output_item_dict: dict[str, Any], is_invalid_tool_call: bool
+) -> int | None:
+    """Return the non-syntax payload size for a model-emitted tool call.
+
+    Structured calls expose their JSON arguments directly. Invalid textual calls
+    are measured after removing XML-like tags so degenerate outputs such as a
+    function name followed only by repeated closing tags count as empty.
+    """
+    if output_item_dict.get("type") == "function_call":
+        return len(str(output_item_dict.get("arguments", "")).strip())
+    if not is_invalid_tool_call:
+        return None
+
+    content_key = (
+        "summary" if output_item_dict.get("type") == "reasoning" else "content"
+    )
+    text = "".join(
+        str(part.get("text", ""))
+        for part in output_item_dict.get(content_key, [])
+        if isinstance(part, dict)
+    )
+    payload = re.sub(r"<[^>]*>", "", text).strip()
+    return len(payload)
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -491,6 +518,9 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     thinking_tags=self.cfg.get("thinking_tags"),
                 )
             )
+            tool_call_payload_chars = _tool_call_payload_char_count(
+                output_item_dict, is_invalid_tool_call
+            )
 
             assistant_message = {
                 "role": "assistant",
@@ -500,6 +530,12 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 # Structured function calls were parsed and executed by NeMo-Gym.
                 "is_tool_call": output_item_dict.get("type") == "function_call",
                 "is_invalid_tool_call": is_invalid_tool_call,
+                "is_empty_tool_call": (
+                    tool_call_payload_chars == 0
+                    if tool_call_payload_chars is not None
+                    else False
+                ),
+                "tool_call_payload_chars": tool_call_payload_chars,
                 "has_malformed_thinking": has_malformed_thinking,
             }
             if routed_experts is not None:

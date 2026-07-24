@@ -275,6 +275,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
             "output": [
                 {
                     "type": "function_call",
+                    "arguments": '{"command":"ls"}',
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
@@ -306,6 +307,8 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][1]["is_tool_call"] is True
+    assert result["message_log"][1]["is_empty_tool_call"] is False
+    assert result["message_log"][1]["tool_call_payload_chars"] == 16
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
     assert result["message_log"][3]["is_tool_call"] is False
@@ -376,6 +379,52 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     assert "apply_chat_template failed" in msg
     assert "RuntimeError" in msg
     assert "['reasoning']" in msg
+
+
+def test_nemo_gym_postprocess_flags_empty_textual_tool_call():
+    class _Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def batch_decode(self, batch):
+            return ["decoded" for _ in batch]
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                "<tool_call><function=shell_command>"
+                                "</command></command></tool_call>"
+                            ),
+                        }
+                    ],
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4, 5],
+                    "generation_log_probs": [-0.1, -0.2, -0.3],
+                }
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assistant = result["message_log"][1]
+    assert assistant["is_invalid_tool_call"] is True
+    assert assistant["is_empty_tool_call"] is True
+    assert assistant["tool_call_payload_chars"] == 0
 
 
 def test_nemo_gym_postprocess_replaces_padding_with_minimal_dummy_tokens():
