@@ -265,8 +265,14 @@ tests/test_suites/llm/distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama
 # DTensor PPO with value sequence parallelism (TP2+SP) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.sh
 
+# Non-colocated AutoModel PPO with vLLM on a dedicated GPU split (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-noncolocated.sh
+
 # Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
+
+# Non-colocated Megatron PPO with dedicated training and vLLM nodes (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated.sh
 
 # Megatron PPO with value SP + pipeline + context parallelism + sequence packing (TP2+SP+PP2+CP2) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack.sh

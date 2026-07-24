@@ -38,9 +38,24 @@ We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that cont
 
 The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **DTensor backend** (`value.dtensor_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
 
-### Colocated Architecture
+### Deployment Architectures
 
-PPO uses a colocated architecture where the **policy**, **value model**, and **vLLM generation engine** share the same set of GPUs. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for other components.
+By default, PPO uses a colocated architecture where the **policy**, **value model**, and **generation engine** share one `RayVirtualCluster`. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for the other components.
+
+PPO also supports non-colocated vLLM generation. In this mode, the policy and value model continue to time-share one training `RayVirtualCluster`, while vLLM runs on a separate inference `RayVirtualCluster` in the same Ray cluster. Updated policy weights are transferred to vLLM through the cross-cluster collective refit path.
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: null
+```
+
+When only one node remains for policy and generation after other resources are reserved, `gpus_per_node` reserves that many GPUs for generation and `num_nodes` must be `null` or `1`. When more than one node remains for training and generation, generation uses complete nodes: set `num_nodes` to the number of inference nodes and `gpus_per_node` equal to `cluster.gpus_per_node`. Non-colocated SGLang generation is not currently supported by PPO.
 
 ### Value Model Configuration
 
@@ -217,6 +232,8 @@ ppo:
   seed: 42
   use_dynamic_sampling: false
   overlong_filtering: false
+  # null logs mismatch metrics without masking; set a threshold to mask sequences.
+  seq_logprob_error_threshold: null
 
   adv_estimator:
     name: "gae"
@@ -257,6 +274,7 @@ value_loss_fn:
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of training updates per rollout batch
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
+- **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)
 - **`ppo.adv_estimator.gae_gamma`**: Discount factor $\gamma$ (typically 1.0 for outcome-supervised tasks)
@@ -268,7 +286,7 @@ All other parameters (clipping, KL, importance sampling, dynamic sampling, rewar
 
 ## Metrics
 
-PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). In addition, the following critic-specific metrics are logged:
+PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). It also logs the following PPO-specific metrics:
 
 | Metric | Description |
 |--------|-------------|
@@ -279,6 +297,9 @@ PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). In 
 | `critic/values_max` | Maximum predicted value |
 | `critic/returns_mean` | Mean of GAE returns |
 | `critic/explained_var` | Explained variance: $1 - \text{Var}(R - V) / \text{Var}(R)$. Higher is better; values near 1.0 indicate the critic accurately predicts returns. |
+| `max_seq_mult_prob_error` | Maximum sequence-level multiplicative probability error between generation and training logprobs before optional masking. |
+| `mean_seq_mult_prob_error` | Mean sequence-level multiplicative probability error before optional masking. |
+| `num_masked_seqs_by_logprob_error` | Number of sequences excluded by `ppo.seq_logprob_error_threshold`. |
 
 ## Evaluate the Trained Model
 
