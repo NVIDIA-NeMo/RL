@@ -51,6 +51,8 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
+    _placeholder_seq_logprob_error_metrics,
+    _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
     compute_and_apply_seq_logprob_error_masking,
@@ -71,7 +73,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
@@ -777,9 +779,27 @@ def grpo_train_sync(
                 baseline_for_log = baseline.clone()
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                print("▶ Preparing for logprob inference...", flush=True)
-                with timer.time("logprob_inference_prep"):
-                    policy.prepare_for_lp_inference()
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
+                compute_prev = not skip_prev_logprobs
+                compute_ref = not skip_reference_logprobs
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                # Effective field set for this step. Filtered once; both
+                # the driver-side read_from_dataplane and the workers'
+                # train_presharded fetch (via train_from_meta) consume it.
+                train_fields = tuple(
+                    f
+                    for f in DP_TRAIN_FIELDS
+                    if not (skip_prev_logprobs and f == "prev_logprobs")
+                )
+
+                if compute_prev or compute_ref:
+                    print("▶ Preparing for logprob inference...", flush=True)
+                    with timer.time("logprob_inference_prep"):
+                        policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -791,15 +811,21 @@ def grpo_train_sync(
                     # batched fetch to avoid double-shipping the per-token
                     # tensor through Ray's plasma store on top of the TQ
                     # writeback.
-                    policy.get_logprobs_from_meta(meta, timer=timer)
-                    compute_ref = not master_config.grpo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    )
+                    select_fields = ["generation_logprobs", "token_mask"]
+                    if compute_prev:
+                        policy.get_logprobs_from_meta(meta, timer=timer)
+                        select_fields.append("prev_logprobs")
+                    else:
+                        print(
+                            "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                            flush=True,
+                        )
                     if compute_ref:
                         policy.get_reference_policy_logprobs_from_meta(
                             meta,
                             timer=timer,
                         )
+                        select_fields.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs
                     # for masking / advantage. Bulk (input_ids, multimodal,
@@ -807,21 +833,26 @@ def grpo_train_sync(
                     # TQ — workers will fetch it via ``train_presharded``.
                     extras_bdd = policy.read_from_dataplane(
                         meta,
-                        select_fields=[
-                            "prev_logprobs",
-                            "generation_logprobs",
-                            "token_mask",
-                            *(["reference_policy_logprobs"] if compute_ref else []),
-                        ],
+                        select_fields=select_fields,
                         pad_value_dict=_pad_dict,
                     )
-                    prev_logprobs = extras_bdd["prev_logprobs"]
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
+                    prev_logprobs = (
+                        extras_bdd["prev_logprobs"]
+                        if compute_prev
+                        else torch.zeros_like(generation_logprobs)
+                    )
                     reference_policy_logprobs = (
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
+                # Seq-level logprob error metrics/masking require real prev_logprobs
+                if skip_prev_logprobs:
+                    sample_mask = loss_multiplier
+                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
                             token_mask=token_mask,
@@ -829,9 +860,7 @@ def grpo_train_sync(
                             prev_logprobs=prev_logprobs,
                             generation_logprobs=generation_logprobs,
                             rewards=rewards,
-                            seq_logprob_error_threshold=master_config.grpo[
-                                "seq_logprob_error_threshold"
-                            ],
+                            seq_logprob_error_threshold=seq_logprob_error_threshold,
                         )
                     )
 
@@ -900,6 +929,7 @@ def grpo_train_sync(
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
+                        train_fields=train_fields,
                     )
 
                 if sync_kv_scales:
