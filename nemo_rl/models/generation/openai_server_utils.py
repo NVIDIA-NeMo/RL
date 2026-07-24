@@ -101,6 +101,10 @@ def replace_prefix_tokens(
     if model_prefix_token_ids[-1] == eos_token_id:
         model_cut_end -= 1
 
+    # Locate the turn boundary by EOS count rather than token position. Qwen3
+    # templates may strip prior reasoning blocks when re-rendering history;
+    # EOS counting preserves the original generated reasoning tokens without
+    # requiring a customized chat template.
     count_needed = template_prefix_token_ids.count(eos_token_id)
     count_seen = 0
     template_cut_start = -1
