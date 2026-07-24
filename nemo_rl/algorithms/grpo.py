@@ -33,6 +33,7 @@ from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    GRPOWithTeacherAdvantageEstimator,
     OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
@@ -191,10 +192,10 @@ class AsyncGRPOConfig(TypedDict):
 
 
 class AdvEstimatorConfig(TypedDict):
-    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
+    """Configuration for advantage estimator (GRPO, GDPO, Reinforce++, OPD, or GRPO+teacher)."""
 
-    name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
-    # GRPO specific
+    name: str  # "grpo", "gdpo", "reinforce_plus_plus", "opd", or "grpo_with_teacher"
+    # GRPO / GRPO+teacher specific
     normalize_rewards: NotRequired[bool]
     use_leave_one_out_baseline: NotRequired[bool]
     # GDPO specific: optional per-component weights w_n for the aggregation
@@ -203,6 +204,8 @@ class AdvEstimatorConfig(TypedDict):
     reward_weights: NotRequired[list[float] | None]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
+    # GRPO+teacher specific: coefficient scaling the token-level teacher-distillation term.
+    distill_coeff: NotRequired[float]
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -2160,6 +2163,12 @@ def _create_advantage_estimator(master_config: MasterConfig):
             adv_estimator_config, loss_config
         )
         print("  ✓ Using Reinforce++ advantage estimator")
+    elif adv_estimator_name == "grpo_with_teacher":
+        opd_module.assert_prev_logprobs_available(master_config)
+        adv_estimator = GRPOWithTeacherAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
+        print("  ✓ Using GRPO + teacher-distillation advantage estimator")
     else:
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 
@@ -4424,6 +4433,9 @@ def async_grpo_train(
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )
+                    # Make teacher logprobs available to the loss function
+                    # (consumed by ClippedPGLossFn.teacher_distillation).
+                    train_data["teacher_logprobs"] = trajectory_teacher_logprobs
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):

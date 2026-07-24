@@ -69,6 +69,8 @@ loss_fn:
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  # Optional forward-KL distillation against teacher per-token logprobs.
+  teacher_distillation: null
 
 value_loss_fn:
   scale: 0.4
