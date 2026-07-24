@@ -1,8 +1,0 @@
-adapter a: PASS aligned=800/800 steps=100/100 hash_bad=0 token_bad=0 max_local=0.210852623 max_step=0.053783882
-adapter b: FAIL aligned=800/800 steps=100/100 hash_bad=0 token_bad=0 max_local=0.300064683 max_step=0.108614050
-adapter c: PASS aligned=800/800 steps=100/100 hash_bad=0 token_bad=0 max_local=0.282607555 max_step=0.059785347
-adapter d: FAIL aligned=800/800 steps=100/100 hash_bad=0 token_bad=0 max_local=0.904210329 max_step=0.428196265
-OVERALL: PAIRWISE FAIL
-wrote results/native100_noclip_pairwise.json
-wrote results/native100_noclip_pairwise.csv
-wrote results/native100_noclip_pairwise.png

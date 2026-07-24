@@ -476,18 +476,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        # NOUSNET_DUMP_EVERYTHING: per-call step counter advance + pre-step
-        # param/grad/opt snapshot. Counter is global to this worker process,
-        # rolls forward by 1 each time policy.train() is called.
-        import os as _dump_os
-        if _dump_os.environ.get("NOUSNET_DUMP_EVERYTHING") == "1":
-            try:
-                from nemo_rl.models.multi_lora.debug import dump_everything as _dump
-                _dump.set_step(_dump.get_step() + 1)
-                _dump.dump_params_and_opt(self.model, self.optimizer, phase="pre_step")
-            except Exception as _e:
-                print(f"[DUMP_EVERYTHING] pre_step dump failed: {_e}", flush=True)
-
         # Multi-LoRA per-row routing. When the batch carries `adapter_ids`
         # (LongTensor[B], one global id per row), call into the downstream
         # multi-adapter helper to write the routing buffer onto every
@@ -764,18 +752,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             print(f"[DIAG] pre-step capture failed: {_e}", flush=True)
 
                     self.optimizer.step()
-
-                    # NOUSNET_DUMP_EVERYTHING: post-opt-step snapshot. After
-                    # this point the optimizer state (Adam m/v) has been
-                    # written and params reflect the gradient update.
-                    if _dump_os.environ.get("NOUSNET_DUMP_EVERYTHING") == "1":
-                        try:
-                            from nemo_rl.models.multi_lora.debug import dump_everything as _dump
-                            _dump.dump_params_and_opt(
-                                self.model, self.optimizer, phase="post_optstep"
-                            )
-                        except Exception as _e:
-                            print(f"[DUMP_EVERYTHING] post_optstep dump failed: {_e}", flush=True)
 
                     if (
                         _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1"
@@ -1324,50 +1300,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
-
-        # nousnet bit-eq fingerprint hooks (gated by NOUSNET_FORWARD_BACKWARD_DIAG=1).
-        # Installed AFTER FSDP wrap + LoRA injection + optimizer is bound, so the
-        # hooked params are the exact ones the optimizer will update.
-        # See: ~/.hermes/skills/ml-training/multi-lora-bit-equivalence-debugging/
-        #      references/per-layer-activation-grad-fingerprint-bisection.md
-        import os as _os
-        if _os.environ.get("NOUSNET_FORWARD_BACKWARD_DIAG") == "1":
-            try:
-                from nemo_rl.models.multi_lora.debug.forward_backward_fingerprint import (
-                    install_fingerprint_hooks,
-                )
-                install_fingerprint_hooks(
-                    self.model,
-                    log_rank=0,
-                    module_filters=(
-                        "NemotronHBlock",
-                        "shared_experts",
-                        "MultiLinearLoRA",
-                        "LinearLoRA",
-                        "lm_head",
-                    ),
-                    param_filters=(
-                        "lora_A.weight",
-                        "lora_B.weight",
-                        "_lora_A_stacked",
-                        "_lora_B_stacked",
-                        "_lora_A_extras_merged",
-                        "_lora_B_extras_merged",
-                    ),
-                )
-            except Exception as _e:
-                print(f"[FP_INSTALL] failed to install fingerprint hooks: {_e}", flush=True)
-
-        # NOUSNET_DUMP_EVERYTHING=1: literal pre+post forward/backward hooks on
-        # every leaf module, dumping inputs/outputs/grads to disk per microbatch.
-        # See nousnet/debug/dump_everything.py for the dump layout. Step counter
-        # is advanced from the train loop via dump_everything.set_step(step).
-        if _os.environ.get("NOUSNET_DUMP_EVERYTHING") == "1":
-            try:
-                from nemo_rl.models.multi_lora.debug.dump_everything import install_dump_hooks
-                install_dump_hooks(self.model)
-            except Exception as _e:
-                print(f"[DUMP_EVERYTHING] failed to install dump hooks: {_e}", flush=True)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")

@@ -1,6 +1,0 @@
-mode=clip1
-a: campaign_input_sha=800/800 token=800/800; native step1=0.000000000 mean=0.009693561 max=0.091447840; campaign step1=0.000000000 mean=0.013602118 max=0.209927821
-b: campaign_input_sha=800/800 token=800/800; native step1=0.000000000 mean=0.009385829 max=0.056355394; campaign step1=0.000000000 mean=0.013313120 max=0.117514467
-c: campaign_input_sha=800/800 token=800/800; native step1=0.000000000 mean=0.011472191 max=0.178174661; campaign step1=0.000000000 mean=0.012542767 max=0.122780569
-d: campaign_input_sha=800/800 token=800/800; native step1=0.000000000 mean=0.008943292 max=0.032748202; campaign step1=0.000000000 mean=0.011695386 max=0.102387358
-PREPROCESSING_PARITY=PASS
