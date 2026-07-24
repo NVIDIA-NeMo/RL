@@ -56,6 +56,13 @@ done
 mkdir -p "${HF_HOME_HOST}"
 
 cp -f "${CFG_ABS}" "${EXP_DIR}/config.yaml"
+# Recipe configs inherit via `defaults: base.yaml` (resolved relative to the
+# config file's own directory). The run executes from the EXP_DIR copy, so the
+# base must travel with it.
+CFG_DIR_SRC="$(dirname -- "${CFG_ABS}")"
+if grep -qE '^defaults:' "${CFG_ABS}" && [[ -f "${CFG_DIR_SRC}/base.yaml" ]]; then
+    cp -f "${CFG_DIR_SRC}/base.yaml" "${EXP_DIR}/base.yaml"
+fi
 
 INNER_CMD="
 set -eoux pipefail
