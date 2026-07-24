@@ -1,0 +1,8 @@
+defaults: base.yaml
+run_name: parity100_noclip_single_a
+single_dataset: a
+policy:
+  train_global_batch_size: 16
+  train_micro_batch_size: 2
+multi_lora:
+  enabled: false

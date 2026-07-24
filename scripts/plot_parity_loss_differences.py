@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Plot native100 V3 pairwise losses with an explicit |delta| panel per adapter."""
+"""Plot parity-battery pairwise losses with an explicit |delta| panel per adapter.
+
+Reads results/<prefix>_<mode>_pairwise.csv (from analyze_pairwise_loss.py) and
+writes results/<prefix>_<mode>_loss_with_delta.png for mode in {noclip, clip1}.
+"""
 from __future__ import annotations
 
+import argparse
 import csv
 from pathlib import Path
 
@@ -11,11 +16,17 @@ import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--prefix", default="parity100",
+                help="results/<prefix>_<mode>_pairwise.csv input stem")
+ap.add_argument("--steps", type=int, default=100)
+args = ap.parse_args()
+
 for mode, label in (
     ("noclip", "NO GRADIENT CLIPPING"),
     ("clip1", "INDEPENDENT PER-ADAPTER GRADIENT CLIPPING, max_norm=1.0"),
 ):
-    src = ROOT / f"results/native100v3_{mode}_pairwise.csv"
+    src = ROOT / f"results/{args.prefix}_{mode}_pairwise.csv"
     rows = list(csv.DictReader(src.open(encoding="utf-8")))
     fig, axes = plt.subplots(
         4,
@@ -29,8 +40,10 @@ for mode, label in (
             (r for r in rows if r["adapter"] == adapter),
             key=lambda r: int(r["step"]),
         )
-        if len(ar) != 100:
-            raise RuntimeError(f"adapter {adapter}: expected 100 steps, found {len(ar)}")
+        if len(ar) != args.steps:
+            raise RuntimeError(
+                f"adapter {adapter}: expected {args.steps} steps, found {len(ar)}"
+            )
         x = [int(r["step"]) for r in ar]
         single = [float(r["single_loss"]) for r in ar]
         multi = [float(r["multi_loss"]) for r in ar]
@@ -66,7 +79,8 @@ for mode, label in (
         )
         ad.set_title(
             f"|Multi − Single|: {'FAIL' if violations else 'PASS'}\n"
-            f"mean={sum(diff)/len(diff):.4f} · final={diff[-1]:.4f} · ≥0.1: {violations}/100",
+            f"mean={sum(diff)/len(diff):.4f} · final={diff[-1]:.4f} · "
+            f"≥0.1: {violations}/{args.steps}",
             weight="bold",
             fontsize=10,
             pad=9,
@@ -78,13 +92,13 @@ for mode, label in (
         ad.legend(fontsize=8, loc="upper right")
 
     fig.suptitle(
-        f"Native NeMo-RL V3: 100-step per-adapter loss comparison — {label}\n"
-        "Exact previous-campaign preprocessing; left: raw curves, right: absolute difference\n"
-        "8 data-parallel ranks; 800/800 rows per adapter aligned by step, rank, input hash, and tokens",
+        f"Multi-LoRA parity battery: {args.steps}-step per-adapter loss comparison — {label}\n"
+        "left: raw curves, right: absolute difference\n"
+        "8 data-parallel ranks; rows aligned by step, rank, input hash, and tokens",
         fontsize=15,
         weight="bold",
     )
-    out = ROOT / f"results/native100v3_{mode}_loss_with_delta.png"
+    out = ROOT / f"results/{args.prefix}_{mode}_loss_with_delta.png"
     fig.savefig(out, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(out)

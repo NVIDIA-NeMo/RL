@@ -1,0 +1,7 @@
+# Quick functional check: 10 steps, multi-LoRA on, no checkpoints.
+defaults: base.yaml
+run_name: smoke_10step_multi
+sft:
+  max_num_steps: 10
+checkpointing:
+  enabled: false

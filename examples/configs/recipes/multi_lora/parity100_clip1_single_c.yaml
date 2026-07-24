@@ -1,0 +1,9 @@
+defaults: base.yaml
+run_name: parity100_clip1_single_c
+single_dataset: c
+policy:
+  max_grad_norm: 1.0
+  train_global_batch_size: 16
+  train_micro_batch_size: 2
+multi_lora:
+  enabled: false
