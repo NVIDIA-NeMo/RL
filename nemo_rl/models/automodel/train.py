@@ -42,13 +42,14 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
+    from_parallel_hidden_states_to_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
@@ -186,6 +187,179 @@ def apply_temperature_scaling(
     if sampling_params is not None and sampling_params.temperature != 1.0:
         logits.div_(sampling_params.temperature)
     return logits
+
+
+def _get_module_by_path(model: nn.Module, module_path: str) -> nn.Module:
+    module: Any = model
+    for part in module_path.split("."):
+        module = getattr(module, part, None)
+        if module is None:
+            raise AttributeError(f"Could not resolve module path {module_path!r}")
+    return module
+
+
+def _as_hidden_state_tensor(value: Any) -> torch.Tensor | None:
+    if isinstance(value, (tuple, list)):
+        value = value[-1] if value else None
+    if isinstance(value, DTensor):
+        return value.to_local()
+    if torch.is_tensor(value):
+        return value
+    return None
+
+
+def _fused_linear_logprobs_requested(
+    model: nn.Module,
+    post_processing_fn: PostProcessingFunction,
+) -> bool:
+    if not getattr(model, "_use_fused_linear_logprobs", False):
+        return False
+    if isinstance(post_processing_fn, LogprobsPostProcessor):
+        return True
+    return (
+        isinstance(post_processing_fn, LossPostProcessor)
+        and post_processing_fn.loss_fn.input_type == LossInputType.LOGPROB
+    )
+
+
+def _set_lm_head_skip_for_fused_linear_logprobs(
+    model: nn.Module,
+    enabled: bool,
+) -> None:
+    setattr(model, "_skip_lm_head_for_fused_linear_logprobs", enabled)
+    lm_head_path = getattr(model, "_fused_linear_logprobs_lm_head_path", None)
+    if lm_head_path is None:
+        return
+    try:
+        lm_head = _get_module_by_path(model, lm_head_path)
+    except AttributeError:
+        return
+    setattr(lm_head, "_skip_lm_head_for_fused_linear_logprobs", enabled)
+
+
+def _tp_rank_for_fused_linear_logprobs(tp_group: Any) -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(tp_group)
+    return 0
+
+
+def _tp_size_for_fused_linear_logprobs(tp_group: Any) -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(tp_group)
+    return 1
+
+
+def _dtensor_weight_is_tp_vocab_sharded(output_weight: DTensor) -> bool:
+    mesh_dim_names = output_weight.device_mesh.mesh_dim_names
+    if mesh_dim_names is None:
+        return False
+
+    for mesh_dim_name, placement in zip(mesh_dim_names, output_weight.placements):
+        if isinstance(placement, Shard) and placement.dim == 0:
+            return mesh_dim_name == "tp"
+
+    return False
+
+
+def _lm_head_weight_for_fused_linear_logprobs(
+    lm_head: nn.Module,
+) -> tuple[torch.Tensor, bool]:
+    output_weight = getattr(lm_head, "weight", None)
+    if output_weight is None:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True but the resolved LM head "
+            "does not expose a weight tensor."
+        )
+    if isinstance(output_weight, DTensor):
+        local_vocab_is_tp_partition = _dtensor_weight_is_tp_vocab_sharded(output_weight)
+        output_weight = (
+            output_weight.to_local()
+            if local_vocab_is_tp_partition
+            else output_weight.full_tensor()
+        )
+    else:
+        local_vocab_is_tp_partition = True
+    if not torch.is_tensor(output_weight):
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True but the resolved LM head "
+            "weight is not a tensor."
+        )
+    return output_weight, local_vocab_is_tp_partition
+
+
+def _compute_fused_linear_logprobs(
+    model: nn.Module,
+    outputs: Any,
+    input_ids: torch.Tensor,
+    sampling_params: Optional[TrainingSamplingParams],
+) -> torch.Tensor:
+    captured_hidden_states = getattr(
+        model, "_fused_linear_logprobs_hidden_states", None
+    )
+    hidden_states = _as_hidden_state_tensor(captured_hidden_states)
+    if hidden_states is None:
+        hidden_states = _as_hidden_state_tensor(getattr(outputs, "hidden_states", None))
+    if hidden_states is None:
+        hidden_states = _as_hidden_state_tensor(
+            getattr(outputs, "last_hidden_state", None)
+        )
+    if hidden_states is None:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True but no hidden states were "
+            "captured from the LM head or returned by the model output."
+        )
+    if hidden_states.ndim != 3:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True requires hidden states with "
+            f"shape [batch, seq, hidden], got {tuple(hidden_states.shape)}."
+        )
+
+    lm_head_path = getattr(model, "_fused_linear_logprobs_lm_head_path", None)
+    if lm_head_path is None:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True but the model is missing "
+            "fused linear logprob LM-head metadata."
+        )
+    lm_head = _get_module_by_path(model, lm_head_path)
+    output_weight, local_vocab_is_tp_partition = (
+        _lm_head_weight_for_fused_linear_logprobs(lm_head)
+    )
+
+    if sampling_params is not None and sampling_params.temperature != 1.0:
+        output_weight = output_weight / sampling_params.temperature
+
+    tp_group = getattr(model, "_fused_linear_logprobs_tp_group", None)
+    chunk_size = getattr(model, "_fused_linear_logprobs_chunk_size", None)
+    if chunk_size is None:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True but no fused linear "
+            "logprob chunk size was configured."
+        )
+
+    tp_size = _tp_size_for_fused_linear_logprobs(tp_group)
+    if not local_vocab_is_tp_partition and tp_size > 1:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True requires the LM-head weight "
+            "to be vocab-sharded on the tp mesh dimension when tensor "
+            "parallelism is enabled."
+        )
+
+    tp_rank = _tp_rank_for_fused_linear_logprobs(tp_group)
+    local_vocab_size = int(output_weight.shape[0])
+    vocab_start_index = tp_rank * local_vocab_size if local_vocab_is_tp_partition else 0
+    tensor_parallel_hidden_states = hidden_states.transpose(0, 1).contiguous()
+    return from_parallel_hidden_states_to_logprobs(
+        tensor_parallel_hidden_states=tensor_parallel_hidden_states,
+        output_weight_layer=output_weight,
+        runtime_gather_output=False,
+        target=input_ids.to(hidden_states.device),
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_start_index + local_vocab_size,
+        tp_group=tp_group,
+        inference_only=not torch.is_grad_enabled(),
+        cp_group=None,
+        chunk_size=int(chunk_size),
+    )
 
 
 def apply_top_k_top_p_filtering_for_local_logits(
@@ -348,18 +522,39 @@ def forward_with_post_processing_fn(
     # keeps use_cache=True for KV-sharing models under activation checkpointing
     # (NVIDIA-NeMo/Automodel#1705).
     use_cache = _needs_kv_cache_for_shared_layers(model)
+    use_fused_linear_logprobs = _fused_linear_logprobs_requested(
+        model, post_processing_fn
+    )
+    if use_fused_linear_logprobs and need_top_k_or_top_p_filtering(sampling_params):
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs is not supported with top-k/top-p "
+            "filtering because the fused path does not materialize full logits."
+        )
 
     # Model forward pass
-    outputs = model_forward(
-        model,
-        processed_inputs,
-        is_reward_model=is_reward_model,
-        allow_flash_attn_args=allow_flash_attn_args,
-        use_cache=use_cache,
-    )
+    if use_fused_linear_logprobs:
+        model._fused_linear_logprobs_hidden_states = None
+        _set_lm_head_skip_for_fused_linear_logprobs(model, True)
+    try:
+        outputs = model_forward(
+            model,
+            processed_inputs,
+            is_reward_model=is_reward_model,
+            allow_flash_attn_args=allow_flash_attn_args,
+            use_cache=use_cache,
+        )
+    finally:
+        if use_fused_linear_logprobs:
+            _set_lm_head_skip_for_fused_linear_logprobs(model, False)
 
     # Extract logits from model outputs
-    logits = extract_logits(model, outputs)
+    logits = (
+        _compute_fused_linear_logprobs(
+            model, outputs, data_dict["input_ids"], sampling_params
+        )
+        if use_fused_linear_logprobs
+        else extract_logits(model, outputs)
+    )
     del outputs
 
     # Apply temperature scaling only for sampling-oriented post-processors
@@ -376,18 +571,30 @@ def forward_with_post_processing_fn(
         # Temperature scaling is element-wise, directly applying it here.
         # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
         # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
-        logits = apply_temperature_scaling(logits, sampling_params)
+        if not use_fused_linear_logprobs:
+            logits = apply_temperature_scaling(logits, sampling_params)
 
     # Apply the post-processing function directly based on type
     if isinstance(post_processing_fn, LossPostProcessor):
-        result, metrics = post_processing_fn(
-            logits=logits,
-            data_dict=data_dict,
-            processed_inputs=processed_inputs,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-            sequence_dim=sequence_dim,
-        )
+        loss_fn = post_processing_fn.loss_fn
+        previous_fused_flag = getattr(loss_fn, "use_fused_linear_logprobs", None)
+        if use_fused_linear_logprobs:
+            loss_fn.use_fused_linear_logprobs = True
+        try:
+            result, metrics = post_processing_fn(
+                logits=logits,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                sequence_dim=sequence_dim,
+            )
+        finally:
+            if use_fused_linear_logprobs:
+                if previous_fused_flag is None:
+                    delattr(loss_fn, "use_fused_linear_logprobs")
+                else:
+                    loss_fn.use_fused_linear_logprobs = previous_fused_flag
     elif isinstance(
         post_processing_fn,
         (LogprobsPostProcessor, TopkLogitsPostProcessor),
@@ -705,7 +912,26 @@ class LogprobsPostProcessor:
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
 
-        if self.cp_size > 1:
+        if logits.ndim == 2:
+            if logits.shape != (processed_inputs.input_ids.shape[0], seq_len - 1):
+                raise ValueError(
+                    "Precomputed selected logprobs must have shape "
+                    f"[batch, seq_len - 1], got {tuple(logits.shape)} for "
+                    f"batch={processed_inputs.input_ids.shape[0]} and "
+                    f"seq_len={seq_len}."
+                )
+            if self.cp_size > 1:
+                raise NotImplementedError(
+                    "Precomputed selected logprobs are not supported with "
+                    "context parallelism."
+                )
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Precomputed selected logprobs are not supported with "
+                    "sequence packing."
+                )
+            token_logprobs = logits.to(torch.float32)
+        elif self.cp_size > 1:
             seq_index_tensor = (
                 DTensor.from_local(
                     processed_inputs.seq_index,

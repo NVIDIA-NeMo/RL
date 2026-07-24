@@ -525,6 +525,16 @@ class PolicyConfig(TypedDict):
     # If None, chunking is disabled and the full sequence is processed at once.
     logprob_chunk_size: NotRequired[int | None]
     generation: NotRequired[GenerationConfig]
+    # AutoModel-only opt-in for computing selected next-token logprobs directly
+    # from hidden states and the LM-head weight, avoiding full [B, S, V] logits
+    # for loss/logprob postprocessing. This mirrors the Megatron
+    # use_fused_linear_logprobs path. It is not compatible with context
+    # parallelism, sequence packing, or top-k/top-p training-time filtering.
+    use_fused_linear_logprobs: NotRequired[bool]
+    # Number of sequence tokens per chunk for AutoModel fused linear logprobs.
+    # If omitted, policy.logprob_chunk_size is used. One of the two must be set
+    # when use_fused_linear_logprobs is enabled.
+    fused_linear_logprobs_chunk_size: NotRequired[int]
     generation_batch_size: NotRequired[
         int
     ]  # used in static batched (framework) generation

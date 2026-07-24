@@ -64,7 +64,10 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.automodel.config import (
     DistributedContext,
@@ -294,6 +297,7 @@ def validate_and_prepare_config(
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
+    use_fused_linear_logprobs = config.get("use_fused_linear_logprobs", False)
 
     # Validate sequence packing
     if enable_seq_packing:
@@ -392,6 +396,29 @@ def validate_and_prepare_config(
             "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. "
             "Enable tp_size > 1 to use sequence parallelism."
         )
+
+    if use_fused_linear_logprobs:
+        chunk_size = config.get(
+            "fused_linear_logprobs_chunk_size", config.get("logprob_chunk_size", None)
+        )
+        if chunk_size is None:
+            raise ValueError(
+                "policy.use_fused_linear_logprobs requires "
+                "policy.fused_linear_logprobs_chunk_size or "
+                "policy.logprob_chunk_size."
+            )
+        if enable_seq_packing:
+            raise ValueError(
+                "policy.use_fused_linear_logprobs is not supported with sequence packing."
+            )
+        if cp_size > 1:
+            raise ValueError(
+                "policy.use_fused_linear_logprobs is not supported with context parallelism."
+            )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            raise ValueError(
+                "policy.use_fused_linear_logprobs is not supported with top-k/top-p filtering."
+            )
 
     return RuntimeConfig(
         model_class=model_class,
@@ -571,6 +598,98 @@ def _disable_automodel_checkpoint_dtype_restore() -> None:
     # real behavior even after this no-op has globally replaced the symbol process-wide.
     _noop._nrl_original = restore
     _model_init._restore_loaded_model_dtype = _noop
+
+
+def _get_module_by_path(model: torch.nn.Module, module_path: str) -> torch.nn.Module:
+    module: Any = model
+    for part in module_path.split("."):
+        module = getattr(module, part, None)
+        if module is None:
+            raise AttributeError(f"Could not resolve module path {module_path!r}")
+    return module
+
+
+def _setup_fused_linear_logprobs_for_automodel(
+    model: torch.nn.Module,
+    config: PolicyConfig,
+    device_mesh: Any,
+) -> None:
+    """Configure AutoModel selected-token logprob fusion when explicitly enabled.
+
+    The fused path captures the hidden states entering the LM head and lets the
+    training loop compute selected next-token logprobs from hidden states plus
+    output weights. It stores only lightweight metadata on the model to avoid
+    registering duplicate LM-head modules.
+    """
+    if not config.get("use_fused_linear_logprobs", False):
+        return
+
+    chunk_size = config.get(
+        "fused_linear_logprobs_chunk_size", config.get("logprob_chunk_size", None)
+    )
+    if chunk_size is None:
+        raise ValueError(
+            "policy.use_fused_linear_logprobs requires "
+            "policy.fused_linear_logprobs_chunk_size or policy.logprob_chunk_size."
+        )
+
+    lm_head_path = None
+    lm_head = None
+    for candidate_path in ("lm_head", "language_model.lm_head", "model.lm_head"):
+        try:
+            candidate = _get_module_by_path(model, candidate_path)
+        except AttributeError:
+            continue
+        if hasattr(candidate, "weight"):
+            lm_head_path = candidate_path
+            lm_head = candidate
+            break
+
+    if lm_head_path is None or lm_head is None:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True but no LM head with a "
+            "weight was found. Tried lm_head, language_model.lm_head, and "
+            "model.lm_head."
+        )
+
+    model._use_fused_linear_logprobs = True
+    model._fused_linear_logprobs_lm_head_path = lm_head_path
+    model._fused_linear_logprobs_chunk_size = int(chunk_size)
+    model._fused_linear_logprobs_tp_group = device_mesh["tp"].get_group()
+    model._fused_linear_logprobs_hidden_states = None
+
+    if getattr(lm_head, "_fused_linear_logprobs_installed", False):
+        return
+
+    def _capture_hidden_states(_module, args, kwargs):
+        hidden_states = args[0] if args else kwargs.get("input", None)
+        if hidden_states is not None:
+            model._fused_linear_logprobs_hidden_states = hidden_states
+        return None
+
+    lm_head.register_forward_pre_hook(_capture_hidden_states, with_kwargs=True)
+    original_forward = lm_head.forward
+
+    def _forward_with_optional_skip(*args, **kwargs):
+        if getattr(model, "_skip_lm_head_for_fused_linear_logprobs", False) or getattr(
+            lm_head, "_skip_lm_head_for_fused_linear_logprobs", False
+        ):
+            if args:
+                hidden_states = args[0]
+            elif "input" in kwargs:
+                hidden_states = kwargs["input"]
+            elif kwargs:
+                hidden_states = next(iter(kwargs.values()))
+            else:
+                return original_forward(*args, **kwargs)
+            if torch.is_tensor(hidden_states):
+                return hidden_states.new_zeros(1)
+            return original_forward(*args, **kwargs)
+        return original_forward(*args, **kwargs)
+
+    lm_head._fused_linear_logprobs_original_forward = original_forward
+    lm_head.forward = _forward_with_optional_skip
+    lm_head._fused_linear_logprobs_installed = True
 
 
 def setup_model_and_optimizer(
@@ -863,6 +982,12 @@ def setup_model_and_optimizer(
         print(
             "No weights path provided. Loaded base HF weights via from_pretrained (default policy init)"
         )
+
+    _setup_fused_linear_logprobs_for_automodel(
+        model=model,
+        config=config,
+        device_mesh=distributed_context.device_mesh,
+    )
 
     return ModelAndOptimizerState(
         model=model,

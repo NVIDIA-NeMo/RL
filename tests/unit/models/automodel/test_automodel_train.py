@@ -17,13 +17,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 try:
     import nemo_automodel  # noqa: F401
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+import nemo_rl.models.automodel.train as automodel_train
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -68,6 +69,88 @@ def mock_loss_fn():
     loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
     loss_fn.input_type = LossInputType.LOGIT
     return loss_fn
+
+
+class _FakeDeviceMesh:
+    def __init__(self, mesh_dim_names):
+        self.mesh_dim_names = mesh_dim_names
+
+
+class _FakeWeightDTensor:
+    def __init__(
+        self,
+        *,
+        local_tensor: torch.Tensor,
+        full_tensor: torch.Tensor,
+        placements,
+        mesh_dim_names,
+    ):
+        self._local_tensor = local_tensor
+        self._full_tensor = full_tensor
+        self.placements = placements
+        self.device_mesh = _FakeDeviceMesh(mesh_dim_names)
+        self.to_local_calls = 0
+        self.full_tensor_calls = 0
+
+    def to_local(self):
+        self.to_local_calls += 1
+        return self._local_tensor
+
+    def full_tensor(self):
+        self.full_tensor_calls += 1
+        return self._full_tensor
+
+
+@pytest.mark.automodel
+def test_lm_head_weight_for_fused_logprobs_uses_to_local_for_tp_vocab_dtensor(
+    monkeypatch,
+):
+    monkeypatch.setattr(automodel_train, "DTensor", _FakeWeightDTensor)
+    local_tensor = torch.randn(4, 3)
+    full_tensor = torch.randn(8, 3)
+    weight = _FakeWeightDTensor(
+        local_tensor=local_tensor,
+        full_tensor=full_tensor,
+        placements=[Shard(0)],
+        mesh_dim_names=["tp"],
+    )
+    lm_head = torch.nn.Module()
+    lm_head.weight = weight
+
+    output_weight, local_vocab_is_tp_partition = (
+        automodel_train._lm_head_weight_for_fused_linear_logprobs(lm_head)
+    )
+
+    assert output_weight is local_tensor
+    assert local_vocab_is_tp_partition is True
+    assert weight.to_local_calls == 1
+    assert weight.full_tensor_calls == 0
+
+
+@pytest.mark.automodel
+def test_lm_head_weight_for_fused_logprobs_uses_full_tensor_for_dp_dtensor(
+    monkeypatch,
+):
+    monkeypatch.setattr(automodel_train, "DTensor", _FakeWeightDTensor)
+    local_tensor = torch.randn(4, 3)
+    full_tensor = torch.randn(8, 3)
+    weight = _FakeWeightDTensor(
+        local_tensor=local_tensor,
+        full_tensor=full_tensor,
+        placements=[Shard(0)],
+        mesh_dim_names=["dp"],
+    )
+    lm_head = torch.nn.Module()
+    lm_head.weight = weight
+
+    output_weight, local_vocab_is_tp_partition = (
+        automodel_train._lm_head_weight_for_fused_linear_logprobs(lm_head)
+    )
+
+    assert output_weight is full_tensor
+    assert local_vocab_is_tp_partition is False
+    assert weight.to_local_calls == 0
+    assert weight.full_tensor_calls == 1
 
 
 @pytest.fixture
@@ -551,6 +634,122 @@ class TestLogprobsPostProcessor:
 
         assert result.shape == (batch_size, seq_len)
 
+    def test_logprobs_accepts_precomputed_selected_logprobs(
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+    ):
+        processor = LogprobsPostProcessor(
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+        )
+
+        batch_size = 3
+        seq_len = 5
+        input_ids = torch.arange(batch_size * seq_len).reshape(batch_size, seq_len)
+        selected_logprobs = torch.randn(batch_size, seq_len - 1).to(torch.bfloat16)
+        input_lengths = torch.full((batch_size,), seq_len)
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=seq_len,
+            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
+            position_ids=torch.arange(seq_len).repeat(batch_size, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+        )
+
+        result = processor(
+            logits=selected_logprobs,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+
+        assert result.shape == (batch_size, seq_len)
+        assert result.dtype == torch.float32
+        torch.testing.assert_close(result[:, 0], torch.zeros(batch_size))
+        torch.testing.assert_close(result[:, 1:], selected_logprobs.to(torch.float32))
+
+    def test_precomputed_selected_logprobs_rejects_context_parallel(
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+    ):
+        processor = LogprobsPostProcessor(
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=2,
+        )
+        batch_size = 3
+        seq_len = 5
+        input_ids = torch.arange(batch_size * seq_len).reshape(batch_size, seq_len)
+        selected_logprobs = torch.randn(batch_size, seq_len - 1)
+        data_dict = BatchedDataDict(
+            {"input_lengths": torch.full((batch_size,), seq_len)}
+        )
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=seq_len,
+            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
+            position_ids=torch.arange(seq_len).repeat(batch_size, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+        )
+
+        with pytest.raises(NotImplementedError, match="context parallelism"):
+            processor(
+                logits=selected_logprobs,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=batch_size,
+                original_seq_len=seq_len,
+            )
+
+    def test_precomputed_selected_logprobs_rejects_sequence_packing(
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+    ):
+        processor = LogprobsPostProcessor(
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+            enable_seq_packing=True,
+        )
+        batch_size = 3
+        seq_len = 5
+        input_ids = torch.arange(batch_size * seq_len).reshape(batch_size, seq_len)
+        selected_logprobs = torch.randn(batch_size, seq_len - 1)
+        data_dict = BatchedDataDict(
+            {"input_lengths": torch.full((batch_size,), seq_len)}
+        )
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=seq_len,
+            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
+            position_ids=torch.arange(seq_len).repeat(batch_size, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+        )
+
+        with pytest.raises(NotImplementedError, match="sequence packing"):
+            processor(
+                logits=selected_logprobs,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=batch_size,
+                original_seq_len=seq_len,
+            )
+
     def test_logprobs_with_chunking(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
     ):
@@ -805,6 +1004,77 @@ class TestProcessedInputsProperties:
 # =====================
 @pytest.mark.automodel
 class TestForwardWithPostProcessingFn:
+    class _FusedLogprobModel(torch.nn.Module):
+        def __init__(
+            self,
+            batch_size: int,
+            seq_len: int,
+            hidden_size: int,
+            vocab_size: int,
+        ):
+            super().__init__()
+            self.batch_size = batch_size
+            self.seq_len = seq_len
+            self.hidden_size = hidden_size
+            self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+            self._use_fused_linear_logprobs = True
+            self._fused_linear_logprobs_lm_head_path = "lm_head"
+            self._fused_linear_logprobs_chunk_size = 2
+            self._fused_linear_logprobs_tp_group = object()
+            self._fused_linear_logprobs_hidden_states = None
+            self.saw_skip_flag = None
+
+        def forward(self, input_ids, **kwargs):  # noqa: ARG002
+            self.saw_skip_flag = getattr(
+                self, "_skip_lm_head_for_fused_linear_logprobs", False
+            )
+            hidden_states = torch.arange(
+                self.batch_size * self.seq_len * self.hidden_size,
+                dtype=self.lm_head.weight.dtype,
+                device=self.lm_head.weight.device,
+            ).reshape(self.batch_size, self.seq_len, self.hidden_size)
+            self._fused_linear_logprobs_hidden_states = hidden_states
+            return MagicMock(logits=torch.empty(1))
+
+    class _RecordingLogprobLoss:
+        input_type = LossInputType.LOGPROB
+
+        def __init__(self):
+            self.use_fused_linear_logprobs = False
+            self.seen_logprobs = None
+
+        def __call__(
+            self,
+            data,
+            next_token_logprobs,
+            global_valid_seqs,
+            global_valid_toks,
+        ):
+            _ = (data, global_valid_seqs, global_valid_toks)
+            self.seen_logprobs = next_token_logprobs
+            return next_token_logprobs.sum() * 0, {"loss": 0.0}
+
+    def _make_processed_mb(self, batch_size=2, seq_len=5, vocab_size=11):
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=seq_len,
+            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
+            position_ids=torch.arange(seq_len).repeat(batch_size, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+        )
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": torch.full((batch_size,), seq_len),
+                "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+            }
+        )
+        return ProcessedMicrobatch(data_dict, processed_inputs, batch_size, seq_len)
+
     def test_forward_with_loss_post_processor(
         self,
         mock_model,
@@ -876,6 +1146,138 @@ class TestForwardWithPostProcessingFn:
 
         # Verify returned microbatch is correct
         assert returned_mb is processed_mb
+
+    @patch("nemo_rl.models.automodel.train.apply_temperature_scaling")
+    @patch("nemo_rl.models.automodel.train.from_parallel_hidden_states_to_logprobs")
+    def test_forward_with_logprobs_uses_fused_linear_logprobs(
+        self,
+        mock_fused_logprobs,
+        mock_temperature_scaling,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+        mock_tp_mesh,
+    ):
+        batch_size = 2
+        seq_len = 5
+        hidden_size = 3
+        vocab_size = 11
+        model = self._FusedLogprobModel(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+        )
+        selected_logprobs = torch.randn(batch_size, seq_len - 1)
+        mock_fused_logprobs.return_value = selected_logprobs
+        mock_temperature_scaling.side_effect = AssertionError(
+            "temperature scaling should not run on precomputed logprobs"
+        )
+        processed_mb = self._make_processed_mb(batch_size, seq_len, vocab_size)
+        processor = LogprobsPostProcessor(
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+        )
+
+        result, metrics, returned_mb = forward_with_post_processing_fn(
+            model=model,
+            post_processing_fn=processor,
+            processed_mb=processed_mb,
+            sampling_params=TrainingSamplingParams(temperature=2.0),
+        )
+
+        assert returned_mb is processed_mb
+        assert model.saw_skip_flag is True
+        assert model._skip_lm_head_for_fused_linear_logprobs is False
+        mock_fused_logprobs.assert_called_once()
+        call_kwargs = mock_fused_logprobs.call_args.kwargs
+        assert call_kwargs["tensor_parallel_hidden_states"].shape == (
+            seq_len,
+            batch_size,
+            hidden_size,
+        )
+        assert call_kwargs["chunk_size"] == 2
+        torch.testing.assert_close(
+            call_kwargs["output_weight_layer"], model.lm_head.weight / 2.0
+        )
+        torch.testing.assert_close(result[:, 1:], selected_logprobs)
+        torch.testing.assert_close(metrics["logprobs"], result)
+
+    @patch("nemo_rl.models.automodel.train.from_parallel_hidden_states_to_logprobs")
+    def test_forward_with_loss_uses_fused_linear_logprobs(
+        self,
+        mock_fused_logprobs,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+        mock_tp_mesh,
+    ):
+        batch_size = 2
+        seq_len = 5
+        hidden_size = 3
+        vocab_size = 11
+        model = self._FusedLogprobModel(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+        )
+        selected_logprobs = torch.randn(batch_size, seq_len - 1)
+        mock_fused_logprobs.return_value = selected_logprobs
+        processed_mb = self._make_processed_mb(batch_size, seq_len, vocab_size)
+        loss_fn = self._RecordingLogprobLoss()
+        processor = LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+            dp_size=1,
+        )
+
+        result, metrics, returned_mb = forward_with_post_processing_fn(
+            model=model,
+            post_processing_fn=processor,
+            processed_mb=processed_mb,
+            global_valid_seqs=torch.tensor(batch_size),
+            global_valid_toks=torch.tensor(batch_size * seq_len),
+        )
+
+        assert returned_mb is processed_mb
+        assert result.shape == ()
+        assert metrics == {"loss": 0.0}
+        assert loss_fn.use_fused_linear_logprobs is False
+        torch.testing.assert_close(loss_fn.seen_logprobs, selected_logprobs)
+
+    def test_fused_linear_logprobs_rejects_top_k_top_p(
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+    ):
+        model = self._FusedLogprobModel(
+            batch_size=2,
+            seq_len=5,
+            hidden_size=3,
+            vocab_size=11,
+        )
+        processed_mb = self._make_processed_mb()
+        processor = LogprobsPostProcessor(
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+        )
+
+        with pytest.raises(RuntimeError, match="top-k/top-p"):
+            forward_with_post_processing_fn(
+                model=model,
+                post_processing_fn=processor,
+                processed_mb=processed_mb,
+                sampling_params=TrainingSamplingParams(top_k=2, top_p=1.0),
+            )
 
     def test_forward_with_score_post_processor(
         self,

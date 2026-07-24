@@ -382,22 +382,35 @@ This works for GRPO because [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss
 
 **How to enable:**
 
-Add the following to your Megatron config in your YAML file:
+For Megatron, add the following to your YAML file:
 
 ```yaml
 policy:
   megatron_cfg:
     enabled: true
     use_fused_linear_logprobs: true
-    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+    fused_linear_logprobs_chunk_size: 256
 ```
 
-**Notes:**
+For AutoModel, set the equivalent top-level policy keys:
 
-- Only supported on the Megatron backend (`policy.megatron_cfg.enabled: true`).
+```yaml
+policy:
+  dtensor_cfg:
+    enabled: true
+  use_fused_linear_logprobs: true
+  fused_linear_logprobs_chunk_size: 256
+```
+
+**Limitations:**
+
 - Context parallelism is not supported when fused linear logprobs are enabled.
 - Sequence packing is not supported with fused linear logprobs; set `policy.sequence_packing.enabled: false`. The fused forward rolls labels over the whole packed sequence and would mix tokens across packed-sequence boundaries.
 - Top-k/top-p training-time filtering is not supported with fused linear logprobs (set `policy.generation.top_k: null` and `policy.generation.top_p: 1.0`), because the fused path gathers logprobs from the unfiltered logits.
+
+**Notes:**
+
+- Supported on the Megatron and AutoModel backends.
 - The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Loss
