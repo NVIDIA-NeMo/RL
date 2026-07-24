@@ -14,6 +14,16 @@ sft:
   seed: 42
   only_unmask_final: false
 
+  # Anchored SFT (ASFT, arXiv:2509.23753). null => plain cross-entropy SFT.
+  # Set this block to switch the loss to DFT-reweighted NLL + a KL anchor against
+  # the frozen base model (a reference model is enabled automatically, like DPO).
+  #   asft:
+  #     kl_weight: 0.03            # anchor strength (0.005-0.01 sweet spot; <=5e-6 LR)
+  #     kl_type: "k3"              # Schulman KL estimator: k1 | k2 | k3
+  #     kl_input_clamp_value: 20.0
+  #     kl_output_clamp_value: 10.0
+  asft: null
+
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft"
