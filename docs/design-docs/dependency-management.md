@@ -57,6 +57,25 @@ The virtual environment location depends on your runtime environment:
 - **Bare metal**: The venv defaults to `.venv/` local to your NeMo RL clone
 - **Container**: The container sets [`UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv`](https://github.com/NVIDIA-NeMo/RL/blob/main/docker/Dockerfile#L67), so the environment is synced to `/opt/nemo_rl_venv`. Note that this location is ephemeral to the container instance.
 
+> [!WARNING]
+> **Multi-node (`ray.sub`): pre-sync the venv before starting Ray.**
+> On a Slurm launch, the Ray head is started from this same shared venv (`/opt/nemo_rl_venv`), and
+> only *afterwards* does the driver run `uv run examples/run_grpo.py`. In a
+> [development workflow](#development-workflow) (local deps drifted from the container), the driver's
+> implicit `uv sync` step then installs/updates packages **into the venv the head is already running
+> from**, mutating it live. This can break the driver→head attach and surface as a confusing
+> `ValueError: ... resources ... must not be provided when connecting to an existing cluster` at
+> `ray.init` — see [NeMo-RL #382](https://github.com/NVIDIA-NeMo/RL/issues/382). The symptom looks
+> like a Ray bug but is really the launch-time venv mutation.
+>
+> **Fix:** sync the shared venv **once, before** `ray start`, so the driver's later `uv run` is a
+> no-op. `ray.sub` runs `SETUP_COMMAND` on every node before starting Ray, so pass it a pre-sync:
+> ```bash
+> SETUP_COMMAND='uv sync' \
+>   CONTAINER=... MOUNTS=... sbatch ... ray.sub
+> ```
+> Alternatively, remove the drift so no sync is needed at launch — [rebuild the container](#option-2-rebuild-the-container).
+
 ### 3. `source .venv/bin/activate`
 
 Activates the virtual environment, setting up the Python path and environment variables so your script runs with the correct dependencies.
