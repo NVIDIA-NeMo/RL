@@ -4244,6 +4244,11 @@ def async_grpo_train(
                             per_group_metrics.setdefault(k, []).append(v)
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
+                    if not _should_log_nemo_gym_responses(master_config):
+                        for key in list(rollout_metrics):
+                            if "full_result" in key:
+                                rollout_metrics.pop(key)
+
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
                     master_config.grpo["num_prompts_per_step"]
