@@ -347,10 +347,11 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 # The TE override is needed to pin the TE version across all extras
-# The opencv-python-headless override pins >=5.0.0 to patch CVE-2025-9951, CVE-2025-1594, and CVE-2024-31582
-# (bundled FFmpeg 5.1.6 in 4.x wheels) and excludes it from the shipped container (sys_platform == 'never')
-# because its bundled FFmpeg codec libs (H.264, H.265, AAC) may incur royalties. Installed at runtime
-# via tools/install_audio_deps.sh. vllm defaults to opencv for video IO but falls back to torchcodec.
+# The opencv-python-headless override excludes it from the shipped container (sys_platform == 'never')
+# because its bundled FFmpeg codec libs (H.264, H.265, AAC) may incur royalties. The CVE floor
+# (>=5.0.0) is kept separately in constraint-dependencies so it applies to anyone who does install it.
+# Installed at runtime via tools/install_audio_deps.sh (--no-config bypasses the override there).
+# vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
@@ -358,7 +359,7 @@ override-dependencies = [
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.23.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
-  "opencv-python-headless>=5.0.0; sys_platform == 'never'",
+  "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
@@ -417,6 +418,7 @@ constraint-dependencies = [
   # 8.0.1 fixed _IncludedRouter.path crash on fastapi>=0.137 (github.com/trallnag/prometheus-fastapi-instrumentator/issues/370)
   "prometheus-fastapi-instrumentator>=8.0.2",
   "av>=17.1.0",                               # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
+  "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
 # Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
