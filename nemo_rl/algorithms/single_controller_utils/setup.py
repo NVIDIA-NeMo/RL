@@ -328,9 +328,7 @@ def setup_single_controller(
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
-        response_data = setup_response_data(
-            tokenizer, data_config, env_configs=None
-        )
+        response_data = setup_response_data(tokenizer, data_config, env_configs=None)
         assert len(response_data) == 2
         dataset, _val_dataset = response_data
         env_handles: dict[str, EnvironmentInterface] = {}
