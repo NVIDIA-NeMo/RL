@@ -527,9 +527,20 @@ def get_formatted_message_log(
         if tools is not None:
             template_kwargs["tools"] = tools
 
-        formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
-            message_log_strs[: i + 1], **template_kwargs
-        )
+        try:
+            formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
+                message_log_strs[: i + 1], **template_kwargs
+            )
+        except Exception:
+            ## some chat templates (e.g. Qwen3, kanana) refuse to render a prefix
+            ## that has no user turn yet. Defer leading pre-user turns (usually
+            ## system) by emitting an empty chunk; their tokens fold into the first
+            ## user turn's chunk. Re-raise for any later turn so real template
+            ## errors surface.
+            if i < first_user_msg_id:
+                formatted_message = prev_formatted_message
+            else:
+                raise
 
         ## get the length of the previous message, excluding the eos token (if present)
         prev_message_len_no_eos: int = get_first_index_that_differs(
