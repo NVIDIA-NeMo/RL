@@ -16,8 +16,8 @@
 
 Handles weight transfer between a colocated policy and the SGLang generation
 backend via the backend-specific colocated refit drivers
-(``refit_sglang_colocated`` in ``megatron_policy_worker`` /
-``dtensor_policy_worker_v2``), which gather HF tensor buckets per engine and
+(``refit_sglang_colocated`` in ``megatron_refit_sglang`` /
+``dtensor_refit_sglang``), which gather HF tensor buckets per engine and
 push them over Ray CUDA IPC (``send_hf_buckets_via_ipc_actor_impl``).
 
 Lifecycle per sync:
@@ -94,12 +94,12 @@ class SGLangColocatedWeightSynchronizer(WeightSynchronizer):
             self._policy.cfg.get("megatron_cfg", {}).get("enabled", False)
         )
         if use_megatron:
-            from nemo_rl.models.policy.workers import (
-                megatron_policy_worker as _backend,
+            from nemo_rl.weight_sync import (
+                megatron_refit_sglang as _backend,
             )
         else:
-            from nemo_rl.models.policy.workers import (
-                dtensor_policy_worker_v2 as _backend,
+            from nemo_rl.weight_sync import (
+                dtensor_refit_sglang as _backend,
             )
 
         return _backend.refit_sglang_colocated(

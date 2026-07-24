@@ -2296,17 +2296,21 @@ def _refit_sglang_dispatch(
     Backend-specific lifecycle (lock + pause/flush + send + post_process +
     continue) lives in the corresponding worker module:
 
-    - ``megatron_policy_worker.refit_sglang_{colocated,distributed}``
-    - ``dtensor_policy_worker_v2.refit_sglang_{colocated,distributed}``
+    - ``megatron_refit_sglang.refit_sglang_{colocated,distributed}``
+    - ``dtensor_refit_sglang.refit_sglang_{colocated,distributed}``
 
     so this function only picks the right module by trainer backend and
-    transfer mode.
+    transfer mode. Those modules are deliberately separate from the policy
+    worker modules: the driver venv has neither the ``mcore`` nor the training
+    backend extras installed (and ``mcore``/``sglang`` are conflicting extras),
+    so importing ``megatron_policy_worker`` here would raise
+    ``ModuleNotFoundError``.
     """
     use_megatron = bool(policy.cfg.get("megatron_cfg", {}).get("enabled", False))
     if use_megatron:
-        from nemo_rl.models.policy.workers import megatron_policy_worker as _backend
+        from nemo_rl.weight_sync import megatron_refit_sglang as _backend
     else:
-        from nemo_rl.models.policy.workers import dtensor_policy_worker_v2 as _backend
+        from nemo_rl.weight_sync import dtensor_refit_sglang as _backend
 
     if mode == "ipc":
         helper = _backend.refit_sglang_colocated
