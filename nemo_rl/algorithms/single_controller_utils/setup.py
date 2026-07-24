@@ -382,6 +382,8 @@ def setup_single_controller(
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
     # ==========================
     if use_nemo_gym:
+        # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
+        # overlaps model loading instead of running serially afterward.
         enable_router_replay = router_replay_enabled(master_config.policy)
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
             env_configs=master_config.env,
