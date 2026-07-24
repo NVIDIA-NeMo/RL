@@ -2267,8 +2267,8 @@ def refit_policy_generation(
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
+                all_results = ray.get(list(futures_train) + list(futures_inference))
+                results = all_results[len(futures_train) :]
                 update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl (vLLM) or megatron reshard
@@ -2285,8 +2285,8 @@ def refit_policy_generation(
                 )
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            all_results = ray.get(list(futures_train) + list(futures_inference))
+            results = all_results[len(futures_train) :]
             update_success = all(result for result in results if result is not None)
 
         # check if update is successful
