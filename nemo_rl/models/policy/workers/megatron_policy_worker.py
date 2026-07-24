@@ -748,9 +748,17 @@ class MegatronPolicyWorkerImpl(
                     # (MTP params are tagged only when mtp_detach_heads=True, on the last
                     # pipeline stage). grad_norms_by_group always exists after step().
                     mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
+                    # Draft params are tagged with their own grad-norm group
+                    # (see build_draft_model) and clipped separately from the
+                    # policy so their large early gradients don't shrink the
+                    # policy update. None when no draft model is attached.
+                    draft_grad_norm = self.optimizer.grad_norms_by_group.get(
+                        "draft"
+                    )
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
                     mtp_grad_norm = None
+                    draft_grad_norm = None
 
                 pg_collection = get_pg_collection(self.model)
 
@@ -771,6 +779,11 @@ class MegatronPolicyWorkerImpl(
                 # non-last-PP-stage ranks, where it is None) has the MTP grad norm.
                 mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
                     mtp_grad_norm, mp_group=pg_collection.mp
+                )
+                # Same for the draft grad norm: the draft model lives on a single
+                # PP stage, so other ranks see None until reduced.
+                draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+                    draft_grad_norm, mp_group=pg_collection.mp
                 )
                 if (
                     not eval_mode
@@ -875,6 +888,8 @@ class MegatronPolicyWorkerImpl(
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
         self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
