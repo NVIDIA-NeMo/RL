@@ -298,6 +298,163 @@ def wait_for_rayjob_terminal(
     )
 
 
+def _rayjob_dashboard_base(rayjob: dict[str, Any], namespace: str) -> str | None:
+    """In-cluster URL for the RayJob's head dashboard, or None if not ready."""
+    rc_name = (rayjob.get("status") or {}).get("rayClusterName")
+    if not rc_name:
+        return None
+    return f"http://{rc_name}-head-svc.{namespace}.svc.cluster.local:8265"
+
+
+def _http_get_jobs(dashboard_base: str, timeout_s: float = 5.0) -> list[dict] | None:
+    """Return ``GET <dashboard>/api/jobs/`` or None on transport/parse error."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(f"{dashboard_base}/api/jobs/", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _http_post_job(
+    dashboard_base: str,
+    *,
+    entrypoint: str,
+    submission_id: str,
+    timeout_s: float = 10.0,
+) -> tuple[int, str]:
+    """Post a Ray Job entrypoint to the dashboard and return status/body."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps(
+        {
+            "entrypoint": entrypoint,
+            "submission_id": submission_id,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{dashboard_base}/api/jobs/",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
+        return -1, str(exc)
+
+
+def _raycluster_provisioned(raycluster: dict[str, Any]) -> bool:
+    """True iff the RayCluster's ``RayClusterProvisioned`` condition is True."""
+    for cond in (raycluster.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "RayClusterProvisioned":
+            return cond.get("status") == "True"
+    return False
+
+
+def ensure_rayjob_driver_submitted(
+    rayjob_name: str,
+    namespace: str,
+    *,
+    operator_grace_s: int = 90,
+    overall_timeout_s: int = 600,
+    poll_s: int = 5,
+    log: callable | None = None,
+) -> str:
+    """Ensure a RayJob driver is present on the head dashboard.
+
+    KubeRay's ``submissionMode: HTTPMode`` normally posts ``spec.entrypoint``
+    to ``/api/jobs/`` once the RayCluster is provisioned. Some clusters can
+    miss that transition and leave the RayJob running with no submitted driver.
+    This helper waits for provisioning, gives the operator a grace period, then
+    posts the entrypoint using KubeRay's own ``status.jobId`` as the submission
+    id if the operator has not done so.
+    """
+    log = log or (lambda msg: None)
+    deadline = time.monotonic() + overall_timeout_s
+
+    rc_name: str | None = None
+    while time.monotonic() < deadline:
+        rayjob = get_rayjob(rayjob_name, namespace)
+        rc_name = (rayjob or {}).get("status", {}).get("rayClusterName")
+        if rc_name:
+            break
+        time.sleep(poll_s)
+    if not rc_name:
+        raise TimeoutError(f"RayJob {rayjob_name} never populated rayClusterName")
+
+    while time.monotonic() < deadline:
+        rc = get_raycluster(rc_name, namespace)
+        if rc is not None and _raycluster_provisioned(rc):
+            log(f"[ensure-driver] RayCluster {rc_name} is provisioned")
+            break
+        time.sleep(poll_s)
+    else:
+        raise TimeoutError(
+            f"RayCluster {rc_name} did not reach RayClusterProvisioned=True"
+        )
+
+    rayjob = get_rayjob(rayjob_name, namespace) or {}
+    status = rayjob.get("status") or {}
+    job_id = status.get("jobId") or ""
+    if not job_id:
+        raise TimeoutError(
+            f"RayJob {rayjob_name} never populated jobId; cannot submit driver"
+        )
+    dashboard = _rayjob_dashboard_base(rayjob, namespace)
+    if dashboard is None:
+        raise TimeoutError(
+            f"RayJob {rayjob_name} has no dashboard URL (no rayClusterName)"
+        )
+
+    log(
+        f"[ensure-driver] waiting up to {operator_grace_s}s for operator to "
+        f"submit driver (rayjob={rayjob_name}, jobId={job_id})"
+    )
+    grace_until = min(deadline, time.monotonic() + operator_grace_s)
+    while time.monotonic() < grace_until:
+        jobs = _http_get_jobs(dashboard)
+        if jobs is not None:
+            for job in jobs:
+                if job.get("submission_id") == job_id:
+                    log(
+                        f"[ensure-driver] operator submitted driver "
+                        f"(submission_id={job_id})"
+                    )
+                    return job_id
+        time.sleep(poll_s)
+
+    entrypoint = (rayjob.get("spec") or {}).get("entrypoint")
+    if not entrypoint:
+        raise RuntimeError(f"RayJob {rayjob_name} has no spec.entrypoint to POST")
+    log(
+        f"[ensure-driver] operator did not submit driver within "
+        f"{operator_grace_s}s; POSTing entrypoint to dashboard with "
+        f"submission_id={job_id}"
+    )
+    post_status, body = _http_post_job(
+        dashboard, entrypoint=entrypoint, submission_id=job_id
+    )
+    if post_status in (200, 201):
+        log("[ensure-driver] direct POST succeeded")
+        return job_id
+    if post_status == 400 and "exists" in body.lower():
+        log("[ensure-driver] direct POST returned 'already exists'")
+        return job_id
+    raise RuntimeError(
+        f"failed to POST driver entrypoint (status={post_status}): {body[:300]}"
+    )
+
+
 def delete_configmap(name: str, namespace: str, *, ignore_missing: bool = True) -> bool:
     """Delete a ConfigMap. Returns True if deleted, False if it didn't exist."""
     load_kubeconfig()
@@ -699,6 +856,7 @@ __all__ = [
     "delete_rayjob",
     "delete_resource_claim_template",
     "delete_service",
+    "ensure_rayjob_driver_submitted",
     "get_deployment",
     "get_head_pod",
     "get_pod_phase",
