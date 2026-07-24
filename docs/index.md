@@ -348,6 +348,7 @@ design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
+design-docs/nccl-reshard-refit.md
 ```
 
 ```{toctree}

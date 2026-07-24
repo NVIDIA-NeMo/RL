@@ -559,3 +559,6 @@ class PolicyConfig(TypedDict):
     # If true, use standard Megatron layer specs while keeping ModelOpt
     # quantization enabled. Useful for faster QARL runs and logged in configs.
     disable_modelopt_layer_spec: NotRequired[bool]
+
+    # shard-to-shard refit for large models (experimental)
+    nccl_reshard_refit: NotRequired[bool]
