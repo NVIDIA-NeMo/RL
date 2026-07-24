@@ -46,7 +46,6 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.nsys import nsys_nvtx_range
 from nemo_rl.utils.r3_trace import trace_tq_prefetch_payload
 
 TQ_SAMPLE_IDS_FIELD = "__tq_sample_ids"
@@ -647,23 +646,21 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
     ) -> PrefetchedMicrobatch:
         try:
             start = time.perf_counter()
-            with nsys_nvtx_range("train_prefetch/tq_get"):
-                wire = self._client.get_samples(
-                    sample_ids=list(sample_ids),
-                    partition_id=self._meta.partition_id,
-                    select_fields=list(self._plan.fields),
-                )
+            wire = self._client.get_samples(
+                sample_ids=list(sample_ids),
+                partition_id=self._meta.partition_id,
+                select_fields=list(self._plan.fields),
+            )
             self._record("tq_get_s", time.perf_counter() - start)
             self._record("tq_get_calls", 1.0)
 
             start = time.perf_counter()
-            with nsys_nvtx_range("train_prefetch/materialize"):
-                data = materialize(
-                    wire,
-                    layout="padded",
-                    pad_value_dict=self._pad_value_dict,
-                    pad_to_seqlen=self._plan.pad_to_seqlen,
-                )
+            data = materialize(
+                wire,
+                layout="padded",
+                pad_value_dict=self._pad_value_dict,
+                pad_to_seqlen=self._plan.pad_to_seqlen,
+            )
             del wire
             if data.size != len(sample_ids):
                 raise ValueError(
@@ -766,8 +763,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
                 from_source=False,
             )
         try:
-            with nsys_nvtx_range("train_prefetch/consumer_wait"):
-                return next(self._prefetch_iterator)
+            return next(self._prefetch_iterator)
         except Exception as error:
             return _PrefetchFailure(
                 f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
@@ -788,88 +784,87 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
     ) -> PrefetchedMicrobatch:
         """Broadcast one PP-stage payload from TP0/CP0 in the foreground."""
         start = time.perf_counter()
-        with nsys_nvtx_range("train_prefetch/foreground_distribute"):
-            if self._group.is_stage_leader:
-                if isinstance(item, PrefetchedMicrobatch):
-                    try:
-                        item = PrefetchedMicrobatch(
-                            item.global_batch_index,
-                            item.microbatch_index,
-                            item.sample_ids,
-                            _move_stage_payload_to_cuda(item.data),
-                        )
-                    except Exception as error:
-                        item = _PrefetchFailure(
-                            "stage-leader GPU staging failed: "
-                            f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
-                            from_source=False,
-                        )
-                if isinstance(item, _PrefetchFailure):
-                    envelope: list[Any] = [
-                        (
-                            "error",
-                            expected_gb,
-                            expected_mb,
-                            item.message,
-                        )
-                    ]
-                elif isinstance(item, PrefetchedMicrobatch):
-                    envelope = [
-                        (
-                            "ok",
-                            item.global_batch_index,
-                            item.microbatch_index,
-                            item.sample_ids,
-                        )
-                    ]
-                else:
-                    envelope = [
-                        (
-                            "error",
-                            expected_gb,
-                            expected_mb,
-                            "stage leader has no prefetched payload",
-                        )
-                    ]
+        if self._group.is_stage_leader:
+            if isinstance(item, PrefetchedMicrobatch):
+                try:
+                    item = PrefetchedMicrobatch(
+                        item.global_batch_index,
+                        item.microbatch_index,
+                        item.sample_ids,
+                        _move_stage_payload_to_cuda(item.data),
+                    )
+                except Exception as error:
+                    item = _PrefetchFailure(
+                        "stage-leader GPU staging failed: "
+                        f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
+                        from_source=False,
+                    )
+            if isinstance(item, _PrefetchFailure):
+                envelope: list[Any] = [
+                    (
+                        "error",
+                        expected_gb,
+                        expected_mb,
+                        item.message,
+                    )
+                ]
+            elif isinstance(item, PrefetchedMicrobatch):
+                envelope = [
+                    (
+                        "ok",
+                        item.global_batch_index,
+                        item.microbatch_index,
+                        item.sample_ids,
+                    )
+                ]
             else:
-                envelope = [None]
+                envelope = [
+                    (
+                        "error",
+                        expected_gb,
+                        expected_mb,
+                        "stage leader has no prefetched payload",
+                    )
+                ]
+        else:
+            envelope = [None]
 
-            torch.distributed.broadcast_object_list(
-                envelope,
-                src=self._group.stage_source_rank,
-                group=self._group.stage_group,
+        torch.distributed.broadcast_object_list(
+            envelope,
+            src=self._group.stage_source_rank,
+            group=self._group.stage_group,
+        )
+        status = envelope[0]
+        if not isinstance(status, tuple) or not status:
+            raise self._batch_error(
+                expected_gb,
+                expected_mb,
+                f"invalid stage-prefetch envelope: {status!r}",
             )
-            status = envelope[0]
-            if not isinstance(status, tuple) or not status:
-                raise self._batch_error(
-                    expected_gb,
-                    expected_mb,
-                    f"invalid stage-prefetch envelope: {status!r}",
-                )
-            if status[0] == "error":
-                raise self._batch_error(
-                    int(status[1]),
-                    int(status[2]),
-                    str(status[3]),
-                )
+        if status[0] == "error":
+            raise self._batch_error(
+                int(status[1]),
+                int(status[2]),
+                str(status[3]),
+            )
 
-            data = _broadcast_batched_data_dict(
-                item.data if isinstance(item, PrefetchedMicrobatch) else None,
-                is_leader=self._group.is_stage_leader,
-                src=self._group.stage_source_rank,
-                group=self._group.stage_group,
-                keep_on_broadcast_device=True,
+        data = _broadcast_batched_data_dict(
+            item.data if isinstance(item, PrefetchedMicrobatch) else None,
+            is_leader=self._group.is_stage_leader,
+            src=self._group.stage_source_rank,
+            group=self._group.stage_group,
+            keep_on_broadcast_device=True,
+        )
+        # Complete the shared payload collective before evaluating local
+        # metadata. A rank-local early exit would strand its stage peers.
+        expected_status = ("ok", expected_gb, expected_mb, expected_ids)
+        if status != expected_status:
+            raise self._batch_error(
+                expected_gb,
+                expected_mb,
+                "stage-prefetch order mismatch: expected "
+                f"{expected_status}, received {status}",
             )
-            # Complete the shared payload collective before evaluating local
-            # metadata. A rank-local early exit would strand its stage peers.
-            expected_status = ("ok", expected_gb, expected_mb, expected_ids)
-            if status != expected_status:
-                raise self._batch_error(
-                    expected_gb,
-                    expected_mb,
-                    "stage-prefetch order mismatch: expected "
-                    f"{expected_status}, received {status}",
-                )
         with self._metrics_lock:
             self._foreground_distribute_s += time.perf_counter() - start
         return PrefetchedMicrobatch(expected_gb, expected_mb, expected_ids, data)

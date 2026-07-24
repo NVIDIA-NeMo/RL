@@ -318,12 +318,6 @@ class MegatronPolicyWorkerImpl(
         else:
             prefetcher.close()
             result["train_microbatch_prefetch_metrics"] = prefetcher.metrics()
-            result["train_microbatch_prefetch_dp_rank"] = (
-                parallel_state.get_data_parallel_rank()
-            )
-            result["train_microbatch_prefetch_pp_rank"] = (
-                parallel_state.get_pipeline_model_parallel_rank()
-            )
             return result
 
     @staticmethod
@@ -403,12 +397,6 @@ class MegatronPolicyWorkerImpl(
             TrainMicrobatchPrefetchGroup
         ] = None
         if self._train_microbatch_prefetch_enabled:
-            if "collective_timeout_s" in prefetch_cfg:
-                raise ValueError(
-                    "policy.train_microbatch_prefetch.collective_timeout_s was "
-                    "specific to the removed Gloo transport; remove this option "
-                    "for stage-local NCCL prefetch"
-                )
             if "item_ready_timeout_s" not in prefetch_cfg:
                 raise ValueError(
                     "policy.train_microbatch_prefetch.item_ready_timeout_s is "

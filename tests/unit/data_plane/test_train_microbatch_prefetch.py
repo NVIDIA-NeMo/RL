@@ -694,16 +694,6 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
         "TrainMicrobatchPrefetcher",
         FakePrefetcher,
     )
-    monkeypatch.setattr(
-        megatron_policy_worker.parallel_state,
-        "get_data_parallel_rank",
-        lambda: 2,
-    )
-    monkeypatch.setattr(
-        megatron_policy_worker.parallel_state,
-        "get_pipeline_model_parallel_rank",
-        lambda: 1,
-    )
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _: None)
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
     meta = _meta(["A"], indices=[[[0, 1]]], lengths=[[4]])
@@ -723,8 +713,6 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
     assert calls["assert_complete"] is True
     assert calls["closed"] is True
     assert result["train_microbatch_prefetch_metrics"] == {"ready_fraction": 1.0}
-    assert result["train_microbatch_prefetch_dp_rank"] == 2
-    assert result["train_microbatch_prefetch_pp_rank"] == 1
 
 
 def test_prefetch_plan_matches_legacy_complete_shard_fetch(

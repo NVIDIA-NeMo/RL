@@ -120,9 +120,11 @@ def _summarize_train_microbatch_prefetch_source_metrics(
 ) -> dict[str, float]:
     """Flatten development-only microbatch-prefetch metrics for step logging.
 
-    The sharded policy dispatch returns one TP0/CP0 source for every DP×PP
-    stage. Stages execute concurrently: duration totals use the slowest source,
-    while calls, bytes, and counts describe job-wide work.
+    The sharded policy dispatch returns only PP=TP=CP=0 for each DP replica,
+    so these are explicitly source-side diagnostics rather than all-stage
+    measurements. DP replicas execute concurrently: duration totals use the
+    slowest source, while calls, bytes, and counts cover only the reported
+    PP0 sources.
     """
     sources = train_results.get("train_microbatch_prefetch_source_metrics")
     if not sources:

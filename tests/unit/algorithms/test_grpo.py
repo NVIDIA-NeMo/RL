@@ -603,8 +603,6 @@ def test_summarize_train_microbatch_prefetch_source_metrics() -> None:
         "train_microbatch_prefetch_source_metrics": [
             {
                 "rank": 0,
-                "dp_rank": 0,
-                "pp_rank": 0,
                 "tq_get_s": 1.0,
                 "materialize_s": 0.2,
                 "foreground_distribute_s": 0.3,
@@ -619,8 +617,6 @@ def test_summarize_train_microbatch_prefetch_source_metrics() -> None:
             },
             {
                 "rank": 16,
-                "dp_rank": 0,
-                "pp_rank": 1,
                 "tq_get_s": 2.0,
                 "materialize_s": 0.1,
                 "foreground_distribute_s": 0.6,
