@@ -2464,9 +2464,9 @@ def _refit_sglang_dispatch(
     """
     use_megatron = bool(policy.cfg.get("megatron_cfg", {}).get("enabled", False))
     if use_megatron:
-        from nemo_rl.models.policy.workers import megatron_policy_worker as _backend
+        from nemo_rl.weight_sync import megatron_sglang_refit as _backend
     else:
-        from nemo_rl.models.policy.workers import dtensor_policy_worker_v2 as _backend
+        from nemo_rl.weight_sync import dtensor_sglang_refit as _backend
 
     if mode == "ipc":
         helper = _backend.refit_sglang_colocated
