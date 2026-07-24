@@ -8,8 +8,8 @@
 # Safe to call multiple times — exits immediately if already installed.
 set -euo pipefail
 
-# Fast exit: both torchcodec and cv2 must be importable.
-if python -c "import torchcodec; import cv2" 2>/dev/null; then
+# Fast exit: if torchcodec imports cleanly it already has FFmpeg available.
+if python -c "import torchcodec" 2>/dev/null; then
     echo "[audio-deps] Already installed and functional, skipping."
     exit 0
 fi
@@ -28,12 +28,4 @@ uv pip install --no-config \
     "torchaudio==2.11.0" \
     "torchcodec>=0.3.0"
 
-# opencv-python-headless is excluded from the shipped container (bundled FFmpeg codec
-# libs incur royalties). vllm defaults to opencv for video IO; install >=5.0.0 which
-# also patches CVE-2025-9951, CVE-2025-1594, and CVE-2024-31582.
-# --no-config prevents the sys_platform=='never' override in pyproject.toml from
-# suppressing this install.
-echo "[audio-deps] Installing opencv-python-headless..."
-uv pip install --no-config "opencv-python-headless>=5.0.0"
-python -c "import cv2" || { echo "[audio-deps] ERROR: cv2 not importable after install" >&2; exit 1; }
 echo "[audio-deps] Done."
