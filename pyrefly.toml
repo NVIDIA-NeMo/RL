@@ -177,6 +177,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/collective_rpc.py",
   "nemo_rl/models/generation/vllm/config.py",
   "nemo_rl/models/generation/vllm/patches.py",
+  "nemo_rl/models/generation/vllm/quantization/bf16_trtllm_moe_utils.py",
   "nemo_rl/models/generation/vllm/quantization/fp8_train_utils.py",
   "nemo_rl/models/generation/vllm/quantization/mxfp8_utils.py",
   "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",

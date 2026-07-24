@@ -450,6 +450,7 @@ class BaseVllmGenerationWorker:
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
+        install_bf16_trtllm_patches = True
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
@@ -462,6 +463,33 @@ class BaseVllmGenerationWorker:
             _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
+            # fp8 runs can still leave MoE layers unquantized
+            # (num_first/last_layers_in_bf16, quantization_ignored_layer_kws);
+            # those take the stock unquantized TRTLLM path and hit the same
+            # refit breakage, so they need the bf16 patches below too.
+            install_bf16_trtllm_patches = (
+                self.cfg["vllm_cfg"].get("num_first_layers_in_bf16", 0) > 0
+                or self.cfg["vllm_cfg"].get("num_last_layers_in_bf16", 0) > 0
+                or bool(self.cfg["vllm_cfg"].get("quantization_ignored_layer_kws"))
+            )
+        if (
+            install_bf16_trtllm_patches
+            and os.getenv("NRL_BF16_TRTLLM_REFIT", "1") != "0"
+        ):
+            # Unquantized vLLM with the FlashInfer TRTLLM MoE backend rebinds
+            # the fused-MoE weights to a 4D block layout on first processing,
+            # which breaks every subsequent refit load. Install idempotent
+            # replacements that keep checkpoint-layout params as permanent
+            # load targets. Inert unless a FusedMoE layer actually selects
+            # the TRTLLM backend. Kill switch: NRL_BF16_TRTLLM_REFIT=0.
+            # Composes with the fp8 patches above (they target different MoE
+            # method classes); init_fp8 must run first so the engine-core
+            # entry points chain fp8 -> bf16.
+            from nemo_rl.models.generation.vllm.quantization.bf16_trtllm_moe import (
+                init_bf16_trtllm_moe,
+            )
+
+            init_bf16_trtllm_moe(self.cfg["vllm_cfg"], model_parallel_size)
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
