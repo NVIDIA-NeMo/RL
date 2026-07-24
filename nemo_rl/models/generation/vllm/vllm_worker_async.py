@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import math
 import threading
 import time
 import uuid
@@ -52,6 +53,23 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _replace_non_finite(obj: Any) -> Any:
+    """Recursively replace NaN/Inf floats with 0.0.
+
+    starlette's JSONResponse serializes with allow_nan=False, so a single
+    non-finite value raises ValueError and the request returns HTTP 500. vLLM
+    can return NaN/Inf logprobs (we hit this at long context), so sanitize the
+    response payload before serializing it.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else 0.0
+    if isinstance(obj, dict):
+        return {k: _replace_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_replace_non_finite(v) for v in obj]
+    return obj
 
 
 def _replace_prefix_tokens(
@@ -812,8 +830,11 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
+                # NaN/Inf logprobs would make JSONResponse (allow_nan=False) 500.
                 return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
+                    content=_replace_non_finite(
+                        model_dump_chat_response_with_routed_experts(generator)
+                    )
                 )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
