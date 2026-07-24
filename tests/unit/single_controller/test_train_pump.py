@@ -285,7 +285,9 @@ def test_train_pump_drives_mcore_training_step(
                 _prepopulate_buffer(tq_buffer, meta, weight_version=step)
 
         log = _CallLog.remote()
-        weight_sync = SimpleNamespace(sync_weights=lambda: None)
+        weight_sync = SimpleNamespace(
+            sync_weights=lambda *, kv_scales=None: None,
+        )
         adv_est = _FakeAdvEstimator()
         # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
         rollout_manager = SimpleNamespace(
