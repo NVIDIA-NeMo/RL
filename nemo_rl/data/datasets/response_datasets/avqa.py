@@ -74,6 +74,8 @@ class AVQADataset(RawDataset):
     """
 
     task_name = "avqa"
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
 
     def __init__(
         self,

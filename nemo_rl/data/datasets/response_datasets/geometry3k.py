@@ -60,6 +60,9 @@ class Geometry3KDataset(RawDataset):
         split: Split name for the dataset, default is "train"
     """
 
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
+
     def __init__(self, split: str = "train", **kwargs):
         # train, validation, and test are supported splits.
         assert split in ["train", "validation", "test"], (

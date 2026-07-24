@@ -14,37 +14,6 @@
 
 import pytest
 
-from nemo_rl.data.datasets.eval_datasets import (
-    MULTIMODAL_DATASETS,
-    _is_multimodal_dataset,
-)
-
-
-class TestIsMultimodalDataset:
-    """Tests for _is_multimodal_dataset and MULTIMODAL_DATASETS."""
-
-    def test_mmau_is_multimodal(self):
-        assert _is_multimodal_dataset("mmau") is True
-
-    def test_twinkstart_mmau_is_multimodal(self):
-        assert _is_multimodal_dataset("TwinkStart/MMAU") is True
-
-    def test_math_is_not_multimodal(self):
-        assert _is_multimodal_dataset("math") is False
-
-    def test_gpqa_is_not_multimodal(self):
-        assert _is_multimodal_dataset("gpqa") is False
-
-    def test_empty_string_is_not_multimodal(self):
-        assert _is_multimodal_dataset("") is False
-
-    def test_multimodal_datasets_is_a_set(self):
-        assert isinstance(MULTIMODAL_DATASETS, set)
-
-    def test_multimodal_datasets_contains_expected(self):
-        assert "mmau" in MULTIMODAL_DATASETS
-        assert "TwinkStart/MMAU" in MULTIMODAL_DATASETS
-
 
 class TestAVQADataset:
     """Tests for AVQADataset loading and format_data."""

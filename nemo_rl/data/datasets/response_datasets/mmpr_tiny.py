@@ -183,6 +183,9 @@ class MMPRTinyDataset(RawDataset):
         seed: Random seed for train/validation split (default 42).
     """
 
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
+
     def __init__(
         self,
         split: str = "train",

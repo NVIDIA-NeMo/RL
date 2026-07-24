@@ -12,33 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MMLU-Pro dataset."""
+"""MMLU-Pro response dataset."""
 
-from typing import Any, Optional
+from typing import Any
 
 from datasets import load_dataset
 
-from nemo_rl.data import processors
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-class MMLUProDataset:
-    def __init__(self, prompt_file: str, system_prompt_file: Optional[str] = None):
-        ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-        self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
+class MMLUProDataset(RawDataset):
+    default_processor = "multichoice_qa_processor"
 
-        self.task_spec = TaskDataSpec(
-            task_name="MMLU-Pro",
-            prompt_file=prompt_file,
-            system_prompt_file=system_prompt_file,
+    def __init__(self, **kwargs):
+        self.task_name = "MMLU-Pro"
+
+        dataset = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+        self.dataset = dataset.map(
+            self._rekey,
+            remove_columns=dataset.column_names,
         )
-        self.processor = processors.multichoice_qa_processor
+        self.val_dataset = None
 
-    def _rekey(self, data: dict[str, Any]):
-        options = {chr(ord("A") + i): op for i, op in enumerate(data["options"])}
+    def _rekey(self, data: dict[str, Any]) -> dict[str, Any]:
+        options = {
+            chr(ord("A") + i): option for i, option in enumerate(data["options"])
+        }
         return {
             "question": data["question"],
             "options": options,
             "answer": data["answer"],
             "subject": data["category"],
+            "task_name": self.task_name,
         }

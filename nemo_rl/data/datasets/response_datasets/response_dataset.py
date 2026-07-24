@@ -39,6 +39,8 @@ class ResponseDataset(RawDataset):
         seed: Seed for train/validation split when split_validation_size > 0, default is 42
     """
 
+    default_processor = "math_hf_data_processor"
+
     def __init__(
         self,
         data_path: str,
@@ -79,7 +81,9 @@ class ResponseDataset(RawDataset):
         return {
             "messages": [
                 {"role": "user", "content": data[self.input_key]},
-                {"role": "assistant", "content": data[self.output_key]},
+                # CSV/JSON loaders can infer all-numeric output columns as ints;
+                # cast so the messages column keeps a uniform str content schema.
+                {"role": "assistant", "content": str(data[self.output_key])},
             ],
             "task_name": self.task_name,
         }

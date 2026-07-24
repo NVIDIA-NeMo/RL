@@ -22,9 +22,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
-from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
-from nemo_rl.data.datasets.response_datasets import load_response_dataset
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    is_multimodal_response_dataset,
+    load_response_dataset,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
@@ -51,18 +53,7 @@ def parse_args():
 def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     print("Setting up data...")
 
-    # load dataset
-    # TODO(#2840): consolidate onto load_response_dataset. Migration is in
-    # progress -- remaining eval-only datasets (mmlu, gpqa, math, mmau) will
-    # move into DATASET_REGISTRY, at which point this branch collapses.
-    # DATASET_REGISTRY cannot be used as the gate yet because it also contains
-    # datasets such as daily-omni that still require an eval-specific wrapper.
-    if data_config["dataset_name"] in {"AIME2024", "AIME2025", "AIME2026"}:
-        base_dataset = load_response_dataset(data_config)
-        rekeyed_ds = base_dataset.dataset
-    else:
-        base_dataset = load_eval_dataset(data_config)
-        rekeyed_ds = base_dataset.rekeyed_ds
+    base_dataset = load_response_dataset(data_config)
 
     # Mirrors nemo_rl/data/utils.py: use data.env_name to look up the env
     # config block and determine the registered environment class.
@@ -72,7 +63,7 @@ def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     env = create_env(env_name=registered_env_name, env_config=env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
-        dataset=rekeyed_ds,
+        dataset=base_dataset.dataset,
         tokenizer=tokenizer,
         default_task_data_spec=base_dataset.task_spec,
         task_data_processors=base_dataset.processor,
@@ -112,8 +103,9 @@ def main():
     # Init ray
     init_ray()
 
-    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
+    # Determine the tokenizer type from the dataset capability rather than from
+    # a manually synchronized name or processor allowlist.
+    is_multimodal = is_multimodal_response_dataset(config.data["dataset_name"])
     tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
     config.generation = configure_generation_config(
         config.generation, tokenizer, is_eval=True
