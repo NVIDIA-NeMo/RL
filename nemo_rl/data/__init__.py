@@ -43,6 +43,11 @@ class PreferenceDatasetConfig(TypedDict):
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
+    split_validation_size: NotRequired[float | int]
+    legacy_validation_split: NotRequired[bool]
+    seed: NotRequired[int]
+    max_samples: NotRequired[int | None]
+    cache_dir: NotRequired[str | None]
 
 
 class DataConfig(TypedDict):

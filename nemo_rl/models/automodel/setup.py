@@ -182,15 +182,25 @@ def get_tokenizer(
         The configured tokenizer or processor instance.
     """
     processor = None
+    tokenizer_load_kwargs: dict[str, bool] = {}
+    if "fix_mistral_regex" in tokenizer_config:
+        tokenizer_load_kwargs["fix_mistral_regex"] = tokenizer_config[
+            "fix_mistral_regex"
+        ]
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=True,
+            **tokenizer_load_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = NeMoAutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_load_kwargs,
         )
 
     if tokenizer.pad_token is None:

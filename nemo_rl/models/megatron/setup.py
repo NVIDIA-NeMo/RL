@@ -21,7 +21,7 @@ import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
 from megatron.bridge import AutoBridge
@@ -659,6 +659,9 @@ def setup_model_config(
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
 
+    # Apply optional multimodal provider settings
+    _apply_multimodal_config(model_cfg, config)
+
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
@@ -870,6 +873,27 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )
+
+
+def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Map legacy Omni freeze controls onto canonical provider attributes."""
+    field_mapping = {
+        "freeze_vision_encoder": "freeze_vision_model",
+        "freeze_vision_projector": "freeze_vision_projection",
+        "freeze_audio_encoder": "freeze_sound_encoder",
+        "freeze_audio_projector": "freeze_sound_projection",
+        "radio_force_cpe_eval_mode": "radio_force_cpe_eval_mode",
+    }
+    megatron_cfg = cast(dict[str, Any], config["megatron_cfg"])
+    for config_key, provider_attr in field_mapping.items():
+        if config_key not in megatron_cfg:
+            continue
+        if not hasattr(model_cfg, provider_attr):
+            raise ValueError(
+                f"policy.megatron_cfg.{config_key} is only supported by a "
+                f"multimodal provider exposing {provider_attr!r}."
+            )
+        setattr(model_cfg, provider_attr, megatron_cfg[config_key])
 
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
