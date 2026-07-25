@@ -553,11 +553,10 @@ def get_formatted_message_log(
         # the assistant's generation prompt as part of the user message.
 
         # Only pass tools parameter if tools exist
-        template_kwargs = {
+        template_kwargs: dict[str, Any] = {
             "add_generation_prompt": add_generation_prompt
             and message["role"] in ["user", "tool"],
             "tokenize": False,
-            "add_special_tokens": False,
         }
         if tools is not None:
             template_kwargs["tools"] = tools

@@ -1382,3 +1382,62 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     assert torch.all(
         reconstructed["sequence_lengths"] == batch_data["sequence_lengths"]
     )
+
+
+def test_sequence_packing_keeps_preference_pairs_atomic():
+    sequence_lengths = torch.tensor([50, 60, 55, 65, 45, 70, 40, 75])
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(8, 128, dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]),
+            "is_chosen": torch.tensor(
+                [True, False, True, False, True, False, True, False]
+            ),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        pair_grouping_key="pair_index",
+        max_sequences_per_bin=1,
+    )
+
+    shards, _ = batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+    seen_pairs = set()
+    for shard in shards:
+        for microbatch in shard.make_microbatch_iterator_for_packable_sequences():
+            pair_ids = torch.unique(microbatch["pair_index"]).tolist()
+            assert len(pair_ids) == 1
+            pair_id = pair_ids[0]
+            roles = microbatch["is_chosen"][
+                microbatch["pair_index"] == pair_id
+            ].tolist()
+            assert sorted(roles) == [False, True]
+            seen_pairs.add(pair_id)
+    assert seen_pairs == {0, 1, 2, 3}
+
+
+def test_sequence_packing_rejects_oversized_preference_pair():
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(4, 800, dtype=torch.long),
+            "sequence_lengths": torch.tensor([600, 600, 100, 100]),
+            "pair_index": torch.tensor([0, 0, 1, 1]),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        pair_grouping_key="pair_index",
+    )
+
+    with pytest.raises(ValueError, match="pair group 0 requires 1200 tokens"):
+        batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)

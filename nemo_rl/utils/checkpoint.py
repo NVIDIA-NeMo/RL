@@ -268,6 +268,16 @@ class CheckpointManager:
                     # state from the weights_path.
                     return weights_path, optimizer_path
 
+            # Modern Megatron torch_dist checkpoints store optimizer shards in the
+            # distributed checkpoint rather than common.pt. Their run_config is the
+            # authoritative manifest used by Megatron-Bridge during load.
+            run_config_path = weights_path / "iter_0000000" / "run_config.yaml"
+            if run_config_path.exists():
+                with open(run_config_path) as f:
+                    run_config = yaml.safe_load(f) or {}
+                if run_config.get("checkpoint", {}).get("save_optim") is True:
+                    return weights_path, optimizer_path
+
             warnings.warn(
                 f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "

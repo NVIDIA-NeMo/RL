@@ -1,0 +1,18 @@
+# Packing A/B control for the Super 2K no-packing experiment.
+# Keep model, data, optimizer, batch size, and parallelism identical; only
+# enable pair-atomic, model-owned sequence packing.
+defaults: vlm_mpo-nemotron-super-omni-nopack-2k-parity.yaml
+
+policy:
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+    fuse_loss: true
+    pair_grouping_key: pair_index
+    max_sequences_per_bin: 1
+
+logger:
+  wandb:
+    name: super-main-packed-2k-cp1-100step
