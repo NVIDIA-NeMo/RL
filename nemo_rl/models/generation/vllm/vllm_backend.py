@@ -114,7 +114,7 @@ def _param_for_loaded_weight(
 ) -> torch.Tensor | None:
     candidates = [name]
     if name.startswith("backbone."):
-        candidates.append(f"model.{name[len('backbone.'):]}")
+        candidates.append(f"model.{name[len('backbone.') :]}")
     for candidate in candidates:
         param = params.get(candidate)
         if param is not None:
@@ -213,6 +213,8 @@ def _maybe_expand_tp_local_weight(
 
 
 class VllmInternalWorkerExtension:
+    _mx_megatron_mode: bool | None
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -600,7 +602,7 @@ class VllmInternalWorkerExtension:
             # cache. The Megatron path has its own discover/plan loop, so
             # we only do enough discover here to detect the publisher kind.
             if not hasattr(self, "_mx_megatron_mode"):
-                self._mx_megatron_mode = None  # None = unknown, True/False = latched
+                self._mx_megatron_mode = None
 
             # ---- Lazy-init receiver and register receive buffers (once) ----
             if not hasattr(self, "_mx_receiver") or self._mx_receiver is None:
@@ -611,7 +613,7 @@ class VllmInternalWorkerExtension:
                     if torch.distributed.is_initialized()
                     else 0
                 )
-                self._mx_receiver = build_v2_receiver(
+                self._mx_receiver = build_v2_receiver(  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
                     rank=rank,
                     device_id=self.device.index,
                     mx_config=mx_config,
@@ -629,13 +631,15 @@ class VllmInternalWorkerExtension:
                     if p.is_cuda
                 }
                 self._mx_receiver.initialize(model_tensors=receive_buffers)
-                self._mx_recv_buffers = receive_buffers
+                self._mx_recv_buffers = receive_buffers  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
 
             # ---- Discover, pick, and pull ----
             candidates = self._mx_receiver.discover_v2_sources(
                 model_name=self.model_config.model
                 if hasattr(self.model_config, "model")
-                else getattr(self.model_runner.vllm_config.model_config, "model", "unknown"),
+                else getattr(
+                    self.model_runner.vllm_config.model_config, "model", "unknown"
+                ),
                 min_version=int(version),
                 same_rank_only=mx_config.same_rank_only,
                 include_replicas=mx_config.tree_scale_out,
@@ -669,10 +673,14 @@ class VllmInternalWorkerExtension:
                 # EP-gather) as a rollback.
                 if os.environ.get("MX_MEGATRON_LEGACY_RECEIVER", "0") == "1":
                     return self._update_weights_via_mx_megatron(
-                        candidates=candidates, version=int(version), mx_config=mx_config,
+                        candidates=candidates,
+                        version=int(version),
+                        mx_config=mx_config,
                     )
                 return self._update_weights_via_mx_native(
-                    candidates=candidates, version=int(version), mx_config=mx_config,
+                    candidates=candidates,
+                    version=int(version),
+                    mx_config=mx_config,
                 )
 
             chosen = self._mx_receiver.pick_best_source(candidates)
@@ -701,14 +709,7 @@ class VllmInternalWorkerExtension:
             # Build (name, weight) pairs for _load_weights from buffers.
             weights = []
             for name, buf in self._mx_recv_buffers.items():
-                w = buf
-                # apply gpt-oss transpose fix on the way in
-                if (
-                    "GptOssForCausalLM"
-                    in self.model_runner.vllm_config.model_config.architectures
-                ):
-                    w = fix_gpt_oss_export_transpose(name, w)
-                weights.append((name, w))
+                weights.append((name, buf))
 
             self._load_weights(weights)
             torch.cuda.current_stream().synchronize()
@@ -780,12 +781,12 @@ class VllmInternalWorkerExtension:
                 )
 
     def _introspect_rollout_ep_layout(self) -> tuple[int, int, int]:
-        """Read the live vLLM rollout's expert-parallel layout from its FusedMoE
-        layers (ground truth). Returns (ep_world_size, ep_rank, num_experts).
+        """Read the live vLLM rollout's expert-parallel layout.
 
-        Falls back to (1, 0, <num_experts or 0>) when the rollout is not
-        expert-parallel or introspection fails — i.e. the caller then delivers the
-        full expert set (no pruning), preserving the proven behavior.
+        Uses FusedMoE layers as ground truth and returns
+        ``(ep_world_size, ep_rank, num_experts)``. Falls back to
+        ``(1, 0, <num_experts or 0>)`` when the rollout is not expert-parallel or
+        introspection fails, so the caller delivers the full expert set.
         """
         try:
             model = self.model_runner.model
@@ -827,9 +828,7 @@ class VllmInternalWorkerExtension:
             )
             return tp_size, 0
 
-    @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_via_mx_native"
-    )
+    @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_mx_native")
     def _update_weights_via_mx_native(
         self,
         *,
@@ -852,7 +851,7 @@ class VllmInternalWorkerExtension:
         (pull only this rank's experts) is a bandwidth optimization deferred to a
         follow-up that introspects the rollout's live EP layout.
         """
-        from modelexpress.engines.vllm.weight_update import (
+        from modelexpress.engines.vllm.weight_update import (  # pyrefly: ignore[import-error]  Optional ModelExpress integration.
             MxInitInfo,
             MxUpdateInfo,
             MxVllmWeightUpdater,
@@ -861,9 +860,7 @@ class VllmInternalWorkerExtension:
         model_name = (
             self.model_config.model
             if hasattr(self.model_config, "model")
-            else getattr(
-                self.model_runner.vllm_config.model_config, "model", "unknown"
-            )
+            else getattr(self.model_runner.vllm_config.model_config, "model", "unknown")
         )
         if getattr(self, "_mx_updater", None) is None:
             rank = (
@@ -871,7 +868,7 @@ class VllmInternalWorkerExtension:
                 if torch.distributed.is_initialized()
                 else 0
             )
-            self._mx_updater = MxVllmWeightUpdater()
+            self._mx_updater = MxVllmWeightUpdater()  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
             self._mx_updater.initialize_weight_update_setup(
                 MxInitInfo(
                     mx_server_url=mx_config.mx_server_url,
@@ -926,8 +923,7 @@ class VllmInternalWorkerExtension:
             self._mx_updater.finish_weight_update(int(version))
         except Exception as e:
             print(
-                f"Error in _update_weights_via_mx_native: {e}\n"
-                f"{traceback.format_exc()}"
+                f"Error in _update_weights_via_mx_native: {e}\n{traceback.format_exc()}"
             )
             return False
 
@@ -964,13 +960,13 @@ class VllmInternalWorkerExtension:
         See ``temp/NemoRL_Megatron_MX_Design.md`` §6 + §9b and
         ``temp/NemoRL_Megatron_MX_Phase_C_Handoff.md``.
         """
-        from modelexpress.megatron_translator import (
+        from modelexpress.megatron_translator import (  # pyrefly: ignore[import-error]  Optional ModelExpress integration.
             MegatronReceiverContext,
             ReceiveSpec,
             discover_megatron_context,
             run_refit_cycle,
         )
-        from modelexpress.nemo_rl_v2 import (
+        from modelexpress.nemo_rl_v2 import (  # pyrefly: ignore[import-error]  Optional ModelExpress integration.
             ROLE_MEGATRON_VOCAB_PARALLEL,
             TargetTpLayout,
         )
@@ -999,7 +995,8 @@ class VllmInternalWorkerExtension:
                 else 0
             )
             target_tp_layout = TargetTpLayout(
-                tp_size=target_tp, tp_rank=target_tp_rank,
+                tp_size=target_tp,
+                tp_rank=target_tp_rank,
             )
 
             # For each Megatron source-name → list of HF target names, build
@@ -1021,10 +1018,13 @@ class VllmInternalWorkerExtension:
                     # be defensive in case a publisher emits the `module.`
                     # prefix and the name_map doesn't.
                     lookup_name = (
-                        td.name[len("module."):] if td.name.startswith("module.")
+                        td.name[len("module.") :]
+                        if td.name.startswith("module.")
                         else td.name
                     )
-                    hf_names = name_map.get(lookup_name, name_map.get(td.name, [td.name]))
+                    hf_names = name_map.get(
+                        lookup_name, name_map.get(td.name, [td.name])
+                    )
                     receive_specs[td.name] = ReceiveSpec(
                         megatron_name=td.name,
                         hf_names=list(hf_names),
@@ -1036,7 +1036,7 @@ class VllmInternalWorkerExtension:
                         role_descriptor=dict(td.megatron_extras or {}),
                     )
 
-            self._mx_megatron_ctx = MegatronReceiverContext(
+            self._mx_megatron_ctx = MegatronReceiverContext(  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
                 target_tp_layout=target_tp_layout,
                 transformer_config=cfg,
                 hf_name_map=name_map,
@@ -1099,7 +1099,8 @@ class VllmInternalWorkerExtension:
                     # builds per-expert buffers as part of assembly.
                     continue
                 dt = {
-                    "bfloat16": torch.bfloat16, "float16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                    "float16": torch.float16,
                     "float32": torch.float32,
                 }.get(spec.target_dtype, torch.bfloat16)
                 target = buffers
@@ -1110,14 +1111,16 @@ class VllmInternalWorkerExtension:
                 # shape. Vocab tensors are the exception: vLLM's loader wants
                 # the full vocab tensor and slices it internally for TP.
                 target[spec.megatron_name] = torch.empty(
-                    full_shape, dtype=dt, **_alloc_kwargs,
+                    full_shape,
+                    dtype=dt,
+                    **_alloc_kwargs,
                 )
             # Register all at once with the receiver's NIXL plane.
             all_buffers = dict(buffers)
             all_buffers.update(vocab_buffers)
             self._mx_receiver._receiver._nixl.register_tensors(all_buffers)
-            self._mx_megatron_buffers = buffers
-            self._mx_megatron_vocab_buffers = vocab_buffers
+            self._mx_megatron_buffers = buffers  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
+            self._mx_megatron_vocab_buffers = vocab_buffers  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
             print(
                 f"[mx-megatron] pre-allocated + registered "
                 f"{len(buffers)} per-rank Megatron buffers and "
@@ -1131,31 +1134,35 @@ class VllmInternalWorkerExtension:
         # TP-world AND there to exist a source at our tp_rank. Otherwise
         # fall through to the multi-source path.
         matched = next(
-            (c for c in candidates
-             if c.megatron_meta is not None
-             and c.megatron_meta.tp_rank == ctx.target_tp_layout.tp_rank),
+            (
+                c
+                for c in candidates
+                if c.megatron_meta is not None
+                and c.megatron_meta.tp_rank == ctx.target_tp_layout.tp_rank
+            ),
             None,
         )
         any_megatron_tp_size = next(
-            (c.megatron_meta.tp_size for c in candidates
-             if c.megatron_meta is not None and c.megatron_meta.tp_size > 0),
+            (
+                c.megatron_meta.tp_size
+                for c in candidates
+                if c.megatron_meta is not None and c.megatron_meta.tp_size > 0
+            ),
             None,
         )
         target_tp_size = ctx.target_tp_layout.tp_size
-        is_matched_tp = (
-            matched is not None
-            and (any_megatron_tp_size is None or any_megatron_tp_size == target_tp_size)
+        is_matched_tp = matched is not None and (
+            any_megatron_tp_size is None or any_megatron_tp_size == target_tp_size
         )
 
         weights: list[tuple[str, "torch.Tensor"]] = []
 
         if is_matched_tp:
             # Bulk RDMA pull — single source, one wire transfer.
-            self._mx_receiver._receiver._nixl.rebind_tensors(
-                self._mx_megatron_buffers
-            )
+            self._mx_receiver._receiver._nixl.rebind_tensors(self._mx_megatron_buffers)
             for _name, _t in self._mx_receiver.receive_from(
-                matched, timeout_seconds=mx_config.timeout_seconds,
+                matched,
+                timeout_seconds=mx_config.timeout_seconds,
             ):
                 pass  # buffers filled in-place via NIXL
 
@@ -1209,10 +1216,12 @@ class VllmInternalWorkerExtension:
                 f"candidates={len(megatron_cands)}"
             )
 
-            from modelexpress.megatron_translator import (
+            from modelexpress.megatron_translator import (  # pyrefly: ignore[import-error]  Optional ModelExpress integration.
                 translate_megatron_to_hf,
             )
-            from modelexpress.nemo_rl_v2 import MegatronTensorSpec
+            from modelexpress.nemo_rl_v2 import (
+                MegatronTensorSpec,  # pyrefly: ignore[import-error]  Optional ModelExpress integration.
+            )
 
             target_specs: dict[str, MegatronTensorSpec] = {
                 m_name: MegatronTensorSpec(
@@ -1247,13 +1256,16 @@ class VllmInternalWorkerExtension:
             # Cache is keyed on the receiver's own state; it survives
             # across cycles for the lifetime of this worker.
             dt_map = {
-                "bfloat16": torch.bfloat16, "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
                 "float32": torch.float32,
             }
             cached_plan_dests = getattr(self, "_mx_megatron_plan_dests", None)
             plan_dests: dict[str, "torch.Tensor"] = cached_plan_dests or {}
             # Per-source pull batches: cand_sid -> list[(name, subslice, dest_view)]
-            v1_batches: dict[str, list] = {c.ref.mx_source_id: [] for c in megatron_cands}
+            v1_batches: dict[str, list] = {
+                c.ref.mx_source_id: [] for c in megatron_cands
+            }
             # Plans that need the v0 scratch path (non-contiguous narrows
             # OR per_expert dict assembly).
             v0_plans: list = []
@@ -1277,7 +1289,9 @@ class VllmInternalWorkerExtension:
                     # above: "host" places pinned CPU buffers, "device"
                     # keeps HBM.
                     dest = torch.empty(
-                        plan.target_shape, dtype=dt, **_alloc_kwargs,
+                        plan.target_shape,
+                        dtype=dt,
+                        **_alloc_kwargs,
                     )
                     plan_dests[plan.tensor_name] = dest
                     newly_allocated_this_cycle += 1
@@ -1322,7 +1336,7 @@ class VllmInternalWorkerExtension:
             if newly_allocated_this_cycle > 0 and plan_dests:
                 t0 = time.perf_counter()
                 self._mx_receiver._receiver._nixl.register_tensors(plan_dests)
-                self._mx_megatron_plan_dests = plan_dests
+                self._mx_megatron_plan_dests = plan_dests  # pyrefly: ignore[implicitly-defined-attribute]  This extension class has no constructor.
                 print(
                     f"[mx-megatron] registered {len(plan_dests)} v1 dest buffers "
                     f"with NIXL in {time.perf_counter() - t0:.2f}s "
@@ -1336,9 +1350,7 @@ class VllmInternalWorkerExtension:
                 # consistent with the buffers' actual device (matters
                 # for DRAM/CUDA dispatch in prep_xfer_dlist).
                 self._mx_receiver._receiver._nixl.rebind_tensors(plan_dests)
-                print(
-                    f"[mx-megatron] reusing {len(plan_dests)} cached v1 dest buffers"
-                )
+                print(f"[mx-megatron] reusing {len(plan_dests)} cached v1 dest buffers")
 
             # ------ Phase 3: per-source sliced pulls (v1) ------
             t0 = time.perf_counter()
@@ -1348,12 +1360,16 @@ class VllmInternalWorkerExtension:
                 if not batch:
                     continue
                 xferred, n_slices, elapsed = self._mx_receiver._receiver.pull_to(
-                    cand.ref, batch, timeout_seconds=mx_config.timeout_seconds,
+                    cand.ref,
+                    batch,
+                    timeout_seconds=mx_config.timeout_seconds,
                 )
                 v1_total_bytes += xferred
             v1_elapsed = time.perf_counter() - t0
             if n_v1_slices:
-                v1_bw = (v1_total_bytes * 8) / (v1_elapsed * 1e9) if v1_elapsed > 0 else 0
+                v1_bw = (
+                    (v1_total_bytes * 8) / (v1_elapsed * 1e9) if v1_elapsed > 0 else 0
+                )
                 print(
                     f"[mx-megatron] v1 pull complete: {n_v1_slices} slices, "
                     f"{v1_total_bytes / 1e9:.2f} GB, {v1_elapsed:.2f}s, "
@@ -1384,15 +1400,14 @@ class VllmInternalWorkerExtension:
                     tensor_shapes = {
                         td.name: tuple(int(dim) for dim in td.global_shape)
                         for td in (
-                            cand.registry.get("tensors", [])
-                            if cand.registry
-                            else []
+                            cand.registry.get("tensors", []) if cand.registry else []
                         )
                         if td.name in include_names and tuple(td.global_shape)
                     }
                     buf_dict: dict[str, "torch.Tensor"] = {}
                     for name, t in self._mx_receiver._receiver.receive_weights_scratch(
-                        cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                        cand.ref,
+                        timeout_seconds=mx_config.timeout_seconds,
                         tensor_shapes=tensor_shapes or None,
                         include_names=include_names,
                     ):
@@ -1407,9 +1422,10 @@ class VllmInternalWorkerExtension:
                     f"{time.perf_counter() - t0:.2f}s"
                 )
             # ------ Phase 5: assemble + translate per plan ------
-            from modelexpress.megatron_translator import (
+            from modelexpress.megatron_translator import (  # pyrefly: ignore[import-error]  Optional ModelExpress integration.
                 assemble_into_destination,
             )
+
             for plan in plans:
                 if not plan.sources:
                     continue
@@ -1443,12 +1459,17 @@ class VllmInternalWorkerExtension:
                                     f"axis={axis} subslice={src.source_subslice}"
                                 )
                             dest.copy_(slice_src, non_blocking=True)
+
                         return _pull
+
                     assembled = assemble_into_destination(
-                        plan, pull=_pull_factory(), device=self.device,
+                        plan,
+                        pull=_pull_factory(),
+                        device=self.device,
                     )
                 for hf_name, hf_tensor in translate_megatron_to_hf(
-                    plan, assembled,
+                    plan,
+                    assembled,
                     transformer_config=ctx.transformer_config,
                     hf_names=list(rs.hf_names),
                 ):
@@ -1468,7 +1489,9 @@ class VllmInternalWorkerExtension:
                 model_name=self.model_config.model
                 if hasattr(self.model_config, "model")
                 else getattr(
-                    self.model_runner.vllm_config.model_config, "model", "unknown",
+                    self.model_runner.vllm_config.model_config,
+                    "model",
+                    "unknown",
                 ),
             )
 

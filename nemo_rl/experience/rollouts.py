@@ -1100,7 +1100,7 @@ async def run_sample_multi_turn_rollout(
             final_sample_state[name] = torch.tensor(acc)
 
     # Sample metrics
-    sample_metrics = {
+    sample_metrics: dict[str, Any] = {
         "turn_count": turn_count,
         "total_tokens": token_count,
         "assistant_tokens": assistant_token_count,
