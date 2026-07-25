@@ -44,12 +44,13 @@ class DatumSpec(TypedDict):
 
 
 class PreferenceDatumSpec(TypedDict):
-    message_log_chosen: LLMMessageLogType
-    message_log_rejected: LLMMessageLogType
+    message_log_chosen: LLMMessageLogType | VLMMessageLogType
+    message_log_rejected: LLMMessageLogType | VLMMessageLogType
     length_chosen: int
     length_rejected: int
     loss_multiplier: float
     idx: int
+    task_name: NotRequired[str]
 
 
 @dataclass
