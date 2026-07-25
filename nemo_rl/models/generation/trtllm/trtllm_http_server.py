@@ -296,7 +296,7 @@ def create_app(
                 "generation_log_probs": gen_logprobs,
             }
 
-        response = {
+        response: dict[str, Any] = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
             "created": int(time.time()),
