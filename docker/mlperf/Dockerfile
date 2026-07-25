@@ -153,9 +153,14 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 #   BUILD_CUSTOM_TRTLLM_URL  git remote (default: github.com/NVIDIA/TensorRT-LLM)
 #   BUILD_CUSTOM_TRTLLM_REF  commit hash / branch / tag to checkout
 # The build is handled by 3rdparty/TensorRT-LLM-workspace/_backend.py via the
-# PEP 517 hook invoked during `uv sync --extra trtllm`.
-ARG BUILD_CUSTOM_TRTLLM_URL
-ARG BUILD_CUSTOM_TRTLLM_REF
+# PEP 517 hook invoked during `uv sync --extra trtllm`. Defaults below are used
+# unless overridden with `--build-arg`; promoting the ARGs to ENV puts them in
+# the `uv sync` process environment so _backend.py reads them (an ARG alone is
+# only a build-time substitution var, not an env var).
+ARG BUILD_CUSTOM_TRTLLM_URL=https://github.com/hchings/TensorRT-LLM.git
+ARG BUILD_CUSTOM_TRTLLM_REF=983e7ff57dd26ce662e1b34cce94b76c9181be05
+ENV BUILD_CUSTOM_TRTLLM_URL=${BUILD_CUSTOM_TRTLLM_URL}
+ENV BUILD_CUSTOM_TRTLLM_REF=${BUILD_CUSTOM_TRTLLM_REF}
 ARG SKIP_VLLM_BUILD
 # SGLang is not used by this benchmark; skip it by default to cut build time.
 ARG SKIP_SGLANG_BUILD=1
@@ -219,11 +224,9 @@ if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
 fi
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
-    # invokes tools/build-custom-trtllm.sh during this sync (≈60 min).
-    # Build coordinates are passed via env vars:
-    #   BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
-    BUILD_CUSTOM_TRTLLM_URL=https://github.com/hchings/TensorRT-LLM.git \
-    BUILD_CUSTOM_TRTLLM_REF=983e7ff57dd26ce662e1b34cce94b76c9181be05 \
+    # invokes tools/build-custom-trtllm.sh during this sync (≈60 min). Build
+    # coordinates come from the BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
+    # ENV set above (from the ARGs / --build-arg), so no inline override here.
     uv sync --link-mode symlink --locked --extra trtllm --no-install-project
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
