@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -128,15 +128,21 @@ def setup(
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
     val_dataset: dict[str, AllTaskProcessedDataset],
+    *,
+    loss_fn_factory: Callable[[Any, PolicyConfig, Any], Any] | None = None,
+    save_state_cls: type = DPOSaveState,
+    initial_save_state_fn: Callable[[], Any] = _initial_dpo_save_state,
+    allow_sequence_packing: bool = False,
+    cluster_name: str = "dpo_cluster",
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
     dict[str, StatefulDataLoader],
-    DPOLossFn,
+    Any,
     Logger,
     CheckpointManager,
-    DPOSaveState,
+    Any,
     MasterConfig,
 ]:
     """Main entry point for running DPO algorithm.
@@ -164,10 +170,11 @@ def setup(
         "Dynamic batching is currently not supported with DPO. "
         "See https://github.com/NVIDIA-NeMo/RL/issues/719"
     )
-    assert not policy_config["sequence_packing"]["enabled"], (
-        "Sequence packing is currently not supported with DPO. "
-        "See https://github.com/NVIDIA-NeMo/RL/issues/719"
-    )
+    if not allow_sequence_packing:
+        assert not policy_config["sequence_packing"]["enabled"], (
+            "Sequence packing is currently not supported with DPO. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/719"
+        )
 
     # Add a guardrail for linear CE fusion loss: if sequence packing is enabled for DPO in the future,
     # we need to validate the fusion path with cu_seqlens-based logprob aggregation first and then remove this guardrail.
@@ -192,7 +199,18 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    dpo_save_state = _get_dpo_save_state(loaded_state)
+    if loaded_state is not None:
+        # Filter to only known save-state fields; checkpoints may carry
+        # extra keys (e.g. validation metrics from previous runs).
+        known_fields = {f.name for f in fields(save_state_cls)}
+        if "total_valid_tokens" in known_fields:
+            # Backcompat: checkpoints saved before total_valid_tokens was added.
+            loaded_state.setdefault("total_valid_tokens", 0)
+        dpo_save_state = save_state_cls(
+            **{k: v for k, v in loaded_state.items() if k in known_fields}
+        )
+    else:
+        dpo_save_state = initial_save_state_fn()
 
     # ==========================
     #           Data
@@ -244,7 +262,7 @@ def setup(
     segment_size = cluster_config.get("segment_size")
     node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
-        name="dpo_cluster",
+        name=cluster_name,
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
@@ -287,11 +305,14 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = DPOLossFn(
-        master_config.dpo,
-        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"],
-    )
+    if loss_fn_factory is None:
+        loss_fn = DPOLossFn(
+            master_config.dpo,
+            use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+            and policy_config["megatron_cfg"]["use_fused_linear_logprobs"],
+        )
+    else:
+        loss_fn = loss_fn_factory(master_config.dpo, policy_config, dpo_save_state)
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -361,6 +382,7 @@ def validate(
     val_batch_size: int,
     val_mbs: int,
     logger: Logger,
+    metrics_cls: type = DPOValMetrics,
 ):
     val_metrics, validation_timings = {}, {}
     for val_dataset_name, v in val_dataloader.items():
@@ -374,13 +396,14 @@ def validate(
             val_batch_size=val_batch_size,
             val_mbs=val_mbs,
             dataset_name=val_dataset_name,
+            metrics_cls=metrics_cls,
         )
         prefix = f"validation-{val_dataset_name}"
 
         logger.log_metrics(asdict(k_val_metrics), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        for metric_name in [f.name for f in fields(DPOValMetrics)]:
+        for metric_name in [f.name for f in fields(metrics_cls)]:
             val_metrics[f"{prefix}_{metric_name}"] = getattr(k_val_metrics, metric_name)
         validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
             "total_validation_time"
@@ -408,6 +431,7 @@ def validate_one_dataset(
     val_batch_size: int,
     val_mbs: int,
     dataset_name: str,
+    metrics_cls: type = DPOValMetrics,
 ):
     """Run validation on one validation dataset."""
     if val_dataloader is None:
@@ -443,7 +467,7 @@ def validate_one_dataset(
                     " This is likely because there were no valid samples."
                 )
             else:
-                for metric_name in [f.name for f in fields(DPOValMetrics)]:
+                for metric_name in [f.name for f in fields(metrics_cls)]:
                     reduction = (
                         np.mean
                         if metric_name in {"global_valid_seqs", "global_valid_toks"}
@@ -462,7 +486,7 @@ def validate_one_dataset(
             sum_num_valid_samples = sum(val_metrics["num_valid_samples"])
             global_valid_toks = sum(val_metrics["global_valid_toks"])
             global_valid_seqs = sum(val_metrics["global_valid_seqs"])
-            val_metrics = DPOValMetrics(
+            val_metrics = metrics_cls(
                 num_valid_samples=sum_num_valid_samples,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
@@ -477,7 +501,7 @@ def validate_one_dataset(
                         ]
                     )
                     / sum_num_valid_samples
-                    for metric_name in [f.name for f in fields(DPOValMetrics)]
+                    for metric_name in [f.name for f in fields(metrics_cls)]
                     if metric_name
                     not in {
                         "num_valid_samples",
@@ -491,10 +515,10 @@ def validate_one_dataset(
                 "No validation metrics were collected."
                 " This is likely because there were no valid samples in the validation set."
             )
-            val_metrics = DPOValMetrics(
+            val_metrics = metrics_cls(
                 **{
                     metric_name: 0.0
-                    for metric_name in [f.name for f in fields(DPOValMetrics)]
+                    for metric_name in [f.name for f in fields(metrics_cls)]
                 }
             )
 
@@ -507,7 +531,7 @@ def validate_one_dataset(
 
     # Print summary of validation results
     print(f"\n📊 Validation Results for `{dataset_name}` set:")
-    for metric_name in [f.name for f in fields(DPOValMetrics)]:
+    for metric_name in [f.name for f in fields(metrics_cls)]:
         print(
             f"    • Validation {metric_name}: {getattr(val_metrics, metric_name):.4f}"
         )
@@ -533,6 +557,9 @@ def dpo_train(
     logger,
     checkpointer,
     dpo_save_state: DPOSaveState,
+    *,
+    metrics_cls: type = DPOValMetrics,
+    post_train_step: Callable[[dict[str, Any], Any, Any], None] | None = None,
 ) -> None:
     # Run dpo training
     timer = Timer()
@@ -568,6 +595,7 @@ def dpo_train(
             val_batch_size=dpo_config.val_global_batch_size,
             val_mbs=dpo_config.val_micro_batch_size,
             logger=logger,
+            metrics_cls=metrics_cls,
         )
         if validation_result is not None:
             val_metrics, validation_timings = validation_result
@@ -603,6 +631,8 @@ def dpo_train(
                         mbs=master_config.policy["train_micro_batch_size"] * 2,
                         timer=timer,
                     )
+                    if post_train_step is not None:
+                        post_train_step(train_results, loss_fn, dpo_save_state)
 
                 is_last_step = total_steps + 1 >= master_config.dpo.max_num_steps or (
                     current_epoch + 1 == max_num_epochs
@@ -624,6 +654,7 @@ def dpo_train(
                         val_batch_size=dpo_config.val_global_batch_size,
                         val_mbs=dpo_config.val_micro_batch_size,
                         logger=logger,
+                        metrics_cls=metrics_cls,
                     )
                     if validation_result is not None:
                         val_metrics, validation_timings = validation_result
@@ -679,7 +710,7 @@ def dpo_train(
                                 [
                                     key.endswith(f"_{metric_name}")
                                     for metric_name in [
-                                        f.name for f in fields(DPOValMetrics)
+                                        f.name for f in fields(metrics_cls)
                                     ]
                                     if metric_name != "num_valid_samples"
                                 ]
@@ -753,7 +784,7 @@ def dpo_train(
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
-            for metric_name in [f.name for f in fields(DPOValMetrics)]:
+            for metric_name in [f.name for f in fields(metrics_cls)]:
                 print(f"  • {metric_name}: {float(metrics[metric_name]):.4f}")
             if "total_flops" in train_results:
                 total_tflops = (

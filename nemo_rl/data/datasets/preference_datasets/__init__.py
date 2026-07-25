@@ -16,6 +16,7 @@ from nemo_rl.data.datasets.preference_datasets.binary_preference_dataset import 
     BinaryPreferenceDataset,
 )
 from nemo_rl.data.datasets.preference_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.preference_datasets.mmpr import MMPRPreferenceDataset
 from nemo_rl.data.datasets.preference_datasets.preference_dataset import (
     PreferenceDataset,
 )
@@ -29,6 +30,7 @@ DATASET_REGISTRY = {
     # built-in datasets
     "HelpSteer3": HelpSteer3Dataset,
     "Tulu3Preference": Tulu3PreferenceDataset,
+    "MMPRPreference": MMPRPreferenceDataset,
     # load from local JSONL file or HuggingFace
     "BinaryPreferenceDataset": BinaryPreferenceDataset,
     "PreferenceDataset": PreferenceDataset,
@@ -81,6 +83,7 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
 __all__ = [
     "BinaryPreferenceDataset",
     "HelpSteer3Dataset",
+    "MMPRPreferenceDataset",
     "PreferenceDataset",
     "Tulu3PreferenceDataset",
     "load_preference_dataset",

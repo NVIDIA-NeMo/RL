@@ -165,7 +165,8 @@ def preference_collate_fn(
         make_sequence_length_divisible_by: Make the sequence length divisible by this value
         add_loss_mask: Whether to add a token_mask to the returned data
     Returns:
-        BatchedDataDict with input_ids, input_lengths, token_mask (optional), and sample_mask fields.
+        BatchedDataDict with input_ids, input_lengths, token_mask (optional),
+        sample_mask, pair_index, is_chosen, and any multimodal processor outputs.
     """
     message_log = []
     length = []
@@ -207,14 +208,26 @@ def preference_collate_fn(
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
 
+    num_pairs = len(data_batch)
     data: BatchedDataDict[Any] = BatchedDataDict(
         {
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "sample_mask": batch["loss_multiplier"],
+            # Packing can reorder rows, so preference losses must not infer
+            # pair membership from positional [::2] / [1::2] slicing.
+            "pair_index": torch.arange(num_pairs, dtype=torch.long).repeat_interleave(
+                2
+            ),
+            "is_chosen": torch.arange(2 * num_pairs) % 2 == 0,
         }
     )
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
+
+    # Keep processor-expanded multimodal data in the same batch coordinate
+    # system as input_ids. NemotronOmniModel owns media insertion and packing;
+    # NeMo-RL must not collapse image placeholders here.
+    data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
 
     return data

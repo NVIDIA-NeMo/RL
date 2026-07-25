@@ -7,3 +7,6 @@ tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
 
 # Disable this due to know vLLM bug with Qwen3.5: https://github.com/vllm-project/vllm/issues/37856
 tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh
+
+# Enable after the first Nano MMPR MPO CP=1 functional qualification.
+tests/test_suites/vlm/vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.sh
