@@ -11,7 +11,7 @@ CHAIN_ID="${CHAIN_ID:-$(date +%Y%m%d-%H%M%S)}"
 CHAIN_NAME="${CHAIN_NAME:-nemotron-omni-mpo-chain-${CHAIN_ID}}"
 RESULTS_NAME="${RESULTS_NAME:-${CHAIN_NAME}}"
 WANDB_NAME="${WANDB_NAME:-${CHAIN_NAME}}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-$(python -c 'import secrets; print(secrets.token_hex(4))')}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-$(python -c 'import secrets; print(\"mpo\" + secrets.token_hex(3))')}"
 RESULTS_ROOT="${RESULTS_ROOT:-${NEMORL}/results}"
 
 [[ "${CHAIN_SEGMENTS}" =~ ^[1-9][0-9]*$ ]] || {
