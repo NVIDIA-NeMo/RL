@@ -608,6 +608,12 @@ if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
 
+# Development containers can opt into the checkout's Ray/Python environment so
+# the cluster and driver use identical Ray and Python versions.
+if [[ -n "${NRL_RAY_VENV:-}" ]]; then
+  export PATH="${NRL_RAY_VENV:-}/bin:\${PATH}"
+fi
+
 # Turn on pipefail here; it does not carry into this 'bash -c' subshell from the
 # submit host. Without it, 'ray status | grep worker_units | awk ...' exits 0 even
 # when grep matches nothing (awk's status wins), so the '|| echo 0' fallback never
@@ -847,6 +853,11 @@ worker_cmd=$(cat <<EOF
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
+
+if [[ -n "${NRL_RAY_VENV:-}" ]]; then
+  export PATH="${NRL_RAY_VENV:-}/bin:\${PATH}"
+fi
+
 echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
 
 # Fail fast if LOG_DIR is not actually shared with the submit host -- the worker
