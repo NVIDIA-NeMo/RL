@@ -354,9 +354,7 @@ def create_teacher_worker_groups(
     policy_config: dict[str, Any],
     tokenizer: Any,
     *,
-    segment_size: Optional[int] = None,
-    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
-    teacher_clusters: Optional[dict[str, RayVirtualCluster]] = None,
+    teacher_clusters: dict[str, RayVirtualCluster],
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Create TeacherWorkerGroup instances for non-colocated teachers.
 
@@ -365,15 +363,8 @@ def create_teacher_worker_groups(
         policy_config: Student policy configuration used as the teacher worker
             configuration template.
         tokenizer: Tokenizer passed to every teacher worker.
-        segment_size: NVLink-domain segment size from the cluster config; when
-            set, each teacher is placed topology-aware so its TP/PP/CP stays
-            within an NVLink domain.
-        teacher_segment_topology: Topology of the nodes left after policy /
-            inference placement, used to pin teacher nodes (see
-            ``prepare_segment_topology``).
         teacher_clusters: Clusters already reserved by
-            :func:`reserve_teacher_clusters`. When omitted, this function
-            reserves the clusters itself for backward compatibility.
+            :func:`reserve_teacher_clusters`, keyed by teacher alias.
 
     Returns:
         A tuple containing the worker groups by primary teacher alias and the
@@ -396,12 +387,6 @@ def create_teacher_worker_groups(
     _validate_default_teacher_alias(opd_cfg)
 
     teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
-    if teacher_clusters is None:
-        teacher_clusters = reserve_teacher_clusters(
-            master_config,
-            segment_size=segment_size,
-            teacher_segment_topology=teacher_segment_topology,
-        )
     expected_aliases = {teacher_config.alias for teacher_config in teacher_configs}
     if set(teacher_clusters) != expected_aliases:
         raise ValueError(
