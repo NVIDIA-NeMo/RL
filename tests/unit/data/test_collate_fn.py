@@ -107,6 +107,8 @@ def test_preference_collate_fn():
     assert "input_lengths" in train_data
     assert "token_mask" in train_data
     assert "sample_mask" in train_data
+    assert "pair_index" in train_data
+    assert "is_chosen" in train_data
 
     # Verify batch size is doubled (chosen + rejected for each example)
     assert train_data["input_ids"].shape[0] == 4  # 2 examples * 2 (chosen + rejected)
@@ -137,6 +139,10 @@ def test_preference_collate_fn():
         0.0,
     ]  # loss_multiplier repeated for chosen/rejected
     assert torch.equal(train_data["sample_mask"], torch.tensor(expected_sample_mask))
+    assert torch.equal(train_data["pair_index"], torch.tensor([0, 0, 1, 1]))
+    assert torch.equal(
+        train_data["is_chosen"], torch.tensor([True, False, True, False])
+    )
 
     # Verify message content is preserved
     # First example chosen
