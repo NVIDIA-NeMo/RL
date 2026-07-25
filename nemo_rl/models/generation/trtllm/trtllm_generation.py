@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Optional, Union
+from typing import Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -263,7 +263,8 @@ class TrtllmGeneration(GenerationInterface):
     def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
         """Collect HTTP server base URLs from each DP-rank-0 worker."""
         if not self.cfg["trtllm_cfg"].get("expose_http_server"):
-            return [None] * self.dp_size
+            urls = [cast(Optional[str], None)] * self.dp_size
+            return urls
         futures = self.worker_group.run_all_workers_single_data(
             "report_dp_openai_server_base_url",
             run_rank_0_only_axes=["tensor_parallel"],
@@ -317,9 +318,12 @@ class TrtllmGeneration(GenerationInterface):
         assert "input_ids" in data and "input_lengths" in data
 
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
-            dp_size,
-            allow_uneven_shards=True,
+        sharded_data = cast(
+            list[SlicedDataDict],
+            data.shard_by_batch_size(
+                dp_size,
+                allow_uneven_shards=True,
+            ),
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_async",
