@@ -47,6 +47,15 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 os.environ.setdefault("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
 
 
+def _call_model_loader_hook_if_available(model_loader: Any, hook_name: str) -> bool:
+    """Call a refit lifecycle hook when supported by the installed TRT-LLM."""
+    hook = getattr(model_loader, hook_name, None)
+    if hook is None:
+        return False
+    hook()
+    return True
+
+
 class NcclExtension(WorkerExtension):
     """NCCL-based weight update extension for TRT-LLM Ray workers.
 
@@ -146,7 +155,9 @@ class NcclExtension(WorkerExtension):
                 # iter is enqueued, but its GPU forward may still be in flight.
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
-                model_engine.model_loader.begin_update_weights()
+                _call_model_loader_hook_if_available(
+                    model_engine.model_loader, "begin_update_weights"
+                )
                 for module in model.modules():
                     if hasattr(module, "pre_reload_weights") and not getattr(
                         module, "_weights_removed", False
@@ -158,7 +169,9 @@ class NcclExtension(WorkerExtension):
                     src=0,
                     post_unpack_func=load_model_weight_func,
                 )
-                model_engine.model_loader.finalize_update_weights()
+                _call_model_loader_hook_if_available(
+                    model_engine.model_loader, "finalize_update_weights"
+                )
                 for module in model.modules():
                     if hasattr(module, "process_weights_after_loading") and not getattr(
                         module, "_weights_removed", False
@@ -172,7 +185,9 @@ class NcclExtension(WorkerExtension):
 
                 self.engine.reset_prefix_cache()
             except Exception as e:
-                model_engine.model_loader.abort_update_weights()
+                _call_model_loader_hook_if_available(
+                    model_engine.model_loader, "abort_update_weights"
+                )
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
                 return False
 
@@ -214,7 +229,9 @@ class NcclExtension(WorkerExtension):
         weights = None
         try:
             self.maybe_init_zmq()
-            model_engine.model_loader.begin_update_weights()
+            _call_model_loader_hook_if_available(
+                model_engine.model_loader, "begin_update_weights"
+            )
             for module in model.modules():
                 if hasattr(module, "pre_reload_weights") and not getattr(
                     module, "_weights_removed", False
@@ -264,7 +281,9 @@ class NcclExtension(WorkerExtension):
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            model_engine.model_loader.finalize_update_weights()
+            _call_model_loader_hook_if_available(
+                model_engine.model_loader, "finalize_update_weights"
+            )
             for module in model.modules():
                 if hasattr(module, "process_weights_after_loading") and not getattr(
                     module, "_weights_removed", False
@@ -280,7 +299,9 @@ class NcclExtension(WorkerExtension):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            model_engine.model_loader.abort_update_weights()
+            _call_model_loader_hook_if_available(
+                model_engine.model_loader, "abort_update_weights"
+            )
             print(
                 f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
                 f"{traceback.format_exc()}"

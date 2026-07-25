@@ -56,6 +56,35 @@ def _ipc_extension(backend):
 
 
 @pytest.mark.parametrize(
+    ("hook_name", "is_available"),
+    [
+        ("begin_update_weights", True),
+        ("begin_update_weights", False),
+        ("finalize_update_weights", True),
+        ("finalize_update_weights", False),
+        ("abort_update_weights", True),
+        ("abort_update_weights", False),
+    ],
+)
+def test_model_loader_lifecycle_hooks_are_optional(hook_name, is_available):
+    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
+
+    hook = MagicMock()
+    model_loader = (
+        SimpleNamespace(**{hook_name: hook}) if is_available else SimpleNamespace()
+    )
+
+    assert (
+        backend._call_model_loader_hook_if_available(model_loader, hook_name)
+        is is_available
+    )
+    if is_available:
+        hook.assert_called_once_with()
+    else:
+        hook.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("drain", "recompute_kv"),
     [(True, False), (False, False), (False, True)],
 )

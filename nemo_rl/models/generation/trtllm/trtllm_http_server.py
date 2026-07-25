@@ -122,11 +122,11 @@ def create_app(
         # The NeMo-RL generation config, not the request, is the source of truth
         # for sampling params.
         for key in ("temperature", "top_p"):
-            assert key in body, f"request must include {key}"
-            assert body[key] == sampling_config[key], (
-                f"request {key} {body[key]!r} must match the "
-                f"NeMo-RL generation config ({sampling_config[key]})"
-            )
+            if body.get(key) is not None:
+                assert body[key] == sampling_config[key], (
+                    f"request {key} {body[key]!r} must match the "
+                    f"NeMo-RL generation config ({sampling_config[key]})"
+                )
 
         # Request kwargs override server defaults.
         per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
