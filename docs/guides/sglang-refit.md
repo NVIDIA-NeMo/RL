@@ -97,7 +97,13 @@ the image.
 | Run | Alive GPU nodes | GPUs per node | Total GPUs | Expected refit group |
 |---|---:|---:|---:|---|
 | Two-node smoke | 2 | 4 | 8 | `world_size=5 engines=4` |
-| Async Gym integration | 16 | 8 | 128 | `world_size=65 engines=32` |
+| Async Gym integration (`16n8g`) | 16 | 8 | 128 | `world_size=65 engines=32` |
+| Async Gym integration (`32n4g`) | 32 | 4 | 128 | `world_size=65 engines=32` |
+
+The two async variants are the same run on different host shapes: identical
+parallelism, 64 training GPUs, 64 generation GPUs and 32 TP2 engines in both.
+Pick the one matching the GPUs per node your cluster exposes; the preflight
+check rejects a variant whose per-node GPU count the cluster cannot satisfy.
 
 Before running either driver, verify:
 
@@ -316,7 +322,11 @@ PARTITION="<partition>" \
   tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-async-gym-sglang.sh
 ```
 
-The recipe uses eight training nodes and eight generation nodes. It is a
+On a cluster whose nodes expose four GPUs, substitute the `32n4g` driver in
+both commands above; it allocates sixteen training nodes and sixteen generation
+nodes for the same totals.
+
+The `16n8g` recipe uses eight training nodes and eight generation nodes. It is a
 three-step integration check, not a convergence run. Its evidence validator
 requires `train/loss` through step 3, the exact
 `world_size=65 engines=32` topology, at least two successful refits, no fatal
