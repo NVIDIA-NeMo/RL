@@ -637,6 +637,11 @@ env:
             NCCL_MNNVL_ENABLE: "1"
             VLLM_USE_DEEP_GEMM: "0"
             VLLM_MOE_USE_DEEP_GEMM: "0"
+            # # Qwen-235B expert dims aren't FlashInfer-TRTLLM-MoE-compatible at TP=4
+            # # (K % blockK != 0). Disable the FlashInfer MoE path (inherited on from
+            # # the launcher's VLLM_USE_FLASHINFER_MOE_FP8=1), matching nl2bash_judge_model.
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
 
           vllm_serve_kwargs:
             tensor_parallel_size: 4
