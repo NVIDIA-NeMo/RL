@@ -148,10 +148,20 @@ def build_v2_publisher(
     from modelexpress import MxV2TrainingPublisher, TrainerWorldLayout
 
     pin_local_nic(device_id=device_id, mode=mx_config.nic_pin)
+    listen_port = None
+    if os.environ.get("MX_MEGATRON_RESHARD496", "0") == "1":
+        port_base = int(os.environ.get("MX_RESHARD_LISTEN_PORT_BASE", "18000"))
+        listen_port = port_base + rank
+        if not 1 <= listen_port <= 65535:
+            raise ValueError(
+                "MX reshard NIXL listen port is outside the valid range: "
+                f"base={port_base}, rank={rank}, port={listen_port}"
+            )
 
     return MxV2TrainingPublisher(
         agent_name=agent_name or f"nemo-rl-trainer-r{rank}",
         device_id=device_id,
+        listen_port=listen_port,
         mx_server_url=mx_config.mx_server_url,
         worker_rank=rank,
         world_layout=TrainerWorldLayout(

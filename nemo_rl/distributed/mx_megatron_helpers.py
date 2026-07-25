@@ -120,6 +120,84 @@ class MegatronRoleSpec:
     owned_expert_ids: set[int] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class MegatronTpShardGeometry:
+    """Global TP geometry for one rank-local native Megatron tensor."""
+
+    global_shape: tuple[int, ...]
+    shard_axis: int
+    local_shard_range: tuple[int, int]
+
+
+def infer_megatron_tp_shard_geometry(
+    *,
+    local_shape: tuple[int, ...],
+    role: str,
+    tp_size: int,
+    tp_rank: int,
+    expert_tp_size: int | None = None,
+    expert_tp_rank: int | None = None,
+    descriptor_extras: dict[str, str] | None = None,
+) -> MegatronTpShardGeometry | None:
+    """Describe the TP shard held by a native Megatron parameter.
+
+    Expert tensors still have TP geometry when inference EP is disabled. The
+    previous publisher omitted it for every expert, which forced receivers to
+    pull each complete expert tensor and slice locally.
+    """
+    is_expert = role in {ROLE_EXPERT_COLUMN, ROLE_EXPERT_ROW}
+    shard_world_size = (
+        int(expert_tp_size)
+        if is_expert and expert_tp_size is not None
+        else int(tp_size)
+    )
+    shard_rank = (
+        int(expert_tp_rank)
+        if is_expert and expert_tp_rank is not None
+        else int(tp_rank)
+    )
+    if not 0 <= shard_rank < shard_world_size:
+        raise ValueError(
+            f"shard rank {shard_rank} is outside [0, {shard_world_size}) "
+            f"for Megatron role {role!r}"
+        )
+    if role == ROLE_REPLICATED or shard_world_size <= 1:
+        return None
+    extras = descriptor_extras or {}
+    expert_layout = extras.get("expert_layout", "grouped")
+    if role in {
+        ROLE_COLUMN,
+        ROLE_QKV_COLUMN,
+        ROLE_GATED_MLP_COLUMN,
+        ROLE_VOCAB_PARALLEL,
+    }:
+        shard_axis = 0
+    elif role == ROLE_ROW:
+        shard_axis = 1
+    elif role == ROLE_EXPERT_COLUMN:
+        shard_axis = 1 if expert_layout == "leading_axis" else 0
+    elif role == ROLE_EXPERT_ROW:
+        shard_axis = 2 if expert_layout == "leading_axis" else 1
+    else:
+        raise ValueError(f"unsupported Megatron TP shard role {role!r}")
+    if shard_axis >= len(local_shape):
+        raise ValueError(
+            f"Megatron role {role!r} requires shard axis {shard_axis}, "
+            f"but local shape is {local_shape}"
+        )
+    local_extent = int(local_shape[shard_axis])
+    global_shape = list(local_shape)
+    global_shape[shard_axis] = local_extent * shard_world_size
+    return MegatronTpShardGeometry(
+        global_shape=tuple(global_shape),
+        shard_axis=shard_axis,
+        local_shard_range=(
+            shard_rank * local_extent,
+            (shard_rank + 1) * local_extent,
+        ),
+    )
+
+
 # Heuristic name patterns for fused-QKV and fused-gate+up linears in
 # mainline Megatron-Core. Override via ``MxConfig.megatron_role_overrides``
 # if your fork uses different names.
@@ -222,6 +300,34 @@ def _expert_index_from_param(name_part: str) -> int | None:
             if suffix and suffix.isdigit():
                 return int(suffix)
     return None
+
+
+def canonicalize_grouped_expert_name(
+    name: str, descriptor_extras: dict[str, str]
+) -> str:
+    """Replace an EP-local grouped-expert leaf index with its global ID.
+
+    Generic #496 source grouping is tensor-name based. Leaving every EP rank's
+    first local expert named ``weight0`` makes unrelated experts collide before
+    the Megatron translator can inspect descriptor extras.
+    """
+    if descriptor_extras.get("expert_layout") != "grouped":
+        return name
+    local = descriptor_extras.get("local_expert_id")
+    global_id = descriptor_extras.get("expert_id")
+    if local is None or global_id is None:
+        raise ValueError(
+            f"grouped expert tensor {name!r} is missing local/global expert IDs"
+        )
+    parent, separator, leaf = name.rpartition(".")
+    for prefix in ("weight", "bias", "scale"):
+        if leaf == f"{prefix}{local}":
+            global_leaf = f"{prefix}{global_id}"
+            return f"{parent}{separator}{global_leaf}" if separator else global_leaf
+    raise ValueError(
+        f"grouped expert tensor {name!r} does not end in an indexed "
+        "weight/bias/scale leaf"
+    )
 
 
 def publish_eagle_draft_weights(
@@ -545,6 +651,8 @@ def collect_megatron_publish_set(
             expert_pattern=expert_pattern,
             role_overrides=role_overrides,
         )
+        if spec.is_expert:
+            name = canonicalize_grouped_expert_name(name, spec.descriptor_extras)
 
         if spec.role == ROLE_REPLICATED and tp_rank != 0:
             continue
@@ -570,6 +678,7 @@ def collect_megatron_publish_set(
 
 __all__ = [
     "MegatronRoleSpec",
+    "MegatronTpShardGeometry",
     "ROLE_COLUMN",
     "ROLE_EXPERT_COLUMN",
     "ROLE_EXPERT_ROW",
@@ -578,6 +687,8 @@ __all__ = [
     "ROLE_REPLICATED",
     "ROLE_ROW",
     "ROLE_VOCAB_PARALLEL",
+    "canonicalize_grouped_expert_name",
     "collect_megatron_publish_set",
     "detect_megatron_role",
+    "infer_megatron_tp_shard_geometry",
 ]

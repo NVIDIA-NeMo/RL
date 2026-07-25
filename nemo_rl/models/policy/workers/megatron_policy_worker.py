@@ -13,8 +13,10 @@
 # limitations under the License.
 import copy
 import gc
+import json
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -1368,6 +1370,7 @@ class MegatronPolicyWorkerImpl(
 
     def _use_real_quant_refit(self) -> bool:
         return False
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_mx")
     def stream_weights_via_mx(
@@ -1398,13 +1401,17 @@ class MegatronPolicyWorkerImpl(
         receiver-side slice planner that consumes this metadata lives in
         ``modelexpress.nemo_rl_v2`` (PR #421 commit ``12c73a7``).
         """
+        cycle_started = time.perf_counter()
+        init_s = 0.0
         from megatron.core import parallel_state
+        from modelexpress.shape_descriptors import NonExpertShardSpec
 
         from nemo_rl.distributed.mx_helpers import build_v2_publisher
         from nemo_rl.distributed.mx_megatron_helpers import (
             ROLE_COLUMN,
             ROLE_REPLICATED,
             collect_megatron_publish_set,
+            infer_megatron_tp_shard_geometry,
             publish_eagle_draft_weights,
         )
 
@@ -1414,9 +1421,24 @@ class MegatronPolicyWorkerImpl(
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         ep_size = parallel_state.get_expert_model_parallel_world_size()
         ep_rank = parallel_state.get_expert_model_parallel_rank()
+        expert_tp_size = int(
+            getattr(
+                parallel_state,
+                "get_expert_tensor_parallel_world_size",
+                lambda: 1,
+            )()
+        )
+        expert_tp_rank = int(
+            getattr(
+                parallel_state,
+                "get_expert_tensor_parallel_rank",
+                lambda: 0,
+            )()
+        )
 
         # ---- Lazy-init the publisher (once per worker lifetime). ----
         if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            init_started = time.perf_counter()
             mx_device_id = torch.cuda.current_device()
             self._mx_publisher = build_v2_publisher(
                 rank=self.rank,
@@ -1453,6 +1475,7 @@ class MegatronPolicyWorkerImpl(
                 # Older modelexpress without the sidecar setter — stash for
                 # the alternate path that injects via add_tensor metadata.
                 pass
+            init_s = time.perf_counter() - init_started
 
         # ---- Resolve attention head metadata for qkv_column descriptors. ----
         # Megatron-Core's transformer_config carries this; for non-mainline
@@ -1473,6 +1496,15 @@ class MegatronPolicyWorkerImpl(
             if tcfg
             else None
         )
+        num_moe_experts = getattr(tcfg, "num_moe_experts", None) if tcfg else None
+        num_local_experts = None
+        if num_moe_experts is not None:
+            if int(num_moe_experts) % ep_size:
+                raise RuntimeError(
+                    "Megatron MoE expert count is not divisible by EP size: "
+                    f"experts={num_moe_experts}, ep_size={ep_size}"
+                )
+            num_local_experts = int(num_moe_experts) // ep_size
 
         role_overrides = self._mx_megatron_role_overrides_from_sidecar(
             role=ROLE_COLUMN,
@@ -1483,6 +1515,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         # ---- Add tensors. ----
+        registry_started = time.perf_counter()
         if hasattr(self._mx_publisher, "_registry"):
             self._mx_publisher._registry.clear()
         if hasattr(self._mx_publisher, "_registered_tensors"):
@@ -1504,6 +1537,7 @@ class MegatronPolicyWorkerImpl(
             ep_size=ep_size,
             ep_rank=ep_rank,
             tp_rank=tp_rank,
+            num_local_experts=num_local_experts,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -1514,6 +1548,22 @@ class MegatronPolicyWorkerImpl(
                 ("draft_model.", "module.draft_model.")
             ):
                 continue
+            shard_geometry = infer_megatron_tp_shard_geometry(
+                local_shape=tuple(local.shape),
+                role=spec.role,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                expert_tp_size=expert_tp_size,
+                expert_tp_rank=expert_tp_rank,
+                descriptor_extras=spec.descriptor_extras,
+            )
+            shard_spec = None
+            if shard_geometry is not None:
+                shard_spec = NonExpertShardSpec(
+                    global_shape=shard_geometry.global_shape,
+                    shard_axis=shard_geometry.shard_axis,
+                    local_shard_range=shard_geometry.local_shard_range,
+                )
             # Per-tensor megatron metadata goes into the registry via
             # the new add_tensor kwargs (megatron_role, megatron_extras).
             # The per-source mesh position was already stamped above and
@@ -1526,6 +1576,7 @@ class MegatronPolicyWorkerImpl(
                 owned_expert_ids=spec.owned_expert_ids,
                 megatron_role=spec.role,
                 megatron_extras=spec.descriptor_extras,
+                shard_spec=shard_spec,
             )
 
         if kv_scales and (tp_rank == 0 or publish_kv_scales_on_all_ranks):
@@ -1555,10 +1606,35 @@ class MegatronPolicyWorkerImpl(
                 f"[mx-megatron] published {draft_count} EAGLE draft tensors",
                 flush=True,
             )
+        registry_s = time.perf_counter() - registry_started
 
         # ---- Publish + mark ready. ----
+        publish_started = time.perf_counter()
         self._mx_publisher.publish(version=int(version))
+        publish_s = time.perf_counter() - publish_started
+        ready_started = time.perf_counter()
         self._mx_publisher.mark_ready()
+        ready_s = time.perf_counter() - ready_started
+        if os.environ.get("MX_REFIT_TIMING_STDOUT", "0") != "0":
+            print(
+                "MX_PUBLISH_TIMING "
+                + json.dumps(
+                    {
+                        "version": int(version),
+                        "rank": int(self.rank),
+                        "tp_rank": int(tp_rank),
+                        "pp_rank": int(pp_rank),
+                        "ep_rank": int(ep_rank),
+                        "init_s": round(init_s, 6),
+                        "registry_s": round(registry_s, 6),
+                        "publish_s": round(publish_s, 6),
+                        "mark_ready_s": round(ready_s, 6),
+                        "e2e_s": round(time.perf_counter() - cycle_started, 6),
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
 
     def _mx_megatron_role_overrides_from_sidecar(self, *, role: str) -> dict[str, str]:
         """Derive publish role overrides from Bridge's Megatron-to-HF name map."""
