@@ -40,6 +40,7 @@ SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
 MPO_MAX_NUM_STEPS="${MPO_MAX_NUM_STEPS:-}"
 MPO_MAX_SAMPLES="${MPO_MAX_SAMPLES:-}"
 MPO_TRAIN_GLOBAL_BATCH_SIZE="${MPO_TRAIN_GLOBAL_BATCH_SIZE:-}"
+MPO_CHECKPOINT_MUST_SAVE_BY="${MPO_CHECKPOINT_MUST_SAVE_BY:-}"
 
 OPTIONAL_OVERRIDES=""
 if [[ -n "${MPO_MAX_NUM_STEPS}" ]]; then
@@ -62,6 +63,13 @@ if [[ -n "${MPO_TRAIN_GLOBAL_BATCH_SIZE}" ]]; then
     exit 2
   }
   OPTIONAL_OVERRIDES+=" policy.train_global_batch_size=${MPO_TRAIN_GLOBAL_BATCH_SIZE}"
+fi
+if [[ -n "${MPO_CHECKPOINT_MUST_SAVE_BY}" ]]; then
+  [[ "${MPO_CHECKPOINT_MUST_SAVE_BY}" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || {
+    echo "MPO_CHECKPOINT_MUST_SAVE_BY must use DD:HH:MM:SS format" >&2
+    exit 2
+  }
+  OPTIONAL_OVERRIDES+=" checkpointing.checkpoint_must_save_by='${MPO_CHECKPOINT_MUST_SAVE_BY}'"
 fi
 if [[ -n "${WANDB_RUN_ID}" ]]; then
   [[ "${WANDB_RUN_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || {
