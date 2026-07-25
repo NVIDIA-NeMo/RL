@@ -498,6 +498,7 @@ def _dispatch_update_weights_via_mx_remote(
         # concurrent NIXL pulls. Per-pod work (pause/refit/resume)
         # is unchanged — only the outer loop becomes wave-parallel.
         FANOUT = 4
+        tree_scale_out = bool(mx_config_dict.get("tree_scale_out", False))
         import concurrent.futures
 
         def _refit_one(inst: dict[str, Any]) -> tuple[Any, list[str], dict[str, Any]]:
@@ -555,7 +556,14 @@ def _dispatch_update_weights_via_mx_remote(
         wave_idx = 0
         while remaining:
             wave_idx += 1
-            wave_size = min(len(remaining), FANOUT**wave_idx)
+            # Staged waves only help when newly-refitted replicas republish as
+            # tree sources. Without tree scale-out they merely serialize the
+            # fleet behind multiple receiver critical paths.
+            wave_size = (
+                min(len(remaining), FANOUT**wave_idx)
+                if tree_scale_out
+                else len(remaining)
+            )
             wave = remaining[:wave_size]
             remaining = remaining[wave_size:]
             wave_start = _time.monotonic()

@@ -78,6 +78,23 @@ class MxConfig:
         )
 
 
+def _served_model_name(model_config: Any) -> str:
+    """Return the logical served model name used for MX rendezvous identity.
+
+    vLLM resolves ``model_config.model`` to a local snapshot directory, but MX
+    trainers publish under the logical HF id (``served_model_name``). The reshard
+    ``source_id`` hashes this string, so receivers must use the same value the
+    trainer published or discovery silently sees zero sources. ``served_model_name``
+    may be a plain string or a list of aliases depending on vLLM version.
+    """
+    served = getattr(model_config, "served_model_name", None)
+    if isinstance(served, (list, tuple)):
+        served = served[0] if served else None
+    if isinstance(served, str) and served:
+        return served
+    return getattr(model_config, "model", "unknown")
+
+
 # =============================================================================
 # NIC pinning (port of nemo_rl.distributed.mx_helpers.pin_local_nic)
 # =============================================================================
@@ -208,12 +225,23 @@ class MxRefitWorkerExtension:
         # hardcode name transforms. Empty on dense models / when the
         # backend is swizzled (see _mx_check_moe_swizzle — that guard
         # fires first). shard_id: w1=gate, w3=up, w2=down.
-        expert_lookup: dict[str, tuple] = {}  # weight_suffix -> (param_suffix, expert_id, shard_id)
+        expert_lookup: dict[
+            str, tuple
+        ] = {}  # weight_suffix -> (param_suffix, expert_id, shard_id)
         try:
             model = self.model_runner.model
             if hasattr(model, "get_expert_mapping"):
-                for param_suffix, weight_suffix, expert_id, shard_id in model.get_expert_mapping():
-                    expert_lookup[weight_suffix] = (param_suffix, int(expert_id), shard_id)
+                for (
+                    param_suffix,
+                    weight_suffix,
+                    expert_id,
+                    shard_id,
+                ) in model.get_expert_mapping():
+                    expert_lookup[weight_suffix] = (
+                        param_suffix,
+                        int(expert_id),
+                        shard_id,
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.info("[mx-mdl] no expert mapping (dense or unavailable): %s", exc)
 
@@ -232,7 +260,10 @@ class MxRefitWorkerExtension:
             # MoE per-expert tensor? Resolve via vLLM's expert mapping.
             if ".experts." in hf_name and expert_lookup:
                 dest = self._mx_resolve_expert_dest(
-                    hf_name, name_to_shape[hf_name], expert_lookup, params,
+                    hf_name,
+                    name_to_shape[hf_name],
+                    expert_lookup,
+                    params,
                 )
                 if dest is not None:
                     expert[hf_name] = dest
@@ -240,7 +271,9 @@ class MxRefitWorkerExtension:
             # Try stacked-group membership.
             matched = False
             for fused_suffix, member_suffix, order in self._MX_STACKED_GROUPS:
-                if member_suffix + "." in hf_name or hf_name.endswith(member_suffix + ".weight"):
+                if member_suffix + "." in hf_name or hf_name.endswith(
+                    member_suffix + ".weight"
+                ):
                     fused_name = hf_name.replace(member_suffix, fused_suffix)
                     fused_param = params.get(fused_name)
                     if fused_param is None:
@@ -267,7 +300,9 @@ class MxRefitWorkerExtension:
                 logger.warning(
                     "[mx-mdl] fused group %s: member rows sum to %d but "
                     "param axis-0 is %d; routing group to fallback",
-                    fused_name, offset, int(fused_param.shape[0]),
+                    fused_name,
+                    offset,
+                    int(fused_param.shape[0]),
                 )
                 for _o, hf_name, _r in members:
                     fused.pop(hf_name, None)
@@ -280,7 +315,10 @@ class MxRefitWorkerExtension:
         logger.info(
             "[mx-mdl] dest map built: %d direct, %d fused-slice, "
             "%d expert-slice, %d fallback",
-            len(direct), len(fused), len(expert), len(fallback_names),
+            len(direct),
+            len(fused),
+            len(expert),
+            len(fallback_names),
         )
 
     def _mx_resolve_expert_dest(
@@ -330,16 +368,20 @@ class MxRefitWorkerExtension:
 
             # global → local expert index (identity at EP=1).
             local_idx = self._mx_map_global_to_local_expert(fused_name, expert_id)
-            if local_idx is None or local_idx < 0 or local_idx >= int(fused_param.shape[0]):
+            if (
+                local_idx is None
+                or local_idx < 0
+                or local_idx >= int(fused_param.shape[0])
+            ):
                 return None  # not local to this rank → fallback/skip
 
             per_expert = fused_param.shape[1]  # axis-0 size of param.data[E]
             rows = hf_shape[0]
-            if shard_id == "w1":       # gate → first half
+            if shard_id == "w1":  # gate → first half
                 axis, offset, size = 0, 0, rows
-            elif shard_id == "w3":     # up → second half
+            elif shard_id == "w3":  # up → second half
                 axis, offset, size = 0, rows, rows
-            else:                       # w2 (down) → full slot
+            else:  # w2 (down) → full slot
                 axis, offset, size = 0, 0, int(per_expert)
             # Shape sanity: the narrowed slot must equal the received tensor.
             if size != rows and shard_id in ("w1", "w3"):
@@ -420,14 +462,12 @@ class MxRefitWorkerExtension:
             _t_stock = _time.perf_counter() - _t0
 
             if mode == "direct":
-                self._mx_param_cache = dict(
-                    self.model_runner.model.named_parameters()
-                )
+                self._mx_param_cache = dict(self.model_runner.model.named_parameters())
                 self._mx_build_fused_dest_map(weights)
                 logger.info(
-                    "[mx-mdl] cold-cycle stock load_weights: %.2fs; "
-                    "cached %d params",
-                    _t_stock, len(self._mx_param_cache),
+                    "[mx-mdl] cold-cycle stock load_weights: %.2fs; cached %d params",
+                    _t_stock,
+                    len(self._mx_param_cache),
                 )
             return
 
@@ -474,8 +514,13 @@ class MxRefitWorkerExtension:
         logger.info(
             "[mx-mdl] warm-cycle: %d direct + %d fused-slice + %d expert-slice "
             "in %.3fs, %d fallback via stock in %.3fs (cycle %d)",
-            direct_hits, fused_hits, expert_hits, _t_direct,
-            len(fallback), _t_fb, self._mx_direct_load_cycles,
+            direct_hits,
+            fused_hits,
+            expert_hits,
+            _t_direct,
+            len(fallback),
+            _t_fb,
+            self._mx_direct_load_cycles,
         )
 
     def _mx_check_moe_swizzle(self) -> None:
@@ -500,7 +545,7 @@ class MxRefitWorkerExtension:
         No-op on dense models and on correctly-configured MoE.
         """
         for name, param in self.model_runner.model.named_parameters():
-            if ("experts" in name and name.endswith(("w13_weight", "w2_weight"))):
+            if "experts" in name and name.endswith(("w13_weight", "w2_weight")):
                 if param.ndim > 3:
                     raise RuntimeError(
                         f"[mx-megatron] MoE expert param {name!r} is in a "
@@ -518,8 +563,9 @@ class MxRefitWorkerExtension:
         self,
         receive_specs: dict,
     ) -> None:
-        """Rewrite ``role_descriptor['local_expert_ids']`` on expert-role
-        specs to reflect THIS receiver's EP layout.
+        """Rewrite local expert IDs for the receiver's EP layout.
+
+        Updates ``role_descriptor['local_expert_ids']`` on expert-role specs.
 
         Wired to vLLM's parallel_config (§4.5 of the MX-RL design doc):
         when ``enable_expert_parallel=True``, only the experts routed to
@@ -542,6 +588,7 @@ class MxRefitWorkerExtension:
         if ep_enabled:
             try:
                 from vllm.distributed import parallel_state as _ps
+
                 _ep = _ps.get_ep_group()
                 ep_world_size = int(_ep.world_size)
                 ep_rank = int(_ep.rank_in_group)
@@ -571,6 +618,7 @@ class MxRefitWorkerExtension:
             placement = "linear"
 
         from modelexpress.rl_expert_layout import compute_local_expert_ids
+
         local = compute_local_expert_ids(
             ep_rank=ep_rank,
             ep_world_size=ep_world_size,
@@ -596,8 +644,14 @@ class MxRefitWorkerExtension:
             "[mx-megatron] EP filter: ep_enabled=%s ep_rank=%d ep_size=%d "
             "num_experts=%d placement=%s local=%d experts (%s...) "
             "applied to %d expert-role specs",
-            ep_enabled, ep_rank, ep_world_size, num_experts, placement,
-            len(local), local_str[:60], touched,
+            ep_enabled,
+            ep_rank,
+            ep_world_size,
+            num_experts,
+            placement,
+            len(local),
+            local_str[:60],
+            touched,
         )
 
     def _mx_verify_byte_identity(
@@ -632,7 +686,10 @@ class MxRefitWorkerExtension:
         # only page-cache pressure, not per-tensor RSS.
         try:
             gt_blob = torch.load(
-                gt_path, map_location="cpu", weights_only=False, mmap=True,
+                gt_path,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
             )
             _mmap_ok = True
         except (TypeError, RuntimeError) as exc:
@@ -657,7 +714,9 @@ class MxRefitWorkerExtension:
         )
         logger.info(
             "[mx-verify] loaded GT (mmap=%s, %d tensors) in %.2fs",
-            _mmap_ok, len(gt), _time.perf_counter() - t0,
+            _mmap_ok,
+            len(gt),
+            _time.perf_counter() - t0,
         )
 
         match = 0
@@ -677,7 +736,10 @@ class MxRefitWorkerExtension:
                     mismatch_examples.append(f"missing-in-gt: {name}")
                 continue
             recv_cpu = recv.detach().to("cpu") if recv.device.type != "cpu" else recv
-            if tuple(recv_cpu.shape) != tuple(gt_t.shape) or recv_cpu.dtype != gt_t.dtype:
+            if (
+                tuple(recv_cpu.shape) != tuple(gt_t.shape)
+                or recv_cpu.dtype != gt_t.dtype
+            ):
                 shape_dtype_mismatch += 1
                 if len(mismatch_examples) < 5:
                     mismatch_examples.append(
@@ -705,8 +767,14 @@ class MxRefitWorkerExtension:
             "[mx-verify] byte-identity: %d/%d tensors match "
             "(%d mismatches: %d missing-in-gt, %d shape/dtype, %d value) "
             "in %.2fs against gt=%s",
-            match, total, mismatches, missing_in_gt, shape_dtype_mismatch,
-            value_mismatch, elapsed, gt_path,
+            match,
+            total,
+            mismatches,
+            missing_in_gt,
+            shape_dtype_mismatch,
+            value_mismatch,
+            elapsed,
+            gt_path,
         )
         if mismatch_examples:
             for line in mismatch_examples:
@@ -774,6 +842,11 @@ class MxRefitWorkerExtension:
             # Allow dict input — the handler may pass through unparsed JSON
             if not isinstance(mx_config, MxConfig):
                 mx_config = MxConfig.from_dict(mx_config or {})
+            if os.environ.get("MX_MEGATRON_RESHARD496", "0") == "1":
+                return self._update_weights_via_mx_reshard496(
+                    version=int(version),
+                    mx_config=mx_config,
+                )
 
             # ---- Lazy-init receiver (no pre-registered buffers; scratch path) ----
             # We use ``MxRefitReceiver.receive_weights_scratch`` rather than the
@@ -798,9 +871,7 @@ class MxRefitWorkerExtension:
                     if torch.distributed.is_initialized()
                     else 0
                 )
-                _pin_local_nic(
-                    device_id=self.device.index, mode=mx_config.nic_pin
-                )
+                _pin_local_nic(device_id=self.device.index, mode=mx_config.nic_pin)
                 self._mx_receiver = MxV2RefitReceiver(  # noqa: SLF001
                     agent_name=f"dynamo-vllm-r{rank}",
                     device_id=self.device.index,
@@ -898,9 +969,7 @@ class MxRefitWorkerExtension:
                 except Exception as exc:  # noqa: BLE001
                     # Non-fatal: refit succeeded, we just can't serve as a
                     # source for downstream receivers this cycle.
-                    logger.warning(
-                        "[mx] tree-scale-out republish failed: %s", exc
-                    )
+                    logger.warning("[mx] tree-scale-out republish failed: %s", exc)
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -908,13 +977,80 @@ class MxRefitWorkerExtension:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[mx] update_weights_via_mx failed on rank=%d: %s\n%s",
-                getattr(
-                    getattr(self, "_mx_receiver", None), "worker_rank", -1
-                ),
+                getattr(getattr(self, "_mx_receiver", None), "worker_rank", -1),
                 exc,
                 traceback.format_exc(),
             )
             return False
+
+    def _update_weights_via_mx_reshard496(
+        self,
+        *,
+        version: int,
+        mx_config: MxConfig,
+    ) -> bool:
+        """Use merged #496 against HF aliases of live Megatron shards."""
+        if not getattr(self, "_mx_reshard496_receiver", None):
+            from modelexpress.engines.vllm.refit.receiver import (
+                VllmReshardReceiver,
+            )
+
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            device = next(self.model_runner.model.parameters()).device
+            vllm_config = getattr(self, "vllm_config", None) or getattr(
+                self.model_runner, "vllm_config", None
+            )
+            if vllm_config is None:
+                raise RuntimeError("vLLM config is unavailable on the worker")
+            # The reshard rendezvous source_id hashes the served model name. vLLM
+            # resolves ``model_config.model`` to a local snapshot path, but the
+            # trainer publishes under the logical HF id, so match the trainer by
+            # preferring ``served_model_name`` (str or list) and only falling back
+            # to the resolved path when it is unavailable.
+            model_name = _served_model_name(vllm_config.model_config)
+            num_trainers = int(os.environ.get("MX_NUM_TRAINER_SOURCES", "16"))
+            listen_base = int(os.environ.get("MX_RESHARD_RECEIVER_PORT_BASE", "19100"))
+            _pin_local_nic(device_id=device.index, mode=mx_config.nic_pin)
+            self._mx_reshard496_receiver = VllmReshardReceiver(
+                model=self.model_runner.model,
+                vllm_config=vllm_config,
+                model_config=vllm_config.model_config,
+                model_name=model_name,
+                mx_server=mx_config.mx_server_url,
+                agent_name=(
+                    f"mx-reshard496-{os.environ.get('HOSTNAME', 'worker')}-r{rank}"
+                ),
+                local_rank=int(device.index),
+                global_rank=int(rank),
+                num_trainer_sources=num_trainers,
+                device=device,
+                listen_port=listen_base + int(device.index),
+                timeout=mx_config.timeout_seconds,
+            )
+            logger.info(
+                "[mx-reshard496] initialized rank=%d trainers=%d model=%s",
+                rank,
+                num_trainers,
+                model_name,
+            )
+
+        started = _time.perf_counter()
+        metrics = self._mx_reshard496_receiver.update_weights(
+            int(version),
+            timeout=mx_config.timeout_seconds,
+        )
+        logger.warning(
+            "[mx-reshard496] version=%d bytes=%d segments=%d e2e_s=%.6f",
+            version,
+            int(metrics["bytes_received"]),
+            int(metrics["segments"]),
+            _time.perf_counter() - started,
+        )
+        return True
 
     # ------------------------------------------------------------------ #
     # Megatron-MX path (cluster-validated 2026-06-10 on Qwen3-MoE-30B-A3B:
@@ -959,10 +1095,14 @@ class MxRefitWorkerExtension:
           * synthetic TP=1 → TP=2 mixed-TP target-wider (v1 sliced-pull): 16 / 16
         """
         import time as _time
+
         from modelexpress.megatron_translator import (
-            MegatronReceiverContext, ReceiveSpec,
-            assemble_into_destination, discover_megatron_context,
-            run_refit_cycle, translate_megatron_to_hf,
+            MegatronReceiverContext,
+            ReceiveSpec,
+            assemble_into_destination,
+            discover_megatron_context,
+            run_refit_cycle,
+            translate_megatron_to_hf,
         )
         from modelexpress.nemo_rl_v2 import MegatronTensorSpec, TargetTpLayout
 
@@ -982,28 +1122,34 @@ class MxRefitWorkerExtension:
         # Receiver's target layout: vLLM TP world × rank.
         target_tp = getattr(
             self.model_runner.vllm_config.parallel_config,
-            "tensor_parallel_size", 1,
+            "tensor_parallel_size",
+            1,
         )
         target_tp_rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized() else 0
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         )
         layout = TargetTpLayout(tp_size=target_tp, tp_rank=target_tp_rank)
 
         # Build ReceiveSpecs from candidate registries (union — replicated
         # tensors may only be published by rank 0).
         SHARD_AXIS_BY_ROLE = {
-            "column": 0, "qkv_column": 0, "gated_mlp_column": 0,
-            "vocab_parallel": 0, "row": 1,
-            "expert_column": 0, "expert_row": 0, "replicated": 0,
+            "column": 0,
+            "qkv_column": 0,
+            "gated_mlp_column": 0,
+            "vocab_parallel": 0,
+            "row": 1,
+            "expert_column": 0,
+            "expert_row": 0,
+            "replicated": 0,
         }
         receive_specs: dict[str, ReceiveSpec] = {}
         source_tp_size = max(
-            c.megatron_meta.tp_size for c in megatron_cands
+            c.megatron_meta.tp_size
+            for c in megatron_cands
             if c.megatron_meta.tp_size > 0
         )
         for c in megatron_cands:
-            for td in (c.registry.get("tensors", []) if c.registry else []):
+            for td in c.registry.get("tensors", []) if c.registry else []:
                 if not td.megatron_role or td.name in receive_specs:
                     continue
                 role = td.megatron_role
@@ -1015,12 +1161,11 @@ class MxRefitWorkerExtension:
                         per_rank_shape[shard_axis] * source_tp_size
                     )
                 lookup_name = (
-                    td.name[len("module."):]
-                    if td.name.startswith("module.") else td.name
+                    td.name[len("module.") :]
+                    if td.name.startswith("module.")
+                    else td.name
                 )
-                hf_names = name_map.get(
-                    lookup_name, name_map.get(td.name, [td.name])
-                )
+                hf_names = name_map.get(lookup_name, name_map.get(td.name, [td.name]))
                 receive_specs[td.name] = ReceiveSpec(
                     megatron_name=td.name,
                     hf_names=list(hf_names),
@@ -1034,7 +1179,9 @@ class MxRefitWorkerExtension:
 
         logger.info(
             "[mx-megatron] %d ReceiveSpecs built; source_tp=%d target_tp=%d",
-            len(receive_specs), source_tp_size, target_tp,
+            len(receive_specs),
+            source_tp_size,
+            target_tp,
         )
 
         # Inference-side EP filter wire-up (§4.5 of the design doc).
@@ -1066,16 +1213,20 @@ class MxRefitWorkerExtension:
 
         # Matched-TP fast path: bulk receive_from into pre-allocated buffers.
         matched = next(
-            (c for c in megatron_cands
-             if c.megatron_meta.tp_rank == layout.tp_rank
-             and c.megatron_meta.tp_size == layout.tp_size),
+            (
+                c
+                for c in megatron_cands
+                if c.megatron_meta.tp_rank == layout.tp_rank
+                and c.megatron_meta.tp_size == layout.tp_size
+            ),
             None,
         )
         is_matched_tp = matched is not None
 
         device = self.device
         dt_map = {
-            "bfloat16": torch.bfloat16, "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
             "float32": torch.float32,
         }
 
@@ -1127,15 +1278,16 @@ class MxRefitWorkerExtension:
                         axis_extent = full_shape[spec.shard_axis]
                         per_rank = axis_extent // target_tp
                         full_shape[spec.shard_axis] = (
-                            axis_extent if layout.tp_rank == target_tp - 1
-                            else per_rank
+                            axis_extent if layout.tp_rank == target_tp - 1 else per_rank
                         )
                     if spec.role.startswith("expert_"):
                         # Grouped-MoE per-expert tensors are passthrough — the
                         # source-side per-expert shape IS the target.
                         pass
                     buffers[spec.megatron_name] = torch.empty(
-                        full_shape, dtype=dt, **_alloc_kwargs,
+                        full_shape,
+                        dtype=dt,
+                        **_alloc_kwargs,
                     )
                 self._mx_receiver._receiver._nixl.register_tensors(buffers)
                 self._mx_megatron_buffers = buffers
@@ -1160,12 +1312,14 @@ class MxRefitWorkerExtension:
                 )
             t0 = _time.perf_counter()
             for _name, _t in self._mx_receiver.receive_from(
-                matched, timeout_seconds=mx_config.timeout_seconds,
+                matched,
+                timeout_seconds=mx_config.timeout_seconds,
             ):
                 pass
             elapsed = _time.perf_counter() - t0
             logger.info(
-                "[mx-megatron] matched-TP bulk receive_from: %.2fs", elapsed,
+                "[mx-megatron] matched-TP bulk receive_from: %.2fs",
+                elapsed,
             )
 
             ctx = MegatronReceiverContext(
@@ -1190,15 +1344,18 @@ class MxRefitWorkerExtension:
             # branch.
             target_specs = {
                 m_name: MegatronTensorSpec(
-                    role=rs.role, target_shape=rs.target_shape,
-                    target_dtype=rs.target_dtype, shard_axis=rs.shard_axis,
+                    role=rs.role,
+                    target_shape=rs.target_shape,
+                    target_dtype=rs.target_dtype,
+                    shard_axis=rs.shard_axis,
                     pp_rank=rs.pp_rank,
                     role_descriptor=dict(rs.role_descriptor or {}),
                 )
                 for m_name, rs in receive_specs.items()
             }
             plans = self._mx_receiver.pick_megatron_slice_plans(
-                megatron_cands, target_tp_layout=layout,
+                megatron_cands,
+                target_tp_layout=layout,
                 target_tensor_specs=target_specs,
             )
 
@@ -1209,10 +1366,14 @@ class MxRefitWorkerExtension:
             # benchmark (2026-06-22). v1 sliced-pull writes directly into
             # these dest views, so cached buffers stay live across pulls.
             cached_plan_dests: dict[str, torch.Tensor] | None = getattr(
-                self, "_mx_megatron_plan_dests", None,
+                self,
+                "_mx_megatron_plan_dests",
+                None,
             )
             plan_dests: dict[str, torch.Tensor] = cached_plan_dests or {}
-            v1_batches: dict[str, list] = {c.ref.mx_source_id: [] for c in megatron_cands}
+            v1_batches: dict[str, list] = {
+                c.ref.mx_source_id: [] for c in megatron_cands
+            }
             v0_plans: list = []
             newly_allocated_this_cycle = 0
 
@@ -1228,7 +1389,9 @@ class MxRefitWorkerExtension:
                     dest = plan_dests[plan.tensor_name]
                 else:
                     dest = torch.empty(
-                        plan.target_shape, dtype=dt, **_alloc_kwargs,
+                        plan.target_shape,
+                        dtype=dt,
+                        **_alloc_kwargs,
                     )
                     plan_dests[plan.tensor_name] = dest
                     newly_allocated_this_cycle += 1
@@ -1262,7 +1425,9 @@ class MxRefitWorkerExtension:
                 logger.info(
                     "[mx-megatron] mixed-TP: registered %d plan_dests "
                     "(%d newly allocated this cycle, loc=%s)",
-                    len(plan_dests), newly_allocated_this_cycle, _buffer_loc,
+                    len(plan_dests),
+                    newly_allocated_this_cycle,
+                    _buffer_loc,
                 )
             elif plan_dests:
                 # Cache hit — no register call this cycle. Rebind so
@@ -1274,8 +1439,10 @@ class MxRefitWorkerExtension:
             logger.info(
                 "[mx-megatron] mixed-TP: %d v1 slices across %d sources "
                 "(plans: %d v1, %d v0)",
-                n_v1_slices, sum(1 for b in v1_batches.values() if b),
-                len(plan_dests), len(v0_plans),
+                n_v1_slices,
+                sum(1 for b in v1_batches.values() if b),
+                len(plan_dests),
+                len(v0_plans),
             )
 
             for cand in megatron_cands:
@@ -1283,7 +1450,8 @@ class MxRefitWorkerExtension:
                 if not batch:
                     continue
                 self._mx_receiver._receiver.pull_to(
-                    cand.ref, batch,
+                    cand.ref,
+                    batch,
                     timeout_seconds=mx_config.timeout_seconds,
                 )
 
@@ -1305,15 +1473,14 @@ class MxRefitWorkerExtension:
                     tensor_shapes = {
                         td.name: tuple(int(dim) for dim in td.global_shape)
                         for td in (
-                            cand.registry.get("tensors", [])
-                            if cand.registry
-                            else []
+                            cand.registry.get("tensors", []) if cand.registry else []
                         )
                         if td.name in include_names and tuple(td.global_shape)
                     }
                     buf_dict: dict[str, torch.Tensor] = {}
                     for name, t in self._mx_receiver._receiver.receive_weights_scratch(
-                        cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                        cand.ref,
+                        timeout_seconds=mx_config.timeout_seconds,
                         tensor_shapes=tensor_shapes or None,
                         include_names=include_names,
                     ):
@@ -1342,6 +1509,7 @@ class MxRefitWorkerExtension:
                 if plan.tensor_name in plan_dests:
                     assembled = plan_dests[plan.tensor_name]
                 else:
+
                     def _pull_factory(name=plan.tensor_name, assembly=plan.assembly):
                         def _pull(src, dest):
                             full = scratch.get(src.mx_source_id, {}).get(name)
@@ -1357,12 +1525,17 @@ class MxRefitWorkerExtension:
                             else:
                                 slice_src = full
                             dest.copy_(slice_src, non_blocking=True)
+
                         return _pull
+
                     assembled = assemble_into_destination(
-                        plan, pull=_pull_factory(), device=device,
+                        plan,
+                        pull=_pull_factory(),
+                        device=device,
                     )
                 for hf_name, hf_tensor in translate_megatron_to_hf(
-                    plan, assembled,
+                    plan,
+                    assembled,
                     transformer_config=ctx.transformer_config,
                     hf_names=list(rs.hf_names),
                 ):
@@ -1405,11 +1578,13 @@ class MxRefitWorkerExtension:
         if mx_config.tree_scale_out:
             try:
                 self._mx_receiver.publish_self_as_source(
-                    version=version, model_name=model_name,
+                    version=version,
+                    model_name=model_name,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "[mx-megatron] tree-scale-out republish failed: %s", exc,
+                    "[mx-megatron] tree-scale-out republish failed: %s",
+                    exc,
                 )
 
         gc.collect()
@@ -1489,7 +1664,8 @@ class MxRefitWorkerExtension:
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "[mx-poller] discover-receiver initialize() failed: %s; "
-                    "polling thread will not start", exc,
+                    "polling thread will not start",
+                    exc,
                 )
                 return
             while not self._mx_poller_stop.is_set():
@@ -1501,22 +1677,16 @@ class MxRefitWorkerExtension:
                         include_replicas=cfg.tree_scale_out,
                     )
                     if candidates:
-                        latest = max(
-                            int(c.ref.training_step) for c in candidates
-                        )
+                        latest = max(int(c.ref.training_step) for c in candidates)
                         logger.info(
                             "[mx-poller] new version detected: %d (last=%d)",
                             latest,
                             self._mx_poller_last_version,
                         )
-                        ok = self.update_weights_via_mx(
-                            version=latest, mx_config=cfg
-                        )
+                        ok = self.update_weights_via_mx(version=latest, mx_config=cfg)
                         if ok:
                             self._mx_poller_last_version = latest
-                            logger.info(
-                                "[mx-poller] refit OK to version %d", latest
-                            )
+                            logger.info("[mx-poller] refit OK to version %d", latest)
                         else:
                             logger.warning(
                                 "[mx-poller] refit failed for version %d; will retry",
