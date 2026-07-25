@@ -1,0 +1,91 @@
+# Istvan topology A:
+#   Qwen3-30B-A3B-Instruct-2507
+#   trainer TP2 x PP1 x DP8 with EP4/ETP1 (16 GPUs)
+#     -> 4 independent vLLM replicas, each TP4 (16 GPUs)
+#
+# Performance runs use 1 warm-up + 10 measured refits. The final acceptance
+# run uses all 50 GRPO steps and reports all-rank critical-path timing.
+
+defaults: ../../../../../examples/configs/grpo_math_qwen30ba3b_megatron.yaml
+
+grpo:
+  # One cold/warm-up cycle followed by ten measured warm refits.
+  max_num_steps: 11
+  # One generation per trainer rank keeps the batch divisible by 16.
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    activation_checkpointing: true
+    empty_unused_memory_level: 1
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+
+  generation:
+    backend: dynamo
+    max_new_tokens: 8
+    temperature: 1.0
+    top_p: 1.0
+    dynamo_cfg:
+      request_timeout_s: 1800.0
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 4
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+    vllm_kwargs:
+      moe_backend: triton
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+
+data:
+  max_input_seq_length: 1024
+
+logger:
+  log_dir: logs/grpo-qwen3-30b-tp2ep4dp2-tp4dp4-dynamo-mx
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  weight_sync:
+    method: mx
+    mx_config:
+      enabled: true
+      mx_server_url: modelexpress-server:8001
+      timeout_seconds: 1800.0
+      same_rank_only: false
+      tree_scale_out: false
+      moe_expert_filter: false
+      nic_pin: "off"
