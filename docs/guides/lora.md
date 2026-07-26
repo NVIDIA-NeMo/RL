@@ -88,6 +88,31 @@ policy:
 - **`use_triton`** (bool): Use Triton-optimized kernels for better performance. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
 - **`restore_from`** (str, optional): Path to a donor PEFT adapter checkpoint (a directory containing `adapter_model.safetensors` + `adapter_config.json`, e.g. a previous run's `step_*/policy/weights`) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
+### Grouped MoE Experts
+
+`match_all_linear: true` matches linear modules and skips Automodel's grouped
+expert modules. To adapt grouped experts, set `match_all_linear: false` and
+include their module names in `target_modules`, for example:
+
+```yaml
+policy:
+  automodel_cfg:
+    lora_cfg:
+      enabled: true
+      match_all_linear: false
+      target_modules: ['*_proj', '*experts']
+      dim: 8
+      alpha: 32
+  generation:
+    lora_refit_mode: merged
+```
+
+With merged refitting, the grouped expert adapters are merged into
+`gate_and_up_projs` and `down_projs` before conversion to the inference engine's
+weight format. The adapter tensors themselves are excluded from the refit.
+The example explicitly selects merged refitting; synchronous vLLM otherwise
+defaults to native adapter refitting.
+
 ## Megatron Configuration
 
 LoRA settings live under `policy.megatron_cfg.peft`:
