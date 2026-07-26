@@ -327,6 +327,139 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         )
 
 
+def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
+    """Make MessageQueue's remote socket survive losing a port race.
+
+    ``MessageQueue.__init__`` picks the port for its remote (TCP) socket with
+    ``remote_subscribe_port = get_open_port()``, which *probes a port and
+    releases it*, and only binds it with ZMQ several statements later
+    (``shm_broadcast.py``: ``self.remote_socket.bind(socket_addr)``). The
+    window between the probe and the bind is a TOCTOU race.
+
+    On vLLM 0.25 that race is lost reliably, not occasionally. Every
+    ``RayWorkerProc`` on a **non-driver** node takes ``n_local_reader=0``
+    (``ray_executor_v2.py::_init_message_queues``), so every one of them needs
+    a real TCP port, and they all scan from the same ``VLLM_PORT`` -- 7000 for
+    a node-spanning engine. ``_init_message_queues`` runs immediately after
+    ``init_device()``, whose process-group setup is a collective barrier, so
+    all workers on the node arrive at the probe within microseconds of each
+    other, all see the same port free, and all but one die with::
+
+        zmq.error.ZMQError: Address already in use (addr='tcp://10.65.1.9:7000')
+
+    Workers on the driver node take ``n_local_reader=1`` and use an ``ipc://``
+    socket instead, which is why only node-spanning engines are affected --
+    and why no nightly test catches it (none runs an engine whose
+    ``tensor_parallel_size * pipeline_parallel_size`` exceeds
+    ``cluster.gpus_per_node``). See RL-1111.
+
+    Fix the race at the bind rather than the probe: retry, advancing past the
+    port that was lost. This is safe and terminating because a port a peer
+    already holds with ZMQ *is* visible to the next ``_get_open_port`` probe
+    (a plain ``bind(("", port))`` on it fails with ``EADDRINUSE``), so each
+    retry makes forward progress.
+
+    Deliberately keeps the search anchored at ``VLLM_PORT`` instead of letting
+    vLLM fall back to ``bind(("", 0))``: kernel-assigned ephemeral ports are
+    exactly the TOCTOU contention the reserved sub-ephemeral band exists to
+    prevent (#2380, #3103).
+
+    Patching the bind (rather than handing each worker a private start port)
+    also covers every other ``MessageQueue`` with a remote reader -- notably
+    the executor's own ``rpc_broadcast_mq`` -- instead of the one call site
+    that happens to be failing today.
+
+    Returns without raising when the snippet is missing, but logs at warning
+    level so a silent no-op is visible in worker logs.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "distributed/device_communicators/shm_broadcast.py"
+        )
+    except RuntimeError:
+        logger.warning(
+            "Could not locate shm_broadcast.py; MessageQueue bind-retry patch "
+            "NOT applied. Engines spanning nodes may fail with EADDRINUSE at "
+            "startup."
+        )
+        return
+
+    marker = "_nrl_bind_attempts"
+    old_snippet = (
+        '            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
+        "            self.remote_socket.bind(socket_addr)\n"
+    )
+    new_snippet = (
+        "            # NeMo-RL: get_open_port() above probed this port and then\n"
+        "            # released it; ZMQ only binds it for real here. Every worker\n"
+        "            # on a non-driver node builds its response queue at the same\n"
+        "            # instant (init_device()'s collective releases them together)\n"
+        "            # scanning from the same VLLM_PORT, so they all probe the same\n"
+        "            # free port and all but one die with EADDRINUSE. Retry around\n"
+        "            # the bind instead of trusting the probe: a port a peer already\n"
+        "            # holds IS visible to the next probe, so advancing past the\n"
+        "            # loser terminates. Ports stay in the reserved VLLM_PORT band\n"
+        "            # rather than falling back to kernel-ephemeral ones, which is\n"
+        "            # the contention that band exists to avoid (#2380, #3103).\n"
+        "            _nrl_bind_attempts = 64\n"
+        "            for _nrl_bind_attempt in range(_nrl_bind_attempts):\n"
+        '                socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
+        "                try:\n"
+        "                    self.remote_socket.bind(socket_addr)\n"
+        "                    break\n"
+        "                except zmq.ZMQError:\n"
+        "                    if _nrl_bind_attempt == _nrl_bind_attempts - 1:\n"
+        "                        raise\n"
+        "                    from vllm.utils.network_utils import _get_open_port\n"
+        "\n"
+        "                    logger.info(\n"
+        '                        "Port %s was taken between probe and bind; '
+        'retrying.",\n'
+        "                        remote_subscribe_port,\n"
+        "                    )\n"
+        "                    remote_subscribe_port = (\n"
+        "                        _get_open_port(start_port=remote_subscribe_port + 1)\n"
+        "                        if envs.VLLM_PORT is not None\n"
+        "                        else get_open_port()\n"
+        "                    )\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM MessageQueue bind-retry patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply MessageQueue bind-retry patch: expected "
+                "snippet not found in %s. The vLLM version may have changed. "
+                "Engines spanning nodes may fail with EADDRINUSE at startup.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    # Read back so a patch that silently failed to land is not reported as
+    # applied; this is the failure mode that previously went unnoticed.
+    try:
+        with open(file_to_patch) as handle:
+            applied = marker in handle.read()
+    except OSError as error:
+        logger.warning("Could not verify MessageQueue bind-retry patch: %s", error)
+        return
+
+    if applied:
+        logger.info("Successfully patched vLLM MessageQueue remote socket bind.")
+    else:
+        logger.warning(
+            "MessageQueue bind-retry patch did not persist to %s. Engines "
+            "spanning nodes may fail with EADDRINUSE at startup.",
+            file_to_patch,
+        )
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -357,3 +490,4 @@ def _apply_vllm_patches(
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
+    _patch_vllm_shm_broadcast_bind_retry(patch_logger)
