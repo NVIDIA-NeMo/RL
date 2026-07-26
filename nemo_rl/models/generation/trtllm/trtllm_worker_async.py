@@ -95,13 +95,19 @@ class TrtllmAsyncGenerationWorkerImpl:
         seed: Optional[int] = None,
     ) -> None:
         self.cfg = config
-        self.model_name = self.cfg["model_name"]
+        # Allow gen side to use a quantized checkpoint
+        self.model_name = (
+            self.cfg.get("trtllm_cfg", {}).get("model_name") or self.cfg["model_name"]
+        )
         self.is_model_owner = bundle_indices is not None
         self._bundle_indices = bundle_indices
         self._fraction_of_gpus = fraction_of_gpus
         self._seed = seed
         self.llm = None
         self.TrtSamplingParams = None
+        self._http_thread = None
+        self._http_base_url: Optional[str] = None
+        self._http_server = None
 
         if not self.is_model_owner:
             return
@@ -141,13 +147,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             flush=True,
         )
 
-        # One PG entry per worker (placement_groups=[pg]*N,
-        # placement_bundle_indices=[[i0], [i1], ...]) so the expansion
-        # generalises to multi-PG layouts (cross-node TP) when
-        # configure_worker surfaces per-rank PGs.
-        n_workers = len(self._bundle_indices)
-        placement_groups_list = [pg] * n_workers
-        placement_bundle_indices_list = [[i] for i in self._bundle_indices]
+        # TRT-LLM expects one bundle-index list per placement group. A unified
+        # PG can contain bundles on multiple nodes, allowing one TP replica to
+        # span them while Ray still pins every rank to a specific GPU bundle.
+        placement_groups_list = [pg]
+        placement_bundle_indices_list = [list(self._bundle_indices)]
 
         llm_kwargs: dict[str, Any] = dict(
             model=self.model_name,
@@ -157,6 +161,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             max_seq_len=trtllm_cfg["max_model_len"],
             max_batch_size=trtllm_cfg["max_batch_size"],
             max_num_tokens=trtllm_cfg["max_num_tokens"],
+            # vLLM accepts prompts up to max_model_len (no separate input cap; it clamps output so
+            # input+output <= max_model_len). TRT-LLM defaults max_input_len=1024, which rejects long
+            # SWE-agent prompts before any tokens generate -> NeMo Gym sees "no generation data".
+            # Match the input cap to the context window so it isn't the bottleneck.
+            max_input_len=trtllm_cfg["max_model_len"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
             placement_groups=placement_groups_list,
@@ -213,6 +222,17 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
+        # Propagate the nsight runtime_env down to TRT-LLM's internal Ray GPU
+        # workers.  The outer actor's @ray.remote nsight config does NOT inherit
+        # into TRT-LLM's RayExecutor workers (ray_executor.py sets an explicit
+        # runtime_env); passing ray_worker_nsight_options is the sanctioned hook
+        # (ray_executor.py:120,147). Returns {} when profiling is off → no-op.
+        _nsight = get_nsight_config_if_pattern_matches(
+            "trtllm_async_generation_worker"
+        ).get("nsight")
+        if _nsight and "ray_worker_nsight_options" not in llm_kwargs:
+            llm_kwargs["ray_worker_nsight_options"] = _nsight
+
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.
         self.llm = AsyncLLM(**llm_kwargs)
@@ -225,7 +245,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         return True
 
     async def post_init_async(self) -> None:
-        """Finish async-side engine setup on the Ray actor's asyncio loop."""
+        """Finish async engine setup on the Ray actor's asyncio loop and (optionally) start HTTP server."""
         if not self.is_model_owner or self.llm is None:
             return
 
@@ -233,8 +253,12 @@ class TrtllmAsyncGenerationWorkerImpl:
         await self.llm.setup_async()
         print("[TrtllmAsyncWorker] AsyncLLM ready", flush=True)
 
+        if self.cfg["trtllm_cfg"].get("expose_http_server"):
+            self.start_http_server()
+
     def shutdown(self) -> bool:
         try:
+            self.stop_http_server()
             if self.llm is not None:
                 del self.llm
                 self.llm = None
@@ -244,6 +268,56 @@ class TrtllmAsyncGenerationWorkerImpl:
         except Exception as e:
             print(f"Error during TRT-LLM shutdown: {e}")
             return False
+
+    # ------------------------------------------------------------------ #
+    #  HTTP server for NeMo Gym
+    # ------------------------------------------------------------------ #
+
+    def start_http_server(self, port: int = 0) -> str:
+        """Start an OpenAI-compatible HTTP server backed by ``self.llm``."""
+        if self._http_base_url is not None:
+            return self._http_base_url
+
+        from transformers import AutoTokenizer
+
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name,
+            trust_remote_code=True,
+        )
+        self._http_thread, self._http_base_url, self._http_server = start_server(
+            llm=self.llm,
+            tokenizer=tokenizer,
+            model_name=self.model_name,
+            port=port,
+            max_seq_len=self.cfg["trtllm_cfg"]["max_model_len"],
+            sampling_config={
+                "temperature": self.cfg["temperature"],
+                "top_p": self.cfg["top_p"],
+            },
+            stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
+            default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
+                "default_chat_template_kwargs"
+            ),
+            tool_parser=self.cfg["trtllm_cfg"].get("tool_parser"),
+            reasoning_parser=self.cfg["trtllm_cfg"].get("reasoning_parser"),
+        )
+        print(
+            f"[TrtllmAsyncWorker] HTTP server started: {self._http_base_url}",
+            flush=True,
+        )
+        return self._http_base_url
+
+    def stop_http_server(self) -> None:
+        if self._http_server is not None:
+            self._http_server.should_exit = True
+            self._http_server = None
+            self._http_thread = None
+            self._http_base_url = None
+
+    async def report_dp_openai_server_base_url(self) -> Optional[str]:
+        return self._http_base_url
 
     # ------------------------------------------------------------------ #
     #  Collective RPC / refit
@@ -378,6 +452,19 @@ class TrtllmAsyncGenerationWorkerImpl:
             return True
         await self.llm.collective_rpc("reset_prefix_cache")
         return True
+
+    # ------------------------------------------------------------------ #
+    #  GPU profiling (nsys capture-range trigger)
+    # ------------------------------------------------------------------ #
+
+    async def start_gpu_profiling_async(self) -> None:
+        # Outer actor is CPU-only; broadcast to the internal GPU workers.
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling")
+
+    async def stop_gpu_profiling_async(self) -> None:
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling")
 
     # ------------------------------------------------------------------ #
     #  Generation
