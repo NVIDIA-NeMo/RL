@@ -174,6 +174,10 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
   nemo_gym:
+    # Declared so the driver can point this at the image's prefetched venvs.
+    # The env block below sets _override_, so nothing else supplies the key and
+    # a bare Hydra override of it would fail to compose.
+    uv_venv_dir: "${oc.env:HF_HOME}/gym_venvs"
     skip_venv_if_present: true
     port_range_low: 5000
     port_range_high: 5999
