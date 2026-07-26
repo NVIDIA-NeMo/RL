@@ -505,7 +505,7 @@ jobs:
       - name: main
         uses: ./.github/actions/test-template
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ !startsWith(github.ref, 'refs/heads/pull-request/') && secrets.HF_TOKEN || '' }}
         with:
           runner: ${{ matrix.runner }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
@@ -514,6 +514,7 @@ jobs:
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           is_doc_test: "true"
+          is_fork_pr: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-unit-tests:
