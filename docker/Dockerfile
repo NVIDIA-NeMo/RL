@@ -23,7 +23,7 @@
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -153,9 +153,11 @@ ARG UV_VERSION
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
+ARG UV_NO_INSTALL_PACKAGES="--no-install-package nvidia-nccl-cu12 --no-install-package nvidia-nccl-cu13"
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
+ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
@@ -220,17 +222,17 @@ fi
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --no-install-project $UV_NO_INSTALL_PACKAGES
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
+    UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
+    UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project $UV_NO_INSTALL_PACKAGES
 fi
-uv sync --link-mode symlink --frozen --extra mcore --no-install-project
-uv sync --link-mode symlink --frozen --extra automodel --no-install-project
-uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
-uv sync --link-mode symlink --frozen --all-groups --no-install-project
+uv sync --link-mode symlink --frozen --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --frozen --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --frozen --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --frozen --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -285,7 +287,7 @@ TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
 set +e
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
-    uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
+    uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project $UV_NO_INSTALL_PACKAGES \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
     | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
 TRTLLM_SYNC_STATUS=$?
@@ -304,7 +306,7 @@ du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
 # Restore the intended default environment in the same layer so the transient
 # TRT-LLM installation does not add a large intermediate venv layer.
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+uv sync --link-mode symlink --locked --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 
 # The final sync can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
