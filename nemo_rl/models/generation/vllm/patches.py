@@ -236,8 +236,19 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     therefore below the OS ephemeral floor. That band is deliberate: leaving
     ``VLLM_PORT`` unset would send vLLM to kernel-assigned ephemeral ports and
     reintroduce the TOCTOU contention this layout exists to prevent (#2380,
-    #3103). vLLM applies the same disjoint-window idea to co-located DP engines
-    a few lines below, seeding them from ``master_port + 100 + rank * 32``.
+    #3103).
+
+    The offset must be applied *before* the ``local_dp_rank is None`` test, not
+    inside it. vLLM's own disjoint-window branch below reads as if it only
+    applies to DP engines, but ``ParallelConfig.__post_init__`` takes the
+    "offline SPMD" path for every engine NeMo-RL builds and assigns
+    ``data_parallel_rank_local = envs.VLLM_DP_RANK_LOCAL`` (0 by default) and
+    ``data_parallel_master_port = envs.VLLM_DP_MASTER_PORT`` (0 by default). So
+    a plain non-DP engine arrives here with ``local_dp_rank=0``, not ``None``:
+    the ``None`` branch is dead, and the DP branch searches from
+    ``0 + 100 + 0 * 32 = 100``, fails all 32 attempts on the privileged range,
+    and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
+    That is exactly the port the MessageQueue takes. See RL-1104.
 
     Returns without raising when the snippet is missing, but logs at warning
     level so a silent no-op is visible in worker logs.
@@ -256,17 +267,27 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         "        if local_dp_rank is None:\n            return get_open_port()\n"
     )
     new_snippet = (
+        "        if envs.VLLM_PORT is not None:\n"
+        "            # NeMo-RL: this port and the broadcast MessageQueue's remote\n"
+        "            # socket are both allocated from VLLM_PORT, but the queue\n"
+        "            # binds and holds its port before this one is bound in the\n"
+        "            # rank-0 worker, so a shared search collides. Search a window\n"
+        "            # past the queue's, still inside the engine's reserved\n"
+        "            # 100-port band.\n"
+        "            #\n"
+        "            # This has to run *before* the local_dp_rank test below:\n"
+        "            # ParallelConfig leaves a non-DP engine with\n"
+        "            # data_parallel_rank_local=0 (not None) and\n"
+        "            # data_parallel_master_port=0, so that branch searches from\n"
+        "            # port 100, fails on the privileged range, and falls back to\n"
+        "            # get_open_port() -- straight back to VLLM_PORT.\n"
+        "            try:\n"
+        "                return _get_open_port(\n"
+        "                    start_port=envs.VLLM_PORT + 32, max_attempts=32\n"
+        "                )\n"
+        "            except RuntimeError:\n"
+        "                pass\n"
         "        if local_dp_rank is None:\n"
-        "            if envs.VLLM_PORT is not None:\n"
-        "                # NeMo-RL: start past the ports the broadcast\n"
-        "                # MessageQueue allocates from VLLM_PORT, which it binds\n"
-        "                # before this port is bound in the rank-0 worker.\n"
-        "                try:\n"
-        "                    return _get_open_port(\n"
-        "                        start_port=envs.VLLM_PORT + 32, max_attempts=32\n"
-        "                    )\n"
-        "                except RuntimeError:\n"
-        "                    return get_open_port()\n"
         "            return get_open_port()\n"
     )
 
