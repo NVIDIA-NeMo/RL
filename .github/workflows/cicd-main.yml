@@ -504,6 +504,8 @@ jobs:
         uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           runner: ${{ matrix.runner }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
