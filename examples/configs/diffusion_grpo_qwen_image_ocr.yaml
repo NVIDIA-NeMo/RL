@@ -7,12 +7,13 @@ grpo:
   num_generations_per_prompt: 16
   max_num_steps: 300
   ppo_epochs: 1
+  ppo_mini_batch_size: 256  # 16 prompts x16 gen (verl-omni ppo_mini_batch_size=16xrollout.n=16); 512/256 = 2 optimizer updates/step. Unset would collapse to 1 update/step.
   val_period: 30
   val_at_start: true
   val_at_end: false
   max_val_samples: 0  # 0 validates on the full val set
   seed: 42
-  use_leave_one_out_baseline: true
+  use_leave_one_out_baseline: false  # verl-omni uses the plain in-group mean baseline (no leave-one-out)
   use_global_std: true  # whole-batch reward std (verl-omni `global_std`); per-group std explodes on near-constant OCR groups
   val_generation:
     num_inference_steps: 50  # deterministic ODE eval, matches verl-omni val_kwargs (training rollout uses 10)
