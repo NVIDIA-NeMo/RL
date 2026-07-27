@@ -393,8 +393,10 @@ class TQPolicy(Policy):
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        # ``train_fields`` columns must already be in TQ (rollout + worker
-        # logprob deltas + driver advantage delta) before this call.
+        # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
+        # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
+        # by workers + driver delta-writes. Caller may narrow to drop columns
+        # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
