@@ -2120,6 +2120,7 @@ class MegatronPolicyWorkerImpl(
             ep_size=ep_size,
             ep_rank=ep_rank,
             tp_rank=tp_rank,
+            pp_size=pp_size,
             num_local_experts=num_local_experts,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,

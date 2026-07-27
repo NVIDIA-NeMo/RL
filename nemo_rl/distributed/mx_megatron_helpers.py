@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -385,6 +386,91 @@ def detect_megatron_role(
     )
 
 
+_LAYER_PATH_RE = re.compile(r"^(?P<head>.*?layers)\.(?P<idx>\d+)(?P<tail>\..*)$")
+_LAYER_INDEX_TAIL_RE = re.compile(r"layers\.\d+$")
+
+
+def map_local_layers_to_global(
+    model: "torch.nn.Module", *, pp_size: int
+) -> dict[str, int]:
+    """Map each transformer-layer module path to its GLOBAL layer index.
+
+    ``model.named_parameters()`` names a layer by its index in the local
+    ``TransformerBlock.layers`` ModuleList, which under pipeline parallelism is
+    NOT the global layer index. Megatron's own checkpoint code says so, and
+    exists partly to undo it::
+
+        offset = get_transformer_layer_offset(config, vp_stage, pp_rank)
+        global_layer_offset = layer.layer_number - 1   # layer_number is GLOBAL
+        state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'
+                                            # ^ module list index
+
+    Publishing the local index makes both pipeline stages of a 48-layer model
+    offer ``decoder.layers.0..23``. The shard table is keyed by name and
+    tiebroken first-writer-wins, so layers 24-47 become unaddressable and are
+    never refit, while a stage-1 offer that wins the tiebreak fills destination
+    layer N from global layer N+24 - at a valid address, with a self-consistent
+    digest, undetectably.
+
+    Read the global index off ``TransformerLayer.layer_number`` rather than
+    recomputing an offset. That is exact by construction and needs no
+    assumptions: it handles virtual pipeline parallelism, where a rank owns
+    several non-contiguous chunks, and uneven stages
+    (``num_layers_in_first_pipeline_stage``) for free. Both of those break the
+    tempting ``pp_rank * layers_per_stage``.
+    """
+    mapping: dict[str, int] = {}
+    for module_path, module in model.named_modules():
+        number = getattr(module, "layer_number", None)
+        # `layer_number` is 1-based and global. Require the path to end in a
+        # ModuleList index so this only picks up transformer layers themselves
+        # and not submodules that happen to carry the attribute.
+        if not (isinstance(number, int) and number >= 1):
+            continue
+        if _LAYER_INDEX_TAIL_RE.search(module_path):
+            mapping[module_path] = number - 1
+
+    if pp_size > 1 and not mapping:
+        # Refusing here is deliberate. The failure this guards against produces
+        # a refit that silently covers half the model and passes every
+        # correctness gate available, because those gates compare arrived bytes
+        # against the publisher's digest for the same name, and a name collision
+        # makes both sides agree on the wrong tensor.
+        raise RuntimeError(
+            "pipeline parallelism is enabled (pp_size="
+            f"{pp_size}) but no transformer layer exposes `layer_number`, so "
+            "local layer indices cannot be mapped to global ones. Publishing "
+            "local indices would silently collide across pipeline stages."
+        )
+    return mapping
+
+
+def globalize_megatron_layer_name(
+    raw_name: str, name: str, global_layer_index: dict[str, int]
+) -> str:
+    """Rewrite a pipeline-local layer index in ``name`` to its global index.
+
+    ``raw_name`` is the module-prefixed name used to locate the layer module;
+    ``name`` is the stripped form that gets published. Returns ``name``
+    unchanged for anything that is not inside a transformer layer (embeddings,
+    the final norm, the LM head), and for the ``pp_size == 1`` case where the
+    local index already equals the global one.
+    """
+    match = _LAYER_PATH_RE.match(raw_name)
+    if match is None:
+        return name
+    module_path = f"{match['head']}.{match['idx']}"
+    global_idx = global_layer_index.get(module_path)
+    if global_idx is None or global_idx == int(match["idx"]):
+        return name
+    # Rewrite in `name`, not `raw_name`: the published name is the stripped one,
+    # and the local index appears at the same position in both.
+    local_match = _LAYER_PATH_RE.match(name)
+    if local_match is None:
+        return name
+    return f"{local_match['head']}.{global_idx}{local_match['tail']}"
+
+
 def collect_megatron_publish_set(
     model: "torch.nn.Module",
     *,
@@ -392,6 +478,7 @@ def collect_megatron_publish_set(
     ep_size: int,
     ep_rank: int,
     tp_rank: int,
+    pp_size: int = 1,
     num_local_experts: int | None = None,
     num_attention_heads: int | None = None,
     num_kv_heads: int | None = None,
@@ -410,9 +497,13 @@ def collect_megatron_publish_set(
       them as global tensors and slice past the end.
     * Returns the parameter as-is — Megatron stores native shards, so
       the param tensor IS the local shard. No allgather, no Bridge call.
+    * Rewrites pipeline-local transformer layer indices to global ones, so that
+      two pipeline stages cannot publish colliding names.
+
     Caller is responsible for invoking ``add_tensor`` and
     ``publish(version=...)`` on the publisher.
     """
+    global_layer_index = map_local_layers_to_global(model, pp_size=pp_size)
     for raw_name, param in model.named_parameters():
         if not param.is_floating_point():
             # Skip non-float buffers (rotary inv_freq, etc.); they aren't
@@ -436,6 +527,7 @@ def collect_megatron_publish_set(
         name = (
             raw_name[len("module.") :] if raw_name.startswith("module.") else raw_name
         )
+        name = globalize_megatron_layer_name(raw_name, name, global_layer_index)
 
         spec = detect_megatron_role(
             raw_name,
@@ -475,4 +567,6 @@ __all__ = [
     "ROLE_VOCAB_PARALLEL",
     "collect_megatron_publish_set",
     "detect_megatron_role",
+    "globalize_megatron_layer_name",
+    "map_local_layers_to_global",
 ]
