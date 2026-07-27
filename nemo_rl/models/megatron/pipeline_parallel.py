@@ -76,7 +76,41 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     return obj_list[0]
 
 
-def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) -> list:
+def _materialize_loss_metrics_for_object_broadcast(
+    loss_metrics: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert tensor metrics to host values before object transport."""
+    materialized = [dict(metric) for metric in loss_metrics]
+    scalar_groups: dict[
+        tuple[torch.device, torch.dtype],
+        list[tuple[int, str, torch.Tensor]],
+    ] = {}
+
+    for metric_index, metric in enumerate(materialized):
+        for key, value in metric.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.numel() != 1:
+                metric[key] = value.detach().cpu()
+                continue
+            group_key = (value.device, value.dtype)
+            scalar_groups.setdefault(group_key, []).append((metric_index, key, value))
+
+    for entries in scalar_groups.values():
+        host_values = (
+            torch.stack([value.detach().reshape(()) for _, _, value in entries])
+            .cpu()
+            .tolist()
+        )
+        for (metric_index, key, _), host_value in zip(entries, host_values):
+            materialized[metric_index][key] = host_value
+
+    return materialized
+
+
+def broadcast_loss_metrics_from_last_stage(
+    loss_metrics: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
     """Broadcast loss metrics from the last pipeline stage to all stages.
 
     This utility handles the common pattern where loss computation happens on the last
@@ -88,25 +122,36 @@ def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) 
     Returns:
         List of loss metrics on all ranks
     """
+    if get_pipeline_model_parallel_world_size() == 1:
+        if loss_metrics is None:
+            raise ValueError("Last PP stage must provide loss metrics.")
+        return loss_metrics
+
     pp_group = get_pipeline_model_parallel_group()
     last_rank = get_pipeline_model_parallel_last_rank()
 
     if is_pipeline_last_stage(ignore_virtual=True):
-        metrics_to_broadcast = [loss_metrics]
+        if loss_metrics is None:
+            raise ValueError("Last PP stage must provide loss metrics.")
+        host_metrics = _materialize_loss_metrics_for_object_broadcast(loss_metrics)
+        metrics_to_broadcast = [host_metrics]
         torch.distributed.broadcast_object_list(
             metrics_to_broadcast,
             src=last_rank,
             group=pp_group,
         )
-        return loss_metrics
+        return host_metrics
     else:
-        metrics_to_broadcast = [None]
+        metrics_to_broadcast: list[Optional[list[dict[str, Any]]]] = [None]
         torch.distributed.broadcast_object_list(
             metrics_to_broadcast,
             src=last_rank,
             group=pp_group,
         )
-        return metrics_to_broadcast[0]
+        received_metrics = metrics_to_broadcast[0]
+        if received_metrics is None:
+            raise RuntimeError("Pipeline loss metric broadcast returned no metrics.")
+        return received_metrics
 
 
 def broadcast_tensors_from_last_stage(

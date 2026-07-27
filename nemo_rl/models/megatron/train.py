@@ -15,7 +15,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import torch
 from megatron.core.models.gpt import GPTModel
@@ -874,8 +874,13 @@ def aggregate_training_statistics(
     """
     # Compute global loss across all data-parallel ranks
     with torch.no_grad():
-        if losses and all(isinstance(loss, torch.Tensor) for loss in losses):
-            global_loss = torch.stack([loss.detach() for loss in losses])
+        tensor_losses = [
+            cast(torch.Tensor, loss).detach()
+            for loss in losses
+            if isinstance(loss, torch.Tensor)
+        ]
+        if losses and len(tensor_losses) == len(losses):
+            global_loss = torch.stack(tensor_losses)
         else:
             global_loss = torch.tensor(losses, device="cuda")
         torch.distributed.all_reduce(
