@@ -164,21 +164,32 @@ def test_rl_collate_fn_rejects_context_parallel_mismatch() -> None:
         rl_collate_fn([datum], megatron_sft_context_parallel_size=1)
 
 
-def test_rl_collate_fn_keeps_tensors_aligned_in_megatron_dp_stride_order() -> None:
+def test_rl_collate_fn_preserves_source_order_before_megatron_dp_sharding() -> None:
     data = [_packed_datum(idx) for idx in range(8)]
 
     batch = rl_collate_fn(data, megatron_sft_dp_stride_size=4)
 
     assert list(zip(batch["idx"], batch["input_ids"][:, 0].tolist(), strict=True)) == [
         (0, 0),
-        (4, 40),
         (1, 10),
-        (5, 50),
         (2, 20),
-        (6, 60),
         (3, 30),
+        (4, 40),
+        (5, 50),
+        (6, 60),
         (7, 70),
     ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_rl_collate_fn_accepts_partial_packed_validation_batch(
+    batch_size: int,
+) -> None:
+    data = [_packed_datum(idx) for idx in range(batch_size)]
+
+    batch = rl_collate_fn(data, megatron_sft_dp_stride_size=4)
+
+    assert batch["idx"] == list(range(batch_size))
 
 
 def test_preference_collate_fn():

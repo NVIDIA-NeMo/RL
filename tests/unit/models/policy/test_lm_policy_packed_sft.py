@@ -83,10 +83,10 @@ def _policy(
     return cast(Policy, policy)
 
 
-def test_direct_packed_rows_preserve_collated_dp_stride_during_sharding():
+def test_direct_packed_rows_construct_dp_strides_from_source_order():
     policy = _policy()
 
-    policy.train(_direct_batch(row_order=[0, 2, 1, 3]), MagicMock())
+    policy.train(_direct_batch(row_order=[0, 1, 2, 3]), MagicMock())
 
     call = policy.worker_group.run_all_workers_sharded_data.call_args
     assert {
