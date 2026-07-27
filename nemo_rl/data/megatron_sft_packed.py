@@ -212,14 +212,11 @@ def megatron_sft_packed_preprocessor(
         raise ValueError("max_seq_length must be a positive integer")
     if context_parallel_size < 1:
         raise ValueError("context_parallel_size must be >= 1")
-    if tokenizer.eos_token_id is None:
-        raise ValueError("Megatron SFT packed data requires an EOD token")
 
     prompt_config = _get_prompt_config(prompt_format, pad_token, assistant_prefix_len)
     assert prompt_format is not None
     pack_length = max_seq_length
     pad = _resolve_pad_token_id(tokenizer, prompt_config)
-    eod = int(tokenizer.eos_token_id)
     conversations = split_megatron_sft_conversations(datum_dict["packed_messages"])
     if not conversations:
         raise ValueError("Megatron SFT packed data requires at least one conversation")
@@ -244,9 +241,6 @@ def megatron_sft_packed_preprocessor(
         )
         if not tokens:
             raise ValueError("Megatron SFT conversation tokenized to zero tokens")
-        if tokens[-1] != eod:
-            tokens.append(eod)
-            targets.append(eod)
 
         pack_tokens.extend(tokens)
         pack_targets.extend(targets)

@@ -226,7 +226,7 @@ def test_packed_preprocessor_matches_megatron_without_appending_eod() -> None:
     assert processed["packed_max_seqlen"] == megatron_processed["max_seqlen"].item()
 
 
-def test_packed_preprocessor_does_not_duplicate_existing_eod() -> None:
+def test_packed_preprocessor_preserves_existing_eod() -> None:
     messages = [
         {"role": "system", "content": "s"},
         {"role": "user", "content": "u"},
@@ -265,7 +265,7 @@ def test_identity_uses_unk_padding_and_supervises_all_literal_targets() -> None:
         prompt_format="identity",
     )
 
-    assert torch.equal(processed["target_ids"], torch.tensor([20, 30, 2, 99, 99]))
+    assert torch.equal(processed["target_ids"], torch.tensor([20, 30, 99, 99, 99]))
     assert tokenizer.calls[0][1]["add_generation_prompt"] is False
 
 
@@ -283,8 +283,8 @@ def test_identity_uses_unk_padding_and_supervises_all_literal_targets() -> None:
                 ("user", "question"): [20],
                 ("assistant", ""): [],
             },
-            [10, 20, 2, 99],
-            [20, 2, 99, 99],
+            [10, 20, 99, 99],
+            [20, 99, 99, 99],
             id="empty-assistant",
         ),
         pytest.param(
@@ -300,8 +300,8 @@ def test_identity_uses_unk_padding_and_supervises_all_literal_targets() -> None:
                 ("tool", "result"): [25],
                 ("assistant", "answer"): [30],
             },
-            [10, 20, 25, 30, 2],
-            [20, 25, 30, 2, 99],
+            [10, 20, 25, 30, 99],
+            [20, 25, 30, 99, 99],
             id="tool-turn",
         ),
         pytest.param(
@@ -315,8 +315,8 @@ def test_identity_uses_unk_padding_and_supervises_all_literal_targets() -> None:
                 ("assistant", "first"): [30],
                 ("assistant", "second"): [40],
             },
-            [10, 30, 40, 2, 99],
-            [30, 40, 2, 99, 99],
+            [10, 30, 40, 99, 99],
+            [30, 40, 99, 99, 99],
             id="consecutive-assistants",
         ),
     ],
@@ -400,7 +400,7 @@ def test_nemotron_preprocessor_masks_prompt_and_assistant_prefix() -> None:
                 IGNORE_INDEX,
                 IGNORE_INDEX,
                 33,
-                2,
+                99,
                 99,
                 99,
                 99,
@@ -443,7 +443,7 @@ def test_nemotron_preprocessor_masks_tool_output_before_assistant_response() -> 
                 IGNORE_INDEX,
                 IGNORE_INDEX,
                 33,
-                2,
+                99,
                 99,
                 99,
                 99,
@@ -475,7 +475,7 @@ def test_nemotron_preprocessor_masks_unsupervised_tokens_from_loss() -> None:
 
     assert torch.equal(
         processed["token_mask"],
-        torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
 
 
