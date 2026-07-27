@@ -54,6 +54,14 @@ env:
           - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
           - resources_servers/math_with_judge/configs/math_with_judge.yaml
 
+        # `replicas: N` makes N identical instances of a shard.
+        # Each instance runs on one node.
+        # The router assigns prompt groups round-robin.
+        # Replication needs N more nodes and the default STRICT_SPREAD.
+        # It cannot be exercised by this one-node config.
+        # Replicas share one merged config and therefore one port range.
+        # replicas: 2
+
     # The base recipe already configures policy_model.
     # Claim that inherited overlay by key instead of copying its value.
     # Both shards need the proxy.
