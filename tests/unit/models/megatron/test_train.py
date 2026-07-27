@@ -36,12 +36,12 @@ from nemo_rl.algorithms.loss.interfaces import LossInputType
 pytestmark = pytest.mark.mcore
 
 
-def _run_direct_model_loss() -> tuple[torch.Tensor, dict[str, Any], MagicMock]:
+def _run_direct_model_loss() -> tuple[torch.Tensor, dict[str, Any]]:
+    from nemo_rl.algorithms.loss import NLLLossFn
     from nemo_rl.models.megatron import train as megatron_train
 
-    custom_loss_fn = MagicMock()
     processor = megatron_train.LossPostProcessor(
-        loss_fn=custom_loss_fn,
+        loss_fn=NLLLossFn(),
         cfg={"sequence_packing": {"enabled": True}},
         num_microbatches=4,
     )
@@ -60,7 +60,7 @@ def _run_direct_model_loss() -> tuple[torch.Tensor, dict[str, Any], MagicMock]:
         )
 
     loss, metrics = wrapped(torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
-    return loss, metrics, custom_loss_fn
+    return loss, metrics
 
 
 class TestModelForward:
@@ -1032,29 +1032,43 @@ class TestLossPostProcessor:
 
 
 def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling():
-    loss, _, _ = _run_direct_model_loss()
+    loss, _ = _run_direct_model_loss()
 
     assert torch.isclose(loss, torch.tensor(4.0 / 3.0))
 
 
 def test_direct_model_loss_reports_unscaled_loss_without_cp_local_token_count():
-    _, metrics, _ = _run_direct_model_loss()
+    _, metrics = _run_direct_model_loss()
 
     assert metrics["loss"].item() == pytest.approx(2.0 / 3.0)
     assert "num_unmasked_tokens" not in metrics
 
 
-def test_direct_model_loss_bypasses_online_logit_loss_function():
-    _, _, online_loss_fn = _run_direct_model_loss()
-
-    assert online_loss_fn.call_count == 0
-
-
-def test_direct_model_loss_rejects_misaligned_target_mask():
+def test_direct_model_loss_rejects_non_nll_loss_semantics():
     from nemo_rl.models.megatron.train import LossPostProcessor
 
     processor = LossPostProcessor(
         loss_fn=MagicMock(),
+        cfg={"sequence_packing": {"enabled": True}},
+    )
+
+    with pytest.raises(
+        TypeError,
+        match=r"direct Megatron-LM prepacked SFT requires.*NLLLossFn",
+    ):
+        processor(
+            data_dict=MagicMock(),
+            global_valid_toks=torch.tensor(1.0),
+            prepacked_loss_mask=torch.ones(1, 4),
+        )
+
+
+def test_direct_model_loss_rejects_misaligned_target_mask():
+    from nemo_rl.algorithms.loss import NLLLossFn
+    from nemo_rl.models.megatron.train import LossPostProcessor
+
+    processor = LossPostProcessor(
+        loss_fn=NLLLossFn(),
         cfg={"sequence_packing": {"enabled": True}},
     )
     wrapped = processor(

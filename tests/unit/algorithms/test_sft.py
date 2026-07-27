@@ -23,6 +23,7 @@ from nemo_rl.algorithms.sft import (
     MasterConfig,
     SFTConfig,
     _initial_sft_save_state,
+    setup,
     sft_train,
     validate,
 )
@@ -290,6 +291,32 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     # step (5). Each save calls init_tmp_checkpoint(step, ...).
     saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
     assert saved_steps == [2, 4, 5]
+
+
+def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effects(
+    mock_components,
+):
+    master_config = mock_components["master_config"]
+    master_config.sft.only_unmask_final = True
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    train_dataset = MagicMock()
+    train_dataset.task_data_processors = {"megatron_sft_packed": MagicMock()}
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(
+            ValueError,
+            match=r"sft\.only_unmask_final=true.*direct Megatron-LM prepacked SFT",
+        ):
+            setup(
+                master_config,
+                mock_components["tokenizer"],
+                train_dataset,
+                None,
+            )
 
 
 def _direct_packed_batch(batch_size: int = 1) -> BatchedDataDict:
