@@ -611,3 +611,90 @@ def test_logger_metrics_always_has_canonical_vllm_keys(
     assert out["kv_cache_usage_perc"] == {0: [0.5]}
     assert out["generation_tokens"] == {0: [100.0]}
     assert "vllm_num_requests_running" not in out
+
+
+# ---------------------------------------------------------------- MX refit retry
+#
+# A refit failure is retried against a shared cycle deadline. That is right for
+# a transient failure and wrong for a deterministic one: the publishers hold the
+# same bytes, so a verification mismatch reproduces on every attempt and the
+# retry only converts a named correctness failure into a timeout.
+
+
+def _refit_cycle(monkeypatch, refit_result, *, timeout_seconds=30.0):
+    """Drive one refit cycle against a single stubbed worker."""
+    monkeypatch.setattr(
+        _dynmod,
+        "_discover_worker_instances",
+        lambda **_kwargs: [{"instance_id": "w0", "system_url": "http://10.0.0.1:9090"}],
+    )
+
+    posts = []
+
+    def fake_post_json(url, body, timeout_s):
+        posts.append(url)
+        if url.endswith("/engine/update_weights_via_mx"):
+            return refit_result
+        return {"status": "ok"}
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+
+    # ``_dispatch_update_weights_via_mx_remote`` is a Ray remote; call the
+    # plain function it wraps so the cycle runs in-process.
+    dispatch = _dynmod._dispatch_update_weights_via_mx_remote._function
+
+    with pytest.raises(RuntimeError) as excinfo:
+        dispatch(
+            k8s_namespace="ns",
+            dgd_name="dgd",
+            version=1,
+            mx_config_dict={"timeout_seconds": timeout_seconds},
+        )
+    refit_posts = [u for u in posts if u.endswith("/engine/update_weights_via_mx")]
+    return str(excinfo.value), refit_posts
+
+
+def test_verification_failure_is_attempted_once(monkeypatch):
+    """The failure this exists for: it burned ~50 minutes of a 12-node
+    reservation re-running an attempt that could not succeed."""
+    message, refit_posts = _refit_cycle(
+        monkeypatch,
+        {
+            "status": "error",
+            "reason": (
+                "[reshard] parameter verification FAILED at step 2: 9 of 3096 "
+                "checked shard(s) differ from the publisher's digest."
+            ),
+        },
+    )
+
+    assert len(refit_posts) == 1
+    assert "terminally" in message
+    assert "parameter verification FAILED" in message
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "UnsupportedReshard: qkv fusion is not a box",
+        "no destination for model.layers.0.mlp.down_proj.weight",
+        "[mx-mdl] install_mapped: dtype mismatch",
+    ],
+)
+def test_other_deterministic_failures_are_also_terminal(monkeypatch, reason):
+    _message, refit_posts = _refit_cycle(
+        monkeypatch, {"status": "error", "reason": reason}
+    )
+
+    assert len(refit_posts) == 1
+
+
+def test_transient_failure_is_still_retried_until_the_deadline(monkeypatch):
+    """Source readiness clears on its own, so retrying is what makes it work."""
+    _message, refit_posts = _refit_cycle(
+        monkeypatch,
+        {"status": "error", "reason": "no v2 source available"},
+        timeout_seconds=1.0,
+    )
+
+    assert len(refit_posts) > 1

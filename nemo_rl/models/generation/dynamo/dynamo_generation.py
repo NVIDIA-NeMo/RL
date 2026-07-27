@@ -421,6 +421,33 @@ def _dispatch_update_weights_via_mx_remote(
         return _http_post_json(f"{sys_url}/engine/{route}", body, timeout_s)
 
     refitted_ids: set[Any] = set()
+
+    # A refit failure is retryable only if the next attempt could plausibly see
+    # a different world. Source readiness, discovery and connectivity all clear
+    # on their own, so those are retried (see the deadline comment below).
+    #
+    # These do not. The publishers hold the same bytes and advertise the same
+    # geometry, so attempt N is identical to attempt 1 by construction: a
+    # parameter-verification mismatch, an unsupported reshard geometry, a
+    # coverage gap, or a failed install. Retrying one of these burns the whole
+    # cycle deadline and then reports a timeout, which reads as an
+    # infrastructure problem and hides the real failure. One observed instance
+    # re-ran a verification failure every four seconds for the better part of an
+    # hour on a twelve-node reservation without advancing a step.
+    _TERMINAL_REFIT_MARKERS = (
+        "parameter verification failed",
+        "unsupportedreshard",
+        "unsupported reshard",
+        "no destination for",
+        "coverage",
+        "install_mapped",
+        "dtype mismatch",
+    )
+
+    def _is_terminal_refit_failure(result: dict[str, Any]) -> bool:
+        reason = str(result.get("reason", "")).lower()
+        return any(marker in reason for marker in _TERMINAL_REFIT_MARKERS)
+
     iteration_logs: list[dict[str, Any]] = []
     failures: list[str] = []
 
@@ -534,6 +561,14 @@ def _dispatch_update_weights_via_mx_remote(
                 )
                 steps["refit"] = r_refit
                 if r_refit.get("status") == "ok":
+                    break
+                if _is_terminal_refit_failure(r_refit):
+                    steps["refit_terminal"] = True
+                    failure_msgs.append(
+                        f"refit@{sys_url}({inst_id}) failed terminally on attempt "
+                        f"{attempt} and was not retried - the publishers hold the "
+                        f"same bytes, so a retry cannot succeed: {r_refit}"
+                    )
                     break
                 if _time.monotonic() >= _cycle_deadline:
                     failure_msgs.append(
