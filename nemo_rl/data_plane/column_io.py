@@ -45,6 +45,10 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+# Fields the codec packs jagged via ``pack_per_token_field``. Rest go
+# through ``.detach().contiguous()``. Add per-token fields here — no
+# separate structural check is needed because the codec's binary
+# dispatch (Tensor | ndarray[object]) errors loudly on unknown types.
 TOKEN_ALIGNED_FIELDS = frozenset(
     {
         "input_ids",
@@ -60,6 +64,8 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "routed_experts",
         INVALID_TOOL_CALL_MASK,
         MALFORMED_THINKING_MASK,
+        "mm_token_type_ids",
+        "token_type_ids",
     }
 )
 
@@ -197,12 +203,26 @@ def kv_first_write(
             f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
-    fields: dict[str, torch.Tensor | np.ndarray] = {
-        k: v
-        for k, v in final_batch_cpu.items()
-        if isinstance(v, torch.Tensor)
-        or (isinstance(v, np.ndarray) and v.dtype == object)
-    }
+    # Binary wire dispatch: only ``torch.Tensor`` (including
+    # ``torch.nested``) and ``np.ndarray[object]`` cross the codec.
+    # Raise loudly on anything else instead of silently dropping —
+    # that's the class of silent-drop bug that let PackedTensor
+    # pixel_values disappear from the TQ pipe pre-Option B.
+    fields: dict[str, torch.Tensor | np.ndarray] = {}
+    for k, v in final_batch_cpu.items():
+        if isinstance(v, torch.Tensor) or (
+            isinstance(v, np.ndarray) and v.dtype == object
+        ):
+            fields[k] = v
+        else:
+            raise TypeError(
+                f"Field {k!r}: unexpected wire type {type(v).__name__}. "
+                "Only torch.Tensor (incl. torch.nested) and "
+                "np.ndarray[object] cross the wire boundary. Convert "
+                "domain-layer wrappers (e.g. PackedTensor via "
+                "torch.nested.as_nested_tensor) in the rollout actor "
+                "before calling kv_first_write."
+            )
     td = pack_jagged_fields(
         fields,
         lengths=lengths,

@@ -38,6 +38,11 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
+    PackedTensor,
+)
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -49,6 +54,16 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
+
+# Include-list of multimodal fields the logprob dispatch must ship so
+# the trainer's forward matches the rollout. Only ``PACKED`` fields
+# ship a companion ``__lengths`` — per-token fields are rectangular
+# and travel as plain tensors.
+_LP_MULTIMODAL_FIELDS = (
+    PER_TOKEN_MULTIMODAL_FIELDS
+    | PACKED_MULTIMODAL_FIELDS
+    | frozenset(PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS)
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-stage aggregators that assemble per-rank worker results into the
@@ -224,10 +239,15 @@ class TQPolicy(TQDriverMixin, Policy):
         always None, so this dispatcher just waits for completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
+        # Narrow the fetch to LP_SEED_FIELDS + any multimodal fields
+        # the rollout actually wrote (filter is required — noop
+        # adapter and TQ contract both raise on unknown fields) +
+        # optional routed_experts under R3 replay.
+        present_multimodal = _LP_MULTIMODAL_FIELDS & set(meta.fields or ())
         lp_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
+                [*LP_SEED_FIELDS, *present_multimodal],
                 enabled=self._router_replay_enabled and include_router_replay,
             ),
             task_name=task_name,
