@@ -49,7 +49,9 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
-from nemo_rl.models.generation.interfaces import resolve_routed_experts_dtype_name_for_model
+from nemo_rl.models.generation.interfaces import (
+    resolve_routed_experts_dtype_name_for_model,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -384,9 +386,10 @@ def setup_single_controller(
         # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
         # overlaps model loading instead of running serially afterward.
         enable_router_replay = router_replay_enabled(policy_config)
-        routed_experts_dtype=(
-            resolve_routed_experts_dtype_name_for_model(model_name)
-            if enable_router_replay else "int16"
+        routed_experts_dtype = (
+            resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
+            if enable_router_replay
+            else "int16"
         )
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
             env_configs=master_config.env,
