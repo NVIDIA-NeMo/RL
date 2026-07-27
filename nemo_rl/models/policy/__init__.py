@@ -281,6 +281,10 @@ class MegatronDDPConfig(TypedDict):
     overlap_param_gather: bool
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
+    # Validate per-bucket grads for NaNs in the grad-ready hook (a D2H sync
+    # mid-backward). Absent keeps the current default (true); set false for
+    # large multi-node MoE runs where the sync can deadlock collectives.
+    check_for_nan_in_grad: NotRequired[bool]
 
 
 class Fp8Config(TypedDict):
@@ -415,6 +419,11 @@ class MegatronConfig(TypedDict):
     gradient_accumulation_fusion: NotRequired[bool]
     # Enable fused weighted squared ReLU when the architecture supports it.
     use_fused_weighted_squared_relu: NotRequired[bool]
+    # Keep the first/last transformer layers in BF16 (used by FP8 recipes to
+    # preserve precision at the model boundaries).
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # When True, computes per-token logprobs with a chunked linear cross-entropy
     # fusion kernel directly from hidden states, avoiding materialization of the
     # full [batch, seq_len, vocab_size] logit tensor. This significantly reduces

@@ -695,6 +695,18 @@ class MegatronPolicyWorkerImpl(
                     mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
+                    # Memory snapshot before the fwd/bwd peak; opt in via
+                    # NRL_MEM_DEBUG=1.
+                    if os.environ.get("NRL_MEM_DEBUG") == "1":
+                        _alloc = torch.cuda.memory_allocated() / (1024**3)
+                        _resv = torch.cuda.memory_reserved() / (1024**3)
+                        _free, _total = torch.cuda.mem_get_info()
+                        print(
+                            f"[mem-debug] rank={self.rank} before train fwd/bwd: "
+                            f"allocated={_alloc:.1f}GiB reserved={_resv:.1f}GiB "
+                            f"device_free={_free / (1024**3):.1f}GiB of {_total / (1024**3):.1f}GiB"
+                        )
+
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     use_router_replay = _should_use_router_replay(
@@ -1940,9 +1952,36 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks=self.refit_conversion_tasks,
         )
 
+        # Stacked 3D fused-expert exports ([num_experts, ...] gate_up_proj /
+        # down_proj) trip vLLM 0.20's fused FusedMoE load path for Qwen3.5
+        # ("shard_dim=0 is not a valid data dimension for a 3D tensor"), which
+        # kills the collective refit. Split them into per-expert 2D HF tensors
+        # (experts.{i}.{gate,up,down}_proj.weight), which vLLM loads through
+        # its standard per-expert mapping. Both prepare_refit_info and the
+        # broadcast use this same iterator, so metadata and payload agree.
+        # Disable with NRL_REFIT_SPLIT_FUSED_EXPERTS=0.
+        split_fused = os.environ.get("NRL_REFIT_SPLIT_FUSED_EXPERTS", "1") == "1"
+
+        def _maybe_split_fused_experts(name, tensor):
+            if not split_fused or tensor.ndim != 3:
+                yield name, tensor
+                return
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                prefix = name[: -len("gate_up_proj")]
+                inter = tensor.shape[1] // 2
+                for e in range(tensor.shape[0]):
+                    yield f"{prefix}{e}.gate_proj.weight", tensor[e, :inter]
+                    yield f"{prefix}{e}.up_proj.weight", tensor[e, inter:]
+            elif name.endswith(".mlp.experts.down_proj"):
+                prefix = name[: -len("down_proj")]
+                for e in range(tensor.shape[0]):
+                    yield f"{prefix}{e}.down_proj.weight", tensor[e]
+            else:
+                yield name, tensor
+
         # Yield the original parameters first.
         for name, tensor in base_iter:
-            yield name, tensor
+            yield from _maybe_split_fused_experts(name, tensor)
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -2013,9 +2052,27 @@ class MegatronPolicyWorkerImpl(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
+
+        def _log_expert_shapes_once(iterator):
+            log_experts = not getattr(self, "_refit_expert_shapes_logged", False)
+            logged = 0
+            for name, tensor in iterator:
+                if log_experts and ".mlp.experts." in name and logged < 4:
+                    # A few representative tensors are enough to diagnose
+                    # layout mismatches on the vLLM side.
+                    logged += 1
+                    print(
+                        f"[refit-debug] sending '{name}' "
+                        f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                    )
+                yield name, tensor
+            self._refit_expert_shapes_logged = True
+
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            iterator=_log_expert_shapes_once(
+                self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
