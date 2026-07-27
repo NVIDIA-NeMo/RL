@@ -450,6 +450,22 @@ def test_an_unknown_placement_strategy_is_rejected():
         parse_shard_plan(_sharded_config(placement_strategy="SPRED"))
 
 
+def test_replicas_that_could_share_a_node_would_share_a_port_range():
+    """Replicas come from one merge, so they cannot be given separate ranges."""
+    config = _sharded_config(placement_strategy="PACK")
+    config["shards"][1]["replicas"] = 2
+
+    with pytest.raises(ShardConfigError, match=r"\['tools'\] declare replicas"):
+        parse_shard_plan(config)
+
+
+def test_replicas_are_fine_on_the_default_strategy_that_spreads_them():
+    config = _sharded_config()
+    config["shards"][1]["replicas"] = 2
+
+    assert [shard.replicas for shard in parse_shard_plan(config).shards] == [1, 2]
+
+
 def test_apply_shard_overlay_layers_shard_over_common():
     plan = ShardPlan(
         shards=[],

@@ -2337,6 +2337,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "remote_time": 2.0,
+        "timing/test/routing/groups/nemo_gym": 1,
     }
 
 
@@ -2464,6 +2465,52 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
+    class _FailedRef:
+        def __await__(self):
+            async def _resolve():
+                raise RuntimeError("actor died")
+
+            return _resolve().__await__()
+
+    class _FailedStream:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return _FailedRef()
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, timer_prefix):
+            del inputs, timer_prefix
+            return _FailedStream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+
+    with pytest.raises(RuntimeError, match="instance 'nemo_gym' failed"):
+        asyncio.run(
+            manager._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+            )
+        )
 
 
 @pytest.mark.nemo_gym
