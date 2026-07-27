@@ -1300,11 +1300,18 @@ class NemoGymShardSet:
         self._next_replica[shard_name] = (index + 1) % len(replicas)
         return replicas[index]
 
-    def shard_name_of(self, handle: Any) -> str:
-        """Reverse-look up a handle's shard, for error messages and metric tags."""
+    def instance_label(self, handle: Any) -> str:
+        """Name one actor, for error messages and metric keys.
+
+        A shard with one replica is named by the shard alone, so the common
+        case reads as it did before replicas existed; a replicated shard adds
+        the replica index. This is the same rule the per-shard log directories
+        follow, so a metric and its logs carry the same name.
+        """
         for shard_name, replicas in self.handles.items():
-            if any(replica is handle for replica in replicas):
-                return shard_name
+            for index, replica in enumerate(replicas):
+                if replica is handle:
+                    return shard_name if len(replicas) == 1 else f"{shard_name}/{index}"
         raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
 
     def shutdown(self) -> None:
@@ -1457,7 +1464,6 @@ def _build_sharded_gym_actors(
             f"{DEFAULT_PLACEMENT_STRATEGY}, so shards may share a node and the "
             f"per-node capacity isolation sharding exists for does not hold."
         )
-
     base_gym_dict = {
         key: value
         for key, value in nemo_gym_dict.items()

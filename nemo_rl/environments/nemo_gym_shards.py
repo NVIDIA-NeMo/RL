@@ -347,6 +347,23 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             f"{sorted(PLACEMENT_STRATEGIES)}, got {placement_strategy!r}"
         )
 
+    # Replicas are stamped from one merge, so they share that shard's port
+    # range and no per-replica override exists to give them separate ones.
+    # Only STRICT_SPREAD guarantees each one its own node, and therefore its
+    # own port space; under any other strategy two replicas can land together
+    # and race for the same ports at spinup.
+    replicated = [shard.name for shard in shards if shard.replicas > 1]
+    if replicated and placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
+        raise ShardConfigError(
+            f"Shards {replicated} declare replicas, which requires "
+            f"placement_strategy {DEFAULT_PLACEMENT_STRATEGY} so that each "
+            f"replica gets its own node and port space; got "
+            f"{placement_strategy!r}. Replicas share one merged config, so "
+            f"they cannot be given separate port ranges. Either drop the "
+            f"replicas or split them into separate shards with their own "
+            f"port_range_low/high."
+        )
+
     if placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
         missing_ranges = [
             shard.name for shard in shards if shard.port_range_low is None

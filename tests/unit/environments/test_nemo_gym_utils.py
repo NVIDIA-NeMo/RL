@@ -672,13 +672,22 @@ def test_an_existing_shard_set_is_passed_through_untouched():
     assert nemo_gym_mod.as_nemo_gym_shard_set(shard_set) is shard_set
 
 
-def test_shard_name_of_identifies_a_replica_for_error_messages():
+def test_a_replicated_shard_labels_each_instance_apart():
     first, second = MagicMock(), MagicMock()
     shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [first, second]})
 
-    assert shard_set.shard_name_of(second) == "tools"
+    assert shard_set.instance_label(first) == "tools/0"
+    assert shard_set.instance_label(second) == "tools/1"
     with pytest.raises(nemo_gym_mod.ShardSetupError, match="does not belong"):
-        shard_set.shard_name_of(MagicMock())
+        shard_set.instance_label(MagicMock())
+
+
+def test_an_unreplicated_shard_is_labelled_by_its_name_alone():
+    """Names a metric and its log directory the same way."""
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [handle]})
+
+    assert shard_set.instance_label(handle) == "tools"
 
 
 def _gym_dataset(*agent_names):
