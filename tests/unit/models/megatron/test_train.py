@@ -1038,13 +1038,15 @@ def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling
     assert torch.isclose(loss, torch.tensor(4.0 / 3.0))
 
 
-def test_direct_model_loss_reports_host_scalar_diagnostics():
+def test_direct_model_loss_defers_host_scalar_materialization():
     _, metrics = _run_direct_model_loss()
 
-    assert type(metrics["loss"]) is float
-    assert metrics["loss"] == pytest.approx(2.0 / 3.0)
-    assert type(metrics["num_valid_samples"]) is float
-    assert metrics["num_valid_samples"] == pytest.approx(1.0)
+    assert isinstance(metrics["loss"], torch.Tensor)
+    assert not metrics["loss"].requires_grad
+    assert torch.isclose(metrics["loss"], torch.tensor(2.0 / 3.0))
+    assert isinstance(metrics["num_valid_samples"], torch.Tensor)
+    assert not metrics["num_valid_samples"].requires_grad
+    assert torch.isclose(metrics["num_valid_samples"], torch.tensor(1.0))
     assert "num_unmasked_tokens" not in metrics
 
 
@@ -1484,6 +1486,33 @@ class TestTopkLogitsPostProcessor:
 
 class TestAggregateTrainingStatistics:
     """Tests for aggregate_training_statistics function."""
+
+    @patch("torch.distributed.all_reduce")
+    def test_materializes_scalar_tensor_metrics_at_reporting_boundary(
+        self, mock_all_reduce
+    ):
+        """Tensor metrics stay on device until one batched host transfer."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        all_mb_metrics = [
+            {"loss": torch.tensor(0.5), "num_valid_samples": torch.tensor(3.0)},
+            {"loss": torch.tensor(0.3), "num_valid_samples": torch.tensor(5.0)},
+        ]
+
+        mb_metrics, global_loss = aggregate_training_statistics(
+            all_mb_metrics=all_mb_metrics,
+            losses=[torch.tensor(0.5), torch.tensor(0.3)],
+            data_parallel_group=MagicMock(),
+        )
+
+        assert torch.equal(global_loss.cpu(), torch.tensor([0.5, 0.3]))
+        assert mb_metrics["loss"] == pytest.approx([0.5, 0.3])
+        assert mb_metrics["num_valid_samples"] == [3.0, 5.0]
+        assert all(
+            type(value) is float
+            for values in mb_metrics.values()
+            for value in values
+        )
 
     @patch("torch.distributed.all_reduce")
     def test_aggregates_metrics_across_microbatches(self, mock_all_reduce):
