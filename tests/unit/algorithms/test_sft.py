@@ -300,6 +300,10 @@ def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effec
     master_config.sft.only_unmask_final = True
     master_config.data = {"shuffle": False, "num_workers": 0}
     master_config.logger = {}
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "use_fused_linear_logprobs": False,
+    }
     train_dataset = MagicMock()
     train_dataset.task_data_processors = {"megatron_sft_packed": MagicMock()}
 
