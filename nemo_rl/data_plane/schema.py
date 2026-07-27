@@ -44,7 +44,7 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
-# Subset fetched by logprob / ref-logprob workers.
+# Core fields the logprob workers require; multimodal extras added by TQPolicy._logprob_dispatch.
 LP_SEED_FIELDS = (
     "input_ids",
     "input_lengths",
