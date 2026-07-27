@@ -49,7 +49,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import build_nemo_gym_actors
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -384,12 +384,20 @@ def setup_single_controller(
     if use_nemo_gym:
         # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
         # overlaps model loading instead of running serially afterward.
-        env_handles["nemo_gym"] = spinup_nemo_gym_actor(
-            master_config.env,
-            base_urls=generation.dp_openai_server_base_urls,
-            model_name=generation_config["model_name"],
-            enable_router_replay=router_replay_enabled(master_config.policy),
-            use_fastokens=bool(master_config.policy["tokenizer"].get("use_fastokens")),
+        # EnvironmentInterface describes step()-based environments; the gym
+        # entry has never been one. It used to be an actor handle and is now a
+        # shard set, and callers only ever ask it to run rollouts or shut down.
+        env_handles["nemo_gym"] = cast(
+            EnvironmentInterface,
+            build_nemo_gym_actors(
+                master_config.env,
+                base_urls=generation.dp_openai_server_base_urls,
+                model_name=generation_config["model_name"],
+                enable_router_replay=router_replay_enabled(master_config.policy),
+                use_fastokens=bool(
+                    master_config.policy["tokenizer"].get("use_fastokens")
+                ),
+            ),
         )
 
     # ==========================

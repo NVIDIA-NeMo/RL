@@ -409,7 +409,7 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
             ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
@@ -437,7 +437,7 @@ class TestSetup:
 
         with (
             patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
-            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            patch.object(sc_setup_mod, "build_nemo_gym_actors") as mock_spinup,
             pytest.raises(NotImplementedError, match="vllm"),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))

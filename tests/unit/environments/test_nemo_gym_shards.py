@@ -88,6 +88,25 @@ def test_top_level_config_paths_conflicts_with_shards():
         parse_shard_plan(_sharded_config(config_paths=["gym.yaml"]))
 
 
+def test_an_inherited_config_paths_can_be_retracted_with_null():
+    """A Hydra override can blank a key it inherited but cannot delete it, so
+    null has to read as absent or no recipe could ever be sharded."""
+    plan = parse_shard_plan(_sharded_config(config_paths=None))
+
+    assert plan is not None
+    assert [shard.name for shard in plan.shards] == ["judged", "tools"]
+
+
+def test_a_nulled_entry_overlay_is_not_forwarded_to_gym():
+    """Gym should get the key gone, not the key set to null."""
+    plan = parse_shard_plan(_sharded_config(policy_model=None))
+    assert plan is not None
+
+    merged = apply_shard_overlay({"policy_model": None}, plan, plan.shards[0])
+
+    assert "policy_model" not in merged
+
+
 def test_stray_entry_overlay_is_rejected():
     """A top-level Gym overlay has no unambiguous shard, so it must be placed."""
     with pytest.raises(ShardConfigError, match="nl2bash_judge_model"):
@@ -141,6 +160,21 @@ def test_stray_entry_overlay_is_rejected():
 def test_malformed_shards_are_rejected(shards, expected):
     with pytest.raises(ShardConfigError, match=expected):
         parse_shard_plan({"shards": shards})
+
+
+def test_shards_land_on_distinct_nodes_unless_told_otherwise():
+    assert parse_shard_plan(_sharded_config()).placement_strategy == "STRICT_SPREAD"
+
+
+def test_placement_strategy_can_be_relaxed_to_run_shards_on_one_machine():
+    plan = parse_shard_plan(_sharded_config(placement_strategy="PACK"))
+
+    assert plan.placement_strategy == "PACK"
+
+
+def test_an_unknown_placement_strategy_is_rejected():
+    with pytest.raises(ShardConfigError, match="placement_strategy must be one of"):
+        parse_shard_plan(_sharded_config(placement_strategy="SPRED"))
 
 
 def test_allowed_duplicate_entries_must_be_strings():
