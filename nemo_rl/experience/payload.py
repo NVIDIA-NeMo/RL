@@ -40,7 +40,7 @@ def record_to_train_batch(
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, and total_reward.
+        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -75,17 +75,18 @@ def record_to_train_batch(
     )
     sample_mask = torch.ones(n, dtype=torch.float32)
 
-    return BatchedDataDict[Any](
-        {
-            "input_ids": flat["token_ids"],
-            "input_lengths": input_lengths,
-            "generation_logprobs": flat["generation_logprobs"],
-            "token_mask": flat["token_loss_mask"],
-            "sample_mask": sample_mask,
-            "prompt_ids_for_adv": prompt_flat["token_ids"],
-            "total_reward": total_reward,
-        }
-    )
+    train_data: dict[str, Any] = {
+        "input_ids": flat["token_ids"],
+        "input_lengths": input_lengths,
+        "generation_logprobs": flat["generation_logprobs"],
+        "token_mask": flat["token_loss_mask"],
+        "sample_mask": sample_mask,
+        "prompt_ids_for_adv": prompt_flat["token_ids"],
+        "total_reward": total_reward,
+    }
+    if "routed_experts" in flat:
+        train_data["routed_experts"] = flat["routed_experts"]
+    return BatchedDataDict[Any](train_data)
 
 
 def pack_payload(
