@@ -86,8 +86,12 @@ def _materialize_loss_metrics_for_object_broadcast(
     loss_metrics: LossMetricPayloadT,
 ) -> LossMetricPayloadT:
     """Convert tensor metrics to host values before object transport."""
-    is_flat_dict = isinstance(loss_metrics, dict)
-    metrics = [loss_metrics] if is_flat_dict else loss_metrics
+    if isinstance(loss_metrics, dict):
+        is_flat_dict = True
+        metrics: list[dict[str, Any]] = [loss_metrics]
+    else:
+        is_flat_dict = False
+        metrics = loss_metrics
     materialized = [dict(metric) for metric in metrics]
     scalar_groups: dict[
         tuple[torch.device, torch.dtype],
