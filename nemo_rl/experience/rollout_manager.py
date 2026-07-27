@@ -25,6 +25,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import _tensorize_by_key, calculate_rewards
@@ -492,7 +493,11 @@ class AsyncNemoGymRolloutImpl:
         self, inputs: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
-        nemo_gym_env = self._task_to_env["nemo_gym"]
+        # These rows are all one prompt's generations, so they share an agent and
+        # go to one instance -- there is nothing to bucket, and splitting them
+        # would break any verifier that scores a group against itself.
+        shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
+        nemo_gym_env = shard_set.pick_handle(inputs[0]["agent_ref"]["name"])
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
