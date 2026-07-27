@@ -1,0 +1,79 @@
+# Two-shard NeMo-Gym smoke config, for exercising sharding by hand.
+#
+# This is not a training recipe. It is the smallest config that puts two Gym
+# stacks behind one job so the sharding machinery can be watched end to end:
+# per-shard spinup, the agent->shard map, routing whole prompt groups to the
+# shard hosting their agent, per-shard log directories, and teardown of both
+# actors plus their placement group.
+#
+# The split is by environment, since an agent may live in exactly one shard:
+# workplace_assistant on one, math_with_judge on the other. Both were already
+# a supported multi-environment combination -- see the commented config_paths
+# in the base recipe -- so this only changes where they run, not what they do.
+#
+# Run `ng_prepare_data` for BOTH environments and point data.train/validation
+# at the combined jsonl before running. A dataset covering only one of them
+# still starts, but every row lands on one shard and the other sits idle, so
+# routing is never exercised. A dataset naming a third agent fails at setup,
+# which is itself worth seeing once.
+#
+# Single node:
+#   the default STRICT_SPREAD wants one node per shard, so override
+#   env.nemo_gym.placement_strategy=PACK to colocate them. That gives up the
+#   capacity isolation sharding exists for, which is fine when the point is to
+#   test the mechanism rather than to relieve a node.
+#
+# Two or more nodes:
+#   leave placement_strategy alone and confirm the shards land on different
+#   nodes.
+
+defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
+
+env:
+  nemo_gym:
+    # Retract the inherited single-stack settings. A Hydra override can blank
+    # an inherited key but not delete it, so null is how these are given up;
+    # the sharded schema reads null as absent.
+    config_paths: null
+    policy_model: null
+    # An overlay for an environment neither shard hosts. Left in place it would
+    # be rejected as having no shard to belong to, which is the check working.
+    code_gen: null
+
+    # Each shard gets its own port window so two stacks on one node cannot
+    # collide. The base recipe's 5000-5999 is split in half.
+    shards:
+      - name: workplace
+        port_range_low: 5000
+        port_range_high: 5499
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+
+      - name: math
+        port_range_low: 5500
+        port_range_high: 5999
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/math_with_judge/configs/math_with_judge.yaml
+
+    # Both shards need policy_model, which is a client of NeMo RL's vLLM
+    # servers rather than an engine of its own, so hosting it twice claims no
+    # extra GPU. That is what the allowlist below is for; without it the
+    # duplicate-entry check would stop the job, which is the right default
+    # since a duplicated engine-bearing entry doubles its GPU claim silently.
+    common_overrides:
+      policy_model:
+        responses_api_models:
+          vllm_model:
+            uses_reasoning_parser: false
+            extra_body:
+              chat_template_kwargs:
+                enable_thinking: false
+    allowed_duplicate_entries:
+      - policy_model
+
+logger:
+  log_dir: "logs/grpo-sharded-gym-smoke"
+  wandb_enabled: false
+  monitor_gpus: false

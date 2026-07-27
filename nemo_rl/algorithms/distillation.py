@@ -52,7 +52,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import build_nemo_gym_actors
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -505,7 +505,7 @@ def setup(
             def init_nemo_gym():
                 # Distillation does not configure vLLM for router replay, so the
                 # actor must not require routed experts on its output items.
-                return spinup_nemo_gym_actor(
+                return build_nemo_gym_actors(
                     env_configs,
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
                     model_name=generation_config["model_name"],
