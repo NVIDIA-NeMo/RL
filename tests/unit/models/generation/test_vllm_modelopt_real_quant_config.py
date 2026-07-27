@@ -126,7 +126,7 @@ def _install_optional_modelopt_config_api(monkeypatch):
 
 def _install_fake_vllm_worker(monkeypatch):
     """Install the minimal vLLM worker hierarchy needed by the backend import."""
-    module_names = ["vllm", "vllm.v1", "vllm.v1.worker"]
+    module_names = ["vllm", "vllm.distributed", "vllm.v1", "vllm.v1.worker"]
     modules = {}
     for module_name in module_names:
         module = types.ModuleType(module_name)
@@ -141,6 +141,17 @@ def _install_fake_vllm_worker(monkeypatch):
 
     gpu_worker_module.Worker = FakeVllmWorker
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", gpu_worker_module)
+    parallel_state_module = types.ModuleType("vllm.distributed.parallel_state")
+
+    def get_pp_group() -> types.SimpleNamespace:
+        return types.SimpleNamespace(is_last_rank=True)
+
+    parallel_state_module.get_pp_group = get_pp_group
+    monkeypatch.setitem(
+        sys.modules, "vllm.distributed.parallel_state", parallel_state_module
+    )
+    modules["vllm"].distributed = modules["vllm.distributed"]
+    modules["vllm.distributed"].parallel_state = parallel_state_module
     modules["vllm"].v1 = modules["vllm.v1"]
     modules["vllm.v1"].worker = modules["vllm.v1.worker"]
     modules["vllm.v1.worker"].gpu_worker = gpu_worker_module

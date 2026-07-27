@@ -1288,6 +1288,10 @@ class MegatronPolicyWorkerImpl(
             self.model.start_grad_sync()
         self.model.finish_grad_sync()
 
+        # Wait for the comm-stream reduce dispatched above before opt.step
+        # reads main_grad. Without this, grad_norm collapses to ~1/2.
+        torch.cuda.synchronize()
+
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()

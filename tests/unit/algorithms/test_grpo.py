@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
+    refit_policy_generation,
     validate,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
@@ -56,6 +57,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
@@ -70,6 +72,33 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    # Match VllmGeneration's default; a bare MagicMock would auto-create a truthy
+    # weight_synchronizer and refit_policy_generation would delegate to it instead
+    # of taking the colocated IPC path under test.
+    policy_generation.weight_synchronizer = None
+    kv_scales = {"layer.0": 0.5}
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=1.0,
+        kv_scales=kv_scales,
+    )
+
+    policy.stream_weights_via_ipc_zmq.assert_called_once_with(
+        buffer_size_bytes=1024**3,
+        kv_scales=kv_scales,
+    )
 
 
 class TestMaskSampleFilter:
@@ -852,6 +881,13 @@ class StubAsyncTrajectoryCollector:
         """
         mock = MagicMock()
         mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def get_rollouts_state(self):
+        """Return a remote-callable mock yielding collector rollout state."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={NEXT_NEMO_GYM_TASK_INDEX_KEY: 0})
         return mock
 
 
