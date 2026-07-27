@@ -21,6 +21,8 @@ from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     mxfp8_e4m3_quantize_for_refit,
 )
 
+pytestmark = pytest.mark.vllm
+
 
 def _dequantize(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     num_blocks = x_fp8.shape[-1] // MXFP8_BLOCK_SIZE
