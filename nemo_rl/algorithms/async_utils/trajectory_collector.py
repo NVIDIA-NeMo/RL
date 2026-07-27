@@ -281,43 +281,51 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
+                # Wait until NO pause condition holds, re-checking every
+                # condition after each wake-up: sequential checks race with
+                # pause() at validation boundaries and let full batches launch
+                # into the validation window.
+                while self.running:
+                    if not self._manual_pause_cleared.is_set():
+                        self._manual_pause_cleared.wait()
+                        continue  # re-check all conditions after waking
 
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    with self._efficiency_timer.time("idle/refit_event_wait"):
-                        self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
+                    if not self._refit_pause_cleared.is_set():
+                        print("⏸️ Pausing collection for refit...")
+                        with self._efficiency_timer.time("idle/refit_event_wait"):
+                            self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
+                        continue  # re-check all conditions after waking
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
+                    if self._should_pause_for_generation_limits():
+                        # Only log warning once per weight version
+                        if (
+                            self._last_limit_warning_version
+                            != self.current_weight_version
+                        ):
+                            async_cfg = self.master_config.grpo.get("async_grpo", {})
+                            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                            target_weights = [
+                                self.current_weight_version + i
+                                for i in range(max_trajectory_age)
+                            ]
 
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
+                            print(
+                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                                f"already exist in buffer. Waiting for weight update..."
+                            )
+                            self._last_limit_warning_version = (
+                                self.current_weight_version
+                            )
 
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
+                            self._generation_limit_cleared.clear()  # Clear the event to pause
 
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    with self._efficiency_timer.time("idle/generation_limit_pause"):
-                        self._generation_limit_cleared.wait()
+                        # Efficiently wait for generation limits to be cleared (no polling!)
+                        with self._efficiency_timer.time("idle/generation_limit_pause"):
+                            self._generation_limit_cleared.wait()
+                        continue  # re-check all conditions after waking
 
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
+                    break  # nothing requires pausing; clear to launch
 
                 if not self.running:
                     break
@@ -415,6 +423,12 @@ class AsyncTrajectoryCollector:
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
 
             use_nemo_gym = _should_use_nemo_gym(self.master_config)
+
+            # Honor a manual pause (e.g. a validation boundary) before
+            # spawning, so the batch cannot launch into the val window.
+            if not self._manual_pause_cleared.is_set() and self.running:
+                print("⏸️ Manual pause before batch spawn: holding launch")
+                self._manual_pause_cleared.wait()
 
             if not self._refit_pause_cleared.is_set() and self.running:
                 with self._threads_lock:
@@ -550,6 +564,10 @@ class AsyncTrajectoryCollector:
         # Invalidate&recompute vLLM caches after the in-flight weight updates if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
+        # NOTE: for drained (non-in-flight) refits with prefix caching enabled,
+        # cache invalidation is handled unconditionally in
+        # refit_policy_generation (grpo.py), which also covers the
+        # pre-validation refit path that never reaches this method.
         async_cfg = self.master_config.grpo.get("async_grpo", {})
         if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
             "recompute_kv_cache_after_weight_updates", False

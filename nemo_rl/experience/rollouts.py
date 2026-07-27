@@ -59,6 +59,54 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
+_NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
+_NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
+_NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY = "chat_template_kwargs"
+
+
+def _get_nemo_gym_chat_template_kwargs(metadata: dict[str, Any]) -> dict[str, Any]:
+    chat_template_kwargs_str = metadata.get(
+        _NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY, "{}"
+    )
+    assert isinstance(chat_template_kwargs_str, str), (
+        "NeMo-Gym responses_create_params.metadata.chat_template_kwargs must be a JSON string."
+    )
+
+    chat_template_kwargs = json.loads(chat_template_kwargs_str)
+    assert isinstance(chat_template_kwargs, dict), (
+        "NeMo-Gym responses_create_params.metadata.chat_template_kwargs must decode to a dict."
+    )
+    return chat_template_kwargs
+
+
+def _set_nemo_rl_request_type(
+    responses_create_params: dict[str, Any], request_type: str | None
+) -> None:
+    metadata = responses_create_params.get("metadata") or {}
+    assert isinstance(metadata, dict), (
+        "NeMo-Gym responses_create_params.metadata must be a dict."
+    )
+    metadata = dict(metadata)
+    metadata.pop(_NEMO_RL_REQUEST_TYPE_METADATA_KEY, None)
+
+    chat_template_kwargs = _get_nemo_gym_chat_template_kwargs(metadata)
+    if request_type is None:
+        chat_template_kwargs.pop(_NEMO_RL_REQUEST_TYPE_METADATA_KEY, None)
+    else:
+        chat_template_kwargs[_NEMO_RL_REQUEST_TYPE_METADATA_KEY] = request_type
+
+    if chat_template_kwargs:
+        metadata[_NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY] = json.dumps(
+            chat_template_kwargs
+        )
+    else:
+        metadata.pop(_NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY, None)
+
+    if metadata:
+        responses_create_params["metadata"] = metadata
+    else:
+        responses_create_params.pop("metadata", None)
+
 
 def _add_r3_fallback_metrics(
     gen_metrics: dict[str, float | int],
@@ -1947,7 +1995,9 @@ def apply_reward_penalties(
 
 
 def _prepare_nemo_gym_rows(
-    rows: list[dict], generation_config: GenerationConfig
+    rows: list[dict],
+    generation_config: GenerationConfig,
+    mark_validation_request: bool = False,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
     for row_index, row in enumerate(rows):
@@ -1959,6 +2009,12 @@ def _prepare_nemo_gym_rows(
 
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
+        if mark_validation_request:
+            _set_nemo_rl_request_type(
+                responses_create_params, _NEMO_RL_VALIDATION_REQUEST_TYPE
+            )
+        else:
+            _set_nemo_rl_request_type(responses_create_params, None)
         configured_max_tokens = generation_config["max_new_tokens"]
         row_max_tokens = responses_create_params.get("max_output_tokens")
         responses_create_params["max_output_tokens"] = (
@@ -1997,6 +2053,7 @@ async def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mark_validation_request: bool = False,
     returns_entire_batch: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
@@ -2099,7 +2156,11 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            mark_validation_request=mark_validation_request,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2184,6 +2245,7 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mark_validation_request: bool = False,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2206,6 +2268,9 @@ def run_nemo_gym_rollout_sync(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mark_validation_request: Whether to tag every row's request as a
+            validation request so the generation server exempts it from the
+            strict training sampling-parameter checks.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2235,6 +2300,7 @@ def run_nemo_gym_rollout_sync(
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
             thinking_tags=thinking_tags,
+            mark_validation_request=mark_validation_request,
             returns_entire_batch=True,
         ):
             pass
