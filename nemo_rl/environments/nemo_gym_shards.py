@@ -75,6 +75,10 @@ class ShardConfigError(ValueError):
     """Raised for a malformed ``env.nemo_gym.shards`` block."""
 
 
+class ShardSetupError(RuntimeError):
+    """Raised when a sharded stack fails to start or fails its startup checks."""
+
+
 @dataclass(frozen=True)
 class ShardSpec:
     """One shard: a slice of the Gym config that gets its own actor.
@@ -377,6 +381,56 @@ def apply_shard_overlay(
         merged["port_range_low"] = shard.port_range_low
         merged["port_range_high"] = shard.port_range_high
     return merged
+
+
+def build_agent_shard_map(
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+    allowed_duplicate_entries: frozenset[str] | set[str] = frozenset(),
+) -> dict[str, str]:
+    """Map each agent entry to its shard, rejecting duplicates across shards.
+
+    Takes what each shard reported from ``NemoGym.list_entries()`` and returns
+    ``{agent_entry_name: shard_name}``, the lookup the router dispatches on.
+
+    Two failures are caught here rather than at first dispatch. An agent hosted
+    by two shards is always an error: rows naming it could go to either, so
+    routing would be silently nondeterministic. Any other entry in two shards
+    has to be allowlisted, because duplication is usually accidental — a shared
+    YAML dropped into two shards' path lists quietly brings its judge along and
+    doubles that judge's GPU claim.
+
+    Only names are compared. What an entry means is Gym's business.
+    """
+    agent_to_shard: dict[str, str] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry, types in entries.items():
+            if "responses_api_agents" not in types:
+                continue
+            if entry in agent_to_shard:
+                raise ShardSetupError(
+                    f"Agent '{entry}' is hosted by both shard "
+                    f"'{agent_to_shard[entry]}' and shard '{shard_name}'. An "
+                    f"agent must live in exactly one shard so rows naming it "
+                    f"have one destination."
+                )
+            agent_to_shard[entry] = shard_name
+
+    hosting_shard: dict[str, str] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry in entries:
+            if entry in agent_to_shard:
+                continue
+            if entry in hosting_shard and entry not in allowed_duplicate_entries:
+                raise ShardSetupError(
+                    f"Config entry '{entry}' appears in shard "
+                    f"'{hosting_shard[entry]}' and shard '{shard_name}' but is "
+                    f"not listed in allowed_duplicate_entries. If this entry "
+                    f"starts a model engine, duplicating it doubles its GPU "
+                    f"claim; if the duplication is intended, allowlist it."
+                )
+            hosting_shard.setdefault(entry, shard_name)
+
+    return agent_to_shard
 
 
 def apply_shard_log_dir(

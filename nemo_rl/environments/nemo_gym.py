@@ -17,12 +17,18 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
@@ -47,8 +53,15 @@ from nemo_rl.environments.nemo_gym_multimodal import (
 from nemo_rl.environments.nemo_gym_shards import (
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
+    ShardPlan,
+    ShardSetupError,
+    ShardSpec,
+    apply_shard_log_dir,
+    apply_shard_overlay,
+    build_agent_shard_map,
     parse_shard_plan,
 )
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -73,6 +86,26 @@ GYM_SERVER_TYPE_KEYS = (
     "responses_api_models",
     "resources_servers",
 )
+
+# Shard name used when the job is unsharded, so a single actor and a sharded
+# set have the same shape and callers need only one code path.
+DEFAULT_SHARD_NAME = "nemo_gym"
+
+# Logical CPUs reserved per shard bundle. This is a scheduling reservation, not
+# a limit: it decides whether a node can host a shard and steers Ray away from
+# stacking other CPU work there. Gym's subprocesses are not metered against it,
+# so a shard can use more than it reserves. Override per shard for known-heavy
+# stacks (e.g. code_gen and its sandbox pool).
+DEFAULT_SHARD_CPUS = 8
+
+# Waiting for STRICT_SPREAD bundles. Failing here means the allocation has
+# fewer usable nodes than the plan needs, which is worth reporting quickly.
+DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS = 180.0
+
+# Waiting for a shard to finish _spinup. Generous because a node that has never
+# run Gym builds every server's venv first; with venvs baked into the image
+# this is far shorter.
+DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS = 1800.0
 
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
@@ -1039,7 +1072,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
 ) -> NemoGymConfig:
-    """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
+    """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
     Splits ``env_configs["nemo_gym"]`` into the NeMo-RL-side fields the actor
     reads directly and the remainder, which is forwarded verbatim as NeMo-Gym's
@@ -1060,20 +1093,44 @@ def build_nemo_gym_config(
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
         remaining ``env_configs["nemo_gym"]`` keys under
         ``initial_global_config_dict``. The caller's ``env_configs`` is not mutated.
+
+    Raises:
+        ShardConfigError: The config is sharded. One config cannot describe
+            several shards; use :func:`build_nemo_gym_actors`.
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
-    # Validate the shards block even though only single-actor creation is wired
-    # up so far, so a malformed or premature sharded config fails at setup with
-    # a precise message instead of silently running unsharded.
     shard_plan = parse_shard_plan(nemo_gym_dict)
     if shard_plan is not None:
         raise ShardConfigError(
             f"env.nemo_gym.shards defines {len(shard_plan.shards)} shards "
-            f"({', '.join(s.name for s in shard_plan.shards)}), but multi-actor "
-            f"creation is not wired up yet. Remove 'shards' and use "
-            f"'config_paths' to run this job on a single actor."
+            f"({', '.join(s.name for s in shard_plan.shards)}), so it does not "
+            f"describe a single actor. Use build_nemo_gym_actors() instead."
         )
+
+    return _build_gym_actor_config(
+        nemo_gym_dict,
+        base_urls=base_urls,
+        model_name=model_name,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+    )
+
+
+def _build_gym_actor_config(
+    nemo_gym_dict: dict[str, Any],
+    *,
+    base_urls: list[str],
+    model_name: str,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+) -> NemoGymConfig:
+    """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
+
+    Shared by the unsharded path and by each shard, so every actor gets the
+    same treatment of NeMo-RL-side keys regardless of how it was composed.
+    """
+    nemo_gym_dict = dict(nemo_gym_dict)
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -1124,6 +1181,349 @@ def build_nemo_gym_config(
     )
 
 
+@dataclass
+class NemoGymShardSet:
+    """The live actors behind one NeMo-Gym stack, sharded or not.
+
+    An unsharded job is the one-shard, one-replica case, so callers do not need
+    a separate code path for it.
+
+    Attributes:
+        handles: Shard name to its replica handles, in replica order.
+        agent_to_shard: Agent entry name to the shard hosting it. Empty when
+            unsharded, where every row goes to the only actor anyway.
+        placement_group: The STRICT_SPREAD group pinning shards to distinct
+            nodes, or None when unsharded.
+    """
+
+    handles: Dict[str, List[Any]]
+    agent_to_shard: Dict[str, str] = field(default_factory=dict)
+    placement_group: Any = None
+
+    @property
+    def is_sharded(self) -> bool:
+        return self.placement_group is not None
+
+    @property
+    def all_handles(self) -> List[Any]:
+        return [handle for replicas in self.handles.values() for handle in replicas]
+
+    def sole_handle(self) -> Any:
+        """The only actor, for callers that predate routing.
+
+        Raises:
+            ShardSetupError: There is more than one actor, so picking one would
+                silently drop the rest.
+        """
+        handles = self.all_handles
+        if len(handles) != 1:
+            raise ShardSetupError(
+                f"Expected a single NeMo-Gym actor but this set has "
+                f"{len(handles)} across shards {sorted(self.handles)}. The "
+                f"caller needs the shard-aware rollout router."
+            )
+        return handles[0]
+
+    def shutdown(self) -> None:
+        """Stop every actor, then release the bundles they were pinned to."""
+        shutdown_environments(
+            {
+                f"nemo_gym[{shard}][{replica}]": handle
+                for shard, replicas in self.handles.items()
+                for replica, handle in enumerate(replicas)
+            },
+            timeout=None,
+        )
+        if self.placement_group is not None:
+            try:
+                remove_placement_group(self.placement_group)
+            except Exception as error:
+                print(f"Failed to release the NeMo-Gym placement group: {error}")
+            self.placement_group = None
+
+
+def _shard_instances(plan: ShardPlan) -> List[tuple[ShardSpec, int]]:
+    """Expand shards into one (shard, replica_index) entry per actor."""
+    return [
+        (shard, replica) for shard in plan.shards for replica in range(shard.replicas)
+    ]
+
+
+def build_nemo_gym_actors(
+    env_configs: dict[str, Any],
+    *,
+    base_urls: list[str],
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+    pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
+    spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
+) -> NemoGymShardSet:
+    """Create and spin up every NeMo-Gym actor this job needs.
+
+    Without ``shards`` this makes exactly one actor, scheduled as before. With
+    ``shards`` it makes one actor per replica, each pinned by a STRICT_SPREAD
+    placement group to a distinct node, each holding its own complete Gym
+    stack. Actors are spun up concurrently, so the wall-clock cost is roughly
+    the slowest shard rather than the sum.
+
+    Args:
+        tokenizer: Installed on every actor once it is up, rather than passed
+            per rollout call. See ``NemoGym.set_tokenizer`` for why.
+
+    Returns:
+        A :class:`NemoGymShardSet` whose actors are all running and validated.
+
+    Raises:
+        ShardSetupError: The bundles could not be placed, a shard failed to
+            start, or the shards' entries did not pass the startup checks. Any
+            actors already created are torn down first.
+    """
+    nemo_gym_dict = dict(env_configs["nemo_gym"])
+    plan = parse_shard_plan(nemo_gym_dict)
+
+    if plan is None:
+        return _build_single_gym_actor(
+            nemo_gym_dict,
+            base_urls=base_urls,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            enable_router_replay=enable_router_replay,
+            use_fastokens=use_fastokens,
+        )
+
+    return _build_sharded_gym_actors(
+        nemo_gym_dict,
+        plan,
+        base_urls=base_urls,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+        pg_ready_timeout=pg_ready_timeout,
+        spinup_timeout=spinup_timeout,
+    )
+
+
+def _build_single_gym_actor(
+    nemo_gym_dict: dict[str, Any],
+    *,
+    base_urls: list[str],
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+) -> NemoGymShardSet:
+    """The pre-sharding path: one actor, no placement group, no discovery.
+
+    Discovery is skipped rather than merely unused. Its checks compare entry
+    names *between* shards, so with one shard there is nothing they could find.
+    """
+    actor_config = _build_gym_actor_config(
+        nemo_gym_dict,
+        base_urls=base_urls,
+        model_name=model_name,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+    )
+
+    actor_options: dict[str, Any] = {
+        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+    }
+    if nemo_gym_dict.get("num_gpu_nodes", 0):
+        actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(),
+            soft=True,
+        )
+
+    actor = NemoGym.options(**actor_options).remote(actor_config)
+    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
+    try:
+        ray.get(actor._spinup.remote())
+        ray.get(actor.set_tokenizer.remote(tokenizer))
+    except BaseException:
+        shard_set.shutdown()
+        raise
+    return shard_set
+
+
+def _build_sharded_gym_actors(
+    nemo_gym_dict: dict[str, Any],
+    plan: ShardPlan,
+    *,
+    base_urls: list[str],
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+    pg_ready_timeout: float,
+    spinup_timeout: float,
+) -> NemoGymShardSet:
+    instances = _shard_instances(plan)
+
+    # num_gpu_nodes normally pins the single actor to the driver node. Under
+    # sharding that is the opposite of what we want, so the placement group
+    # wins; num_gpu_nodes keeps its other job of sizing the allocation.
+    if nemo_gym_dict.get("num_gpu_nodes", 0):
+        print(
+            "env.nemo_gym.shards is set, so the num_gpu_nodes affinity hint is "
+            "superseded by STRICT_SPREAD placement across "
+            f"{len(instances)} nodes."
+        )
+
+    base_gym_dict = {
+        key: value
+        for key, value in nemo_gym_dict.items()
+        if key not in SHARDING_CONFIG_KEYS
+    }
+    # One merge per shard; replicas are identical stamps of it apart from the
+    # log directory, so they must not re-run the merge.
+    merged_by_shard = {
+        shard.name: apply_shard_overlay(base_gym_dict, plan, shard)
+        for shard in plan.shards
+    }
+
+    # This may create a temporary all-node placement group while materializing
+    # the actor venv. Finish it before the shard group reserves those CPUs.
+    actor_runtime_env = make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+
+    pg = placement_group(
+        bundles=[
+            {
+                "CPU": float(
+                    shard.actor_cpus
+                    if shard.actor_cpus is not None
+                    else DEFAULT_SHARD_CPUS
+                )
+            }
+            for shard, _ in instances
+        ],
+        strategy="STRICT_SPREAD",
+    )
+    try:
+        ray.get(pg.ready(), timeout=pg_ready_timeout)
+    except BaseException as error:
+        remove_placement_group(pg)
+        raise ShardSetupError(
+            f"Could not place {len(instances)} NeMo-Gym shard instances on "
+            f"distinct nodes within {pg_ready_timeout}s. STRICT_SPREAD needs "
+            f"one node per instance with the requested CPUs free; the "
+            f"allocation may be too small or its nodes too busy."
+        ) from error
+
+    shard_set = NemoGymShardSet(handles={}, placement_group=pg)
+    try:
+        for bundle_index, (shard, replica) in enumerate(instances):
+            instance_gym_dict = apply_shard_log_dir(
+                merged_by_shard[shard.name],
+                shard.name,
+                replica_index=replica if shard.replicas > 1 else None,
+            )
+            actor = NemoGym.options(
+                runtime_env=actor_runtime_env,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=bundle_index,
+                ),
+            ).remote(
+                _build_gym_actor_config(
+                    instance_gym_dict,
+                    base_urls=base_urls,
+                    model_name=model_name,
+                    enable_router_replay=enable_router_replay,
+                    use_fastokens=use_fastokens,
+                )
+            )
+            shard_set.handles.setdefault(shard.name, []).append(actor)
+
+        _spinup_shards_concurrently(shard_set, spinup_timeout, tokenizer=tokenizer)
+        shard_set.agent_to_shard = _discover_agent_shard_map(shard_set, plan)
+    except BaseException:
+        # A ray.get timeout does not cancel the actor-side work, so a
+        # half-started stack would keep running with nothing left to stop it.
+        shard_set.shutdown()
+        raise
+
+    print(f"NeMo-Gym shard map (agent -> shard): {shard_set.agent_to_shard}")
+    return shard_set
+
+
+def _spinup_shards_concurrently(
+    shard_set: NemoGymShardSet,
+    spinup_timeout: float,
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    """Start every shard at once, naming the shard behind any failure.
+
+    Config faults surface inside ``_spinup`` -- a server ref pointing at an
+    entry that is missing from *this* shard's slice raises Gym's
+    ``ServerRefNotFoundError`` there. Gym names the entry and field but has no
+    concept of a shard, so the shard name is added here.
+
+    The tokenizer install is a second pass rather than a call queued behind
+    each ``_spinup``. Queuing both up front would mean waiting on the install
+    to learn the spinup failed, which loses the message above.
+    """
+    instance_handles = [
+        (shard_name, replica, handle)
+        for shard_name, replicas in shard_set.handles.items()
+        for replica, handle in enumerate(replicas)
+    ]
+    deadline = monotonic() + spinup_timeout
+
+    pending = [
+        (shard_name, replica, handle._spinup.remote())
+        for shard_name, replica, handle in instance_handles
+    ]
+    for shard_name, replica, reference in pending:
+        try:
+            ray.get(reference, timeout=max(0.0, deadline - monotonic()))
+        except BaseException as error:
+            # A timed-out ray.get does not cancel actor work. Let every startup
+            # task leave RunHelper.start() before teardown, so shutdown can
+            # reap the subprocesses instead of killing their blocked owner.
+            for _, _, pending_reference in pending:
+                try:
+                    ray.get(pending_reference)
+                except BaseException:
+                    pass
+            raise ShardSetupError(
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) failed to "
+                f"start. A reference to an entry that is not in this shard's "
+                f"config_paths is the usual cause: {error}"
+            ) from error
+
+    installs = [
+        (shard_name, replica, handle.set_tokenizer.remote(tokenizer))
+        for shard_name, replica, handle in instance_handles
+    ]
+    for shard_name, replica, reference in installs:
+        try:
+            ray.get(reference, timeout=max(0.0, deadline - monotonic()))
+        except BaseException as error:
+            raise ShardSetupError(
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) did not "
+                f"accept the tokenizer: {error}"
+            ) from error
+
+
+def _discover_agent_shard_map(
+    shard_set: NemoGymShardSet, plan: ShardPlan
+) -> Dict[str, str]:
+    """Ask one replica per shard what it spawned, then validate across shards.
+
+    Replicas of a shard are stamped from one merge, so they host identical
+    entries and only the first needs to be asked.
+    """
+    entries_by_shard = {
+        shard.name: ray.get(shard_set.handles[shard.name][0].list_entries.remote())
+        for shard in plan.shards
+    }
+    return build_agent_shard_map(entries_by_shard, plan.allowed_duplicate_entries)
+
+
 def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
     *,
@@ -1133,7 +1533,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
 ) -> Any:
-    """Spin up the NeMo-Gym actor against the given generation server URLs.
+    """Spin up a single NeMo-Gym actor against the given generation server URLs.
 
     When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
     scheduled with soft NodeAffinity to the caller's Ray node so its colocated
@@ -1147,25 +1547,25 @@ def spinup_nemo_gym_actor(
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
+
+    Raises:
+        ShardConfigError: The config is sharded. Callers that dispatch to a
+            single handle cannot serve several shards; they need the router.
     """
-    nemo_gym_cfg = build_nemo_gym_config(
+    plan = parse_shard_plan(dict(env_configs["nemo_gym"]))
+    if plan is not None:
+        raise ShardConfigError(
+            f"env.nemo_gym.shards defines {len(plan.shards)} shards "
+            f"({', '.join(shard.name for shard in plan.shards)}), but this "
+            f"entrypoint dispatches rollouts to one actor handle. Shard-aware "
+            f"rollout routing is not wired up yet."
+        )
+
+    return build_nemo_gym_actors(
         env_configs,
         base_urls=base_urls,
         model_name=model_name,
+        tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
-    )
-
-    nemo_gym_opts: dict[str, Any] = {
-        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
-    }
-    if env_configs["nemo_gym"].get("num_gpu_nodes", 0):
-        nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-            node_id=ray.get_runtime_context().get_node_id(),
-            soft=True,
-        )
-
-    actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-    ray.get(actor._spinup.remote())
-    ray.get(actor.set_tokenizer.remote(tokenizer))
-    return actor
+    ).sole_handle()

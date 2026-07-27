@@ -20,9 +20,11 @@ from nemo_rl.environments.nemo_gym_shards import (
     GYM_LOG_DIR_KEY,
     ShardConfigError,
     ShardPlan,
+    ShardSetupError,
     ShardSpec,
     apply_shard_log_dir,
     apply_shard_overlay,
+    build_agent_shard_map,
     find_gym_config_entries,
     parse_shard_plan,
 )
@@ -385,6 +387,75 @@ def test_apply_shard_overlay_keeps_global_ports_by_default():
     )
 
     assert (merged["port_range_low"], merged["port_range_high"]) == (5000, 5999)
+
+
+def test_build_agent_shard_map_routes_each_agent_to_its_shard():
+    agent_to_shard = build_agent_shard_map(
+        {
+            "judged": {
+                "math_agent": ["responses_api_agents"],
+                "math_env": ["resources_servers"],
+            },
+            "tools": {
+                "bash_agent": ["responses_api_agents"],
+                "bash_tools": ["resources_servers"],
+            },
+        }
+    )
+
+    assert agent_to_shard == {"math_agent": "judged", "bash_agent": "tools"}
+
+
+def test_build_agent_shard_map_rejects_an_agent_in_two_shards():
+    """Rows naming the agent could go to either shard, so routing is undefined."""
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_agent_shard_map(
+            {
+                "judged": {"math_agent": ["responses_api_agents"]},
+                "tools": {"math_agent": ["responses_api_agents"]},
+            }
+        )
+
+
+def test_agents_are_never_allowlisted_for_duplication():
+    """The allowlist covers shared support entries, not routing ambiguity."""
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_agent_shard_map(
+            {
+                "a": {"math_agent": ["responses_api_agents"]},
+                "b": {"math_agent": ["responses_api_agents"]},
+            },
+            allowed_duplicate_entries={"math_agent"},
+        )
+
+
+def test_build_agent_shard_map_rejects_an_unlisted_duplicate_entry():
+    with pytest.raises(ShardSetupError, match="allowed_duplicate_entries"):
+        build_agent_shard_map(
+            {
+                "judged": {"shared_judge": ["responses_api_models"]},
+                "tools": {"shared_judge": ["responses_api_models"]},
+            }
+        )
+
+
+def test_build_agent_shard_map_allows_a_listed_duplicate_entry():
+    """Policy proxies are copied into every shard on purpose."""
+    agent_to_shard = build_agent_shard_map(
+        {
+            "judged": {
+                "math_agent": ["responses_api_agents"],
+                "policy_model": ["responses_api_models"],
+            },
+            "tools": {
+                "bash_agent": ["responses_api_agents"],
+                "policy_model": ["responses_api_models"],
+            },
+        },
+        allowed_duplicate_entries={"policy_model"},
+    )
+
+    assert agent_to_shard == {"math_agent": "judged", "bash_agent": "tools"}
 
 
 def test_apply_shard_log_dir_gives_each_shard_its_own_directory():
