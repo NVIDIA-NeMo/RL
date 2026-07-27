@@ -46,7 +46,11 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.environments.nemo_gym import (
+    DEFAULT_THINKING_TAGS,
+    NemoGymShardSet,
+    as_nemo_gym_shard_set,
+)
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -1969,6 +1973,123 @@ def _prepare_nemo_gym_rows(
         row["_rowidx"] = row_index
 
 
+def _bucket_nemo_gym_rows_by_shard(
+    rows: list[dict],
+    shard_set: NemoGymShardSet,
+    num_generations: int,
+) -> list[tuple[str, Any, list[dict]]]:
+    """Split already-stamped rows into one bucket per actor, by prompt group.
+
+    Bucketing is by group and never by row. A group split across shards would
+    deadlock any verifier that scores rollouts against their peers: those
+    buffer a whole group in one process and block until it is complete, so each
+    half would wait forever for rollouts sitting in the other.
+
+    Rows keep the global ``_rowidx`` stamped over the whole batch, so the
+    accumulator downstream never learns that shards exist.
+
+    Returns:
+        ``(shard_name, handle, rows)`` per actor that has work, in first-use
+        order. Actors with no rows are omitted rather than sent an empty batch.
+    """
+    buckets: dict[int, tuple[str, Any, list[dict]]] = {}
+    for start in range(0, len(rows), num_generations):
+        group = rows[start : start + num_generations]
+        agent_names = {row["agent_ref"]["name"] for row in group}
+        shard_names = {shard_set.shard_for_agent(name) for name in agent_names}
+        if len(shard_names) != 1:
+            raise ValueError(
+                f"NeMo-Gym prompt group at row {start} spans shards "
+                f"{sorted(shard_names)} via agents {sorted(agent_names)}. A "
+                f"group must be served by one shard."
+            )
+        handle = shard_set.pick_handle(next(iter(agent_names)))
+        if id(handle) not in buckets:
+            buckets[id(handle)] = (shard_names.pop(), handle, [])
+        buckets[id(handle)][2].extend(group)
+    return list(buckets.values())
+
+
+async def _merge_nemo_gym_shard_streams(
+    buckets: list[tuple[str, Any, list[dict]]],
+    tokenizer: TokenizerType,
+    timer_prefix: str,
+) -> AsyncGenerator[tuple[int, dict, dict | None, str], None]:
+    """Interleave K actor streams into one, yielding rows as they complete.
+
+    ``run_rollouts`` is a streaming generator, so there is nothing to gather:
+    this replaces one stream with a merge of K and hands the merged rows to the
+    accumulator that already exists. With a single bucket it degenerates to
+    that one stream, which is what keeps the unsharded path unchanged.
+
+    Yields:
+        ``(row_index, result, timing_metrics, shard_name)``. ``timing_metrics``
+        is non-None only on the last row of each shard's bucket.
+    """
+    iterators = {}
+    for shard_name, handle, rows in buckets:
+        stream = handle.run_rollouts.options(num_returns="streaming").remote(
+            rows, tokenizer, timer_prefix
+        )
+        iterators[stream.__aiter__()] = shard_name
+
+    pending = {
+        asyncio.ensure_future(anext(iterator)): iterator for iterator in iterators
+    }
+    try:
+        while pending:
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                iterator = pending.pop(task)
+                shard_name = iterators[iterator]
+                try:
+                    future = task.result()
+                except StopAsyncIteration:
+                    continue
+                except Exception as error:
+                    raise RuntimeError(
+                        f"NeMo-Gym shard '{shard_name}' failed during rollout "
+                        f"collection: {error}"
+                    ) from error
+                row_index, result, timing_metrics = await future
+                yield row_index, result, timing_metrics, shard_name
+                pending[asyncio.ensure_future(anext(iterator))] = iterator
+    finally:
+        # Leaving the merge early (an error downstream, or the consumer closing
+        # the generator) must not strand the anext tasks still in flight.
+        for task in pending:
+            task.cancel()
+
+
+def _merge_nemo_gym_timing_metrics(
+    timing_by_shard: dict[str, dict[str, Any]], timer_prefix: str
+) -> dict[str, Any]:
+    """Combine per-shard actor timings into per-shard plus rolled-up metrics.
+
+    Each shard reports the same key names, so the roll-up takes the maximum
+    rather than the sum: shards run concurrently and the step is gated by the
+    slowest one, not by their total. That also means the rolled-up
+    ``postprocess_results_pct`` is the worst shard's share rather than a
+    batch-wide average, which is the honest reading -- averaging percentages
+    over shards with different row counts would not mean anything.
+
+    With one shard this returns exactly what that shard reported, so the
+    unsharded path is unchanged.
+    """
+    if len(timing_by_shard) <= 1:
+        return dict(next(iter(timing_by_shard.values()), {}))
+
+    merged: dict[str, Any] = {}
+    for shard_name, metrics in timing_by_shard.items():
+        for key, value in metrics.items():
+            suffix = (
+                key[len(timer_prefix) + 1 :] if key.startswith(timer_prefix) else key
+            )
+            merged[f"{timer_prefix}/shard/{shard_name}/{suffix}"] = value
+            merged[key] = max(merged[key], value) if key in merged else value
+    return merged
+
+
 def _tensorize_nemo_gym_result(result: dict) -> None:
     """Convert token fields returned by the Gym actor back to tensors."""
     _tensorize_by_key(result["input_message_log"], "token_ids")
@@ -2106,13 +2227,15 @@ async def run_async_nemo_gym_rollout(
             allow_mixed_agents=returns_entire_batch,
         )
         final_rollout_result: NemoGymRolloutResult | None = None
-        actor_timing_metrics: dict[str, Any] = {}
-        nemo_gym_environment = task_to_env["nemo_gym"]
+        actor_timing_by_shard: dict[str, dict[str, Any]] = {}
+        shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
         with timer.time(run_rollouts_timer_label):
-            rollout_gen = nemo_gym_environment.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(nemo_gym_rows, tokenizer, timer_prefix)
-        rollout_iterator = rollout_gen.__aiter__()
+            buckets = _bucket_nemo_gym_rows_by_shard(
+                nemo_gym_rows, shard_set, num_generations
+            )
+            rollout_iterator = _merge_nemo_gym_shard_streams(
+                buckets, tokenizer, timer_prefix
+            )
 
     while True:
         stream_finished = False
@@ -2120,15 +2243,15 @@ async def run_async_nemo_gym_rollout(
         with timer.time(total_timer_label):
             with timer.time(run_rollouts_timer_label):
                 try:
-                    future = await anext(rollout_iterator)
+                    rowidx, result, timing_metrics, shard_name = await anext(
+                        rollout_iterator
+                    )
                 except StopAsyncIteration:
                     stream_finished = True
-                else:
-                    rowidx, result, timing_metrics = await future
 
             if not stream_finished:
                 if timing_metrics is not None:
-                    actor_timing_metrics = timing_metrics
+                    actor_timing_by_shard[shard_name] = timing_metrics
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
@@ -2166,7 +2289,9 @@ async def run_async_nemo_gym_rollout(
                 "NeMo-Gym completed without producing a final prompt group"
             )
 
-    final_rollout_result.rollout_metrics.update(actor_timing_metrics)
+    final_rollout_result.rollout_metrics.update(
+        _merge_nemo_gym_timing_metrics(actor_timing_by_shard, timer_prefix)
+    )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
     yield final_rollout_result
 
