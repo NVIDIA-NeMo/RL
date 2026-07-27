@@ -49,6 +49,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
     )
     ray_get = MagicMock(return_value={})
+    shutdown_environments = MagicMock()
 
     monkeypatch.setattr(
         run_grpo_single_controller,
@@ -89,6 +90,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         MagicMock(return_value=actor),
     )
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
+    monkeypatch.setattr(
+        run_grpo_single_controller,
+        "shutdown_environments",
+        shutdown_environments,
+    )
 
     return SimpleNamespace(
         actor_args=actor_args,
@@ -97,6 +103,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         configured_generation=configured_generation,
         generation_config=generation_config,
         ray_get=ray_get,
+        shutdown_environments=shutdown_environments,
     )
 
 
@@ -104,28 +111,18 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     main_context: SimpleNamespace,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    failing_env = SimpleNamespace(
-        shutdown=SimpleNamespace(remote=MagicMock(return_value="failing-env"))
-    )
-    healthy_env = SimpleNamespace(
-        shutdown=SimpleNamespace(remote=MagicMock(return_value="healthy-env"))
-    )
+    env_handles = {"nemo_gym": MagicMock()}
     generation = SimpleNamespace(
         shutdown=MagicMock(side_effect=RuntimeError("generation cleanup failed"))
     )
     trainer = SimpleNamespace(shutdown=MagicMock())
-    main_context.actor_args.env_handles = {
-        "failing": failing_env,
-        "healthy": healthy_env,
-    }
+    main_context.actor_args.env_handles = env_handles
     main_context.actor_args.gen_handle = generation
     main_context.actor_args.trainer_handle = trainer
 
     def get(ref: object) -> None:
         if ref == "run":
             raise RuntimeError("training failed")
-        if ref == "failing-env":
-            raise RuntimeError("env cleanup failed")
         return None
 
     main_context.ray_get.side_effect = get
@@ -133,11 +130,10 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     with pytest.raises(RuntimeError, match="training failed"):
         run_grpo_single_controller.main()
 
-    healthy_env.shutdown.remote.assert_called_once_with()
+    main_context.shutdown_environments.assert_called_once_with(env_handles)
     generation.shutdown.assert_called_once_with()
     trainer.shutdown.assert_called_once_with()
     output = capsys.readouterr().out
-    assert "Env 'failing' shutdown failed: env cleanup failed" in output
     assert "Generation shutdown failed: generation cleanup failed" in output
 
 
