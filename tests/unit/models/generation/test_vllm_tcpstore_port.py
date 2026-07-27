@@ -28,13 +28,15 @@ second node, so the whole class of failure is covered by the unit suite.
 
 import ast
 import logging
-import shutil
 import socket
 from pathlib import Path
 
 import pytest
 
 from nemo_rl.models.generation.vllm import patches
+from tests.unit.models.generation.vllm_patch_source_utils import (
+    write_unpatched_copy,
+)
 
 pytestmark = pytest.mark.vllm
 
@@ -101,11 +103,17 @@ def _load_select_tcpstore_port(source_path: Path):
 
 @pytest.fixture
 def pristine_source(tmp_path) -> Path:
-    """A copy of the installed vLLM ray_executor_v2.py, unpatched."""
-    installed = Path(patches._get_vllm_file(_VLLM_EXECUTOR_SOURCE))
-    copied = tmp_path / "ray_executor_v2.py"
-    shutil.copy(installed, copied)
-    return copied
+    """A copy of the installed vLLM ray_executor_v2.py, unpatched.
+
+    The installed copy may already carry the patch: the vLLM lane rewrites
+    site-packages in place as soon as any earlier test builds a generation
+    worker. Reversing it keeps this fixture honest whatever the test order.
+    """
+    return write_unpatched_copy(
+        _VLLM_EXECUTOR_SOURCE,
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        tmp_path / "ray_executor_v2.py",
+    )
 
 
 @pytest.fixture

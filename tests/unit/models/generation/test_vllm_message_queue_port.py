@@ -34,13 +34,15 @@ so it is covered without a GPU or a second node.
 import ast
 import logging
 import multiprocessing as mp
-import shutil
 import socket
 from pathlib import Path
 
 import pytest
 
 from nemo_rl.models.generation.vllm import patches
+from tests.unit.models.generation.vllm_patch_source_utils import (
+    write_unpatched_copy,
+)
 
 pytestmark = pytest.mark.vllm
 
@@ -133,21 +135,29 @@ def _race(message_queue_cls, racers: int = _RACERS) -> list[str]:
 
 @pytest.fixture
 def pristine_source(tmp_path) -> Path:
-    """A copy of the installed vLLM shm_broadcast.py, unpatched."""
-    installed = Path(patches._get_vllm_file(_VLLM_MQ_SOURCE))
-    copied = tmp_path / "pristine" / "shm_broadcast.py"
-    copied.parent.mkdir()
-    shutil.copy(installed, copied)
-    return copied
+    """A copy of the installed vLLM shm_broadcast.py, unpatched.
+
+    The installed copy may already carry the patch: the vLLM lane rewrites
+    site-packages in place as soon as any earlier test builds a generation
+    worker. Reversing it keeps this fixture honest whatever the test order --
+    without that, the unpatched racer never loses and its negative-control
+    test skips itself as "the race did not materialize".
+    """
+    return write_unpatched_copy(
+        _VLLM_MQ_SOURCE,
+        "_patch_vllm_shm_broadcast_bind_retry",
+        tmp_path / "pristine" / "shm_broadcast.py",
+    )
 
 
 @pytest.fixture
 def patched_source(tmp_path, monkeypatch) -> Path:
     """The same copy after the NeMo-RL MessageQueue bind patch is applied."""
-    installed = Path(patches._get_vllm_file(_VLLM_MQ_SOURCE))
-    copied = tmp_path / "patched" / "shm_broadcast.py"
-    copied.parent.mkdir()
-    shutil.copy(installed, copied)
+    copied = write_unpatched_copy(
+        _VLLM_MQ_SOURCE,
+        "_patch_vllm_shm_broadcast_bind_retry",
+        tmp_path / "patched" / "shm_broadcast.py",
+    )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_shm_broadcast_bind_retry(logging.getLogger(__name__))
     return copied
