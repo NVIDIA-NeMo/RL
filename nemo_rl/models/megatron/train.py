@@ -35,6 +35,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
+    NLLLossFn,
     SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
     prepare_loss_input,
@@ -456,6 +457,15 @@ class LossPostProcessor:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
         if prepacked_loss_mask is not None:
+            if (
+                type(self.loss_fn) is not NLLLossFn
+                or self.loss_fn.use_fused_linear_logprobs
+            ):
+                raise TypeError(
+                    "direct Megatron-LM prepacked SFT requires the standard "
+                    "NLLLossFn with use_fused_linear_logprobs=false because "
+                    "custom LossFunction implementations are not invoked"
+                )
             if global_valid_toks is None:
                 raise ValueError(
                     "global_valid_toks is required for direct packed model loss"

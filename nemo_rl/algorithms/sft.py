@@ -89,6 +89,45 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
 
 
+def _uses_direct_megatron_sft_packing(
+    dataset: Optional[AllTaskProcessedDataset],
+) -> bool:
+    if dataset is None:
+        return False
+    task_data_processors = dataset.task_data_processors
+    return (
+        isinstance(task_data_processors, dict)
+        and "megatron_sft_packed" in task_data_processors
+    )
+
+
+def _validate_direct_megatron_sft_setup(
+    master_config: MasterConfig,
+    train_dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset],
+    loss_fn: NLLLossFn,
+) -> None:
+    uses_direct_packing = _uses_direct_megatron_sft_packing(
+        train_dataset
+    ) or _uses_direct_megatron_sft_packing(val_dataset)
+    if not uses_direct_packing:
+        return
+
+    if master_config.sft.only_unmask_final:
+        raise ValueError(
+            "sft.only_unmask_final=true is not supported with direct "
+            "Megatron-LM prepacked SFT because its assistant-token loss masks "
+            "were materialized during offline packing. Set "
+            "sft.only_unmask_final=false or use the online SFT data path."
+        )
+
+    if type(loss_fn) is not NLLLossFn or loss_fn.use_fused_linear_logprobs:
+        raise TypeError(
+            "Direct Megatron-LM prepacked SFT requires the standard NLLLossFn "
+            "with use_fused_linear_logprobs=false."
+        )
+
+
 def _build_sft_collate_fn(
     policy_config: PolicyConfig,
     cluster_config: ClusterConfig,
@@ -137,6 +176,17 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+
+    loss_fn = NLLLossFn(
+        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
+    )
+    _validate_direct_megatron_sft_setup(
+        master_config,
+        train_dataset,
+        val_dataset,
+        loss_fn,
+    )
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -245,10 +295,6 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLossFn(
-        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
-    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
