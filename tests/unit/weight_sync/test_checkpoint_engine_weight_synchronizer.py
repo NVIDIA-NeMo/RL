@@ -172,6 +172,23 @@ class TestCheckpointEngineWeightSynchronizer:
         ]
         sync._ensure_checkpoint_engine_ready.assert_called_once_with()
 
+    def test_init_communicator_rejects_missing_prequant_metadata(self):
+        sync = _checkpoint_sync(MagicMock())
+        sync._ensure_checkpoint_engine_ready = MagicMock()
+        sync._policy.prepare_refit_info.return_value = {
+            "layer_0": {"shape": [4096, 4096]}
+        }
+        sync._generation.prepare_refit_info.return_value = ["layer_0"]
+        sync._policy.enable_refit_prequantize.return_value = None
+
+        with pytest.raises(
+            RuntimeError,
+            match="did not return updated metadata",
+        ):
+            sync.init_communicator()
+
+        sync._ensure_checkpoint_engine_ready.assert_not_called()
+
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_bucket_uses_minimum_total_memory_and_is_cached(self, mock_ray, capsys):
         config = _checkpoint_engine_cfg(bucket_memory_ratio=0.125)

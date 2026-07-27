@@ -14,6 +14,7 @@
 
 import math
 from datetime import datetime
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
+    maybe_enable_refit_prequantize,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
@@ -737,3 +739,64 @@ class TestPrintEfficiencySummary:
         assert result["efficiency/total_waste_s"] == 60.0
         assert result["efficiency/productive_time_s"] == 0.0
         assert result["efficiency/efficiency_pct"] == 0.0
+
+
+class TestMaybeEnableRefitPrequantize:
+    def test_returns_when_generation_does_not_request_prequantization(self):
+        policy = MagicMock()
+        generation = MagicMock()
+        generation.prepare_refit_info.return_value = None
+        state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+
+        maybe_enable_refit_prequantize(
+            policy,
+            generation,
+            state_dict_info,
+            {"megatron_cfg": {"enabled": True}},
+        )
+
+        generation.prepare_refit_info.assert_called_once_with(state_dict_info)
+        policy.enable_refit_prequantize.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "policy_config",
+        [{}, {"megatron_cfg": {"enabled": False}}],
+    )
+    def test_rejects_prequantization_without_megatron(self, policy_config):
+        policy = MagicMock()
+        generation = MagicMock()
+        generation.prepare_refit_info.return_value = ["model.weight"]
+
+        with pytest.raises(ValueError, match="requires the Megatron policy backend"):
+            maybe_enable_refit_prequantize(
+                policy,
+                generation,
+                {"model.weight": ((2, 2), torch.bfloat16)},
+                policy_config,
+            )
+
+        policy.enable_refit_prequantize.assert_not_called()
+
+    def test_refreshes_generation_metadata_after_prequantization(self):
+        policy = MagicMock()
+        generation = MagicMock()
+        state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+        updated_info = {
+            "model.weight": ((2, 2), torch.float8_e4m3fn),
+            "model.weight_scale_from_checkpoint": ((2, 1), torch.uint8),
+        }
+        generation.prepare_refit_info.side_effect = [["model.weight"], None]
+        policy.enable_refit_prequantize.return_value = updated_info
+
+        maybe_enable_refit_prequantize(
+            policy,
+            generation,
+            state_dict_info,
+            {"megatron_cfg": {"enabled": True}},
+        )
+
+        policy.enable_refit_prequantize.assert_called_once_with(["model.weight"])
+        assert generation.prepare_refit_info.call_args_list == [
+            call(state_dict_info),
+            call(updated_info),
+        ]

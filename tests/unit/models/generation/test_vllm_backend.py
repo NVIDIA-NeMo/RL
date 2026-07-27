@@ -120,6 +120,104 @@ def _make_mtp_refit_extension(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = object()
+    config = object()
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=config)
+    state_dict_info = {
+        "model.linear.weight": ((2, 2), torch.bfloat16),
+        "model.norm.weight": ((2,), torch.bfloat16),
+    }
+    is_fp8_model = MagicMock(return_value=True)
+    checked_names = []
+
+    def is_fp8_weight(name, candidate_model):
+        assert candidate_model is model
+        checked_names.append(name)
+        return name == "model.linear.weight"
+
+    monkeypatch.setattr(
+        fp8,
+        "global_fp8_config",
+        SimpleNamespace(is_mx=True, refit_prequantize=enabled),
+    )
+    monkeypatch.setattr(fp8, "is_fp8_model", is_fp8_model)
+    monkeypatch.setattr(fp8, "_is_fp8_weight", is_fp8_weight)
+
+    result = ext.prepare_refit_info(state_dict_info)
+
+    assert ext.state_dict_info is state_dict_info
+    if enabled:
+        assert result == ["model.linear.weight"]
+        is_fp8_model.assert_called_once_with(config)
+        assert checked_names == list(state_dict_info)
+    else:
+        assert result is None
+        is_fp8_model.assert_not_called()
+        assert checked_names == []
+
+
+@pytest.mark.vllm
+def test_sync_prepare_refit_info_unions_worker_names():
+    from nemo_rl.models.generation.vllm.vllm_worker import (
+        VllmGenerationWorkerImpl,
+    )
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    worker.llm = SimpleNamespace(
+        collective_rpc=MagicMock(
+            return_value=[
+                None,
+                ["model.b.weight", "model.a.weight"],
+                ["model.a.weight"],
+            ]
+        )
+    )
+
+    assert worker.prepare_refit_info(state_dict_info) == [
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    worker.llm.collective_rpc.assert_called_once_with(
+        "prepare_refit_info",
+        args=(state_dict_info,),
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_prepare_refit_info_unions_worker_names():
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(
+            return_value=[None, ["model.b.weight"], ["model.a.weight"]]
+        )
+    )
+
+    assert await worker.prepare_refit_info_async(state_dict_info) == [
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "prepare_refit_info",
+        args=(state_dict_info,),
+    )
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("with_mtp", [False, True])
 def test_update_weights_from_collective_processes_weights_after_loading(
     monkeypatch, with_mtp

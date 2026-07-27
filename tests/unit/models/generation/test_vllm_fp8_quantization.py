@@ -15,6 +15,7 @@
 import types
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.vllm
 
@@ -169,3 +170,64 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         for path in patched_paths
     )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
+
+def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
+    fp8_module, monkeypatch
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(is_mx=True)
+    native = torch.ones(2, 2, dtype=torch.bfloat16)
+    prequantized = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+    receiver_quantized = torch.full((2, 2), 2.0, dtype=torch.bfloat16)
+    receiver_fp8 = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+    receiver_scales = torch.tensor([[[0], [7]], [[3], [0]]], dtype=torch.uint8)
+    loaded = []
+
+    monkeypatch.setattr(
+        fp8,
+        "_is_fp8_weight",
+        lambda name, _model: name != "model.native",
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda tensor: (
+            (
+                receiver_fp8,
+                receiver_scales,
+            )
+            if tensor is receiver_quantized
+            else pytest.fail("unexpected receiver quantization input")
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "load_weights_maybe_cached",
+        lambda model, weights: loaded.extend(weights),
+    )
+    model = object()
+
+    fp8.load_weights(
+        [
+            ("model.native", native),
+            ("model.prequantized.weight", prequantized),
+            ("model.receiver.weight", receiver_quantized),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    assert loaded[0][0] == "model.native"
+    assert loaded[0][1] is native
+    assert loaded[1][0] == "model.prequantized.weight"
+    assert loaded[1][1] is prequantized
+    assert loaded[2][0] == "model.receiver.weight"
+    assert loaded[2][1] is receiver_fp8
+    assert loaded[3][0] == "model.receiver.weight_scale_from_checkpoint"
+    torch.testing.assert_close(
+        loaded[3][1],
+        torch.tensor([[1, 7], [3, 1]], dtype=torch.uint8),
+    )

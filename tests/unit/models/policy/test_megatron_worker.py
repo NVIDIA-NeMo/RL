@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -134,6 +135,220 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     assert exported[name].dtype == torch.float8_e4m3fn
     assert exported[scale_name].dtype == torch.uint8
     assert exported[scale_name].shape == (64, 2)
+
+
+def test_reference_model_pinned_swap_restores_state_and_reuses_buffer(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+            self.register_buffer("extra_state_cache", torch.tensor([2.0]))
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = Model()
+    worker.reference_state_dict = {
+        "weight": torch.tensor([11.0]),
+        "extra_state_cache": torch.tensor([12.0]),
+    }
+    worker.cfg = {
+        "megatron_cfg": {
+            "pinned_reference_swap": True,
+            "empty_unused_memory_level": 0,
+        }
+    }
+    worker._pinned_swap_save_buffers = {}
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    allocations = []
+    original_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        allocations.append(kwargs)
+        kwargs = {**kwargs, "pin_memory": False}
+        return original_empty(*args, **kwargs)
+
+    synchronize = MagicMock()
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
+    cached_buffer = None
+    for _ in range(2):
+        with worker.use_reference_model():
+            torch.testing.assert_close(worker.model.weight, torch.tensor([11.0]))
+            torch.testing.assert_close(
+                worker.model.extra_state_cache, torch.tensor([12.0])
+            )
+        torch.testing.assert_close(worker.model.weight, torch.tensor([1.0]))
+        torch.testing.assert_close(worker.model.extra_state_cache, torch.tensor([2.0]))
+        if cached_buffer is None:
+            cached_buffer = worker._pinned_swap_save_buffers["weight"]
+        else:
+            assert worker._pinned_swap_save_buffers["weight"] is cached_buffer
+
+    assert list(worker._pinned_swap_save_buffers) == ["weight"]
+    assert allocations == [
+        {
+            "dtype": torch.float32,
+            "device": "cpu",
+            "pin_memory": True,
+        }
+    ]
+    assert synchronize.call_count == 6
+
+
+def test_clear_rope_and_moe_dispatcher_caches_clears_tensor_state(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    cache_clear = MagicMock()
+
+    def forward():
+        return None
+
+    forward.cache_clear = cache_clear
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    dispatcher = SimpleNamespace(
+        probs=torch.ones(1),
+        routing_map=torch.ones(1),
+        reversed_local_input_permutation_mapping=torch.ones(1),
+        local_probs=torch.ones(1),
+        local_map=torch.ones(1),
+        non_tensor="keep",
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(
+        modules=lambda: [
+            SimpleNamespace(),
+            SimpleNamespace(token_dispatcher=None),
+            SimpleNamespace(token_dispatcher=dispatcher),
+        ]
+    )
+
+    worker._clear_rope_and_moe_dispatcher_caches()
+
+    cache_clear.assert_called_once_with()
+    assert dispatcher.probs is None
+    assert dispatcher.routing_map is None
+    assert dispatcher.reversed_local_input_permutation_mapping is None
+    assert dispatcher.local_probs is None
+    assert dispatcher.local_map is None
+    assert dispatcher.non_tensor == "keep"
+
+
+def test_clear_rope_and_moe_dispatcher_caches_is_best_effort(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    def forward():
+        return None
+
+    forward.cache_clear = MagicMock(side_effect=RuntimeError("rotary cache"))
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(
+        modules=MagicMock(side_effect=RuntimeError("module traversal"))
+    )
+
+    worker._clear_rope_and_moe_dispatcher_caches()
+
+
+@pytest.mark.parametrize(
+    ("selected", "dtype"),
+    [(False, torch.bfloat16), (True, torch.float8_e4m3fn)],
+)
+def test_maybe_prequantize_param_passthrough(selected, dtype):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name} if selected else set()
+    tensor = torch.ones(2, 2, dtype=dtype)
+
+    result = list(worker._maybe_prequantize_param(name, tensor))
+
+    assert len(result) == 1
+    assert result[0][0] == name
+    assert result[0][1] is tensor
+
+
+@pytest.mark.parametrize("slim", [False, True])
+def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = SimpleNamespace(eval=MagicMock())
+    worker.model = model
+    worker.move_model = MagicMock(return_value=model)
+    worker.cfg = {
+        "megatron_cfg": {
+            "refit_slim_offload_after": slim,
+            "clear_memory_caches_before_refit": True,
+        }
+    }
+    worker.fp8_cfg = {"force_clear_fp8_caches": True}
+    worker._clear_fp8_caches = MagicMock()
+    worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.move_optimizer = MagicMock()
+    worker.offload_before_refit = MagicMock()
+    collect = MagicMock()
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        torch,
+        "randn",
+        lambda *_args, **_kwargs: SimpleNamespace(cuda=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.gc.collect",
+        collect,
+    )
+
+    worker.offload_after_refit()
+
+    worker.move_model.assert_called_once_with(model, "cpu")
+    model.eval.assert_called_once_with()
+    if slim:
+        worker._clear_fp8_caches.assert_called_once_with()
+        worker._clear_rope_and_moe_dispatcher_caches.assert_called_once_with()
+        worker.move_optimizer.assert_called_once_with("cpu")
+        collect.assert_called_once_with()
+        empty_cache.assert_called_once_with()
+        worker.offload_before_refit.assert_not_called()
+    else:
+        worker.offload_before_refit.assert_called_once_with()
+        worker._clear_fp8_caches.assert_not_called()
+        worker._clear_rope_and_moe_dispatcher_caches.assert_not_called()
+        worker.move_optimizer.assert_not_called()
+        collect.assert_not_called()
+        empty_cache.assert_not_called()
 
 
 def test_megatron_prepare_for_training_restores_optimizer():
