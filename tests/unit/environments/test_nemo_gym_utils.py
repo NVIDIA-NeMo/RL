@@ -633,6 +633,35 @@ def test_spinup_nemo_gym_actor_rejects_a_sharded_config(detected_uv_dirs):
         )
 
 
+def test_a_bare_actor_handle_reads_as_a_one_shard_set():
+    """Call sites that predate sharding keep working without building a set."""
+    handle = MagicMock()
+
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+
+    assert shard_set.all_handles == [handle]
+    assert not shard_set.is_sharded
+    # No map was discovered because nothing could have conflicted, so every
+    # agent resolves to the only actor there is.
+    assert shard_set.pick_handle("any-agent") is handle
+    assert shard_set.hosted_agents == frozenset()
+
+
+def test_an_existing_shard_set_is_passed_through_untouched():
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"a": [MagicMock()]})
+
+    assert nemo_gym_mod.as_nemo_gym_shard_set(shard_set) is shard_set
+
+
+def test_shard_name_of_identifies_a_replica_for_error_messages():
+    first, second = MagicMock(), MagicMock()
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [first, second]})
+
+    assert shard_set.shard_name_of(second) == "tools"
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="does not belong"):
+        shard_set.shard_name_of(MagicMock())
+
+
 def test_sole_handle_refuses_to_pick_one_of_many():
     shard_set = nemo_gym_mod.NemoGymShardSet(
         handles={"a": [MagicMock()], "b": [MagicMock()]}
