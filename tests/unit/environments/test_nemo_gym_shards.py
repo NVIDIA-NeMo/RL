@@ -17,9 +17,11 @@ import pytest
 from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym_shards import (
+    GYM_LOG_DIR_KEY,
     ShardConfigError,
     ShardPlan,
     ShardSpec,
+    apply_shard_log_dir,
     apply_shard_overlay,
     find_gym_config_entries,
     parse_shard_plan,
@@ -190,6 +192,43 @@ def test_apply_shard_overlay_keeps_global_ports_by_default():
     )
 
     assert (merged["port_range_low"], merged["port_range_high"]) == (5000, 5999)
+
+
+def test_apply_shard_log_dir_gives_each_shard_its_own_directory():
+    config = {GYM_LOG_DIR_KEY: "/logs/gym", "default_host": "10.0.0.1"}
+
+    judged = apply_shard_log_dir(config, "judged")
+    tools = apply_shard_log_dir(config, "tools")
+
+    assert judged[GYM_LOG_DIR_KEY] == "/logs/gym/judged"
+    assert tools[GYM_LOG_DIR_KEY] == "/logs/gym/tools"
+    # Unrelated settings survive, and the input is not mutated.
+    assert judged["default_host"] == "10.0.0.1"
+    assert config[GYM_LOG_DIR_KEY] == "/logs/gym"
+
+
+def test_apply_shard_log_dir_separates_replicas():
+    """Replicas are stamped from one merge, so they host identical server names."""
+    config = {GYM_LOG_DIR_KEY: "/logs/gym"}
+
+    first = apply_shard_log_dir(config, "tools", replica_index=0)
+    second = apply_shard_log_dir(config, "tools", replica_index=1)
+
+    assert first[GYM_LOG_DIR_KEY] == "/logs/gym/tools/0"
+    assert second[GYM_LOG_DIR_KEY] == "/logs/gym/tools/1"
+
+
+def test_apply_shard_log_dir_is_a_noop_without_a_configured_log_dir():
+    """Gym only writes log files when the key is set, which is not the default."""
+    assert apply_shard_log_dir({"default_host": "10.0.0.1"}, "judged") == {
+        "default_host": "10.0.0.1"
+    }
+
+
+def test_apply_shard_log_dir_sanitizes_the_shard_name():
+    config = apply_shard_log_dir({GYM_LOG_DIR_KEY: "/logs"}, "team/judged")
+
+    assert config[GYM_LOG_DIR_KEY] == "/logs/team_judged"
 
 
 def test_find_gym_config_entries_ignores_scalars_and_known_keys():
