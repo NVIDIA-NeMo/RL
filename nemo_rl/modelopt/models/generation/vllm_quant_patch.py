@@ -84,9 +84,17 @@ def _drop_nonclass_quant_registry_keys() -> None:
 
     from modelopt.torch.quantization.nn import QuantModuleRegistry
 
-    for key in list(QuantModuleRegistry._registry):
-        if not inspect.isclass(key):
-            QuantModuleRegistry.unregister(key)
+    dropped = [key for key in QuantModuleRegistry._registry if not inspect.isclass(key)]
+    if dropped:
+        # Record what was purged. Today this is only vllm_FusedMoE, whose key
+        # became a factory function in 0.25 and which is re-registered against
+        # RoutedExperts below. If vLLM turns another layer class into a factory,
+        # this loop would silently drop that quantization too -- e.g. a
+        # RowParallelLinear factory would leave the fakequant model quantizing
+        # MoE and nothing else, with no error anywhere.
+        print(f"Dropping non-class QuantModuleRegistry keys: {dropped}")
+    for key in dropped:
+        QuantModuleRegistry.unregister(key)
 
 
 def _register_routed_experts_quant_module() -> None:
