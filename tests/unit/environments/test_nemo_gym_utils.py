@@ -349,3 +349,312 @@ def test_list_entries_before_spinup_raises():
 
     with pytest.raises(RuntimeError, match="call _spinup"):
         actor.list_entries()
+
+
+class _FakeGymCluster:
+    """Stands in for Ray while the factory creates, starts and queries actors.
+
+    Each actor returns tagged sentinels from ``.remote()`` so ``ray.get`` can
+    tell spinups from entry queries and fail whichever the test asks it to.
+    """
+
+    def __init__(
+        self, *, entries_by_index=None, spinup_failures=None, pg_ready_error=None
+    ):
+        self.entries_by_index = entries_by_index or {}
+        self.spinup_failures = spinup_failures or {}
+        self.pg_ready_error = pg_ready_error
+        self.actors = []
+        self.actor_options = []
+        self.actor_configs = []
+        self.removed_placement_groups = []
+        self.placement_group_calls = []
+        self.placement_group = MagicMock(name="placement_group")
+        self.placement_group.ready.return_value = "pg-ready"
+
+    def make_placement_group(self, **kwargs):
+        self.placement_group_calls.append(kwargs)
+        return self.placement_group
+
+    def remove_placement_group(self, pg):
+        self.removed_placement_groups.append(pg)
+
+    def make_actor_class(self):
+        actor_class = MagicMock(name="NemoGym")
+
+        def options(**option_kwargs):
+            holder = MagicMock()
+
+            def remote(config):
+                index = len(self.actors)
+                actor = MagicMock(name=f"gym-actor-{index}")
+                actor._spinup.remote.return_value = ("spinup", index)
+                actor.list_entries.remote.return_value = ("entries", index)
+                self.actors.append(actor)
+                self.actor_options.append(option_kwargs)
+                self.actor_configs.append(config)
+                return actor
+
+            holder.remote = remote
+            return holder
+
+        actor_class.options = options
+        return actor_class
+
+    def ray_get(self, reference, timeout=None):
+        if reference == "pg-ready":
+            if self.pg_ready_error is not None:
+                raise self.pg_ready_error
+            return None
+        kind, index = reference
+        if kind == "spinup":
+            failure = self.spinup_failures.get(index)
+            if failure is not None:
+                raise failure
+            return None
+        return self.entries_by_index.get(index, {})
+
+
+@contextmanager
+def _patched_cluster(cluster):
+    with (
+        patch.object(nemo_gym_mod, "NemoGym", cluster.make_actor_class()),
+        patch.object(
+            nemo_gym_mod, "make_actor_runtime_env", return_value={"py_executable": "p"}
+        ),
+        patch.object(
+            nemo_gym_mod, "placement_group", side_effect=cluster.make_placement_group
+        ),
+        patch.object(
+            nemo_gym_mod,
+            "remove_placement_group",
+            side_effect=cluster.remove_placement_group,
+        ),
+        patch.object(nemo_gym_mod, "shutdown_environments") as shutdown,
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_ray.get.side_effect = cluster.ray_get
+        mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
+        cluster.shutdown_environments = shutdown
+        yield cluster
+
+
+def _shard_env_configs(**overrides):
+    nemo_gym = {
+        "num_gpu_nodes": 1,
+        "shards": [
+            {"name": "judged", "config_paths": ["judge.yaml"]},
+            {"name": "tools", "config_paths": ["tools.yaml"], "replicas": 2},
+        ],
+        "allowed_duplicate_entries": ["policy_model"],
+        "nemo_gym_log_dir": "/logs/gym",
+    }
+    nemo_gym.update(overrides)
+    return {"nemo_gym": nemo_gym}
+
+
+def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dirs):
+    """The pre-sharding path must stay identical: one actor, no placement group."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+        )
+
+    assert not shard_set.is_sharded
+    assert shard_set.sole_handle() is cluster.actors[0]
+    assert cluster.placement_group_calls == []
+    # Node affinity still applies when the actor has colocated GPUs.
+    assert isinstance(
+        cluster.actor_options[0]["scheduling_strategy"],
+        nemo_gym_mod.NodeAffinitySchedulingStrategy,
+    )
+
+
+def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
+    detected_uv_dirs,
+):
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {"math_agent": ["responses_api_agents"]},
+            1: {"bash_agent": ["responses_api_agents"]},
+        }
+    )
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+        )
+
+    # Two shards, one with replicas: 2, so three actors on three nodes.
+    assert len(cluster.actors) == 3
+    assert [len(replicas) for replicas in shard_set.handles.values()] == [1, 2]
+
+    (pg_kwargs,) = cluster.placement_group_calls
+    assert pg_kwargs["strategy"] == "STRICT_SPREAD"
+    assert pg_kwargs["bundles"] == [
+        {"CPU": float(nemo_gym_mod.DEFAULT_SHARD_CPUS)} for _ in range(3)
+    ]
+
+    # Each actor is pinned to its own bundle.
+    bundle_indices = [
+        options["scheduling_strategy"].placement_group_bundle_index
+        for options in cluster.actor_options
+    ]
+    assert bundle_indices == [0, 1, 2]
+    assert shard_set.agent_to_shard == {"math_agent": "judged", "bash_agent": "tools"}
+
+
+def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+        )
+
+    gym_configs = [
+        config["initial_global_config_dict"] for config in cluster.actor_configs
+    ]
+    assert [config["config_paths"] for config in gym_configs] == [
+        ["judge.yaml"],
+        ["tools.yaml"],
+        ["tools.yaml"],
+    ]
+    # A single-replica shard needs no replica component; replicas of one shard
+    # must not share a directory, since they spawn identical server names.
+    assert [config["nemo_gym_log_dir"] for config in gym_configs] == [
+        "/logs/gym/judged",
+        "/logs/gym/tools/0",
+        "/logs/gym/tools/1",
+    ]
+    # NeMo-RL-only keys must never reach Gym.
+    for config in gym_configs:
+        assert "shards" not in config
+        assert "allowed_duplicate_entries" not in config
+
+
+def test_actor_cpus_override_sizes_that_shards_bundle(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+    env_configs = _shard_env_configs(
+        shards=[
+            {"name": "code_gen", "config_paths": ["code.yaml"], "actor_cpus": 64},
+            {"name": "tools", "config_paths": ["tools.yaml"]},
+        ]
+    )
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            env_configs, base_urls=["http://vllm-0"], model_name="test-model"
+        )
+
+    (pg_kwargs,) = cluster.placement_group_calls
+    assert pg_kwargs["bundles"] == [
+        {"CPU": 64.0},
+        {"CPU": float(nemo_gym_mod.DEFAULT_SHARD_CPUS)},
+    ]
+
+
+def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
+    detected_uv_dirs,
+):
+    """A ray.get timeout does not stop the actor, so cleanup must be explicit."""
+    cluster = _FakeGymCluster(
+        spinup_failures={1: RuntimeError("ServerRefNotFoundError: judge_model")}
+    )
+
+    with _patched_cluster(cluster):
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError, match="shard 'tools' \\(replica 0\\)"
+        ) as excinfo:
+            nemo_gym_mod.build_nemo_gym_actors(
+                _shard_env_configs(),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+            )
+
+    # Gym names the offending entry; we add the shard it belongs to.
+    assert "ServerRefNotFoundError" in str(excinfo.value)
+    cluster.shutdown_environments.assert_called_once()
+    torn_down = cluster.shutdown_environments.call_args.args[0]
+    assert len(torn_down) == 3
+    assert cluster.removed_placement_groups == [cluster.placement_group]
+
+
+def test_unplaceable_bundles_fail_fast_and_release_the_group(detected_uv_dirs):
+    cluster = _FakeGymCluster(pg_ready_error=TimeoutError("no nodes"))
+
+    with _patched_cluster(cluster):
+        with pytest.raises(nemo_gym_mod.ShardSetupError, match="distinct nodes"):
+            nemo_gym_mod.build_nemo_gym_actors(
+                _shard_env_configs(),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+            )
+
+    assert cluster.actors == []
+    assert cluster.removed_placement_groups == [cluster.placement_group]
+
+
+def test_duplicate_agent_across_shards_tears_the_set_down(detected_uv_dirs):
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {"math_agent": ["responses_api_agents"]},
+            1: {"math_agent": ["responses_api_agents"]},
+        }
+    )
+
+    with _patched_cluster(cluster):
+        with pytest.raises(nemo_gym_mod.ShardSetupError, match="hosted by both shard"):
+            nemo_gym_mod.build_nemo_gym_actors(
+                _shard_env_configs(),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+            )
+
+    cluster.shutdown_environments.assert_called_once()
+    assert cluster.removed_placement_groups == [cluster.placement_group]
+
+
+def test_spinup_nemo_gym_actor_rejects_a_sharded_config(detected_uv_dirs):
+    """Single-handle callers cannot serve several shards; say so up front."""
+    with pytest.raises(nemo_gym_mod.ShardConfigError, match="not wired up yet"):
+        spinup_nemo_gym_actor(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+        )
+
+
+def test_sole_handle_refuses_to_pick_one_of_many():
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"a": [MagicMock()], "b": [MagicMock()]}
+    )
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="2 across shards"):
+        shard_set.sole_handle()
+
+
+def test_shard_set_shutdown_releases_the_placement_group_once():
+    pg = MagicMock()
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"tools": [MagicMock(), MagicMock()]}, placement_group=pg
+    )
+
+    with (
+        patch.object(nemo_gym_mod, "shutdown_environments") as shutdown,
+        patch.object(nemo_gym_mod, "remove_placement_group") as remove,
+    ):
+        shard_set.shutdown()
+        shard_set.shutdown()
+
+    assert shutdown.call_count == 2
+    # Releasing a group twice raises; the second shutdown must not try.
+    remove.assert_called_once_with(pg)
