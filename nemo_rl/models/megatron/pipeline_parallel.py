@@ -14,7 +14,7 @@
 
 """Pipeline parallel utilities for Megatron models."""
 
-from typing import Any, Optional, TypeVar, cast
+from typing import Any, Optional, TypeAlias, TypeVar, cast
 
 import torch
 from megatron.core.parallel_state import (
@@ -29,6 +29,7 @@ LossMetricPayloadT = TypeVar(
     dict[str, Any],
     list[dict[str, Any]],
 )
+LossMetricPayload: TypeAlias = dict[str, Any] | list[dict[str, Any]]
 
 
 def broadcast_obj_from_pp_rank(obj: Any) -> Any:
@@ -83,8 +84,8 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
 
 
 def _materialize_loss_metrics_for_object_broadcast(
-    loss_metrics: LossMetricPayloadT,
-) -> LossMetricPayloadT:
+    loss_metrics: LossMetricPayload,
+) -> LossMetricPayload:
     """Convert tensor metrics to host values before object transport."""
     if isinstance(loss_metrics, dict):
         is_flat_dict = True
@@ -118,8 +119,8 @@ def _materialize_loss_metrics_for_object_broadcast(
             materialized[metric_index][key] = host_value
 
     if is_flat_dict:
-        return cast(LossMetricPayloadT, materialized[0])
-    return cast(LossMetricPayloadT, materialized)
+        return materialized[0]
+    return materialized
 
 
 def broadcast_loss_metrics_from_last_stage(
@@ -147,7 +148,10 @@ def broadcast_loss_metrics_from_last_stage(
     if is_pipeline_last_stage(ignore_virtual=True):
         if loss_metrics is None:
             raise ValueError("Last PP stage must provide loss metrics.")
-        host_metrics = _materialize_loss_metrics_for_object_broadcast(loss_metrics)
+        host_metrics = cast(
+            LossMetricPayloadT,
+            _materialize_loss_metrics_for_object_broadcast(loss_metrics),
+        )
         metrics_to_broadcast = [host_metrics]
         torch.distributed.broadcast_object_list(
             metrics_to_broadcast,
