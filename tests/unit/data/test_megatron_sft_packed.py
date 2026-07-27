@@ -336,6 +336,48 @@ def test_nemotron_preprocessor_masks_prompt_and_assistant_prefix() -> None:
     )
 
 
+def test_nemotron_preprocessor_masks_tool_output_before_assistant_response() -> None:
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "tool", "content": "tool-output"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    tokenizer = _DummyTokenizer(
+        {
+            ("system", "s"): [10],
+            ("user", "u"): [20],
+            ("tool", "tool-output"): [25],
+            ("assistant", "answer"): [30, 31, 32, 33],
+        }
+    )
+
+    processed = _preprocess(
+        messages,
+        tokenizer,
+        max_seq_length=10,
+        prompt_format="nemotron-nano-v2",
+    )
+
+    assert torch.equal(
+        processed["target_ids"],
+        torch.tensor(
+            [
+                IGNORE_INDEX,
+                IGNORE_INDEX,
+                IGNORE_INDEX,
+                IGNORE_INDEX,
+                IGNORE_INDEX,
+                33,
+                2,
+                99,
+                99,
+                99,
+            ]
+        ),
+    )
+
+
 def test_nemotron_preprocessor_masks_unsupervised_tokens_from_loss() -> None:
     messages = [
         {"role": "system", "content": "s"},

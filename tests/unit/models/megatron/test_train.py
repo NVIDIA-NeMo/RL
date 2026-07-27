@@ -217,7 +217,7 @@ class TestModelForward:
             model.call_args.kwargs["loss_mask"] is loss_mask,
         ) == (True, True)
 
-    def test_direct_labels_take_precedence_over_fused_linear_logprobs(self):
+    def test_direct_labels_reject_fused_linear_logprobs(self):
         from nemo_rl.models.megatron.train import model_forward
 
         model = MagicMock(return_value=torch.ones(1, 4))
@@ -226,19 +226,20 @@ class TestModelForward:
         labels = torch.tensor([[2, 3, 4, -100]])
         loss_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
 
-        model_forward(
-            model=model,
-            data_dict=data,
-            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
-            position_ids=torch.tensor([[0, 1, 2, 3]]),
-            attention_mask=None,
-            labels_cp_sharded=labels,
-            loss_mask_cp_sharded=loss_mask,
-            use_fused_linear_logprobs=True,
-        )
-
-        assert model.call_args.kwargs["labels"] is labels
-        assert "return_logprobs_for_linear_ce_fusion" not in model.call_args.kwargs
+        with pytest.raises(
+            ValueError,
+            match="Direct packed SFT labels do not support fused linear logprobs",
+        ):
+            model_forward(
+                model=model,
+                data_dict=data,
+                input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+                position_ids=torch.tensor([[0, 1, 2, 3]]),
+                attention_mask=None,
+                labels_cp_sharded=labels,
+                loss_mask_cp_sharded=loss_mask,
+                use_fused_linear_logprobs=True,
+            )
 
     def test_mtp_mask_remains_compatible_with_fused_linear_logprobs(self):
         from nemo_rl.models.megatron.train import model_forward
@@ -1036,13 +1037,11 @@ def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling
     assert torch.isclose(loss, torch.tensor(4.0 / 3.0))
 
 
-def test_direct_model_loss_reports_unscaled_loss_and_target_token_count():
+def test_direct_model_loss_reports_unscaled_loss_without_cp_local_token_count():
     _, metrics, _ = _run_direct_model_loss()
 
-    assert {
-        "loss": metrics["loss"].item(),
-        "num_unmasked_tokens": metrics["num_unmasked_tokens"].item(),
-    } == pytest.approx({"loss": 2.0 / 3.0, "num_unmasked_tokens": 2.0})
+    assert metrics["loss"].item() == pytest.approx(2.0 / 3.0)
+    assert "num_unmasked_tokens" not in metrics
 
 
 def test_direct_model_loss_bypasses_online_logit_loss_function():
