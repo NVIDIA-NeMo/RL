@@ -17,6 +17,7 @@ from typing import cast
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.trtllm import TrtllmConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
@@ -81,5 +82,8 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
+
+    elif config["backend"] == "trtllm":
+        config = cast(TrtllmConfig, config)
 
     return config

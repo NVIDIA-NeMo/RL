@@ -511,6 +511,12 @@ class AsyncTrajectoryCollector:
             is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
                 "async_engine", False
             )
+        elif backend == "trtllm":
+            assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
+                "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+                "synchronous engine path (async_engine=false) is no longer supported."
+            )
+            is_async_engine = True
         else:
             is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(

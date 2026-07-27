@@ -39,7 +39,7 @@ def create_weight_synchronizer(
     colocated: bool,
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
-    refit_buffer_size_gb: Optional[int] = None,
+    refit_buffer_size_gb: Optional[float | int] = None,
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
