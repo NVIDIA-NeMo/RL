@@ -52,8 +52,10 @@ def configure_generation_config(
                 raise ValueError(
                     "generation.real_quant_export_cpu_offload must be a boolean"
                 )
+            colocated = config.get("colocated")
             if not export_cpu_offload and (
-                not config["colocated"]["enabled"]
+                colocated is None
+                or not colocated["enabled"]
                 or config.get("refit_transport") is not None
             ):
                 raise ValueError(

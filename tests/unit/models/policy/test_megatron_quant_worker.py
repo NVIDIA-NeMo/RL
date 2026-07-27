@@ -31,6 +31,8 @@ from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.test_utils import SimpleLossFn
 
+pytestmark = pytest.mark.mcore
+
 _MODELOPT_AVAILABLE = False
 try:
     import modelopt.torch.quantization as mtq  # noqa: F401
