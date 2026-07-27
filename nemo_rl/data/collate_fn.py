@@ -42,31 +42,8 @@ _MEGATRON_SFT_PACKED_REQUIRED_FIELDS = _MEGATRON_SFT_PACKED_FIELDS | {
 }
 
 
-def _maybe_reorder_megatron_sft_dp_stride_batch(
-    data_batch: list[DatumSpec], dp_size: int | None
-) -> list[DatumSpec]:
-    if dp_size is None or dp_size <= 1 or not data_batch:
-        return data_batch
-
-    total_batch_size = len(data_batch)
-    if total_batch_size % dp_size != 0:
-        raise ValueError(
-            "Cannot apply Megatron SFT DP-strided order in collate: batch size "
-            f"{total_batch_size} is not divisible by DP size {dp_size}"
-        )
-
-    per_dp_batch_size = total_batch_size // dp_size
-    order = [
-        microbatch_idx * dp_size + dp_rank
-        for dp_rank in range(dp_size)
-        for microbatch_idx in range(per_dp_batch_size)
-    ]
-    return [data_batch[index] for index in order]
-
-
 def _collate_megatron_sft_packed(
     data_batch: list[DatumSpec],
-    megatron_sft_dp_stride_size: int | None,
     megatron_sft_context_parallel_size: int | None,
 ) -> BatchedDataDict[Any] | None:
     packed_fields_by_row = [
@@ -179,10 +156,7 @@ def _collate_megatron_sft_packed(
                 )
 
     packed_data_batch = [
-        cast(MegatronSFTPackedDatumSpec, datum_spec)
-        for datum_spec in _maybe_reorder_megatron_sft_dp_stride_batch(
-            data_batch, megatron_sft_dp_stride_size
-        )
+        cast(MegatronSFTPackedDatumSpec, datum_spec) for datum_spec in data_batch
     ]
     max_cu_seqlens_length = max(
         len(datum_spec["packed_cu_seqlens"]) for datum_spec in packed_data_batch
@@ -236,13 +210,11 @@ def _collate_megatron_sft_packed(
 
 def rl_collate_fn(
     data_batch: list[DatumSpec],
-    megatron_sft_dp_stride_size: int | None = None,
     megatron_sft_context_parallel_size: int | None = None,
 ) -> BatchedDataDict[Any]:
     """Collate function for RL training."""
     packed_batch = _collate_megatron_sft_packed(
         data_batch,
-        megatron_sft_dp_stride_size,
         megatron_sft_context_parallel_size,
     )
     if packed_batch is not None:

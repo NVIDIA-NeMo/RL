@@ -326,7 +326,7 @@ def _packed_sft_row(row_id: int, context_parallel_size: int) -> dict[str, object
     }
 
 
-def test_sft_collate_orders_packed_rows_for_megatron_data_parallel_shards():
+def test_sft_collate_preserves_packed_row_order_before_data_parallel_sharding():
     from nemo_rl.algorithms.sft import _build_sft_collate_fn
 
     collate_fn = _build_sft_collate_fn(
@@ -345,7 +345,7 @@ def test_sft_collate_orders_packed_rows_for_megatron_data_parallel_shards():
         [_packed_sft_row(row_id, context_parallel_size=2) for row_id in range(8)]
     )
 
-    assert batch["input_ids"][:, 0].tolist() == [0, 4, 1, 5, 2, 6, 3, 7]
+    assert batch["input_ids"][:, 0].tolist() == list(range(8))
 
 
 def test_sft_collate_rejects_rows_prepared_for_different_context_parallel_size():

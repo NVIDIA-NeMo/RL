@@ -95,30 +95,11 @@ def _build_sft_collate_fn(
 ) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
     megatron_cfg = policy_config.get("megatron_cfg", {})
     context_parallel_size = None
-    data_parallel_size = None
     if megatron_cfg.get("enabled", False):
-        tensor_parallel_size = int(megatron_cfg.get("tensor_model_parallel_size", 1))
-        pipeline_parallel_size = int(
-            megatron_cfg.get("pipeline_model_parallel_size", 1)
-        )
         context_parallel_size = int(megatron_cfg.get("context_parallel_size", 1))
-        model_parallel_size = (
-            tensor_parallel_size * pipeline_parallel_size * context_parallel_size
-        )
-        world_size = int(cluster_config["num_nodes"]) * int(
-            cluster_config["gpus_per_node"]
-        )
-        if world_size % model_parallel_size != 0:
-            raise ValueError(
-                "SFT cluster world size must be divisible by TP * PP * CP to "
-                "preserve Megatron SFT DP-strided row order: "
-                f"world_size={world_size}, model_parallel_size={model_parallel_size}"
-            )
-        data_parallel_size = world_size // model_parallel_size
 
     return partial(
         rl_collate_fn,
-        megatron_sft_dp_stride_size=data_parallel_size,
         megatron_sft_context_parallel_size=context_parallel_size,
     )
 

@@ -539,10 +539,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "Direct packed SFT global batch size must be divisible by data "
                     f"parallel size: gbs={batch_size}, dp={dp_size}"
                 )
-            sharded_data = data.shard_by_batch_size(
-                dp_size,
-                batch_size=batch_size,
-            )
+            sharded_data = [
+                SlicedDataDict(
+                    data.select_indices(list(range(dp_rank, data.size, dp_size)))
+                )
+                for dp_rank in range(dp_size)
+            ]
         elif self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"

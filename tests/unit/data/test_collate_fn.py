@@ -167,7 +167,7 @@ def test_rl_collate_fn_rejects_context_parallel_mismatch() -> None:
 def test_rl_collate_fn_preserves_source_order_before_megatron_dp_sharding() -> None:
     data = [_packed_datum(idx) for idx in range(8)]
 
-    batch = rl_collate_fn(data, megatron_sft_dp_stride_size=4)
+    batch = rl_collate_fn(data)
 
     assert list(zip(batch["idx"], batch["input_ids"][:, 0].tolist(), strict=True)) == [
         (0, 0),
@@ -187,7 +187,7 @@ def test_rl_collate_fn_accepts_partial_packed_validation_batch(
 ) -> None:
     data = [_packed_datum(idx) for idx in range(batch_size)]
 
-    batch = rl_collate_fn(data, megatron_sft_dp_stride_size=4)
+    batch = rl_collate_fn(data)
 
     assert batch["idx"] == list(range(batch_size))
 
