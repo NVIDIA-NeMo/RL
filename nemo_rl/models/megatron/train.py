@@ -477,10 +477,7 @@ class LossPostProcessor:
                     device=model_losses.device, dtype=torch.float32
                 ).clamp(min=1)
                 loss = (model_losses.float() * mask).sum() / normalizer
-                metrics: Dict[str, Any] = {
-                    "loss": loss.detach(),
-                    "num_unmasked_tokens": mask.sum().detach(),
-                }
+                metrics: Dict[str, Any] = {"loss": loss.detach()}
                 if "sample_mask" in data_dict:
                     metrics["num_valid_samples"] = (
                         data_dict["sample_mask"].sum().detach()
