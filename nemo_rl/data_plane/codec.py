@@ -41,6 +41,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.schema import Layout
 
 if TYPE_CHECKING:
@@ -177,7 +178,10 @@ def pack_jagged_fields(
         else:
             raise TypeError(
                 f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
-                "Use torch.Tensor or np.ndarray(dtype=object)."
+                "Use torch.Tensor or np.ndarray(dtype=object). PackedTensor "
+                "must be converted to torch.nested at the wire boundary "
+                "(see sync_rollout_actor.py) so the codec's dispatch stays "
+                "binary."
             )
     return TensorDict(packed, batch_size=[n])
 
@@ -325,11 +329,16 @@ def materialize(
         # right-padded output) ride the ``else`` branch above, so without
         # this they'd skip the cross-DP forward pad target and break the
         # microbatch iterator (truncate_tensors → narrow length>size).
+        #
+        # Skip multimodal packed fields — their dim 1 is patch/image
+        # count, not seqlen, and padding it up to token seqlen inflates
+        # memory ~40x for pixel_values [B, patches, C, H, W].
         if (
             pad_to_seqlen > 0
             and isinstance(padded, torch.Tensor)
             and padded.dim() >= 2
             and padded.shape[1] < pad_to_seqlen
+            and key not in PACKED_MULTIMODAL_FIELDS
         ):
             pad_spec = [0, 0] * (padded.dim() - 2) + [
                 0,
