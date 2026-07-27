@@ -175,8 +175,9 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
 def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
     fp8_module, monkeypatch
 ):
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(is_mx=True)
