@@ -181,7 +181,6 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     produced no test failure -- just a slow OOM in a nightly days later.
     """
     import torch
-
     from vllm.model_executor.layers.quantization.utils import fp8_utils
 
     from nemo_rl.models.generation.vllm.quantization import fp8
