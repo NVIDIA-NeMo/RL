@@ -24,7 +24,9 @@ from nemo_rl.algorithms.sft import (
     SFTConfig,
     _initial_sft_save_state,
     sft_train,
+    validate,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.fixture
@@ -288,3 +290,164 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     # step (5). Each save calls init_tmp_checkpoint(step, ...).
     saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
     assert saved_steps == [2, 4, 5]
+
+
+def _direct_packed_batch(batch_size: int = 1) -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.arange(batch_size * 4).reshape(batch_size, 4),
+            "target_ids": torch.arange(1, batch_size * 4 + 1).reshape(batch_size, 4),
+            "token_mask": torch.ones(batch_size, 4),
+            "position_ids": torch.arange(4).repeat(batch_size, 1),
+            "input_lengths": torch.full((batch_size,), 4),
+            "sample_mask": torch.ones(batch_size),
+            "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32).repeat(
+                batch_size, 1
+            ),
+            "packed_cu_seqlens_lengths": torch.full((batch_size,), 2),
+            "packed_max_seqlen": torch.full((batch_size,), 4),
+        }
+    )
+
+
+def _packed_sft_row(row_id: int, context_parallel_size: int) -> dict[str, object]:
+    return {
+        "input_ids": torch.tensor([row_id, 1, 2, 3]),
+        "target_ids": torch.tensor([1, 2, 3, 4]),
+        "token_mask": torch.ones(4),
+        "position_ids": torch.arange(4),
+        "packed_cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "packed_max_seqlen": 4,
+        "packed_context_parallel_size": context_parallel_size,
+        "length": 4,
+        "loss_multiplier": 1.0,
+        "idx": row_id,
+        "task_name": "megatron_sft_packed",
+    }
+
+
+def test_sft_collate_orders_packed_rows_for_megatron_data_parallel_shards():
+    from nemo_rl.algorithms.sft import _build_sft_collate_fn
+
+    collate_fn = _build_sft_collate_fn(
+        {
+            "megatron_cfg": {
+                "enabled": True,
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 2,
+            }
+        },
+        {"num_nodes": 1, "gpus_per_node": 8},
+    )
+
+    batch = collate_fn(
+        [_packed_sft_row(row_id, context_parallel_size=2) for row_id in range(8)]
+    )
+
+    assert batch["input_ids"][:, 0].tolist() == [0, 4, 1, 5, 2, 6, 3, 7]
+
+
+def test_sft_collate_rejects_rows_prepared_for_different_context_parallel_size():
+    from nemo_rl.algorithms.sft import _build_sft_collate_fn
+
+    collate_fn = _build_sft_collate_fn(
+        {
+            "megatron_cfg": {
+                "enabled": True,
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 2,
+            }
+        },
+        {"num_nodes": 1, "gpus_per_node": 2},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"prepared for context_parallel_size=1.*context_parallel_size=2",
+    ):
+        collate_fn([_packed_sft_row(0, context_parallel_size=1)])
+
+
+def test_sft_train_bypasses_online_message_repacking_for_direct_packed_rows(
+    mock_components,
+):
+    direct_batch = _direct_packed_batch()
+    train_dataloader = mock_components["train_dataloader"]
+    train_dataloader.__iter__ = lambda self: iter([direct_batch])
+    train_dataloader.__len__ = MagicMock(return_value=1)
+    mock_components["master_config"].sft.max_num_steps = 1
+    mock_components["master_config"].sft.max_num_epochs = 1
+
+    with (
+        patch("nemo_rl.algorithms.sft.add_loss_mask_to_message_log") as add_mask,
+        patch("nemo_rl.algorithms.sft.batched_message_log_to_flat_message") as flatten,
+    ):
+        sft_train(
+            mock_components["policy"],
+            train_dataloader,
+            None,
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["master_config"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _initial_sft_save_state(),
+        )
+
+    assert (add_mask.call_count, flatten.call_count) == (0, 0)
+    assert mock_components["policy"].train.call_args.args[0] is direct_batch
+
+
+def test_validate_bypasses_online_message_repacking_for_direct_packed_rows(
+    mock_components,
+):
+    direct_batch = _direct_packed_batch()
+    val_dataloader = mock_components["val_dataloader"]
+    val_dataloader.__iter__ = lambda self: iter([direct_batch])
+    val_dataloader.__len__ = MagicMock(return_value=1)
+    mock_components["policy"].sharding_annotations.get_axis_size.return_value = 1
+
+    with (
+        patch("nemo_rl.algorithms.sft.add_loss_mask_to_message_log") as add_mask,
+        patch("nemo_rl.algorithms.sft.batched_message_log_to_flat_message") as flatten,
+    ):
+        validate(
+            mock_components["policy"],
+            val_dataloader,
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            step=0,
+            master_config=mock_components["master_config"],
+            val_batches=1,
+            val_batch_size=1,
+            val_mbs=1,
+        )
+
+    assert (add_mask.call_count, flatten.call_count) == (0, 0)
+    assert mock_components["policy"].train.call_args.args[0] is direct_batch
+
+
+def test_sft_train_keeps_repacking_legacy_online_message_batches(mock_components):
+    train_dataloader = mock_components["train_dataloader"]
+    train_dataloader.__len__ = MagicMock(return_value=1)
+    mock_components["master_config"].sft.max_num_steps = 1
+    mock_components["master_config"].sft.max_num_epochs = 1
+
+    sft_train(
+        mock_components["policy"],
+        train_dataloader,
+        None,
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["master_config"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _initial_sft_save_state(),
+    )
+
+    trained_batch = mock_components["policy"].train.call_args.args[0]
+    assert "message_log" not in trained_batch and torch.equal(
+        trained_batch["input_ids"][0, :3], torch.tensor([1, 2, 3])
+    )

@@ -24,6 +24,7 @@ focusing on:
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,6 +34,33 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
 pytestmark = pytest.mark.mcore
+
+
+def _run_direct_model_loss() -> tuple[torch.Tensor, dict[str, Any], MagicMock]:
+    from nemo_rl.models.megatron import train as megatron_train
+
+    custom_loss_fn = MagicMock()
+    processor = megatron_train.LossPostProcessor(
+        loss_fn=custom_loss_fn,
+        cfg={"sequence_packing": {"enabled": True}},
+        num_microbatches=4,
+    )
+    data = MagicMock()
+    data.__contains__.side_effect = lambda key: key == "sample_mask"
+    data.__getitem__.side_effect = lambda key: torch.tensor([1.0])
+    loss_mask = torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+
+    with patch.object(
+        megatron_train, "get_context_parallel_world_size", return_value=2
+    ):
+        wrapped = processor(
+            data_dict=data,
+            global_valid_toks=torch.tensor(6.0),
+            prepacked_loss_mask=loss_mask,
+        )
+
+    loss, metrics = wrapped(torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
+    return loss, metrics, custom_loss_fn
 
 
 class TestModelForward:
@@ -164,6 +192,30 @@ class TestModelForward:
 
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["position_ids"] is None
+
+    def test_model_forward_passes_direct_labels_and_loss_mask(self):
+        from nemo_rl.models.megatron.train import model_forward
+
+        model = MagicMock(return_value=torch.ones(1, 4))
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        labels = torch.tensor([[2, 3, 4, -100]])
+        loss_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+
+        model_forward(
+            model=model,
+            data_dict=data,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            position_ids=torch.tensor([[0, 1, 2, 3]]),
+            attention_mask=None,
+            labels_cp_sharded=labels,
+            loss_mask_cp_sharded=loss_mask,
+        )
+
+        assert (
+            model.call_args.kwargs["labels"] is labels,
+            model.call_args.kwargs["loss_mask"] is loss_mask,
+        ) == (True, True)
 
 
 class TestApplyTemperatureScaling:
@@ -396,6 +448,58 @@ class TestForwardWithPostProcessingFn:
 
         # Verify apply_temperature_scaling was called with the output tensor and cfg
         mock_temp_scaling.assert_called_once_with(output_tensor, sampling_params)
+
+    def test_forward_with_direct_labels_routes_model_loss_without_temperature_scaling(
+        self,
+    ):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron import train as megatron_train
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+
+        labels = torch.tensor([[2, 3, 4, 5]])
+        loss_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict({"sample_mask": torch.ones(1)}),
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=torch.tensor([[0, 1, 2, 3]]),
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=torch.tensor([0, 4]),
+            labels_cp_sharded=labels,
+            loss_mask_cp_sharded=loss_mask,
+        )
+        processor = megatron_train.LossPostProcessor(
+            loss_fn=MagicMock(),
+            cfg={"sequence_packing": {"enabled": True}},
+        )
+
+        with (
+            patch.object(
+                megatron_train,
+                "model_forward",
+                return_value=torch.ones(1, 4),
+            ) as model_forward_mock,
+            patch.object(
+                megatron_train, "apply_temperature_scaling"
+            ) as temperature_mock,
+            patch.object(
+                megatron_train, "get_context_parallel_world_size", return_value=1
+            ),
+        ):
+            megatron_train.forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=processor,
+                global_valid_toks=torch.tensor(3.0),
+                sampling_params=TrainingSamplingParams(temperature=0.5),
+            )
+
+        assert (
+            model_forward_mock.call_args.kwargs["labels_cp_sharded"] is labels,
+            model_forward_mock.call_args.kwargs["loss_mask_cp_sharded"] is loss_mask,
+            temperature_mock.call_count,
+        ) == (True, True, 0)
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
@@ -878,6 +982,81 @@ class TestLossPostProcessor:
 
         # Verify SequencePackingLossWrapper was called
         mock_wrapper.assert_called_once()
+
+
+def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling():
+    loss, _, _ = _run_direct_model_loss()
+
+    assert torch.isclose(loss, torch.tensor(4.0 / 3.0))
+
+
+def test_direct_model_loss_reports_unscaled_loss_and_target_token_count():
+    _, metrics, _ = _run_direct_model_loss()
+
+    assert {
+        "loss": metrics["loss"].item(),
+        "num_unmasked_tokens": metrics["num_unmasked_tokens"].item(),
+    } == pytest.approx({"loss": 2.0 / 3.0, "num_unmasked_tokens": 2.0})
+
+
+def test_direct_model_loss_bypasses_online_logit_loss_function():
+    _, _, online_loss_fn = _run_direct_model_loss()
+
+    assert online_loss_fn.call_count == 0
+
+
+def test_direct_model_loss_rejects_misaligned_target_mask():
+    from nemo_rl.models.megatron.train import LossPostProcessor
+
+    processor = LossPostProcessor(
+        loss_fn=MagicMock(),
+        cfg={"sequence_packing": {"enabled": True}},
+    )
+    wrapped = processor(
+        data_dict=MagicMock(),
+        global_valid_toks=torch.tensor(1.0),
+        prepacked_loss_mask=torch.ones(1, 3),
+    )
+
+    with pytest.raises(ValueError, match="loss and loss mask shapes must match"):
+        wrapped(torch.ones(1, 4))
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (
+            {
+                "packed_cu_seqlens": torch.tensor([[0, 4]]),
+                "target_ids": torch.ones(1, 4),
+            },
+            True,
+        ),
+        ({"packed_cu_seqlens": torch.tensor([[0, 4]])}, False),
+        ({"target_ids": torch.ones(1, 4)}, False),
+    ],
+)
+def test_context_parallel_loss_reduction_is_selected_only_for_direct_packed_sft(
+    data: dict[str, torch.Tensor], expected: bool
+):
+    from nemo_rl.models.megatron.train import (
+        should_reduce_loss_across_context_parallel,
+    )
+
+    assert should_reduce_loss_across_context_parallel(data) is expected
+
+
+def test_context_parallel_metric_cleanup_preserves_nonlocal_metrics():
+    from nemo_rl.models.megatron.train import (
+        strip_context_parallel_local_loss_metric,
+    )
+
+    result = strip_context_parallel_local_loss_metric(
+        {"loss": [torch.tensor(1.0)], "lr": [1e-4]},
+        enabled=True,
+    )
+
+    assert result == {"lr": [1e-4]}
 
 
 class TestLogprobsPostProcessor:
