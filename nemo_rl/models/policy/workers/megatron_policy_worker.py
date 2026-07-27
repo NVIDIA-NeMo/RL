@@ -808,8 +808,8 @@ class MegatronPolicyWorkerImpl(
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.detach()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.detach()
                         mb_losses.append(loss_metrics["loss"])
 
                 else:
@@ -823,7 +823,12 @@ class MegatronPolicyWorkerImpl(
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
-                losses.append(torch.tensor(mb_losses).sum().item())
+                if all(isinstance(loss, torch.Tensor) for loss in mb_losses):
+                    losses.append(torch.stack(mb_losses).sum())
+                else:
+                    losses.append(
+                        torch.tensor(mb_losses, device=global_valid_toks.device).sum()
+                    )
 
         if saved_extra_state is not None:
             self._restore_model_extra_state_dict(saved_extra_state)

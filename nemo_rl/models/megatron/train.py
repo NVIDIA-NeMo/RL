@@ -487,10 +487,10 @@ class LossPostProcessor:
                     device=model_losses.device, dtype=torch.float32
                 ).clamp(min=1)
                 loss = (model_losses.float() * mask).sum() / normalizer
-                metrics: Dict[str, Any] = {"loss": float(loss.detach().item())}
+                metrics: Dict[str, Any] = {"loss": loss.detach()}
                 if "sample_mask" in data_dict:
-                    metrics["num_valid_samples"] = float(
-                        data_dict["sample_mask"].sum().detach().item()
+                    metrics["num_valid_samples"] = (
+                        data_dict["sample_mask"].sum().detach()
                     )
                 return loss, metrics
 
@@ -852,7 +852,7 @@ class TopkLogitsPostProcessor:
 
 def aggregate_training_statistics(
     all_mb_metrics: List[Dict[str, Any]],
-    losses: List[float],
+    losses: List[Union[float, torch.Tensor]],
     data_parallel_group: torch.distributed.ProcessGroup,
 ) -> Tuple[Dict[str, List[Any]], torch.Tensor]:
     """Aggregate training statistics across microbatches and data-parallel ranks.
@@ -863,7 +863,8 @@ def aggregate_training_statistics(
 
     Args:
         all_mb_metrics: List of metric dicts from each microbatch.
-        losses: List of per-gradient-buffer scalar losses on this rank.
+        losses: List of per-gradient-buffer scalar losses on this rank. Tensor
+            values remain on device until the final reduction.
         data_parallel_group: The data-parallel process group for all-reduce.
 
     Returns:
@@ -873,7 +874,10 @@ def aggregate_training_statistics(
     """
     # Compute global loss across all data-parallel ranks
     with torch.no_grad():
-        global_loss = torch.tensor(losses, device="cuda")
+        if losses and all(isinstance(loss, torch.Tensor) for loss in losses):
+            global_loss = torch.stack([loss.detach() for loss in losses])
+        else:
+            global_loss = torch.tensor(losses, device="cuda")
         torch.distributed.all_reduce(
             global_loss,
             op=torch.distributed.ReduceOp.SUM,
@@ -885,5 +889,15 @@ def aggregate_training_statistics(
     for m in all_mb_metrics:
         for k, v in m.items():
             mb_metrics[k].append(v)
+
+    for key, values in mb_metrics.items():
+        if values and all(
+            isinstance(value, torch.Tensor) and value.numel() == 1 for value in values
+        ):
+            mb_metrics[key] = (
+                torch.stack([value.detach().reshape(()) for value in values])
+                .cpu()
+                .tolist()
+            )
 
     return dict(mb_metrics), global_loss

@@ -1509,9 +1509,7 @@ class TestAggregateTrainingStatistics:
         assert mb_metrics["loss"] == pytest.approx([0.5, 0.3])
         assert mb_metrics["num_valid_samples"] == [3.0, 5.0]
         assert all(
-            type(value) is float
-            for values in mb_metrics.values()
-            for value in values
+            type(value) is float for values in mb_metrics.values() for value in values
         )
 
     @patch("torch.distributed.all_reduce")
