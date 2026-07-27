@@ -67,7 +67,15 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _bucket_size_bytes: int | None = None
 
     def init_communicator(self) -> None:
-        self._generation.prepare_refit_info(self._policy.prepare_refit_info())
+        state_dict_info = self._policy.prepare_refit_info()
+        prequant_names = self._generation.prepare_refit_info(state_dict_info)
+        if prequant_names:
+            updated_info = self._policy.enable_refit_prequantize(prequant_names)
+            if updated_info is None:
+                raise RuntimeError(
+                    "Trainer-side refit prequantization did not return updated metadata."
+                )
+            self._generation.prepare_refit_info(updated_info)
         self._ensure_checkpoint_engine_ready()
 
     @property

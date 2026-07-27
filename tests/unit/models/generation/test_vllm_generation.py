@@ -138,6 +138,15 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 
+@pytest.mark.vllm
+def test_prepare_refit_info_skips_missing_metadata():
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.worker_group = MagicMock()
+
+    assert generation.prepare_refit_info(None) is None
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
+
+
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
     def raise_if_called():
         raise AssertionError("CUDA capability should not be queried")

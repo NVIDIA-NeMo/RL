@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pytest
@@ -76,6 +76,64 @@ def test_megatron_move_model_does_not_serialize_extra_state():
     assert moved_model is model
     assert model.weight.device.type == "cpu"
     assert model.scale.device.type == "cpu"
+
+
+def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
+    from nemo_rl.models.policy.workers.checkpoint_engine import (
+        MegatronCheckpointEngineSendMixin,
+    )
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+        CheckpointEngineWeightSynchronizer,
+    )
+
+    class _PrequantCheckpointWorker(MegatronCheckpointEngineSendMixin):
+        enable_refit_prequantize = MegatronPolicyWorkerImpl.enable_refit_prequantize
+        _iter_params_with_optional_kv_scales = (
+            MegatronPolicyWorkerImpl._iter_params_with_optional_kv_scales
+        )
+        _maybe_prequantize_param = MegatronPolicyWorkerImpl._maybe_prequantize_param
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    weight = torch.randn(64, 64, dtype=torch.bfloat16)
+    worker = _PrequantCheckpointWorker()
+    worker._refit_prequant_names = set()
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
+    )
+    worker.prepare_refit_info = lambda: {name: (weight.shape, weight.dtype)}
+    worker.checkpoint_engine = SimpleNamespace(get_target_weight_layout=lambda: None)
+
+    class _Generation:
+        def __init__(self) -> None:
+            self.refit_info: list[dict[str, Any]] = []
+
+        def prepare_refit_info(
+            self, state_dict_info: dict[str, Any] | None
+        ) -> list[str] | None:
+            assert state_dict_info is not None
+            self.refit_info.append(state_dict_info)
+            return [name] if len(self.refit_info) == 1 else None
+
+    generation = _Generation()
+    synchronizer = CheckpointEngineWeightSynchronizer(worker, generation, {})
+    synchronizer._ensure_checkpoint_engine_ready = lambda: None
+
+    synchronizer.init_communicator()
+    exported = dict(worker._checkpoint_engine_weight_iterator())
+
+    scale_name = name + "_scale_from_checkpoint"
+    assert generation.refit_info[1][name][1] == torch.float8_e4m3fn
+    assert generation.refit_info[1][scale_name][1] == torch.uint8
+    assert exported[name].dtype == torch.float8_e4m3fn
+    assert exported[scale_name].dtype == torch.uint8
+    assert exported[scale_name].shape == (64, 2)
 
 
 def test_megatron_prepare_for_training_restores_optimizer():

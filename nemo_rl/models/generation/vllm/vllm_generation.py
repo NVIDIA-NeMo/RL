@@ -926,6 +926,9 @@ class VllmGeneration(GenerationInterface):
             (vllm_cfg.refit_prequantize), the parameter names the engine wants
             quantized on the trainer before streaming. None otherwise.
         """
+        if state_dict_info is None:
+            return None
+
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"

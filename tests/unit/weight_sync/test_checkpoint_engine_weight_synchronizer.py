@@ -14,7 +14,7 @@
 
 """Tests for checkpoint-engine weight synchronization and factory routing."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -153,6 +153,25 @@ def _checkpoint_sync(
 
 
 class TestCheckpointEngineWeightSynchronizer:
+    def test_init_communicator_completes_prequant_handshake(self):
+        sync = _checkpoint_sync(MagicMock())
+        sync._ensure_checkpoint_engine_ready = MagicMock()
+        state_dict_info = {"layer_0": {"shape": [4096, 4096]}}
+        prequant_names = ["layer_0"]
+        updated_info = {"layer_0": {"shape": [4096, 4096], "dtype": "float8_e4m3fn"}}
+        sync._policy.prepare_refit_info.return_value = state_dict_info
+        sync._generation.prepare_refit_info.side_effect = [prequant_names, None]
+        sync._policy.enable_refit_prequantize.return_value = updated_info
+
+        sync.init_communicator()
+
+        sync._policy.enable_refit_prequantize.assert_called_once_with(prequant_names)
+        assert sync._generation.prepare_refit_info.call_args_list == [
+            call(state_dict_info),
+            call(updated_info),
+        ]
+        sync._ensure_checkpoint_engine_ready.assert_called_once_with()
+
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_bucket_uses_minimum_total_memory_and_is_cached(self, mock_ray, capsys):
         config = _checkpoint_engine_cfg(bucket_memory_ratio=0.125)
