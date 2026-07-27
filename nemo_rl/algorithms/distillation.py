@@ -809,6 +809,7 @@ def _distillation_train_impl(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
+                            num_generations_per_prompt=master_config.distillation.num_generations_per_prompt,
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -1295,6 +1296,7 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
+                    num_generations_per_prompt=master_config.distillation.num_generations_per_prompt,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
