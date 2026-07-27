@@ -578,6 +578,8 @@ def setup(
             "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
 
+    _validate_use_kl_in_reward_compat(master_config)
+
     # ==========================
     #          Cluster
     # ==========================
@@ -2130,14 +2132,6 @@ def _create_advantage_estimator(master_config: MasterConfig):
     grpo_config = master_config.grpo
     loss_config = master_config.loss_fn
 
-    assert not (
-        getattr(loss_config, "use_kl_in_reward", False)
-        and opd_module._skip_prev_logprobs(master_config)
-    ), (
-        "loss_fn.use_kl_in_reward requires real prev_logprobs but force_on_policy_ratio "
-        "with no grpo.seq_logprob_error_threshold zeros them (KL would be computed against a zero placeholder)."
-    )
-
     # Provide backward-compatible defaults when adv_estimator is not in config.
     # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
     # which older configs still use.
@@ -2381,7 +2375,29 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
-def _resolve_logprob_skip_flags(master_config: MasterConfig) -> tuple[bool, Any]:
+def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
+    """Reject ``use_kl_in_reward`` when the KL term would read zero placeholder logprobs.
+
+    ``force_on_policy_ratio`` (without ``seq_logprob_error_threshold``) skips
+    the prev_logprobs forward and passes a zero placeholder to the advantage
+    estimator; ``use_kl_in_reward`` then applies
+    ``kl_coef * calculate_kl(zeros, ref)`` which corrupts the advantage.
+    ``kl_coef=0`` (``reference_policy_kl_penalty=0``) zeros the term regardless,
+    so that case is allowed.
+    """
+    loss_config = master_config.loss_fn
+    if loss_config.use_kl_in_reward and loss_config.reference_policy_kl_penalty != 0:
+        assert not opd_module._skip_prev_logprobs(master_config), (
+            "loss_fn.use_kl_in_reward with nonzero loss_fn.reference_policy_kl_penalty "
+            "requires real prev_logprobs, but force_on_policy_ratio (without "
+            "grpo.seq_logprob_error_threshold) zeros them — KL would be computed "
+            "against a zero placeholder."
+        )
+
+
+def _resolve_logprob_skip_flags(
+    master_config: MasterConfig,
+) -> tuple[bool, bool | None]:
     """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
 
     Skip prev_logprobs when force_on_policy_ratio=True unless

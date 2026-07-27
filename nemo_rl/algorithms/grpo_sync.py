@@ -787,9 +787,10 @@ def grpo_train_sync(
                 seq_logprob_error_threshold = master_config.grpo.get(
                     "seq_logprob_error_threshold", None
                 )
-                # Effective field set for this step. Filtered once; both
-                # the driver-side read_from_dataplane and the workers'
-                # train_presharded fetch (via train_from_meta) consume it.
+                # Worker-side fetch schema for this step. Derived from the
+                # same skip decision as ``select_fields`` below, but consumed
+                # only by ``train_from_meta`` (the driver read uses
+                # ``select_fields``).
                 train_fields = tuple(
                     f
                     for f in DP_TRAIN_FIELDS

@@ -32,13 +32,13 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
-    _create_advantage_estimator,
     _default_grpo_save_state,
     _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -3633,10 +3633,14 @@ class TestAggregateRolloutMetrics:
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
 
 
-def _cfg(*, force=False, threshold=None, skip_ref=None, kl_reward=False):
+def _cfg(
+    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+):
     return MasterConfig.model_construct(
         loss_fn=ClippedPGLossConfig(
-            force_on_policy_ratio=force, use_kl_in_reward=kl_reward
+            force_on_policy_ratio=force,
+            use_kl_in_reward=kl_reward,
+            reference_policy_kl_penalty=kl_penalty,
         ),
         grpo={
             "seq_logprob_error_threshold": threshold,
@@ -3656,9 +3660,19 @@ def _cfg(*, force=False, threshold=None, skip_ref=None, kl_reward=False):
     ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
 )
 def test_resolve_logprob_skip_flags(kw, expected):
-    assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    if kw.get("force") and kw.get("threshold") is not None:
+        with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
+            assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    else:
+        assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
 
 
-def test_advantage_estimator_rejects_kl_reward_with_force_on_policy_ratio():
+def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():
     with pytest.raises(AssertionError, match="use_kl_in_reward"):
-        _create_advantage_estimator(_cfg(force=True, kl_reward=True))
+        _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True))
+
+
+def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
+    # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
+    # prev_logprobs can't corrupt the advantage.
+    _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))

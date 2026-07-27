@@ -380,6 +380,10 @@ class TQPolicy(Policy):
             gbs: Global batch size; defaults to ``cfg["train_global_batch_size"]``.
             mbs: Micro batch size; defaults to ``cfg["train_micro_batch_size"]``.
             timer: Optional timer for nested ``policy_training/*`` measurements.
+            train_fields: TQ columns workers fetch this step; defaults to the
+                full ``DP_TRAIN_FIELDS`` schema. Caller may narrow it to drop
+                columns it skipped writing (e.g. ``prev_logprobs`` when
+                ``force_on_policy_ratio=True``).
 
         Returns:
             Aggregated training-step output dict.
@@ -389,12 +393,12 @@ class TQPolicy(Policy):
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        # Train workers fetch the full DP_TRAIN_FIELDS schema (rollout +
-        # logprob deltas + advantages + sample_mask). Caller is responsible
-        # for ensuring those columns have been written to TQ before this
-        # call (workers + driver delta-writes).
-        # Caller may narrow the fetch schema (e.g. drop prev_logprobs
-        # when force_on_policy_ratio=True).
+        # Train workers fetch ``train_fields`` (rollout + logprob deltas +
+        # advantages + sample_mask), defaulting to the full DP_TRAIN_FIELDS
+        # schema. Caller is responsible for ensuring those columns have been
+        # written to TQ before this call (workers + driver delta-writes), and
+        # may narrow it to drop columns it skipped writing this step (e.g.
+        # prev_logprobs when force_on_policy_ratio=True).
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
