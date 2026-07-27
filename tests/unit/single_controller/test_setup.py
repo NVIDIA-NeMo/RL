@@ -1153,7 +1153,6 @@ class TestSetup:
             # run_rollouts call.
             tokenizer=tokenizer,
             enable_router_replay=False,
-            routed_experts_dtype="int16",
             use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
