@@ -117,6 +117,13 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
+def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
+    """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
+    return tuple(
+        f for f in DP_TRAIN_FIELDS if not (skip_prev_logprobs and f == "prev_logprobs")
+    )
+
+
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
 # on std != 0, accumulate survivors across iterations, slice on overflow.
@@ -787,15 +794,10 @@ def grpo_train_sync(
                 seq_logprob_error_threshold = master_config.grpo.get(
                     "seq_logprob_error_threshold", None
                 )
-                # Worker-side fetch schema for this step. Derived from the
-                # same skip decision as ``select_fields`` below, but consumed
-                # only by ``train_from_meta`` (the driver read uses
-                # ``select_fields``).
-                train_fields = tuple(
-                    f
-                    for f in DP_TRAIN_FIELDS
-                    if not (skip_prev_logprobs and f == "prev_logprobs")
-                )
+                # Worker-side fetch schema for this step. Same skip decision
+                # as ``select_fields`` below, but consumed only by
+                # ``train_from_meta`` (driver read uses ``select_fields``).
+                train_fields = _train_fields_for_step(skip_prev_logprobs)
 
                 if compute_prev or compute_ref:
                     print("▶ Preparing for logprob inference...", flush=True)

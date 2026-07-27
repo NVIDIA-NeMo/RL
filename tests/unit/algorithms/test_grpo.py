@@ -47,6 +47,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -3676,3 +3677,13 @@ def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
     # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
     # prev_logprobs can't corrupt the advantage.
     _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))
+
+
+@pytest.mark.parametrize(
+    "skip_prev_logprobs, expect_prev",
+    [(False, True), (True, False)],
+    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+)
+def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
+    fields = _train_fields_for_step(skip_prev_logprobs)
+    assert ("prev_logprobs" in fields) is expect_prev
