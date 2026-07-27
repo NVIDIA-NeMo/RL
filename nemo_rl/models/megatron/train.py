@@ -108,6 +108,10 @@ def model_forward(
         raise ValueError(
             "labels_cp_sharded and loss_mask_cp_sharded must be provided together"
         )
+    if labels_cp_sharded is not None and use_fused_linear_logprobs:
+        raise ValueError(
+            "Direct packed SFT labels do not support fused linear logprobs"
+        )
 
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
