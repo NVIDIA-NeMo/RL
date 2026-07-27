@@ -436,7 +436,6 @@ class TestSetup:
             base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
             model_name="test-model",
             enable_router_replay=False,
-            routed_experts_dtype="int16",
             use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
