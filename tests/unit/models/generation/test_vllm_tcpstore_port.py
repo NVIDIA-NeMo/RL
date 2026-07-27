@@ -135,10 +135,28 @@ def test_patch_anchor_still_matches_installed_vllm(patched_source):
     ast.parse(patched_source.read_text())  # the edit must leave valid Python
 
 
-def test_unpatched_vllm_hands_the_tcpstore_the_messagequeue_port(
-    pristine_source, monkeypatch
-):
-    """Documents the bug: without the patch both consumers pick the same port."""
+def test_unpatched_vllm_picks_an_unusable_tcpstore_port(pristine_source, monkeypatch):
+    """Documents the bug, and proves the patch is load-bearing.
+
+    Unpatched, ``local_dp_rank`` is 0 rather than None, so vLLM takes its DP
+    branch and searches from ``master_port + 100 + local_dp_rank * 32`` = 100.
+    What happens next depends on whether the process may bind privileged ports,
+    and *both* outcomes are broken:
+
+    * cannot bind < 1024 (the CI cluster) -- all 32 attempts fail and it falls
+      through to ``get_open_port()``, i.e. straight back to ``VLLM_PORT``. That
+      is the port the MessageQueue binds and holds, so rank 0 dies with
+      EADDRINUSE. This is what DeepSeek-V3 hit on port 7000.
+    * can bind < 1024 (this unit-test container runs as root) -- it returns 100,
+      outside the engine's reserved band and identical for *every* engine on the
+      node, since each computes the same ``0 + 100 + 0 * 32``.
+
+    Asserting either specific port would pin the test to one environment, so
+    assert the property the patch actually restores: a port inside this engine's
+    reserved band that the MessageQueue will not also take.
+    """
+    from nemo_rl.distributed.virtual_cluster import DEFAULT_VLLM_PORTS_PER_ENGINE
+
     base = _find_free_port_band(_WINDOW * 2)
     monkeypatch.setenv("VLLM_PORT", str(base))
 
@@ -146,7 +164,16 @@ def test_unpatched_vllm_hands_the_tcpstore_the_messagequeue_port(
     from vllm.utils.network_utils import get_open_port
 
     tcpstore_port = select(_NON_DP_LOCAL_RANK, _NON_DP_MASTER_PORT)
-    assert tcpstore_port == get_open_port() == base
+    # get_open_port() is what MessageQueue calls for its remote subscribe socket.
+    in_band = base <= tcpstore_port < base + DEFAULT_VLLM_PORTS_PER_ENGINE
+    disjoint = tcpstore_port != get_open_port()
+
+    assert not (in_band and disjoint), (
+        f"unpatched vLLM returned TCPStore port {tcpstore_port} for VLLM_PORT="
+        f"{base}, which is both in-band and disjoint from the MessageQueue's "
+        "port -- the bug this patch exists for would not reproduce, so the "
+        "patch may no longer be needed"
+    )
 
 
 def test_patched_tcpstore_port_avoids_the_messagequeue_scan(
