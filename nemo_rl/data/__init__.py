@@ -18,6 +18,7 @@ from typing import Literal, NotRequired, TypedDict, Union
 class ResponseDatasetConfig(TypedDict):
     dataset_name: NotRequired[str]
     data_path: NotRequired[str]
+    chat_key: NotRequired[str]
     input_key: NotRequired[str]
     output_key: NotRequired[str]
     subset: NotRequired[str | None]
@@ -31,6 +32,10 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    megatron_sft_prompt_format: NotRequired[str]
+    megatron_sft_pad_token: NotRequired[str | None]
+    megatron_sft_assistant_prefix_len: NotRequired[int | None]
+    megatron_sft_context_parallel_size: NotRequired[int]
 
 
 class PreferenceDatasetConfig(TypedDict):
