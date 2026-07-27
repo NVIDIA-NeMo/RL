@@ -14,7 +14,7 @@
 
 """Pipeline parallel utilities for Megatron models."""
 
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar, cast
 
 import torch
 from megatron.core.parallel_state import (
@@ -22,6 +22,12 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_last_rank,
     get_pipeline_model_parallel_world_size,
     is_pipeline_last_stage,
+)
+
+LossMetricPayloadT = TypeVar(
+    "LossMetricPayloadT",
+    dict[str, Any],
+    list[dict[str, Any]],
 )
 
 
@@ -77,10 +83,12 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
 
 
 def _materialize_loss_metrics_for_object_broadcast(
-    loss_metrics: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    loss_metrics: LossMetricPayloadT,
+) -> LossMetricPayloadT:
     """Convert tensor metrics to host values before object transport."""
-    materialized = [dict(metric) for metric in loss_metrics]
+    is_flat_dict = isinstance(loss_metrics, dict)
+    metrics = [loss_metrics] if is_flat_dict else loss_metrics
+    materialized = [dict(metric) for metric in metrics]
     scalar_groups: dict[
         tuple[torch.device, torch.dtype],
         list[tuple[int, str, torch.Tensor]],
@@ -105,12 +113,14 @@ def _materialize_loss_metrics_for_object_broadcast(
         for (metric_index, key, _), host_value in zip(entries, host_values):
             materialized[metric_index][key] = host_value
 
-    return materialized
+    if is_flat_dict:
+        return cast(LossMetricPayloadT, materialized[0])
+    return cast(LossMetricPayloadT, materialized)
 
 
 def broadcast_loss_metrics_from_last_stage(
-    loss_metrics: Optional[list[dict[str, Any]]] = None,
-) -> list[dict[str, Any]]:
+    loss_metrics: Optional[LossMetricPayloadT] = None,
+) -> LossMetricPayloadT:
     """Broadcast loss metrics from the last pipeline stage to all stages.
 
     This utility handles the common pattern where loss computation happens on the last
@@ -142,7 +152,7 @@ def broadcast_loss_metrics_from_last_stage(
         )
         return host_metrics
     else:
-        metrics_to_broadcast: list[Optional[list[dict[str, Any]]]] = [None]
+        metrics_to_broadcast: list[Optional[LossMetricPayloadT]] = [None]
         torch.distributed.broadcast_object_list(
             metrics_to_broadcast,
             src=last_rank,

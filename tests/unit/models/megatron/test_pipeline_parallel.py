@@ -133,3 +133,40 @@ def test_loss_metric_object_broadcast_preserves_flat_mtp_dict(
     assert result == {"mtp_loss_0": 0.25, "mtp_loss_1": 0.125}
     assert result is mock_broadcast.call_args.args[0][0]
     assert all(not isinstance(value, torch.Tensor) for value in result.values())
+
+
+@patch(
+    "nemo_rl.models.megatron.pipeline_parallel.get_pipeline_model_parallel_world_size",
+    return_value=2,
+)
+@patch(
+    "nemo_rl.models.megatron.pipeline_parallel.get_pipeline_model_parallel_last_rank",
+    return_value=1,
+)
+@patch("nemo_rl.models.megatron.pipeline_parallel.get_pipeline_model_parallel_group")
+@patch(
+    "nemo_rl.models.megatron.pipeline_parallel.is_pipeline_last_stage",
+    return_value=False,
+)
+@patch(
+    "nemo_rl.models.megatron.pipeline_parallel.torch.distributed.broadcast_object_list"
+)
+def test_loss_metric_object_broadcast_receives_flat_mtp_dict(
+    mock_broadcast: MagicMock,
+    mock_is_last_stage: MagicMock,
+    mock_pp_group: MagicMock,
+    mock_last_rank: MagicMock,
+    mock_pp_size: MagicMock,
+) -> None:
+    from nemo_rl.models.megatron.pipeline_parallel import (
+        broadcast_loss_metrics_from_last_stage,
+    )
+
+    def receive_metrics(payload: list[object], **_: object) -> None:
+        payload[0] = {"mtp_loss_0": 0.25}
+
+    mock_broadcast.side_effect = receive_metrics
+
+    result = broadcast_loss_metrics_from_last_stage()
+
+    assert result == {"mtp_loss_0": 0.25}
