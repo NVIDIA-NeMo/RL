@@ -332,6 +332,37 @@ def test_checkpoint_engine_weight_layout_rejects_transposed_experts():
 
 
 @pytest.mark.vllm
+def test_checkpoint_engine_weight_layout_rejects_experts_outside_routed_experts():
+    """parse_hf_expert_weight() hardcodes the '.routed_experts.' segment.
+
+    If vLLM ever moves expert weights out from under it, every HF expert weight
+    maps to a non-existent parameter and the checkpoint-engine sender drops them
+    all silently -- the engine would serve stale experts for the whole run while
+    non-expert weights refit normally. Nothing downstream catches that, so it
+    has to fail here.
+    """
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    owner = _FakeExpertOwner(use_ep=True)
+    param = _expert_param((2, 8, 4), owner)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            named_parameters=lambda: [
+                # A hypothetical future layout without the nested submodule.
+                ("model.layers.0.mlp.experts.w13_weight", param)
+            ]
+        )
+    )
+    with pytest.raises(RuntimeError, match="routed_experts"):
+        ext._checkpoint_engine_weight_layout()
+
+
+@pytest.mark.vllm
 def test_sharded_refit_directly_loads_full_ep_owned_experts():
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtensionWithCheckpointEngine,
