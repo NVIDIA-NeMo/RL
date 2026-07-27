@@ -524,13 +524,18 @@ class MegatronGenerationMixin:
             batch_size, dtype=torch.long, device=input_ids.device
         )
         for i in range(batch_size):
-            tokens = result[i].prompt_tokens.tolist() + result[i].generated_tokens
-            seq_len = len(tokens)
-            output_ids_padded[i, :seq_len] = torch.tensor(
-                tokens, dtype=torch.long, device=input_ids.device
-            )
+            # Take the prompt from the request we submitted rather than from the
+            # engine's reply: mcore only echoes prompt_tokens back when
+            # SamplingParams.return_prompt_tokens is set, and asking for them would
+            # ship the whole prompt over ZMQ for data we already hold.
             prompt_len = input_lengths[i].item()
-            generation_lengths[i] = seq_len - prompt_len
+            generated_tokens = result[i].generated_tokens
+            seq_len = prompt_len + len(generated_tokens)
+            output_ids_padded[i, :prompt_len] = input_ids[i, :prompt_len]
+            output_ids_padded[i, prompt_len:seq_len] = torch.tensor(
+                generated_tokens, dtype=torch.long, device=input_ids.device
+            )
+            generation_lengths[i] = len(generated_tokens)
             unpadded_sequence_lengths[i] = seq_len
             gen_logprobs = result[i].generated_log_probs
             logprobs_padded[i, prompt_len : prompt_len + len(gen_logprobs)] = (
