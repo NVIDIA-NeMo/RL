@@ -479,6 +479,9 @@ class TokenizerConfig(TypedDict):
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]
     use_processor: NotRequired[bool]
+    # Opt-in fastokens Rust-backed BPE tokenizer (~10x faster encode). Defaults to
+    # off when absent; NRL_USE_FASTOKENS overrides at runtime when set.
+    use_fastokens: NotRequired[bool]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -550,7 +553,7 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
-    refit_buffer_size_gb: NotRequired[float]
+    refit_buffer_size_gb: NotRequired[float | int]
     # Keep the CUDA-IPC ping-pong staging buffers allocated across refits instead of
     # reallocating and freeing them (plus a gc.collect/empty_cache pair) every refit.
     # Works best with a fixed refit_buffer_size_gb; the buffers stay resident on the

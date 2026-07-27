@@ -28,6 +28,7 @@ from transformers import (
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
+from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 if TYPE_CHECKING:
@@ -361,6 +362,8 @@ def get_tokenizer(
         >>>
         ```
     """
+    maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
+
     processor = None
 
     if get_processor:

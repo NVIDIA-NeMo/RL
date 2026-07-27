@@ -154,12 +154,24 @@ def main() -> None:
         )
 
     with rl_init_timer.time("tokenizer"):
+        # setup tokenizer
         tokenizer = get_tokenizer(config.policy["tokenizer"])
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
+        has_refit_draft_weights = (
+            "draft" in config.policy and config.policy["draft"]["enabled"]
+        )
+        trains_mtp = (
+            "megatron_cfg" in config.policy
+            and config.policy["megatron_cfg"]["enabled"]
+            and bool(config.policy["megatron_cfg"].get("mtp_num_layers"))
+        )
         config.policy["generation"] = configure_generation_config(
-            config.policy["generation"], tokenizer
+            config.policy["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+            trains_mtp=trains_mtp,
         )
 
         # NeMo-Gym specific config setup.

@@ -374,7 +374,11 @@ def batched_message_log_to_flat_message(
         # Filter out None values and validate consistency
         values: list[Tensor | None] = cast(list[Tensor | None], values)
         tensors = cast(list[Tensor], [t for t in values if t is not None])
-        _validate_tensor_consistency(tensors)
+        try:
+            _validate_tensor_consistency(tensors)
+        except RuntimeError as e:
+            e.add_note(f"[key={key!r}]")
+            raise
 
         # Create zero tensors for None values
         filled_values: list[Tensor] = [
