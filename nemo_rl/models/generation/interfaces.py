@@ -203,10 +203,14 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
+    # Optional request-level left-truncation limit for HTTP chat generation.
+    truncate_prompt_tokens: NotRequired[int | None]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # Internal GRPO validation-only sampling config used by OpenAI-compatible generation servers.
+    _validation_generation: NotRequired[dict[str, float] | None]
 
 
 class GenerationDatumSpec(TypedDict):
