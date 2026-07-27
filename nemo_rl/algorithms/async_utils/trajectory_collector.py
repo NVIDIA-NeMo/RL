@@ -792,6 +792,10 @@ class AsyncTrajectoryCollector:
                 greedy=False,
                 reward_penalty_config=self.master_config.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
+                mask_env_flagged_samples=self.master_config.grpo.get(
+                    "mask_env_flagged_samples"
+                )
+                is not False,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
