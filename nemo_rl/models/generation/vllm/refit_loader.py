@@ -123,6 +123,28 @@ class VllmShardedExpertRefitMixin:
                 "local_expert_ids": local_expert_ids,
             }
 
+        # parse_hf_expert_weight() builds its lookup key by hardcoding the
+        # ".routed_experts." segment that vLLM 0.25 introduced, while these keys
+        # come from real named_parameters(). This is the one place that sees
+        # both sides, so check them here: on a mismatch every HF expert weight
+        # would map to a non-existent parameter,
+        # select_hf_weight_for_vllm_target() would return None for all of them,
+        # and the checkpoint-engine sender would drop them silently -- the
+        # engine would then serve stale experts for the whole run with no
+        # exception and no warning, since there is no require_complete()
+        # equivalent on this path.
+        if expert_params and not all(
+            ".routed_experts." in name for name in expert_params
+        ):
+            raise RuntimeError(
+                "vLLM expert parameters are not under the expected "
+                "'.routed_experts.' submodule (saw "
+                f"{sorted(expert_params)[:3]}). parse_hf_expert_weight() would map "
+                "every HF expert weight to a non-existent parameter and the "
+                "checkpoint-engine sender would silently skip them, leaving the "
+                "engine serving stale experts."
+            )
+
         return {
             "expert_params": expert_params,
             "missing_weight_prefixes": get_pp_missing_layer_names(
