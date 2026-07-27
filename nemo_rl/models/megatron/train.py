@@ -74,13 +74,15 @@ def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
     input_ids_cp_sharded: torch.Tensor,
-    position_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    labels_cp_sharded: Optional[torch.Tensor] = None,
+    loss_mask_cp_sharded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -96,10 +98,17 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        labels_cp_sharded: Target-aligned labels for direct MCore loss computation
+        loss_mask_cp_sharded: Target-aligned mask for direct MCore loss computation
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
     """
+    if (labels_cp_sharded is None) != (loss_mask_cp_sharded is None):
+        raise ValueError(
+            "labels_cp_sharded and loss_mask_cp_sharded must be provided together"
+        )
+
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
@@ -111,13 +120,15 @@ def model_forward(
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
 
-    # Pass MTP loss mask to exclude prompt tokens from MTP loss
-    if mtp_loss_mask is not None:
+    if labels_cp_sharded is not None:
+        additional_kwargs["labels"] = labels_cp_sharded
+        additional_kwargs["loss_mask"] = loss_mask_cp_sharded
+    elif mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
-    if use_fused_linear_logprobs:
+    if use_fused_linear_logprobs and labels_cp_sharded is None:
         additional_kwargs["labels"] = input_ids_cp_sharded
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
@@ -202,6 +213,8 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
+    labels_cp_sharded = processed_mb.labels_cp_sharded
+    loss_mask_cp_sharded = processed_mb.loss_mask_cp_sharded
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
 
     if use_router_replay:
@@ -226,6 +239,8 @@ def forward_with_post_processing_fn(
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                labels_cp_sharded=labels_cp_sharded,
+                loss_mask_cp_sharded=loss_mask_cp_sharded,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -259,7 +274,7 @@ def forward_with_post_processing_fn(
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
-    if isinstance(
+    if labels_cp_sharded is None and isinstance(
         post_processing_fn,
         (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
@@ -275,6 +290,7 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            prepacked_loss_mask=loss_mask_cp_sharded,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -416,6 +432,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        prepacked_loss_mask: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -428,10 +445,55 @@ class LossPostProcessor:
             packed_seq_params: Parameters for packed sequences (optional)
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
+            prepacked_loss_mask: CP-local target-aligned mask when MCore returned
+                per-token losses for a direct packed row
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
+        if prepacked_loss_mask is not None:
+            if global_valid_toks is None:
+                raise ValueError(
+                    "global_valid_toks is required for direct packed model loss"
+                )
+
+            def _direct_packed_model_loss(
+                model_losses: torch.Tensor,
+            ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+                if model_losses.shape != prepacked_loss_mask.shape:
+                    raise ValueError(
+                        "loss and loss mask shapes must match for direct packed "
+                        f"SFT: loss={tuple(model_losses.shape)}, "
+                        f"mask={tuple(prepacked_loss_mask.shape)}"
+                    )
+                mask = prepacked_loss_mask.to(
+                    device=model_losses.device, dtype=torch.float32
+                )
+                normalizer = global_valid_toks.to(
+                    device=model_losses.device, dtype=torch.float32
+                ).clamp(min=1)
+                loss = (model_losses.float() * mask).sum() / normalizer
+                metrics: Dict[str, Any] = {
+                    "loss": loss.detach(),
+                    "num_unmasked_tokens": mask.sum().detach(),
+                }
+                if "sample_mask" in data_dict:
+                    metrics["num_valid_samples"] = (
+                        data_dict["sample_mask"].sum().detach()
+                    )
+                return loss, metrics
+
+            cp_size = get_context_parallel_world_size()
+            num_microbatches = self.num_microbatches
+
+            def _counteract_direct_mcore_loss_averaging(
+                model_losses: torch.Tensor,
+            ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+                loss, metrics = _direct_packed_model_loss(model_losses)
+                return loss * num_microbatches / cp_size, metrics
+
+            return _counteract_direct_mcore_loss_averaging
+
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
         if self.prepare_fn is not None:
@@ -526,6 +588,22 @@ class LossPostProcessor:
         loss_fn_wrapped = _counteract_mcore_loss_averaging
 
         return loss_fn_wrapped
+
+
+def should_reduce_loss_across_context_parallel(
+    data: BatchedDataDict[Any] | dict[str, Any],
+) -> bool:
+    """Return whether scalar loss reporting must include context-parallel ranks."""
+    return "packed_cu_seqlens" in data and "target_ids" in data
+
+
+def strip_context_parallel_local_loss_metric(
+    metrics: Dict[str, List[Any]], enabled: bool
+) -> Dict[str, List[Any]]:
+    """Remove CP-local loss after it contributes to the global reduction."""
+    if enabled:
+        metrics.pop("loss", None)
+    return metrics
 
 
 class LogprobsPostProcessor:

@@ -217,6 +217,52 @@ class TestModelForward:
             model.call_args.kwargs["loss_mask"] is loss_mask,
         ) == (True, True)
 
+    def test_direct_labels_take_precedence_over_fused_linear_logprobs(self):
+        from nemo_rl.models.megatron.train import model_forward
+
+        model = MagicMock(return_value=torch.ones(1, 4))
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        labels = torch.tensor([[2, 3, 4, -100]])
+        loss_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+
+        model_forward(
+            model=model,
+            data_dict=data,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            position_ids=torch.tensor([[0, 1, 2, 3]]),
+            attention_mask=None,
+            labels_cp_sharded=labels,
+            loss_mask_cp_sharded=loss_mask,
+            use_fused_linear_logprobs=True,
+        )
+
+        assert model.call_args.kwargs["labels"] is labels
+        assert "return_logprobs_for_linear_ce_fusion" not in model.call_args.kwargs
+
+    def test_mtp_mask_remains_compatible_with_fused_linear_logprobs(self):
+        from nemo_rl.models.megatron.train import model_forward
+
+        model = MagicMock(return_value=torch.ones(1, 4))
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        mtp_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+
+        model_forward(
+            model=model,
+            data_dict=data,
+            input_ids_cp_sharded=input_ids,
+            position_ids=torch.tensor([[0, 1, 2, 3]]),
+            attention_mask=None,
+            mtp_loss_mask=mtp_mask,
+            use_fused_linear_logprobs=True,
+        )
+
+        assert model.call_args.kwargs["labels"] is input_ids
+        assert model.call_args.kwargs["loss_mask"] is mtp_mask
+        assert model.call_args.kwargs["return_logprobs_for_linear_ce_fusion"] is True
+
 
 class TestApplyTemperatureScaling:
     """Tests for apply_temperature_scaling function."""

@@ -13,8 +13,10 @@
 # limitations under the License.
 import os
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, fields
-from typing import Optional
+from functools import partial
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -27,6 +29,7 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -84,6 +87,40 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+
+
+def _build_sft_collate_fn(
+    policy_config: PolicyConfig,
+    cluster_config: ClusterConfig,
+) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+    context_parallel_size = None
+    data_parallel_size = None
+    if megatron_cfg.get("enabled", False):
+        tensor_parallel_size = int(megatron_cfg.get("tensor_model_parallel_size", 1))
+        pipeline_parallel_size = int(
+            megatron_cfg.get("pipeline_model_parallel_size", 1)
+        )
+        context_parallel_size = int(megatron_cfg.get("context_parallel_size", 1))
+        model_parallel_size = (
+            tensor_parallel_size * pipeline_parallel_size * context_parallel_size
+        )
+        world_size = int(cluster_config["num_nodes"]) * int(
+            cluster_config["gpus_per_node"]
+        )
+        if world_size % model_parallel_size != 0:
+            raise ValueError(
+                "SFT cluster world size must be divisible by TP * PP * CP to "
+                "preserve Megatron SFT DP-strided row order: "
+                f"world_size={world_size}, model_parallel_size={model_parallel_size}"
+            )
+        data_parallel_size = world_size // model_parallel_size
+
+    return partial(
+        rl_collate_fn,
+        megatron_sft_dp_stride_size=data_parallel_size,
+        megatron_sft_context_parallel_size=context_parallel_size,
+    )
 
 
 # =======================================================
@@ -151,11 +188,12 @@ def setup(
     # ==========================
     #           Data
     # ==========================
+    sft_collate_fn = _build_sft_collate_fn(policy_config, cluster_config)
     train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
         shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
+        collate_fn=sft_collate_fn,
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
@@ -168,7 +206,7 @@ def setup(
             val_dataset,
             batch_size=sft_config.val_global_batch_size,
             shuffle=False,
-            collate_fn=rl_collate_fn,
+            collate_fn=sft_collate_fn,
             drop_last=False,
             num_workers=data_config["num_workers"],
         )
@@ -284,32 +322,35 @@ def validate(
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
-            ## add loss mask based on role to every message
-            add_loss_mask_to_message_log(
-                val_batch["message_log"],
-                roles_to_train_on=["assistant"],
-                only_unmask_final=master_config.sft.only_unmask_final,
-            )
+            if "packed_cu_seqlens" in val_batch:
+                val_data = val_batch
+            else:
+                ## add loss mask based on role to every message
+                add_loss_mask_to_message_log(
+                    val_batch["message_log"],
+                    roles_to_train_on=["assistant"],
+                    only_unmask_final=master_config.sft.only_unmask_final,
+                )
 
-            cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                val_batch["message_log"],
-                pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                make_sequence_length_divisible_by=master_config.policy[
-                    "make_sequence_length_divisible_by"
-                ],
-            )
+                cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+                    val_batch["message_log"],
+                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    make_sequence_length_divisible_by=master_config.policy[
+                        "make_sequence_length_divisible_by"
+                    ],
+                )
 
-            val_data: BatchedDataDict = BatchedDataDict(
-                {
-                    "input_ids": cat_and_padded["token_ids"],
-                    "input_lengths": input_lengths,
-                    "token_mask": cat_and_padded["token_loss_mask"],
-                    "sample_mask": val_batch["loss_multiplier"],
-                }
-            )
+                val_data = BatchedDataDict(
+                    {
+                        "input_ids": cat_and_padded["token_ids"],
+                        "input_lengths": input_lengths,
+                        "token_mask": cat_and_padded["token_loss_mask"],
+                        "sample_mask": val_batch["loss_multiplier"],
+                    }
+                )
 
-            # update multimodal data
-            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+                # update multimodal data
+                val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
             # When running validation with drop_last=False, we might end up with a partial batch.
             # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
             if val_data.size < val_batch_size:
@@ -440,32 +481,37 @@ def sft_train(
                 # Prepare batch and generate responses
                 print("▶ Preparing batch...")
                 with timer.time("data_processing"):
-                    ## add loss mask based on role to every message
-                    add_loss_mask_to_message_log(
-                        batch["message_log"],
-                        roles_to_train_on=["assistant"],
-                        only_unmask_final=master_config.sft.only_unmask_final,
-                    )
+                    if "packed_cu_seqlens" in batch:
+                        train_data = batch
+                    else:
+                        ## add loss mask based on role to every message
+                        add_loss_mask_to_message_log(
+                            batch["message_log"],
+                            roles_to_train_on=["assistant"],
+                            only_unmask_final=master_config.sft.only_unmask_final,
+                        )
 
-                    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                        batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config.policy[
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
+                        cat_and_padded, input_lengths = (
+                            batched_message_log_to_flat_message(
+                                batch["message_log"],
+                                pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                                make_sequence_length_divisible_by=master_config.policy[
+                                    "make_sequence_length_divisible_by"
+                                ],
+                            )
+                        )
 
-                    train_data: BatchedDataDict = BatchedDataDict(
-                        {
-                            "input_ids": cat_and_padded["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": cat_and_padded["token_loss_mask"],
-                            "sample_mask": batch["loss_multiplier"],
-                        }
-                    )
-                    train_data.update(
-                        cat_and_padded.get_multimodal_dict(as_tensors=False)
-                    )
+                        train_data = BatchedDataDict(
+                            {
+                                "input_ids": cat_and_padded["token_ids"],
+                                "input_lengths": input_lengths,
+                                "token_mask": cat_and_padded["token_loss_mask"],
+                                "sample_mask": batch["loss_multiplier"],
+                            }
+                        )
+                        train_data.update(
+                            cat_and_padded.get_multimodal_dict(as_tensors=False)
+                        )
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):

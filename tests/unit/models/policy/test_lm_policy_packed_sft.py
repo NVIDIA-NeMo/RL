@@ -130,3 +130,11 @@ def test_direct_packed_rows_reject_missing_target_aligned_field():
 
     with pytest.raises(ValueError, match=r"missing required fields.*target_ids"):
         policy.train(batch, MagicMock())
+
+
+def test_direct_packed_rows_reject_draft_training():
+    policy = _policy()
+    policy.cfg["draft"] = {"enabled": True}
+
+    with pytest.raises(NotImplementedError, match="draft training"):
+        policy.train(_direct_batch(), MagicMock())
