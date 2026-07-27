@@ -3093,8 +3093,10 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
             )
 
     synchronizer = MagicMock()
-    nemo_gym_actor = object()
-    spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
+    # is_sharded=False is what an unsharded job returns, and it lets the real
+    # agent-coverage check take its early return instead of scanning a mock dataset.
+    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
@@ -3117,7 +3119,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     monkeypatch.setattr(
         grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
     )
-    monkeypatch.setattr(grpo_mod, "spinup_nemo_gym_actor", spinup_nemo_gym_actor)
+    monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2
@@ -3131,12 +3133,12 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     ]
     assert inference_cluster.kwargs["node_resource_constraints"] is None
     assert result[1].dp_openai_server_base_urls == ["http://dynamo-wrapper.example/v1"]
-    assert result[2] is nemo_gym_actor
+    assert result[2] is nemo_gym_shard_set
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
     synchronizer.init_communicator.assert_called_once_with()
-    spinup_nemo_gym_actor.assert_called_once_with(
+    build_nemo_gym_actors.assert_called_once_with(
         master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],
         model_name=master_config.policy["model_name"],
@@ -3456,8 +3458,10 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def get_refit_payload_mode(self):
             return "hf_export"
 
-    nemo_gym_actor = object()
-    spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
+    # is_sharded=False is what an unsharded job returns, and it lets the real
+    # agent-coverage check take its early return instead of scanning a mock dataset.
+    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
@@ -3473,7 +3477,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         "TrtllmGeneration",
         lambda *_args, **_kwargs: DummyTrtllmGeneration(),
     )
-    monkeypatch.setattr(grpo_mod, "spinup_nemo_gym_actor", spinup_nemo_gym_actor)
+    monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
 
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
@@ -3514,8 +3518,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     tokenizer = MagicMock()
     result = grpo_mod.setup(master_config, tokenizer, dataset, None)
 
-    assert result[2] is nemo_gym_actor
-    spinup_nemo_gym_actor.assert_called_once_with(
+    assert result[2] is nemo_gym_shard_set
+    build_nemo_gym_actors.assert_called_once_with(
         master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
