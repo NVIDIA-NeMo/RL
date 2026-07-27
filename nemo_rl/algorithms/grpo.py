@@ -593,11 +593,17 @@ def setup(
         """Spin up the NeMo Gym actor against the given generation server URLs."""
         t0 = time.perf_counter()
         enable_router_replay = router_replay_enabled(policy_config)
+        routed_experts_dtype=(
+            resolve_routed_experts_dtype_name_for_model(model_name)
+            if enable_router_replay else "int16"
+        )
         actor = spinup_nemo_gym_actor(
             env_configs=env_configs,
             base_urls=base_urls,
             model_name=model_name,
             enable_router_replay=enable_router_replay,
+            routed_experts_dtype=routed_experts_dtype,
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
         return actor, time.perf_counter() - t0
 
