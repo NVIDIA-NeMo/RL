@@ -87,7 +87,12 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    build_nemo_gym_actors,
+    should_use_nemo_gym,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -644,8 +649,8 @@ def _spinup_gym(
     master_config: MasterConfig,
     base_urls: list[str],
     tokenizer: PreTrainedTokenizerBase,
-) -> tuple[Any, float]:
-    """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
+) -> tuple[NemoGymShardSet, float]:
+    """Spin up the NeMo-Gym shard set against the reserved vLLM URLs.
 
     Args:
         master_config: SC MasterConfig.
@@ -654,21 +659,21 @@ def _spinup_gym(
             call. See NemoGym.set_tokenizer.
 
     Returns:
-        A tuple of (NeMo-Gym actor, wall time spent in this call).
+        A tuple of (NeMo-Gym shard set, wall time spent in this call).
     """
     t0 = time.perf_counter()
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
-    actor = spinup_nemo_gym_actor(
-        env_configs=master_config.env,
+    shard_set = build_nemo_gym_actors(
+        master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
     )
-    return actor, time.perf_counter() - t0
+    return shard_set, time.perf_counter() - t0
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -1255,6 +1260,8 @@ def setup_single_controller(
 
     # Submit build tasks and get results
     weight_synchronizer: Optional[WeightSynchronizer] = None
+    submitted: dict[str, Any] = {}
+    nemo_gym_shards = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
@@ -1288,8 +1295,23 @@ def setup_single_controller(
                 weight_synchronizer.sync_weights()
                 setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
             if use_nemo_gym:
-                env_handles["nemo_gym"], gym_time = submitted["nemo_gym"].result()
+                nemo_gym_shards, gym_time = submitted["nemo_gym"].result()
+                validate_dataset_agent_coverage(
+                    nemo_gym_shards,
+                    {"training": dataset, "validation": _val_dataset},
+                )
+                env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time
+    except BaseException:
+        if use_nemo_gym:
+            if nemo_gym_shards is None and "nemo_gym" in submitted:
+                try:
+                    nemo_gym_shards, _ = submitted["nemo_gym"].result()
+                except BaseException:
+                    pass
+            if nemo_gym_shards is not None:
+                nemo_gym_shards.shutdown()
+        raise
     finally:
         if megatron_port_holder is not None:
             # Rank 0 adopted (or will never adopt) the held socket; drop the holder.
