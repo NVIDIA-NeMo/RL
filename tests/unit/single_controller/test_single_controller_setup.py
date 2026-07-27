@@ -71,6 +71,7 @@ def _make_master_config(
             "train_global_batch_size": num_prompts_per_step * 2,
             "max_total_sequence_length": 32,
             "megatron_cfg": {"enabled": megatron_enabled},
+            "tokenizer": {},
             "generation": {
                 "backend": backend,
                 "colocated": {"enabled": colocated, "resources": {}},
@@ -415,12 +416,13 @@ class TestSetup:
             actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         mock_spinup.assert_called_once_with(
-            env_configs=mc.env,
+            mc.env,
             base_urls=patched_factories[
                 "_build_generation"
             ].return_value.dp_openai_server_base_urls,
             model_name="test-model",
             enable_router_replay=False,
+            use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 

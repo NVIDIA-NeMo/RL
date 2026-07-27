@@ -25,7 +25,6 @@ import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -34,7 +33,9 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import make_actor_runtime_env
+
+NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 
 # Kept local (not imported from models.generation) so the gym actor stays free of
 # generation-module imports. Must cover every name resolve_routed_experts_dtype
@@ -609,17 +610,19 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_token_ids"] = None
 
 
-def spinup_nemo_gym_actor(
+def build_nemo_gym_config(
     env_configs: dict[str, Any],
+    *,
     base_urls: list[Optional[str]],
     model_name: str,
-    enable_router_replay: bool,
-) -> Any:
-    """Spin up the NeMo-Gym actor against the given generation server URLs.
+    enable_router_replay: bool = False,
+    use_fastokens: bool = False,
+) -> NemoGymConfig:
+    """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
 
-    When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
-    scheduled with soft NodeAffinity to the current Ray node so its colocated
-    GPU resources land where the caller expects.
+    Splits ``env_configs["nemo_gym"]`` into the NeMo-RL-side fields the actor
+    reads directly and the remainder, which is forwarded verbatim as NeMo-Gym's
+    initial global config.
 
     Args:
         env_configs: The ``master_config.env`` mapping; ``env_configs["nemo_gym"]``
@@ -628,11 +631,10 @@ def spinup_nemo_gym_actor(
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the
             generation backend.
         model_name: Served model name the Gym rollouts should target.
-        enable_router_replay: Sets ``require_routed_experts`` on the
-            ``NemoGymConfig``.
-
-    Returns:
-        The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
+        enable_router_replay: Sets ``require_routed_experts`` and selects the
+            routed-experts carry dtype for the model.
+        use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
+            actor patches its tokenizer the same way the driver does.
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
@@ -650,35 +652,60 @@ def spinup_nemo_gym_actor(
     if uv_venv_dir is not None:
         nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
 
-    nemo_gym_cfg = NemoGymConfig(
+    routed_experts_dtype = "int16"
+    if enable_router_replay:
+        # Deferred so the actor module stays free of generation-package imports.
+        from nemo_rl.models.generation.interfaces import (
+            resolve_routed_experts_dtype_name_for_model,
+        )
+
+        routed_experts_dtype = resolve_routed_experts_dtype_name_for_model(model_name)
+
+    return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         require_routed_experts=enable_router_replay,
+        routed_experts_dtype=routed_experts_dtype,
+        use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
     )
 
-    nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
-    if nemo_gym_py_exec.startswith("uv"):
-        nemo_gym_py_exec = create_local_venv_on_each_node(
-            nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
-        )
 
-    nemo_gym_opts: dict[str, Any] = {}
-    if nemo_gym_dict.get("num_gpu_nodes", 0):
+def spinup_nemo_gym_actor(
+    env_configs: dict[str, Any],
+    *,
+    base_urls: list[Optional[str]],
+    model_name: str,
+    enable_router_replay: bool = False,
+    use_fastokens: bool = False,
+) -> Any:
+    """Spin up the NeMo-Gym actor against the given generation server URLs.
+
+    When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
+    scheduled with soft NodeAffinity to the caller's Ray node so its colocated
+    GPU resources land where the caller expects.
+
+    Returns:
+        The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
+    """
+    nemo_gym_cfg = build_nemo_gym_config(
+        env_configs,
+        base_urls=base_urls,
+        model_name=model_name,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+    )
+
+    nemo_gym_opts: dict[str, Any] = {
+        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+    }
+    if env_configs["nemo_gym"].get("num_gpu_nodes", 0):
         nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
             node_id=ray.get_runtime_context().get_node_id(),
             soft=True,
         )
-    nemo_gym_opts["runtime_env"] = {
-        "py_executable": nemo_gym_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": nemo_gym_py_exec,
-            "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-        },
-    }
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
     ray.get(actor._spinup.remote())
