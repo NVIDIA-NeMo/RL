@@ -294,6 +294,30 @@ def test_generation_lifecycle_routes_by_colocation(
     )
 
 
+def test_prepare_refit_info_skips_missing_metadata_and_dispatches_present_metadata(
+    monkeypatch,
+):
+    generation = _bare_generation()
+    ray_get = MagicMock()
+    monkeypatch.setattr(trtllm_generation.ray, "get", ray_get)
+
+    assert generation.prepare_refit_info(None) is None
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
+    ray_get.assert_not_called()
+
+    state_dict_info = {"weight": {"shape": [2, 2]}}
+    futures = [SimpleNamespace()]
+    generation.worker_group.run_all_workers_single_data.return_value = futures
+
+    assert generation.prepare_refit_info(state_dict_info) is None
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "prepare_refit_info_async",
+        state_dict_info=state_dict_info,
+        run_rank_0_only_axes=["tensor_parallel"],
+    )
+    ray_get.assert_called_once_with(futures)
+
+
 @pytest.mark.parametrize(
     ("in_flight", "recompute_kv", "expected_drain"),
     [(False, False, True), (True, False, False), (True, True, False)],
