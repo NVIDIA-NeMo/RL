@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from megatron.training.datasets.sft_dataset import SFTDataset
 
 from nemo_rl.data.datasets.response_datasets import (
     DATASET_REGISTRY,
@@ -47,6 +48,54 @@ class _DummyTokenizer:
         return self.unk_token_id
 
 
+class _MegatronTokenizer:
+    eod = 2
+    pad = 99
+
+    def __init__(self, turn_tokens: dict[tuple[str, str], list[int]]) -> None:
+        self.turn_tokens = turn_tokens
+
+    def tokenize_conversation(
+        self,
+        conversation: list[dict[str, Any]],
+        return_target: bool,
+        add_generation_prompt: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert return_target is True
+        assert add_generation_prompt is False
+        tokens = np.asarray(
+            [
+                token_id
+                for message in conversation
+                for token_id in self.turn_tokens[(message["role"], message["content"])]
+            ]
+        )
+        return tokens, tokens.copy()
+
+
+class _MegatronConfig:
+    def __init__(
+        self,
+        tokenizer: _MegatronTokenizer,
+        sequence_length: int,
+        context_parallel_size: int,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.sequence_length = sequence_length
+        self.context_parallel_size = context_parallel_size
+        self.reset_position_ids = False
+        self.create_attention_mask = False
+        self.reset_attention_mask = False
+
+
+class _MegatronLowLevelDataset:
+    def __init__(self, messages: list[dict[str, str]]) -> None:
+        self.messages = messages
+
+    def __getitem__(self, _idx: int) -> list[dict[str, str]]:
+        return self.messages
+
+
 def _preprocess(
     messages: list[dict[str, str]],
     tokenizer: _DummyTokenizer,
@@ -68,6 +117,24 @@ def _dataset_parser() -> MegatronSFTPackedDataset:
     dataset.chat_key = "messages"
     dataset.task_name = "megatron_sft_packed"
     return dataset
+
+
+def _megatron_preprocess(
+    messages: list[dict[str, str]],
+    tokenizer: _MegatronTokenizer,
+    max_seq_length: int,
+    context_parallel_size: int = 1,
+) -> dict[str, torch.Tensor]:
+    dataset = SFTDataset.__new__(SFTDataset)
+    dataset.dataset = _MegatronLowLevelDataset(messages)
+    dataset.indices = np.asarray([0])
+    dataset.num_samples = 1
+    dataset.config = _MegatronConfig(
+        tokenizer,
+        sequence_length=max_seq_length,
+        context_parallel_size=context_parallel_size,
+    )
+    return dataset[0]
 
 
 def test_split_megatron_sft_conversations_starts_each_segment_at_system() -> None:
@@ -127,29 +194,36 @@ def test_dataset_parser_rejects_invalid_packed_rows(
         _dataset_parser().format_data({"messages": messages})
 
 
-def test_packed_preprocessor_appends_eod_and_applies_global_target_shift() -> None:
+def test_packed_preprocessor_matches_megatron_without_appending_eod() -> None:
     messages = [
         {"role": "system", "content": "s"},
         {"role": "user", "content": "u"},
         {"role": "assistant", "content": "a"},
     ]
-    tokenizer = _DummyTokenizer(
-        {("system", "s"): [10], ("user", "u"): [20], ("assistant", "a"): [30]}
-    )
+    turn_tokens = {
+        ("system", "s"): [10],
+        ("user", "u"): [20],
+        ("assistant", "a"): [30],
+    }
 
     processed = _preprocess(
         messages,
-        tokenizer,
+        _DummyTokenizer(turn_tokens),
         max_seq_length=5,
         prompt_format="identity",
     )
+    megatron_processed = _megatron_preprocess(
+        messages,
+        _MegatronTokenizer(turn_tokens),
+        max_seq_length=5,
+    )
 
-    assert torch.equal(processed["input_ids"], torch.tensor([10, 20, 30, 2, 99]))
-    assert torch.equal(processed["target_ids"], torch.tensor([20, 30, 2, 99, 99]))
-    assert torch.equal(processed["token_mask"], torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0]))
-    assert torch.equal(processed["position_ids"], torch.arange(5))
+    assert torch.equal(processed["input_ids"], megatron_processed["tokens"])
+    assert torch.equal(processed["target_ids"], megatron_processed["labels"])
+    assert torch.equal(processed["token_mask"], megatron_processed["loss_mask"])
+    assert torch.equal(processed["position_ids"], megatron_processed["position_ids"])
     assert torch.equal(processed["packed_cu_seqlens"], torch.tensor([0, 5]))
-    assert processed["packed_max_seqlen"] == 5
+    assert processed["packed_max_seqlen"] == megatron_processed["max_seqlen"].item()
 
 
 def test_packed_preprocessor_does_not_duplicate_existing_eod() -> None:
