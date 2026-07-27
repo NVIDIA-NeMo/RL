@@ -187,7 +187,9 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
-        self, *args: Any, **kwargs: Any
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         pass
 

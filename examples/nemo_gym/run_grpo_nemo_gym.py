@@ -44,7 +44,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
 )
-from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
+from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -88,13 +88,15 @@ def collect_trajectories(
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
     for val_batch in val_dataloader:
-        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
             policy_generation=policy_generation,
             input_batch=val_batch,
             tokenizer=tokenizer,
             task_to_env=val_task_to_env,
             max_seq_len=master_config.policy["max_total_sequence_length"],
             generation_config=generation_config,
+            # This utility consumes the Tables below to write its trajectory JSONL.
+            log_full_result_tables=True,
             max_rollout_turns=None,
             greedy=False,
         )
@@ -152,12 +154,24 @@ def main() -> None:
         )
 
     with rl_init_timer.time("tokenizer"):
+        # setup tokenizer
         tokenizer = get_tokenizer(config.policy["tokenizer"])
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
+        has_refit_draft_weights = (
+            "draft" in config.policy and config.policy["draft"]["enabled"]
+        )
+        trains_mtp = (
+            "megatron_cfg" in config.policy
+            and config.policy["megatron_cfg"]["enabled"]
+            and bool(config.policy["megatron_cfg"].get("mtp_num_layers"))
+        )
         config.policy["generation"] = configure_generation_config(
-            config.policy["generation"], tokenizer
+            config.policy["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+            trains_mtp=trains_mtp,
         )
 
         # NeMo-Gym specific config setup.
@@ -232,7 +246,7 @@ The validation set you pass in will directly be used for validation with no addi
 
     # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
     # Bind task_to_env and val_task_to_env for the nemo_gym env.
-    # Hardcode here to match `run_async_nemo_gym_rollout`.
+    # NeMo-Gym is the only environment used by this runner.
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
