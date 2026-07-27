@@ -137,8 +137,10 @@ class PPLossAdapter:
     This adapter indexes into pre-chunked RL tensors to compute the loss for
     each microbatch.
 
-    **Critical**: The loss is scaled by ``dp_size * cp_size`` to cancel FSDP's
-    automatic gradient averaging, matching the non-PP path.
+    **Critical**: The loss is normally scaled by ``dp_size * cp_size`` to
+    cancel FSDP's automatic gradient averaging, matching the non-PP path. GLM
+    DSA's gathered-logits path uses ``dp_size`` because the differentiable
+    all-gather already sums identical loss gradients across CP ranks.
     """
 
     def __init__(
@@ -166,6 +168,11 @@ class PPLossAdapter:
         # GLM DSA CP shards the sequence contiguously; logits are all-gathered
         # back to the global layout here and the loss then runs as if cp=1.
         self._glm_dsa_cp_group = glm_dsa_cp_group
+        self._loss_scale = (
+            self._dp_size
+            if self._glm_dsa_cp_group is not None
+            else self._dp_size * self._cp_size
+        )
 
         self._microbatches: list[dict[str, Any]] = []
         self._cu_seqlens_list: list[Optional[torch.Tensor]] = []
@@ -176,6 +183,11 @@ class PPLossAdapter:
         self._global_valid_toks: Optional[torch.Tensor] = None
         self._num_global_batches: int = 1
         self._context_parallel_group: Any = None
+
+    @property
+    def loss_scale(self) -> int:
+        """Scale applied to the loss returned to the PP schedule."""
+        return self._loss_scale
 
     def set_microbatches(
         self,
@@ -299,8 +311,9 @@ class PPLossAdapter:
 
         self._all_metrics.append(loss_metrics)
 
-        # Scale loss to cancel FSDP's automatic gradient averaging
-        return loss * self._dp_size * self._cp_size
+        # Scale loss to cancel FSDP averaging. The GLM gathered-logits path
+        # excludes CP because all-gather backward already contributes a CP SUM.
+        return loss * self._loss_scale
 
     def reset(self) -> None:
         """Reset state for the next forward-backward call."""
@@ -672,9 +685,7 @@ def pp_forward_with_post_processing(
         # models (e.g. GLM DSA with TileLang kernels) get cu_seqlens/qkv_format.
         actual_seqs = input_ids.shape[0]
         pack_model = model.parts[0]
-        glm_dsa_cp = cp_size > 1 and hasattr(
-            pack_model, "prepare_model_inputs_for_cp"
-        )
+        glm_dsa_cp = cp_size > 1 and hasattr(pack_model, "prepare_model_inputs_for_cp")
         pp_batch, _, thd_batch = prepare_pp_seqpack_batch(
             input_ids=input_ids,
             input_lengths=chunk_data["input_lengths"],

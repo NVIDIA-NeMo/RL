@@ -744,13 +744,12 @@ class DTensorPolicyWorkerV2Impl(
                             all_mb_metrics.append(m)
 
                 if not eval_mode:
-                    # PP gradient scaling: each schedule.step() scales loss by
-                    # dp_size*cp_size (cancelling FSDP averaging), matching the
-                    # non-PP path. Set num_label_tokens = dp_group_size so the
-                    # PP scaling in scale_grads_and_clip_grad_norm is a no-op
+                    # PPLossAdapter scales the loss to cancel FSDP averaging;
+                    # GLM gathered logits additionally compensate for the CP SUM
+                    # performed by all-gather backward. dp_group_size remains the
+                    # actual DP*CP mesh size, so the PP scaling below is a no-op
                     # (divides by 1). Gradient accumulation naturally sums across
-                    # steps — this matches non-PP behavior where the full batch
-                    # gradient is computed in one pass.
+                    # steps, matching the non-PP full-batch computation.
                     dp_group_size = self.dp_size * self.cp_size
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
@@ -776,8 +775,8 @@ class DTensorPolicyWorkerV2Impl(
                     self._update_moe_gate_bias_if_supported()
 
                 # Broadcast loss from last PP stage so all ranks report correct value.
-                # Undo dp*cp scaling from PPLossAdapter (needed for FSDP grad averaging
-                # during training, but not for the reported loss).
+                # Undo the exact scaling applied by PPLossAdapter. This is dp*cp
+                # normally and dp for GLM's gathered-logits loss path.
                 if self.pp_size > 1:
                     loss_tensor = gb_total_loss.unsqueeze(0)
                     broadcasted = broadcast_tensors_from_last_pp_stage(
@@ -785,8 +784,8 @@ class DTensorPolicyWorkerV2Impl(
                         self.pp_mesh,
                         self.has_last_stage,
                     )
-                    gb_total_loss = broadcasted["loss"].squeeze(0) / (
-                        self.dp_size * self.cp_size
+                    gb_total_loss = (
+                        broadcasted["loss"].squeeze(0) / loss_adapter.loss_scale
                     )
                 losses.append(gb_total_loss.item())
 
@@ -840,9 +839,7 @@ class DTensorPolicyWorkerV2Impl(
             max_seq = torch.tensor([seq_dim_size], device="cuda")
             torch.distributed.all_reduce(max_seq, op=torch.distributed.ReduceOp.MAX)
             seq_dim_size = int(max_seq.item())
-            return_data = self._get_logprobs_pp(
-                data, logprob_batch_size, seq_dim_size
-            )
+            return_data = self._get_logprobs_pp(data, logprob_batch_size, seq_dim_size)
             self.timer.stop("get_logprobs")
             return return_data
 
