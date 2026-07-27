@@ -152,7 +152,7 @@ def _tokenize_megatron_sft_conversation(
         if role == "assistant" and len(turn["content"]) == 0:
             raise ValueError(f"empty assistant turn in conversation: {conversation}.")
         if role == "assistant":
-            assert conversation[turn_idx - 1]["role"].lower() == "user"
+            assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
         turn_tokens = _normalize_token_ids(
             tokenizer.apply_chat_template(
@@ -165,7 +165,7 @@ def _tokenize_megatron_sft_conversation(
             turn_tokens = turn_tokens[1:]
         turn_len = len(turn_tokens)
 
-        if role in ("system", "user"):
+        if role in ("system", "user", "tool"):
             targets[idx : idx + turn_len] = [IGNORE_INDEX] * turn_len
         elif role == "assistant":
             prefix_len = prompt_config.assistant_prefix_len
