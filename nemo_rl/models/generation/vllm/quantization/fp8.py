@@ -23,6 +23,7 @@ from transformers import AutoConfig, AutoModel
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -30,6 +31,8 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
+
+logger = init_logger(__name__)
 
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
@@ -690,6 +693,16 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             kernel = FlashInferCutlassMxfp8LinearKernel(kernel.config)
             self.kernel = kernel
             kernel_name = type(kernel).__name__
+            # Record it: this demotes vLLM's first-choice MXFP8 linear kernel
+            # on every such layer, so anyone comparing NeMo-RL rollout
+            # throughput against a plain vLLM MXFP8 serve has an explanation
+            # in the log rather than only in this comment.
+            logger.warning_once(
+                "NeMo-RL MXFP8 refit requires the [N, K] weight layout; "
+                "replacing vLLM's preferred FlashInferCutedslMxfp8LinearKernel "
+                "with FlashInferCutlassMxfp8LinearKernel. Expect a rollout "
+                "throughput difference vs. plain vLLM serving."
+            )
         if kernel_name != "FlashInferCutlassMxfp8LinearKernel":
             raise AssertionError(
                 f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
