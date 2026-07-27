@@ -1038,10 +1038,13 @@ def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling
     assert torch.isclose(loss, torch.tensor(4.0 / 3.0))
 
 
-def test_direct_model_loss_reports_unscaled_loss_without_cp_local_token_count():
+def test_direct_model_loss_reports_host_scalar_diagnostics():
     _, metrics = _run_direct_model_loss()
 
-    assert metrics["loss"].item() == pytest.approx(2.0 / 3.0)
+    assert type(metrics["loss"]) is float
+    assert metrics["loss"] == pytest.approx(2.0 / 3.0)
+    assert type(metrics["num_valid_samples"]) is float
+    assert metrics["num_valid_samples"] == pytest.approx(1.0)
     assert "num_unmasked_tokens" not in metrics
 
 
