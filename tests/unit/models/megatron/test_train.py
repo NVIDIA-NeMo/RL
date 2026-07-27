@@ -499,6 +499,7 @@ class TestForwardWithPostProcessingFn:
     def test_forward_with_direct_labels_routes_model_loss_without_temperature_scaling(
         self,
     ):
+        from nemo_rl.algorithms.loss import NLLLossFn
         from nemo_rl.distributed.batched_data_dict import BatchedDataDict
         from nemo_rl.models.megatron import train as megatron_train
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -517,7 +518,7 @@ class TestForwardWithPostProcessingFn:
             loss_mask_cp_sharded=loss_mask,
         )
         processor = megatron_train.LossPostProcessor(
-            loss_fn=MagicMock(),
+            loss_fn=NLLLossFn(),
             cfg={"sequence_packing": {"enabled": True}},
         )
 
