@@ -152,15 +152,17 @@ def _register_routed_experts_quant_module() -> None:
             # incoming amax buffers).
             import importlib
 
-            packages = [modelopt_vllm.vllm_fused_moe_package]
-            try:
-                packages.append(
-                    importlib.import_module(
-                        "vllm.model_executor.layers.fused_moe.experts.triton_moe"
-                    )
-                )
-            except ImportError:
-                pass
+            # Not wrapped in try/except: swallowing an ImportError here would
+            # recreate exactly the silent failure described above. `originals`
+            # cannot catch it either, since it is non-empty as soon as
+            # vllm_fused_moe_package contributes a name, which it always does.
+            # If this module ever moves, failing loudly is the point.
+            packages = [
+                modelopt_vllm.vllm_fused_moe_package,
+                importlib.import_module(
+                    "vllm.model_executor.layers.fused_moe.experts.triton_moe"
+                ),
+            ]
             names = modelopt_vllm._FUSED_MOE_KERNEL_CANDIDATES
             originals: list[tuple[Any, str, Any]] = []
             for package in packages:
