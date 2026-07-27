@@ -279,53 +279,6 @@ def test_malformed_shards_are_rejected(shards, expected):
         parse_shard_plan({"shards": shards})
 
 
-@pytest.mark.parametrize("name", ["../judged", "team/judged", ".", ".."])
-def test_shard_names_must_be_safe_log_path_components(name):
-    with pytest.raises(ShardConfigError, match="one safe path component"):
-        parse_shard_plan(
-            _sharded_config(shards=[{"name": name, "config_paths": ["judge.yaml"]}])
-        )
-
-
-@pytest.mark.parametrize("actor_cpus", [0, -1, float("nan"), float("inf"), "8"])
-def test_actor_cpus_must_be_positive_and_finite(actor_cpus):
-    with pytest.raises(ShardConfigError, match="positive finite number"):
-        parse_shard_plan(
-            _sharded_config(
-                shards=[
-                    {
-                        "name": "judged",
-                        "config_paths": ["judge.yaml"],
-                        "actor_cpus": actor_cpus,
-                    }
-                ]
-            )
-        )
-
-
-def test_config_paths_and_port_types_are_validated_at_parse_time():
-    with pytest.raises(
-        ShardConfigError, match="config_paths must be non-empty strings"
-    ):
-        parse_shard_plan(
-            _sharded_config(shards=[{"name": "judged", "config_paths": [123]}])
-        )
-
-    with pytest.raises(ShardConfigError, match="port range must use integers"):
-        parse_shard_plan(
-            _sharded_config(
-                shards=[
-                    {
-                        "name": "judged",
-                        "config_paths": ["judge.yaml"],
-                        "port_range_low": "5000",
-                        "port_range_high": 5500,
-                    }
-                ]
-            )
-        )
-
-
 def test_shards_land_on_distinct_nodes_unless_told_otherwise():
     assert parse_shard_plan(_sharded_config()).placement_strategy == "STRICT_SPREAD"
 
@@ -380,9 +333,72 @@ def test_relaxed_placement_requires_disjoint_explicit_port_ranges():
         )
 
 
+@pytest.mark.parametrize("name", ["../judged", "team/judged", ".", ".."])
+def test_shard_names_must_be_safe_log_path_components(name):
+    with pytest.raises(ShardConfigError, match="one safe path component"):
+        parse_shard_plan(
+            _sharded_config(shards=[{"name": name, "config_paths": ["judge.yaml"]}])
+        )
+
+
+@pytest.mark.parametrize("actor_cpus", [0, -1, float("nan"), float("inf"), "8"])
+def test_actor_cpus_must_be_positive_and_finite(actor_cpus):
+    with pytest.raises(ShardConfigError, match="positive finite number"):
+        parse_shard_plan(
+            _sharded_config(
+                shards=[
+                    {
+                        "name": "judged",
+                        "config_paths": ["judge.yaml"],
+                        "actor_cpus": actor_cpus,
+                    }
+                ]
+            )
+        )
+
+
+def test_config_paths_and_port_types_are_validated_at_parse_time():
+    with pytest.raises(
+        ShardConfigError, match="config_paths must be non-empty strings"
+    ):
+        parse_shard_plan(
+            _sharded_config(shards=[{"name": "judged", "config_paths": [123]}])
+        )
+
+    with pytest.raises(ShardConfigError, match="port range must use integers"):
+        parse_shard_plan(
+            _sharded_config(
+                shards=[
+                    {
+                        "name": "judged",
+                        "config_paths": ["judge.yaml"],
+                        "port_range_low": "5000",
+                        "port_range_high": 5500,
+                    }
+                ]
+            )
+        )
+
+
 def test_an_unknown_placement_strategy_is_rejected():
     with pytest.raises(ShardConfigError, match="placement_strategy must be one of"):
         parse_shard_plan(_sharded_config(placement_strategy="SPRED"))
+
+
+def test_replicas_that_could_share_a_node_would_share_a_port_range():
+    """Replicas come from one merge, so they cannot be given separate ranges."""
+    config = _sharded_config(placement_strategy="PACK")
+    config["shards"][1]["replicas"] = 2
+
+    with pytest.raises(ShardConfigError, match=r"\['tools'\] declare replicas"):
+        parse_shard_plan(config)
+
+
+def test_replicas_are_fine_on_the_default_strategy_that_spreads_them():
+    config = _sharded_config()
+    config["shards"][1]["replicas"] = 2
+
+    assert parse_shard_plan(config).total_instances == 3
 
 
 def test_allowed_duplicate_entries_must_be_strings():
