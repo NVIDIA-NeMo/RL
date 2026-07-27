@@ -384,12 +384,12 @@ def setup_single_controller(
     if use_nemo_gym:
         # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
         # overlaps model loading instead of running serially afterward.
-        enable_router_replay = router_replay_enabled(master_config.policy)
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
-            env_configs=master_config.env,
+            master_config.env,
             base_urls=generation.dp_openai_server_base_urls,
             model_name=generation_config["model_name"],
-            enable_router_replay=enable_router_replay,
+            enable_router_replay=router_replay_enabled(master_config.policy),
+            use_fastokens=bool(master_config.policy["tokenizer"].get("use_fastokens")),
         )
 
     # ==========================
