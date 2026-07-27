@@ -93,6 +93,13 @@ class SingleControllerActor:
                 construct a bundle by hand (or with fakes) to bypass the real factories.
         """
         self._advantage_cfg = AdvantageConfig()
+        # The reference model is only built when the reference-KL penalty is
+        # active (setup.py: init_reference_model = reference_policy_kl_penalty
+        # > 0). Keep the advantage config consistent so a KL=0 run does not
+        # request reference logprobs the trainer never initialized (otherwise
+        # get_reference_policy_logprobs fails with no reference_state_dict).
+        if master_config.loss_fn.reference_policy_kl_penalty <= 0:
+            self._advantage_cfg.reference_logprobs_field = None
         self._weight_sync_cfg = WeightSyncConfig()
         self._partition_id: str = bundle.partition_id
         self._diagnostics: bool = False
@@ -401,6 +408,9 @@ class SingleControllerActor:
             groups_dispatched = 0
             min_sample_version = None
             step_open = False
+            # Observability accumulators for this training step.
+            evicted_this_step = 0
+            step_staleness: list[int] = []
 
             with self._timer.time("total_step_time"):
                 while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
@@ -412,6 +422,7 @@ class SingleControllerActor:
                         evicted = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
+                        evicted_this_step += evicted
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -483,6 +494,15 @@ class SingleControllerActor:
                             int(s) for s in train_meta.sequence_lengths
                         )
 
+                    # Per-sample staleness = current trainer version − the rollout's
+                    # START weight version (t["weight_version"] is the start version
+                    # stamped by the rollout manager). Accumulated across every
+                    # sub-batch selected for this training step.
+                    step_staleness.extend(
+                        self._trainer_version - int(t["weight_version"])
+                        for t in train_meta.tags  # type: ignore
+                    )
+
                     # Refresh min_sample_version
                     curr_min_sample_version = min(
                         t["weight_version"]
@@ -521,6 +541,17 @@ class SingleControllerActor:
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+
+                # Async observability: average staleness (by rollout start weight
+                # version) of the samples consumed this step, and how many stale
+                # prompt groups were evicted. Logged under train/ to W&B below.
+                if step_staleness:
+                    step_metrics["sample_staleness/mean"] = sum(step_staleness) / len(
+                        step_staleness
+                    )
+                    step_metrics["sample_staleness/max"] = float(max(step_staleness))
+                    step_metrics["sample_staleness/min"] = float(min(step_staleness))
+                step_metrics["evicted_groups"] = float(evicted_this_step)
 
                 self._trainer_version += 1
                 self._train_steps += 1
