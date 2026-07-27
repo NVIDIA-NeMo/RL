@@ -32,6 +32,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -939,7 +940,10 @@ class AsyncNemoGymRolloutImpl:
         group retry pays 16 generations to recover one. Completed rows are kept across
         attempts, which is the same shape as the legacy collector's pending-group retry.
         """
-        nemo_gym_env = self._task_to_env["nemo_gym"]
+        # These rows are all one prompt's generations.
+        # They share an agent and must stay on one instance.
+        shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
+        nemo_gym_env = shard_set.pick_handle(inputs[0]["agent_ref"]["name"])
         total_rows = len(inputs)
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here

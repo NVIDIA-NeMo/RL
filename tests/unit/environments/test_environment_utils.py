@@ -121,6 +121,46 @@ def test_shutdown_environments_continues_after_a_failed_kill():
     healthy.shutdown.remote.assert_called_once_with()
 
 
+class _FakeOwner:
+    """An environment that owns actors rather than being one.
+
+    Written out rather than mocked because the distinction under test is
+    precisely that ``shutdown`` is a plain method with no ``.remote``, and a
+    MagicMock grows a ``.remote`` on demand.
+    """
+
+    def __init__(self, error=None):
+        self.error = error
+        self.shutdown_calls = 0
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+        if self.error is not None:
+            raise self.error
+
+
+def test_an_owner_object_shuts_itself_down_instead_of_being_killed():
+    """A shard set holds its own actors, so only it can tear them down."""
+    shard_set = _FakeOwner()
+
+    with patch("nemo_rl.environments.utils.ray") as mock_ray:
+        shutdown_environments({"nemo_gym": shard_set})
+
+    assert shard_set.shutdown_calls == 1
+    mock_ray.get.assert_not_called()
+    mock_ray.kill.assert_not_called()
+
+
+def test_a_failed_owner_teardown_is_not_escalated_to_a_kill():
+    """There is no single handle to kill, and the owner already reported why."""
+    shard_set = _FakeOwner(error=RuntimeError("a shard would not stop"))
+
+    with patch("nemo_rl.environments.utils.ray") as mock_ray:
+        shutdown_environments({"nemo_gym": shard_set})
+
+    mock_ray.kill.assert_not_called()
+
+
 def test_shutdown_environments_tolerates_empty_input():
     with patch("nemo_rl.environments.utils.ray") as mock_ray:
         shutdown_environments(None, {})

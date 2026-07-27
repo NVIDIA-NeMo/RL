@@ -156,6 +156,10 @@ def shutdown_environments(
     in-flight HTTP requests to the vLLM endpoints, and killing generation first
     leaves them retrying dead connections.
 
+    An entry is either a Ray actor handle or a local object that owns actors of
+    its own (a NeMo-Gym shard set); the latter is asked to shut itself down
+    rather than killed, since only it knows what it holds.
+
     Args:
         env_maps: Task-name to environment mappings. ``None`` and empty
             mappings are skipped.
@@ -171,10 +175,20 @@ def shutdown_environments(
                 continue
             seen.add(id(env))
             print(f"🛑 Shutting down environment {task_name}...")
+            # An actor handle offers shutdown as a remote call; an owner object
+            # offers it as a plain method. Nothing else distinguishes them here.
+            remote_shutdown = getattr(getattr(env, "shutdown", None), "remote", None)
             try:
-                ray.get(env.shutdown.remote(), timeout=timeout)
+                if remote_shutdown is not None:
+                    ray.get(remote_shutdown(), timeout=timeout)
+                else:
+                    env.shutdown()
             except Exception as e:
                 print(f"Graceful shutdown of environment {task_name} failed: {e}")
+                if remote_shutdown is None:
+                    # Nothing to kill: the failure came from an owner object
+                    # that already tried, and reported, its own teardown.
+                    continue
                 try:
                     ray.kill(env)
                 except Exception as kill_error:
