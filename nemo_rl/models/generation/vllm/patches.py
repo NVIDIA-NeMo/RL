@@ -71,7 +71,7 @@ def _locked_file_patch(file_path: str):
 
 def _patch_vllm_init_workers_ray(
     py_executable: str, extra_env_vars: list[str] | None
-) -> None:
+) -> bool:
     """Patch vLLM's Ray executor env propagation and worker runtime_env.
 
     1. Pass custom runtime_env in _init_workers_ray call (file patch).
@@ -81,6 +81,12 @@ def _patch_vllm_init_workers_ray(
        HUGGING_FACE_* vars are already copied by vLLM's default prefix list
        (this includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
        https://github.com/NVIDIA-NeMo/RL/pull/898).
+
+    Returns:
+        Whether the runtime_env source patch is in place. The env-var merge in
+        step 2 cannot fail, but step 1 is anchored on a call-site string; if
+        that moves upstream the py_executable injection silently stops
+        happening, so the caller must not report success unconditionally.
     """
     file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
 
@@ -90,9 +96,13 @@ def _patch_vllm_init_workers_ray(
         f'runtime_env={{"py_executable": "{py_executable}"}})'
     )
 
+    applied = False
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_line not in content and old_line in content:
+        if new_line in content:
+            applied = True  # already patched by another worker on this node
+        elif old_line in content:
             write_back(content.replace(old_line, new_line))
+            applied = True
 
     env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
     existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
@@ -100,6 +110,8 @@ def _patch_vllm_init_workers_ray(
         var.strip() for var in (*existing.split(","), *env_vars_to_copy) if var.strip()
     }
     os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
+
+    return applied
 
 
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
@@ -484,8 +496,14 @@ def _apply_vllm_patches(
 
     patch_logger = init_logger("vllm_patch")
 
-    _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
-    patch_logger.info("Successfully patched vllm _init_workers_ray.")
+    if _patch_vllm_init_workers_ray(py_executable, extra_env_vars):
+        patch_logger.info("Successfully patched vllm _init_workers_ray.")
+    else:
+        patch_logger.warning(
+            "vllm _init_workers_ray patch did not apply: the "
+            "'self._init_workers_ray(placement_group)' anchor was not found. "
+            "Ray workers may launch under the wrong interpreter."
+        )
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
