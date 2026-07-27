@@ -26,8 +26,8 @@ import pytest
 from nemo_rl.environments.nemo_gym import NemoGymShardSet, as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_shards import ShardSetupError
 from nemo_rl.experience.rollouts import (
-    _bucket_nemo_gym_rows_by_shard,
-    _merge_nemo_gym_shard_streams,
+    _bucket_nemo_gym_rows_by_instance,
+    _merge_nemo_gym_instance_streams,
     _merge_nemo_gym_timing_metrics,
 )
 
@@ -125,7 +125,7 @@ def test_unsharded_dispatch_keeps_one_bucket_holding_the_whole_batch():
     shard_set = as_nemo_gym_shard_set(actor)
     rows = _rows(["alpha", "beta"], num_generations=2)
 
-    buckets = _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
     assert len(buckets) == 1
     _, handle, bucket_rows = buckets[0]
@@ -141,7 +141,7 @@ def test_groups_follow_their_agent_to_its_shard():
     )
     rows = _rows(["alpha", "beta", "alpha"], num_generations=2)
 
-    buckets = _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
     by_shard = {name: rows for name, _, rows in buckets}
     # Whole groups, and the batch-global row indices survive bucketing -- the
@@ -161,7 +161,7 @@ def test_task_source_routes_rows_that_gym_has_not_resolved_to_an_agent():
         for index, source in enumerate(["math_env", "math_env", "tool_env", "tool_env"])
     ]
 
-    buckets = _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
     by_shard = {name: rows for name, _, rows in buckets}
     assert [row["_rowidx"] for row in by_shard["left"]] == [0, 1]
@@ -173,13 +173,26 @@ def test_replicas_of_one_shard_take_turns_by_group():
     shard_set = _shard_set({"busy": [first, second]}, {"alpha": "busy"})
     rows = _rows(["alpha"] * 4, num_generations=2)
 
-    buckets = _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
     assert len(buckets) == 2
     assert [label for label, _, _ in buckets] == ["busy/0", "busy/1"]
     dispatched = {id(handle): bucket_rows for _, handle, bucket_rows in buckets}
     assert [row["_rowidx"] for row in dispatched[id(first)]] == [0, 1, 4, 5]
     assert [row["_rowidx"] for row in dispatched[id(second)]] == [2, 3, 6, 7]
+    # Replicas are labelled apart, so what each one did stays distinguishable
+    # once the buckets become metric keys and error messages.
+    assert sorted(label for label, _, _ in buckets) == ["busy/0", "busy/1"]
+
+
+def test_a_shard_without_replicas_is_labelled_by_its_name_alone():
+    """The common case should read as it did before replicas existed."""
+    shard_set = _shard_set({"left": [_FakeActor("left")]}, {"alpha": "left"})
+    rows = _rows(["alpha"], num_generations=2)
+
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
+
+    assert [label for label, _, _ in buckets] == ["left"]
 
 
 def test_concurrent_replica_selection_serializes_the_round_robin_cursor():
@@ -233,7 +246,7 @@ def test_a_group_that_mixes_agents_across_shards_is_rejected():
     rows[1]["agent_ref"]["name"] = "beta"
 
     with pytest.raises(ValueError, match="mixes routes"):
-        _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+        _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
 
 def test_a_group_that_mixes_agents_on_one_shard_is_rejected():
@@ -245,7 +258,7 @@ def test_a_group_that_mixes_agents_on_one_shard_is_rejected():
     rows[1]["agent_ref"]["name"] = "beta"
 
     with pytest.raises(ValueError, match="mixes routes"):
-        _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+        _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
 
 def test_a_row_naming_an_unhosted_route_names_the_routes_that_are_hosted():
@@ -253,13 +266,13 @@ def test_a_row_naming_an_unhosted_route_names_the_routes_that_are_hosted():
     rows = _rows(["ghost"], num_generations=2)
 
     with pytest.raises(ShardSetupError, match="No NeMo-Gym shard hosts route 'ghost'"):
-        _bucket_nemo_gym_rows_by_shard(rows, shard_set, num_generations=2)
+        _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
 
 async def _drain(buckets):
     return [
         (rowidx, timing, shard_name)
-        async for rowidx, _, _, timing, shard_name in _merge_nemo_gym_shard_streams(
+        async for rowidx, _, _, timing, shard_name in _merge_nemo_gym_instance_streams(
             buckets, timer_prefix="timing/rollout"
         )
     ]
@@ -295,13 +308,24 @@ def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
         ):
             drained.append(result)
 
-    with pytest.raises(RuntimeError, match="shard 'broken' failed"):
+    with pytest.raises(RuntimeError, match="instance 'broken' failed"):
         asyncio.run(drain_until_failure())
 
     assert [rowidx for rowidx, *_ in drained] == [0, 1]
 
 
-def test_a_ray_failure_raised_while_awaiting_a_row_names_the_shard():
+def test_a_failing_replica_names_the_instance_not_just_the_shard():
+    """The shard is still serving rows; only one node is at fault."""
+    buckets = [
+        ("busy/0", _FakeActor("busy"), _rows(["alpha"], num_generations=2)),
+        ("busy/1", _FakeActor("busy", fail=True), _rows(["alpha"], num_generations=2)),
+    ]
+
+    with pytest.raises(RuntimeError, match="instance 'busy/1' failed"):
+        asyncio.run(_drain(buckets))
+
+
+def test_a_ray_failure_raised_while_awaiting_a_row_names_the_instance():
     buckets = [
         (
             "busy/1",
@@ -310,7 +334,7 @@ def test_a_ray_failure_raised_while_awaiting_a_row_names_the_shard():
         )
     ]
 
-    with pytest.raises(RuntimeError, match="shard 'busy/1' failed"):
+    with pytest.raises(RuntimeError, match="instance 'busy/1' failed"):
         asyncio.run(_drain(buckets))
 
 
@@ -337,6 +361,22 @@ def test_several_shards_keep_their_own_numbers_and_roll_up_to_the_slowest():
     assert merged["timing/rollout/shard/left/await_results"] == 4.0
     assert merged["timing/rollout/shard/right/await_results"] == 9.0
     # The step waits for the slowest shard, not for their sum.
+    assert merged["timing/rollout/await_results"] == 9.0
+
+
+def test_replicas_report_separately_rather_than_overwriting_each_other():
+    """Keyed by shard, the second replica would clobber the first and the
+    shard would look like it had done half its work."""
+    merged = _merge_nemo_gym_timing_metrics(
+        {
+            "busy/0": {"timing/rollout/await_results": 4.0},
+            "busy/1": {"timing/rollout/await_results": 9.0},
+        },
+        "timing/rollout",
+    )
+
+    assert merged["timing/rollout/shard/busy/0/await_results"] == 4.0
+    assert merged["timing/rollout/shard/busy/1/await_results"] == 9.0
     assert merged["timing/rollout/await_results"] == 9.0
 
 
