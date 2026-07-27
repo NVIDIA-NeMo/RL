@@ -174,12 +174,17 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     return is_invalid_tool_call, has_malformed_thinking
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+# Fail fast rather than restart. The servers this actor owns are started in
+# _spinup, which Ray does not re-run after a restart, so a restarted actor is
+# permanently broken: every later call raises AttributeError on self.rch and
+# the caller never sees the RayActorError it is waiting for.
+@ray.remote(max_restarts=0, max_task_retries=0)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        self.rh = None
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -512,7 +517,16 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
         }
 
     def shutdown(self) -> None:
-        self.rh.shutdown()
+        """Stop the Gym servers. Safe to call more than once, and before spinup.
+
+        Callers routinely hold the same actor under both the train and the
+        validation environment map, so this is reached twice on a normal exit.
+        The underlying RunHelper.shutdown() raises on a second call, which used
+        to escalate an otherwise graceful teardown into a ray.kill().
+        """
+        rh, self.rh = self.rh, None
+        if rh is not None:
+            rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
