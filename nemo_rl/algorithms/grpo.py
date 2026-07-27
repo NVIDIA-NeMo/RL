@@ -78,11 +78,11 @@ from nemo_rl.distributed.virtual_cluster import (
     get_ray_cluster_topology,
     prepare_segment_topology,
 )
+from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
-    EnvironmentInterface,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
