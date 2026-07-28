@@ -26,6 +26,23 @@ DEEPEP_WHEEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/s
 scripts/experiments/oci-hsg/hybridep/submit_grpo.sh
 ```
 
+To measure the fake-token padding introduced by the HybridEP sequence-packing
+alignment, enable bounded rank-0 logging. The reduction reports group-wide raw,
+padded, and added token counts; use this diagnostic run for padding analysis,
+not timing comparison, because the logging path adds synchronization:
+
+```bash
+NEMO_RL_HYBRIDEP_LOG_PACKING=1 \
+NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS=4096 \
+NEMO_RL_HYBRIDEP_LOG_PACKING_RANKS=0 \
+NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE=1 \
+scripts/experiments/oci-hsg/hybridep/submit_grpo.sh
+```
+
+Set `DISPATCHER_MODE=recipe` to preserve the recipe's default dispatcher
+without adding any HybridEP override. This is the accuracy and performance
+control arm; the default remains `DISPATCHER_MODE=hybridep`.
+
 To run the 32-node Nemotron3 Super 120B async 1-off recipe with the same
 HybridEP overrides, the model profile also exports `NCCL_NVLS_ENABLE=0` to
 match the official performance harness and avoid NVLS-related OOM:

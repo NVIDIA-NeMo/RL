@@ -76,10 +76,23 @@ RUN_SUFFIX=${RUN_SUFFIX:-"$(date +%Y%m%d-%H%M%S)"}
 RUN_NAME=${RUN_NAME:-"${MODEL_ID}-hybridep-${DEEPEP_COMMIT:0:8}-${RUN_SUFFIX}"}
 WANDB_ENABLED=${WANDB_ENABLED:-False}
 WANDB_PROJECT=${WANDB_PROJECT:-sna-async-grpo-gb200}
+DISPATCHER_MODE=${DISPATCHER_MODE:-hybridep}
+PADDING_LOG_ENABLED=${NEMO_RL_HYBRIDEP_LOG_PACKING:-0}
+PADDING_LOG_MAX_CALLS=${NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS:-4096}
+PADDING_LOG_RANKS=${NEMO_RL_HYBRIDEP_LOG_PACKING_RANKS:-0}
+PADDING_LOG_REDUCE=${NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE:-1}
 CONTAINER=${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/qwen30-hybridep-oci-20260727/nemo_rl_nightly.sqsh}
 HF_HOME=${HF_HOME:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-"${HF_HOME}/cache"}
 RUN_ROOT=${RUN_ROOT:-"${PROJECT_ROOT}/exp_logs/hybridep/${MODEL_ID}/${RUN_NAME}"}
+
+case "${DISPATCHER_MODE}" in
+  hybridep | recipe) ;;
+  *)
+    printf 'DISPATCHER_MODE must be either hybridep or recipe.\n' >&2
+    exit 2
+    ;;
+esac
 
 if [[ ! "${DEEPEP_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'DEEPEP_COMMIT must be a full lowercase 40-character SHA.\n' >&2
@@ -178,9 +191,6 @@ driver_args=(
   "cluster.num_nodes=${NUM_ACTOR_NODES}"
   "cluster.gpus_per_node=${GPUS_PER_NODE}"
   "cluster.segment_size=${SEGMENT_SIZE}"
-  policy.megatron_cfg.moe_token_dispatcher_type=flex
-  ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep
-  ++policy.megatron_cfg.moe_hybridep_num_sms=32
   "logger.log_dir=${RUN_ROOT}/training"
   "logger.wandb_enabled=${WANDB_ENABLED}"
   "logger.wandb.project=${WANDB_PROJECT}"
@@ -190,6 +200,21 @@ driver_args=(
   checkpointing.enabled=false
   "++deepep_override=${DEEPEP_COMMIT}"
 )
+if [[ "${DISPATCHER_MODE}" == "hybridep" ]]; then
+  driver_args+=(
+    policy.megatron_cfg.moe_token_dispatcher_type=flex
+    ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep
+    ++policy.megatron_cfg.moe_hybridep_num_sms=32
+  )
+  if [[ "${PADDING_LOG_ENABLED}" == "1" ]]; then
+    driver_args+=(
+      "++policy.megatron_cfg.env_vars.NEMO_RL_HYBRIDEP_LOG_PACKING='${PADDING_LOG_ENABLED}'"
+      "++policy.megatron_cfg.env_vars.NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS='${PADDING_LOG_MAX_CALLS}'"
+      "++policy.megatron_cfg.env_vars.NEMO_RL_HYBRIDEP_LOG_PACKING_RANKS='${PADDING_LOG_RANKS}'"
+      "++policy.megatron_cfg.env_vars.NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE='${PADDING_LOG_REDUCE}'"
+    )
+  fi
+fi
 printf -v driver_command '%q ' "${driver_args[@]}"
 
 SETUP_COMMAND=
@@ -247,6 +272,11 @@ metadata_path="${RUN_ROOT}/submission.env"
   printf 'gpus_per_node=%q\n' "${GPUS_PER_NODE}"
   printf 'segment_size=%q\n' "${SEGMENT_SIZE}"
   printf 'max_steps=%q\n' "${MAX_STEPS}"
+  printf 'dispatcher_mode=%q\n' "${DISPATCHER_MODE}"
+  printf 'padding_log_enabled=%q\n' "${PADDING_LOG_ENABLED}"
+  printf 'padding_log_max_calls=%q\n' "${PADDING_LOG_MAX_CALLS}"
+  printf 'padding_log_ranks=%q\n' "${PADDING_LOG_RANKS}"
+  printf 'padding_log_reduce=%q\n' "${PADDING_LOG_REDUCE}"
   printf 'nccl_nvls_enable=%q\n' "${NCCL_NVLS_ENABLE:-}"
   printf 'rl_commit=%q\n' "${RL_COMMIT}"
   printf 'bridge_commit=%q\n' "${BRIDGE_COMMIT}"
