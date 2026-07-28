@@ -369,4 +369,169 @@ All NeMo-RL-side; no Gym fork changes in this stage.
 
 ## S5 — verification
 
-Status: not started (blocked on S4 sign-off)
+Status: **in progress (2026-07-28).** S4 signed off ("Commit S4 start S5")
+and committed as RL `6b32665ca`. Work items (§ 10 S5): fixed-seed
+legacy-vs-capture row diff, reward-curve comparison, per-call HTTP bytes
+vs the echo path (+ `token_in_rate` into the SC logger, deferred from S4),
+chaos smoke (kill gate mid-step), capture-enabled functional test in
+`L1_Functional_Tests_SingleController.sh` (blocked on the gitlink/CI
+decision). S5 sign-off = MVP acceptance.
+
+### Row diff: legacy vs capture (2026-07-28)
+
+Method: env-gated row dump (`nemo_rl/experience/row_dump.py`,
+`NRL_SC_DUMP_TRAIN_ROWS=<dir>`, no-op unless set) hooked at both canonical
+publish sites; identical direct-invocation runs (same node/placement/data)
+differing only in `token_capture.enabled`; offline matcher keyed by
+`(weight_version, prompt_ids_for_adv)`.
+
+Constraints discovered (documented, not fixable in-scope):
+
+- **No per-request sampling determinism exists** (engine seed is
+  placement-derived; `SamplingParams` carries no seed; the Gym path
+  rejects `top_k` overrides at `rollout_manager.py:452`; dataset-level
+  `temperature` is overwritten by the generation config at
+  `rollout_manager.py:474`).
+- `policy.generation.temperature=0` (greedy) reaches the engine but NaNs
+  the loss at iteration 1 on **both** paths identically (vLLM's degenerate
+  greedy logprobs → NaN grad norm) — so the byte diff is a one-step
+  (wv=0) comparison, and full-length curves run at temperature 1.
+- vLLM is cross-run nondeterministic under continuous batching (logit
+  jitter with batch composition), bounding what any cross-run diff can
+  show.
+
+Results:
+
+- Temp-1 pair (10 steps, 80 rows/run): all 40 group keys matched 1:1,
+  **prompt prefixes byte-identical in every row**; generated suffixes
+  diverge (sampling, as expected).
+- Greedy wv=0 pair (identical weights): **7/8 rows byte-identical in ids
+  and masks end-to-end** across two entirely different pipelines
+  (echo-splice-tensorize vs gate-TQ-finalizer). The 1/8 divergence is a
+  mid-generation argmax flip at a near-tie (candidate logprobs −1.01 vs
+  −0.97) — engine jitter, not pipeline drift. Logprob deltas on
+  identical-token rows: exactly 0.0 on several rows, ≤ 0.147 max
+  elsewhere (batch-composition numerics; a transformation bug would be
+  systematic, not zero-on-some-rows).
+- Step-1 rows are all single-call at this sequence budget; cross-run
+  multi-turn splice fidelity is not separately re-proven here — it rests
+  on the S1 live token-in smoke, S3 gate e2e prefix chaining, the per-row
+  digest verification live in every capture run, and the capture run's
+  gen_kl_error (0.0375) matching legacy (0.038).
+
+### Reward-curve comparison (2026-07-28, temp-1 pair, 10 steps)
+
+- `train/reward` per step: **identical 10/10** —
+  `[0, 0, 0.25, 0, 0.25, 0.25, 0.25, 0.5, 0, 0]` on both paths (seeded
+  dataset order; same prompts per step; same reward outcomes).
+- `train/gen_kl_error`: same band — legacy median 0.0379 (max 0.068),
+  capture median 0.0358 (max 0.046).
+- `train/global_valid_seqs` = 8.0 every step on both paths.
+
+### Wire metrics (2026-07-28)
+
+- `gate/*` metrics wired into the SC logger (the S4 deferral): per-step
+  fetch of the gate's cumulative § 8 counters through a new
+  `RolloutManager.gate_metrics()` passthrough, logged with derived
+  `gate/token_in_rate`; fetch failures are swallowed loudly (metrics never
+  kill a step). Live reading recorded with the chaos run below.
+- Per-call token-carrier bytes, computed from the temp-1 run's actual rows
+  (JSON as on the wire): legacy echo attachment
+  (`prompt_token_ids`+`generation_token_ids`+`generation_log_probs`) mean
+  **2,540 B/call** (8.6 B/token at ~296 tok/call) vs capture marker
+  **35 B/call** — **−98.6 %** on the gate→agent carrier for this
+  single-turn workload; multi-turn re-echo compounds the legacy side per
+  turn. The full HTTP-level perf report (bytes/token, step time, gate
+  latency) remains post-MVP validation per § 10.
+
+### Instrumented perf A/B (2026-07-28, user-requested; pulled forward from
+### post-MVP validation)
+
+Method: env-gated ASGI byte counters on every HTTP server (Gym
+`HttpByteCounterMiddleware` in `server_utils.py`, `NG_HTTP_BYTES_DIR`; RL
+mirror `nemo_rl/utils/http_byte_counter.py` on the vLLM worker app,
+`NRL_HTTP_BYTES_DIR`); identical 10-step runs at 1024 seq budget differing
+only in the flag; per-hop aggregation + timing from TB metrics.
+
+| Metric | Legacy | Capture | Δ |
+|---|---|---|---|
+| HTTP bytes / trained token | 107.3 B | 69.1 B | **−35.6 %** |
+| Total HTTP bytes (10 steps) | 2.52 MB | 1.64 MB | −35 % |
+| `total_step_time` median | 4.48 s | 4.07 s | **−9.0 %** |
+| `exposed_generation` median | 1.99 s | 1.65 s | **−16.8 %** |
+| `valid_tokens/s/GPU` median | 30.8 | 34.7 | **+12.5 %** |
+
+Per-hop highlights: the worker's `/tokenize` route disappears entirely
+(77 calls → 0); worker `/v1/chat/completions` response bytes 0.34 → 0.19 MB
+(logprob echo gone); gate `/v1/responses` responses 0.28 → 0.13 MB (token
+arrays → markers); even the verifier hop shrinks (0.37 → 0.23 MB in) since
+agent histories no longer carry token arrays. Health parity: same KL band
+(0.0376 vs 0.0413 median), identical `max_reward` 0.5, all rows valid.
+
+Caveats: this workload remains single-call per rollout even at 1024
+(gate counters: 80 registered/sealed, 0 token_in, 0 fallbacks — all roots),
+so the echo's per-turn compounding and `token_in_rate` are not exercised —
+the prototype's −46.9 % bytes/token multi-turn number remains the
+reference; 10-step timing on a 0.6B model is directional, not a benchmark.
+
+Reading of the numbers (assessment):
+
+- **The bytes reduction is structural, not statistical** — it comes from
+  routes/payloads that categorically no longer exist (`/tokenize` gone,
+  logprob echo gone, token arrays → 35 B markers), and this single-call
+  workload is capture's *worst case*: legacy never paid its per-turn
+  history re-echo (roughly quadratic in turns) while capture stays
+  O(generated tokens). −35.6 % is a floor that grows with agentic depth
+  and context length.
+- **The timing wins are plausibly real but not yet bankable**: one run
+  pair, n=10 medians, 0.6B model — variance on this stack can be
+  ±5–10 %. In their favor: a concrete mechanism (one fewer HTTP
+  round-trip per call + ~40 % smaller payloads on the generation critical
+  path) and the gain concentrating in `exposed_generation` (−16.8 %)
+  exactly where the mechanism predicts. Expect the relative timing win to
+  compress on large models (GPU decode dominates) while the bytes win
+  grows.
+- **Capture is at minimum perf-neutral while buying provenance**: the
+  gate, staging writes, digest verification, and finalizer all sit in the
+  measured path and the capture run is faster, with identical training
+  health — the design's custody guarantees carry no perf tax.
+- To make the timing claim quotable: 3–5 repeated pairs (variance bars)
+  and a genuinely multi-turn workload (untrimmed tools, larger budget),
+  which is also the run that measures a real `token_in_rate` — earmarked
+  as the post-MVP perf report (§ 10).
+
+### Chaos smoke: gate killed mid-step (2026-07-28)
+
+Method: capture run, `SIGKILL` to the verified `policy_model` (gate)
+process after step 3, 3-minute observation, then teardown. (Four earlier
+attempts were invalidated by harness bugs — orphaned wrapper teardown,
+GPU-squatting orphan EngineCore, a pgrep pattern that couldn't match the
+gate, a task timeout — all documented in the session log; none were
+capture-path defects.)
+
+Verdict vs the § 7 failure model:
+
+- **No corruption, no crash**: the SC actor and run stayed alive; step
+  count froze at 3 — nothing trained on bad data after the kill, and the
+  three completed steps were healthy.
+- **FINDING (S5 → H1): gate death is a silent stall, not the promised
+  loud failure.** The NemoGym actor's control-plane `register_rollouts`
+  call to the dead gate sat in Gym's `server_utils.request` retry loop —
+  observed at **retry=375+ over the full window** (`ClientOSError`,
+  unbounded for connection errors) — so the dispatch never failed, the § 7
+  fail-path (abort slot → `fail_rollouts` → placeholders) never engaged,
+  and the run would stall indefinitely. § 7's "SC dispatch timeout" row
+  presumes a timeout that is not wired for control-plane calls.
+  Recommended fix (H1 scope, where the design already places the failure
+  sweep + kill-gate CI test): bound control-plane retries/time
+  (`RolloutControlClient` request timeout), so gate death surfaces as
+  failed dispatches + placeholders + staging TTL, per the § 7 table.
+- Staging-TTL sweep not observable in a 3-minute window (TTL 3600 s);
+  covered by unit tests.
+
+S5 finding fixed en route: agent `/run` 500s raise
+`aiohttp.ClientResponseError` out of `run_rollouts`, and Ray cannot pickle
+its `CIMultiDictProxy` headers — the SC saw a masking `TypeError` instead
+of the real error. Fixed in `environments/nemo_gym.py` (catch + re-raise
+picklable `RuntimeError`). **Active with the flag off** (any legacy agent
+500 hit the same masking); disclosed for the S5 gate.

@@ -708,6 +708,19 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
+    async def gate_metrics(self) -> Optional[dict[str, int]]:
+        """Fetch the capture gate's § 8 counters, or None off the capture path.
+
+        Returns:
+            Cumulative gate counters (token_in, fallback_*, capture_failed,
+            registered/sealed/failed/expired) from ``/ng-control/metrics``,
+            or None when no NemoGym env handle is wired.
+        """
+        env = self._env_handles.get("nemo_gym") if self._env_handles else None
+        if env is None:
+            return None
+        return await env.gate_metrics.remote()
+
     async def run_rollout(
         self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
     ) -> PromptGroupRecord:

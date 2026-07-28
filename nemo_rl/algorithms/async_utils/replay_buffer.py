@@ -25,6 +25,7 @@ from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.row_dump import maybe_dump_train_rows
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -658,6 +659,13 @@ class TQReplayBuffer:
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
+        )
+        maybe_dump_train_rows(
+            source="legacy_commit",
+            group_id=group_id,
+            sample_ids=list(sample_ids),
+            train_batch=train_batch,
+            weight_version=start_weight_version,
         )
         await self._call_dp(
             "put_samples",

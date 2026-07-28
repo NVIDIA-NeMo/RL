@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
+import aiohttp
 import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -368,7 +369,17 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except aiohttp.ClientResponseError as e:
+                        # aiohttp exceptions carry CIMultiDictProxy headers
+                        # that Ray cannot pickle across the actor boundary,
+                        # masking the real error with a TypeError; re-raise
+                        # as a plain, picklable RuntimeError.
+                        raise RuntimeError(
+                            f"NemoGym rollout HTTP error: {e.status} "
+                            f"{e.message} url={e.request_info.real_url}"
+                        ) from None
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     if self._token_capture_enabled:

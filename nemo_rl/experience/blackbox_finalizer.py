@@ -39,6 +39,7 @@ import torch
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.row_dump import maybe_dump_train_rows
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,13 @@ class BlackboxFinalizer:
         }
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=group_min_wv, group_id=group_id
+        )
+        maybe_dump_train_rows(
+            source="finalizer",
+            group_id=group_id,
+            sample_ids=list(sample_ids),
+            train_batch=train_batch,
+            weight_version=group_min_wv,
         )
         assert sample_ids == rollout_ids, (
             "canonical sample ids must equal the gate-registered rollout ids: "

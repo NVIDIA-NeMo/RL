@@ -36,6 +36,9 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
+# Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
+# custodying token lineage and the finalizer publishing training rows.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
