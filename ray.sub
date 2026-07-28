@@ -78,7 +78,7 @@ detect_cpus_per_node() {
   # `scontrol show hostnames` expands the compressed nodelist string locally
   # (no controller RPC). Take the first line with parameter expansion (no
   # head/grep pipeline, to avoid `set -e`/`pipefail` foot-guns).
-  nodelist=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+  nodelist=$(scontrol show hostnames "$RAY_NODELIST")
   first_node=${nodelist%%$'\n'*}
   # Parse "CPUTot=<n>" out of the single-line (`-o`) node description using
   # pure bash parameter expansion.
@@ -100,6 +100,28 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+# By default Ray uses the complete Slurm allocation. Specialized launchers may
+# reserve nodes for side services by restricting Ray to an explicit subset.
+RAY_NODELIST="${RAY_NODELIST:-${SLURM_JOB_NODELIST}}"
+mapfile -t ray_nodes_array < <(scontrol show hostnames "$RAY_NODELIST")
+RAY_NUM_NODES=${#ray_nodes_array[@]}
+if (( RAY_NUM_NODES <= 0 )); then
+  echo "Error: RAY_NODELIST did not resolve to any nodes: ${RAY_NODELIST}" >&2
+  exit 1
+fi
+
+mapfile -t allocated_nodes_array < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+declare -A allocated_node_set=()
+for _allocated_node in "${allocated_nodes_array[@]}"; do
+  allocated_node_set["$_allocated_node"]=1
+done
+for _ray_node in "${ray_nodes_array[@]}"; do
+  if [[ -z "${allocated_node_set[$_ray_node]:-}" ]]; then
+    echo "Error: RAY_NODELIST contains node '$_ray_node', which is not part of this Slurm allocation." >&2
+    exit 1
+  fi
+done
+echo "[INFO] Ray node scope: ${RAY_NUM_NODES}/${SLURM_JOB_NUM_NODES} allocated nodes (${RAY_NODELIST})"
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -368,7 +390,7 @@ num_retries=3
 WORKER_NUM_RETRIES=20
 
 # Total Ray worker_units expected once every node has registered with the head.
-NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+NUM_ACTORS=$((GPUS_PER_NODE * RAY_NUM_NODES))
 
 # Track backgrounded srun client PIDs for head and workers
 declare -A SRUN_PIDS
@@ -388,8 +410,8 @@ check_srun_processes() {
 }
 
 # Getting the node names and IP addresses in the SLURM allocation
-nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-nodes_array=($nodes)
+nodes=$(printf '%s\n' "${ray_nodes_array[@]}")
+nodes_array=("${ray_nodes_array[@]}")
 ip_addresses_array=()
 
 log_phase "resolving ${#nodes_array[@]} node hostname(s) to IPs"
@@ -749,17 +771,17 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     fi
     if [[ "\$sandbox_ready" -eq 0 ]]; then
       ready_count=\$(ls -1 "$SANDBOX_PORTS_DIR"/SANDBOX_READY_* 2>/dev/null | wc -l)
-      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$SLURM_JOB_NUM_NODES nodes..."
-      if [[ "\$ready_count" -ge "$SLURM_JOB_NUM_NODES" ]]; then
+      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$RAY_NUM_NODES nodes..."
+      if [[ "\$ready_count" -ge "$RAY_NUM_NODES" ]]; then
         sandbox_ready=1
-        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All $SLURM_JOB_NUM_NODES sandbox instances ready."
+        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All $RAY_NUM_NODES sandbox instances ready."
       fi
     fi
     if [[ "\$workers_ready" -eq 1 ]] && [[ "\$sandbox_ready" -eq 1 ]]; then
       break
     fi
     if [[ "\$sandbox_ready" -eq 0 ]] && (( SECONDS > SANDBOX_DEADLINE )); then
-      echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$SLURM_JOB_NUM_NODES after 10 min)"
+      echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$RAY_NUM_NODES after 10 min)"
       touch "$LOG_DIR/ENDED"
       exit 1
     fi
@@ -939,7 +961,7 @@ bash -n <(printf '%s' "$worker_cmd") || { echo "[FATAL] Worker script has syntax
 # task starts the sandbox, polls its local port, and on success touches
 # SANDBOX_READY_<hostname> so the head can gate the driver on all instances.
 ########################################################
-export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+export SLURM_MASTER_NODE="$head_node"
 SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
 SANDBOX_BASE_PORT="${SANDBOX_BASE_PORT:-6001}"
@@ -954,7 +976,7 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
   fi
 
-  echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
+  echo "[INFO] Starting sandbox sidecars on all ${RAY_NUM_NODES} Ray nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
   srun --output "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --error "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --container-image="$SANDBOX_CONTAINER" \
@@ -966,7 +988,8 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --wait=60 \
     --kill-on-bad-exit=1 \
     --overlap \
-    --nodes="$SLURM_JOB_NUM_NODES" \
+    --nodelist="$RAY_NODELIST" \
+    --nodes="$RAY_NUM_NODES" \
     --ntasks-per-node=1 \
     --export="$SANDBOX_EXPORTS" \
     bash -xc '
@@ -1003,18 +1026,20 @@ SRUN_PIDS["ray-head"]=$!
 # the number of srun/slurmctld RPCs stays constant regardless of node count. In
 # single-node mode there are no workers: the head already registers its GPUs as Ray
 # resources.
-_num_workers=$((SLURM_JOB_NUM_NODES - 1))
+_num_workers=$((RAY_NUM_NODES - 1))
 if [[ $_num_workers -gt 0 ]]; then
+  worker_nodes=("${nodes_array[@]:1}")
+  worker_nodelist=$(IFS=,; echo "${worker_nodes[*]}")
   # srun -o with %t produces per-task log files; zero-pad to the worker-count
   # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
   _task_digits=${#_num_workers}
   srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+    --nodelist="$worker_nodelist" \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \
     --ntasks-per-node=1 \
     --cpus-per-task=$CPUS_PER_WORKER \
     --kill-on-bad-exit=0 \
-    --exclude="$head_node" \
     -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
     bash -x -c "$worker_cmd" &
   SRUN_PIDS["ray-workers"]=$!
@@ -1090,14 +1115,14 @@ if [[ -z "\$WORKER_NUM" ]]; then
   else
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
   fi
-elif [[ $SLURM_JOB_NUM_NODES -eq 1 ]]; then
+elif [[ $RAY_NUM_NODES -eq 1 ]]; then
   echo "Error: Single-node mode — only the head node is available. Run without arguments."
   exit 1
 else
   # All workers share the container name 'ray-worker'; target a specific one by node.
   # Log files are 0-indexed: worker K maps to ray-worker-(K-1).log
-  if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
-    echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
+  if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $RAY_NUM_NODES ]]; then
+    echo "Error: WORKER_NUM must be between 1 and $((RAY_NUM_NODES-1))"
     exit 1
   fi
   nodes_array=($nodes)
@@ -1112,7 +1137,7 @@ EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
   echo "     COMMAND='echo hello' bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # run a non-interactive command on head node"
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
-  if [[ $SLURM_JOB_NUM_NODES -gt 1 ]]; then
+  if [[ $RAY_NUM_NODES -gt 1 ]]; then
     echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
     echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
   fi
