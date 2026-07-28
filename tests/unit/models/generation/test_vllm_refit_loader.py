@@ -345,7 +345,9 @@ def test_checkpoint_engine_weight_layout_rejects_experts_outside_routed_experts(
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    owner = _FakeExpertOwner(use_ep=True)
+    # use_ep=False so the per-parameter validations all pass and the loop
+    # completes: the layout guard runs after it, and that is what must fire.
+    owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((2, 8, 4), owner)
     ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
         VllmInternalWorkerExtensionWithCheckpointEngine
