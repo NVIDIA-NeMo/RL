@@ -266,7 +266,16 @@ stays green.
    must not crash teardown (§ 7 cleanup).
 6. Functional-test side effect: `ng_prepare_data` rewrote
    `workplace_assistant` metrics JSONs in the submodule working tree during
-   the flag-off evidence run; reverted, not committed.
+   the flag-off evidence runs; reverted, not committed.
+
+### Regression evidence (flag off, S3 pin)
+
+- `tests/functional/grpo_async_gym_single_controller.sh` re-run against the
+  S3 pin (`05986b04`, gate code present but `token_capture_gate.enabled`
+  defaulting false): **PASS** (2026-07-28) — `median(gen_kl_error)`=0.038
+  < 1.3, `max(reward)`=0.5 > 0. The legacy token-echo path through the
+  edited `app.py`/converter is behaviorally unchanged.
+- Full Gym unit suite at the S3 commit: 1507 passed / 30 skipped.
 
 Not in S3 (lands in S4 with the RL wiring): NeMo-RL's use of
 `RolloutControlClient` (register/seal/fail from `environments/nemo_gym.py`),
