@@ -18,6 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+BRIDGE_SRC="${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src"
 
 cd "${PROJECT_ROOT}"
 
@@ -127,6 +128,11 @@ fi
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   printf 'Recipe does not exist: %s\n' "${CONFIG_PATH}" >&2
+  exit 2
+fi
+
+if [[ ! -d "${BRIDGE_SRC}/megatron/bridge" ]]; then
+  printf 'Megatron-Bridge source package does not exist: %s\n' "${BRIDGE_SRC}" >&2
   exit 2
 fi
 
@@ -299,6 +305,7 @@ export GPUS_PER_NODE
 export SETUP_COMMAND
 export BASE_LOG_DIR="${RUN_ROOT}/ray"
 PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+PYTHONPATH="${BRIDGE_SRC}:${PYTHONPATH}"
 if [[ -n "${DEEPEP_OVERLAY}" ]]; then
   PYTHONPATH="${DEEPEP_OVERLAY}:${PYTHONPATH}"
 fi

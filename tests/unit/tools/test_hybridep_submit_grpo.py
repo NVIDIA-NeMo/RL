@@ -164,7 +164,7 @@ def test_submission_metadata_records_dispatcher_and_padding_logging(
     assert "padding_log_reduce=1\n" in metadata
 
 
-def test_hybridep_launcher_preserves_project_pythonpath() -> None:
+def test_hybridep_launcher_preserves_project_and_bridge_pythonpath() -> None:
     project_root = Path(__file__).resolve().parents[3]
     launcher = (
         project_root
@@ -177,11 +177,14 @@ def test_hybridep_launcher_preserves_project_pythonpath() -> None:
     source = launcher.read_text()
 
     project_path = 'PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"'
+    bridge_path = 'PYTHONPATH="${BRIDGE_SRC}:${PYTHONPATH}"'
     overlay_path = 'PYTHONPATH="${DEEPEP_OVERLAY}:${PYTHONPATH}"'
     export_path = "export PYTHONPATH"
 
     assert project_path in source
+    assert bridge_path in source
     assert overlay_path in source
     assert export_path in source
-    assert source.index(project_path) < source.index(overlay_path)
+    assert source.index(project_path) < source.index(bridge_path)
+    assert source.index(bridge_path) < source.index(overlay_path)
     assert source.index(overlay_path) < source.index(export_path)
