@@ -34,6 +34,27 @@ from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
 
+_INITIALIZER_IMPORT_ENV_VARS = (
+    "HF_HOME",
+    "HF_MODULES_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "PYTHONPATH",
+    "TRANSFORMERS_CACHE",
+)
+
+
+def _get_initializer_import_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    """Return import/cache variables needed before initializer deserialization.
+
+    Ray deserializes the worker builder while creating the pooled initializer.
+    Custom Hugging Face processor classes live under ``transformers_modules``,
+    so their shared module cache must already be on ``PYTHONPATH`` at that
+    point. Per-worker runtime variables are still applied only to the workers.
+    """
+    return {
+        key: env_vars[key] for key in _INITIALIZER_IMPORT_ENV_VARS if key in env_vars
+    }
+
 
 @dataclass
 class MultiWorkerFuture:
@@ -493,12 +514,15 @@ class RayWorkerGroup:
         available_ports = [port for _, port in addr_port_results]
 
         # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
-        # per worker. All workers on a node share the same py_executable, so
-        # the initializer only needs that in its runtime_env — per-worker
-        # env_vars are passed through create_worker(). This reduces GCS actor
-        # registrations from N_workers to N_nodes.
+        # per worker. The initializer needs import/cache variables because Ray
+        # deserializes the worker builder there before per-worker env vars are
+        # applied. Other per-worker env vars are passed through create_worker().
+        # This reduces GCS actor registrations from N_workers to N_nodes.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_runtime_env = {"py_executable": py_executable}
+        initializer_runtime_env = {
+            "env_vars": _get_initializer_import_env_vars(env_vars),
+            "py_executable": py_executable,
+        }
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it

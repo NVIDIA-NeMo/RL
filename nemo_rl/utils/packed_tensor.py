@@ -63,9 +63,16 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
 
     while True:
         # Move to the next buffer
+        previous_buffer_idx = buffer_idx
         buffer_idx = (buffer_idx + 1) % num_buffers
         # Synchronize the current stream
         streams[buffer_idx].synchronize()
+        # Parameter iteration can launch TP/EP collectives before the packed
+        # broadcast. Keep adjacent chains ordered across the side streams so
+        # ranks cannot interleave collectives differently or consume a weight
+        # chunk before the preceding load has completed.
+        if num_buffers > 1:
+            streams[buffer_idx].wait_stream(streams[previous_buffer_idx])
         # Start tasks for the new buffer in a new stream
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             try:
@@ -172,9 +179,15 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
 
     while True:
         # Move to the next buffer
+        previous_buffer_idx = buffer_idx
         buffer_idx = (buffer_idx + 1) % num_buffers
         # Synchronize the current stream
         streams[buffer_idx].synchronize()
+        # Mirror the producer ordering on the shared communicator. Without
+        # this dependency, concurrent receive/load chains can race and leave
+        # only part of a large non-colocated model at the new weight version.
+        if num_buffers > 1:
+            streams[buffer_idx].wait_stream(streams[previous_buffer_idx])
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             # Initialize the packing tensor meta data
             packing_tensor_meta_data[buffer_idx] = []

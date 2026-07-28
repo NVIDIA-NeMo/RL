@@ -1,0 +1,177 @@
+# Static-video, one-turn async GRPO for Nemotron Omni on 16 nodes.
+#
+# Prepare JSONL rows with:
+#   python examples/nemo_gym/prepare_video_dataset.py convert \
+#     --input source.jsonl --output video-gym.jsonl --require-video \
+#     --skip-missing-local-videos
+# Export NEMO_RL_VIDEO_TRAIN_JSONL, NEMO_RL_VIDEO_VAL_JSONL, and the common
+# NEMO_RL_VIDEO_MEDIA_ROOT allowed for vLLM file-URL access before launch.
+# Policy-side preprocessing also requires NRL_VIDEO_BACKEND=torchcodec and
+# NRL_VIDEO_SAMPLING_STYLE=nemotron_vl to match the validated rollout contract.
+
+# Keep the video recipe on the maintained NeMo-Gym base.  The former
+# Nemotron-Omni Gym-V smoke overlay was scratch configuration and was removed
+# from the integration branch.
+defaults: grpo_nanov3.yaml
+
+grpo:
+  # Keep the initial rollout below the batch scheduler's idle-policy reaper
+  # window while retaining 16 generations for each GRPO prompt.
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 1
+  # Run until the configured dataset epochs are exhausted.
+  max_num_steps: -1
+  max_rollout_turns: 1
+  val_period: 500
+  val_batch_size: null
+  # Report raw logprob error without masking or dropping high-error samples.
+  seq_logprob_error_threshold: null
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+
+policy:
+  model_name: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+  is_vlm: true
+  train_global_batch_size: 64
+  max_total_sequence_length: 24576
+  logprob_chunk_size: 2048
+  refit_buffer_size_gb: 1
+  # Multimodal payloads are already deduplicated per prompt. Keep the source
+  # video recipe's conservative unpacked path until packed video training is
+  # validated independently.
+  sequence_packing:
+    enabled: false
+  tokenizer:
+    name: ${policy.model_name}
+    # Declare the key so launchers can override it with a local .jinja file.
+    # "default" preserves the model-bundled template when no override is used.
+    chat_template: default
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+    video:
+      num_frames: 32
+  megatron_cfg:
+    # H100 nodes use CUDA compute capability 9.0. Megatron requires this
+    # explicitly when the runtime container does not provide it.
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: "9.0"
+    # Frozen RADIO features keep vLLM's multimodal cache valid across refits.
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    # Match the validated source run: the checkpoint can contain MTP weights,
+    # but GRPO trains only the next-token objective here.
+    mtp_num_layers: 0
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.0
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    # Reuse the two-node policy topology verified by the synchronous control.
+    # Fourteen generation nodes leave only 12.5% of the allocation idle while
+    # an uncapped long rollout is still in flight.
+    expert_model_parallel_size: 4
+    context_parallel_size: 1
+    moe_shared_expert_overlap: false
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+  # Keep sequence padding consistent with the validated Omni configuration.
+  make_sequence_length_divisible_by: 32
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    bad_words: []
+    vllm_cfg:
+      # Both vision modules are frozen, so refits do not invalidate encoder
+      # outputs and in-flight async requests can safely remain active.
+      reset_mm_cache_after_refit: false
+      logprobs_mode: raw_logprobs
+      # Match the TP4 policy topology. TP8 vLLM inference can diverge from the
+      # TP4 Megatron logprobs on rare tokens, while TP4 preserves raw-logprob
+      # parity without masking or dropping samples.
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      env_vars:
+        # Decode raw video bytes with the same TorchCodec/Nemotron sampling
+        # contract used by policy-side preprocessing.
+        NRL_VIDEO_BACKEND: "torchcodec"
+        NRL_VIDEO_SAMPLING_STYLE: "nemotron_vl"
+        # Keep recovered short-video frame counts divisible by RADIO's temporal
+        # tubelet size in both rollout and policy preprocessing.
+        NRL_VIDEO_TEMPORAL_PATCH_SIZE: "2"
+        VLLM_VIDEO_LOADER_BACKEND: "nemotron_vl"
+      http_server_serving_chat_kwargs:
+        # None delegates to the initialized tokenizer's template. Declaring the
+        # key also permits a normal Hydra override for local model checkpoints.
+        chat_template: null
+        chat_template_content_format: string
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nemotron_v3
+    vllm_kwargs:
+      allowed_local_media_path: "${oc.env:NEMO_RL_VIDEO_MEDIA_ROOT}"
+      mm_processor_cache_gb: 0
+      max_num_seqs: 1
+      limit_mm_per_prompt:
+        # Cached frames are represented as one native video for vLLM while
+        # policy preprocessing consumes the same lossless PNG sequence.
+        image: 32
+        video:
+          count: 1
+          num_frames: 32
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      enable_chunked_prefill: false
+      disable_custom_all_reduce: true
+      attention_backend: FLASH_ATTN
+      attention_config:
+        use_trtllm_attention: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 14
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  # Video decoding imports the pinned vLLM media loader; keep it in the driver
+  # instead of importing vLLM for the first time after a DataLoader fork.
+  num_workers: 0
+  default:
+    num_frames: 32
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+    min_generation_tokens: 2000
+  train:
+    data_path: "${oc.env:NEMO_RL_VIDEO_TRAIN_JSONL}"
+  validation:
+    data_path: "${oc.env:NEMO_RL_VIDEO_VAL_JSONL}"
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    # The source blend's video-only subset is multiple-choice, so only the
+    # policy model and MCQA grader are required.
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

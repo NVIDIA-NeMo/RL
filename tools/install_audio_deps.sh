@@ -26,6 +26,6 @@ uv pip install --no-config \
     --extra-index-url https://pypi.org/simple \
     --reinstall-package torchaudio \
     "torchaudio==2.11.0" \
-    "torchcodec>=0.3.0"
+    "torchcodec==0.11.1"
 
 echo "[audio-deps] Done."

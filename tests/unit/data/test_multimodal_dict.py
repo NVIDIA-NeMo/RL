@@ -480,3 +480,81 @@ def test_slice_preserves_pad_to_max_shape_flag():
 
     assert sliced.pad_to_max_shape is True
     assert sliced.as_tensor().shape == (2, 3, 4, 4)
+
+
+def test_packedtensor_deduplicate_preserves_logical_tensor():
+    first = torch.tensor([[1.0], [2.0]])
+    second = torch.tensor([[3.0]])
+    packed = PackedTensor(
+        [first, first.clone(), second, second.clone()], dim_to_pack=0
+    )
+
+    deduplicated = packed.deduplicate(torch.tensor([7, 7, 11, 11]))
+
+    assert len(deduplicated) == 4
+    assert len(deduplicated.tensors) == 2
+    torch.testing.assert_close(deduplicated.as_tensor(), packed.as_tensor())
+
+
+def test_packedtensor_deduplicate_slice_compacts_unique_tensors():
+    packed = PackedTensor(
+        [torch.tensor([1]), torch.tensor([2]), torch.tensor([3]), torch.tensor([4])],
+        dim_to_pack=0,
+    ).deduplicate([0, 0, 1, 1])
+
+    selected = packed.slice([1, 2, 3])
+
+    assert len(selected) == 3
+    assert len(selected.tensors) == 2
+    torch.testing.assert_close(selected.as_tensor(), torch.tensor([1, 3, 3]))
+
+
+def test_packedtensor_repeat_interleave_shares_physical_tensors():
+    packed = PackedTensor(
+        [torch.tensor([1]), torch.tensor([2])],
+        dim_to_pack=0,
+    )
+
+    repeated = packed.repeat_interleave(3)
+
+    assert len(repeated) == 6
+    assert len(repeated.tensors) == 2
+    torch.testing.assert_close(
+        repeated.as_tensor(), torch.tensor([1, 1, 1, 2, 2, 2])
+    )
+
+
+def test_packedtensor_concat_preserves_deduplication():
+    first = PackedTensor(
+        [torch.tensor([1]), torch.tensor([2])], dim_to_pack=0
+    ).repeat_interleave(2)
+    second = PackedTensor([torch.tensor([3])], dim_to_pack=0)
+
+    combined = PackedTensor.concat([first, second])
+
+    assert len(combined) == 5
+    assert len(combined.tensors) == 3
+    torch.testing.assert_close(
+        combined.as_tensor(), torch.tensor([1, 1, 2, 2, 3])
+    )
+
+
+def test_batched_data_dict_repeat_interleave_supports_packed_tensor():
+    batch = BatchedDataDict(
+        {
+            "ids": torch.tensor([[1], [2]]),
+            "pixel_values": PackedTensor(
+                [torch.tensor([10]), torch.tensor([20])], dim_to_pack=0
+            ),
+        }
+    )
+
+    repeated = batch.repeat_interleave(2)
+
+    torch.testing.assert_close(
+        repeated["ids"], torch.tensor([[1], [1], [2], [2]])
+    )
+    assert len(repeated["pixel_values"].tensors) == 2
+    torch.testing.assert_close(
+        repeated["pixel_values"].as_tensor(), torch.tensor([10, 10, 20, 20])
+    )

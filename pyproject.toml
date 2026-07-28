@@ -50,7 +50,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
   "torchvision==0.26.0",
-  # torchaudio and torchcodec are NOT installed in the container image.
+  # torchaudio and torchcodec are not installed in the base environment.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
   # Floor raised to 5.5.0 for Gemma 4 support.
@@ -347,7 +347,7 @@ link-mode = "copy"
 # because its bundled FFmpeg codec libs (H.264, H.265, AAC) may incur royalties. The CVE floor
 # (>=5.0.0) is kept separately in constraint-dependencies so it applies to anyone who does install it.
 # Installed at runtime via tools/install_audio_deps.sh (--no-config bypasses the override there).
-# vllm defaults to opencv for video IO but falls back to torchcodec.
+# NeMo-RL registers a TorchCodec-backed vLLM loader for Nemotron video IO.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",

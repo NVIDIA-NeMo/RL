@@ -297,6 +297,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     class ReasoningParserManager:
         import_reasoning_parser = MagicMock()
 
+    load_chat_template = MagicMock(return_value="{{ resolved chat template }}")
+    make_module(
+        "vllm.entrypoints.chat_utils",
+        load_chat_template=load_chat_template,
+    )
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
@@ -342,7 +347,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         ToolParserManager=ToolParserManager,
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return (
+        ToolParserManager,
+        ReasoningParserManager,
+        OpenAIServingChat,
+        load_chat_template,
+    )
 
 
 class _FakeFastAPIApp:
@@ -362,6 +372,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        load_chat_template,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -373,6 +384,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
             "reasoning_parser_plugin": "/plugins/reasoning_parser.py",
             "http_server_serving_chat_kwargs": {
                 "reasoning_parser": "nano_v3",
+                "chat_template": "/tmp/chat_template.jinja",
             },
         },
     }
@@ -389,6 +401,17 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     )
     reasoning_parser_manager.import_reasoning_parser.assert_called_once_with(
         "/plugins/reasoning_parser.py"
+    )
+    load_chat_template.assert_called_once_with("/tmp/chat_template.jinja")
+    assert (
+        openai_serving_chat.instances[0].kwargs["online_renderer"].kwargs[
+            "chat_template"
+        ]
+        == "{{ resolved chat template }}"
+    )
+    assert (
+        openai_serving_chat.instances[0].kwargs["chat_template"]
+        == "{{ resolved chat template }}"
     )
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`

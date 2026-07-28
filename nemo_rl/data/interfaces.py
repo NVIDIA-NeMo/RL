@@ -59,6 +59,17 @@ class TaskDataSpec:
     prompt_file: Optional[PathLike] = None
 
     system_prompt_file: Optional[PathLike] = None
+    # Image/video processing controls. These defaults match the processor
+    # contract used by existing non-video datasets.
+    num_frames: int = 8
+    use_tiling: bool = False
+    use_dynamic_resolution: Optional[bool] = None
+    max_num_tiles: Optional[int] = None
+    max_num_patches: Optional[int] = None
+    video_target_num_patches: Optional[int] = None
+    video_temporal_patch_size: int = 1
+    video_maintain_aspect_ratio: bool = True
+    min_generation_tokens: int = 2000
 
     def __post_init__(self) -> None:
         def load_prompt_file(

@@ -31,6 +31,16 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    # Multimodal media processing controls forwarded to TaskDataSpec.
+    num_frames: NotRequired[int]
+    use_tiling: NotRequired[bool]
+    use_dynamic_resolution: NotRequired[bool | None]
+    max_num_tiles: NotRequired[int | None]
+    max_num_patches: NotRequired[int | None]
+    video_target_num_patches: NotRequired[int | None]
+    video_temporal_patch_size: NotRequired[int]
+    video_maintain_aspect_ratio: NotRequired[bool]
+    min_generation_tokens: NotRequired[int]
 
 
 class PreferenceDatasetConfig(TypedDict):
