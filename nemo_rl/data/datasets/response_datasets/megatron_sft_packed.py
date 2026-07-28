@@ -17,7 +17,10 @@ from typing import Any, Optional
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.megatron_sft_packed import megatron_sft_packed_preprocessor
+from nemo_rl.data.megatron_sft_packed import (
+    megatron_sft_packed_preprocessor,
+    validate_megatron_sft_prompt_format,
+)
 
 
 class MegatronSFTPackedDataset(RawDataset):
@@ -56,18 +59,23 @@ class MegatronSFTPackedDataset(RawDataset):
         return {"packed_messages": messages, "task_name": self.task_name}
 
     def set_processor(self) -> None:
+        prompt_format: Any = self.data_config["megatron_sft_prompt_format"]
+        validate_megatron_sft_prompt_format(str(prompt_format))
         configured_prefix_len: Any = self.data_config.get(
             "megatron_sft_assistant_prefix_len", None
         )
-        configured_context_parallel_size: Any = self.data_config.get(
-            "megatron_sft_context_parallel_size", 1
-        )
+        configured_context_parallel_size: Any = self.data_config[
+            "megatron_sft_context_parallel_size"
+        ]
+        context_parallel_size = int(configured_context_parallel_size)
+        if context_parallel_size < 1:
+            raise ValueError("megatron_sft_context_parallel_size must be >= 1")
         self.processor = partial(
             megatron_sft_packed_preprocessor,
-            prompt_format=self.data_config.get("megatron_sft_prompt_format", None),
+            prompt_format=str(prompt_format),
             pad_token=self.data_config.get("megatron_sft_pad_token", None),
             assistant_prefix_len=(
                 None if configured_prefix_len is None else int(configured_prefix_len)
             ),
-            context_parallel_size=int(configured_context_parallel_size),
+            context_parallel_size=context_parallel_size,
         )

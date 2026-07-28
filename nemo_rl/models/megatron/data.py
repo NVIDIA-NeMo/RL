@@ -52,6 +52,14 @@ class ProcessedInputs:
     loss_mask_cp_sharded: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True)
+class DirectPackedMetadata:
+    """Host-validated scalar metadata for one direct-packed microbatch."""
+
+    cu_seqlens_length: int
+    max_seqlen: int
+
+
 @dataclass
 class ProcessedMicrobatch:
     """Container for a processed microbatch ready for model forward pass.
@@ -89,6 +97,91 @@ class ProcessedMicrobatch:
     loss_mask_cp_sharded: Optional[torch.Tensor] = None
 
 
+def _validate_direct_packed_microbatch(
+    data_dict: BatchedDataDict[Any],
+    *,
+    context_parallel_size: int,
+) -> DirectPackedMetadata:
+    """Validate direct-packed metadata before the batch moves to CUDA."""
+    required_keys = {
+        "target_ids",
+        "token_mask",
+        "sample_mask",
+        "position_ids",
+        "packed_cu_seqlens",
+        "packed_cu_seqlens_lengths",
+        "packed_max_seqlen",
+    }
+    missing_keys = sorted(required_keys.difference(data_dict.keys()))
+    if missing_keys:
+        raise ValueError(
+            "Megatron direct packed rows are missing required fields: "
+            + ", ".join(missing_keys)
+        )
+
+    input_ids = data_dict["input_ids"]
+    if input_ids.shape[0] != 1:
+        raise ValueError(
+            "Megatron direct packed microbatches must contain exactly one row"
+        )
+    for key in ("target_ids", "token_mask", "position_ids"):
+        if data_dict[key].shape != input_ids.shape:
+            raise ValueError(
+                f"{key} must have shape {tuple(input_ids.shape)} for a "
+                "Megatron direct packed row"
+            )
+    if data_dict["sample_mask"].shape != (1,):
+        raise ValueError("sample_mask must have shape (1,) for a direct packed row")
+
+    cu_lengths = data_dict["packed_cu_seqlens_lengths"]
+    packed_max_seqlen = data_dict["packed_max_seqlen"]
+    if cu_lengths.shape != (1,) or packed_max_seqlen.shape != (1,):
+        raise ValueError(
+            "packed_cu_seqlens_lengths and packed_max_seqlen must have "
+            "shape (1,) for a direct packed microbatch"
+        )
+
+    cu_len = int(cu_lengths[0].item())
+    packed_cu_seqlens = data_dict["packed_cu_seqlens"]
+    if packed_cu_seqlens.ndim != 2 or not 2 <= cu_len <= packed_cu_seqlens.shape[1]:
+        raise ValueError("packed_cu_seqlens_lengths is invalid for the packed row")
+
+    boundaries = [
+        int(boundary)
+        for boundary in packed_cu_seqlens[0, :cu_len].detach().cpu().tolist()
+    ]
+    segment_lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+    if (
+        boundaries[0] != 0
+        or boundaries[-1] != input_ids.shape[1]
+        or any(length <= 0 for length in segment_lengths)
+    ):
+        raise ValueError(
+            "packed_cu_seqlens must contain increasing boundaries from 0 "
+            "through the packed row length"
+        )
+    if context_parallel_size > 1 and any(
+        length % (2 * context_parallel_size) != 0 for length in segment_lengths
+    ):
+        raise ValueError(
+            "Direct packed SFT segment lengths must be divisible by "
+            f"2 * context_parallel_size ({2 * context_parallel_size})"
+        )
+
+    target_aligned_loss_mask = data_dict["token_mask"] * data_dict[
+        "sample_mask"
+    ].unsqueeze(-1)
+    if "mtp_loss_mask" in data_dict and not torch.equal(
+        data_dict["mtp_loss_mask"], target_aligned_loss_mask
+    ):
+        raise ValueError("mtp_loss_mask must match the direct target-aligned loss mask")
+
+    return DirectPackedMetadata(
+        cu_seqlens_length=cu_len,
+        max_seqlen=int(packed_max_seqlen[0].item()),
+    )
+
+
 def make_processed_microbatch_iterator(
     raw_iterator: Iterator[BatchedDataDict[Any]],
     cfg: dict[str, Any],
@@ -119,6 +212,13 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        direct_packed_metadata = None
+        if "packed_cu_seqlens" in data_dict:
+            direct_packed_metadata = _validate_direct_packed_microbatch(
+                data_dict,
+                context_parallel_size=get_context_parallel_world_size(),
+            )
+
         # Move to GPU
         data_dict = data_dict.to("cuda")
 
@@ -132,6 +232,7 @@ def make_processed_microbatch_iterator(
             pack_sequences=pack_sequences,
             delegate_pack_to_model=delegate_pack_to_model,
             straggler_timer=straggler_timer,
+            direct_packed_metadata=direct_packed_metadata,
         )
 
         yield ProcessedMicrobatch(
@@ -262,6 +363,7 @@ def _get_direct_packed_bundle_on_this_cp_rank(
     *,
     cp_size: int,
     cp_rank: int,
+    direct_packed_metadata: Optional[DirectPackedMetadata] = None,
 ) -> tuple[dict[str, torch.Tensor], PackedSeqParams]:
     """Apply current-main per-sequence zigzag CP sharding to packed row tensors."""
     if not batch:
@@ -282,14 +384,15 @@ def _get_direct_packed_bundle_on_this_cp_rank(
                 "Direct packed SFT tensors must share the same sequence dimension"
             )
 
-    segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    if bool((segment_lengths <= 0).any().item()):
-        raise ValueError("Direct packed SFT sequence boundaries must increase")
-    if cp_size > 1 and bool((segment_lengths % (2 * cp_size) != 0).any().item()):
-        raise ValueError(
-            "Direct packed SFT segment lengths must be divisible by "
-            f"2 * context_parallel_size ({2 * cp_size})"
-        )
+    if direct_packed_metadata is None:
+        segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if bool((segment_lengths <= 0).any().item()):
+            raise ValueError("Direct packed SFT sequence boundaries must increase")
+        if cp_size > 1 and bool((segment_lengths % (2 * cp_size) != 0).any().item()):
+            raise ValueError(
+                "Direct packed SFT segment lengths must be divisible by "
+                f"2 * context_parallel_size ({2 * cp_size})"
+            )
 
     cp_batch = {name: tensor.contiguous() for name, tensor in batch.items()}
     if cp_size > 1:
@@ -312,7 +415,11 @@ def _get_direct_packed_bundle_on_this_cp_rank(
         }
 
     local_token_count = next(iter(cp_batch.values())).shape[1]
-    max_seqlen = int(packed_max_seqlen.item())
+    max_seqlen = (
+        int(packed_max_seqlen.item())
+        if direct_packed_metadata is None
+        else direct_packed_metadata.max_seqlen
+    )
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
@@ -335,6 +442,7 @@ def process_microbatch(
     pack_sequences: bool = False,
     delegate_pack_to_model: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    direct_packed_metadata: Optional[DirectPackedMetadata] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
@@ -364,24 +472,6 @@ def process_microbatch(
         loss_mask_cp_sharded = None
 
         if "packed_cu_seqlens" in data_dict:
-            required_keys = {
-                "target_ids",
-                "token_mask",
-                "sample_mask",
-                "position_ids",
-                "packed_cu_seqlens_lengths",
-                "packed_max_seqlen",
-            }
-            missing_keys = sorted(required_keys.difference(data_dict.keys()))
-            if missing_keys:
-                raise ValueError(
-                    "Megatron direct packed rows are missing required fields: "
-                    + ", ".join(missing_keys)
-                )
-            if input_ids.shape[0] != 1:
-                raise ValueError(
-                    "Megatron direct packed microbatches must contain exactly one row"
-                )
             if delegate_pack_to_model:
                 raise NotImplementedError(
                     "Megatron direct packed rows do not support "
@@ -391,54 +481,21 @@ def process_microbatch(
                 raise NotImplementedError(
                     "Router replay is not supported with Megatron direct packed rows"
                 )
-
-            for key in ("target_ids", "token_mask", "position_ids"):
-                if data_dict[key].shape != input_ids.shape:
-                    raise ValueError(
-                        f"{key} must have shape {tuple(input_ids.shape)} for a "
-                        "Megatron direct packed row"
-                    )
-            if data_dict["sample_mask"].shape != (1,):
-                raise ValueError(
-                    "sample_mask must have shape (1,) for a direct packed row"
+            cp_size = get_context_parallel_world_size()
+            if direct_packed_metadata is None:
+                direct_packed_metadata = _validate_direct_packed_microbatch(
+                    data_dict,
+                    context_parallel_size=cp_size,
                 )
-
-            cu_lengths = data_dict["packed_cu_seqlens_lengths"]
             packed_max_seqlen = data_dict["packed_max_seqlen"]
-            if cu_lengths.shape != (1,) or packed_max_seqlen.shape != (1,):
-                raise ValueError(
-                    "packed_cu_seqlens_lengths and packed_max_seqlen must have "
-                    "shape (1,) for a direct packed microbatch"
-                )
-            cu_len = int(cu_lengths[0].item())
             packed_cu_seqlens = data_dict["packed_cu_seqlens"]
-            if (
-                packed_cu_seqlens.ndim != 2
-                or not 2 <= cu_len <= packed_cu_seqlens.shape[1]
-            ):
-                raise ValueError(
-                    "packed_cu_seqlens_lengths is invalid for the packed row"
-                )
-            cu_seqlens = packed_cu_seqlens[0, :cu_len].to(torch.int32)
-            if (
-                int(cu_seqlens[0].item()) != 0
-                or int(cu_seqlens[-1].item()) != input_ids.shape[1]
-                or bool(((cu_seqlens[1:] - cu_seqlens[:-1]) <= 0).any().item())
-            ):
-                raise ValueError(
-                    "packed_cu_seqlens must contain increasing boundaries from 0 "
-                    "through the packed row length"
-                )
+            cu_seqlens = packed_cu_seqlens[
+                0, : direct_packed_metadata.cu_seqlens_length
+            ].to(torch.int32)
 
             target_aligned_loss_mask = data_dict["token_mask"] * data_dict[
                 "sample_mask"
             ].unsqueeze(-1)
-            if "mtp_loss_mask" in data_dict and not torch.equal(
-                data_dict["mtp_loss_mask"], target_aligned_loss_mask
-            ):
-                raise ValueError(
-                    "mtp_loss_mask must match the direct target-aligned loss mask"
-                )
             cp_batch, packed_seq_params = _get_direct_packed_bundle_on_this_cp_rank(
                 {
                     "tokens": input_ids,
@@ -448,8 +505,9 @@ def process_microbatch(
                 },
                 cu_seqlens,
                 packed_max_seqlen,
-                cp_size=get_context_parallel_world_size(),
+                cp_size=cp_size,
                 cp_rank=get_context_parallel_rank(),
+                direct_packed_metadata=direct_packed_metadata,
             )
             input_ids_cp_sharded = cp_batch["tokens"]
             labels_cp_sharded = cp_batch["labels"]

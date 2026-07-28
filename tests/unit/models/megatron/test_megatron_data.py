@@ -338,12 +338,14 @@ class TestProcessMicrobatch:
             *,
             cp_size: int,
             cp_rank: int,
+            direct_packed_metadata=None,
         ) -> tuple[dict[str, torch.Tensor], MagicMock]:
             expected_cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
             assert set(batch) == {"tokens", "labels", "loss_mask", "position_ids"}
             assert torch.equal(cu_seqlens, expected_cu_seqlens)
             assert torch.equal(packed_max_seqlen, torch.tensor([4]))
             assert (cp_size, cp_rank) == (2, 1)
+            assert direct_packed_metadata is not None
             return {
                 key: value[:, cp_indices] for key, value in batch.items()
             }, packed_seq_params

@@ -57,6 +57,11 @@ _PROMPT_CONFIGS = {
 }
 
 
+def validate_megatron_sft_prompt_format(prompt_format: str) -> None:
+    if prompt_format not in _PROMPT_CONFIGS:
+        raise NotImplementedError("unknown SFT prompt format", prompt_format)
+
+
 class MegatronSFTPackedDatumSpec(DatumSpec):
     input_ids: torch.Tensor
     target_ids: torch.Tensor
@@ -90,8 +95,9 @@ def _get_prompt_config(
     pad_token: str | None,
     assistant_prefix_len: int | None,
 ) -> _PromptConfig:
-    if prompt_format is None or prompt_format not in _PROMPT_CONFIGS:
+    if prompt_format is None:
         raise NotImplementedError("unknown SFT prompt format", prompt_format)
+    validate_megatron_sft_prompt_format(prompt_format)
 
     default = _PROMPT_CONFIGS[prompt_format]
     return _PromptConfig(
@@ -200,10 +206,11 @@ def megatron_sft_packed_preprocessor(
     tokenizer: Any,
     max_seq_length: int | None,
     idx: int,
-    prompt_format: str | None = None,
+    *,
+    prompt_format: str,
+    context_parallel_size: int,
     pad_token: str | None = None,
     assistant_prefix_len: int | None = None,
-    context_parallel_size: int = 1,
     **_unused_kwargs: Any,
 ) -> MegatronSFTPackedDatumSpec:
     """Build one direct tensor row with Megatron-LM ``SFTDataset`` semantics."""
@@ -214,7 +221,6 @@ def megatron_sft_packed_preprocessor(
         raise ValueError("context_parallel_size must be >= 1")
 
     prompt_config = _get_prompt_config(prompt_format, pad_token, assistant_prefix_len)
-    assert prompt_format is not None
     pack_length = max_seq_length
     pad = _resolve_pad_token_id(tokenizer, prompt_config)
     conversations = split_megatron_sft_conversations(datum_dict["packed_messages"])

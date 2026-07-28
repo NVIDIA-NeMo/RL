@@ -108,6 +108,7 @@ def _preprocess(
         tokenizer,
         max_seq_length,
         idx=7,
+        context_parallel_size=kwargs.pop("context_parallel_size", 1),
         **kwargs,
     )
 
