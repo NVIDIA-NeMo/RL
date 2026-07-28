@@ -73,15 +73,31 @@ class _FakeBuffer:
     def __init__(self) -> None:
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
         self.commit_calls: list[tuple[str, object, int, int]] = []
+        self.abort_calls: list[str] = []
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
 
-    def reserve(self, *, weight_version: int, group_id: str | None = None) -> str:
+    def reserve(
+        self,
+        *,
+        weight_version: int,
+        target_step: int | None = None,
+        group_id: str | None = None,
+        rollout_ids: list[str] | None = None,
+    ) -> str:
+        del target_step, rollout_ids
         if group_id is None:
             group_id = str(uuid.uuid4())
         self.reserve_calls.append(weight_version)
         self._slots.append(group_id)
         return group_id
+
+    def abort(self, group_id: str) -> bool:
+        self.abort_calls.append(group_id)
+        if group_id in self._slots:
+            self._slots.remove(group_id)
+            return True
+        return False
 
     async def commit(
         self,
@@ -246,6 +262,37 @@ class TestGenerateAndPushFlow:
         mgr._tq_buffer = None
         with pytest.raises(AssertionError, match="tq_buffer"):
             _run(mgr.generate_and_push({"prompt": "p"}))
+
+    def test_failed_rollout_aborts_reserved_slot(self):
+        """A dispatch that raises must not leave a phantom unready slot."""
+
+        async def _boom(_input_sample):
+            raise RuntimeError("rollout exploded")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_boom))
+
+        with pytest.raises(RuntimeError, match="rollout exploded"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert len(buf.reserve_calls) == 1
+        assert buf.commit_calls == []
+        assert len(buf.abort_calls) == 1
+        assert buf._slots == []  # the reserved slot was dropped
+
+    def test_failed_commit_aborts_reserved_slot(self):
+        """Commit failures (e.g. evicted slot) also abort the reservation."""
+
+        class _CommitBoomBuffer(_FakeBuffer):
+            async def commit(self, group_id, record, start_weight_version, end_weight_version):
+                raise ValueError("no live slot")
+
+        buf = _CommitBoomBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+
+        with pytest.raises(ValueError, match="no live slot"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+        assert len(buf.abort_calls) == 1
 
 
 # ---------------------------------------------------------------------------

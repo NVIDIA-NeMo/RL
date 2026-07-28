@@ -658,12 +658,20 @@ class RolloutManager:
             weight_version=start_version, target_step=target_step
         )
 
-        record = await self.run_rollout(input_sample)
-        end_version = self._weight_version
+        try:
+            record = await self.run_rollout(input_sample)
+            end_version = self._weight_version
 
-        await self._tq_buffer.commit(
-            group_id,
-            record,
-            start_weight_version=start_version,
-            end_weight_version=end_version,
-        )
+            await self._tq_buffer.commit(
+                group_id,
+                record,
+                start_weight_version=start_version,
+                end_weight_version=end_version,
+            )
+        except BaseException:
+            # A slot that will never commit must not linger as a phantom
+            # unready entry until staleness eviction — drop it now so buffer
+            # occupancy and _buffer_capacity stay in step (the dispatch task
+            # releases the capacity permit on the same exception).
+            self._tq_buffer.abort(group_id)
+            raise

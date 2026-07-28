@@ -350,6 +350,33 @@ def setup_single_controller(
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
 
+    # Token-capture mode: pre-register both rollout partitions from this
+    # single driver thread before any producer is live. TQ's controller
+    # registers unseen field names lazily inside update_production_status
+    # without a lock, so the first concurrent puts into an unregistered
+    # partition can race kv_retrieve_meta and kill the controller thread
+    # (see TQDataPlaneClient.register_partition).
+    token_capture_cfg = master_config.token_capture
+    if token_capture_cfg.enabled:
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+
+        group_size = grpo_config["num_generations_per_prompt"]
+        num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=list(DP_TRAIN_FIELDS),
+            num_samples=num_rollout_samples,
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=group_size,
+        )
+        dp_client.register_partition(
+            partition_id=token_capture_cfg.staging_partition,
+            fields=list(STAGING_FIELDS),
+            num_samples=num_rollout_samples,
+            consumer_tasks=["finalize"],
+        )
+
     backend = generation_config["backend"]
     weight_synchronizer = create_weight_synchronizer(
         policy=policy,
@@ -372,6 +399,9 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        staging_partition_id=(
+            token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
+        ),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

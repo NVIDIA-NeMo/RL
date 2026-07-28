@@ -50,6 +50,35 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     force_in_order: bool = False
 
 
+class TokenCaptureConfig(BaseModel, extra="allow"):
+    """Gate-authoritative token capture (token-in/token-out via NeMo-Gym).
+
+    Dormant by default: with ``enabled=False`` every legacy codepath behaves
+    exactly as before — no staging partition is registered, no gate is
+    installed, and rollouts ride the token-echo path. See
+    docs/design-docs/tq-gym-gate-authoritative.md.
+    """
+
+    enabled: bool = False
+    # TQ partition holding per-call staged token deltas (cleared by the
+    # finalizer; distinct from the canonical rollout partition).
+    staging_partition: str = "rollout_staging"
+    # A failed worker-side stage poisons the rollout; "continue" serves the
+    # completion and lets the finalizer emit a placeholder row, "abort" fails
+    # the whole rollout at the gate.
+    on_capture_failure: Literal["continue", "abort"] = "continue"
+    # "allow" trains groups whose calls span a refit (staleness accounted via
+    # group_min_wv); "reject" placeholders them. Strict modes beyond the MVP
+    # matrix raise NotImplementedError at setup.
+    mixed_weight_version_policy: Literal["allow", "reject"] = "allow"
+    # Drop the whole group when fewer than this fraction of its rollouts
+    # produced valid rows (None keeps every group).
+    min_valid_fraction_per_group: Optional[float] = None
+    # Gate-side cleanup backstops.
+    registration_ttl_s: float = 3600.0
+    staging_ttl_s: float = 3600.0
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -61,6 +90,7 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig = Field(default_factory=AsyncRLConfig)
+    token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
 
 # ── Internal SingleController configs ────────────────────────────────────

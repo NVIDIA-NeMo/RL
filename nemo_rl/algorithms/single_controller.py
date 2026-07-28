@@ -316,6 +316,12 @@ class SingleControllerActor:
                             content = prompt["message_log"][i]["content"]
                             break
                     print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
+            except BaseException:
+                # A failed dispatch never reaches the train pump, so its
+                # _buffer_capacity slot (released there per consumed group)
+                # would leak and eventually starve the rollout pump.
+                self._buffer_capacity.release()
+                raise
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
