@@ -210,7 +210,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 # Node-local uv cache (ephemeral). Each node builds its own venv independently —
 # a shared-filesystem uv cache corrupts under concurrent multi-node builds.
 # Pre-warm LUSTRE_UV_CACHE once with a single process to skip long compiles.
-export UV_CACHE_DIR=/tmp/uv_cache
+# export UV_CACHE_DIR=/tmp/uv_cache
 export UV_LOCK_TIMEOUT=3600
 export RAY_DEDUP_LOGS=1
 export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
@@ -293,12 +293,9 @@ _seed_cache() {
 
 _seed_cache "${LUSTRE_INDUCTOR_CACHE}" "${INDUCTOR_CACHE_DIR}" "Inductor"
 _seed_cache "${LUSTRE_TRITON_CACHE}" "${TRITON_CACHE_DIR}" "Triton"
-# uv cache: read-only rsync of single-process-prebuilt wheels into node-local
-# /tmp so the uv sync below is a cache hit, not a ~28min build.
-# (NOTE: no backticks/'\$(...)' in this heredoc body -- they would be command-
-# substituted on the LOGIN node when SETUP_COMMAND is read.)
-mkdir -p "${UV_CACHE_DIR}"
-_seed_cache "${LUSTRE_UV_CACHE}" "${UV_CACHE_DIR}" "uv (prebuilt wheels)"
+# uv cache seeding removed: the container ships prebuilt deps in its default uv
+# cache, so we no longer seed a node-local /tmp uv cache or override UV_CACHE_DIR
+# (uv sync below uses the container default).
 echo "[CACHE SEED] Done."
 
 # ===== Compile-cache WRITE-BACK sidecar =====
@@ -341,6 +338,12 @@ if [ "${CACHE_SYNC_FREQUENCY}" -gt 0 ] 2>/dev/null; then
 else
   echo "[CACHE SYNC] disabled (CACHE_SYNC_FREQUENCY=${CACHE_SYNC_FREQUENCY})"
 fi
+
+# Log the uv cache location as seen INSIDE the container. Escaped (\$) so it is
+# evaluated at container runtime, not expanded on the login node when
+# SETUP_COMMAND is read. "uv cache dir" prints uv's effective cache directory.
+echo "[UV CHECK] UV_CACHE_DIR=\${UV_CACHE_DIR:-<unset>}"
+echo "[UV CHECK] uv cache dir -> \$(uv cache dir 2>/dev/null || echo '<uv not found>')"
 
 UV_HTTP_TIMEOUT=3600 \
   uv sync --frozen --extra mcore
@@ -389,7 +392,6 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN} \
   HF_HOME=${HF_HOME} \
   HF_DATASETS_CACHE=${HF_DATASETS_CACHE} \
-  UV_CACHE_DIR=${UV_CACHE_DIR} \
   VLLM_ATTENTION_BACKEND=FLASH_ATTN \
   VLLM_CACHE_ROOT=${LUSTRE_VLLM_CACHE} \
   DG_JIT_CACHE_DIR=${LUSTRE_VLLM_CACHE}/deep_gemm \
@@ -520,6 +522,7 @@ echo "SWE async GRPO | Experiment: ${EXP_SUFFIX}"
 echo "Entrypoint: ${ENTRYPOINT} (SC_MODE=${SC_MODE})"
 echo "Run tree:   ${RUN_DIR} @ ${RUN_COMMIT}"
 echo "Account:    ${ACCOUNT} / ${PARTITION}"
+echo "MOUNTS:     ${MOUNTS} ${EXTRA_MOUNTS}"
 echo "Nodes: ${NUM_NODES} total (generation carves out ${NUM_GEN_NODES})    Time: ${TIME}"
 echo "Container:  ${CONTAINER}"
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
