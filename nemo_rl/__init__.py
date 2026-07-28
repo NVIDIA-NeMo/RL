@@ -76,8 +76,7 @@ def _warn_if_uv_cache_dir_set():
         "holding NeMo RL's prebuilt wheels (causing slow reinstalls even with a prebuilt "
         "container), and a cache on a persistent/shared filesystem can be corrupted by "
         "concurrent jobs. Recommended: `unset UV_CACHE_DIR` and let uv use its default, "
-        "whether in a container or on baremetal. With ray.sub, use UV_CACHE_DIR_OVERRIDE "
-        "instead (see docs/cluster.md)."
+        "whether in a container or on baremetal."
     )
 
 
