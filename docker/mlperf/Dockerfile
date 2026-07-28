@@ -76,8 +76,8 @@ FROM base AS nemo-rl-src
 
 ## 1. Clone nemo-rl (+ 3rdparty submodules) and record provenance.
 # Submodule ARGs: SKIP = keep the pin from the nemo-rl revision.
-ARG NEMO_RL_REPO=https://github.com/shuyixiong/RL.git
-ARG NEMO_RL_REVISION=trtllm-agentic-swe-mlperf
+ARG NEMO_RL_REPO=https://github.com/NVIDIA-NeMo/RL.git
+ARG NEMO_RL_REVISION=opt/dev-backup
 ARG NEMO_GYM_REVISION=SKIP
 ARG MBRIDGE_REVISION=SKIP
 ARG AUTOMODEL_REVISION=SKIP
