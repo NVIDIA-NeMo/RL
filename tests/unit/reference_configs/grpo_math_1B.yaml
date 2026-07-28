@@ -25,6 +25,7 @@ grpo:
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
+  deduplicate_multimodal_data: false
   reward_shaping:
     enabled: false
     overlong_buffer_length: 128

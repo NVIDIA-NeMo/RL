@@ -12,9 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 
-from nemo_rl.models.huggingface.common import ModelFlag, is_gemma_model
+from nemo_rl.models.huggingface.common import (
+    ModelFlag,
+    is_gemma_model,
+    is_nano_nemotron_vl_model,
+)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"],
+)
+def test_nemotron_model_flag_does_not_import_remote_code(tmp_path, model_type):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "auto_map": {"AutoConfig": "configuration.ShouldNotBeImported"},
+                "model_type": model_type,
+            }
+        )
+    )
+    (tmp_path / "configuration.py").write_text(
+        "raise AssertionError('model flag imported checkpoint code')\n"
+    )
+
+    assert is_nano_nemotron_vl_model(str(tmp_path))
+    assert ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(str(tmp_path))
 
 
 @pytest.mark.hf_gated

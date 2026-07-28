@@ -17,7 +17,7 @@ from enum import Enum, auto
 from typing import Optional, Tuple, TypeVar
 
 import torch
-from transformers import AutoConfig
+from transformers import PretrainedConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -50,28 +50,39 @@ class ModelFlag(Enum):
     def matches(self, model_name: str) -> bool:
         match self:
             case ModelFlag.VLLM_LOAD_FORMAT_AUTO:
-                return is_gemma_model(model_name) or is_nano_nemotron_vl_model(
-                    model_name
-                )
+                model_type = _get_model_type(model_name)
+                return model_type in _GEMMA_MODEL_TYPES | _NANO_NEMOTRON_VL_MODEL_TYPES
             case _:
                 raise ValueError(f"Unknown ModelFlag: {self}")
 
 
+_GEMMA_MODEL_TYPES = {"gemma2", "gemma3", "gemma3_text"}
+_NANO_NEMOTRON_VL_MODEL_TYPES = {
+    "NemotronH_Nano_VL_V2",
+    "NemotronH_Nano_Omni_Reasoning_V3",
+}
+
+
+def _get_model_type(model_name: str) -> str | None:
+    """Read ``model_type`` without importing checkpoint-provided Python code.
+
+    Model flags are evaluated concurrently by every vLLM worker. Using
+    ``AutoConfig.from_pretrained(..., trust_remote_code=True)`` here can make
+    those workers race while populating Transformers' shared dynamic-module
+    cache. The flag only needs the serialized model type, so loading the raw
+    config dictionary is both sufficient and safe under concurrent startup.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(model_name)
+    model_type = config_dict.get("model_type")
+    return model_type if isinstance(model_type, str) else None
+
+
 def is_gemma_model(model_name: str) -> bool:
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    return hasattr(hf_config, "model_type") and hf_config.model_type in [
-        "gemma2",
-        "gemma3",
-        "gemma3_text",
-    ]
+    return _get_model_type(model_name) in _GEMMA_MODEL_TYPES
 
 
 def is_nano_nemotron_vl_model(model_name: str) -> bool:
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    return hasattr(hf_config, "model_type") and hf_config.model_type in [
-        "NemotronH_Nano_VL_V2",
-        "NemotronH_Nano_Omni_Reasoning_V3",
-    ]
+    return _get_model_type(model_name) in _NANO_NEMOTRON_VL_MODEL_TYPES
 
 
 def group_and_cat_tensors(

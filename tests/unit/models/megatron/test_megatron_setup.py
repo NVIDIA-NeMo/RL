@@ -33,6 +33,41 @@ import torch
 
 
 @pytest.mark.mcore
+class TestVLMProviderConfig:
+    def test_applies_only_explicit_freeze_controls(self):
+        from nemo_rl.models.megatron.setup import _apply_vlm_provider_config
+
+        provider = SimpleNamespace(
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_sound_encoder=False,
+            freeze_sound_projection=False,
+        )
+        config = {
+            "megatron_cfg": {
+                "freeze_vision_model": True,
+                "freeze_sound_encoder": True,
+            }
+        }
+
+        _apply_vlm_provider_config(provider, config)
+
+        assert provider.freeze_vision_model is True
+        assert provider.freeze_vision_projection is False
+        assert provider.freeze_sound_encoder is True
+        assert provider.freeze_sound_projection is False
+
+    def test_rejects_unsupported_explicit_freeze_control(self):
+        from nemo_rl.models.megatron.setup import _apply_vlm_provider_config
+
+        with pytest.raises(ValueError, match="does not support"):
+            _apply_vlm_provider_config(
+                SimpleNamespace(),
+                {"megatron_cfg": {"freeze_vision_model": True}},
+            )
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 

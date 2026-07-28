@@ -29,6 +29,7 @@ from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -1123,10 +1124,14 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                     "input_message_log": [{"token_ids": [rowidx]}],
                     "message_log": [
                         {
+                            "role": "user",
+                            "token_ids": [rowidx],
+                        },
+                        {
                             "role": "assistant",
                             "token_ids": [rowidx],
                             "generation_logprobs": [0.0],
-                        }
+                        },
                     ],
                 }
                 timing = {"timing/remote": 1.0} if position == 3 else None
@@ -1145,18 +1150,35 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "_ng_task_index": task_index,
             }
         )
+    video_payloads = [
+        PackedTensor([torch.tensor([rowidx])], dim_to_pack=0) for rowidx in range(4)
+    ]
     input_batch = BatchedDataDict(
         {
             "extra_env_info": rows,
-            "message_log": [[{"role": "user", "content": "prompt"}]] * 4,
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt",
+                        "video": video_payload,
+                    }
+                ]
+                for video_payload in video_payloads
+            ],
             "loss_multiplier": torch.ones(4),
         }
     )
     captured_groups = []
+    captured_video_payloads = {}
 
     def _postprocess_group(**kwargs):
         assert kwargs["log_full_result_tables"] is False
         task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
+        for result in kwargs["results"]:
+            captured_video_payloads[result["rowidx"]] = result["message_log"][0][
+                "video"
+            ]
         captured_groups.append(
             (task_index, [result["rowidx"] for result in kwargs["results"]])
         )
@@ -1209,6 +1231,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     assert [result.task_index for result in rollout_results] == [11, 10]
     assert captured_groups == [(11, [2, 3]), (10, [0, 1])]
+    assert all(
+        captured_video_payloads[rowidx] is video_payloads[rowidx] for rowidx in range(4)
+    )
     assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
@@ -1399,7 +1424,9 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
-    manager._result_to_completion = lambda result: result["value"]
+    manager._result_to_completion = (
+        lambda result, *, source_message_log: result["value"]
+    )
     manager._compute_rollout_metrics = lambda completions, agent: {
         "completion_count": len(completions),
         "agent": agent,
@@ -1413,6 +1440,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             ],
             timer=rollouts_mod.Timer(),
             timer_prefix="timing/test",
+            source_message_log=[],
         )
     )
 
@@ -1479,6 +1507,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
                 ],
                 timer=rollouts_mod.Timer(),
                 timer_prefix="timing/test",
+                source_message_log=[],
             )
         )
 

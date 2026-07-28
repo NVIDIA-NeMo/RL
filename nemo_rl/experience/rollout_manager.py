@@ -454,7 +454,10 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_inputs = self._build_inputs(input_sample)
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
-            rollout_inputs, timer, timer_prefix
+            rollout_inputs,
+            timer,
+            timer_prefix,
+            source_message_log=input_sample["message_log"],
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -512,7 +515,12 @@ class AsyncNemoGymRolloutImpl:
         return rows
 
     async def _run_rollouts(
-        self, inputs: list[dict], timer: Timer, timer_prefix: str
+        self,
+        inputs: list[dict],
+        timer: Timer,
+        timer_prefix: str,
+        *,
+        source_message_log: list[dict[str, Any]],
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
         nemo_gym_env = self._task_to_env["nemo_gym"]
@@ -547,9 +555,17 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
+            from nemo_rl.environments.nemo_gym import (
+                reattach_static_multimodal_payload,
+            )
+
+            reattach_static_multimodal_payload(prompt_message_log, source_message_log)
             # Convert results to completions.
             completions = [
-                self._result_to_completion(result) for result in completed_results
+                self._result_to_completion(
+                    result, source_message_log=source_message_log
+                )
+                for result in completed_results
             ]
 
         # Compute rollout metrics.
@@ -562,7 +578,12 @@ class AsyncNemoGymRolloutImpl:
 
         return completions, prompt_message_log, rollout_metrics
 
-    def _result_to_completion(self, result: dict) -> Completion:
+    def _result_to_completion(
+        self,
+        result: dict,
+        *,
+        source_message_log: list[dict[str, Any]],
+    ) -> Completion:
         """Convert one run_rollouts result dict into a Completion."""
         # Tensorize token fields.
         _tensorize_by_key(result["message_log"], "token_ids")
@@ -570,6 +591,11 @@ class AsyncNemoGymRolloutImpl:
             [m for m in result["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
+        from nemo_rl.environments.nemo_gym import (
+            reattach_static_multimodal_payload,
+        )
+
+        reattach_static_multimodal_payload(result["message_log"], source_message_log)
 
         # Calculate truncation.
         truncated = (
