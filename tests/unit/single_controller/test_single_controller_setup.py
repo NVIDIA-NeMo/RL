@@ -70,6 +70,7 @@ def _make_master_config(
         policy={
             "train_global_batch_size": num_prompts_per_step * 2,
             "max_total_sequence_length": 32,
+            "tokenizer": {"use_fastokens": False},
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
                 "backend": backend,
@@ -421,6 +422,8 @@ class TestSetup:
             ].return_value.dp_openai_server_base_urls,
             model_name="test-model",
             enable_router_replay=False,
+            routed_experts_dtype="int16",
+            use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 

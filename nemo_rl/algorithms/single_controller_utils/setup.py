@@ -30,9 +30,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.grpo import (
-    MasterConfig as GrpoMasterConfig,
-)
+from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
 from nemo_rl.algorithms.grpo import (
     _create_advantage_estimator,
     _should_use_nemo_gym,
@@ -51,6 +49,9 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.models.generation.interfaces import (
+    resolve_routed_experts_dtype_name_for_model,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -384,12 +385,19 @@ def setup_single_controller(
     if use_nemo_gym:
         # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
         # overlaps model loading instead of running serially afterward.
-        enable_router_replay = router_replay_enabled(master_config.policy)
+        enable_router_replay = router_replay_enabled(policy_config)
+        routed_experts_dtype = (
+            resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
+            if enable_router_replay
+            else "int16"
+        )
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
             env_configs=master_config.env,
             base_urls=generation.dp_openai_server_base_urls,
             model_name=generation_config["model_name"],
             enable_router_replay=enable_router_replay,
+            routed_experts_dtype=routed_experts_dtype,
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
 
     # ==========================
