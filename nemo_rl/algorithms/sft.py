@@ -253,8 +253,8 @@ def setup(
 
     use_fused_linear_logprobs = bool(
         megatron_cfg is not None
-        and megatron_cfg.get("enabled", False)
-        and megatron_cfg.get("use_fused_linear_logprobs", False)
+        and megatron_cfg["enabled"]
+        and megatron_cfg.get("use_fused_linear_logprobs")
     )
     loss_fn = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
     _validate_direct_megatron_sft_setup(
