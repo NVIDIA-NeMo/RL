@@ -33,15 +33,29 @@ set -euo pipefail
 : "${GENRM_VLLM_PYTHON:?GENRM_VLLM_PYTHON is required}"
 
 RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 GENRM_REPLICAS="${GENRM_REPLICAS:-8}"
 GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-8}"
 GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-}"
+GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-}"
+GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-}"
+GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-0}"
+GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-}"
+GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-}"
+GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
 GENRM_GROUP_ID="${GENRM_GROUP_ID:-inline-${SLURM_JOB_ID}}"
 GENRM_VLLM_PORT="${GENRM_VLLM_PORT:-8000}"
 GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
+GENRM_LB_PYTHON="${GENRM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
 GENRM_URL_PLACEHOLDER="${GENRM_URL_PLACEHOLDER:-__GENRM_BASE_URL__}"
+export \
+  GENRM_COMPILATION_CONFIG \
+  GENRM_ENABLE_EXPERT_PARALLEL \
+  GENRM_MODEL_LOADER_EXTRA_CONFIG \
+  GENRM_REASONING_PARSER_NAME \
+  GENRM_SERVED_MODEL_NAME \
+  GENRM_TOOL_CALL_PARSER
 
 LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-logs"
 GENRM_URL_FILE="${LOG_DIR}/genrm_url"
@@ -50,6 +64,10 @@ GENRM_STATE_DIR="${GENRM_LOG_DIR}/state"
 
 if [[ ! -f "${RAY_SUB}" ]]; then
   echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
+  exit 1
+fi
+if [[ "${COMMAND}" != *"${GENRM_URL_PLACEHOLDER}"* ]]; then
+  echo "[FATAL] Driver command is missing ${GENRM_URL_PLACEHOLDER}" >&2
   exit 1
 fi
 for required_file in genrm_registry.sh genrm_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
@@ -62,6 +80,25 @@ if [[ -n "${GENRM_REASONING_PARSER}" && ! -f "${GENRM_REASONING_PARSER}" ]]; the
   echo "[FATAL] GenRM reasoning parser does not exist: ${GENRM_REASONING_PARSER}" >&2
   exit 1
 fi
+if { [[ -n "${GENRM_REASONING_PARSER}" ]] && [[ -z "${GENRM_REASONING_PARSER_NAME}" ]]; } ||
+  { [[ -z "${GENRM_REASONING_PARSER}" ]] && [[ -n "${GENRM_REASONING_PARSER_NAME}" ]]; }; then
+  echo "[FATAL] GENRM_REASONING_PARSER and GENRM_REASONING_PARSER_NAME must be set together" >&2
+  exit 1
+fi
+if [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" != "0" && "${GENRM_ENABLE_EXPERT_PARALLEL}" != "1" ]]; then
+  echo "[FATAL] GENRM_ENABLE_EXPERT_PARALLEL must be 0 or 1" >&2
+  exit 1
+fi
+shared_paths=("${BASE_LOG_DIR}" "${GENRM_MODEL}" "${GENRM_TOOLS_DIR_HOST}")
+if [[ -n "${GENRM_REASONING_PARSER}" ]]; then
+  shared_paths+=("${GENRM_REASONING_PARSER}")
+fi
+for shared_path in "${shared_paths[@]}"; do
+  if [[ "${shared_path}" != "/lustre" && "${shared_path}" != /lustre/* ]]; then
+    echo "[FATAL] Path must be under /lustre for the GenRM container mount: ${shared_path}" >&2
+    exit 1
+  fi
+done
 if (( GENRM_TENSOR_PARALLEL_SIZE % GPUS_PER_NODE != 0 )); then
   echo "[FATAL] GENRM_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE" >&2
   exit 1
@@ -110,6 +147,7 @@ cleanup() {
   local status=$?
   trap - EXIT TERM INT
 
+  touch "${LOG_DIR}/ENDED" 2>/dev/null || true
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
     kill "${ray_sub_pid}" 2>/dev/null || true
   fi
@@ -208,7 +246,32 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   if [[ -n "${REASONING_PARSER:-}" ]]; then
     reasoning_args=(
       --reasoning-parser-plugin "${REASONING_PARSER}"
-      --reasoning-parser ultra_v3
+      --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
+    )
+  fi
+
+  tool_call_args=()
+  if [[ -n "${GENRM_TOOL_CALL_PARSER}" ]]; then
+    tool_call_args=(
+      --enable-auto-tool-choice
+      --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
+    )
+  fi
+
+  expert_parallel_args=()
+  if [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]]; then
+    expert_parallel_args=(--enable-expert-parallel)
+  fi
+
+  compilation_args=()
+  if [[ -n "${GENRM_COMPILATION_CONFIG}" ]]; then
+    compilation_args=(--compilation-config "${GENRM_COMPILATION_CONFIG}")
+  fi
+
+  model_loader_args=()
+  if [[ -n "${GENRM_MODEL_LOADER_EXTRA_CONFIG}" ]]; then
+    model_loader_args=(
+      --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
     )
   fi
 
@@ -222,18 +285,19 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     --gpu-memory-utilization 0.95 \
     --enable-prefix-caching \
     --distributed-executor-backend ray \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder \
-    --enable-expert-parallel \
     --port "${VLLM_PORT}" \
-    --served-model-name model \
+    --served-model-name "${GENRM_SERVED_MODEL_NAME}" \
     "${reasoning_args[@]}" \
-    --compilation-config '{"pass_config": {"fuse_allreduce_rms": false}}' \
-    --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 96}' \
+    "${tool_call_args[@]}" \
+    "${expert_parallel_args[@]}" \
+    "${compilation_args[@]}" \
+    "${model_loader_args[@]}" \
     > "${LOG_FILE}" 2>&1 &
   VLLM_PID=$!
 
-  while ! grep -q "Application startup complete" "${LOG_FILE}" 2>/dev/null; do
+  while ! "${VLLM_PYTHON}" -c \
+    'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).close()' \
+    "http://${HEAD_IP}:${VLLM_PORT}/health" >/dev/null 2>&1; do
     if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
       echo "[${REPLICA_ID}] ERROR: vLLM exited before becoming healthy" >&2
       exit 1
@@ -276,6 +340,48 @@ bash -n <(printf '%s' "${GENRM_BODY}") || {
   exit 1
 }
 
+ray_head_node="${ray_nodes[0]}"
+lb_state_dir="/tmp/external-genrm-state"
+lb_mounts="${MOUNTS},${GENRM_TOOLS_DIR_HOST}:/opt/external-genrm-tools:ro,${GENRM_STATE_DIR}:${lb_state_dir}"
+
+echo "[INFO] Validating the GenRM container and Python environment"
+srun \
+  --no-container-mount-home \
+  --container-image="${GENRM_CONTAINER}" \
+  --container-mounts=/lustre:/lustre \
+  --mpi=pmix \
+  --gres="gpu:${GPUS_PER_NODE}" \
+  -A "${SLURM_JOB_ACCOUNT}" \
+  -p "${SLURM_JOB_PARTITION}" \
+  --overlap \
+  --kill-on-bad-exit=1 \
+  --nodelist="${genrm_nodes[0]}" \
+  --nodes=1 \
+  --ntasks=1 \
+  bash -lc \
+  "command -v ray >/dev/null && '${GENRM_VLLM_PYTHON}' -c 'import ray, vllm; from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches'" \
+  >/dev/null
+
+echo "[INFO] Validating the load-balancer container and Python environment"
+srun \
+  --no-container-mount-home \
+  --container-name="genrm-lb-preflight-${SLURM_JOB_ID}" \
+  --container-image="${CONTAINER}" \
+  --container-mounts="${lb_mounts}" \
+  --container-workdir="${SLURM_SUBMIT_DIR}" \
+  --mpi=pmix \
+  -A "${SLURM_JOB_ACCOUNT}" \
+  -p "${SLURM_JOB_PARTITION}" \
+  --overlap \
+  --kill-on-bad-exit=1 \
+  --nodelist="${ray_head_node}" \
+  --nodes=1 \
+  --ntasks=1 \
+  --cpus-per-task=1 \
+  bash -lc \
+  "test -x /opt/external-genrm-tools/lb_watchdog.sh && '${GENRM_LB_PYTHON}' -c 'import aiohttp'" \
+  >/dev/null
+
 echo "[INFO] Launching external GenRM replicas"
 for (( replica_index = 0; replica_index < GENRM_REPLICAS; replica_index++ )); do
   first_node_index=$((replica_index * GENRM_NODES_PER_REPLICA))
@@ -306,7 +412,6 @@ for (( replica_index = 0; replica_index < GENRM_REPLICAS; replica_index++ )); do
   genrm_step_pids+=("$!")
 done
 
-ray_head_node="${ray_nodes[0]}"
 ray_head_ip=$(resolve_node_ip "${ray_head_node}")
 GENRM_LB_URL="http://${ray_head_ip}:${GENRM_LB_PORT}/v1"
 
@@ -315,7 +420,7 @@ srun \
   --no-container-mount-home \
   --container-name="genrm-lb-${SLURM_JOB_ID}" \
   --container-image="${CONTAINER}" \
-  --container-mounts="${MOUNTS}" \
+  --container-mounts="${lb_mounts}" \
   --container-workdir="${SLURM_SUBMIT_DIR}" \
   --mpi=pmix \
   -A "${SLURM_JOB_ACCOUNT}" \
@@ -326,7 +431,7 @@ srun \
   --ntasks=1 \
   --cpus-per-task=2 \
   --output="${GENRM_LOG_DIR}/load_balancer.log" \
-  bash -lc "PYTHON=/opt/nemo_rl_venv/bin/python /opt/nemo-rl/tools/external_genrm/lb_watchdog.sh '${GENRM_LB_PORT}' '${GENRM_STATE_DIR}' '${GENRM_GROUP_ID}'" &
+  bash -lc "PYTHON='${GENRM_LB_PYTHON}' /opt/external-genrm-tools/lb_watchdog.sh '${GENRM_LB_PORT}' '${lb_state_dir}' '${GENRM_GROUP_ID}'" &
 lb_step_pid=$!
 
 deadline=$((SECONDS + GENRM_STARTUP_TIMEOUT))
@@ -370,10 +475,6 @@ until curl -sfm 10 "${GENRM_LB_URL}/models" >/dev/null 2>&1; do
 done
 
 echo "${GENRM_LB_URL}" > "${GENRM_URL_FILE}"
-if [[ "${COMMAND}" != *"${GENRM_URL_PLACEHOLDER}"* ]]; then
-  echo "[FATAL] Driver command is missing ${GENRM_URL_PLACEHOLDER}" >&2
-  exit 1
-fi
 COMMAND="${COMMAND//${GENRM_URL_PLACEHOLDER}/${GENRM_LB_URL}}"
 export COMMAND
 

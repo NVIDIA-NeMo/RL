@@ -38,12 +38,12 @@ import hashlib
 import json
 import logging
 import os
-import resource
+import signal
 import sys
 import time
 from pathlib import Path
 
-MAX_RSS_MB = 4096  # Exit if RSS exceeds 4GB; watchdog wrapper will restart us
+MAX_RSS_MB = 4096
 
 print(f"[LB] Python: {sys.executable}", flush=True)
 try:
@@ -70,6 +70,17 @@ log = logging.getLogger("genrm_lb")
 # overloaded, etc). We fail over to a different backend and quarantine the sick
 # one until the next health probe clears it.
 RETRYABLE_UPSTREAM_STATUSES = {500, 502, 503, 504}
+
+
+def _read_current_rss_mb() -> float | None:
+    """Read the process's current resident memory from procfs."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    except (OSError, ValueError):
+        log.exception("Failed to read current RSS from /proc/self/status")
+    return None
 
 
 class UpstreamRetryableStatus(Exception):
@@ -125,18 +136,24 @@ class BackendPool:
         if self._session:
             await self._session.close()
 
-    def _read_registry(self) -> dict[str, tuple[str, int]]:
+    def _read_registry(self) -> dict[str, tuple[str, int]] | None:
         """Read registry file. Returns {job_id: (host, port)}."""
-        result = {}
+        result: dict[str, tuple[str, int]] = {}
+        if not self.registry_file.exists():
+            return result
         try:
-            if not self.registry_file.exists():
-                return result
-            for line in self.registry_file.read_text().strip().splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[4] == "ready":
-                    result[parts[0]] = (parts[1], int(parts[2]))
-        except Exception as e:
+            lines = self.registry_file.read_text().strip().splitlines()
+        except (OSError, UnicodeError) as e:
             log.warning("Failed to read registry: %s", e)
+            return None
+
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 5 and parts[4] == "ready":
+                try:
+                    result[parts[0]] = (parts[1], int(parts[2]))
+                except ValueError:
+                    log.warning("Skipping malformed registry entry: %s", line)
         return result
 
     async def _refresh_loop(self) -> None:
@@ -144,41 +161,53 @@ class BackendPool:
         while self._running:
             try:
                 registered = self._read_registry()
-                # Add new backends
-                for job_id, (host, port) in registered.items():
-                    if job_id not in self.backends:
-                        b = Backend(job_id, host, port)
-                        self.backends[job_id] = b
-                        log.info("Discovered new backend: %s", b)
-                # Remove gone backends
-                gone = set(self.backends) - set(registered)
-                for job_id in gone:
-                    b = self.backends.pop(job_id)
-                    log.info("Removed backend: %s", b)
+                if registered is not None:
+                    # Add new backends
+                    for job_id, (host, port) in registered.items():
+                        if job_id not in self.backends:
+                            b = Backend(job_id, host, port)
+                            self.backends[job_id] = b
+                            log.info("Discovered new backend: %s", b)
+                    # Remove gone backends
+                    gone = set(self.backends) - set(registered)
+                    for job_id in gone:
+                        b = self.backends.pop(job_id)
+                        log.info("Removed backend: %s", b)
             except Exception as e:
                 log.warning("Refresh error: %s", e)
             await asyncio.sleep(self.health_interval)
 
+    async def _check_backend_health(self, backend: Backend) -> None:
+        session = self._session
+        if session is None:
+            return
+        try:
+            async with session.get(f"{backend.base_url}/health") as response:
+                backend.healthy = response.status == 200
+        except Exception:
+            backend.healthy = False
+        backend.last_check = time.time()
+
     async def _health_check_loop(self) -> None:
         """Periodically check /health on each backend."""
         while self._running:
-            for b in list(self.backends.values()):
-                try:
-                    async with self._session.get(f"{b.base_url}/health") as resp:
-                        b.healthy = resp.status == 200
-                except Exception:
-                    b.healthy = False
-                b.last_check = time.time()
-            # Memory watchdog: exit cleanly if RSS grows too large.
-            # The wrapper script will restart us automatically.
-            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-            if rss_mb > MAX_RSS_MB:
+            await asyncio.gather(
+                *(
+                    self._check_backend_health(backend)
+                    for backend in list(self.backends.values())
+                )
+            )
+            rss_mb = _read_current_rss_mb()
+            if rss_mb is not None and rss_mb > MAX_RSS_MB:
                 log.error(
-                    "RSS %.0f MB exceeds %d MB limit, exiting for restart",
+                    "Current RSS %.0f MB exceeds %d MB; stopping new requests and "
+                    "draining in-flight requests before restart",
                     rss_mb,
                     MAX_RSS_MB,
                 )
-                os._exit(1)
+                self._running = False
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
             await asyncio.sleep(self.health_interval)
 
     def pick(
@@ -294,9 +323,43 @@ class LoadBalancer:
                         },
                     )
                     await response.prepare(request)
-                    async for chunk in upstream_resp.content.iter_any():
-                        await response.write(chunk)
-                    await response.write_eof()
+                    iterator = upstream_resp.content.iter_any().__aiter__()
+                    while True:
+                        try:
+                            chunk = await anext(iterator)
+                        except StopAsyncIteration:
+                            break
+                        except Exception as e:
+                            backend.healthy = False
+                            log.warning(
+                                "Upstream stream from backend %s failed after response "
+                                "headers were sent; returning the partial response without "
+                                "retrying: %s: %s",
+                                backend,
+                                type(e).__name__,
+                                e,
+                            )
+                            break
+                        try:
+                            await response.write(chunk)
+                        except Exception as e:
+                            log.info(
+                                "Downstream disconnected while streaming from backend %s: "
+                                "%s: %s",
+                                backend,
+                                type(e).__name__,
+                                e,
+                            )
+                            return response
+                    try:
+                        await response.write_eof()
+                    except Exception as e:
+                        log.info(
+                            "Could not finish downstream stream from backend %s: %s: %s",
+                            backend,
+                            type(e).__name__,
+                            e,
+                        )
                     return response
                 resp_body = await upstream_resp.read()
                 resp_headers = {
@@ -329,13 +392,15 @@ class LoadBalancer:
         """
         try:
             data = json.loads(body)
+            if not isinstance(data, dict):
+                return None
             messages = data.get("messages")
             if messages:
                 # Hash messages content only (not metadata/response pairs which vary)
                 return hashlib.md5(
                     json.dumps(messages, sort_keys=True).encode()
                 ).hexdigest()
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, UnicodeError):
             pass
         return None
 
@@ -394,11 +459,6 @@ class LoadBalancer:
                         backend,
                         sorted(tried - {backend.job_id}),
                     )
-                if not backend.healthy:
-                    log.info(
-                        "Backend %s un-quarantined after successful request", backend
-                    )
-                    backend.healthy = True
                 return resp
             except UpstreamRetryableStatus as e:
                 log.warning(
@@ -470,11 +530,14 @@ class LoadBalancer:
         async def on_startup(_app: web.Application) -> None:
             await self.start()
 
-        async def on_shutdown(_app: web.Application) -> None:
+        async def on_cleanup(_app: web.Application) -> None:
             await self.stop()
 
         app.on_startup.append(on_startup)
-        app.on_shutdown.append(on_shutdown)
+        # Cleanup runs after aiohttp has stopped accepting requests and drained
+        # active handlers, so the upstream client session remains usable while
+        # long generations finish.
+        app.on_cleanup.append(on_cleanup)
         return app
 
 
@@ -510,7 +573,7 @@ def main() -> None:
     )
     log.info("Registry: %s", pool.registry_file)
 
-    web.run_app(app, port=args.port, print=log.info)
+    web.run_app(app, port=args.port, print=log.info, shutdown_timeout=1800)
 
 
 if __name__ == "__main__":

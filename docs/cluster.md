@@ -148,6 +148,11 @@ sbatch ray.sub \
     same CPU count) and only queries a single node to avoid hammering the Slurm
     controller with one RPC per node; set this explicitly for a heterogeneous
     allocation or to override detection.
+* - `RAY_NODELIST=$SLURM_JOB_NODELIST`
+  - Slurm nodelist used for the Ray head, workers, and optional sandbox
+    sidecars. By default Ray uses the complete allocation. Set this to a
+    non-empty subset of the allocated nodes when other services share the same
+    allocation; `ray.sub` rejects nodes outside `SLURM_JOB_NODELIST`.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
