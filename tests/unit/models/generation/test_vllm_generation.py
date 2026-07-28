@@ -2816,7 +2816,14 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
 
 @pytest.mark.mcore
-@pytest.mark.timeout(120)
+# Raised 120 -> 240 for vLLM 0.25. Measured call time for this test: 103.80s on
+# 0.20 (PR #3308, job 90163013717) and 113.10s on 0.25 (this branch, job
+# 89878378208) -- ~9s / +9% slower, which cut the headroom under the old 120s
+# budget from 16.2s to 6.9s. That is less than normal run-to-run variance on a
+# shared runner, so the test began failing intermittently on wall clock rather
+# than on any assertion. The budget was already marginal before this bump; 240s
+# restores a real margin instead of tracking the regression down to the second.
+@pytest.mark.timeout(240)
 def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     """Test vLLM generation with Megatron pipeline parallel training."""
 
