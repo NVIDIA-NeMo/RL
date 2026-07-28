@@ -181,17 +181,23 @@ step_metrics={'loss': ..., 'grad_norm': ..., ...}
 
 ## Where the metrics are
 
-**W&B is off unless you export a key.** `ultra_launch.sh` sets
-`logger.wandb_enabled` to true only when `WANDB_API_KEY` is present, so a run
-without it logs `wandb_enabled=False` and produces no dashboard link. The project
-and run name are already wired — `WANDB_PROJ=nano-swe-smoke` in `swe_nano.env`,
-run name = `EXP_NAME` — so a link appears at
-`https://wandb.ai/<entity>/nano-swe-smoke/runs/<run>` as soon as you launch with:
+**W&B is enabled automatically from a secrets file.** `swe_nano.env` sources
+`NRL_SECRETS_FILE` (a file of `export VAR=...` lines) before anything else, so
+every nano launcher picks up `WANDB_API_KEY` and `HF_TOKEN` without the caller
+exporting anything. Point it at your own file:
 
 ```bash
-export WANDB_API_KEY=...        # and optionally WANDB_ENTITY=<team>
-DRY_RUN=0 bash swe_nano_sc.sh
+NRL_SECRETS_FILE=/path/to/secrets.sh DRY_RUN=0 bash swe_nano_sc.sh
 ```
+
+The launcher prints which secrets it found — `[SECRETS] sourced ... (wandb=set
+hf=set)` — and the summary line confirms the result: `W&B: nano-swe-smoke /
+<EXP_NAME> (enabled=True)`. With no readable secrets file you get a `[WARN]`, and
+`ultra_launch.sh` falls back to `logger.wandb_enabled=False`: no dashboard link,
+plus rate-limited unauthenticated HF downloads for the ~60 GB checkpoint.
+
+Project and run name are wired from `WANDB_PROJ=nano-swe-smoke` and `EXP_NAME`,
+so the run lands at `https://wandb.ai/<entity>/nano-swe-smoke/runs/<run>`.
 
 **Without W&B, the per-step metrics are in the SingleController actor's own log**,
 not in the driver log — this trips people up, because `ray-driver.log` shows the
