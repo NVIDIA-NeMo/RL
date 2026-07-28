@@ -525,14 +525,6 @@ class VllmAsyncGenerationWorkerImpl(
                         except TypeError:
                             message["content"] = []
 
-                truncate_prompt_tokens = worker_self.cfg.get("truncate_prompt_tokens")
-                if (
-                    truncate_prompt_tokens is not None
-                    and hasattr(request, "truncate_prompt_tokens")
-                    and request.truncate_prompt_tokens is None
-                ):
-                    request.truncate_prompt_tokens = truncate_prompt_tokens
-
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
                 actual_request_max_tokens = None

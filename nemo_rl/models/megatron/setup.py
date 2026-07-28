@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime
 import hashlib
 import json
 import os
@@ -300,14 +299,8 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Raise the 10-minute NCCL watchdog default: transient first-hit stalls
-    # (e.g. triton JIT on new packed shapes) SIGABRT healthy multi-node runs.
-    # Sub-groups inherit this timeout; SLURM walltime bounds true hangs.
-    timeout_minutes = int(os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60"))
-    torch.distributed.init_process_group(
-        "nccl",
-        timeout=datetime.timedelta(minutes=timeout_minutes),
-    )
+    # Initialize process group
+    torch.distributed.init_process_group("nccl")
 
 
 def validate_and_set_config(
@@ -927,20 +920,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
-    # Optional first/last-layer BF16 precision overrides (used by FP8 recipes to
-    # keep boundary layers in BF16).
-    if "first_last_layers_bf16" in config["megatron_cfg"]:
-        model_cfg.first_last_layers_bf16 = config["megatron_cfg"][
-            "first_last_layers_bf16"
-        ]
-    if "num_layers_at_start_in_bf16" in config["megatron_cfg"]:
-        model_cfg.num_layers_at_start_in_bf16 = config["megatron_cfg"][
-            "num_layers_at_start_in_bf16"
-        ]
-    if "num_layers_at_end_in_bf16" in config["megatron_cfg"]:
-        model_cfg.num_layers_at_end_in_bf16 = config["megatron_cfg"][
-            "num_layers_at_end_in_bf16"
-        ]
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
@@ -1128,29 +1107,6 @@ def _validate_dtype_config(
         )
 
 
-def _normalize_optimizer_dtypes(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Convert serializable dtype names to torch.dtype at the MCore boundary."""
-    normalized = dict(optimizer_cfg)
-    dtype_map = {
-        "float32": torch.float32,
-        "fp32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float16": torch.float16,
-        "fp16": torch.float16,
-    }
-    for key in (
-        "main_params_dtype",
-        "main_grads_dtype",
-        "exp_avg_dtype",
-        "exp_avg_sq_dtype",
-    ):
-        value = normalized.get(key)
-        if isinstance(value, str):
-            normalized[key] = dtype_map[value.lower()]
-    return normalized
-
-
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -1172,7 +1128,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **_normalize_optimizer_dtypes(config["megatron_cfg"]["optimizer"]),
+        **config["megatron_cfg"]["optimizer"],
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
@@ -1211,10 +1167,6 @@ def _create_megatron_config(
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
-            # check_grads does a per-bucket D2H sync inside the grad-ready
-            # hook, which can deadlock large multi-node MoE runs mid-backward
-            # (mcore's own default is False). NaN grads still surface via the
-            # optimizer's global grad norm.
             check_for_nan_in_grad=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ].get("check_for_nan_in_grad", True),
@@ -1359,16 +1311,6 @@ def setup_model_and_optimizer(
     state.initialize_async_checkpoint_worker()
 
     megatron_cfg.dist.external_gpu_device_mapping = True
-    # initialize_megatron creates TP/PP/EP/DP sub-groups with an explicit
-    # timeout (mcore default 10 min) that overrides the default-group value
-    # from setup_distributed() — keep both knobs on the same env var.
-    megatron_cfg.dist.distributed_timeout_minutes = int(
-        os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60")
-    )
-    # If a collective still times out, dump the NCCL flight-recorder trace so
-    # the stalled rank/op is identifiable post-mortem (pair with
-    # TORCH_NCCL_DEBUG_INFO_TEMP_FILE on a mounted path).
-    megatron_cfg.dist.flight_recorder_dump_on_timeout = True
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
