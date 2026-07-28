@@ -16,6 +16,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,10 @@ requires_weight_folding = pytest.mark.skipif(
 _VOCAB_SIZE = 32000
 _BATCH_SIZE = 8
 _NUM_GPUS = 2
+_NVFP4_A16_RECIPE = (
+    Path(__file__).resolve().parents[4]
+    / "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml"
+).as_posix()
 
 
 class _FakeModelOptBridge:
@@ -88,10 +93,10 @@ def _make_real_quant_worker():
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     worker.cfg = {
-        "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
+        "quant_cfg": _NVFP4_A16_RECIPE,
         "generation": {
             "backend": "vllm",
-            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
+            "quant_cfg": _NVFP4_A16_RECIPE,
             "real_quant": True,
             "real_quant_export_cpu_offload": True,
             "real_quant_ignore": ["lm_head"],
