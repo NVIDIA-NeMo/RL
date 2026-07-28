@@ -179,6 +179,34 @@ train step 5/5  trainer_v=5  lag=1
 step_metrics={'loss': ..., 'grad_norm': ..., ...}
 ```
 
+## Where the metrics are
+
+**W&B is off unless you export a key.** `ultra_launch.sh` sets
+`logger.wandb_enabled` to true only when `WANDB_API_KEY` is present, so a run
+without it logs `wandb_enabled=False` and produces no dashboard link. The project
+and run name are already wired — `WANDB_PROJ=nano-swe-smoke` in `swe_nano.env`,
+run name = `EXP_NAME` — so a link appears at
+`https://wandb.ai/<entity>/nano-swe-smoke/runs/<run>` as soon as you launch with:
+
+```bash
+export WANDB_API_KEY=...        # and optionally WANDB_ENTITY=<team>
+DRY_RUN=0 bash swe_nano_sc.sh
+```
+
+**Without W&B, the per-step metrics are in the SingleController actor's own log**,
+not in the driver log — this trips people up, because `ray-driver.log` shows the
+rollout progress bars and TransferQueue actor stats but never prints `train step`:
+
+```bash
+ls workspace/ray_logs/<EXP_NAME>/<jobid>-logs/ray/session_*/logs/worker-*.out
+grep -E "train step|step_metrics|_sync_weights" <that file>
+```
+
+That file carries `train step N/M  trainer_v=..  lag=..`, the per-phase timing
+breakdown (`exposed_generation`, `policy_training`, `weight_sync`), and the full
+`step_metrics` dict. `logger.log_dir` under the run directory holds the same
+metrics on disk.
+
 ## Known limits
 
 - **Rewards are 0.** The base model solves no SWE instance in a smoke run. Real
