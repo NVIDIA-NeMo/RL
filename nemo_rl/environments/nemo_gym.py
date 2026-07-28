@@ -676,9 +676,11 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         mcore_config["async_engine"] = True
         mcore_config["expose_http_server"] = True
     elif backend == "trtllm":
+        # The TRT-LLM worker does expose an OpenAI-compatible HTTP server, but
+        # the Gym rollout path has never been wired to it or exercised against
+        # it. Refuse explicitly rather than emit a config this backend ignores.
         raise NotImplementedError(
-            "NeMo Gym is not supported with the TRT-LLM generation backend "
-            "(the TRT-LLM OpenAI-compatible HTTP server was removed)."
+            "NeMo Gym is not supported with the TRT-LLM generation backend."
         )
     else:
         raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
