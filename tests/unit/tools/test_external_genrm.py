@@ -24,6 +24,7 @@ import pytest
 from aiohttp import ClientPayloadError, web
 
 from tools.external_genrm.genrm_lb import (
+    SHUTDOWN_TIMEOUT_SECONDS,
     Backend,
     BackendPool,
     LoadBalancer,
@@ -32,6 +33,10 @@ from tools.external_genrm.genrm_lb import (
 )
 
 REPO_ROOT = Path(__file__).parents[3]
+
+
+def test_shutdown_timeout_bounds_watchdog_restart_outage():
+    assert 0 < SHUTDOWN_TIMEOUT_SECONDS <= 120
 
 
 def test_read_current_rss_uses_vmrss_instead_of_process_high_water_mark():

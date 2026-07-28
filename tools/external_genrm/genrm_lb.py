@@ -44,6 +44,7 @@ import time
 from pathlib import Path
 
 MAX_RSS_MB = 4096
+SHUTDOWN_TIMEOUT_SECONDS = 120
 
 print(f"[LB] Python: {sys.executable}", flush=True)
 try:
@@ -573,7 +574,14 @@ def main() -> None:
     )
     log.info("Registry: %s", pool.registry_file)
 
-    web.run_app(app, port=args.port, print=log.info, shutdown_timeout=1800)
+    # Stop accepting new connections immediately, but give in-flight requests
+    # a bounded window to finish before the watchdog restarts the process.
+    web.run_app(
+        app,
+        port=args.port,
+        print=log.info,
+        shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS,
+    )
 
 
 if __name__ == "__main__":

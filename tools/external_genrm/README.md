@@ -31,8 +31,9 @@ be `model` unless `GENRM_SERVED_MODEL_NAME` is changed.
 ## Filesystem and container requirements
 
 The GenRM replicas mount `/lustre:/lustre`. Consequently, `BASE_LOG_DIR`,
-`GENRM_MODEL`, `GENRM_TOOLS_DIR_HOST`, and an optional
-`GENRM_REASONING_PARSER` must be absolute paths under `/lustre`.
+`GENRM_TOOLS_DIR_HOST`, an optional `GENRM_REASONING_PARSER`, and an absolute
+`GENRM_MODEL` path must be under `/lustre`. `GENRM_MODEL` may instead be a
+Hugging Face model ID such as `Qwen/Qwen3-32B`.
 
 `GENRM_CONTAINER` must contain:
 
@@ -61,7 +62,7 @@ Required variables:
 | `COMMAND` | NeMo RL command containing `GENRM_URL_PLACEHOLDER` (default `__GENRM_BASE_URL__`) in its Gym `base_url` override. |
 | `CONTAINER` | NeMo RL container used by `ray.sub` and the load balancer. |
 | `GENRM_CONTAINER` | Container used by the native vLLM replicas; see the import requirements above. |
-| `GENRM_MODEL` | `/lustre` model path passed to vLLM. |
+| `GENRM_MODEL` | `/lustre` model path or Hugging Face model ID passed to vLLM. |
 | `GENRM_TOOLS_DIR_HOST` | `/lustre` path to this directory. |
 | `GENRM_VLLM_PYTHON` | Python executable inside `GENRM_CONTAINER`. |
 | `MOUNTS` | Mounts required by `ray.sub` and `COMMAND`. |
@@ -127,7 +128,7 @@ GENRM_COMPILATION_CONFIG='{"pass_config":{"fuse_allreduce_rms":false}}' \
 GENRM_MODEL_LOADER_EXTRA_CONFIG='{"enable_multithread_load":true,"num_threads":96}' \
 GPUS_PER_NODE=4 \
 NUM_GENRM_NODES=16 \
-COMMAND='uv run examples/nemo_gym/run_grpo_nemo_gym.py --config /lustre/path/to/recipe.yaml ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=__GENRM_BASE_URL__ env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=model' \
+COMMAND='uv run examples/nemo_gym/run_grpo_nemo_gym.py --config /lustre/path/to/recipe.yaml ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=__GENRM_BASE_URL__ ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=model' \
 sbatch \
   --account=<account> \
   --partition=<partition> \
@@ -139,8 +140,8 @@ sbatch \
   tools/external_genrm/run_in_allocation.sh
 ```
 
-The `++` prefix makes the `base_url` override work whether or not the recipe
-already declares that key.
+The `++` prefix makes these overrides work whether or not the recipe already
+declares the keys.
 
 The resolved URL is also written to
 `$BASE_LOG_DIR/<job-id>-logs/genrm_url`.

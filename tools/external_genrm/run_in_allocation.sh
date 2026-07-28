@@ -89,7 +89,10 @@ if [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" != "0" && "${GENRM_ENABLE_EXPERT_PARALLE
   echo "[FATAL] GENRM_ENABLE_EXPERT_PARALLEL must be 0 or 1" >&2
   exit 1
 fi
-shared_paths=("${BASE_LOG_DIR}" "${GENRM_MODEL}" "${GENRM_TOOLS_DIR_HOST}")
+shared_paths=("${BASE_LOG_DIR}" "${GENRM_TOOLS_DIR_HOST}")
+if [[ "${GENRM_MODEL}" == /* ]]; then
+  shared_paths+=("${GENRM_MODEL}")
+fi
 if [[ -n "${GENRM_REASONING_PARSER}" ]]; then
   shared_paths+=("${GENRM_REASONING_PARSER}")
 fi
