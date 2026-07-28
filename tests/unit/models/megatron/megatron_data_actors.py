@@ -91,6 +91,7 @@ class PackSequencesTestActor:
             destroy_model_parallel,
             initialize_model_parallel,
         )
+
         from nemo_rl.models.megatron.data import process_microbatch
 
         initialize_model_parallel(context_parallel_size=self.cp_size)
