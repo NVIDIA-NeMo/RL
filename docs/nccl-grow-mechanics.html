@@ -1,0 +1,1251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>How NCCL Communicator Grow Works</title>
+  <style>
+    :root {
+      --bg: #07110d;
+      --surface: #0d1b15;
+      --surface-2: #12251c;
+      --surface-3: #183126;
+      --text: #effcf3;
+      --muted: #a9c4b2;
+      --line: #294b39;
+      --green: #76b900;
+      --green-soft: #b9f66b;
+      --cyan: #4fd1c5;
+      --blue: #7ab7ff;
+      --amber: #f3c969;
+      --red: #ff8d8d;
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+      --radius: 18px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% 5%, rgba(118, 185, 0, 0.14), transparent 34rem),
+        radial-gradient(circle at 90% 22%, rgba(79, 209, 197, 0.08), transparent 30rem),
+        var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.65;
+    }
+
+    a {
+      color: var(--green-soft);
+      text-decoration-color: rgba(185, 246, 107, 0.45);
+      text-underline-offset: 3px;
+    }
+
+    a:hover {
+      color: #d8ff9e;
+    }
+
+    code {
+      padding: 0.14rem 0.36rem;
+      border: 1px solid rgba(118, 185, 0, 0.24);
+      border-radius: 6px;
+      background: rgba(118, 185, 0, 0.08);
+      color: #d9ffac;
+      font-family: var(--mono);
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 1.25rem 0 0;
+      padding: 1.1rem 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #07100c;
+      color: #dff7e7;
+      font: 0.9rem/1.6 var(--mono);
+    }
+
+    pre code {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+    }
+
+    .page {
+      display: grid;
+      grid-template-columns: minmax(210px, 260px) minmax(0, 980px);
+      gap: 2.4rem;
+      width: min(1320px, calc(100% - 2.4rem));
+      margin: 0 auto;
+      padding: 2.2rem 0 5rem;
+    }
+
+    .toc {
+      position: sticky;
+      top: 1.5rem;
+      align-self: start;
+      padding: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(13, 27, 21, 0.88);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    .toc .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      margin-bottom: 1.15rem;
+      color: var(--text);
+      font-weight: 750;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-mark {
+      width: 18px;
+      height: 18px;
+      border: 4px solid var(--green);
+      border-radius: 5px 1px 5px 1px;
+      transform: rotate(45deg);
+    }
+
+    .toc ol {
+      display: grid;
+      gap: 0.62rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: section;
+    }
+
+    .toc li {
+      counter-increment: section;
+    }
+
+    .toc a {
+      display: grid;
+      grid-template-columns: 1.7rem 1fr;
+      gap: 0.3rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-decoration: none;
+    }
+
+    .toc a::before {
+      content: counter(section, decimal-leading-zero);
+      color: var(--green);
+      font: 0.76rem/1.8 var(--mono);
+    }
+
+    .toc a:hover {
+      color: var(--text);
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(2rem, 5vw, 4.3rem);
+      border: 1px solid var(--line);
+      border-radius: 26px;
+      background:
+        linear-gradient(135deg, rgba(118, 185, 0, 0.13), transparent 45%),
+        linear-gradient(180deg, var(--surface-2), var(--surface));
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      position: absolute;
+      right: -7rem;
+      bottom: -8rem;
+      width: 21rem;
+      height: 21rem;
+      border: 1px solid rgba(118, 185, 0, 0.25);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 2.5rem rgba(118, 185, 0, 0.035),
+        0 0 0 5rem rgba(118, 185, 0, 0.025);
+      content: "";
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1.15rem;
+      color: var(--green-soft);
+      font: 700 0.8rem/1 var(--mono);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 1.8rem;
+      height: 2px;
+      background: var(--green);
+      content: "";
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin-top: 0;
+      line-height: 1.17;
+      letter-spacing: -0.035em;
+    }
+
+    h1 {
+      max-width: 760px;
+      margin-bottom: 1.2rem;
+      font-size: clamp(2.5rem, 6vw, 5.4rem);
+    }
+
+    h2 {
+      margin-bottom: 1rem;
+      font-size: clamp(1.75rem, 3vw, 2.55rem);
+    }
+
+    h3 {
+      margin-bottom: 0.7rem;
+      font-size: 1.2rem;
+    }
+
+    .lede {
+      position: relative;
+      z-index: 1;
+      max-width: 760px;
+      margin: 0;
+      color: #c5decc;
+      font-size: clamp(1.05rem, 1.7vw, 1.25rem);
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.7rem;
+      margin-top: 2rem;
+    }
+
+    .pill {
+      padding: 0.42rem 0.75rem;
+      border: 1px solid rgba(185, 246, 107, 0.26);
+      border-radius: 999px;
+      background: rgba(118, 185, 0, 0.08);
+      color: #dafdac;
+      font: 0.78rem/1.2 var(--mono);
+    }
+
+    section {
+      scroll-margin-top: 2rem;
+      margin-top: 2.2rem;
+      padding: clamp(1.45rem, 4vw, 2.55rem);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(18, 37, 28, 0.96), rgba(13, 27, 21, 0.96));
+      box-shadow: var(--shadow);
+    }
+
+    .section-intro {
+      max-width: 780px;
+      margin-bottom: 1.5rem;
+      color: var(--muted);
+      font-size: 1.02rem;
+    }
+
+    .callout {
+      margin: 1.5rem 0;
+      padding: 1.15rem 1.25rem;
+      border: 1px solid rgba(118, 185, 0, 0.35);
+      border-left: 4px solid var(--green);
+      border-radius: 12px;
+      background: rgba(118, 185, 0, 0.07);
+    }
+
+    .callout strong {
+      color: var(--green-soft);
+    }
+
+    .grid-2,
+    .grid-3 {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      padding: 1.2rem;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(7, 17, 13, 0.6);
+    }
+
+    .card p:last-child {
+      margin-bottom: 0;
+    }
+
+    .card-number {
+      display: inline-grid;
+      place-items: center;
+      width: 2rem;
+      height: 2rem;
+      margin-bottom: 0.8rem;
+      border-radius: 50%;
+      background: var(--green);
+      color: #07110d;
+      font: 800 0.85rem/1 var(--mono);
+    }
+
+    .diagram {
+      overflow-x: auto;
+      margin: 1.6rem 0;
+      padding: 0.8rem;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #09150f;
+    }
+
+    .diagram svg {
+      display: block;
+      width: 100%;
+      min-width: 700px;
+      height: auto;
+    }
+
+    .diagram figcaption {
+      margin: 0.65rem 0.2rem 0.1rem;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-top: 0.8rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .swatch {
+      width: 0.85rem;
+      height: 0.85rem;
+      border-radius: 3px;
+    }
+
+    table {
+      width: 100%;
+      margin-top: 1rem;
+      border-collapse: collapse;
+      font-size: 0.94rem;
+    }
+
+    th,
+    td {
+      padding: 0.8rem 0.85rem;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--green-soft);
+      font: 700 0.78rem/1.3 var(--mono);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    td {
+      color: #d5e8db;
+    }
+
+    .yes {
+      color: var(--green-soft);
+    }
+
+    .no {
+      color: var(--red);
+    }
+
+    .steps {
+      display: grid;
+      gap: 0.9rem;
+      margin: 1.2rem 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: steps;
+    }
+
+    .steps li {
+      display: grid;
+      grid-template-columns: 2.5rem 1fr;
+      gap: 0.8rem;
+      align-items: start;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(7, 17, 13, 0.48);
+      counter-increment: steps;
+    }
+
+    .steps li::before {
+      display: grid;
+      place-items: center;
+      width: 2.15rem;
+      height: 2.15rem;
+      border-radius: 8px;
+      background: rgba(118, 185, 0, 0.15);
+      color: var(--green-soft);
+      content: counter(steps, decimal-leading-zero);
+      font: 750 0.78rem/1 var(--mono);
+    }
+
+    .steps strong {
+      display: block;
+      margin-bottom: 0.15rem;
+      color: var(--text);
+    }
+
+    .steps p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .footer {
+      margin-top: 2.2rem;
+      padding: 1.2rem 0.3rem;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .footer strong {
+      color: var(--text);
+    }
+
+    @media (max-width: 960px) {
+      .page {
+        grid-template-columns: 1fr;
+      }
+
+      .toc {
+        position: static;
+      }
+
+      .toc ol {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 680px) {
+      .page {
+        width: min(100% - 1rem, 1320px);
+        padding-top: 0.5rem;
+      }
+
+      .grid-2,
+      .grid-3,
+      .toc ol {
+        grid-template-columns: 1fr;
+      }
+
+      .hero,
+      section {
+        border-radius: 14px;
+      }
+
+      th,
+      td {
+        padding: 0.62rem;
+      }
+    }
+
+    @media print {
+      :root {
+        --bg: #fff;
+        --surface: #fff;
+        --surface-2: #fff;
+        --text: #102018;
+        --muted: #415b4b;
+        --line: #b9c8be;
+      }
+
+      body {
+        background: #fff;
+      }
+
+      .page {
+        display: block;
+        width: 100%;
+        padding: 0;
+      }
+
+      .toc {
+        display: none;
+      }
+
+      .hero,
+      section {
+        box-shadow: none;
+        break-inside: avoid;
+      }
+
+      .diagram {
+        background: #f5faf6;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <nav class="toc" aria-label="Table of contents">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        NCCL Grow
+      </div>
+      <ol>
+        <li><a href="#mental-model">Mental model</a></li>
+        <li><a href="#uid">What the UID does</a></li>
+        <li><a href="#bootstrap">Bootstrap stitching</a></li>
+        <li><a href="#topology">Topology construction</a></li>
+        <li><a href="#sequence">End-to-end sequence</a></li>
+        <li><a href="#example">1,022 → 1,024 example</a></li>
+        <li><a href="#responsibilities">Responsibilities</a></li>
+        <li><a href="#sources">Primary sources</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <header class="hero">
+        <div class="eyebrow">NCCL communicator lifecycle</div>
+        <h1>How NCCL Communicator Grow Works</h1>
+        <p class="lede">
+          A source-guided explanation of how existing ranks and newly added ranks
+          rendezvous, exchange peer information, rebuild communication topology,
+          and create a larger NCCL communicator.
+        </p>
+        <div class="hero-meta">
+          <span class="pill">NCCL 2.29+</span>
+          <span class="pill">ncclCommGrow</span>
+          <span class="pill">Bootstrap + topology + transport</span>
+          <span class="pill">NeMo-RL refit context</span>
+        </div>
+      </header>
+
+      <section id="mental-model">
+        <div class="eyebrow">01 · Mental model</div>
+        <h2>The UID is an entrance, not a topology database</h2>
+        <p class="section-intro">
+          A grow UID does not contain the full member list, GPU topology, ring
+          layout, or transport connections. It is an opaque rendezvous handle
+          that lets new ranks enter NCCL's bootstrap protocol.
+        </p>
+
+        <div class="callout">
+          <strong>Grow requires more than a UID:</strong>
+          the grow UID, the target world size, an assigned rank for every new
+          participant, the parent communicator on existing ranks, and concurrent
+          participation from every rank.
+        </div>
+
+        <div class="grid-3">
+          <article class="card">
+            <div class="card-number">1</div>
+            <h3>Bootstrap plane</h3>
+            <p>
+              Establishes temporary reachability between all participants and
+              creates a bootstrap ring for control-message exchange.
+            </p>
+          </article>
+          <article class="card">
+            <div class="card-number">2</div>
+            <h3>Topology plane</h3>
+            <p>
+              Exchanges GPU, host, process, NIC, and graph information, then
+              computes rings, trees, channels, and rank mappings.
+            </p>
+          </article>
+          <article class="card">
+            <div class="card-number">3</div>
+            <h3>Data plane</h3>
+            <p>
+              Creates the P2P, shared-memory, NVLink, and network transports used
+              by later NCCL collectives.
+            </p>
+          </article>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 920 270" role="img" aria-labelledby="layers-title layers-desc">
+            <title id="layers-title">Three layers of communicator growth</title>
+            <desc id="layers-desc">
+              The UID opens the bootstrap plane. The bootstrap plane enables
+              topology exchange. The computed topology drives data-plane
+              connection creation.
+            </desc>
+            <defs>
+              <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#76b900"/>
+              </marker>
+            </defs>
+            <rect x="35" y="74" width="205" height="122" rx="18" fill="#14291e" stroke="#76b900" stroke-width="2"/>
+            <text x="138" y="112" text-anchor="middle" fill="#b9f66b" font-size="17" font-weight="700">Bootstrap plane</text>
+            <text x="138" y="141" text-anchor="middle" fill="#a9c4b2" font-size="13">UID + parent communicator</text>
+            <text x="138" y="164" text-anchor="middle" fill="#a9c4b2" font-size="13">create temporary reachability</text>
+
+            <line x1="250" y1="135" x2="345" y2="135" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-green)"/>
+            <text x="297" y="119" text-anchor="middle" fill="#a9c4b2" font-size="12">AllGather</text>
+
+            <rect x="357" y="74" width="205" height="122" rx="18" fill="#14291e" stroke="#4fd1c5" stroke-width="2"/>
+            <text x="460" y="112" text-anchor="middle" fill="#8af3e9" font-size="17" font-weight="700">Topology plane</text>
+            <text x="460" y="141" text-anchor="middle" fill="#a9c4b2" font-size="13">discover and exchange</text>
+            <text x="460" y="164" text-anchor="middle" fill="#a9c4b2" font-size="13">GPU / NIC / graph information</text>
+
+            <line x1="572" y1="135" x2="667" y2="135" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-green)"/>
+            <text x="619" y="119" text-anchor="middle" fill="#a9c4b2" font-size="12">Connect</text>
+
+            <rect x="679" y="74" width="205" height="122" rx="18" fill="#14291e" stroke="#7ab7ff" stroke-width="2"/>
+            <text x="782" y="112" text-anchor="middle" fill="#a9d1ff" font-size="17" font-weight="700">Data plane</text>
+            <text x="782" y="141" text-anchor="middle" fill="#a9c4b2" font-size="13">ring / tree / channels</text>
+            <text x="782" y="164" text-anchor="middle" fill="#a9c4b2" font-size="13">GPU and network transports</text>
+
+            <rect x="46" y="22" width="184" height="31" rx="15" fill="#76b900"/>
+            <text x="138" y="43" text-anchor="middle" fill="#07110d" font-size="13" font-weight="800">UID points here</text>
+            <line x1="138" y1="53" x2="138" y2="73" stroke="#76b900" stroke-width="2"/>
+          </svg>
+          <figcaption>
+            The UID only starts the first layer. The larger communicator is built
+            by the protocol that follows.
+          </figcaption>
+        </figure>
+      </section>
+
+      <section id="uid">
+        <div class="eyebrow">02 · Grow UID</div>
+        <h2>What the UID contains—and what it does not</h2>
+        <p class="section-intro">
+          <code>ncclCommGetUniqueId()</code> creates an
+          <code>ncclBootstrapHandle</code>. NCCL starts a temporary bootstrap
+          root listener and copies its handle into the 128-byte opaque
+          <code>ncclUniqueId</code>.
+        </p>
+
+        <div class="grid-2">
+          <article class="card">
+            <h3 class="yes">Conceptually included</h3>
+            <ul>
+              <li>Bootstrap root socket address</li>
+              <li>A grow-session magic value</li>
+              <li>The parent communicator size</li>
+              <li>Opaque bootstrap metadata</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3 class="no">Not included</h3>
+            <ul>
+              <li>The complete rank membership list</li>
+              <li>GPU-to-GPU or GPU-to-NIC topology</li>
+              <li>Ring and tree layouts</li>
+              <li>Established transport connections</li>
+            </ul>
+          </article>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 920 340" role="img" aria-labelledby="uid-title uid-desc">
+            <title id="uid-title">Grow UID creation and distribution</title>
+            <desc id="uid-desc">
+              One existing rank starts a bootstrap listener and obtains a UID.
+              The application sends UID bytes to new ranks through an external
+              control plane. The UID is also propagated to boundary ranks through
+              the parent communicator.
+            </desc>
+            <defs>
+              <marker id="arrow-cyan" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#4fd1c5"/>
+              </marker>
+              <marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#f3c969"/>
+              </marker>
+            </defs>
+
+            <rect x="39" y="48" width="215" height="95" rx="16" fill="#14291e" stroke="#76b900" stroke-width="2"/>
+            <text x="146" y="79" text-anchor="middle" fill="#b9f66b" font-size="16" font-weight="700">Existing grow root</text>
+            <text x="146" y="105" text-anchor="middle" fill="#d7eadc" font-size="13">existing_comm.get_unique_id()</text>
+            <text x="146" y="126" text-anchor="middle" fill="#a9c4b2" font-size="12">one existing rank only</text>
+
+            <rect x="353" y="35" width="215" height="120" rx="16" fill="#17251e" stroke="#4fd1c5" stroke-width="2"/>
+            <text x="460" y="67" text-anchor="middle" fill="#8af3e9" font-size="16" font-weight="700">Bootstrap root</text>
+            <text x="460" y="93" text-anchor="middle" fill="#d7eadc" font-size="13">temporary listening socket</text>
+            <text x="460" y="115" text-anchor="middle" fill="#a9c4b2" font-size="12">address + magic + old size</text>
+            <text x="460" y="137" text-anchor="middle" fill="#a9c4b2" font-size="12">encoded as opaque UID</text>
+
+            <line x1="254" y1="94" x2="342" y2="94" stroke="#4fd1c5" stroke-width="3" marker-end="url(#arrow-cyan)"/>
+            <text x="298" y="78" text-anchor="middle" fill="#a9c4b2" font-size="12">create</text>
+
+            <rect x="667" y="48" width="215" height="95" rx="16" fill="#14291e" stroke="#f3c969" stroke-width="2"/>
+            <text x="774" y="79" text-anchor="middle" fill="#f8dda0" font-size="16" font-weight="700">Application control plane</text>
+            <text x="774" y="105" text-anchor="middle" fill="#d7eadc" font-size="13">Ray RPC / TCP / store</text>
+            <text x="774" y="126" text-anchor="middle" fill="#a9c4b2" font-size="12">moves UID bytes</text>
+
+            <line x1="568" y1="94" x2="656" y2="94" stroke="#f3c969" stroke-width="3" marker-end="url(#arrow-amber)"/>
+            <text x="612" y="78" text-anchor="middle" fill="#a9c4b2" font-size="12">return UID</text>
+
+            <rect x="39" y="230" width="215" height="75" rx="16" fill="#14291e" stroke="#76b900" stroke-width="2"/>
+            <text x="146" y="261" text-anchor="middle" fill="#b9f66b" font-size="15" font-weight="700">Existing boundary ranks</text>
+            <text x="146" y="284" text-anchor="middle" fill="#a9c4b2" font-size="12">rank 0 and old rank N−1</text>
+
+            <rect x="667" y="218" width="215" height="99" rx="16" fill="#14291e" stroke="#7ab7ff" stroke-width="2"/>
+            <text x="774" y="251" text-anchor="middle" fill="#a9d1ff" font-size="15" font-weight="700">New ranks</text>
+            <text x="774" y="276" text-anchor="middle" fill="#d7eadc" font-size="13">null communicator + UID</text>
+            <text x="774" y="297" text-anchor="middle" fill="#a9c4b2" font-size="12">assigned ranks N ... M−1</text>
+
+            <path d="M146 143 L146 218" fill="none" stroke="#4fd1c5" stroke-width="3" marker-end="url(#arrow-cyan)"/>
+            <text x="158" y="188" fill="#a9c4b2" font-size="12">parent bootstrap</text>
+
+            <path d="M774 143 L774 207" fill="none" stroke="#f3c969" stroke-width="3" marker-end="url(#arrow-amber)"/>
+            <text x="786" y="183" fill="#a9c4b2" font-size="12">UID bytes</text>
+          </svg>
+          <figcaption>
+            The application distributes the UID because new ranks are not yet
+            members of any NCCL communicator.
+          </figcaption>
+        </figure>
+
+        <p>
+          The UID is single-use. Once the grow operation succeeds, NCCL consumes
+          it; the application must generate a new grow UID for a later expansion.
+        </p>
+      </section>
+
+      <section id="bootstrap">
+        <div class="eyebrow">03 · Bootstrap stitching</div>
+        <h2>How existing and new ranks become reachable</h2>
+        <p class="section-intro">
+          Existing ranks already have a parent bootstrap network. New ranks have
+          only the grow UID. NCCL combines these two mechanisms to construct a new
+          bootstrap ring spanning the expanded world.
+        </p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 920 480" role="img" aria-labelledby="ring-title ring-desc">
+            <title id="ring-title">Bootstrap ring before and after communicator growth</title>
+            <desc id="ring-desc">
+              Parent ranks zero through two are connected before grow. New ranks
+              three and four enter through the UID. NCCL forms a new bootstrap
+              ring containing all five ranks.
+            </desc>
+            <defs>
+              <marker id="arrow-ring" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#76b900"/>
+              </marker>
+              <marker id="arrow-new" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#7ab7ff"/>
+              </marker>
+            </defs>
+
+            <text x="40" y="38" fill="#b9f66b" font-size="15" font-weight="700">Before grow: parent bootstrap</text>
+            <rect x="78" y="66" width="115" height="60" rx="14" fill="#183126" stroke="#76b900" stroke-width="2"/>
+            <rect x="263" y="66" width="115" height="60" rx="14" fill="#183126" stroke="#76b900" stroke-width="2"/>
+            <rect x="448" y="66" width="115" height="60" rx="14" fill="#183126" stroke="#76b900" stroke-width="2"/>
+            <text x="135" y="102" text-anchor="middle" fill="#effcf3" font-size="15">old rank 0</text>
+            <text x="320" y="102" text-anchor="middle" fill="#effcf3" font-size="15">old rank 1</text>
+            <text x="505" y="102" text-anchor="middle" fill="#effcf3" font-size="15">old rank 2</text>
+            <line x1="193" y1="96" x2="252" y2="96" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-ring)"/>
+            <line x1="378" y1="96" x2="437" y2="96" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-ring)"/>
+
+            <rect x="680" y="55" width="178" height="82" rx="14" fill="#17251e" stroke="#7ab7ff" stroke-width="2" stroke-dasharray="7 5"/>
+            <text x="769" y="88" text-anchor="middle" fill="#a9d1ff" font-size="15" font-weight="700">new ranks 3 and 4</text>
+            <text x="769" y="112" text-anchor="middle" fill="#a9c4b2" font-size="12">enter through UID</text>
+
+            <text x="40" y="198" fill="#b9f66b" font-size="15" font-weight="700">After bootstrap stitching: expanded control ring</text>
+
+            <circle cx="460" cy="307" r="150" fill="none" stroke="#294b39" stroke-width="2" stroke-dasharray="5 7"/>
+
+            <g>
+              <circle cx="460" cy="177" r="43" fill="#183126" stroke="#76b900" stroke-width="2"/>
+              <text x="460" y="173" text-anchor="middle" fill="#effcf3" font-size="14">rank 0</text>
+              <text x="460" y="193" text-anchor="middle" fill="#a9c4b2" font-size="11">existing</text>
+            </g>
+            <g>
+              <circle cx="584" cy="267" r="43" fill="#183126" stroke="#76b900" stroke-width="2"/>
+              <text x="584" y="263" text-anchor="middle" fill="#effcf3" font-size="14">rank 1</text>
+              <text x="584" y="283" text-anchor="middle" fill="#a9c4b2" font-size="11">existing</text>
+            </g>
+            <g>
+              <circle cx="537" cy="413" r="43" fill="#183126" stroke="#76b900" stroke-width="2"/>
+              <text x="537" y="409" text-anchor="middle" fill="#effcf3" font-size="14">rank 2</text>
+              <text x="537" y="429" text-anchor="middle" fill="#a9c4b2" font-size="11">existing</text>
+            </g>
+            <g>
+              <circle cx="383" cy="413" r="43" fill="#172a35" stroke="#7ab7ff" stroke-width="2"/>
+              <text x="383" y="409" text-anchor="middle" fill="#effcf3" font-size="14">rank 3</text>
+              <text x="383" y="429" text-anchor="middle" fill="#a9d1ff" font-size="11">new</text>
+            </g>
+            <g>
+              <circle cx="336" cy="267" r="43" fill="#172a35" stroke="#7ab7ff" stroke-width="2"/>
+              <text x="336" y="263" text-anchor="middle" fill="#effcf3" font-size="14">rank 4</text>
+              <text x="336" y="283" text-anchor="middle" fill="#a9d1ff" font-size="11">new</text>
+            </g>
+
+            <path d="M495 202 Q540 213 553 238" fill="none" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-ring)"/>
+            <path d="M581 311 Q575 352 554 373" fill="none" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-ring)"/>
+            <path d="M494 426 Q460 441 425 426" fill="none" stroke="#7ab7ff" stroke-width="3" marker-end="url(#arrow-new)"/>
+            <path d="M366 377 Q342 345 338 313" fill="none" stroke="#7ab7ff" stroke-width="3" marker-end="url(#arrow-new)"/>
+            <path d="M349 227 Q382 189 417 181" fill="none" stroke="#7ab7ff" stroke-width="3" marker-end="url(#arrow-new)"/>
+          </svg>
+          <figcaption>
+            The bootstrap ring is a temporary control path used to exchange
+            initialization data. It is not necessarily the final collective ring.
+          </figcaption>
+        </figure>
+
+        <div class="callout">
+          <strong>Important distinction:</strong> the bootstrap ring only gives
+          NCCL a way to move initialization messages among all ranks. The final
+          collective rings and trees are computed later from discovered topology.
+        </div>
+      </section>
+
+      <section id="topology">
+        <div class="eyebrow">04 · Topology construction</div>
+        <h2>NCCL does not retrieve topology; it rebuilds it</h2>
+        <p class="section-intro">
+          Once the expanded bootstrap network exists, every rank contributes
+          information. NCCL all-gathers that information, discovers local
+          hardware, computes communication graphs, exchanges graph proposals,
+          and establishes the required transports.
+        </p>
+
+        <ol class="steps">
+          <li>
+            <div>
+              <strong>Collect peer identity and capability</strong>
+              <p>
+                Each rank fills <code>ncclPeerInfo</code> with GPU, host,
+                process, version, and transport capabilities. A bootstrap
+                AllGather gives every rank the complete peer table.
+              </p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Discover local hardware topology</strong>
+              <p>
+                Each process inspects its GPU, PCIe, NVLink/NVSwitch, CPU/NUMA,
+                and NIC relationships, then computes viable local paths.
+              </p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Compute candidate communication graphs</strong>
+              <p>
+                NCCL searches for ring, balanced-tree, CollNet, and NVLS layouts
+                according to hardware capabilities and communicator settings.
+              </p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Exchange and reconcile graph information</strong>
+              <p>
+                A later AllGather shares topology-rank and graph information so
+                all participants derive compatible global channels and mappings.
+              </p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Create transport connections</strong>
+              <p>
+                NCCL initializes the selected P2P, shared-memory, NVLink, and
+                network endpoints. The resulting communicator becomes the data
+                plane used by collectives.
+              </p>
+            </div>
+          </li>
+        </ol>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 920 360" role="img" aria-labelledby="topology-title topology-desc">
+            <title id="topology-title">Distributed topology construction pipeline</title>
+            <desc id="topology-desc">
+              Every rank contributes local identity and hardware information.
+              Bootstrap all-gathers produce a peer table and global graph data,
+              which NCCL uses to build channels and transport connections.
+            </desc>
+            <defs>
+              <marker id="arrow-pipe" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#76b900"/>
+              </marker>
+            </defs>
+
+            <g fill="#14291e" stroke="#4fd1c5" stroke-width="2">
+              <rect x="28" y="35" width="155" height="78" rx="14"/>
+              <rect x="28" y="141" width="155" height="78" rx="14"/>
+              <rect x="28" y="247" width="155" height="78" rx="14"/>
+            </g>
+            <text x="105" y="67" text-anchor="middle" fill="#8af3e9" font-size="14" font-weight="700">Rank 0 local view</text>
+            <text x="105" y="91" text-anchor="middle" fill="#a9c4b2" font-size="11">GPU / host / NIC</text>
+            <text x="105" y="173" text-anchor="middle" fill="#8af3e9" font-size="14" font-weight="700">Rank 1 local view</text>
+            <text x="105" y="197" text-anchor="middle" fill="#a9c4b2" font-size="11">GPU / host / NIC</text>
+            <text x="105" y="279" text-anchor="middle" fill="#8af3e9" font-size="14" font-weight="700">Rank N local view</text>
+            <text x="105" y="303" text-anchor="middle" fill="#a9c4b2" font-size="11">GPU / host / NIC</text>
+
+            <path d="M183 74 C238 74 224 130 277 157" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#arrow-pipe)"/>
+            <path d="M183 180 L270 180" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#arrow-pipe)"/>
+            <path d="M183 286 C238 286 224 230 277 203" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#arrow-pipe)"/>
+
+            <rect x="282" y="117" width="176" height="126" rx="16" fill="#183126" stroke="#76b900" stroke-width="2"/>
+            <text x="370" y="153" text-anchor="middle" fill="#b9f66b" font-size="16" font-weight="700">Bootstrap AllGather</text>
+            <text x="370" y="182" text-anchor="middle" fill="#d7eadc" font-size="12">peerInfo[]</text>
+            <text x="370" y="205" text-anchor="middle" fill="#d7eadc" font-size="12">graphInfo[]</text>
+            <text x="370" y="228" text-anchor="middle" fill="#a9c4b2" font-size="11">replicated on every rank</text>
+
+            <line x1="458" y1="180" x2="546" y2="180" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-pipe)"/>
+
+            <rect x="558" y="117" width="153" height="126" rx="16" fill="#17251e" stroke="#f3c969" stroke-width="2"/>
+            <text x="634" y="151" text-anchor="middle" fill="#f8dda0" font-size="16" font-weight="700">Graph search</text>
+            <text x="634" y="180" text-anchor="middle" fill="#d7eadc" font-size="12">rings</text>
+            <text x="634" y="202" text-anchor="middle" fill="#d7eadc" font-size="12">trees</text>
+            <text x="634" y="224" text-anchor="middle" fill="#d7eadc" font-size="12">channels</text>
+
+            <line x1="711" y1="180" x2="778" y2="180" stroke="#76b900" stroke-width="3" marker-end="url(#arrow-pipe)"/>
+
+            <rect x="790" y="105" width="104" height="150" rx="16" fill="#172a35" stroke="#7ab7ff" stroke-width="2"/>
+            <text x="842" y="143" text-anchor="middle" fill="#a9d1ff" font-size="15" font-weight="700">New comm</text>
+            <text x="842" y="174" text-anchor="middle" fill="#d7eadc" font-size="11">rank map</text>
+            <text x="842" y="196" text-anchor="middle" fill="#d7eadc" font-size="11">neighbors</text>
+            <text x="842" y="218" text-anchor="middle" fill="#d7eadc" font-size="11">transports</text>
+          </svg>
+          <figcaption>
+            There is no central topology database. Each NCCL process executes the
+            same distributed initialization protocol and stores its local
+            communicator state.
+          </figcaption>
+        </figure>
+      </section>
+
+      <section id="sequence">
+        <div class="eyebrow">05 · End-to-end sequence</div>
+        <h2>Who does what during a grow operation</h2>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 980 650" role="img" aria-labelledby="sequence-title sequence-desc">
+            <title id="sequence-title">End-to-end NCCL grow sequence</title>
+            <desc id="sequence-desc">
+              The application requests a UID from one existing rank, distributes
+              it to new ranks, starts grow calls concurrently, and NCCL creates a
+              new bootstrap ring, exchanges topology, and returns new communicators.
+            </desc>
+            <defs>
+              <marker id="seq-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#76b900"/>
+              </marker>
+              <marker id="seq-arrow-blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#7ab7ff"/>
+              </marker>
+            </defs>
+
+            <g font-size="13" font-weight="700">
+              <rect x="25" y="22" width="150" height="46" rx="10" fill="#17251e" stroke="#f3c969"/>
+              <text x="100" y="50" text-anchor="middle" fill="#f8dda0">Application / Ray</text>
+              <rect x="223" y="22" width="150" height="46" rx="10" fill="#183126" stroke="#76b900"/>
+              <text x="298" y="50" text-anchor="middle" fill="#b9f66b">Existing root</text>
+              <rect x="421" y="22" width="150" height="46" rx="10" fill="#183126" stroke="#76b900"/>
+              <text x="496" y="50" text-anchor="middle" fill="#b9f66b">Existing peers</text>
+              <rect x="619" y="22" width="150" height="46" rx="10" fill="#172a35" stroke="#7ab7ff"/>
+              <text x="694" y="50" text-anchor="middle" fill="#a9d1ff">New ranks</text>
+              <rect x="817" y="22" width="138" height="46" rx="10" fill="#17251e" stroke="#4fd1c5"/>
+              <text x="886" y="50" text-anchor="middle" fill="#8af3e9">Bootstrap root</text>
+            </g>
+
+            <g stroke="#345443" stroke-width="1.5" stroke-dasharray="5 6">
+              <line x1="100" y1="68" x2="100" y2="615"/>
+              <line x1="298" y1="68" x2="298" y2="615"/>
+              <line x1="496" y1="68" x2="496" y2="615"/>
+              <line x1="694" y1="68" x2="694" y2="615"/>
+              <line x1="886" y1="68" x2="886" y2="615"/>
+            </g>
+
+            <g font-size="12" fill="#d7eadc">
+              <line x1="100" y1="111" x2="288" y2="111" stroke="#76b900" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <text x="194" y="101" text-anchor="middle">request grow UID</text>
+
+              <line x1="298" y1="151" x2="876" y2="151" stroke="#4fd1c5" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <text x="585" y="141" text-anchor="middle">create listener: address + magic</text>
+
+              <line x1="876" y1="191" x2="308" y2="191" stroke="#4fd1c5" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <text x="585" y="181" text-anchor="middle">return opaque UID</text>
+
+              <line x1="298" y1="231" x2="110" y2="231" stroke="#f3c969" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <text x="204" y="221" text-anchor="middle">UID bytes</text>
+
+              <line x1="100" y1="271" x2="684" y2="271" stroke="#7ab7ff" stroke-width="2.5" marker-end="url(#seq-arrow-blue)"/>
+              <text x="390" y="261" text-anchor="middle">UID + assigned new ranks + target size</text>
+
+              <line x1="100" y1="326" x2="288" y2="326" stroke="#76b900" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <line x1="100" y1="351" x2="486" y2="351" stroke="#76b900" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <line x1="100" y1="376" x2="684" y2="376" stroke="#7ab7ff" stroke-width="2.5" marker-end="url(#seq-arrow-blue)"/>
+              <text x="194" y="315" text-anchor="middle">grow(M, UID)</text>
+              <text x="303" y="341" text-anchor="middle">grow(M)</text>
+              <text x="390" y="366" text-anchor="middle">grow(M, UID, rank=N...)</text>
+
+              <rect x="215" y="406" width="678" height="82" rx="14" fill="rgba(118,185,0,0.08)" stroke="#76b900"/>
+              <text x="554" y="435" text-anchor="middle" fill="#b9f66b" font-size="14" font-weight="700">NCCL internal collective initialization</text>
+              <text x="554" y="459" text-anchor="middle" fill="#d7eadc">stitch bootstrap ring → AllGather peerInfo → discover topology</text>
+              <text x="554" y="479" text-anchor="middle" fill="#d7eadc">compute rings/trees/channels → create transports</text>
+
+              <line x1="288" y1="530" x2="110" y2="530" stroke="#76b900" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <line x1="486" y1="555" x2="110" y2="555" stroke="#76b900" stroke-width="2.5" marker-end="url(#seq-arrow)"/>
+              <line x1="684" y1="580" x2="110" y2="580" stroke="#7ab7ff" stroke-width="2.5" marker-end="url(#seq-arrow-blue)"/>
+              <text x="199" y="520" text-anchor="middle">new communicator</text>
+              <text x="298" y="545" text-anchor="middle">new communicator</text>
+              <text x="398" y="570" text-anchor="middle">new communicator</text>
+            </g>
+          </svg>
+          <figcaption>
+            The grow calls must make progress concurrently because communicator
+            initialization is collective.
+          </figcaption>
+        </figure>
+
+        <pre><code># Existing grow root
+new_comm = existing_comm.grow(new_world_size, uid)
+
+# Existing non-root rank
+new_comm = existing_comm.grow(new_world_size)
+
+# Newly added rank
+new_comm = Communicator().grow(
+    new_world_size,
+    uid,
+    rank=assigned_rank,
+)</code></pre>
+      </section>
+
+      <section id="example">
+        <div class="eyebrow">06 · Concrete example</div>
+        <h2>Growing a shrunk refit group from 1,022 to 1,024 ranks</h2>
+        <p class="section-intro">
+          Suppose a two-GPU generation instance was excluded by shrink and later
+          recovers. The recovered processes join at the end of the current rank
+          space; they do not reclaim their pre-shrink rank numbers.
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Participant</th>
+              <th>Input communicator</th>
+              <th>Grow arguments</th>
+              <th>Rank in new communicator</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Existing grow root</td>
+              <td>1,022-rank parent</td>
+              <td><code>grow(1024, uid)</code></td>
+              <td>Preserves existing rank</td>
+            </tr>
+            <tr>
+              <td>Existing non-root</td>
+              <td>1,022-rank parent</td>
+              <td><code>grow(1024)</code></td>
+              <td>Preserves existing rank</td>
+            </tr>
+            <tr>
+              <td>Recovered GPU process A</td>
+              <td>Null communicator</td>
+              <td><code>grow(1024, uid, rank=1022)</code></td>
+              <td>1,022</td>
+            </tr>
+            <tr>
+              <td>Recovered GPU process B</td>
+              <td>Null communicator</td>
+              <td><code>grow(1024, uid, rank=1023)</code></td>
+              <td>1,023</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 920 260" role="img" aria-labelledby="example-title example-desc">
+            <title id="example-title">Rank-space expansion from 1022 to 1024</title>
+            <desc id="example-desc">
+              Existing ranks zero through 1021 preserve their rank numbers.
+              Recovered processes are appended as ranks 1022 and 1023.
+            </desc>
+            <defs>
+              <linearGradient id="existing-gradient" x1="0" x2="1">
+                <stop offset="0%" stop-color="#315f45"/>
+                <stop offset="100%" stop-color="#76b900"/>
+              </linearGradient>
+              <marker id="example-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#76b900"/>
+              </marker>
+            </defs>
+            <text x="46" y="44" fill="#a9c4b2" font-size="13">Shrunk parent communicator</text>
+            <rect x="46" y="60" width="670" height="58" rx="13" fill="url(#existing-gradient)"/>
+            <text x="381" y="95" text-anchor="middle" fill="#07110d" font-size="16" font-weight="800">existing ranks 0 ... 1021</text>
+
+            <line x1="381" y1="130" x2="381" y2="174" stroke="#76b900" stroke-width="3" marker-end="url(#example-arrow)"/>
+            <text x="399" y="157" fill="#a9c4b2" font-size="12">grow to 1,024</text>
+
+            <text x="46" y="206" fill="#a9c4b2" font-size="13">Expanded communicator</text>
+            <rect x="46" y="218" width="670" height="30" rx="9" fill="url(#existing-gradient)"/>
+            <rect x="723" y="218" width="70" height="30" rx="9" fill="#32638d" stroke="#7ab7ff"/>
+            <rect x="800" y="218" width="70" height="30" rx="9" fill="#32638d" stroke="#7ab7ff"/>
+            <text x="381" y="239" text-anchor="middle" fill="#07110d" font-size="14" font-weight="800">0 ... 1021</text>
+            <text x="758" y="239" text-anchor="middle" fill="#effcf3" font-size="11">1022</text>
+            <text x="835" y="239" text-anchor="middle" fill="#effcf3" font-size="11">1023</text>
+          </svg>
+          <figcaption>
+            Application-level mappings must be updated because recovered workers
+            receive new communicator ranks.
+          </figcaption>
+        </figure>
+
+        <div class="callout">
+          <strong>NeMo-RL implication:</strong> all training and active generation
+          workers must switch to the returned communicator before the next refit.
+          A recovered worker using the new communicator cannot safely synchronize
+          weights with peers still using the parent communicator.
+        </div>
+      </section>
+
+      <section id="responsibilities">
+        <div class="eyebrow">07 · Ownership boundary</div>
+        <h2>Application responsibilities versus NCCL responsibilities</h2>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Application / orchestration layer</th>
+              <th>NCCL library</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Detect that a generation instance recovered</td>
+              <td>Create and manage the temporary bootstrap listener</td>
+            </tr>
+            <tr>
+              <td>Select one existing grow root</td>
+              <td>Stitch existing and new ranks into a bootstrap ring</td>
+            </tr>
+            <tr>
+              <td>Generate and externally distribute UID bytes</td>
+              <td>AllGather peer and graph information</td>
+            </tr>
+            <tr>
+              <td>Choose target world size and unique new rank IDs</td>
+              <td>Discover local GPU, PCIe, NVLink, and NIC topology</td>
+            </tr>
+            <tr>
+              <td>Launch all grow calls concurrently</td>
+              <td>Compute rings, trees, channels, and rank mappings</td>
+            </tr>
+            <tr>
+              <td>Quiesce refit traffic and coordinate communicator swap</td>
+              <td>Create transport connections and return the new communicator</td>
+            </tr>
+            <tr>
+              <td>Retire the parent communicator when safe</td>
+              <td>Consume the one-time grow UID</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 style="margin-top: 1.8rem;">Operational invariants</h3>
+        <ul>
+          <li>All participants must use the same target world size.</li>
+          <li>New ranks must receive unique assigned ranks in the expanded range.</li>
+          <li>Existing ranks preserve their current communicator rank.</li>
+          <li>Grow is collective; participants must be launched concurrently.</li>
+          <li>A grow UID is bound to one grow attempt and cannot be reused.</li>
+          <li>No refit operation should mix parent and expanded communicators.</li>
+        </ul>
+      </section>
+
+      <section id="sources">
+        <div class="eyebrow">08 · Primary sources</div>
+        <h2>Source references</h2>
+        <p class="section-intro">
+          This document is based on the public NCCL API documentation and NCCL
+          source implementation.
+        </p>
+        <ul>
+          <li>
+            <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/nccl4py/communicator/lifecycle.html#nccl.core.Communicator.grow">
+              NCCL4Py communicator lifecycle: <code>Communicator.grow()</code>
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/NVIDIA/nccl/blob/master/src/init.cc#L2937-L3069">
+              NCCL grow UID and <code>ncclCommGrow</code> implementation
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/NVIDIA/nccl/blob/master/src/bootstrap.cc#L386-L455">
+              Bootstrap root creation, grow handle generation, and boundary-rank propagation
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/NVIDIA/nccl/blob/master/src/bootstrap.cc#L638-L808">
+              Bootstrap ring construction and initialization-data exchange
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/NVIDIA/nccl/blob/master/src/init.cc#L944-L1088">
+              Peer information AllGather and topology discovery
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/NVIDIA/nccl/blob/master/src/init.cc#L1142-L1387">
+              Graph information exchange and ring/tree construction
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <footer class="footer">
+        <strong>Scope:</strong> This is an implementation-oriented explanation,
+        not an API compatibility guarantee. NCCL internals can evolve between
+        releases; applications should depend on the documented public API
+        contract.
+      </footer>
+    </main>
+  </div>
+</body>
+</html>
