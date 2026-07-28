@@ -318,17 +318,105 @@ def attach_routed_experts_to_chat_response_choices(
     return response
 
 
+def attach_token_information_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+) -> Any:
+    """Attach engine-native token information to OpenAI chat response choices."""
+    prompt_token_ids = getattr(final_request_output, "prompt_token_ids", None)
+    if prompt_token_ids is None:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but the final request output did "
+            "not include prompt_token_ids."
+        )
+
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    choices = list(getattr(response, "choices", []))
+    choice_indices = [choice.index for choice in choices]
+    if len(outputs_by_index) != len(
+        getattr(final_request_output, "outputs", [])
+    ) or len(set(choice_indices)) != len(choice_indices):
+        raise RuntimeError(
+            "vLLM returned duplicate choice indices while attaching token "
+            "information to the OpenAI-compatible chat response."
+        )
+
+    missing_choice_indices = sorted(set(choice_indices) - outputs_by_index.keys())
+    if missing_choice_indices:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}."
+        )
+
+    for choice in choices:
+        generation_details = outputs_by_index[choice.index]
+        output_token_ids = getattr(generation_details, "token_ids", None)
+        if output_token_ids is None:
+            raise RuntimeError(
+                "vLLM was asked to return token information for the "
+                "OpenAI-compatible chat endpoint but generation output "
+                f"choice_idx={choice.index} did not include token_ids."
+            )
+        generation_token_ids = list(output_token_ids)
+
+        logprob_content = getattr(getattr(choice, "logprobs", None), "content", None)
+        if logprob_content is None:
+            if generation_token_ids:
+                raise RuntimeError(
+                    "vLLM was asked to return token information for the "
+                    "OpenAI-compatible chat endpoint but response "
+                    f"choice_idx={choice.index} did not include logprobs."
+                )
+            generation_log_probs = []
+        else:
+            if len(generation_token_ids) != len(logprob_content):
+                raise RuntimeError(
+                    "vLLM returned mismatched generation token IDs and log "
+                    "probabilities for the OpenAI-compatible chat endpoint: "
+                    f"choice_idx={choice.index}, "
+                    f"token_count={len(generation_token_ids)}, "
+                    f"logprob_count={len(logprob_content)}."
+                )
+            generation_log_probs = []
+            for token_id, logprob_entry in zip(generation_token_ids, logprob_content):
+                if logprob_entry.token != f"token_id:{token_id}":
+                    raise RuntimeError(
+                        "vLLM returned a log probability for an unexpected "
+                        "token while attaching token information to the "
+                        "OpenAI-compatible chat response: "
+                        f"choice_idx={choice.index}, token_id={token_id}, "
+                        f"logprob_token={logprob_entry.token!r}."
+                    )
+                generation_log_probs.append(float(logprob_entry.logprob))
+
+        choice.message.prompt_token_ids = list(prompt_token_ids)
+        choice.message.generation_token_ids = generation_token_ids
+        choice.message.generation_log_probs = generation_log_probs
+
+    return response
+
+
 def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
-    """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
+    """Dump a vLLM OpenAI chat response while preserving dynamic message fields."""
     response_dict = response.model_dump()
     for choice, choice_dict in zip(
         getattr(response, "choices", []), response_dict.get("choices", [])
     ):
-        routed_experts = getattr(
-            getattr(choice, "message", None), "routed_experts", None
-        )
-        if routed_experts is not None:
-            choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
+        message = getattr(choice, "message", None)
+        for field_name in (
+            "routed_experts",
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+        ):
+            field_value = getattr(message, field_name, None)
+            if field_value is not None:
+                choice_dict.setdefault("message", {})[field_name] = field_value
     return response_dict
 
 

@@ -1706,6 +1706,21 @@ def test_vllm_http_server(cluster, tokenizer):
     response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
     actual_result = response.json()
 
+    expected_prompt_token_ids = [
+        151644,
+        872,
+        198,
+        1830,
+        311,
+        220,
+        20,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
+
     # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
     expected_result = {
         "id": "chatcmpl-7b8c0cdeeab34fd58ad260cf44b1a408",
@@ -1725,6 +1740,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     # vLLM 0.25 omits tool_calls when empty and dropped
                     # reasoning_content in favor of reasoning.
                     "reasoning": None,
+                    "prompt_token_ids": expected_prompt_token_ids,
+                    "generation_token_ids": [151667],
                 },
                 "logprobs": {
                     "content": [
@@ -1771,9 +1788,13 @@ def test_vllm_http_server(cluster, tokenizer):
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
+        message.pop("generation_log_probs", None)
 
         return d
 
+    assert actual_result["choices"][0]["message"]["generation_log_probs"] == [
+        actual_result["choices"][0]["logprobs"]["content"][0]["logprob"]
+    ]
     assert _standardize(expected_result) == _standardize(actual_result)
 
     # Check that tokenization route works
@@ -1782,20 +1803,7 @@ def test_vllm_http_server(cluster, tokenizer):
     expected_result = {
         "count": 12,
         "max_model_len": 1024,
-        "tokens": [
-            151644,
-            872,
-            198,
-            1830,
-            311,
-            220,
-            20,
-            151645,
-            198,
-            151644,
-            77091,
-            198,
-        ],
+        "tokens": expected_prompt_token_ids,
         "token_strs": None,
     }
     assert expected_result == actual_result

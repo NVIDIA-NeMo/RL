@@ -45,6 +45,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
@@ -609,19 +610,27 @@ class VllmAsyncGenerationWorkerImpl(
                     **kwargs,
                 )
                 if (
-                    not worker_self._return_routed_experts_enabled()
-                    or not isinstance(response, ChatCompletionResponse)
+                    not isinstance(response, ChatCompletionResponse)
                     or final_res is None
                 ):
                     return response
 
-                return attach_routed_experts_to_chat_response_choices(
-                    response,
-                    final_res,
-                    device=torch.device("cpu"),
-                    logger=LOGGER,
-                    routed_experts_dtype=worker_self.routed_experts_dtype,
-                )
+                if request.logprobs and request.return_tokens_as_token_ids:
+                    response = attach_token_information_to_chat_response_choices(
+                        response,
+                        final_res,
+                    )
+
+                if worker_self._return_routed_experts_enabled():
+                    response = attach_routed_experts_to_chat_response_choices(
+                        response,
+                        final_res,
+                        device=torch.device("cpu"),
+                        logger=LOGGER,
+                        routed_experts_dtype=worker_self.routed_experts_dtype,
+                    )
+
+                return response
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass

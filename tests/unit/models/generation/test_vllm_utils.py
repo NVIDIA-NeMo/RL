@@ -30,6 +30,7 @@ from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
@@ -556,6 +557,62 @@ def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_cho
             final_res,
             device=torch.device("cpu"),
         )
+
+
+def test_attach_token_information_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[
+            SimpleNamespace(index=1, token_ids=[]),
+            SimpleNamespace(index=0, token_ids=[201, 202]),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(),
+                logprobs=SimpleNamespace(
+                    content=[
+                        SimpleNamespace(token="token_id:201", logprob=-0.1),
+                        SimpleNamespace(token="token_id:202", logprob=-0.2),
+                    ]
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                message=SimpleNamespace(),
+                logprobs=SimpleNamespace(content=None),
+            ),
+        ],
+        model_dump=lambda: {
+            "choices": [
+                {"message": {"role": "assistant", "content": "first"}},
+                {"message": {"role": "assistant", "content": "second"}},
+            ]
+        },
+    )
+
+    attach_token_information_to_chat_response_choices(response, final_res)
+    response_dict = model_dump_chat_response_with_routed_experts(response)
+
+    assert response_dict["choices"][0]["message"]["prompt_token_ids"] == [
+        101,
+        102,
+        103,
+    ]
+    assert response_dict["choices"][0]["message"]["generation_token_ids"] == [201, 202]
+    assert response_dict["choices"][0]["message"]["generation_log_probs"] == [
+        -0.1,
+        -0.2,
+    ]
+    assert response_dict["choices"][1]["message"]["prompt_token_ids"] == [
+        101,
+        102,
+        103,
+    ]
+    assert response_dict["choices"][1]["message"]["generation_token_ids"] == []
+    assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
 
 
 def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
