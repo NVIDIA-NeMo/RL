@@ -1357,6 +1357,52 @@ class TestMakeProcessedMicrobatchIterator:
     """Tests for make_processed_microbatch_iterator function."""
 
     @patch("nemo_rl.models.megatron.data.process_microbatch")
+    @patch("nemo_rl.models.megatron.data._validate_direct_packed_microbatch")
+    def test_direct_packed_metadata_is_validated_before_cuda_transfer(
+        self,
+        validate_direct_packed,
+        process_microbatch,
+    ):
+        from nemo_rl.models.megatron.data import (
+            DirectPackedMetadata,
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        metadata = DirectPackedMetadata(cu_seqlens_length=3, max_seqlen=4)
+        validate_direct_packed.return_value = metadata
+        process_microbatch.return_value = ProcessedInputs(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=torch.arange(4).unsqueeze(0),
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=torch.tensor([0, 4]),
+        )
+        data = _direct_packed_microbatch()
+        data["mtp_loss_mask"] = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+
+        def move_to_cuda(device):
+            assert device == "cuda"
+            assert validate_direct_packed.call_count == 1
+            return data
+
+        with patch.object(data, "to", side_effect=move_to_cuda):
+            next(
+                make_processed_microbatch_iterator(
+                    raw_iterator=iter([data]),
+                    cfg={"sequence_packing": {"enabled": False}},
+                    seq_length_key=None,
+                    pad_individual_seqs_to_multiple_of=1,
+                    pad_packed_seq_to_multiple_of=1,
+                    straggler_timer=MagicMock(),
+                    pad_full_seq_to=None,
+                )
+            )
+
+        assert process_microbatch.call_args.kwargs["direct_packed_metadata"] == metadata
+
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
     def test_make_processed_microbatch_iterator_basic(self, mock_process):
         """Test make_processed_microbatch_iterator yields ProcessedMicrobatch."""
         from nemo_rl.models.megatron.data import (

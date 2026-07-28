@@ -119,6 +119,37 @@ def _dataset_parser() -> MegatronSFTPackedDataset:
     return dataset
 
 
+@pytest.mark.parametrize(
+    ("data_config", "message"),
+    [
+        (
+            {"megatron_sft_context_parallel_size": 1},
+            "megatron_sft_prompt_format",
+        ),
+        (
+            {"megatron_sft_prompt_format": "identity"},
+            "megatron_sft_context_parallel_size",
+        ),
+        (
+            {
+                "megatron_sft_prompt_format": "unsupported",
+                "megatron_sft_context_parallel_size": 1,
+            },
+            "unknown SFT prompt format",
+        ),
+    ],
+)
+def test_dataset_processor_rejects_invalid_packed_config_during_setup(
+    data_config: dict[str, Any],
+    message: str,
+) -> None:
+    dataset = _dataset_parser()
+    dataset.data_config = data_config
+
+    with pytest.raises((KeyError, ValueError, NotImplementedError), match=message):
+        dataset.set_processor()
+
+
 def _megatron_preprocess(
     messages: list[dict[str, str]],
     tokenizer: _MegatronTokenizer,
