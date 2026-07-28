@@ -27,7 +27,7 @@ bridge_package_name = "megatron.bridge"
 
 # Default dependencies from pyproject.toml
 CACHED_DEPENDENCIES = [
-    "transformers>=5.8.1,<5.9.0",
+    "transformers>=5.8,<=5.12.1",
     "mistral-common>=1.10.0",
     "peft>=0.18.1",
     "datasets>=2.20.0",
