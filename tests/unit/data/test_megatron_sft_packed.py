@@ -146,6 +146,14 @@ def _dataset_parser() -> MegatronSFTPackedDataset:
             },
             "megatron_sft_assistant_prefix_len must be >= 0",
         ),
+        (
+            {
+                "megatron_sft_prompt_format": "identity",
+                "megatron_sft_context_parallel_size": 1,
+                "megatron_sft_assistant_prefix_len": 1,
+            },
+            "identity prompt format does not support assistant_prefix_len",
+        ),
     ],
 )
 def test_dataset_processor_rejects_invalid_packed_config_during_setup(
@@ -307,6 +315,29 @@ def test_identity_uses_unk_padding_and_supervises_all_literal_targets() -> None:
 
     assert torch.equal(processed["target_ids"], torch.tensor([20, 30, 99, 99, 99]))
     assert tokenizer.calls[0][1]["add_generation_prompt"] is False
+
+
+def test_identity_rejects_assistant_prefix_masking() -> None:
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a"},
+    ]
+    tokenizer = _DummyTokenizer(
+        {("system", "s"): [10], ("user", "u"): [20], ("assistant", "a"): [30]}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="identity prompt format does not support assistant_prefix_len",
+    ):
+        _preprocess(
+            messages,
+            tokenizer,
+            max_seq_length=5,
+            prompt_format="identity",
+            assistant_prefix_len=1,
+        )
 
 
 @pytest.mark.parametrize(

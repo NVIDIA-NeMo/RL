@@ -69,6 +69,10 @@ class MegatronSFTPackedDataset(RawDataset):
         )
         if assistant_prefix_len is not None and assistant_prefix_len < 0:
             raise ValueError("megatron_sft_assistant_prefix_len must be >= 0")
+        if str(prompt_format) == "identity" and assistant_prefix_len not in (None, 0):
+            raise ValueError(
+                "identity prompt format does not support assistant_prefix_len"
+            )
         configured_context_parallel_size: Any = self.data_config[
             "megatron_sft_context_parallel_size"
         ]

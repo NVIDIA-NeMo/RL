@@ -330,6 +330,29 @@ def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effec
             )
 
 
+def test_setup_rejects_missing_megatron_config_for_direct_packed_sft(
+    mock_components,
+):
+    master_config = mock_components["master_config"]
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    master_config.policy["train_micro_batch_size"] = 1
+    master_config.policy["dynamic_batching"] = {"enabled": False}
+    master_config.policy["sequence_packing"] = {"enabled": False}
+    master_config.policy["draft"] = {"enabled": False}
+    master_config.policy["router_replay"] = {"enabled": False}
+    train_dataset = MagicMock()
+    train_dataset.task_data_processors = {"megatron_sft_packed": MagicMock()}
+
+    with pytest.raises(ValueError, match="requires the Megatron backend"):
+        setup(
+            master_config,
+            mock_components["tokenizer"],
+            train_dataset,
+            None,
+        )
+
+
 @pytest.mark.parametrize(
     ("policy_update", "sft_update", "message"),
     [

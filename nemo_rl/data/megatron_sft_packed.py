@@ -107,6 +107,8 @@ def _get_prompt_config(
     )
     if resolved_assistant_prefix_len < 0:
         raise ValueError("assistant_prefix_len must be >= 0")
+    if prompt_format == "identity" and resolved_assistant_prefix_len != 0:
+        raise ValueError("identity prompt format does not support assistant_prefix_len")
     return _PromptConfig(
         assistant_prefix_len=resolved_assistant_prefix_len,
         pad_token=default.pad_token if pad_token is None else pad_token,

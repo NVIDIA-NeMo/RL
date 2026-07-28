@@ -242,6 +242,15 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
+    uses_direct_packing = _uses_direct_megatron_sft_packing(
+        train_dataset
+    ) or _uses_direct_megatron_sft_packing(val_dataset)
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if uses_direct_packing and (megatron_cfg is None or not megatron_cfg["enabled"]):
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires the Megatron backend"
+        )
+
     loss_fn = NLLLossFn(
         use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
         and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]

@@ -160,6 +160,12 @@ def _validate_direct_packed_microbatch(
             "packed_cu_seqlens must contain increasing boundaries from 0 "
             "through the packed row length"
         )
+    resolved_max_seqlen = int(packed_max_seqlen[0].item())
+    if resolved_max_seqlen != max(segment_lengths):
+        raise ValueError(
+            "packed_max_seqlen must equal the longest packed segment "
+            f"({max(segment_lengths)})"
+        )
     if context_parallel_size > 1 and any(
         length % (2 * context_parallel_size) != 0 for length in segment_lengths
     ):
@@ -178,7 +184,7 @@ def _validate_direct_packed_microbatch(
 
     return DirectPackedMetadata(
         cu_seqlens_length=cu_len,
-        max_seqlen=int(packed_max_seqlen[0].item()),
+        max_seqlen=resolved_max_seqlen,
     )
 
 

@@ -1404,6 +1404,18 @@ class TestMakeProcessedMicrobatchIterator:
 
         assert process_microbatch.call_args.kwargs["direct_packed_metadata"] == metadata
 
+    def test_direct_packed_metadata_rejects_inconsistent_max_seqlen(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        data = _direct_packed_microbatch()
+        data["packed_max_seqlen"] = torch.tensor([3])
+
+        with pytest.raises(
+            ValueError,
+            match="packed_max_seqlen must equal the longest packed segment",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=1)
+
     @patch("nemo_rl.models.megatron.data.process_microbatch")
     def test_make_processed_microbatch_iterator_basic(self, mock_process):
         """Test make_processed_microbatch_iterator yields ProcessedMicrobatch."""
