@@ -34,6 +34,12 @@ An example recipe is available at:
 examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
 ```
 
+The native async TransferQueue path uses the SingleController entrypoint with:
+
+```text
+examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
+```
+
 ## Validation
 
 Router Replay validation covers two end-to-end questions:
