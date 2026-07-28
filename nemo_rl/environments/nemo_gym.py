@@ -613,6 +613,7 @@ def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
     base_urls: list[Optional[str]],
     model_name: str,
+    *,
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
