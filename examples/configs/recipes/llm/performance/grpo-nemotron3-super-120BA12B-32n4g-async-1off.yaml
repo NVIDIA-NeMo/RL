@@ -44,8 +44,8 @@ policy:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
       NRL_REFIT_NUM_BUFFERS: "1"
-    # # HybridEP settings. Currently disabled
-    # # due to incompatibility with sequence packing
+    # HybridEP validation launchers override these settings after applying the
+    # packed-sequence padding-mask fix. The base recipe retains alltoall.
     # moe_token_dispatcher_type: flex
     # moe_flex_dispatcher_backend: hybridep
     # moe_hybridep_num_sms: 32

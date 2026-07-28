@@ -27,7 +27,8 @@ scripts/experiments/oci-hsg/hybridep/submit_grpo.sh
 ```
 
 To run the 32-node Nemotron3 Super 120B async 1-off recipe with the same
-HybridEP overrides:
+HybridEP overrides, the model profile also exports `NCCL_NVLS_ENABLE=0` to
+match the official performance harness and avoid NVLS-related OOM:
 
 ```bash
 WANDB_ENABLED=False \
