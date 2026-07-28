@@ -188,10 +188,13 @@ step_metrics={'loss': ..., 'grad_norm': ..., ...}
   usage was ~170 GB/rank of 189 GB. If you scale up context, batch, or model,
   expect the initial weight sync to OOM first; raise EP, enable
   `optimizer_cpu_offload`, or shorten the sequence.
-- **Two-hour walltime.** `WALLTIME=1:59:00` is the max for the `short` QOS and is
-  the practical floor for this recipe. Shorter allocations expired mid-warmup
-  during development. For scale: with `num_prompts_per_step=2` a 4-rollout batch
-  took 6–8 minutes, and the default 64-rollout batch took ~11 minutes.
+- **Walltime and QOS.** `WALLTIME=3:59:00` (the `batch` partition maximum) with
+  no QOS. Two hours is the practical floor — shorter allocations expired
+  mid-warmup during development. The recipe deliberately avoids the `short` QOS:
+  it trades a priority boost for a 2h ceiling and a per-user node cap, and a
+  6-node job here was held with `Reason=QOSMaxNodePerUserLimit` while a larger
+  job of the same user was running. For scale: with `num_prompts_per_step=2` a
+  4-rollout batch took 6–8 minutes; the default 64-rollout batch took ~11.
 - **Submodule pin.** This branch pins `3rdparty/Gym-workspace/Gym` to `v0.4.0` to
   match the container's prebuilt gym venvs (`skip_venv_if_present: true`).
   Bumping it without rebuilding the container forces a concurrent nemo-gym
