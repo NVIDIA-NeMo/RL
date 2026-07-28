@@ -2245,7 +2245,12 @@ class MegatronPolicyWorkerImpl(
             else:
                 count = middle_per_stage
             for _ in range(count):
-                layer_to_pp_stage[f"{layer_prefix}.layers.{layer_idx}"] = stage
+                key = (
+                    f"{layer_prefix}.layers.{layer_idx}"
+                    if layer_prefix
+                    else f"layers.{layer_idx}"
+                )
+                layer_to_pp_stage[key] = stage
                 layer_idx += 1
 
         assert layer_idx == num_layers, (
@@ -2280,12 +2285,6 @@ class MegatronPolicyWorkerImpl(
         # (xferdtensor) or misc (packed_broadcast), preserve yield order so
         # producer/consumer agree on the packed-broadcast iteration.
 
-        # Route QKV to the misc (packed_broadcast) path whenever
-        # KV heads can't be cleanly 1/tp-sharded on EITHER side,
-        # for the code simplicity.
-        train_tp = train_parallelism.get("tp_size", 1)
-        gen_tp = gen_parallelism.get("tp_size", 1)
-
         # Only the FFN gate/up/down weights take the bulk
         # xferdtensor path (>97% of payload for the large models this targets);
         # everything else (attention, embeddings, norms, router, MLA, scales)
@@ -2313,7 +2312,7 @@ class MegatronPolicyWorkerImpl(
                 if is_nccl_reshard_param(name):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
-                    if layer_prefix:
+                    if layer_prefix is not None:
                         assert layer_prefix == _extract_layer_prefix(name), (
                             f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
                         )

@@ -42,11 +42,8 @@ class AbstractPolicyWorker:
             master_address=ip, port=port, rank=self.rank, world_size=world_size
         )
         device = torch.cuda.current_device()
-        # Return cached (unused) torch-allocator blocks to CUDA so NCCL's P2P
-        # transport buffers (raw cudaMalloc at comm init) have headroom.  Without
-        # this, comm_init OOMs ("Cuda failure ... out of memory" in
-        # transport/p2p.cc) on memory-tight shapes (e.g. EP4TP2DP2 / PP=1 / 30B),
-        # surfacing as NCCLError UnhandledCudaError.
+        # Release unused cached allocator blocks before NCCL communicator
+        # initialization so transport buffers have sufficient device-memory headroom.
         torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=device)
 
@@ -78,6 +75,28 @@ class AbstractPolicyWorker:
         torch.cuda.empty_cache()
         self.pp_comm_group.init_nccl_communicator(device=device)
         self.my_pp_stage = my_pp_stage
+
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, int],
+        gen_parallelism: dict[str, int],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> dict[str, Any]:
+        """Prepare parameter metadata for NCCL reshard refit."""
+        # This is a placeholder implementation.
+        # Implementation should be located in each policy worker implementation.
+        raise NotImplementedError(
+            "prepare_nccl_reshard_refit_info is not implemented for this policy worker"
+        )
+
+    def nccl_reshard_refit(self, kv_scales: Optional[dict[str, float]] = None) -> None:
+        """Transfer policy weights with NCCL reshard refit."""
+        # This is a placeholder implementation.
+        # Implementation should be located in each policy worker implementation.
+        raise NotImplementedError(
+            "nccl_reshard_refit is not implemented for this policy worker"
+        )
 
     def is_alive(self) -> bool:
         """Check if the worker is alive."""

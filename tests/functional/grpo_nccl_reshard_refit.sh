@@ -63,7 +63,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
-    +policy.nccl_reshard_refit=true \
+    policy.generation.refit_transport=nccl_reshard \
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \

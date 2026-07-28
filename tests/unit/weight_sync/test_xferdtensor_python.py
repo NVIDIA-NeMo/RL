@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""User-API tests for the Python xferdtensor implementation.
+"""Tests for the Python xferdtensor implementation.
 
-Only the public contract is covered here: the ``xferdtensor_python_impl``
-signature/exports (which must stay drop-in compatible with the real
-``nccl.m2n.reshard`` dispatch in ``xferdtensor.py``) and the orchestration
-order of the public entry point.  Numerical correctness of the reshard is
-exercised end-to-end by ``tests/functional/grpo_nccl_reshard_refit.sh`` and
-the multi-node refit matrix.
+Covers the ``xferdtensor_python_impl`` signature/exports (which must stay
+drop-in compatible with the real ``nccl.m2n.reshard`` dispatch in
+``xferdtensor.py``), public entry-point orchestration, and pure-CPU geometry
+planning for non-trivial reshard layouts.
 """
 
 import inspect
@@ -26,7 +24,7 @@ from contextlib import nullcontext
 
 import pytest
 import torch
-from torch.distributed._tensor import Replicate
+from torch.distributed._tensor import Replicate, Shard
 
 from nemo_rl.weight_sync import xferdtensor_python as impl
 
@@ -138,3 +136,130 @@ def test_public_api_orchestrates_preflight_split_p2p_and_broadcast(monkeypatch):
         is None
     )
     assert calls == ["validate", "split", "stage", "exchange", "broadcast"]
+
+
+def test_intersect_and_local_slices():
+    assert impl._intersect(((0, 4),), ((2, 6),)) == ((2, 4),)
+    assert impl._intersect(((0, 2),), ((2, 4),)) is None
+    assert impl._local_slices(
+        ((2, 4), (3, 6)),
+        ((1, 5), (2, 8)),
+    ) == (slice(1, 3), slice(1, 4))
+
+
+def test_compute_shard_slices_uses_uneven_torch_chunk_semantics():
+    slices = [
+        impl._compute_shard_slices(
+            global_shape=(10,),
+            mesh_shape=(4,),
+            coordinates=(coordinate,),
+            placements=(Shard(0),),
+        )[0]
+        for coordinate in range(4)
+    ]
+
+    assert slices == [
+        slice(0, 3),
+        slice(3, 6),
+        slice(6, 9),
+        slice(9, 10),
+    ]
+
+
+def test_plan_geometry_tp2_to_tp1_gather():
+    src_regions, dst_regions, destination_groups, transfers = impl._plan_geometry(
+        _Mesh([0, 1], (2,)),
+        (Shard(0),),
+        _Mesh([2], (1,)),
+        (Replicate(),),
+        (8, 4),
+    )
+
+    assert src_regions == {
+        0: ((0, 4), (0, 4)),
+        1: ((4, 8), (0, 4)),
+    }
+    assert dst_regions == {2: ((0, 8), (0, 4))}
+    assert destination_groups == ((((0, 8), (0, 4)), (2,), 2),)
+    assert transfers == (
+        (0, 2, ((0, 4), (0, 4))),
+        (1, 2, ((4, 8), (0, 4))),
+    )
+
+
+def test_plan_geometry_tp1_to_tp2_split():
+    src_regions, dst_regions, destination_groups, transfers = impl._plan_geometry(
+        _Mesh([0], (1,)),
+        (Replicate(),),
+        _Mesh([1, 2], (2,)),
+        (Shard(0),),
+        (8, 4),
+    )
+
+    assert src_regions == {0: ((0, 8), (0, 4))}
+    assert dst_regions == {
+        1: ((0, 4), (0, 4)),
+        2: ((4, 8), (0, 4)),
+    }
+    assert destination_groups == (
+        (((0, 4), (0, 4)), (1,), 1),
+        (((4, 8), (0, 4)), (2,), 2),
+    )
+    assert transfers == (
+        (0, 1, ((0, 4), (0, 4))),
+        (0, 2, ((4, 8), (0, 4))),
+    )
+
+
+def test_plan_geometry_deduplicates_dp_replicas():
+    src_regions, dst_regions, destination_groups, transfers = impl._plan_geometry(
+        _Mesh([0, 1], (2,)),
+        (Shard(0),),
+        _Mesh([2, 3, 4, 5], (2, 2)),
+        (Replicate(), Shard(0)),
+        (8, 4),
+    )
+
+    assert src_regions == {
+        0: ((0, 4), (0, 4)),
+        1: ((4, 8), (0, 4)),
+    }
+    assert dst_regions == {
+        2: ((0, 4), (0, 4)),
+        3: ((4, 8), (0, 4)),
+        4: ((0, 4), (0, 4)),
+        5: ((4, 8), (0, 4)),
+    }
+    assert destination_groups == (
+        (((0, 4), (0, 4)), (2, 4), 2),
+        (((4, 8), (0, 4)), (3, 5), 3),
+    )
+    assert transfers == (
+        (0, 2, ((0, 4), (0, 4))),
+        (1, 3, ((4, 8), (0, 4))),
+    )
+
+
+def test_striped_geometry_distributes_replica_receives():
+    striped = impl._striped_geometry(
+        _Mesh([0, 1], (2,)),
+        (Shard(0),),
+        _Mesh([2, 3, 4, 5], (2, 2)),
+        (Replicate(), Shard(0)),
+        (8, 4),
+    )
+
+    assert striped is not None
+    _src_regions, _dst_regions, _groups, transfers, stripes_by_rank = striped
+    assert transfers == (
+        (0, 2, ((0, 2), (0, 4))),
+        (0, 4, ((2, 4), (0, 4))),
+        (1, 3, ((4, 6), (0, 4))),
+        (1, 5, ((6, 8), (0, 4))),
+    )
+    assert stripes_by_rank == {
+        2: ((0, 2), (0, 4)),
+        4: ((2, 4), (0, 4)),
+        3: ((4, 6), (0, 4)),
+        5: ((6, 8), (0, 4)),
+    }

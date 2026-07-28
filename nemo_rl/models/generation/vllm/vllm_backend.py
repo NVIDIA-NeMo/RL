@@ -1017,8 +1017,9 @@ class VllmInternalWorkerExtension:
             for p in self.nccl_reshard_refit_info["per_layer_params"][layer_name]:
                 stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
 
-        num_streams = min(
-            int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)
+        num_streams = max(
+            1,
+            min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)),
         )
 
         streams = [torch.cuda.Stream() for _ in range(num_streams)]

@@ -536,6 +536,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     megatron_cfg = policy.get("megatron_cfg", {}) or {}
     dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
     vllm_cfg = generation.get("vllm_cfg", {}) or {}
+    vllm_kwargs = generation.get("vllm_kwargs", {}) or {}
 
     violations: list[str] = []
 
@@ -551,6 +552,13 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     if backend != "vllm":
         violations.append(
             f"policy.generation.backend must be 'vllm' (got {backend!r})."
+        )
+
+    if vllm_kwargs.get("enable_eplb"):
+        violations.append(
+            "policy.generation.vllm_kwargs.enable_eplb must be False "
+            "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
+            "dynamic expert load balancing can change ownership afterwards)."
         )
 
     # This initial version supports only the Megatron train + vLLM gen
@@ -799,7 +807,16 @@ def build_nccl_reshard_refit_info(
         dst_mesh, dst_dim_map = dst_expert if expert else dst_non_expert
 
         if use_per_stage:
-            stage = layer_to_pp_stage.get(layer, 0)
+            # Guaranteed non-None when use_per_stage (asserted above); narrow it
+            # here too so the type checker sees it in this separate block.
+            assert layer_to_pp_stage is not None
+            if layer not in layer_to_pp_stage:
+                raise KeyError(
+                    f"nccl_reshard: no PP stage for layer {layer!r}. "
+                    f"An out-of-range layer (e.g. MTP) or a "
+                    f"layer_prefix mismatch reaches here."
+                )
+            stage = layer_to_pp_stage[layer]
             stage_src_mesh, stage_src_dim_map = (
                 per_stage_src_expert[stage]
                 if expert

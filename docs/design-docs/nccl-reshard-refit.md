@@ -18,8 +18,7 @@ from the CLI):
 uv run ./examples/run_grpo.py \
   --config <your_config>.yaml \
   policy.generation.colocated.enabled=false \
-  ... \
-  +policy.nccl_reshard_refit=true
+  policy.generation.refit_transport=nccl_reshard
 ```
 
 At setup, `check_nccl_reshard_refit_support()` validates the configuration and raises a
@@ -38,7 +37,8 @@ single `ValueError` listing every violation. The current requirements are:
   (`fp8_param=true` + blockwise recipe) ↔ FP8 gen (`vllm_cfg.precision=fp8`).
   BF16 train ↔ FP8 gen is not supported yet.
 * vLLM expert parallelism is supported with the NeMo RL convention
-  `expert_parallel_size == tensor_parallel_size`.
+  `expert_parallel_size == tensor_parallel_size`. 
+* Generation-side, PP > 1 is not supported. 
 
 Operational knobs:
 
@@ -57,7 +57,7 @@ nccl-reshard-refit implementation:
 * **Bulk path** — the FFN projection weights (`gate_proj` / `up_proj` / `down_proj`
   `.weight`, dense MLP and MoE experts alike; see `is_nccl_reshard_param()`). These are
   resharded shard-to-shard with `xferdtensor` over dedicated NCCL communicators. For
-  large models this covers the vast majority of the refit bytes.
+  large models this covers the vast majority of the refit bytes. For the current version of implementation, it only detects `(experts).N.{gate_proj|up_proj|down_proj}` as the subject of this performant transportation path. The coverage will be expanded via future updates.
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
   MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). These ride
   a packed broadcast (conventional `packed_tensor.py` implementation) over the shared
@@ -244,3 +244,18 @@ and dispatches to one of two transports:
 
 Both transports honor the `stream` argument so the transfer is ordered with the caller's
 `pre`/`post` staging work on one CUDA stream.
+
+
+## Expected Performance
+
+| Platform | Model | Precision | Train → Gen mapping | XferDTensor fraction | Refit time |
+|--|---|---|---|---:|---:|
+| H100 | QWEN3 4B (dense) | BF16 | DP8 → TP8 | 66.9% | 0.21–0.34s |
+| H100 | QWEN3 30B | BF16 | EP8×PP2 → TP8×DP2 | 95.0% | 0.74–1.00s |
+| H100 | QWEN3 30B | FP8 | EP8×DP2 → TP2×DP8 | 93.0% | 2.90–4.00s |
+| H100 | DSV3 | BF16 | PP16×EP16 → TP32×DP8 | 97.6% | 2.39s-2.83s |
+| H100 | QWEN3.5 397B | BF16 | TP8xPP8xEP32 -> TP16xDP16 | 97.4% | 1.97s-2.17s |
+| GB200 | DSV3 | BF16 | PP16×EP16 → TP32×DP8 | 97.6% | 1.93s-2.59s |
+| GB200 | Nemotron Ultra-v3 | BF16 | TP8xEP32xPP2 -> TP8xDP8 | 93.8% | 2.32s |
+
+The feature supports both dense and MoE models. The table above shows the `XferDTensor fraction`, which is the proportion of the refit payload that utilizes the high-performance `bulk` transfer path. As the model size increases, this fraction becomes higher, which is the key to provide a scalable refit time to large models. For FP8 models, the efficiency is currently lower compared to BF16 models.

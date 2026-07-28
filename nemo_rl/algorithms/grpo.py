@@ -1169,7 +1169,9 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None:
+        elif refit_transport is not None and refit_transport != "nccl_reshard":
+            # nccl_reshard is handled below via nccl_reshard_refit_enabled,
+            # not via checkpoint-engine.
             checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
             assert checkpoint_engine_config is not None
 
@@ -1339,7 +1341,15 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    nccl_reshard_refit_enabled = policy_config.get("nccl_reshard_refit", False)
+    nccl_reshard_refit_enabled = (
+        generation_config.get("refit_transport") == "nccl_reshard"
+    )
+    if nccl_reshard_refit_enabled:
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            check_nccl_reshard_refit_support,
+        )
+
+        check_nccl_reshard_refit_support(master_config)
 
     if generation_config.get("refit_transport") is not None and backend != "vllm":
         raise NotImplementedError(
@@ -1385,12 +1395,6 @@ def setup(
             )
             ray.get(futures_train + futures_inference)
         elif nccl_reshard_refit_enabled:
-            from nemo_rl.weight_sync.nccl_reshard_utils import (
-                check_nccl_reshard_refit_support,
-            )
-
-            check_nccl_reshard_refit_support(master_config)
-
             weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -2589,7 +2593,7 @@ def grpo_train(
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
     nccl_reshard_refit_enabled = (
-        master_config.policy.get("nccl_reshard_refit", False)
+        master_config.policy["generation"].get("refit_transport") == "nccl_reshard"
         and not colocated_inference
     )
 
@@ -3882,7 +3886,7 @@ def async_grpo_train(
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     nccl_reshard_refit_enabled = (
-        master_config.policy.get("nccl_reshard_refit", False)
+        master_config.policy["generation"].get("refit_transport") == "nccl_reshard"
         and not colocated_inference
     )
     # Initialize advantage estimator

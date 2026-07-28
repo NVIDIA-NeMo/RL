@@ -21,6 +21,8 @@ mesh construction, placement rules, expert grouping, and the top-level
 torch.distributed, no model object — so this module runs on CPU with no extras.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.distributed.tensor.placement_types import Replicate, Shard
@@ -30,12 +32,59 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _extract_layer_name,
     build_mesh_info,
     build_nccl_reshard_refit_info,
+    check_nccl_reshard_refit_support,
     get_placements,
     get_tp_shard_dim,
     group_expert_params_in_metadata,
     is_expert_param,
     is_nccl_reshard_param,
 )
+
+
+# --------------------------------------------------------------------------
+# check_nccl_reshard_refit_support
+# --------------------------------------------------------------------------
+def _valid_nccl_reshard_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {},
+            },
+            "megatron_cfg": {"enabled": True},
+            "dtensor_cfg": {"enabled": False},
+        }
+    )
+
+
+def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
+    check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
+
+
+@pytest.mark.parametrize(
+    ("generation_update", "expected_violation"),
+    [
+        (
+            {"colocated": {"enabled": True}},
+            "policy.generation.colocated.enabled must be False",
+        ),
+        (
+            {"backend": "sglang"},
+            "policy.generation.backend must be 'vllm' (got 'sglang')",
+        ),
+    ],
+)
+def test_check_nccl_reshard_refit_support_rejects_invalid_config(
+    generation_update: dict[str, object], expected_violation: str
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"].update(generation_update)
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert expected_violation in str(exc_info.value)
 
 
 # --------------------------------------------------------------------------
