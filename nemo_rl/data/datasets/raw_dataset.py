@@ -65,8 +65,24 @@ class RawDataset:
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
+        media_fields = {
+            key: self.data_config[key]
+            for key in (
+                "num_frames",
+                "use_tiling",
+                "use_dynamic_resolution",
+                "max_num_tiles",
+                "max_num_patches",
+                "video_target_num_patches",
+                "video_temporal_patch_size",
+                "video_maintain_aspect_ratio",
+                "min_generation_tokens",
+            )
+            if key in self.data_config
+        }
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
+            **media_fields,
         )

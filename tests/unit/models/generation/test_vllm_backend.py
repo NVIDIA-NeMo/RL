@@ -182,6 +182,11 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         "empty_cache",
         lambda: call_order.append("empty_cache"),
     )
+    monkeypatch.setattr(
+        vllm_backend.torch.accelerator,
+        "synchronize",
+        lambda: call_order.append("sync"),
+    )
 
     assert ext.update_weights_from_collective() is True
 
@@ -196,7 +201,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
     if with_mtp:
         expected_process_calls.append((draft_model, draft_model_config, ext.device))
         expected_call_order.extend(["config_enter", "process_mtp", "config_exit"])
-    expected_call_order.extend(["kv", "gc", "empty_cache"])
+    expected_call_order.extend(["sync", "kv", "gc", "empty_cache"])
 
     assert process_calls == expected_process_calls
     assert call_order == expected_call_order
@@ -277,6 +282,31 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     assert ext.update_weights_via_ipc_zmq() is False
     assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("reset_mm_cache_after_refit", [True, False])
+def test_internal_refit_honors_multimodal_cache_reset_policy(
+    reset_mm_cache_after_refit,
+):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    extension = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    extension.model_runner = SimpleNamespace(
+        reset_mm_cache=MagicMock(),
+        reset_encoder_cache=MagicMock(),
+    )
+
+    extension._clear_multimodal_caches_after_weight_update(reset_mm_cache_after_refit)
+
+    if reset_mm_cache_after_refit:
+        extension.model_runner.reset_mm_cache.assert_called_once_with()
+        extension.model_runner.reset_encoder_cache.assert_called_once_with()
+    else:
+        extension.model_runner.reset_mm_cache.assert_not_called()
+        extension.model_runner.reset_encoder_cache.assert_not_called()
 
 
 @pytest.mark.vllm

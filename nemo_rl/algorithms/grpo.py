@@ -69,6 +69,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -229,6 +230,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
+    # Positive values cap training steps. -1 disables the step cap so finite
+    # dataloaders stop naturally after max_num_epochs.
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
@@ -282,6 +285,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     malformed_thinking_advantage: float | None = None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: AdvEstimatorConfig = Field(default_factory=AdvEstimatorConfig)
+    # Store one physical multimodal payload per prompt while preserving one
+    # logical payload entry per generated response.
+    deduplicate_multimodal_data: bool = False
 
 
 @dataclass
@@ -318,6 +324,62 @@ def _get_grpo_save_state(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
     return GRPOSaveState(**state_values)
+
+
+def _step_limit_reached(completed_steps: int, max_num_steps: int) -> bool:
+    """Return whether a configured positive GRPO step limit was reached.
+
+    ``max_num_steps=-1`` means unlimited. Training then stops through its
+    natural lifecycle: epoch completion for synchronous GRPO and collector
+    exhaustion for asynchronous GRPO.
+    """
+    return max_num_steps > 0 and completed_steps >= max_num_steps
+
+
+def _resolve_megatron_train_iters(
+    max_num_steps: int,
+    max_num_epochs: int,
+    train_steps_per_epoch: int,
+) -> int:
+    """Return a finite scheduler horizon for Megatron-backed GRPO.
+
+    ``max_num_steps=-1`` disables the GRPO loop's step cap, but Megatron still
+    requires a positive, finite ``train_iters`` value to construct its learning
+    rate scheduler. In that mode the finite dataset/epoch horizon is the
+    scheduler horizon.
+    """
+    dataset_train_iters = max_num_epochs * train_steps_per_epoch
+    if dataset_train_iters <= 0:
+        raise ValueError(
+            "GRPO requires at least one training iteration, got "
+            f"max_num_epochs={max_num_epochs} and "
+            f"train_steps_per_epoch={train_steps_per_epoch}."
+        )
+    if max_num_steps == -1:
+        return dataset_train_iters
+    if max_num_steps <= 0:
+        raise ValueError(
+            "grpo.max_num_steps must be -1 (unlimited) or a positive integer, "
+            f"got {max_num_steps}."
+        )
+    return min(max_num_steps, dataset_train_iters)
+
+
+def _step_progress_label(
+    current_step: int,
+    max_num_steps: int,
+    *,
+    epoch_length: Optional[int] = None,
+) -> str:
+    """Format a step label without presenting ``-1`` as a denominator."""
+    if max_num_steps > 0:
+        denominator = (
+            max_num_steps if epoch_length is None else min(epoch_length, max_num_steps)
+        )
+        return f"{current_step}/{denominator}"
+    if epoch_length is not None:
+        return f"{current_step}/{epoch_length}"
+    return f"{current_step} (unlimited)"
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -938,6 +1000,11 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    if grpo_config.deduplicate_multimodal_data and backend != "vllm":
+        raise ValueError(
+            "grpo.deduplicate_multimodal_data requires "
+            "policy.generation.backend='vllm'."
+        )
     remote_transport = None
     remote_synchronizer_cls = None
     remote_baseline_init_refs: list[Any] = []
@@ -954,9 +1021,10 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
+        total_train_iters = _resolve_megatron_train_iters(
             grpo_config.max_num_steps,
-            grpo_config.max_num_epochs * train_sample_count,
+            grpo_config.max_num_epochs,
+            train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -1139,6 +1207,9 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
+        generation_config["deduplicate_multimodal_data"] = (
+            grpo_config.deduplicate_multimodal_data
+        )
         refit_transport = generation_config.get("refit_transport")
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             # Keep optional remote transport dependencies off the default path.
@@ -1982,11 +2053,43 @@ def _preserve_router_replay_routed_experts(
     if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
         target["routed_experts"] = flat_messages["routed_experts"]
 
+
+def _deduplicate_multimodal_payload(
+    extra_multimodal_data: dict[str, Any],
+    repeated_batch: BatchedDataDict,
+) -> dict[str, Any]:
+    """Deduplicate packed media using one prompt id per logical batch row."""
+    if not extra_multimodal_data:
+        return extra_multimodal_data
+    if "_dedup_prompt_idx" not in repeated_batch:
+        raise RuntimeError(
+            "grpo.deduplicate_multimodal_data=true requires "
+            "_dedup_prompt_idx on the repeated batch."
+        )
+
+    prompt_indices = repeated_batch["_dedup_prompt_idx"]
+    if not torch.is_tensor(prompt_indices):
+        prompt_indices = torch.tensor(prompt_indices, dtype=torch.long)
+    prompt_indices = prompt_indices.to(dtype=torch.long, device="cpu").view(-1)
+    if prompt_indices.shape[0] != repeated_batch.size:
+        raise RuntimeError(
+            "_dedup_prompt_idx must have one entry per logical batch row: "
+            f"got {prompt_indices.shape[0]} for batch size {repeated_batch.size}."
+        )
+
+    for key, value in list(extra_multimodal_data.items()):
+        if isinstance(value, PackedTensor):
+            extra_multimodal_data[key] = value.deduplicate(prompt_indices)
+    return extra_multimodal_data
+
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
     repeated_batch: BatchedDataDict,
     policy_config: PolicyConfig,
+    *,
+    deduplicate_multimodal_data: bool = False,
 ) -> BatchedDataDict[ClippedPGLossDataDict]:
     """Build the async no-TQ policy train batch from flattened rollout messages."""
     train_data = BatchedDataDict[ClippedPGLossDataDict](
@@ -2001,6 +2104,10 @@ def _build_async_grpo_train_data(
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
+    if deduplicate_multimodal_data:
+        extra_multimodal_data = _deduplicate_multimodal_payload(
+            extra_multimodal_data, repeated_batch
+        )
     train_data.update(extra_multimodal_data)
     return train_data
 
@@ -2708,7 +2815,9 @@ def grpo_train(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and total_steps < max_num_steps:
+    while current_epoch < max_num_epochs and not _step_limit_reached(
+        total_steps, max_num_steps
+    ):
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -2725,12 +2834,16 @@ def grpo_train(
 
             if master_config.data["use_multiple_dataloader"]:
                 print(
-                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
+                    f"\n{'=' * 25} Step "
+                    f"{_step_progress_label(current_step + 1, max_num_steps)} "
+                    f"{'=' * 25}",
                     flush=True,
                 )
             else:
                 print(
-                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(wrapped_dataloader), max_num_steps)} {'=' * 25}",
+                    f"\n{'=' * 25} Step "
+                    f"{_step_progress_label(current_step + 1, max_num_steps, epoch_length=len(wrapped_dataloader))} "
+                    f"{'=' * 25}",
                     flush=True,
                 )
 
@@ -2749,6 +2862,12 @@ def grpo_train(
                             master_config.grpo.num_generations_per_prompt
                         )
                     )
+                    if master_config.grpo.deduplicate_multimodal_data:
+                        repeated_batch["_dedup_prompt_idx"] = torch.arange(
+                            batch.size, dtype=torch.long
+                        ).repeat_interleave(
+                            master_config.grpo.num_generations_per_prompt
+                        )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -2963,6 +3082,21 @@ def grpo_train(
                             batch_cache,
                         )
                     )
+                    if master_config.grpo.deduplicate_multimodal_data:
+                        generations_per_prompt = (
+                            master_config.grpo.num_generations_per_prompt
+                        )
+                        if repeated_batch.size % generations_per_prompt != 0:
+                            raise RuntimeError(
+                                "Multimodal deduplication requires complete "
+                                "prompt groups after dynamic sampling: "
+                                f"batch size {repeated_batch.size} is not "
+                                f"divisible by {generations_per_prompt}."
+                            )
+                        repeated_batch["_dedup_prompt_idx"] = torch.arange(
+                            repeated_batch.size // generations_per_prompt,
+                            dtype=torch.long,
+                        ).repeat_interleave(generations_per_prompt)
                     if ds_metrics:
                         ds_metrics["dynamic_sampling_num_gen_batches"] = (
                             dynamic_sampling_num_gen_batches
@@ -3052,6 +3186,10 @@ def grpo_train(
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False
                     )
+                    if master_config.grpo.deduplicate_multimodal_data:
+                        extra_multimodal_data = _deduplicate_multimodal_payload(
+                            extra_multimodal_data, repeated_batch
+                        )
                     train_data.update(extra_multimodal_data)
                     # Router replay (R3) on the legacy data_plane.enabled=false
                     # driver path: routed_experts already rides flat_messages
@@ -3217,7 +3355,7 @@ def grpo_train(
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 
-                is_last_step = total_steps + 1 >= max_num_steps
+                is_last_step = _step_limit_reached(total_steps + 1, max_num_steps)
                 if not master_config.data["use_multiple_dataloader"]:
                     is_last_step = is_last_step or (
                         (current_epoch + 1 == max_num_epochs)
@@ -3643,7 +3781,7 @@ def grpo_train(
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if total_steps >= max_num_steps:
+            if _step_limit_reached(total_steps, max_num_steps):
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
@@ -3937,6 +4075,9 @@ def async_grpo_train(
 
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils.trajectory_collector import (
+        ASYNC_COLLECTOR_EPOCHS_COMPLETED_KEY,
+    )
 
     timer = Timer(context={"worker": "driver"})
     training_wall_start = time.perf_counter()
@@ -4094,20 +4235,21 @@ def async_grpo_train(
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         next_nemo_gym_task_index=next_nemo_gym_task_index,
+        epochs_completed=int(
+            (rollouts_state or {}).get(ASYNC_COLLECTOR_EPOCHS_COMPLETED_KEY, 0)
+        ),
     )
-
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
+    # The initial non-colocated refit must finish before rollout requests can
+    # reach the generation workers. Otherwise the collector can capture
+    # trajectories while the dummy-loaded vLLM model is only partially refit.
     print("⏳ Preparing policy generation for training...", flush=True)
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...", flush=True)
@@ -4124,7 +4266,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            return
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4135,7 +4277,11 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            return
+            raise
+
+    collection_task = trajectory_collector.start_collection.remote(dataloader)
+
+    print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -4208,6 +4354,7 @@ def async_grpo_train(
     )
     timer.start("init/total")
     wait_iterations = 0
+    max_num_steps = master_config.grpo.max_num_steps
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
         current_step_ready = ray.get(
@@ -4229,8 +4376,9 @@ def async_grpo_train(
             # the collector advances to targets starting at `step + 2`, leaving
             # `step + 1` permanently missing. Wait for the initial collector,
             # whose range includes both steps, to complete the lookahead first.
-            max_num_steps = master_config.grpo.max_num_steps
-            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
+            need_lookahead = max_trajectory_age_steps > 0 and not _step_limit_reached(
+                step + 1, max_num_steps
+            )
             if need_lookahead:
                 next_step_ready = ray.get(
                     replay_buffer.has_complete_batch.remote(
@@ -4285,11 +4433,13 @@ def async_grpo_train(
 
     # Main training loop
     try:
-        while step < master_config.grpo.max_num_steps:
+        while not _step_limit_reached(step, max_num_steps):
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
             print(
-                f"\n{'=' * 25} Step {step + 1}/{master_config.grpo.max_num_steps} {'=' * 25}"
+                f"\n{'=' * 25} Step "
+                f"{_step_progress_label(step + 1, max_num_steps)} "
+                f"{'=' * 25}"
             )
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
@@ -4367,20 +4517,23 @@ def async_grpo_train(
                         collector_status = ray.get(
                             trajectory_collector.get_status.remote()
                         )
-                        if (
-                            (
-                                collector_status["data_exhausted"]
-                                or collector_status.get("errored", False)
-                            )
-                            and not collector_status["running"]
+                        collector_stopped = (
+                            not collector_status["running"]
                             and collector_status["inflight_workers"] == 0
-                        ):
+                        )
+                        if collector_status.get("errored", False) and collector_stopped:
                             raise RuntimeError(
-                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
-                                f"The dataset ran out of data before training could complete. "
-                                f"Collector status: {collector_status}. "
-                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                                "Trajectory collector failed at "
+                                f"training_step={step}. Collector status: "
+                                f"{collector_status}."
                             )
+                        if collector_status["data_exhausted"] and collector_stopped:
+                            print(
+                                "🏁 Trajectory collection exhausted all configured "
+                                f"epochs and cannot form another full batch; ending "
+                                f"training naturally after {step} steps."
+                            )
+                            break
 
                         with timer.time("idle/buffer_starvation"):
                             time.sleep(0.5)
@@ -4397,6 +4550,17 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+                    if master_config.grpo.deduplicate_multimodal_data:
+                        # Each replay entry is a prompt group. Build a global
+                        # prompt mapping after concatenation; per-group mappings
+                        # are local and cannot be concatenated directly.
+                        prompt_group_sizes = torch.tensor(
+                            [batch.size for batch in per_prompt_batches],
+                            dtype=torch.long,
+                        )
+                        repeated_batch["_dedup_prompt_idx"] = torch.arange(
+                            len(per_prompt_batches), dtype=torch.long
+                        ).repeat_interleave(prompt_group_sizes)
 
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
@@ -4510,6 +4674,9 @@ def async_grpo_train(
                         input_lengths,
                         repeated_batch,
                         master_config.policy,
+                        deduplicate_multimodal_data=(
+                            master_config.grpo.deduplicate_multimodal_data
+                        ),
                     )
                     train_data.to("cpu")
 
@@ -4646,6 +4813,7 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
+                is_last_step = _step_limit_reached(step + 1, max_num_steps)
                 if NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
@@ -4674,7 +4842,8 @@ def async_grpo_train(
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        if not is_last_step:
+                            trajectory_collector.resume_after_refit.remote()
 
                     timer.stop("idle/refit_bubble")
 
@@ -4684,7 +4853,6 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config.grpo.max_num_steps
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (
@@ -4734,8 +4902,9 @@ def async_grpo_train(
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                        if early_stop_message is None:
-                            # Resume trajectory collection after validation
+                        # Resume only when another optimizer step will consume
+                        # trajectories and validation did not trigger an early stop.
+                        if early_stop_message is None and not is_last_step:
                             trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -5077,7 +5246,7 @@ def async_grpo_train(
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if step >= master_config.grpo.max_num_steps:
+            if _step_limit_reached(step, max_num_steps):
                 checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -5090,6 +5259,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         # Finalize any pending async checkpoint before tearing down workers.

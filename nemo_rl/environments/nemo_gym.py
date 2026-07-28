@@ -11,31 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
+import json
 import math
 import os
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from urllib.parse import unquote, urlparse
 
+import numpy as np
 import ray
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoConfig, PreTrainedTokenizerBase
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     encode_images_in_examples,
+    extract_multimodal_model_inputs,
     get_dim_to_pack_along,
     get_multimodal_keys_from_processor,
     resolve_to_image,
     uses_image_placeholder,
 )
-
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -192,6 +198,909 @@ def _detect_invalid_tool_call_and_malformed_thinking(
 ########################################
 # Multimodal helpers
 ########################################
+
+
+_VIDEO_CONTENT_TYPES = {"input_video", "video", "video_url"}
+_IMAGE_CONTENT_TYPES = {"input_image", "image", "image_url"}
+_AUDIO_CONTENT_TYPES = {"input_audio", "audio", "audio_url"}
+
+
+def _get_content_part_url(part: dict[str, Any], *keys: str) -> str:
+    """Return a string media source from a Responses/Chat content part."""
+    for key in keys:
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("path")
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _resolve_local_video_path(source: str) -> str:
+    """Resolve a local video source and reject unsupported remote schemes."""
+    parsed = urlparse(source)
+    if parsed.scheme == "file":
+        source = unquote(parsed.path)
+    elif parsed.scheme:
+        raise ValueError(
+            "NeMo RL Gym video training currently supports local paths and "
+            f"file:// URLs; received scheme {parsed.scheme!r}."
+        )
+
+    path = Path(source).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"Gym video paths must be absolute, got {source!r}.")
+    if not path.is_file():
+        raise FileNotFoundError(f"Gym video file does not exist: {path}")
+    if not os.access(path, os.R_OK):
+        raise PermissionError(f"Gym video file is not readable: {path}")
+    return str(path.resolve())
+
+
+def _extract_static_video_messages(
+    nemo_gym_example: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None] | None:
+    """Convert one-video Responses input into HF multimodal chat messages.
+
+    A video may be represented either by one native video content part or by a
+    sequence of cached ``input_image`` parts carrying ``_is_video_frame``.  The
+    latter is the on-disk frame-cache format used by the video Gym recipes.
+    """
+    response_input = nemo_gym_example.get("responses_create_params", {}).get(
+        "input", []
+    )
+    if isinstance(response_input, str):
+        return None
+
+    video_sources: list[str] = []
+    cached_frame_sources: list[str] = []
+    has_still_images = False
+    hf_messages: list[dict[str, Any]] = []
+    for item in response_input:
+        if not isinstance(item, dict) or "role" not in item:
+            continue
+        content = item.get("content", "")
+        if isinstance(content, str):
+            hf_messages.append({"role": item["role"], "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+
+        hf_content: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "input_text":
+                hf_content.append({"type": "text", "text": part["text"]})
+            elif part_type in _VIDEO_CONTENT_TYPES:
+                source = _get_content_part_url(part, "video_url", "video", "url")
+                if not source:
+                    raise ValueError(f"{part_type} requires a non-empty video URL")
+                video_sources.append(source)
+                hf_content.append({"type": "video", "video": source})
+            elif part_type in _IMAGE_CONTENT_TYPES:
+                if not part.get("_is_video_frame"):
+                    has_still_images = True
+                    continue
+                source = _get_content_part_url(part, "image_url", "image", "url")
+                if not source:
+                    raise ValueError(
+                        "Cached Gym video frames require a non-empty image URL."
+                    )
+                cached_frame_sources.append(str(part.get("_video_source") or ""))
+                hf_content.append(
+                    {
+                        "type": "image",
+                        "image": resolve_to_image(source),
+                        "_is_video_frame": True,
+                        "_video_source": part.get("_video_source"),
+                        "_video_frame_index": part.get("_video_frame_index"),
+                        "_video_fps": part.get("_video_fps"),
+                    }
+                )
+            elif part_type in _AUDIO_CONTENT_TYPES:
+                raise ValueError(
+                    "The initial Gym video contract does not support audio or "
+                    "audio+video inputs."
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported Gym multimodal content type: {part_type!r}"
+                )
+        hf_messages.append({"role": item["role"], "content": hf_content})
+
+    if not video_sources and not cached_frame_sources:
+        return None
+    if has_still_images:
+        raise ValueError(
+            "Gym video training does not support mixing still images and "
+            "video frames in one row."
+        )
+    if video_sources and cached_frame_sources:
+        raise ValueError(
+            "Gym video training does not support mixing native video and "
+            "predecoded video frames in one row."
+        )
+    if len(video_sources) != 1:
+        if video_sources:
+            raise ValueError(
+                "Gym video training requires exactly one video per row; "
+                f"received {len(video_sources)}."
+            )
+        frame_groups = {source for source in cached_frame_sources if source}
+        if len(frame_groups) > 1:
+            raise ValueError(
+                "Gym video training requires cached frames from exactly one "
+                f"video per row; received {len(frame_groups)} sources."
+            )
+        return hf_messages, None
+    return hf_messages, _resolve_local_video_path(video_sources[0])
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _metadata_extra_body(nemo_gym_example: dict[str, Any]) -> dict[str, Any]:
+    metadata = nemo_gym_example.get("responses_create_params", {}).get("metadata", {})
+    if not isinstance(metadata, dict):
+        return {}
+    return _json_mapping(metadata.get("extra_body", {}))
+
+
+def _chat_template_kwargs_for_processor(
+    nemo_gym_example: dict[str, Any],
+) -> dict[str, Any]:
+    extra_body = _metadata_extra_body(nemo_gym_example)
+    processor_kwargs: dict[str, Any] = {}
+    chat_template_kwargs = _json_mapping(extra_body.get("chat_template_kwargs", {}))
+    if chat_template_kwargs:
+        processor_kwargs["chat_template_kwargs"] = chat_template_kwargs
+    enable_thinking = extra_body.get(
+        "enable_thinking", chat_template_kwargs.get("enable_thinking")
+    )
+    if enable_thinking is not None:
+        processor_kwargs["enable_thinking"] = enable_thinking
+    return processor_kwargs
+
+
+def _deep_merge_dict(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _inject_vllm_mm_processor_kwargs(
+    nemo_gym_example: dict[str, Any],
+    mm_processor_kwargs: dict[str, Any],
+) -> None:
+    params = nemo_gym_example.setdefault("responses_create_params", {})
+    if not isinstance(params, dict):
+        raise TypeError("responses_create_params must be a dict")
+    metadata = params.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        raise TypeError("responses_create_params.metadata must be a dict")
+
+    original_extra_body = metadata.get("extra_body", "{}")
+    extra_body = _json_mapping(original_extra_body)
+    extra_body = _deep_merge_dict(
+        extra_body, {"mm_processor_kwargs": mm_processor_kwargs}
+    )
+    metadata["extra_body"] = (
+        json.dumps(extra_body) if isinstance(original_extra_body, str) else extra_body
+    )
+
+
+def _remove_vllm_mm_processor_kwargs(
+    nemo_gym_example: dict[str, Any], names: set[str]
+) -> None:
+    params = nemo_gym_example.get("responses_create_params", {})
+    if not isinstance(params, dict):
+        return
+    metadata = params.get("metadata", {})
+    if not isinstance(metadata, dict) or "extra_body" not in metadata:
+        return
+
+    original_extra_body = metadata["extra_body"]
+    extra_body = _json_mapping(original_extra_body)
+    mm_processor_kwargs = extra_body.get("mm_processor_kwargs")
+    if not isinstance(mm_processor_kwargs, dict):
+        return
+    for name in names:
+        mm_processor_kwargs.pop(name, None)
+    if not mm_processor_kwargs:
+        extra_body.pop("mm_processor_kwargs", None)
+    metadata["extra_body"] = (
+        json.dumps(extra_body) if isinstance(original_extra_body, str) else extra_body
+    )
+
+
+def _replace_cached_video_frames_with_native_video(
+    nemo_gym_example: dict[str, Any],
+) -> None:
+    """Replace cached image parts with one lossless native-video manifest."""
+    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    if not isinstance(input_items, list):
+        raise TypeError("responses_create_params.input must be a list")
+
+    frame_paths = []
+    video_sources = set()
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or not part.get("_is_video_frame"):
+                continue
+            frame_path = _get_content_part_url(part, "image_url", "image", "url")
+            if not frame_path:
+                raise ValueError(
+                    "Cached Gym video frames require a non-empty image URL."
+                )
+            frame_paths.append(frame_path)
+            video_source = part.get("_video_source")
+            if video_source:
+                video_sources.add(str(video_source))
+
+    if not frame_paths:
+        raise ValueError("Cached Gym video request contains no frame paths.")
+    if len(video_sources) != 1:
+        raise ValueError(
+            "Cached Gym video frames require exactly one non-empty _video_source; "
+            f"received {len(video_sources)}."
+        )
+
+    from nemo_rl.models.generation.vllm.utils import (
+        build_cached_video_frame_data_url,
+    )
+
+    video_url = build_cached_video_frame_data_url(frame_paths)
+    inserted_video = False
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        converted_content = []
+        for part in content:
+            if isinstance(part, dict) and part.get("_is_video_frame"):
+                if not inserted_video:
+                    converted_content.append(
+                        {
+                            "type": "input_video",
+                            "video_url": {"url": video_url},
+                        }
+                    )
+                    inserted_video = True
+                continue
+            converted_content.append(part)
+        item["content"] = converted_content
+
+    if not inserted_video:
+        raise ValueError("Failed to insert cached Gym video manifest.")
+
+
+def _ensure_vllm_video_placeholder_target(
+    nemo_gym_example: dict[str, Any],
+) -> None:
+    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    if not isinstance(input_items, list):
+        return
+
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", "")
+        if isinstance(content, str) and "<video>" in content:
+            return
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, str) and "<video>" in part:
+                    return
+                if (
+                    isinstance(part, dict)
+                    and isinstance(part.get("text"), str)
+                    and "<video>" in part["text"]
+                ):
+                    return
+
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content", "")
+        if isinstance(content, str):
+            item["content"] = f"<video>\n{content}" if content else "<video>"
+            return
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") in ("input_text", "text")
+                and isinstance(part.get("text", ""), str)
+            ):
+                text = part.get("text", "")
+                part["text"] = f"<video>\n{text}" if text else "<video>"
+                return
+        content.append({"type": "input_text", "text": "<video>"})
+        return
+
+
+def _strip_local_media_metadata(nemo_gym_example: dict[str, Any]) -> None:
+    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    if not isinstance(input_items, list):
+        return
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            for key in list(part):
+                if key.startswith("_"):
+                    part.pop(key)
+
+
+def _compute_dynamic_prompt_length(
+    processor: Any,
+    messages: list[dict[str, Any]],
+    template_kwargs: dict[str, Any],
+) -> int | None:
+    try:
+        rendered = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+        if not isinstance(rendered, str):
+            return None
+        tokenized = processor.tokenizer(
+            rendered.replace("<image>", ""),
+            add_special_tokens=False,
+        )
+        input_ids = getattr(tokenized, "input_ids", None)
+        if input_ids is None and isinstance(tokenized, dict):
+            input_ids = tokenized.get("input_ids")
+        return len(input_ids) if input_ids is not None else None
+    except Exception as exc:
+        print(
+            "WARNING: failed to compute dynamic video prompt length: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return None
+
+
+def _video_to_image_content(
+    video_path: str,
+    *,
+    num_frames: int,
+    temporal_patch_size: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from nemo_rl.models.generation.vllm.utils import (
+        load_video_frames_with_metadata,
+    )
+
+    frames, metadata = load_video_frames_with_metadata(
+        video_path,
+        num_frames=num_frames,
+        temporal_patch_size=temporal_patch_size,
+    )
+    frame_indices = list((metadata or {}).get("frames_indices", []))
+    fps = float((metadata or {}).get("fps") or 0.0)
+    items = []
+    for frame_idx, frame in enumerate(frames):
+        image = Image.fromarray(frame).convert("RGB")
+        sampled_frame_idx = (
+            int(frame_indices[frame_idx])
+            if frame_idx < len(frame_indices)
+            else frame_idx
+        )
+        items.append(
+            {
+                "type": "image",
+                "image": image,
+                "_is_video_frame": True,
+                "_video_source": video_path,
+                "_video_frame_index": sampled_frame_idx,
+                "_video_fps": fps,
+            }
+        )
+    return items, metadata
+
+
+_NEMOTRON_VIDEO_PROCESSOR_NAMES = frozenset(
+    {
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    }
+)
+
+
+def _required_config_value(config: Any, name: str) -> Any:
+    if isinstance(config, dict):
+        if name not in config:
+            raise ValueError(f"Nemotron video config is missing {name!r}.")
+        return config[name]
+    if not hasattr(config, name):
+        raise ValueError(f"Nemotron video config is missing {name!r}.")
+    return getattr(config, name)
+
+
+@lru_cache(maxsize=8)
+def _load_nemotron_video_model_config(model_name: str) -> Any:
+    return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+
+def _nemotron_video_target_resolution(
+    *,
+    original_width: int,
+    original_height: int,
+    target_num_patches: int,
+    patch_size: int,
+    downsample_ratio: float,
+    maintain_aspect_ratio: bool,
+) -> tuple[int, int]:
+    """Return the SFT/vLLM-compatible ``(width, height)`` for a video frame."""
+    if target_num_patches <= 0:
+        raise ValueError("video_target_num_patches must be positive.")
+    if patch_size <= 0:
+        raise ValueError("Nemotron patch_size must be positive.")
+    if not 0 < downsample_ratio <= 1:
+        raise ValueError(
+            f"Nemotron downsample_ratio must be in (0, 1], got {downsample_ratio}."
+        )
+
+    if maintain_aspect_ratio:
+        aspect_ratio = original_width / max(original_height, 1)
+        patch_height = round(math.sqrt(target_num_patches / aspect_ratio))
+        patch_width = round(math.sqrt(target_num_patches * aspect_ratio))
+    else:
+        side = math.isqrt(target_num_patches)
+        patch_height = patch_width = side
+
+    patch_height = max(1, patch_height)
+    patch_width = max(1, patch_width)
+    required_divisor = int(round(1 / downsample_ratio))
+    if required_divisor > 1:
+        height_remainder = patch_height % required_divisor
+        width_remainder = patch_width % required_divisor
+        height_up = patch_height + (
+            required_divisor - height_remainder if height_remainder else 0
+        )
+        width_up = patch_width + (
+            required_divisor - width_remainder if width_remainder else 0
+        )
+        height_down = patch_height - height_remainder
+        width_down = patch_width - width_remainder
+        if height_up * width_up <= target_num_patches:
+            patch_height, patch_width = height_up, width_up
+        else:
+            patch_height = max(required_divisor, height_down)
+            patch_width = max(required_divisor, width_down)
+
+    return patch_width * patch_size, patch_height * patch_size
+
+
+def _flatten_nemotron_video_frame_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+    """Replace locally decoded frame items with ordered ``<image>`` markers."""
+    flattened_messages = []
+    frames = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            flattened_messages.append(message)
+            continue
+
+        flattened_parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                flattened_parts.append(str(part))
+                continue
+            part_type = part.get("type")
+            if part_type in ("image", "image_url") and part.get("_is_video_frame"):
+                image = part.get("image")
+                if not isinstance(image, Image.Image):
+                    raise ValueError(
+                        "Nemotron video frames must be decoded PIL images, "
+                        f"got {type(image).__name__}."
+                    )
+                frames.append(image)
+                flattened_parts.append("<image>")
+            elif part_type == "text":
+                flattened_parts.append(str(part.get("text", "")))
+            elif part_type in ("image", "image_url"):
+                raise ValueError(
+                    "Nemotron Gym video preprocessing does not support mixing "
+                    "still images with video frames."
+                )
+        flattened_messages.append(
+            {
+                **message,
+                "content": "\n".join(part for part in flattened_parts if part),
+            }
+        )
+    return flattened_messages, frames
+
+
+def _render_nemotron_video_prompt(
+    processor: Any,
+    messages: list[dict[str, Any]],
+    template_kwargs: dict[str, Any],
+) -> str:
+    render_kwargs = copy.deepcopy(template_kwargs)
+    nested_template_kwargs = render_kwargs.pop("chat_template_kwargs", {})
+    if isinstance(nested_template_kwargs, dict):
+        for name, value in nested_template_kwargs.items():
+            render_kwargs.setdefault(name, value)
+    rendered = processor.tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **render_kwargs,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError(
+            "Nemotron tokenizer.apply_chat_template must return a string when "
+            f"tokenize=False, got {type(rendered).__name__}."
+        )
+    return rendered
+
+
+def _expand_nemotron_video_placeholders(
+    rendered_text: str,
+    *,
+    embeddings_per_tubelet: list[int],
+    temporal_patch_size: int,
+) -> str:
+    """Expand primary tubelet frames and retain secondary frames as bare tokens.
+
+    The current Megatron-Bridge model consumes only image tokens inside
+    ``<img>...</img>`` wrappers. vLLM-authored Nemotron prompts retain a bare
+    ``<image>`` for secondary frames in each temporal tubelet, so reproducing
+    that shape here keeps the pre-rollout datum compatible with the native
+    expanded-sequence path. The rollout manager later replaces these provisional
+    token IDs with the exact token IDs returned by vLLM.
+    """
+    if temporal_patch_size < 1:
+        raise ValueError("video_temporal_patch_size must be at least 1.")
+    parts = rendered_text.split("<image>")
+    frame_count = len(parts) - 1
+    expected_tubelets = math.ceil(frame_count / temporal_patch_size)
+    if len(embeddings_per_tubelet) != expected_tubelets:
+        raise ValueError(
+            "Rendered Nemotron video prompt/frame mismatch: "
+            f"found {frame_count} <image> markers for "
+            f"{len(embeddings_per_tubelet)} tubelets; expected "
+            f"{expected_tubelets} tubelets with temporal patch size "
+            f"{temporal_patch_size}."
+        )
+
+    expanded = parts[0]
+    for frame_index, suffix in enumerate(parts[1:]):
+        if frame_index % temporal_patch_size == 0:
+            tubelet_index = frame_index // temporal_patch_size
+            replacement = (
+                "<img>" + "<image>" * embeddings_per_tubelet[tubelet_index] + "</img>"
+            )
+        else:
+            replacement = "<image>"
+        expanded += replacement + suffix
+    return expanded
+
+
+def _process_nemotron_video_frames(
+    processor: Any,
+    messages: list[dict[str, Any]],
+    *,
+    template_kwargs: dict[str, Any],
+    temporal_patch_size: int,
+    target_num_patches: int,
+    maintain_aspect_ratio: bool,
+) -> dict[str, torch.Tensor]:
+    """Port the source branch's dynamic video-frame preprocessing contract."""
+    model_name = getattr(processor.tokenizer, "name_or_path", None)
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError(
+            "Nemotron video preprocessing requires tokenizer.name_or_path."
+        )
+    model_config = _load_nemotron_video_model_config(model_name)
+    patch_size = int(_required_config_value(model_config, "patch_size"))
+    downsample_ratio = float(_required_config_value(model_config, "downsample_ratio"))
+    norm_mean = torch.tensor(
+        _required_config_value(model_config, "norm_mean"), dtype=torch.float32
+    ).view(3, 1, 1)
+    norm_std = torch.tensor(
+        _required_config_value(model_config, "norm_std"), dtype=torch.float32
+    ).view(3, 1, 1)
+
+    flattened_messages, frames = _flatten_nemotron_video_frame_messages(messages)
+    if not frames:
+        raise ValueError("Nemotron video preprocessing received no decoded frames.")
+
+    rendered_text = _render_nemotron_video_prompt(
+        processor, flattened_messages, template_kwargs
+    )
+    pixel_values = []
+    image_sizes = []
+    embeddings_per_frame = []
+    for frame in frames:
+        target_width, target_height = _nemotron_video_target_resolution(
+            original_width=frame.width,
+            original_height=frame.height,
+            target_num_patches=target_num_patches,
+            patch_size=patch_size,
+            downsample_ratio=downsample_ratio,
+            maintain_aspect_ratio=maintain_aspect_ratio,
+        )
+        frame_array = np.array(
+            frame.convert("RGB") if frame.mode != "RGB" else frame,
+            dtype=np.uint8,
+            copy=True,
+        )
+        frame_tensor = torch.from_numpy(frame_array).permute(2, 0, 1).unsqueeze(0)
+        if frame_tensor.shape[-2:] != (target_height, target_width):
+            frame_tensor = F.interpolate(
+                frame_tensor,
+                size=(target_height, target_width),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        normalized = frame_tensor.squeeze(0) / 255.0
+        normalized = (normalized - norm_mean) / norm_std
+        pixel_values.append(normalized.contiguous())
+        image_sizes.append([target_height, target_width])
+        embeddings_per_frame.append(
+            int((target_height // patch_size) * downsample_ratio)
+            * int((target_width // patch_size) * downsample_ratio)
+        )
+
+    if len(set(map(tuple, image_sizes))) != 1:
+        raise ValueError(
+            "All frames from one Nemotron Gym video must resolve to the same "
+            f"target size, got {sorted(set(map(tuple, image_sizes)))}."
+        )
+    embeddings_per_tubelet = [
+        embeddings_per_frame[frame_index]
+        for frame_index in range(0, len(frames), temporal_patch_size)
+    ]
+    expanded_text = _expand_nemotron_video_placeholders(
+        rendered_text,
+        embeddings_per_tubelet=embeddings_per_tubelet,
+        temporal_patch_size=temporal_patch_size,
+    )
+    text_inputs = processor.tokenizer(
+        expanded_text,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+    return {
+        **dict(text_inputs),
+        "pixel_values": torch.stack(pixel_values),
+        "imgs_sizes": torch.tensor(image_sizes, dtype=torch.int32),
+    }
+
+
+def _make_overlength_filtered_video_example(
+    nemo_gym_example: dict[str, Any],
+) -> dict[str, Any]:
+    filtered = copy.deepcopy(nemo_gym_example)
+    params = filtered.setdefault("responses_create_params", {})
+    params["input"] = [
+        {
+            "role": "user",
+            "type": "message",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "This sample was filtered because its prompt is too long.",
+                }
+            ],
+        }
+    ]
+    return filtered
+
+
+def nemo_gym_example_to_video_datum_spec(
+    nemo_gym_example: dict[str, Any],
+    *,
+    processor: Any,
+    max_seq_length: int | None,
+    idx: int,
+    task_name: str,
+    data_config: Any | None = None,
+) -> dict[str, Any] | None:
+    """Preprocess static Gym video with vLLM-equivalent frame sampling.
+
+    The raw video remains in the outbound Gym request. Cached frames are sent as
+    one native-video manifest so vLLM consumes the same lossless RGB frames as
+    policy preprocessing. Those tensors are reattached to vLLM-authored prompt
+    token IDs after the rollout.
+    """
+    extracted = _extract_static_video_messages(nemo_gym_example)
+    if extracted is None:
+        return None
+    hf_messages, video_path = extracted
+
+    num_frames = int(getattr(data_config, "num_frames", 8))
+    temporal_patch_size = int(getattr(data_config, "video_temporal_patch_size", 1))
+    if video_path is not None:
+        frame_items, _video_metadata = _video_to_image_content(
+            video_path,
+            num_frames=num_frames,
+            temporal_patch_size=temporal_patch_size,
+        )
+        for message in hf_messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            expanded_content = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "video":
+                    expanded_content.extend(frame_items)
+                else:
+                    expanded_content.append(part)
+            message["content"] = expanded_content
+    else:
+        frame_items = [
+            part
+            for message in hf_messages
+            for part in message.get("content", [])
+            if isinstance(part, dict)
+            and part.get("type") in ("image", "image_url")
+            and part.get("_is_video_frame")
+        ]
+        if not frame_items:
+            raise ValueError("Cached Gym video preprocessing received no frames.")
+
+    template_kwargs = _chat_template_kwargs_for_processor(nemo_gym_example)
+    video_target_num_patches = getattr(data_config, "video_target_num_patches", None)
+    maintain_aspect_ratio = bool(
+        getattr(data_config, "video_maintain_aspect_ratio", True)
+    )
+    if type(processor).__name__ in _NEMOTRON_VIDEO_PROCESSOR_NAMES:
+        if video_target_num_patches is None:
+            raise ValueError(
+                "Nemotron Gym video data requires video_target_num_patches."
+            )
+        processed = _process_nemotron_video_frames(
+            processor,
+            hf_messages,
+            template_kwargs=template_kwargs,
+            temporal_patch_size=temporal_patch_size,
+            target_num_patches=int(video_target_num_patches),
+            maintain_aspect_ratio=maintain_aspect_ratio,
+        )
+    else:
+        processor_kwargs: dict[str, Any] = {
+            "video_flags": [True] * len(frame_items),
+            "video_temporal_patch_size": temporal_patch_size,
+            "video_maintain_aspect_ratio": maintain_aspect_ratio,
+        }
+        if video_target_num_patches is not None:
+            processor_kwargs["video_target_num_patches"] = video_target_num_patches
+        if max_seq_length is not None:
+            prompt_length = _compute_dynamic_prompt_length(
+                processor, hf_messages, template_kwargs
+            )
+            if prompt_length is not None:
+                processor_kwargs["num_tokens_available"] = (
+                    max_seq_length
+                    - prompt_length
+                    - int(getattr(data_config, "min_generation_tokens", 2000))
+                )
+        processed = dict(
+            processor.apply_chat_template(
+                hf_messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+                **template_kwargs,
+                **processor_kwargs,
+            )
+        )
+    user_message: dict[str, Any] = {
+        "role": "user",
+        "content": "",
+        "token_ids": processed["input_ids"][0],
+    }
+    if "imgs_sizes" in processed and "num_frames" not in processed:
+        processed["num_frames"] = torch.tensor([len(frame_items)], dtype=torch.int32)
+    user_message.update(extract_multimodal_model_inputs(processor, processed))
+    if "num_frames" in processed:
+        user_message["num_frames"] = PackedTensor(
+            processed["num_frames"].to(dtype=torch.int32),
+            dim_to_pack=get_dim_to_pack_along(processor, "num_frames"),
+        )
+
+    length = len(user_message["token_ids"])
+    loss_multiplier = 1.0
+    extra_env_info = copy.deepcopy(nemo_gym_example)
+    is_nemotron_video = type(processor).__name__ in _NEMOTRON_VIDEO_PROCESSOR_NAMES
+    if is_nemotron_video and video_path is None:
+        _replace_cached_video_frames_with_native_video(extra_env_info)
+    _strip_local_media_metadata(extra_env_info)
+    _ensure_vllm_video_placeholder_target(extra_env_info)
+    # vLLM 0.20's native Nano-Nemotron processor consumes the video modality
+    # directly and reads its temporal/dynamic-resolution settings from the
+    # checkpoint config. Its constructor rejects the legacy
+    # ``video_as_images`` kwarg. Keep that compatibility path only for
+    # processors that still expect frame-as-image grouping.
+    if is_nemotron_video:
+        _remove_vllm_mm_processor_kwargs(
+            extra_env_info, {"max_num_tiles", "video_as_images"}
+        )
+    else:
+        mm_processor_kwargs: dict[str, Any] = {"video_as_images": True}
+        if video_target_num_patches is not None:
+            mm_processor_kwargs["max_num_tiles"] = 1
+        _inject_vllm_mm_processor_kwargs(extra_env_info, mm_processor_kwargs)
+
+    if max_seq_length is not None and length >= max_seq_length:
+        for key, value in list(user_message.items()):
+            if isinstance(value, PackedTensor):
+                user_message[key] = PackedTensor.empty_like(value)
+        user_message["token_ids"] = user_message["token_ids"][: min(4, max_seq_length)]
+        length = len(user_message["token_ids"])
+        loss_multiplier = 0.0
+        extra_env_info = _make_overlength_filtered_video_example(nemo_gym_example)
+
+    return {
+        "message_log": [user_message],
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": task_name,
+    }
+
+
+def reattach_static_multimodal_payload(
+    target_message_log: list[dict[str, Any]],
+    source_message_log: list[dict[str, Any]] | None,
+) -> None:
+    """Attach driver-side PackedTensor payloads to the first rollout user turn."""
+    if not source_message_log:
+        return
+    payload = {
+        key: value
+        for message in source_message_log
+        for key, value in message.items()
+        if isinstance(value, PackedTensor)
+    }
+    if not payload:
+        return
+    for message in target_message_log:
+        if message.get("role") == "user":
+            message.update(payload)
+            return
+    raise ValueError(
+        "Cannot attach the static multimodal payload: Gym returned no user message."
+    )
 
 
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:

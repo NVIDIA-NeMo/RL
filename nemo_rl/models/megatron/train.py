@@ -55,6 +55,7 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.multimodal import prepare_multimodal_data
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
     set_router_replay_backward,
@@ -81,6 +82,8 @@ def model_forward(
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    input_ids: Optional[torch.Tensor] = None,
+    use_llava_handoff: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -97,6 +100,10 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        input_ids: Full unsharded token ids used by LLaVA to rebuild its
+            multimodal embedding sequence before applying token parallelism.
+        use_llava_handoff: Convert generation-format multimodal tensors to the
+            keyword arguments accepted by ``LLaVAModel.forward``.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -116,17 +123,36 @@ def model_forward(
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
 
-    if defer_fp32_logits:
+    llava_model = use_llava_handoff
+    if defer_fp32_logits and not llava_model:
         additional_kwargs["fp32_output"] = False
     if use_fused_linear_logprobs:
+        if llava_model:
+            raise NotImplementedError(
+                "Fused linear logprob computation is not supported by the "
+                "LLaVA video handoff."
+            )
         additional_kwargs["labels"] = input_ids_cp_sharded
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
+    model_input_ids = (
+        input_ids
+        if use_llava_handoff and input_ids is not None
+        else input_ids_cp_sharded
+    )
+    if use_llava_handoff:
+        prepare_multimodal_data(
+            multimodal_data,
+            model,
+            input_ids_cp_sharded.device,
+            input_ids=model_input_ids,
+        )
+
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
-            input_ids=input_ids_cp_sharded,
+            input_ids=model_input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             **additional_kwargs,
@@ -204,6 +230,7 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    use_llava_handoff = processed_mb.use_llava_handoff
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -227,6 +254,8 @@ def forward_with_post_processing_fn(
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                input_ids=input_ids,
+                use_llava_handoff=use_llava_handoff,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -236,11 +265,23 @@ def forward_with_post_processing_fn(
             clear_router_replay(model)
         raise
 
+    if isinstance(output_tensor, tuple):
+        output_tensor = output_tensor[0]
+
     if use_router_replay:
         if router_replay_train:
             set_router_replay_backward(model)
         else:
             clear_router_replay(model)
+
+    # LLaVA emits logits in the re-expanded token space. Restore the original
+    # generation-format token targets only after the model consumes collapsed
+    # ids so logprob and loss positions remain aligned.
+    if processed_mb.original_input_ids is not None:
+        data_dict["input_ids"] = processed_mb.original_input_ids
+        input_ids = processed_mb.original_input_ids
+        if processed_mb.original_input_lengths is not None:
+            data_dict["input_lengths"] = processed_mb.original_input_lengths
 
     if capture is not None:
         from megatron.core.transformer.multi_token_prediction import roll_tensor

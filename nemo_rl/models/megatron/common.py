@@ -32,6 +32,29 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
     )
 
 
+def _vlm_sp_repad_collapsed(
+    input_ids: torch.Tensor,
+    tokens_removed_per_sample: Optional[torch.Tensor],
+    divisor: int,
+) -> torch.Tensor:
+    """Pad collapsed VLM tokens so their LLaVA-expanded width is shardable."""
+    if tokens_removed_per_sample is None or divisor <= 1:
+        return input_ids
+
+    max_removed = int(tokens_removed_per_sample.max().item())
+    collapsed_width = input_ids.shape[1]
+    required_width = (
+        _round_up_to_multiple(collapsed_width + max_removed, divisor) - max_removed
+    )
+    if required_width > collapsed_width:
+        input_ids = torch.nn.functional.pad(
+            input_ids,
+            (0, required_width - collapsed_width),
+            value=0,
+        )
+    return input_ids
+
+
 def broadcast_tensor(
     tensor: torch.Tensor | None, src_rank: int, group: dist.ProcessGroup
 ) -> torch.Tensor:

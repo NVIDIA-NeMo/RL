@@ -43,11 +43,13 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    should_reset_mm_cache_after_refit,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+    register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_data_parallel_local_rank,
@@ -802,6 +804,8 @@ class BaseVllmGenerationWorker:
 
 class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        register_torchcodec_vllm_video_loader()
+
         import vllm
 
         self.llm = vllm.LLM(**llm_kwargs)
@@ -1146,6 +1150,17 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    def _invalidate_mm_cache_after_refit(self) -> None:
+        """Reset engine-level multimodal caches after a weight update."""
+        if self.llm is None or not should_reset_mm_cache_after_refit(self.cfg):
+            return
+        if hasattr(self.llm, "reset_mm_cache"):
+            self.llm.reset_mm_cache()
+        if hasattr(self.llm, "llm_engine") and hasattr(
+            self.llm.llm_engine, "reset_encoder_cache"
+        ):
+            self.llm.llm_engine.reset_encoder_cache()
+
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
@@ -1161,7 +1176,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=tuple(),
+                args=(should_reset_mm_cache_after_refit(self.cfg),),
             )
             worker_results = cast(list[bool], result_or_coro)
 
@@ -1170,6 +1185,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            self._invalidate_mm_cache_after_refit()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1192,7 +1208,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(should_reset_mm_cache_after_refit(self.cfg),),
             )
             worker_results = cast(list[bool], result_or_coro)
 
@@ -1201,6 +1218,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            self._invalidate_mm_cache_after_refit()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
