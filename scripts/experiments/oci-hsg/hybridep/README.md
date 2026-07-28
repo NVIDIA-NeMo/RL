@@ -53,6 +53,29 @@ scripts/experiments/oci-hsg/hybridep/submit_grpo.sh \
   scripts/experiments/oci-hsg/hybridep/models/nemotron3-super-120ba12b-32n4g-async-1off.env
 ```
 
+The synchronous Super A/B uses two explicit recipes so the YAML file is the
+only dispatcher-control surface. The baseline preserves the existing
+recipe-native `alltoall` dispatcher:
+
+```bash
+DISPATCHER_MODE=recipe \
+WANDB_ENABLED=False \
+NEMO_RL_HYBRIDEP_LOG_PACKING=0 \
+scripts/experiments/oci-hsg/hybridep/submit_grpo.sh \
+  scripts/experiments/oci-hsg/hybridep/models/nemotron3-super-120ba12b-32n4g-sync.env
+```
+
+The paired HybridEP profile selects the inherited sync recipe that changes
+only the dispatcher type, backend, and SM count:
+
+```bash
+DISPATCHER_MODE=recipe \
+WANDB_ENABLED=False \
+NEMO_RL_HYBRIDEP_LOG_PACKING=0 \
+scripts/experiments/oci-hsg/hybridep/submit_grpo.sh \
+  scripts/experiments/oci-hsg/hybridep/models/nemotron3-super-120ba12b-32n4g-sync-hybridep.env
+```
+
 The launcher selects the highest current user-level FairShare account. Set
 `ACCOUNT` only to override that choice. Set `WANDB_ENABLED=True` to enable W&B;
 the launcher requires `WANDB_API_KEY` in the environment and never writes its
