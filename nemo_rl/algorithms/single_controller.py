@@ -659,6 +659,9 @@ class SingleControllerActor:
             rewards=rewards,
             mask=mask,
             repeated_batch=repeated_batch,
+            # Real validity (token-capture placeholders carry sample_mask 0)
+            # instead of the hardwired all-ones — § 9.1, advantage_estimator.
+            valid_mask=sample_mask,
             **kwargs,
         )
         self._step_log_dict["masked_advantages"].append(

@@ -276,6 +276,37 @@ def setup_single_controller(
             "data.use_multiple_dataloader=True yet."
         )
 
+    # Token capture: validate the MVP matrix loudly at setup (§ 6, § 10) and
+    # give capture-enabled vLLM workers a venv that carries nemo_gym (the
+    # worker hosts Gym's capture core + adapter in-process).
+    token_capture_cfg = master_config.token_capture
+    if token_capture_cfg.enabled:
+        if not _should_use_nemo_gym(master_config):
+            raise ValueError(
+                "token_capture.enabled requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true) — the gate lives in Gym's "
+                "policy model server"
+            )
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "token_capture.enabled supports the vllm backend only; got "
+                f"{generation_config['backend']!r}"
+            )
+        if not generation_config["vllm_cfg"]["async_engine"]:
+            raise ValueError(
+                "token_capture.enabled requires "
+                "policy.generation.vllm_cfg.async_engine=true (the capture "
+                "host is the worker's in-process HTTP server)"
+            )
+        from nemo_rl.distributed.ray_actor_environment_registry import (
+            ACTOR_ENVIRONMENT_REGISTRY,
+        )
+        from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+        ACTOR_ENVIRONMENT_REGISTRY[
+            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+        ] = PY_EXECUTABLES.VLLM_GYM
+
     set_seed(grpo_config["seed"])
 
     # ==========================
@@ -342,6 +373,12 @@ def setup_single_controller(
             env_configs=master_config.env,
             base_urls=generation.dp_openai_server_base_urls,
             model_name=generation_config["model_name"],
+            # Gate config rides into Gym's policy model server (§ 9.1).
+            token_capture=(
+                master_config.token_capture.model_dump()
+                if master_config.token_capture.enabled
+                else None
+            ),
         )
 
     # ==========================
@@ -376,6 +413,25 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize"],
         )
+        # Host Gym's capture core in every vLLM DP leader (in-worker DP
+        # client + TQTokenSink + the single install_capture call), and give
+        # workers the initial weight version to stamp on captured calls.
+        try:
+            generation.setup_token_capture(dp_cfg, token_capture_cfg.staging_partition)
+        except Exception as error:
+            if "No module named 'nemo_gym'" in str(error):
+                # Worker venvs are cached by actor class name
+                # (nemo_rl/utils/venvs.py), so a venv prebuilt before token
+                # capture predates the nemo_gym extra and is reused as-is.
+                raise RuntimeError(
+                    "token_capture.enabled requires nemo_gym inside the vLLM "
+                    "worker venv, but the cached worker venv predates it. "
+                    "Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
+                    "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
+                    "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
+                ) from error
+            raise
+        generation.set_rollout_weight_version(0)
 
     backend = generation_config["backend"]
     weight_synchronizer = create_weight_synchronizer(
@@ -403,6 +459,18 @@ def setup_single_controller(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
     )
+    finalizer = None
+    if token_capture_cfg.enabled:
+        from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer
+
+        finalizer = BlackboxFinalizer(
+            dp_client,
+            partition_id=partition_id,
+            staging_partition=token_capture_cfg.staging_partition,
+            pad_token_id=pad_id,
+            mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
+            min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         env_handles=env_handles,
@@ -413,6 +481,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         tq_buffer=tq_buffer,
+        finalizer=finalizer,
     )
 
     return SingleControllerBundle(

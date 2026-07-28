@@ -80,6 +80,17 @@ class NemoGymConfig(TypedDict):
     thinking_tags: NotRequired[
         List[str] | None
     ]  # Thinking tags to check for malformed usage
+    # Gate-authoritative token capture (token_capture.enabled): the dumped
+    # TokenCaptureConfig. Turns on the gate in Gym's policy model server,
+    # switches run_rollouts to receipt mode, and adds the register/seal/fail
+    # control-plane helpers. None/absent = legacy token-echo path.
+    token_capture: NotRequired[Dict[str, Any] | None]
+
+
+# Gym control-plane server name (the model server hosting the gate) and the
+# metadata key rollout ids ride on (defined in Gym's token_id_capture.gate).
+_POLICY_SERVER_NAME = "policy_model"
+_NG_ROLLOUT_ID_METADATA_KEY = "ng_rollout_id"
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -235,6 +246,35 @@ Depending on your data shape, you may want to change these values."""
             "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
         )
 
+        # Gate-authoritative token capture: turn on the gate in the policy
+        # model server (via the policy_model global-config override block the
+        # env yamls already use) and disable the legacy token echo. Receipt
+        # mode is incompatible with re-dispatching a batch under the same
+        # rollout ids, so the NaN retry must be exactly 1 (create-only
+        # registration would fail the retry loudly anyway; fail at setup).
+        token_capture = self.cfg.get("token_capture") or None
+        self._token_capture_enabled = bool(
+            token_capture and token_capture.get("enabled")
+        )
+        self._server_client = None
+        if self._token_capture_enabled:
+            if self.rollout_max_attempts_to_avoid_lp_nan != 1:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
+                    "would re-register create-only rollout ids at the gate"
+                )
+            policy_overrides = (
+                initial_global_config_dict.setdefault("policy_model", {})
+                .setdefault("responses_api_models", {})
+                .setdefault("vllm_model", {})
+            )
+            policy_overrides["return_token_id_information"] = False
+            policy_overrides["token_capture_gate"] = {
+                "enabled": True,
+                "registration_ttl_s": token_capture["registration_ttl_s"],
+            }
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -252,6 +292,51 @@ Depending on your data shape, you may want to change these values."""
         )
         self.rch = RolloutCollectionHelper()
 
+    # ── gate control plane (token-capture mode) ─────────────────────────────
+
+    def _control_client(self):
+        """Gym ServerClient resolving servers by name from the head server."""
+        if self._server_client is None:
+            from nemo_gym.server_utils import ServerClient
+
+            self._server_client = ServerClient.load_from_global_config(
+                self.head_server_config
+            )
+        return self._server_client
+
+    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+        response = await self._control_client().request(
+            server_name=_POLICY_SERVER_NAME, url_path=path, method=method, **kwargs
+        )
+        if response.status != 200:
+            raise RuntimeError(
+                f"gate control call {method} {path} failed: "
+                f"HTTP {response.status} {await response.text()}"
+            )
+        return await response.json()
+
+    async def register_rollouts(self, rollout_ids: list[str]) -> None:
+        """Create-only registration before dispatch (§ 3.1)."""
+        for rollout_id in rollout_ids:
+            await self._control("PUT", f"/ng-control/rollouts/{rollout_id}")
+
+    async def fail_rollouts(self, rollout_ids: list[str], *, reason: str) -> None:
+        """Best-effort gate cleanup for a cancelled/failed dispatch (§ 7)."""
+        for rollout_id in rollout_ids:
+            try:
+                await self._control(
+                    "POST",
+                    f"/ng-control/rollouts/{rollout_id}/fail",
+                    json={"reason": reason},
+                )
+            except (RuntimeError, OSError) as error:
+                # The registration TTL is the backstop when the gate is
+                # unreachable during teardown.
+                print(f"fail_rollout({rollout_id}) failed: {error}", flush=True)
+
+    async def gate_metrics(self) -> dict:
+        return await self._control("GET", "/ng-control/metrics")
+
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
@@ -259,6 +344,17 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
     ) -> list[dict]:
         timer = Timer()
+
+        if self._token_capture_enabled:
+            # Receipt mode: register the gate-registered ids riding each
+            # row's metadata before dispatch; seal at completion.
+            rollout_ids = [
+                example["responses_create_params"]["metadata"][
+                    _NG_ROLLOUT_ID_METADATA_KEY
+                ]
+                for example in nemo_gym_examples
+            ]
+            await self.register_rollouts(rollout_ids)
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
@@ -275,9 +371,14 @@ Depending on your data shape, you may want to change these values."""
                     nemo_gym_row, nemo_gym_result = await task
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
+                    if self._token_capture_enabled:
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_result, tokenizer
+                        )
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
@@ -315,6 +416,42 @@ Depending on your data shape, you may want to change these values."""
         )
 
         return nemo_rl_results, timing_metrics
+
+    async def _postprocess_receipt_mode(
+        self, nemo_gym_row: dict, nemo_gym_result: dict
+    ) -> dict:
+        """Seal the rollout and return a token-free result (§ 9.1).
+
+        The legacy token walk (and its contiguity assert) does not run: the
+        gate owns lineage now, output items carry no token arrays, and the
+        canonical row is rebuilt by the finalizer from staged deltas. The
+        Ray return carries only the receipt (~100 B/call) beside the
+        agent-level result.
+        """
+        assert isinstance(nemo_gym_result, dict), (
+            f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
+        )
+        rollout_id = nemo_gym_row["responses_create_params"]["metadata"][
+            _NG_ROLLOUT_ID_METADATA_KEY
+        ]
+        try:
+            receipt = await self._control(
+                "POST",
+                f"/ng-control/rollouts/{rollout_id}/seal",
+                json={"reward": float(nemo_gym_result.get("reward") or 0.0)},
+            )
+        except (RuntimeError, OSError) as error:
+            # An unsealable rollout finalizes as a placeholder; the gate's
+            # registration TTL sweeps its state.
+            print(f"seal({rollout_id}) failed: {error}", flush=True)
+            receipt = None
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": nemo_gym_result,
+            "rollout_id": rollout_id,
+            "receipt": receipt,
+        }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
@@ -454,6 +591,7 @@ def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
     base_urls: list[Optional[str]],
     model_name: str,
+    token_capture: Optional[dict[str, Any]] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -485,6 +623,7 @@ def spinup_nemo_gym_actor(
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         initial_global_config_dict=nemo_gym_dict,
+        token_capture=token_capture,
     )
 
     nemo_gym_opts: dict[str, Any] = {}

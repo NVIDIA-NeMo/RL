@@ -202,6 +202,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
+        # In-flight captured calls keyed by id(request): (ActiveCall, the
+        # exact engine prompt ids recorded at preprocess time).
+        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
 
         super().__init__(
             config,
@@ -473,8 +476,62 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         """Rotate the weight version stamped on subsequent captured calls."""
         self._rollout_weight_version = int(version)
 
+    def _begin_request_capture(self, request: Any, prompt_token_ids: list[int]) -> None:
+        """Admit one gate-forwarded call into the capture layer.
+
+        Called from preprocess_chat once the exact engine prompt is known
+        (post-splice in token-in mode, full render in text mode). No-op
+        unless capture is installed and the request carries the gate's
+        ``ng_capture`` context.
+        """
+        capture = self.token_capture
+        context = getattr(request, "ng_capture", None)
+        if capture is None or not context:
+            return
+        call = capture.begin_call(
+            rollout_id=context["rollout_id"],
+            call_id=context["call_id"],
+            parent_call_id=context.get("parent_call_id"),
+            prev_len=int(context.get("prev_len") or 0),
+            mode=context.get("mode") or "text",
+            stream=bool(getattr(request, "stream", False)),
+        )
+        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+
+    def _finish_request_capture(self, request: Any, content: dict) -> dict:
+        """Stage the finished call and ride its coords on the response.
+
+        Fail-closed (§ 3.5): the sink write happens inside complete_call —
+        the coords exist only after the bytes are durable, and any capture
+        failure degrades to capture_failed coords without breaking the
+        completion. Token ids and logprobs are stripped: the staged delta is
+        the only token store on this path, so the worker->gate hop carries
+        text + delta ids + coords only (§ 3.2).
+        """
+        state = self._capture_calls.pop(id(request), None)
+        if state is None:
+            return content
+        call, prompt_token_ids = state
+        payload = dict(content)
+        # vLLM's OpenAI response carries no prompt ids; the adapter reads the
+        # preprocess-time engine prompt off the payload (see
+        # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
+        payload["prompt_token_ids"] = prompt_token_ids
+        coords = self.token_capture.complete_call_from_response(call, payload)
+        for choice in content.get("choices") or []:
+            choice.pop("logprobs", None)
+        content["ng_commit_coords"] = coords.model_dump()
+        return content
+
+    def _abort_request_capture(self, request: Any, *, reason: str) -> None:
+        """Drop the in-flight capture state for a request that errored."""
+        state = self._capture_calls.pop(id(request), None)
+        if state is not None and self.token_capture is not None:
+            self.token_capture.fail_call(state[0], reason=reason)
+
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
+        worker_self = self
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
@@ -645,6 +702,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             actual_request_max_tokens,
                             res[1][0]["prompt_token_ids"],
                         )
+                    # Token capture, text mode: the full render is the exact
+                    # engine prompt.
+                    worker_self._begin_request_capture(
+                        request, res[1][0]["prompt_token_ids"]
+                    )
                     return res
 
                 last_assistant_message_idx = None
@@ -702,6 +764,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         final_prompt_token_ids,
                     )
 
+                # Token capture, token-in mode: the spliced prompt is the
+                # exact engine prompt.
+                worker_self._begin_request_capture(request, final_prompt_token_ids)
+
                 return res
 
         ########################################
@@ -713,6 +779,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            # Gate-authoritative token capture: the call identity the gate
+            # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
+            ng_capture: Optional[dict[str, Any]] = None
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
@@ -782,6 +851,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
+                worker_self._abort_request_capture(request, reason="context_length")
                 return JSONResponse(
                     content={
                         "error": {
@@ -792,15 +862,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     },
                     status_code=400,
                 )
+            except BaseException:
+                worker_self._abort_request_capture(request, reason="engine_error")
+                raise
 
             if isinstance(generator, ErrorResponse):
+                worker_self._abort_request_capture(request, reason="error_response")
                 return JSONResponse(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(content=generator.model_dump())
+                content = generator.model_dump()
+                # Token capture: stage the delta and ride the coords on the
+                # response; strips logprobs/ids (no-op when capture is off).
+                content = worker_self._finish_request_capture(request, content)
+                return JSONResponse(content=content)
 
+            worker_self._abort_request_capture(request, reason="streaming_response")
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
         ########################################

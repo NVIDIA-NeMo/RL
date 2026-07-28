@@ -351,6 +351,29 @@ async_rl:
   # False: enforces per-weight-version dispatch quota.
   over_sampling: true
 
+# Gate-authoritative token capture (token-in/token-out via NeMo-Gym; see
+# docs/design-docs/tq-gym-gate-authoritative.md). Dormant by default: with
+# enabled=false every legacy codepath behaves exactly as before. Requires the
+# NeMo-Gym rollout path (env.should_use_nemo_gym=true) with the async vLLM
+# backend; defaults live on TokenCaptureConfig
+# (nemo_rl/algorithms/single_controller_utils/config.py).
+token_capture:
+  enabled: false
+  # TQ partition holding per-call staged token deltas (finalizer-cleared).
+  staging_partition: "rollout_staging"
+  # continue: a failed worker-side stage poisons the rollout (placeholder row);
+  # abort: fails the whole rollout at the gate.
+  on_capture_failure: "continue"
+  # allow: train groups whose calls span a refit (staleness = group's oldest
+  # call version); reject: placeholder such rollouts.
+  mixed_weight_version_policy: "allow"
+  # Drop the whole group when fewer than this fraction of its rollouts
+  # produced valid rows (null keeps every group).
+  min_valid_fraction_per_group: null
+  # Gate-side cleanup backstops (seconds).
+  registration_ttl_s: 3600.0
+  staging_ttl_s: 3600.0
+
 cluster:
   gpus_per_node: 2
   num_nodes: 1

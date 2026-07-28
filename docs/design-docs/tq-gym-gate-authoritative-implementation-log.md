@@ -285,7 +285,87 @@ receipts through `run_rollouts`, and the finalizer.
 
 ## S4 — receipts, finalizer, SC integration
 
-Status: not started (blocked on S3 sign-off)
+Status: **complete (2026-07-28) — code, unit tests, and live capture-enabled
+gate evidence (below) all green; awaiting user sign-off at the combined
+S2–S4 gate.** (S3 sign-off pending — the user asked to "Finish S4"; S2–S4
+are presented together at the gate.)
+
+All NeMo-RL-side; no Gym fork changes in this stage.
+
+| Item | Status | Notes |
+|---|---|---|
+| `nemo_rl/experience/blackbox_finalizer.py` (new) | done | orchestration only: `finalize_rollout` — receipt → `TQTokenSource.fetch` by manifest keys → § 5 verification (digest recompute over fetched float32 values, mask ∈ {0,1}, finite logprobs, `prev_len + delta_len == cum_len`, weight-version tag equality) → Gym `linearize(main_chain_only, terminal_hint)`; `finalize_group` — always N rows (`{group_id}_g{i}` == the gate-registered rollout ids), placeholders (`sample_mask=0`, `prompt_ids_for_adv` from a valid sibling), `group_min_wv`/`group_max_wv` (fallback wv for all-placeholder groups), `min_valid_fraction_per_group` group drop, `mixed_weight_version_policy` allow/reject, publish via `pack_payload` → `put_samples`, then clear the group's staged rows (finalizer is the staging partition's only reader) |
+| worker request path (`vllm_worker_async.py`) | done | the S2/S3 pairing: `_begin_request_capture` at `preprocess_chat` (both render paths — post-splice ids in token-in mode, full render in text mode), `_finish_request_capture` in the chat endpoint (stage → coords ride `ng_commit_coords`; logprobs stripped so the worker→gate hop is token-light § 3.2), `_abort_request_capture` on every endpoint error path; `ng_capture` field on `NeMoRLChatCompletionRequest` |
+| `environments/nemo_gym.py` | done | `token_capture` on `NemoGymConfig`; `_spinup` injects the gate config through the `policy_model.responses_api_models.vllm_model` global-config override block (`token_capture_gate.enabled=true`, `return_token_id_information=false`) and **hard-errors unless `rollout_max_attempts_to_avoid_lp_nan == 1`** (NaN-retry would re-register create-only ids); control-plane helpers (`register_rollouts`/`fail_rollouts`/`gate_metrics` + seal) via Gym's `ServerClient` resolving the `policy_model` server by name; receipt-mode `run_rollouts` registers before dispatch, seals per completed row, and returns token-free results (the legacy token walk + contiguity assert never runs — the gate owns that guarantee) |
+| `experience/rollout_manager.py` | done | capture dispatch `_generate_and_finalize`: mints `{group_id}_g{i}` (sample ids == rollout ids), reserves the slot with them, threads them into row `metadata.ng_rollout_id`, finalizes via `asyncio.to_thread`, commits via `commit_finalized`; failure path aborts the slot **and** best-effort-fails the gate registrations; receipt-mode `Completion` (token-free; receipt in `env_extras`); receipt-derived token metrics; receipts excluded from the wandb table |
+| `algorithms/advantage_estimator.py` + SC | done | `GRPOAdvantageEstimator.compute_advantage(valid_mask=...)` replaces the hardwired `torch.ones_like` in `calculate_baseline_and_std_per_prompt`; the SC advantage pump passes `sample_mask` (validity folded, no new train field); other estimators absorb the kwarg |
+| `single_controller_utils/setup.py` | done | MVP-matrix validation (requires NeMo-Gym path + vllm + async engine, loud `ValueError`/`NotImplementedError`); `VLLM_GYM` registry override for `VllmAsyncGenerationWorker` **before** generation builds; `setup_token_capture` + `set_rollout_weight_version(0)` fan-outs after partition pre-registration; `BlackboxFinalizer` built and threaded into `RolloutManager`; gate config into `spinup_nemo_gym_actor` |
+| exemplar YAML | done | documented `token_capture` block in `examples/configs/grpo_math_1B_single_controller.yaml` (defaults live on `TokenCaptureConfig`); config-validation suite green |
+| pyrefly | done | `blackbox_finalizer.py` added to `project-includes`; no new errors |
+
+### Tests (all green)
+
+- `tests/unit/data_plane/test_blackbox_finalizer.py` — 5 tests vs a **live TQ
+  simple backend**: the S1 worked-example golden row reproduces byte-exact
+  through staging + finalize; the rejection matrix (missing receipt,
+  poisoned, empty manifest, identity mismatch, missing rows, digest
+  corruption); mixed-wv allow/reject; N-row publish with sibling-prompt
+  placeholder + staging cleanup; `min_valid_fraction_per_group` drop.
+- `tests/unit/models/generation/test_vllm_token_capture_hosting.py` — +4
+  request-path tests (10 total): begin→finish round trip (stage before
+  coords, logprobs stripped, state drained), token-in `prev_len` chaining,
+  no-op off the capture path, abort semantics.
+- `tests/unit/experience/test_rollout_manager.py` — +3 receipt-mode tests
+  (13 total): id minting/threading end-to-end, `commit_finalized` carry,
+  dropped-group abort, failed-dispatch abort + gate `fail_rollouts`.
+- `tests/unit/algorithms/test_advantage_validity.py` — 2 tests: invalid rows
+  excluded from the per-prompt baseline; `None` keeps legacy behavior.
+- Flag-off regression: `tests/unit/single_controller/` +
+  `tests/unit/experience/` + `test_config_validation.py`: **522 passed**
+  (same two pre-existing branch-HEAD failures excluded, documented at S1).
+
+### Deviations / disclosures (for S4 sign-off)
+
+1. **Finalizer runs in the dispatch task** via `asyncio.to_thread` (design's
+   MVP placement); finalize latency rides the rollout dispatch, not the
+   train pump.
+2. **Gate config injection** uses the `policy_model` global-config override
+   block (the mechanism env yamls already use) instead of new
+   `global_config.py` keys — no Gym-side config change needed.
+3. **Legacy test fixtures updated**: `_make_manager`/hand-built managers in
+   `test_rollout_manager.py` gained the new `_finalizer`/`_env_handles`
+   attributes (the legacy `run_rollout` impl call stays byte-identical —
+   verified by the pre-existing flow tests).
+4. **`gate_metrics` control endpoint** is exposed via the NemoGym actor but
+   not yet logged per train step (receipt-derived rollout metrics +
+   `finalize/*` metrics land in `rollout_metrics`); wiring
+   `token_in_rate` into the SC logger is S5 work with the § 8 metrics pass.
+5. **`commit_finalized` staging_keys are empty** by design: the finalizer
+   clears staged rows right after publish, so eviction has nothing extra to
+   clear (the design's staging-aware `remove` remains for abnormal paths).
+
+### Gate evidence (2-GPU capture-enabled run)
+
+- `grpo_async_gym_single_controller.sh ++token_capture.enabled=true`
+  (2026-07-28, dev node, 2×H100, 10 steps): **PASS** — both metric checks
+  green: `median(gen_kl_error)`=0.0375 < 1.3 (statistically identical to
+  the flag-off S3-pin run's 0.038 — the gate→worker→TQ→finalizer path
+  reproduces legacy token fidelity), `max(reward)`=0.5 > 0. Every train
+  step ran with `global_valid_seqs=8.0` — all rows finalizer-verified
+  valid, zero placeholder rows trained.
+- Observed failure-path exercise (loud, handled, § 7 semantics): 3 of the
+  ~40 dispatched groups were cancelled by the SC mid-flight; their agents'
+  in-flight calls then hit the gate after `fail_rollouts` dropped the
+  create-only registrations → `UnknownRolloutError` from
+  `gate.prepare_call` → HTTP 500 to the (already-dead) rollout, and one
+  group's late `seal` correctly got 404 and was absorbed by the
+  `seal(...) failed` warning path. No leaks into training: none of these
+  groups produced rows, and all trained steps were full-valid.
+- Environment caveat (unchanged from S1): first attempt failed on the
+  node's stale prebaked `/opt/ray_venvs` (vllm 0.17.1/Ray 2.54.0 vs the
+  lock's 0.20.0/2.55.1 → `ModuleNotFoundError:
+  vllm.entrypoints.serve.render`); the recorded PASS is the rerun with
+  `NRL_FORCE_REBUILD_VENVS=true`.
 
 ## S5 — verification
 

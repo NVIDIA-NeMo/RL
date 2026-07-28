@@ -171,3 +171,142 @@ def test_generation_set_rollout_weight_version_fans_out():
         version=7,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
+
+
+# ---------------------------------------------------------------------------
+# S4: the request-path hookup (begin -> finish/abort around a served call)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRequest(SimpleNamespace):
+    pass
+
+
+def _worker_with_capture(sink: _MemorySink):
+    from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+
+    worker = _fake_worker()
+    worker._capture_calls = {}
+    worker.token_capture = RolloutTokenCapture(
+        sink=sink,
+        weight_version_fn=lambda: worker._rollout_weight_version,
+        adapter=VLLMCaptureAdapter(),
+    )
+    return worker
+
+
+def _served_content(gen_ids, logprobs):
+    return {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "x"},
+                "logprobs": {
+                    "content": [
+                        {"token": f"token_id:{t}", "logprob": lp}
+                        for t, lp in zip(gen_ids, logprobs)
+                    ]
+                },
+            }
+        ]
+    }
+
+
+def test_request_capture_round_trip_stages_and_rides_coords():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    content = _served_content([13, 14], [-0.1, -0.2])
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+    # Bytes were staged before the coords existed (fail-closed ordering).
+    assert len(sink.records) == 1
+    assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
+    coords = content["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
+    # Logprobs never transit worker -> gate; state map is drained.
+    assert (
+        "logprobs" not in content["choices"][0]
+        or content["choices"][0]["logprobs"] is None
+    )
+    assert worker._capture_calls == {}
+
+
+def test_request_capture_token_in_prev_len_chains():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "call_id": "c2",
+            "parent_call_id": "c1",
+            "prev_len": 3,
+            "mode": "token_in",
+        },
+        stream=False,
+    )
+    spliced_prompt = [10, 11, 12, 20, 21]  # exact prefix + fresh suffix
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, spliced_prompt
+    )
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([22], [-0.5])
+    )
+    coords = content["ng_commit_coords"]
+    assert coords["parent_call_id"] == "c1"
+    assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
+    assert sink.records[0].token_ids_delta == [20, 21, 22]
+
+
+def test_request_capture_is_a_noop_without_context_or_capture():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    plain = _FakeRequest(stream=False)  # no ng_capture attribute
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, plain, [1, 2])
+    content = {
+        "choices": [{"message": {"role": "assistant"}, "logprobs": {"content": []}}]
+    }
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, plain, dict(content)
+    )
+    assert "ng_commit_coords" not in out
+    assert out["choices"][0]["logprobs"] is not None  # untouched off the capture path
+    assert sink.records == []
+
+
+def test_request_capture_abort_fails_the_call_and_drains_state():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
+    VllmAsyncGenerationWorkerImpl._abort_request_capture(
+        worker, request, reason="engine_error"
+    )
+    assert worker._capture_calls == {}
+    assert sink.records == []
+    # A late finish after abort is a no-op (state already drained).
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([3], [-0.1])
+    )
+    assert "ng_commit_coords" not in out
