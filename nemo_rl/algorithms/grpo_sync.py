@@ -658,11 +658,6 @@ def grpo_train_sync(
                         )
                     )
 
-                    if not _should_log_nemo_gym_responses(master_config):
-                        for key in list(rollout_metrics):
-                            if "full_result" in key:
-                                rollout_metrics.pop(key)
-
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )

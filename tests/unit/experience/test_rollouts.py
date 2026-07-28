@@ -24,6 +24,7 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
+import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -37,14 +38,15 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 from nemo_rl.experience.rollouts import (
     generate_responses_async,
     run_async_multi_turn_rollout,
+    run_async_multi_turn_rollout_groups,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -887,17 +889,592 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
 
     # stop_strings is truthy so the function hits the next assert and exits
     # right after emitting the warning — keeps this test free of any rollout work.
+    async def _consume_rollout():
+        async for _ in run_async_nemo_gym_rollout(
+            policy_generation=_FakePolicyGeneration(),
+            input_batch={"extra_env_info": []},
+            tokenizer=None,
+            task_to_env={},
+            generation_config={"stop_strings": "x", "max_new_tokens": 50},
+            num_generations=1,
+            log_full_result_tables=False,
+            max_seq_len=200,
+            max_rollout_turns=None,
+        ):
+            pass
+
     with pytest.warns(UserWarning, match="greater than the"):
         with pytest.raises(AssertionError, match="Stop strings"):
-            run_async_nemo_gym_rollout(
-                policy_generation=_FakePolicyGeneration(),
-                input_batch={"extra_env_info": []},
-                tokenizer=None,
-                task_to_env={},
-                generation_config={"stop_strings": "x", "max_new_tokens": 50},
-                max_seq_len=200,
-                max_rollout_turns=None,
+            asyncio.run(_consume_rollout())
+
+
+def test_native_rollout_groups_match_whole_batch(monkeypatch):
+    """One native batch can be split without changing data or metric semantics."""
+
+    async def fake_sample_rollout(sample_idx, initial_sample_state, **kwargs):
+        del kwargs
+        final_state = {
+            "message_log": initial_sample_state["message_log"]
+            + [{"role": "assistant", "content": f"answer-{sample_idx}"}],
+            "extra_env_info": initial_sample_state["extra_env_info"],
+            "task_name": initial_sample_state["task_name"],
+            "total_reward": torch.tensor(float(sample_idx - 1)),
+            "idx": initial_sample_state["idx"],
+            "reward/correctness": torch.tensor(float(sample_idx)),
+            "reward/style": torch.tensor(float(sample_idx * 2)),
+        }
+        sample_metrics = {
+            "turn_count": sample_idx + 1,
+            "total_tokens": sample_idx + 10,
+            "assistant_tokens": sample_idx + 2,
+            "env_tokens": 8,
+            "terminated": sample_idx % 2 == 0,
+            "truncated": sample_idx == 3,
+            "max_turns_reached": sample_idx == 3,
+            "total_reward": float(sample_idx - 1),
+            "turn_gen_tokens": [sample_idx + 2],
+            "turn_input_tokens": [sample_idx + 10],
+            "turn_total_tokens": [sample_idx + 12],
+            "max_gen_tokens_per_turn": sample_idx + 2,
+            "per_worker_token_counts": {f"worker-{sample_idx % 2}": sample_idx + 1},
+        }
+        return final_state, sample_metrics
+
+    monkeypatch.setattr(
+        rollouts_mod, "run_sample_multi_turn_rollout", fake_sample_rollout
+    )
+    input_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": f"prompt-{i}"}] for i in range(4)
+            ],
+            "extra_env_info": [{"sample": i} for i in range(4)],
+            "task_name": ["test"] * 4,
+            "idx": [100, 101, 102, 103],
+            "loss_multiplier": torch.arange(4),
+        }
+    )
+    rollout_kwargs = {
+        "policy_generation": None,
+        "input_batch": input_batch,
+        "tokenizer": None,
+        "task_to_env": {},
+        "max_seq_len": 128,
+        "max_rollout_turns": 2,
+    }
+
+    whole_batch, whole_metrics = run_async_multi_turn_rollout(**rollout_kwargs)
+
+    async def collect_groups():
+        return [
+            group
+            async for group in run_async_multi_turn_rollout_groups(
+                **rollout_kwargs, num_generations=2
             )
+        ]
+
+    groups = asyncio.run(collect_groups())
+
+    assert [group.group_index for group in groups] == [0, 1]
+    assert [group.final_batch.size for group in groups] == [2, 2]
+    assert [group.task_index for group in groups] == [None, None]
+    for key in (
+        "total_reward",
+        "reward/correctness",
+        "reward/style",
+        "loss_multiplier",
+    ):
+        assert torch.equal(
+            torch.cat([group.final_batch[key] for group in groups]), whole_batch[key]
+        )
+    assert [idx for group in groups for idx in group.final_batch["idx"]] == whole_batch[
+        "idx"
+    ]
+
+    group_metrics = [group.rollout_metrics for group in groups]
+    assert (
+        sum(metrics["total_turns"] for metrics in group_metrics)
+        == whole_metrics["total_turns"]
+    )
+    for key in (
+        "avg_turns_per_sample",
+        "natural_termination_rate",
+        "truncation_rate",
+        "max_turns_reached_rate",
+        "mean_total_tokens_per_sample",
+        "mean_gen_tokens_per_sample",
+        "mean_env_tokens_per_sample",
+        "mean_total_reward",
+    ):
+        assert (
+            sum(metrics[key] for metrics in group_metrics) / len(groups)
+            == (whole_metrics[key])
+        )
+    for key in (
+        "histogram/gen_tokens_length",
+        "histogram/input_tokens_length",
+        "histogram/total_tokens_length",
+    ):
+        assert [value for metrics in group_metrics for value in metrics[key]] == (
+            whole_metrics[key]
+        )
+    combined_worker_counts = {}
+    for metrics in group_metrics:
+        for worker, count in metrics["per_worker_token_counts"].items():
+            combined_worker_counts[worker] = (
+                combined_worker_counts.get(worker, 0) + count
+            )
+    assert combined_worker_counts == whole_metrics["per_worker_token_counts"]
+    assert (
+        min(metrics["min_total_reward"] for metrics in group_metrics)
+        == (whole_metrics["min_total_reward"])
+    )
+    assert (
+        max(metrics["max_total_reward"] for metrics in group_metrics)
+        == (whole_metrics["max_total_reward"])
+    )
+    assert (
+        max(metrics["max_turns_per_sample"] for metrics in group_metrics)
+        == (whole_metrics["max_turns_per_sample"])
+    )
+    assert (
+        max(metrics["max_gen_tokens_per_sample"] for metrics in group_metrics)
+        == (whole_metrics["max_gen_tokens_per_sample"])
+    )
+
+
+def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
+    """Prompt groups are yielded in completion order using async iteration."""
+
+    clock = {"now": 0.0}
+
+    class _FakeTimerContext:
+        def __init__(self, timer, label):
+            self.timer = timer
+            self.label = label
+
+        def __enter__(self):
+            self.timer.start(self.label)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.timer.stop(self.label)
+
+    class _FakeTimer:
+        def __init__(self):
+            self.start_times = {}
+            self.elapsed = {}
+
+        def start(self, label):
+            self.start_times[label] = clock["now"]
+
+        def stop(self, label):
+            elapsed = clock["now"] - self.start_times.pop(label)
+            self.elapsed.setdefault(label, []).append(elapsed)
+            return elapsed
+
+        def time(self, label):
+            return _FakeTimerContext(self, label)
+
+        def get_timing_metrics(self, reduction_op="mean"):
+            assert reduction_op == "sum"
+            return {label: sum(values) for label, values in self.elapsed.items()}
+
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _AsyncOnlyStream:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                value = next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+            clock["now"] += 1.0
+            return value
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, tokenizer, timer_prefix):
+            del rows, tokenizer, timer_prefix
+            # Both groups complete out of order internally and group 1 completes first.
+            completion_order = [3, 1, 2, 0]
+            values = []
+            for position, rowidx in enumerate(completion_order):
+                result = {
+                    "rowidx": rowidx,
+                    "input_message_log": [{"token_ids": [rowidx]}],
+                    "message_log": [
+                        {
+                            "role": "assistant",
+                            "token_ids": [rowidx],
+                            "generation_logprobs": [0.0],
+                        }
+                    ],
+                }
+                timing = {"timing/remote": 1.0} if position == 3 else None
+                values.append(_ReadyRef((rowidx, result, timing)))
+            return _AsyncOnlyStream(values)
+
+    class _PolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 128}}
+
+    rows = []
+    for task_index in (10, 10, 11, 11):
+        rows.append(
+            {
+                "agent_ref": {"name": "agent"},
+                "responses_create_params": {},
+                "_ng_task_index": task_index,
+            }
+        )
+    input_batch = BatchedDataDict(
+        {
+            "extra_env_info": rows,
+            "message_log": [[{"role": "user", "content": "prompt"}]] * 4,
+            "loss_multiplier": torch.ones(4),
+        }
+    )
+    captured_groups = []
+
+    def _postprocess_group(**kwargs):
+        assert kwargs["log_full_result_tables"] is False
+        task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
+        captured_groups.append(
+            (task_index, [result["rowidx"] for result in kwargs["results"]])
+        )
+        return rollouts_mod.NemoGymRolloutResult(
+            input_ids=torch.empty(0),
+            final_batch=kwargs["input_batch"],
+            rollout_metrics={},
+            task_index=task_index,
+        )
+
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_group
+    )
+    monkeypatch.setattr(rollouts_mod, "Timer", _FakeTimer)
+
+    async def _collect():
+        results = []
+        async for result in run_async_nemo_gym_rollout(
+            policy_generation=_PolicyGeneration(),
+            input_batch=input_batch,
+            tokenizer=None,
+            task_to_env={
+                "nemo_gym": type(
+                    "_Environment",
+                    (),
+                    {"run_rollouts": _RunRolloutsRemote()},
+                )()
+            },
+            generation_config={
+                "stop_strings": [],
+                "stop_token_ids": [],
+                "top_k": None,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_new_tokens": 32,
+            },
+            num_generations=2,
+            log_full_result_tables=False,
+        ):
+            results.append(result)
+            if len(results) == 1:
+                # Simulate work done by the consumer before requesting another group.
+                clock["now"] += 100.0
+        return results
+
+    rollout_results = asyncio.run(_collect())
+
+    assert [result.task_index for result in rollout_results] == [11, 10]
+    assert captured_groups == [(11, [2, 3]), (10, [0, 1])]
+    assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
+    assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
+    assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
+
+
+def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
+    rows = [
+        {"agent_ref": {"name": "agent"}},
+        {"agent_ref": {"name": "agent"}},
+    ]
+    accumulator = rollouts_mod._NemoGymStreamAccumulator(
+        rows=rows,
+        num_generations=2,
+        allow_mixed_agents=False,
+    )
+
+    assert accumulator.add(0, {"row": 0}) is None
+    with pytest.raises(ValueError, match="duplicate row index 0"):
+        accumulator.add(0, {"row": 0})
+    with pytest.raises(RuntimeError, match=r"missing row indices \[1\]"):
+        accumulator.finish()
+
+    with pytest.raises(ValueError, match="outside the expected range"):
+        rollouts_mod._NemoGymStreamAccumulator(
+            rows=rows,
+            num_generations=2,
+            allow_mixed_agents=False,
+        ).add(2, {"row": 2})
+
+
+def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
+    accumulator = rollouts_mod._NemoGymStreamAccumulator(
+        rows=[
+            {"agent_ref": {"name": "agent-a"}},
+            {"agent_ref": {"name": "agent-b"}},
+        ],
+        num_generations=2,
+        allow_mixed_agents=False,
+    )
+
+    assert accumulator.add(0, {"row": 0}) is None
+    with pytest.raises(ValueError, match="one NeMo-Gym agent"):
+        accumulator.add(1, {"row": 1})
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
+    rows = [
+        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+    ]
+    results = []
+    for reward in (1.0, 2.0):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": reward},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=log_full_result_tables,
+    )
+
+    assert rollout_result.task_index == 42
+    assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert (
+        "agent/full_result" in rollout_result.rollout_metrics
+    ) is log_full_result_tables
+
+
+def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
+    input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
+    expected = rollouts_mod.NemoGymRolloutResult(
+        input_ids=torch.empty(0),
+        final_batch=input_batch,
+        rollout_metrics={"metric": 1.0},
+        task_index=None,
+    )
+
+    async def fake_stream(**kwargs):
+        assert kwargs["num_generations"] == input_batch.size
+        assert kwargs["returns_entire_batch"] is True
+        assert kwargs["log_full_result_tables"] is False
+        yield expected
+
+    monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
+
+    actual = run_nemo_gym_rollout_sync(
+        policy_generation=None,
+        input_batch=input_batch,
+        tokenizer=None,
+        task_to_env={},
+        generation_config={},
+        log_full_result_tables=False,
+    )
+
+    assert actual is expected
+
+
+def test_rollout_manager_consumes_stream_and_restores_input_order():
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _Stream:
+        def __init__(self):
+            self.values = iter(
+                [
+                    _ReadyRef(
+                        (
+                            1,
+                            {
+                                "value": "second",
+                                "input_message_log": [
+                                    {"role": "user", "token_ids": [1]}
+                                ],
+                            },
+                            None,
+                        )
+                    ),
+                    _ReadyRef(
+                        (
+                            0,
+                            {
+                                "value": "first",
+                                "input_message_log": [
+                                    {"role": "user", "token_ids": [1]}
+                                ],
+                            },
+                            {"remote_time": 2.0},
+                        )
+                    ),
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, tokenizer, timer_prefix):
+            del inputs, tokenizer, timer_prefix
+            return _Stream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+    manager._result_to_completion = lambda result: result["value"]
+    manager._compute_rollout_metrics = lambda completions, agent: {
+        "completion_count": len(completions),
+        "agent": agent,
+    }
+
+    completions, prompt_message_log, metrics = asyncio.run(
+        manager._run_rollouts(
+            inputs=[
+                {"agent_ref": {"name": "agent"}},
+                {"agent_ref": {"name": "agent"}},
+            ],
+            timer=rollouts_mod.Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert completions == ["first", "second"]
+    assert prompt_message_log[0]["role"] == "user"
+    torch.testing.assert_close(prompt_message_log[0]["token_ids"], torch.tensor([1]))
+    assert metrics == {
+        "completion_count": 2,
+        "agent": "agent",
+        "remote_time": 2.0,
+    }
+
+
+def test_rollout_manager_rejects_duplicate_stream_rows():
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _DuplicateStream:
+        def __init__(self):
+            self.values = iter(
+                [
+                    _ReadyRef((0, {"value": "first"}, None)),
+                    _ReadyRef((0, {"value": "duplicate"}, None)),
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, tokenizer, timer_prefix):
+            del inputs, tokenizer, timer_prefix
+            return _DuplicateStream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+
+    with pytest.raises(ValueError, match="duplicate row index 0"):
+        asyncio.run(
+            manager._run_rollouts(
+                inputs=[
+                    {"agent_ref": {"name": "agent"}},
+                    {"agent_ref": {"name": "agent"}},
+                ],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+            )
+        )
 
 
 @pytest.mark.nemo_gym
@@ -932,13 +1509,14 @@ def test_run_async_nemo_gym_rollout(
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
 
-    actual_result = run_async_nemo_gym_rollout(
+    actual_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
+        log_full_result_tables=True,
         max_rollout_turns=None,
     )
     for row in rows:
@@ -1080,554 +1658,3 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
-
-
-# ---------------------------------------------------------------------------
-# Tests for RolloutManager
-# ---------------------------------------------------------------------------
-
-
-def test_rollout_manager_raises_without_impl_params():
-    """RolloutManager raises AssertionError when required params are missing."""
-    common = {
-        "tokenizer": None,
-        "task_to_env": {},
-        "num_generations_per_prompt": 1,
-        "max_seq_len": 1,
-    }
-
-    with pytest.raises(AssertionError, match="num_generations_per_prompt must be >= 1"):
-        updated_common = common.copy()
-        updated_common["num_generations_per_prompt"] = 0
-        RolloutManager(**updated_common, use_nemo_gym=False)
-
-    with pytest.raises(AssertionError, match="policy_generation is required"):
-        RolloutManager(**common, use_nemo_gym=False)
-
-    with pytest.raises(AssertionError, match="generation_config is required"):
-        RolloutManager(**common, use_nemo_gym=True)
-
-
-# ---------------------------------------------------------------------------
-# Tests for AsyncRolloutManager (native async path)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="function")
-def single_multi_step_calculator_input_sample(rollout_tokenizer):
-    """Returns a single DatumSpec prompt dict (problem 0) for AsyncRolloutManager tests."""
-    problem_text = "(5 + 3) * 2"
-    expected_answer = 16.0
-    max_steps = 5
-
-    tool_instructions = (
-        "You have a calculator tool. To use it, respond with:\n"
-        "'[operand1, operand2, operation_name]<call: calculator>'\n"
-        "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
-        "Example: [5, 3, sum]<call: calculator>\n"
-        "You will receive the result of your calculation as <result>...</result>\n"
-        "Use this result to make the next calculation if needed.\n"
-        "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
-        "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
-        "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
-        "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
-        "------\n"
-        f"Solve: {problem_text}"
-    )
-
-    initial_prompt_content = rollout_tokenizer.apply_chat_template(
-        [{"role": "user", "content": tool_instructions}],
-        tokenize=False,
-        add_system_prompt=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-    tokenized_prompt = rollout_tokenizer(
-        initial_prompt_content, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    message_log = [
-        {
-            "role": "user",
-            "content": initial_prompt_content,
-            "token_ids": tokenized_prompt,
-        }
-    ]
-    metadata = MultiStepCalcMetadata(
-        problem=problem_text,
-        expected_final_answer=expected_answer,
-        max_steps=max_steps,
-        current_step=0,
-    )
-    return {
-        "message_log": message_log,
-        "extra_env_info": metadata,
-        "task_name": "multi_step_calculator_game",
-        "stop_strings": ["<call: calculator>"],
-        "idx": 0,
-    }
-
-
-@pytest.mark.vllm
-def test_async_rollout_manager(
-    multi_step_setup_vllm_async,
-    single_multi_step_calculator_input_sample,
-):
-    """Standalone test for AsyncRolloutManager.
-
-    Given 1 prompt with num_generations_per_prompt=N, asserts:
-    - output is a PromptGroupRecord with N Completion objects
-    - each Completion has a reward (float) and a non-empty message_log
-    - rollout_metrics has the expected keys with correct types
-    - completions hold independent (not aliased) message_log objects
-    """
-    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
-    num_generations = 2
-    max_seq_len = 1024
-    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
-
-    manager = RolloutManager(
-        use_nemo_gym=False,
-        tokenizer=rollout_tokenizer,
-        task_to_env=task_to_env,
-        num_generations_per_prompt=num_generations,
-        max_seq_len=max_seq_len,
-        max_rollout_turns=max_rollout_turns,
-        policy_generation=vllm_generation,
-    )
-
-    vllm_generation.prepare_for_generation()
-    record = asyncio.run(manager.run_rollout(input_sample))
-    vllm_generation.finish_generation()
-
-    assert isinstance(record, PromptGroupRecord)
-    assert len(record.completions) == num_generations, (
-        f"Expected {num_generations} completions, got {len(record.completions)}"
-    )
-    assert record.prompt_idx == input_sample["idx"]
-
-    for i, completion in enumerate(record.completions):
-        assert isinstance(completion, Completion)
-
-        # 1. message_log length
-        assert len(completion.message_log) >= 4, (
-            f"Completion {i}: expected >= 4 messages, got {len(completion.message_log)}"
-        )
-
-        # 2. last assistant content
-        last_assistant = next(
-            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
-            None,
-        )
-        assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert last_assistant["content"].strip() == "16", (
-            f"Completion {i}: last assistant content {last_assistant['content']!r} != '16'"
-        )
-
-        # 3. reward
-        assert completion.reward == 1.0, (
-            f"Completion {i}: reward {completion.reward} != 1.0"
-        )
-
-    # completions must be independent objects
-    assert record.completions[0].message_log is not record.completions[1].message_log
-
-
-@pytest.mark.vllm
-def test_async_rollout_manager_truncation(
-    multi_step_setup_vllm_async,
-    single_multi_step_calculator_input_sample,
-):
-    """Small max_seq_len forces truncation and truncation_rate=1.0."""
-    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
-    num_generations = 2
-    max_seq_len = 290
-    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
-
-    manager = RolloutManager(
-        use_nemo_gym=False,
-        tokenizer=rollout_tokenizer,
-        task_to_env=task_to_env,
-        num_generations_per_prompt=num_generations,
-        max_seq_len=max_seq_len,
-        max_rollout_turns=max_rollout_turns,
-        policy_generation=vllm_generation,
-    )
-    vllm_generation.prepare_for_generation()
-    record = asyncio.run(manager.run_rollout(input_sample))
-    vllm_generation.finish_generation()
-
-    assert len(record.completions) == num_generations
-    assert all(c.truncated for c in record.completions)
-    assert record.rollout_metrics["truncation_rate"] == 1.0
-    assert record.rollout_metrics["natural_termination_rate"] == 0.0
-
-
-@pytest.mark.vllm
-def test_async_rollout_manager_matches_original(
-    multi_step_setup_vllm_async,
-    single_multi_step_calculator_input_sample,
-):
-    """Comparison test: AsyncRolloutManager output is structurally equivalent to the original.
-
-    Calls run_async_multi_turn_rollout with a batch of N identical prompts,
-    then calls AsyncRolloutManager with 1 prompt and N generations.
-    Asserts that both produce N results with matching message-log depth, rewards,
-    and rollout_metrics numeric values.
-
-    TODO: remove this test together with run_async_multi_turn_rollout when the legacy path is deleted.
-    """
-    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
-    num_generations = 2
-    max_seq_len = 1024
-    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
-
-    # Build a batch of N identical prompts for the original function
-    batch = BatchedDataDict(
-        {
-            "message_log": [
-                deepcopy(input_sample["message_log"]) for _ in range(num_generations)
-            ],
-            "extra_env_info": [
-                deepcopy(input_sample["extra_env_info"]) for _ in range(num_generations)
-            ],
-            "task_name": [input_sample["task_name"]] * num_generations,
-            "stop_strings": [input_sample["stop_strings"]] * num_generations,
-            "idx": list(range(num_generations)),
-            "loss_multiplier": [1.0] * num_generations,
-        }
-    )
-
-    vllm_generation.prepare_for_generation()
-    original_batch, original_metrics = run_async_multi_turn_rollout(
-        policy_generation=vllm_generation,
-        input_batch=batch,
-        tokenizer=rollout_tokenizer,
-        task_to_env=task_to_env,
-        max_seq_len=max_seq_len,
-        max_rollout_turns=max_rollout_turns,
-    )
-
-    manager = RolloutManager(
-        use_nemo_gym=False,
-        tokenizer=rollout_tokenizer,
-        task_to_env=task_to_env,
-        num_generations_per_prompt=num_generations,
-        max_seq_len=max_seq_len,
-        max_rollout_turns=max_rollout_turns,
-        policy_generation=vllm_generation,
-    )
-    record = asyncio.run(manager.run_rollout(input_sample))
-    vllm_generation.finish_generation()
-
-    # Both should produce N results
-    assert len(original_batch["message_log"]) == num_generations
-    assert len(record.completions) == num_generations
-
-    for i in range(num_generations):
-        orig_msg_log = original_batch["message_log"][i]
-        new_msg_log = record.completions[i].message_log
-
-        # 1. message_log length matches
-        assert len(orig_msg_log) == len(new_msg_log), (
-            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
-        )
-
-        # 2. last assistant content matches
-        def _last_assistant_content(msg_log):
-            for m in reversed(msg_log):
-                if m["role"] == "assistant":
-                    return m.get("content", "")
-            return ""
-
-        orig_last = _last_assistant_content(orig_msg_log)
-        new_last = _last_assistant_content(new_msg_log)
-        assert orig_last == new_last, (
-            f"Completion {i}: last assistant content mismatch\n"
-            f"  original:  {orig_last!r}\n"
-            f"  manager:   {new_last!r}"
-        )
-
-        # 3. reward matches
-        orig_reward = original_batch["total_reward"][i].item()
-        new_reward = record.completions[i].reward
-        assert orig_reward == new_reward, (
-            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
-        )
-
-    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded).
-    # The new impl emits slash-style keys (X/mean, X/max, X/min) via calculate_single_metric;
-    # translate the legacy prefix-style keys before comparing.
-    def _translate_legacy_key(key: str) -> str:
-        if key == "avg_turns_per_sample":
-            return "turns_per_sample/mean"
-        if key == "max_turns_reached_rate":
-            return key
-        # Keys already in slash-style (e.g. turns_per_sample/p95, max_gen_tokens_per_turn/max)
-        # are new-style and should not be re-translated by the prefix-strip logic.
-        if "/" in key:
-            return key
-        for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
-            if key.startswith(prefix):
-                return f"{key[len(prefix) :]}{suffix}"
-        return key
-
-    new_metrics = record.rollout_metrics
-    for key in original_metrics.keys():
-        if key.startswith("timing/") or key.startswith("histogram/"):
-            continue
-
-        new_key = _translate_legacy_key(key)
-        assert new_key in new_metrics, (
-            f"rollout_metrics[{new_key!r}] missing from manager"
-        )
-
-        orig_val = original_metrics[key]
-        new_val = new_metrics[new_key]
-
-        assert type(orig_val) == type(new_val), (
-            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
-        )
-        if not isinstance(orig_val, (bool, int, float)):
-            continue
-
-        assert orig_val == pytest.approx(new_val), (
-            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Tests for AsyncNemoGymRolloutManager
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.nemo_gym
-def test_async_nemo_gym_rollout_manager(
-    nemo_gym,  # noqa: F811
-    nemo_gym_vllm_generation,  # noqa: F811
-    nemo_gym_sanity_test_data,  # noqa: F811
-    nemo_gym_tokenizer,  # noqa: F811
-):
-    """Standalone test for AsyncNemoGymRolloutManager.
-
-    Given 1 prompt with num_generations_per_prompt=N, asserts:
-    - output is a PromptGroupRecord with N Completion objects
-    - each Completion has a reward (float) and a non-empty message_log
-    - completions hold independent message_log objects
-
-    If the result here does not match, please check the following:
-    1. Test data changed: re-run test_nemo_gym_sanity (tests/unit/environments/test_nemo_gym.py)
-       and use _write_actual_test_data output to refresh test_nemo_gym_sanity.json.
-    2. Logic changed: inspect recent changes to AsyncNemoGymRolloutManager or the gym env.
-    """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        for data in nemo_gym_sanity_test_data["input"]:
-            f.write(json.dumps(data) + "\n")
-        data_path = f.name
-
-    dataset = NemoGymDataset(data_path)
-    examples = [
-        nemo_gym_data_processor(dataset.dataset[idx], None, None, None, idx)
-        for idx in range(len(dataset.dataset))
-    ]
-    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(examples)
-
-    # Use only the first prompt
-    single_prompt = {
-        "message_log": input_batch["message_log"][0],
-        "extra_env_info": input_batch["extra_env_info"][0],
-        "task_name": "nemo_gym",
-        "idx": 0,
-        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
-    }
-    num_generations = 2
-
-    manager = RolloutManager(
-        use_nemo_gym=True,
-        tokenizer=nemo_gym_tokenizer,
-        task_to_env={"nemo_gym": nemo_gym},
-        num_generations_per_prompt=num_generations,
-        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
-        generation_config=nemo_gym_vllm_generation.cfg,
-    )
-    record = asyncio.run(manager.run_rollout(single_prompt))
-
-    assert isinstance(record, PromptGroupRecord)
-    assert len(record.completions) == num_generations, (
-        f"Expected {num_generations} completions, got {len(record.completions)}"
-    )
-    assert record.prompt_idx == 0
-
-    for i, completion in enumerate(record.completions):
-        assert isinstance(completion, Completion)
-
-        # 1. message_log length
-        assert len(completion.message_log) == 2, (
-            f"Completion {i}: expected 2 messages, got {len(completion.message_log)}"
-        )
-
-        # 2. last assistant token_ids
-        last_assistant = next(
-            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
-            None,
-        )
-        assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert torch.equal(
-            last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 1077]),
-        ), (
-            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 1077]"
-        )
-
-        # 3. reward
-        assert completion.reward == 0.0, (
-            f"Completion {i}: reward {completion.reward} != 0.0"
-        )
-
-    # completions must be independent objects
-    assert record.completions[0].message_log is not record.completions[1].message_log
-
-
-@pytest.mark.nemo_gym
-def test_async_nemo_gym_rollout_manager_matches_original(
-    nemo_gym,  # noqa: F811
-    nemo_gym_vllm_generation,  # noqa: F811
-    nemo_gym_sanity_test_data,  # noqa: F811
-    nemo_gym_tokenizer,  # noqa: F811
-):
-    """Comparison test: AsyncNemoGymRolloutManager output is structurally equivalent to the original.
-
-    Calls run_async_nemo_gym_rollout with a batch of N identical rows,
-    then calls AsyncNemoGymRolloutManager with 1 prompt, N generations.
-    Asserts that both produce N results and rewards are in the same numeric domain.
-
-    TODO: remove this test together with run_async_nemo_gym_rollout when the legacy path is deleted.
-    """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        for data in nemo_gym_sanity_test_data["input"]:
-            f.write(json.dumps(data) + "\n")
-        data_path = f.name
-
-    dataset = NemoGymDataset(data_path)
-    examples = [
-        nemo_gym_data_processor(dataset.dataset[idx], None, None, None, idx)
-        for idx in range(len(dataset.dataset))
-    ]
-    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(examples)
-
-    num_generations = 2
-    single_prompt = {
-        "message_log": input_batch["message_log"][0],
-        "extra_env_info": input_batch["extra_env_info"][0],
-        "task_name": "nemo_gym",
-        "idx": 0,
-        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
-    }
-
-    # Build a batch of N identical rows for the original function
-    repeated_batch = BatchedDataDict(
-        {
-            "message_log": [
-                deepcopy(input_batch["message_log"][0]) for _ in range(num_generations)
-            ],
-            "extra_env_info": [
-                deepcopy(input_batch["extra_env_info"][0])
-                for _ in range(num_generations)
-            ],
-            "loss_multiplier": input_batch["loss_multiplier"][0:1].repeat(
-                num_generations
-            ),
-            "idx": list(range(num_generations)),
-            "task_name": ["nemo_gym"] * num_generations,
-        }
-    )
-
-    original_result = run_async_nemo_gym_rollout(
-        policy_generation=nemo_gym_vllm_generation,
-        input_batch=repeated_batch,
-        tokenizer=nemo_gym_tokenizer,
-        task_to_env={"nemo_gym": nemo_gym},
-        generation_config=nemo_gym_vllm_generation.cfg,
-        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
-        max_rollout_turns=None,
-    )
-
-    manager = RolloutManager(
-        use_nemo_gym=True,
-        tokenizer=nemo_gym_tokenizer,
-        task_to_env={"nemo_gym": nemo_gym},
-        num_generations_per_prompt=num_generations,
-        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
-        generation_config=nemo_gym_vllm_generation.cfg,
-    )
-    record = asyncio.run(manager.run_rollout(single_prompt))
-
-    # Both should produce N completions
-    assert len(original_result.final_batch["message_log"]) == num_generations
-    assert len(record.completions) == num_generations
-
-    for i in range(num_generations):
-        orig_msg_log = original_result.final_batch["message_log"][i]
-        new_msg_log = record.completions[i].message_log
-
-        # 1. message_log length matches
-        assert len(orig_msg_log) == len(new_msg_log), (
-            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
-        )
-
-        # 2. last assistant token_ids match
-        def _last_assistant_token_ids(msg_log):
-            for m in reversed(msg_log):
-                if m["role"] == "assistant":
-                    return m.get("token_ids")
-            return None
-
-        orig_token_ids = _last_assistant_token_ids(orig_msg_log)
-        new_token_ids = _last_assistant_token_ids(new_msg_log)
-        assert orig_token_ids is not None, (
-            f"Completion {i}: no assistant message in original"
-        )
-        assert new_token_ids is not None, (
-            f"Completion {i}: no assistant message in manager"
-        )
-        assert torch.equal(orig_token_ids, new_token_ids), (
-            f"Completion {i}: last assistant token_ids mismatch\n"
-            f"  original:  {orig_token_ids.tolist()}\n"
-            f"  manager:   {new_token_ids.tolist()}"
-        )
-
-        # 3. reward matches
-        orig_reward = original_result.final_batch["total_reward"][i].item()
-        new_reward = record.completions[i].reward
-        assert orig_reward == new_reward, (
-            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
-        )
-
-    # 4. rollout_metrics numeric values match (timing and Table fields are excluded)
-    orig_metrics = original_result.rollout_metrics
-    new_metrics = record.rollout_metrics
-    for key in orig_metrics.keys():
-        # Skip timing and full_result fields
-        if key.startswith("timing/") or key.endswith("/full_result"):
-            continue
-
-        # Check that the key is present in the new metrics
-        assert key in new_metrics, f"rollout_metrics[{key!r}] missing from manager"
-
-        orig_val = orig_metrics[key]
-        new_val = new_metrics[key]
-
-        # Skip non-numeric fields
-        assert type(orig_val) == type(new_val), (
-            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
-        )
-        if not isinstance(orig_val, (bool, int, float)):
-            continue
-
-        # Check equal
-        assert orig_val == pytest.approx(new_val), (
-            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
-        )

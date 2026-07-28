@@ -35,13 +35,13 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
-    _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -445,6 +445,29 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
         )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+@pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
+def test_configure_generation_config_uses_real_delta_baseline(transport: str):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = transport
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = "nixl"
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
@@ -1759,7 +1782,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] == eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1772,7 +1795,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] != eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1786,7 +1809,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     template_prefix_token_ids = template_token_ids[:-15]
     assert template_prefix_token_ids[-2] == eos_token_id
     assert template_prefix_token_ids[-1] != eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1801,7 +1824,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     template_prefix_token_ids = template_token_ids[:-15]
     assert template_prefix_token_ids[-2] == eos_token_id
     assert template_prefix_token_ids[-1] != eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1813,7 +1836,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] == eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1826,81 +1849,13 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] != eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
     )
     assert result == model_token_ids
-
-
-def test_replace_prefix_tokens_empty_model_prefix_returns_template():
-    class _T:
-        eos_token_id = 2
-
-    tokenizer = _T()
-    model_prefix_token_ids = []
-    template_prefix_token_ids = [9, 2]
-    template_token_ids = [9, 2, 33, 44]
-    result = _replace_prefix_tokens(
-        tokenizer=tokenizer,
-        model_prefix_token_ids=model_prefix_token_ids,
-        template_prefix_token_ids=template_prefix_token_ids,
-        template_token_ids=template_token_ids,
-    )
-    assert result == template_token_ids
-
-
-def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
-    class _T:
-        eos_token_id = 2
-
-        def decode(self, *args, **kwargs):
-            pass
-
-    tokenizer = _T()
-    model_prefix_token_ids = [7, 2]
-    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
-    template_token_ids = [9, 9, 9, 2, 10]
-    with pytest.raises(AssertionError):
-        _replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=model_prefix_token_ids,
-            template_prefix_token_ids=template_prefix_token_ids,
-            template_token_ids=template_token_ids,
-        )
-
-
-def test_replace_prefix_tokens_tokenizer_without_eos_raises():
-    class _T:
-        eos_token_id = None
-
-    tokenizer = _T()
-    with pytest.raises(AssertionError):
-        _replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=[1],
-            template_prefix_token_ids=[1, 2],
-            template_token_ids=[1, 2],
-        )
-
-
-def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
-    class _T:
-        eos_token_id = 2
-
-    tokenizer = _T()
-    model_prefix_token_ids = [100, 2]
-    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
-    template_token_ids = [9, 2, 9, 2, 77, 88]
-    result = _replace_prefix_tokens(
-        tokenizer=tokenizer,
-        model_prefix_token_ids=model_prefix_token_ids,
-        template_prefix_token_ids=template_prefix_token_ids,
-        template_token_ids=template_token_ids,
-    )
-    assert result == [100, 2, 77, 88]
 
 
 @pytest.mark.asyncio
