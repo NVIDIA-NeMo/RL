@@ -53,11 +53,11 @@ DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in com
 {context}
 
 #### Responses to be Scored ####
-[The Begin of Response 1]
+[The Start of Response 1]
 {response_1}
 [The End of Response 1]
 
-[The Begin of Response 2]
+[The Start of Response 2]
 {response_2}
 [The End of Response 2]
 
@@ -94,7 +94,7 @@ Analyze step by step following the evaluation plan, then provide your judgment a
 }}
 ```"""
 
-DEFAULT_PRINCIPLE = "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt."
+DEFAULT_PRINCIPLE = "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers which would be beneficial to include when responding to the user prompt."
 
 def flatten_to_single_turn(message_log):
     ret = ""

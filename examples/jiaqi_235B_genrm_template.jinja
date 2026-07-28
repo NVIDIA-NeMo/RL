@@ -1,0 +1,148 @@
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+    {{- '<|im_start|>user\n' }}
+You are an expert evaluation judge specializing in comparative assessment of LLM responses. You are impartial, rigorous, and consistent. Given the conversation context and two assistant responses to the user's latest query, you will follow the evaluation plan and scoring guidelines exactly as written below.
+
+{{- '\n\n#### Conversation Context ####\n' }}
+{%- for message in messages %}
+    {%- if message['role'] == 'user' %}
+        {{- 'User: ' + message['content']|trim + '\n' }}
+    {%- elif message['role'] == 'assistant' %}
+        {%- if '</think>' in message['content'] %}
+            {%- set content = message['content'].split('</think>')[-1].lstrip() %}
+        {%- else %}
+            {%- set content = message['content'] %}
+        {%- endif %}
+        {{- 'Assistant: ' + content|trim + '\n'}}
+    {%- endif %}
+{%- endfor %}
+
+{{- '\n#### Responses to be Scored ####\n' }}
+{%- for message in messages %}
+    {%- if message['role'] == 'response_1' %}
+        {{- '[The Start of Response 1]\n' + message['content']|trim + '\n[The End of Response 1]\n' }}
+    {%- elif message['role'] == 'response_2' %}
+        {{- '\n[The Start of Response 2]\n' + message['content']|trim + '\n[The End of Response 2]\n' }}
+    {%- endif %}
+{%- endfor %}
+
+#### Evaluation Plan ####
+Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers which would be beneficial to include when responding to the user prompt.
+
+#### Scoring Guidelines ####
+Based on the evaluation plan above, assign scores using these scales:
+
+**Individual Helpfulness Scores (1-5):**
+- 5: Extremely Helpful - Completely aligned with what the user was asking for
+- 4: Mostly Helpful - Generally useful with minor room for improvement
+- 3: Partially Helpful - Misses the overall goal in some way
+- 2: Borderline Unhelpful - Mostly doesn't capture what the user wanted
+- 1: Not Helpful - Completely missed the essence of the request
+
+**Comparative Ranking (1-6):**
+- 1: Response 1 is much better than Response 2
+- 2: Response 1 is better than Response 2
+- 3: Response 1 is slightly better than Response 2
+- 4: Response 2 is slightly better than Response 1
+- 5: Response 2 is better than Response 1
+- 6: Response 2 is much better than Response 1
+
+#### Output Format ####
+Analyze step by step following the evaluation plan, then provide your judgment as JSON:
+```json
+{
+    "response_1_analysis": "Your detailed analysis of Response 1 based on the evaluation plan",
+    "response_2_analysis": "Your detailed analysis of Response 2 based on the evaluation plan",
+    "score_1": <1-5>,
+    "score_2": <1-5>,
+    "ranking": <1-6>
+}
+```
+    {{- '<|im_end|>\n' }}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}
