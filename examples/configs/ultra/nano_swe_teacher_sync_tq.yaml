@@ -1,0 +1,46 @@
+# =============================================================================
+# Nano v3 30B-A3B SWE — SYNC GRPO + TransferQueue data plane (GB200)
+# =============================================================================
+# Purpose: exercise the TransferQueue data plane (data_plane.impl=transfer_queue)
+# under the SYNC trainer (grpo_train_sync). Of the two run_grpo_nemo_gym.py
+# paths, only the sync one puts rollouts through TQ — async_grpo_train uses an
+# in-memory ReplayBuffer — so this variant DISABLES async_grpo.
+#
+# Inherits the nano Qwen3-mesh recipe (TP2·PP2·CP4, vLLM TP2, 6-node shape) and
+# only changes the trainer + data plane.
+#
+# VERIFIED: reached "🚀 Running synchronous GRPO training" → Step 1 (rewards →
+# advantages → logprobs → forward/backward) on the 6-node nano shape, with a
+# 64-rollout SWE batch taking ~11 min.
+#
+# Sync leaves the 16 training GPUs idle during that rollout, which is why the
+# production SWE path is async. For async + honoured TQ use
+# nano_swe_teacher_sc.yaml (SingleController) instead; this file is the simplest
+# way to smoke-test the data plane itself.
+# =============================================================================
+
+defaults:
+  - nano_swe_teacher_qwen3mesh.yaml
+
+grpo:
+  async_grpo:
+    enabled: false          # REQUIRED: TQ data plane runs under grpo_train_sync
+
+# TransferQueue-mediated bulk transfer between rollout and train.
+# See nemo_rl/data_plane/factory.py. 'simple' = CPU backend (no mooncake).
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  # Required by DataPlaneConfig (ints, no defaults). Only read when
+  # backend == "mooncake_cpu"; the "simple" backend ignores them.
+  global_segment_size: 549755813888   # 512 GiB
+  local_buffer_size:   68719476736    # 64 GiB
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true    # keep vLLM async engine (per request); independent of async_grpo

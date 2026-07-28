@@ -32,6 +32,11 @@ def merge_with_override(
 ) -> DictConfig:
     """Merge configs with support for _override_ marker to completely override sections."""
     for key in list(override_config.keys()):
+        # Keep mandatory values (``???``) unresolved while composing configs.
+        # A child config or a CLI override may provide them after inheritance;
+        # evaluating the ``???`` here would raise MissingMandatoryValue mid-merge.
+        if OmegaConf.is_missing(override_config, key):
+            continue
         if isinstance(override_config[key], DictConfig):
             if override_config[key].get("_override_", False):
                 # remove the _override_ marker
