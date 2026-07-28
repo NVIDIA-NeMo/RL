@@ -17,10 +17,11 @@
 
 vLLM owns checkpoint-layout restoration, layerwise post-load processing,
 CUDA-graph-stable tensor placement, and KV-cache scale reload.  This module
-only supplies the vLLM 0.20 gaps needed here: ModelOpt W4A16 NVFP4 methods,
-rank-local Marlin padding, per-projection ModelOpt MoE input-scale loading,
-materialization of FlashInfer's global-scale views, and retention of
-method-owned MoE kernel references across layerwise reload.
+only supplies the vLLM 0.25 gaps needed here: ModelOpt W4A16 NVFP4 methods,
+per-projection ModelOpt MoE input-scale loading, materialization of
+FlashInfer's global-scale views, and retention of method-owned MoE kernel
+references across layerwise reload.  (Rank-local Marlin padding is gone: 0.25's
+``prepare_nvfp4_moe_layer_for_marlin`` pads natively.)
 """
 
 from types import MethodType
@@ -57,12 +58,14 @@ def _load_modelopt_moe_input_scale(
 ) -> bool | None:
     """Load a ModelOpt input scale without losing the gate/up shard.
 
-    Replaces the ``input_scale`` branch of vLLM v0.20.0's
-    ``FusedMoE.weight_loader``, whose ``_load_single_value`` writes
-    ``param.data[expert_id]`` and drops the gate/up (w1/w3) shard index:
-    https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/model_executor/layers/fused_moe/layer.py#L1025-L1031
-    Delete once upstream loads per-projection ModelOpt MoE input scales
-    correctly.
+    Replaces the ``input_scale`` branch of vLLM's MoE weight loader, which
+    drops the gate/up (w1/w3) shard index.  vLLM 0.25 handles this natively at
+    https://github.com/vllm-project/vllm/blob/v0.25.1/vllm/model_executor/layers/fused_moe/routed_experts.py#L699-L712
+    but this override is still required: it uses
+    ``shard_index = 0 if w1 else min(1, param.shape[-1] - 1)`` where upstream
+    hardcodes ``1``, so it also handles the single-scale (non-gated) layout,
+    and it copies with ``reshape_as`` rather than ``_to_scalar()``.
+    Delete once upstream covers the single-column case too.
     """
     del weight_name
     global_expert_id = expert_id
@@ -212,12 +215,15 @@ def register_nemo_modelopt_nvfp4() -> None:
             super().create_weights(layer, *args, **kwargs)
             del layer.input_scale
 
-        # Adapted from vLLM v0.20.0 ModelOptNvFp4LinearMethod
+        # Adapted from vLLM's ModelOptNvFp4LinearMethod
         # .process_weights_after_loading/.apply with input-scale/alpha handling
-        # removed for weight-only W4A16:
-        # https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/model_executor/layers/quantization/modelopt.py#L1169-L1208
-        # Re-sync on vLLM bumps; delete if upstream gains a native W4A16
-        # NVFP4 method.
+        # removed for weight-only W4A16.  vLLM 0.25.1 does now ship a native
+        # ModelOptNvFp4W4A16LinearMethod:
+        # https://github.com/vllm-project/vllm/blob/v0.25.1/vllm/model_executor/layers/quantization/modelopt.py#L1245
+        # This override is kept because 0.25's ModelOptNvFp4Config installs
+        # LinearMethodCls as an *instance* attribute keyed off the quant algo,
+        # which shadows a subclass override (see from_config below).
+        # Re-sync on vLLM bumps.
         def process_weights_after_loading(self, layer: Any) -> None:
             layer.weight_global_scale = Parameter(
                 layer.weight_scale_2.max().to(torch.float32),

@@ -144,10 +144,15 @@ def _batch_fused_modelopt_moe_weights(
 ) -> list[tuple[str, torch.Tensor]]:
     """Map fused ModelOpt payloads to vLLM per-projection checkpoint names.
 
-    Large expert weights and block scales stay batched so vLLM can
+    ``w2`` weights and block scales stay batched so vLLM can
     tensor-parallel-shard the full ``[E, ...]`` tensor at once.  Its scalar
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
+
+    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
+    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
+    fused-3D branch mis-transposes packed NVFP4. See the comment at the
+    emission site below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
