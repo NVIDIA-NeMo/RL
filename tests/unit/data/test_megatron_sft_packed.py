@@ -138,6 +138,14 @@ def _dataset_parser() -> MegatronSFTPackedDataset:
             },
             "unknown SFT prompt format",
         ),
+        (
+            {
+                "megatron_sft_prompt_format": "identity",
+                "megatron_sft_context_parallel_size": 1,
+                "megatron_sft_assistant_prefix_len": -1,
+            },
+            "megatron_sft_assistant_prefix_len must be >= 0",
+        ),
     ],
 )
 def test_dataset_processor_rejects_invalid_packed_config_during_setup(
@@ -440,6 +448,30 @@ def test_nemotron_preprocessor_masks_prompt_and_assistant_prefix() -> None:
             ]
         ),
     )
+
+
+def test_nemotron_preprocessor_rejects_prefix_longer_than_assistant_turn() -> None:
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a"},
+    ]
+    tokenizer = _DummyTokenizer(
+        {
+            ("system", "s"): [10],
+            ("user", "u"): [20],
+            ("assistant", "a"): [30, 31],
+        }
+    )
+
+    with pytest.raises(ValueError, match="assistant_prefix_len"):
+        _preprocess(
+            messages,
+            tokenizer,
+            max_seq_length=8,
+            prompt_format="nemotron-nano-v2",
+            assistant_prefix_len=3,
+        )
 
 
 def test_nemotron_preprocessor_masks_tool_output_before_assistant_response() -> None:

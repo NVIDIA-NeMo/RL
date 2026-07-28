@@ -100,12 +100,15 @@ def _get_prompt_config(
     validate_megatron_sft_prompt_format(prompt_format)
 
     default = _PROMPT_CONFIGS[prompt_format]
+    resolved_assistant_prefix_len = (
+        default.assistant_prefix_len
+        if assistant_prefix_len is None
+        else assistant_prefix_len
+    )
+    if resolved_assistant_prefix_len < 0:
+        raise ValueError("assistant_prefix_len must be >= 0")
     return _PromptConfig(
-        assistant_prefix_len=(
-            default.assistant_prefix_len
-            if assistant_prefix_len is None
-            else assistant_prefix_len
-        ),
+        assistant_prefix_len=resolved_assistant_prefix_len,
         pad_token=default.pad_token if pad_token is None else pad_token,
         chat_template=default.chat_template,
         has_bos=default.has_bos,
@@ -157,8 +160,14 @@ def _tokenize_megatron_sft_conversation(
         role = turn["role"].lower()
         if role == "assistant" and len(turn["content"]) == 0:
             raise ValueError(f"empty assistant turn in conversation: {conversation}.")
-        if role == "assistant":
-            assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
+        if role == "assistant" and (
+            turn_idx == 0
+            or conversation[turn_idx - 1]["role"].lower() not in ("user", "tool")
+        ):
+            raise ValueError(
+                "An assistant turn must follow a user or tool turn in "
+                f"conversation: {conversation}."
+            )
 
         turn_tokens = _normalize_token_ids(
             tokenizer.apply_chat_template(
@@ -175,18 +184,23 @@ def _tokenize_megatron_sft_conversation(
             targets[idx : idx + turn_len] = [IGNORE_INDEX] * turn_len
         elif role == "assistant":
             prefix_len = prompt_config.assistant_prefix_len
+            if prefix_len > turn_len:
+                raise ValueError(
+                    f"assistant_prefix_len={prefix_len} exceeds assistant turn "
+                    f"length={turn_len}"
+                )
             targets[idx : idx + prefix_len] = [IGNORE_INDEX] * prefix_len
         else:
             raise ValueError("Wrong role value.")
 
-        assert tokens[idx : idx + turn_len] == turn_tokens, (
-            f"expected turn tokens to match tokens in conversation {conversation}"
-        )
+        if tokens[idx : idx + turn_len] != turn_tokens:
+            raise ValueError(
+                f"expected turn tokens to match tokens in conversation {conversation}"
+            )
         idx += turn_len
 
-    assert idx == len(tokens), (
-        f"mismatch in target masking the conversation {conversation}"
-    )
+    if idx != len(tokens):
+        raise ValueError(f"mismatch in target masking the conversation {conversation}")
     return tokens, targets
 
 

@@ -101,18 +101,83 @@ def _uses_direct_megatron_sft_packing(
     )
 
 
+def _direct_megatron_sft_context_parallel_sizes(
+    dataset: Optional[AllTaskProcessedDataset],
+) -> set[int]:
+    if dataset is None or not isinstance(dataset.task_data_processors, dict):
+        return set()
+    processor_entry = dataset.task_data_processors.get("megatron_sft_packed")
+    if not isinstance(processor_entry, tuple) or len(processor_entry) != 2:
+        return set()
+    processor = processor_entry[1]
+    if not isinstance(processor, partial) or processor.keywords is None:
+        return set()
+    context_parallel_size = processor.keywords.get("context_parallel_size")
+    return set() if context_parallel_size is None else {int(context_parallel_size)}
+
+
 def _validate_direct_megatron_sft_setup(
     master_config: MasterConfig,
     train_dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
     loss_fn: NLLLossFn,
 ) -> None:
-    uses_direct_packing = _uses_direct_megatron_sft_packing(
-        train_dataset
-    ) or _uses_direct_megatron_sft_packing(val_dataset)
+    direct_train = _uses_direct_megatron_sft_packing(train_dataset)
+    direct_validation = _uses_direct_megatron_sft_packing(val_dataset)
+    uses_direct_packing = direct_train or direct_validation
     if not uses_direct_packing:
         return
 
+    policy_config = master_config.policy
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires the Megatron backend"
+        )
+    policy_context_parallel_size = int(megatron_cfg["context_parallel_size"])
+    data_context_parallel_sizes = _direct_megatron_sft_context_parallel_sizes(
+        train_dataset
+    ) | _direct_megatron_sft_context_parallel_sizes(val_dataset)
+    mismatched_context_parallel_sizes = sorted(
+        size
+        for size in data_context_parallel_sizes
+        if size != policy_context_parallel_size
+    )
+    if mismatched_context_parallel_sizes:
+        raise ValueError(
+            "Megatron-LM prepacked SFT data was prepared for "
+            f"context_parallel_size={mismatched_context_parallel_sizes[0]}, but "
+            "policy context_parallel_size="
+            f"{policy_context_parallel_size}"
+        )
+    if "draft" in policy_config and policy_config["draft"]["enabled"]:
+        raise NotImplementedError(
+            "Direct Megatron-LM prepacked SFT does not support draft training"
+        )
+    if policy_config["dynamic_batching"]["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires dynamic batching to be disabled"
+        )
+    if direct_train and policy_config["train_micro_batch_size"] != 1:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires policy.train_micro_batch_size=1"
+        )
+    if direct_validation and master_config.sft.val_micro_batch_size != 1:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires sft.val_micro_batch_size=1"
+        )
+    if (
+        "sequence_packing" in policy_config
+        and policy_config["sequence_packing"]["enabled"]
+    ):
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires "
+            "policy.sequence_packing.enabled=false"
+        )
+    if "router_replay" in policy_config and policy_config["router_replay"]["enabled"]:
+        raise NotImplementedError(
+            "Direct Megatron-LM prepacked SFT does not support router replay"
+        )
     if master_config.sft.only_unmask_final:
         raise ValueError(
             "sft.only_unmask_final=true is not supported with direct "
@@ -132,10 +197,10 @@ def _build_sft_collate_fn(
     policy_config: PolicyConfig,
     cluster_config: ClusterConfig,
 ) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
-    megatron_cfg = policy_config.get("megatron_cfg", {})
+    megatron_cfg = policy_config.get("megatron_cfg")
     context_parallel_size = None
-    if megatron_cfg.get("enabled", False):
-        context_parallel_size = int(megatron_cfg.get("context_parallel_size", 1))
+    if megatron_cfg is not None and megatron_cfg["enabled"]:
+        context_parallel_size = int(megatron_cfg["context_parallel_size"])
 
     return partial(
         rl_collate_fn,

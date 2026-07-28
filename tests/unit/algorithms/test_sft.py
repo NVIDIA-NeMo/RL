@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -303,7 +304,13 @@ def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effec
     master_config.policy["megatron_cfg"] = {
         "enabled": True,
         "use_fused_linear_logprobs": False,
+        "context_parallel_size": 1,
     }
+    master_config.policy["train_micro_batch_size"] = 1
+    master_config.policy["dynamic_batching"] = {"enabled": False}
+    master_config.policy["sequence_packing"] = {"enabled": False}
+    master_config.policy["draft"] = {"enabled": False}
+    master_config.policy["router_replay"] = {"enabled": False}
     train_dataset = MagicMock()
     train_dataset.task_data_processors = {"megatron_sft_packed": MagicMock()}
 
@@ -314,6 +321,121 @@ def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effec
         with pytest.raises(
             ValueError,
             match=r"sft\.only_unmask_final=true.*direct Megatron-LM prepacked SFT",
+        ):
+            setup(
+                master_config,
+                mock_components["tokenizer"],
+                train_dataset,
+                None,
+            )
+
+
+@pytest.mark.parametrize(
+    ("policy_update", "sft_update", "message"),
+    [
+        ({"megatron_cfg": {"enabled": False}}, {}, "requires the Megatron backend"),
+        ({"draft": {"enabled": True}}, {}, "does not support draft training"),
+        (
+            {"dynamic_batching": {"enabled": True}},
+            {},
+            "requires dynamic batching to be disabled",
+        ),
+        (
+            {"train_micro_batch_size": 2},
+            {},
+            "requires policy.train_micro_batch_size=1",
+        ),
+        (
+            {"sequence_packing": {"enabled": True}},
+            {},
+            "requires policy.sequence_packing.enabled=false",
+        ),
+        (
+            {"router_replay": {"enabled": True}},
+            {},
+            "does not support router replay",
+        ),
+        ({}, {"val_micro_batch_size": 2}, "requires sft.val_micro_batch_size=1"),
+    ],
+)
+def test_setup_rejects_incompatible_direct_packed_policy_before_side_effects(
+    mock_components,
+    policy_update,
+    sft_update,
+    message,
+):
+    master_config = mock_components["master_config"]
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    master_config.policy.update(
+        {
+            "megatron_cfg": {
+                "enabled": True,
+                "use_fused_linear_logprobs": False,
+                "context_parallel_size": 1,
+            },
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "draft": {"enabled": False},
+            "router_replay": {"enabled": False},
+        }
+    )
+    master_config.policy.update(policy_update)
+    for key, value in sft_update.items():
+        setattr(master_config.sft, key, value)
+
+    train_dataset = MagicMock()
+    train_dataset.task_data_processors = {"megatron_sft_packed": MagicMock()}
+    val_dataset = MagicMock()
+    val_dataset.task_data_processors = {"megatron_sft_packed": MagicMock()}
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises((TypeError, ValueError, NotImplementedError), match=message):
+            setup(
+                master_config,
+                mock_components["tokenizer"],
+                train_dataset,
+                val_dataset,
+            )
+
+
+def test_setup_rejects_direct_packed_context_parallel_mismatch_before_side_effects(
+    mock_components,
+):
+    master_config = mock_components["master_config"]
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    master_config.policy.update(
+        {
+            "megatron_cfg": {
+                "enabled": True,
+                "use_fused_linear_logprobs": False,
+                "context_parallel_size": 2,
+            },
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "draft": {"enabled": False},
+            "router_replay": {"enabled": False},
+        }
+    )
+    processor = partial(MagicMock(), context_parallel_size=1)
+    train_dataset = MagicMock()
+    train_dataset.task_data_processors = {
+        "megatron_sft_packed": (MagicMock(), processor)
+    }
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(
+            ValueError,
+            match=r"prepared for context_parallel_size=1.*context_parallel_size=2",
         ):
             setup(
                 master_config,

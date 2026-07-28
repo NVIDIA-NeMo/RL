@@ -32,9 +32,15 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
-    megatron_sft_prompt_format: NotRequired[str]
+    # Prompt format used to reproduce Megatron-LM SFT tokenization.
+    megatron_sft_prompt_format: NotRequired[
+        Literal["identity", "nemotron-nano-v2", "nemotron-h-aligned"]
+    ]
+    # Optional tokenizer token override used to pad each fixed-length packed row.
     megatron_sft_pad_token: NotRequired[str | None]
+    # Optional assistant-prefix token count to exclude from the training loss.
     megatron_sft_assistant_prefix_len: NotRequired[int | None]
+    # Context-parallel size used when padding every packed segment.
     megatron_sft_context_parallel_size: NotRequired[int]
 
 

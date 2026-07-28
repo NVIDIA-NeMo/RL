@@ -64,6 +64,11 @@ class MegatronSFTPackedDataset(RawDataset):
         configured_prefix_len: Any = self.data_config.get(
             "megatron_sft_assistant_prefix_len", None
         )
+        assistant_prefix_len = (
+            None if configured_prefix_len is None else int(configured_prefix_len)
+        )
+        if assistant_prefix_len is not None and assistant_prefix_len < 0:
+            raise ValueError("megatron_sft_assistant_prefix_len must be >= 0")
         configured_context_parallel_size: Any = self.data_config[
             "megatron_sft_context_parallel_size"
         ]
@@ -74,8 +79,6 @@ class MegatronSFTPackedDataset(RawDataset):
             megatron_sft_packed_preprocessor,
             prompt_format=str(prompt_format),
             pad_token=self.data_config.get("megatron_sft_pad_token", None),
-            assistant_prefix_len=(
-                None if configured_prefix_len is None else int(configured_prefix_len)
-            ),
+            assistant_prefix_len=assistant_prefix_len,
             context_parallel_size=context_parallel_size,
         )
