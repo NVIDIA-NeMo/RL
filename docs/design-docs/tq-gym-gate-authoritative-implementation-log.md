@@ -148,7 +148,52 @@ staging/ subpackage" (the post-review restructure; see Open TODOs).
 
 ## S2 — capture core + vLLM adapter + worker hosting
 
-Status: not started (blocked on S1 sign-off)
+Status: **code + tests complete (2026-07-28); awaiting user sign-off at the
+S2 gate.**
+
+### Gym fork (submodule branch `tq-gate-capture`)
+
+One commit on top of the S1 pair: `51b8092e` "feat(token-id-capture): S2
+engine-blind capture core + vLLM adapter".
+
+| Item | Status | Notes |
+|---|---|---|
+| `staging/capture.py` | done | `RolloutTokenCapture.begin_call/complete_call` — engine-blind record + digest build; **fail-closed ordering**: staged coords exist only after `sink.stage` reports bytes durable, every capture failure (bad delta, sink rejection/exception, extraction error) degrades to `capture_failed` coords without breaking the served completion; weight version stamped at `begin_call` (generation-start semantics); streaming rejected (`StreamingUnsupportedError`); double-complete is a loud caller bug; `complete_call_from_response` drives the adapter; `install_capture` working body via the `CaptureHost` one-method seam (instance also returned) |
+| `staging/protocols.py` | done | S1-frozen `install_capture` signature now delegates to the capture core (was `NotImplementedError`); same callable re-exported from `staging/__init__` |
+| `adapters/vllm.py` | done | engine-specific only, **no vllm imports** (duck-typed payloads): `enter_prefix` via the worker's existing `required_prefix_token_ids` field; `replace_prefix_tokens` relocated **verbatim** from `nemo_rl/models/generation/vllm/vllm_worker_async.py`; native extraction off the final chat payload — message token fields or `choice.logprobs.content` `token_id:` entries (in-process; no second `/tokenize`); one-choice guard; `extract_prompt_ids` reads the hookup-attached engine prompt (vLLM's OpenAI response doesn't carry it) |
+| tests | done | `tests/unit_tests/test_token_capture_s2_worker.py` — 29 tests: mock adapter + mock sink ordering matrix, install wiring, extraction shapes, splice goldens incl. the § 4.1-style retokenization-drift example; **75/75 green** (S2 + S1 primitives + #2124 base suite; the purity glob picked up `capture.py` automatically) |
+
+### NeMo-RL repo
+
+| Item | Status | Notes |
+|---|---|---|
+| `vllm_worker_async.py` hosting | done | `install_token_capture` (CaptureHost seam), `setup_token_capture(dp_cfg, staging_partition)` fan-out target (in-worker DP client + `TQTokenSink` + the single `install_capture` call with `VLLMCaptureAdapter`; model-owner ranks only), `_rollout_weight_version` attribute + `set_rollout_weight_version`. All dormant until the fan-out runs. |
+| `vllm_generation.py` fan-outs | done | `setup_token_capture` (asserts async engine) + `set_rollout_weight_version`, standard `run_all_workers_single_data` DP-leader pattern |
+| SC `_sync_weights` rotation | done | flag-gated `set_rollout_weight_version(self._trainer_version)` fan-out beside the existing `RolloutManager.set_weight_version` (§ 9.1 lists this under S4; pulled forward as it completes the S2 version-stamping story — disclosed) |
+| `PY_EXECUTABLES.VLLM_GYM` | done | `--extra vllm --extra nemo_gym` worker env for capture-enabled runs (constant only; the flag-gated registry override for `VllmAsyncGenerationWorker` is S4 setup wiring) |
+| pyrefly | done | `tq_token_sink.py` added to `project-includes`; `nemo_gym.*` added to `replace-imports-with-any` (editable finder hook unresolvable, same pattern as vllm/megatron) |
+| Tests | done | `tests/unit/models/generation/test_vllm_token_capture_hosting.py` — 6 tests (`--nemo-gym-only`): install wiring w/ vLLM adapter, non-model-owner skip, live version stamping through the install closure into staged records, both fan-outs incl. async-engine guard |
+
+### S2 checks (carried from the S1 gate)
+
+- **Leaf package importable in the worker venv**: `uv run --locked --extra
+  vllm --extra nemo_gym` resolves and imports
+  `nemo_gym.token_id_capture.staging` + `adapters.vllm` beside vllm 0.20.0
+  (the prebaked `--extra vllm`-only venv does *not* contain `nemo_gym` —
+  hence `VLLM_GYM`, switched in at setup only when capture is enabled).
+
+### Deviations / disclosures (for S2 sign-off)
+
+1. **`install_capture` returns the capture instance** (S1 signature said
+   `-> None`): additive; the `CaptureHost` seam remains the primary wiring.
+2. **SC `_sync_weights` fan-out pulled forward from S4** (flag-gated,
+   dormant): completes per-call version stamping end-to-end in S2.
+3. **`pyrefly.toml` edits** are active regardless of the flag (type-checker
+   config only; no runtime effect).
+4. **Worker request-path integration deferred to S3** by design: the gate
+   owns the gate→worker context wire shape (serving rule § 3.3), so
+   `begin_call`/`complete_call` are not yet called from the HTTP handler —
+   S2 delivers the hosting seam, the capture core, and the adapter.
 
 ## S3 — Gym gate
 

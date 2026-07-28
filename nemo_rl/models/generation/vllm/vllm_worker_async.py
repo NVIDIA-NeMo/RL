@@ -195,6 +195,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.base_url = None
         self.http_server = None
 
+        # Gate-authoritative token capture (dormant until the
+        # setup_token_capture fan-out runs; see
+        # docs/design-docs/tq-gym-gate-authoritative.md § 9.1). The weight
+        # version is stamped per model call at begin_call time and rotated by
+        # the set_rollout_weight_version fan-out from the SC's _sync_weights.
+        self.token_capture = None
+        self._rollout_weight_version = 0
+
         super().__init__(
             config,
             bundle_indices,
@@ -426,6 +434,44 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
+
+    def install_token_capture(self, capture: Any) -> None:
+        """Gym's ``install_capture`` seam (the ``CaptureHost`` contract)."""
+        self.token_capture = capture
+
+    async def setup_token_capture(
+        self, dp_cfg: dict[str, Any], staging_partition: str
+    ) -> bool:
+        """Host gate-authoritative token capture in this worker.
+
+        Fan-out target (token_capture.enabled only): builds the in-worker
+        data-plane client and TQTokenSink, then makes the single
+        ``install_capture`` call wiring Gym's engine-blind capture core +
+        vLLM adapter into this worker. Returns whether capture was installed
+        (False on non-model-owner ranks, which serve no HTTP).
+        """
+        if not self.is_model_owner:
+            return False
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+        from nemo_gym.token_id_capture.staging import install_capture
+
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        install_capture(
+            self,
+            sink=sink,
+            weight_version_fn=lambda: self._rollout_weight_version,
+            adapter=VLLMCaptureAdapter(),
+        )
+        return True
+
+    async def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version stamped on subsequent captured calls."""
+        self._rollout_weight_version = int(version)
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:

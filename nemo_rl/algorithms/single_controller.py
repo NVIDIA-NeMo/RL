@@ -595,6 +595,12 @@ class SingleControllerActor:
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
+        if self._master_config.token_capture.enabled:
+            # Rotate the version vLLM workers stamp on captured model calls
+            # (per-call tagging; group staleness = min over the group's calls).
+            await asyncio.to_thread(
+                self._gen.set_rollout_weight_version, self._trainer_version
+            )
         self._rollout_permitted.set()
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
