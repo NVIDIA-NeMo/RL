@@ -30,9 +30,38 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    invalidate_sglang_kv_cache_for_refit,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+@pytest.mark.parametrize("pause_mode", ["retract", "release"])
+def test_invalidate_sglang_kv_cache_for_refit_requires_success(pause_mode):
+    policy_generation = unittest.mock.MagicMock()
+    policy_generation.invalidate_kv_cache.return_value = False
+
+    with pytest.raises(RuntimeError, match="no weights were sent"):
+        invalidate_sglang_kv_cache_for_refit(policy_generation, pause_mode)
+
+    policy_generation.invalidate_kv_cache.assert_called_once_with()
+
+
+def test_invalidate_sglang_kv_cache_for_refit_accepts_success():
+    policy_generation = unittest.mock.MagicMock()
+    policy_generation.invalidate_kv_cache.return_value = True
+
+    invalidate_sglang_kv_cache_for_refit(policy_generation, "retract")
+
+    policy_generation.invalidate_kv_cache.assert_called_once_with()
+
+
+def test_invalidate_sglang_kv_cache_for_refit_preserves_in_place_state():
+    policy_generation = unittest.mock.MagicMock()
+
+    invalidate_sglang_kv_cache_for_refit(policy_generation, "in_place")
+
+    policy_generation.invalidate_kv_cache.assert_not_called()
 
 
 class TestGetMegatronCheckpointDir:

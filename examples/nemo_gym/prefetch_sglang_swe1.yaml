@@ -1,0 +1,21 @@
+# Prefetch the NeMo-Gym virtual environments used by the public SGLang SWE1
+# integration recipe. Values below only satisfy config interpolation during
+# NemoGym's dry-run setup; no model server is contacted.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    config_paths:
+    - responses_api_models/sglang_model/configs/sglang_model_for_training.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    policy_model:
+      responses_api_models:
+        sglang_model:
+          context_length: 128
+          sglang_tool_format: hermes
+          uses_reasoning_parser: true

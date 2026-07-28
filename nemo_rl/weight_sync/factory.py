@@ -16,7 +16,7 @@
 
 Selects the appropriate weight synchronizer based on the deployment
 topology (colocated vs. non-colocated) and the generation backend
-(vLLM uses IPC/ZMQ, SGLang uses HTTP, non-colocated uses NCCL).
+(vLLM uses IPC/ZMQ, SGLang uses Ray CUDA-IPC, non-colocated uses NCCL).
 """
 
 from typing import Any, Optional
@@ -116,11 +116,11 @@ def create_weight_synchronizer(
         )
 
     if generation_backend == SGLANG_BACKEND:
-        from nemo_rl.weight_sync.http_weight_synchronizer import (
-            HTTPWeightSynchronizer,
+        from nemo_rl.weight_sync.sglang_weight_synchronizer import (
+            SGLangColocatedWeightSynchronizer,
         )
 
-        return HTTPWeightSynchronizer(
+        return SGLangColocatedWeightSynchronizer(
             policy=policy,
             generation=generation,
             refit_buffer_size_gb=refit_buffer_size_gb,

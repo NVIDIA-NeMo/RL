@@ -15,13 +15,17 @@
 import ipaddress
 import logging
 
-import ray
-
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
 )
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
+from nemo_rl.models.generation.sglang.utils.refit_deadline import (
+    SGLangRefitDeadline,
+)
+from nemo_rl.models.generation.sglang.utils.startup_deadline import (
+    SGLangStartupDeadline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     port_range_low: int = DEFAULT_GENERATION_PORT_RANGE_LOW,
     port_range_high: int = DEFAULT_GENERATION_PORT_RANGE_HIGH,
     node_port_cursor: dict[int, int] | None = None,
+    deadline: SGLangStartupDeadline | SGLangRefitDeadline,
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -96,20 +101,26 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
             def port(consecutive=1):
                 nonlocal start_port
-                port = ray.get(
+                port = deadline.ray_get(
                     engine._get_current_free_port.remote(
                         port_range_low=port_range_low,
                         port_range_high=port_range_high,
                         consecutive=consecutive,
                         start_port=start_port,
-                    )
+                    ),
+                    stage=f"allocating ports on rollout node {node_idx}",
+                    cancel_on_error=True,
                 )
                 start_port = port + consecutive
                 node_port_cursor[node_idx] = start_port
                 return port
 
             def addr():
-                addr = ray.get(engine._get_current_node_ip.remote())
+                addr = deadline.ray_get(
+                    engine._get_current_node_ip.remote(),
+                    stage=f"resolving rollout node {node_idx} address",
+                    cancel_on_error=True,
+                )
                 if addr is None:
                     addr = get_host_info()[1]
                 return addr

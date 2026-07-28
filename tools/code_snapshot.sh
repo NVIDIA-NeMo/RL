@@ -28,16 +28,22 @@ if [[ ! -d "$SNAPSHOT_DIR" ]]; then
   echo2 "Creating new code snapshot in $SNAPSHOT_DIR"
   mkdir -p $SNAPSHOT_DIR
 else
-  echo2 "Using existing code snapshot in $SNAPSHOT_DIR"
-  # Echo the snapshot directory so the caller can use it to `cd` into it
-  echo ${SNAPSHOT_DIR}
-  exit
+  echo2 "Refreshing existing code snapshot in $SNAPSHOT_DIR"
 fi
 
+# Always re-copy. Returning early on an existing directory made a rerun execute
+# whatever that directory happened to hold, while the caller recorded the
+# current source commit as provenance -- so evidence could describe code that
+# never ran. rsync is incremental, so refreshing an up-to-date snapshot is
+# cheap. Deliberately no --delete: run outputs live under this directory.
 echo2 "Copying git-tracked files and submodules..."
 rsync -a --files-from=<(
   git ls-files --recurse-submodules --cached --full-name
 ) ./ $SNAPSHOT_DIR/
+
+# Record what this snapshot was built from, so a stale or hand-edited tree is
+# identifiable after the fact.
+git rev-parse HEAD > "$SNAPSHOT_DIR/.code_snapshot_source_commit"
 
 
 # Echo the snapshot directory so the caller can use it to `cd` into it

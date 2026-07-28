@@ -87,6 +87,7 @@ def make_sglang_cfg(
             "disable_piecewise_cuda_graph": True,
             "disable_cuda_graph": True,
             "mem_fraction_static": 0.3,
+            "engine_startup_timeout_s": 1800,
             "sglang_server_config": {
                 "num_gpus": num_gpus,
                 "num_gpus_per_engine": tp_size,
@@ -157,6 +158,7 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
             host=host_ip,
             router_ip=router_info["ip"],
             router_port=router_info["port"],
+            startup_timeout_s=sglang_cfg["sglang_cfg"]["engine_startup_timeout_s"],
         )
     )
     return worker

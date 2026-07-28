@@ -349,8 +349,8 @@ async def generate_responses_async(
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
     # Check if this is a supported inference engine with async generation enabled.
-    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
-    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; the other
+    # supported backends expose ``cfg`` and gate on their ``async_engine`` flag.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -381,7 +381,8 @@ async def generate_responses_async(
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
         "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
-        "policy.generation.mcore_generation_config.async_engine=True. The "
+        "policy.generation.mcore_generation_config.async_engine=True. For "
+        "TRT-LLM, set policy.generation.trtllm_cfg.async_engine=True. The "
         "generation backend must also implement generate_async."
     )
 
@@ -1983,6 +1984,53 @@ def _tensorize_nemo_gym_result(result: dict) -> None:
     )
 
 
+def _resolve_generation_context_limit(
+    policy_generation: GenerationInterface,
+    *,
+    policy_max_seq_len: Optional[int],
+) -> int:
+    """Resolve the active backend's context limit for NeMo-Gym rollouts.
+
+    Backend dispatch must use ``cfg["backend"]`` rather than the presence of a
+    backend-specific config block because inherited YAML can retain inactive
+    blocks. SGLang permits ``context_length: null``; in that case the policy
+    limit is the only local bound available to NeMo-Gym.
+    """
+    cfg = policy_generation.cfg
+    backend = cfg.get("backend")
+
+    if backend == "sglang":
+        context_length = cfg["sglang_cfg"].get("context_length")
+        if context_length is not None:
+            return context_length
+        if policy_max_seq_len is None:
+            raise ValueError(
+                "SGLang NeMo-Gym rollouts require either "
+                "policy.generation.sglang_cfg.context_length or a policy "
+                "max_total_sequence_length."
+            )
+        return policy_max_seq_len
+
+    if backend == "vllm":
+        return cfg["vllm_cfg"]["max_model_len"]
+    if backend == "megatron":
+        return cfg["mcore_generation_config"]["max_model_len"]
+    if backend == "trtllm":
+        return cfg["trtllm_cfg"]["max_model_len"]
+
+    # Preserve compatibility with lightweight GenerationInterface test doubles
+    # and older backends that do not yet expose an explicit backend field.
+    if "vllm_cfg" in cfg:
+        return cfg["vllm_cfg"]["max_model_len"]
+    if "mcore_generation_config" in cfg:
+        return cfg["mcore_generation_config"]["max_model_len"]
+    if "max_total_sequence_length" in cfg:
+        return cfg["max_total_sequence_length"]
+    if policy_max_seq_len is not None:
+        return policy_max_seq_len
+    raise ValueError("Unable to resolve the generation context limit for NeMo-Gym.")
+
+
 async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -2054,14 +2102,10 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    if "vllm_cfg" in policy_generation.cfg:
-        engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
-    elif "mcore_generation_config" in policy_generation.cfg:
-        engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
-            "max_model_len"
-        ]
-    else:
-        engine_max_model_len = policy_generation.cfg["max_total_sequence_length"]
+    engine_max_model_len = _resolve_generation_context_limit(
+        policy_generation,
+        policy_max_seq_len=max_seq_len,
+    )
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -2138,13 +2182,13 @@ async def run_async_nemo_gym_rollout(
                         results=completed_group.results,
                         timer=timer,
                         timer_prefix=timer_prefix,
-                        policy_generation=policy_generation,
                         input_batch=input_batch.slice(
                             completed_group.group_index * num_generations,
                             (completed_group.group_index + 1) * num_generations,
                         ),
                         tokenizer=tokenizer,
                         log_full_result_tables=log_full_result_tables,
+                        max_total_tokens_per_sample=engine_max_model_len,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
@@ -2250,10 +2294,10 @@ def _postprocess_single_nemo_gym_group(
     results: list[dict],
     timer: Timer,
     timer_prefix: str,
-    policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     log_full_result_tables: bool,
+    max_total_tokens_per_sample: int,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
@@ -2274,22 +2318,6 @@ def _postprocess_single_nemo_gym_group(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        if "vllm_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
-                "max_model_len"
-            ]
-        elif "trtllm_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"][
-                "max_model_len"
-            ]
-        elif "mcore_generation_config" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg[
-                "mcore_generation_config"
-            ]["max_model_len"]
-        else:
-            max_total_tokens_per_sample = policy_generation.cfg[
-                "max_total_sequence_length"
-            ]
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],
