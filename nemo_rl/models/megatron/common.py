@@ -125,6 +125,9 @@ def get_moe_metrics(
     loss_scale: float,
     total_loss_dict: Optional[dict] = None,
     per_layer_logging: bool = False,
+    num_layers: Optional[int] = None,
+    mtp_num_layers: Optional[int] = None,
+    track_names: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
 
@@ -141,7 +144,40 @@ def get_moe_metrics(
         the mean value is returned under the same key (e.g., "load_balancing_loss").
         If per_layer_logging is True, per-layer values are returned under keys of the
         form "moe/{name}_layer_{i}".
+
+    Note:
+        num_layers/mtp_num_layers pre-initialize the aux-loss tracker so every
+        pipeline-parallel rank participates in the collective all_reduce below with
+        an equally-sized tensor, preventing a hang when some PP rank did not save an
+        aux loss this step (e.g. an MTP MoE layer that lives only on the last stage).
     """
+    # Pre-initialize the aux-loss tracker so every PP rank has the same set of
+    # named, equally-sized tensors BEFORE the collective all_reduce below.
+    #
+    # reduce_aux_losses_tracker_across_ranks() runs torch.distributed.all_reduce over
+    # the pipeline-parallel group for each name present in the *local* tracker. The
+    # tracker entry is created lazily (Megatron save_to_aux_losses_tracker only
+    # allocates torch.zeros(num_layers) the first time a rank saves a loss). If any PP
+    # rank did not save an aux loss this step, it skips the all_reduce for that name
+    # while other PP ranks perform it -> the collective mismatches participants and hangs.
+    #
+    # Mirror Megatron's own track_moe_metrics(force_initialize=True) guard: allocate a
+    # zero tensor of size (num_layers + mtp_num_layers) for each tracked name on every
+    # rank, matching the size the router uses in save_to_aux_losses_tracker.
+    if num_layers is not None:
+        if track_names is None:
+            track_names = ["load_balancing_loss"]
+        tracker_num_layers = num_layers + (mtp_num_layers or 0)
+        tracker = get_moe_layer_wise_logging_tracker()
+        for name in track_names:
+            if name not in tracker:
+                tracker[name] = {
+                    "values": torch.zeros(tracker_num_layers, device="cuda"),
+                    "reduce_group": None,
+                    "avg_group": None,
+                    "reduce_group_has_dp": False,
+                }
+
     reduce_aux_losses_tracker_across_ranks()
     tracker = get_moe_layer_wise_logging_tracker()
 
