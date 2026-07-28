@@ -81,20 +81,24 @@ data:
 env:
   image_reward:
     plugins:
-      - name: "ocr"
+      # GenRM OCR reward (verl-omni parity — this is the reward that produces
+      # the convergence curve in docs/guides/diffusion-grpo.md). A Qwen3-VL-8B
+      # judge behind an OpenAI-compatible endpoint (GENRM_BASE_URL env var)
+      # transcribes each image; the transcription is scored by Levenshtein vs
+      # the prompt's quoted target. See the guide for how to serve the judge.
+      - name: "genrm_ocr"
         weight: 1.0
-      # GenRM alternative (verl-omni genrm_ocr parity): a VLM behind an
-      # OpenAI-compatible endpoint (GENRM_BASE_URL env var) transcribes the
-      # image. Defaults shown; only `name` is required.
-      # - name: "genrm_ocr"
+        model: "Qwen/Qwen3-VL-8B-Instruct"
+        temperature: 0.7
+        top_p: 0.8
+        max_tokens: 4096
+      # CPU alternative needing no served judge (used by the nightly recipe):
+      # PaddleOCR edit-distance reward.
+      # - name: "ocr"
       #   weight: 1.0
-      #   model: "~/models/tiny-random/qwen3-vl"
-      #   temperature: 0.7
-      #   top_p: 0.8
-      #   max_tokens: 4096
     num_cpus_per_worker: 4
     num_gpus_per_worker: 0.0
-    num_workers_per_plugin: 16  # 512 images/step on CPU OCR needs parallel replicas
+    num_workers_per_plugin: 16  # parallel replicas for 512 images/step (HTTP judge or CPU OCR)
 
 cluster:
   gpus_per_node: 8
