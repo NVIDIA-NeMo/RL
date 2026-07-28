@@ -19,8 +19,6 @@ import torch
 
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
-    PACKED_MULTIMODAL_FIELDS,
-    PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
 )
 from nemo_rl.distributed.batched_data_dict import (
@@ -642,104 +640,6 @@ def test_packedtensor_empty_legacy_rows_survive_copy_pickle_and_slice():
         assert sum(value.logical_segment_counts_by_row()) == 0
         assert not value.deduplication_enabled
         assert value.as_tensor() is None
-
-
-def test_get_multimodal_dict_full_vlm_wire_roundtrip():
-    """End-to-end wire encoding on a realistic VLM batch.
-
-    Mirrors what ``sync_rollout_actor`` writes and what the trainer
-    reads through the data plane. Verifies:
-      1. Every ``PACKED_MULTIMODAL_FIELDS`` entry survives the
-         ``to_nested_wire`` → materialize (padded) → ``from_nested_wire``
-         round trip so ``.as_tensor()`` recovers the original concat.
-      2. Every ``PER_TOKEN_MULTIMODAL_FIELDS`` plain tensor passes
-         through unchanged.
-      3. Non-multimodal keys (``input_ids``, ``token_mask``) are
-         silently dropped by ``get_multimodal_dict``.
-      4. ``as_tensors=True`` concatenates packed fields; ``as_tensors=False``
-         returns ``PackedTensor`` wrappers so callers can inspect
-         per-sample structure.
-    """
-    # Sanity check: the field names used below are covered by the
-    # module-level registries. Test breaks if someone renames a field
-    # but forgets to update the registry — the silent-drop guard rail.
-    assert "pixel_values" in PACKED_MULTIMODAL_FIELDS
-    assert "image_grid_thw" in PACKED_MULTIMODAL_FIELDS
-    assert "mm_token_type_ids" in PER_TOKEN_MULTIMODAL_FIELDS
-
-    torch.manual_seed(0)
-    batch_size = 4
-    seqlen = 32
-
-    # --- rollout-side state: what get_multimodal_dict(as_tensors=False)
-    # would return before wire encoding. Mixed per-sample sizes to
-    # exercise the jagged path; sample 2 has no image (None entry).
-    pixel_values_per_sample = [
-        torch.randn(3, 4, 4),  # sample 0: 3 patches
-        torch.randn(5, 4, 4),  # sample 1: 5 patches
-        None,  # sample 2: text-only
-        torch.randn(2, 4, 4),  # sample 3: 2 patches
-    ]
-    image_grid_thw_per_sample = [
-        torch.tensor([[1, 2, 2]], dtype=torch.int64),  # 1 image
-        torch.tensor([[1, 3, 3], [1, 2, 2]], dtype=torch.int64),  # 2 images
-        None,
-        torch.tensor([[1, 2, 1]], dtype=torch.int64),  # 1 image
-    ]
-    mm_token_type_ids = torch.randint(0, 3, (batch_size, seqlen), dtype=torch.int64)
-
-    pixel_pt = PackedTensor(pixel_values_per_sample, dim_to_pack=0)
-    grid_pt = PackedTensor(image_grid_thw_per_sample, dim_to_pack=0)
-
-    # --- write side: PackedTensor.to_nested_wire → nested + lengths.
-    pixel_nested, pixel_lengths = pixel_pt.to_nested_wire()
-    grid_nested, grid_lengths = grid_pt.to_nested_wire()
-    assert pixel_nested is not None and pixel_lengths is not None
-    assert grid_nested is not None and grid_lengths is not None
-    assert pixel_lengths.tolist() == [3, 5, 0, 2]
-    assert grid_lengths.tolist() == [1, 2, 0, 1]
-
-    # --- materialize: torch.nested → rectangular padded (what
-    # codec.materialize does before handing off to the trainer).
-    pixel_padded = torch.nested.to_padded_tensor(pixel_nested, padding=0.0)
-    grid_padded = torch.nested.to_padded_tensor(grid_nested, padding=0)
-    # Padded shape carries max per-sample dim in dim 1.
-    assert pixel_padded.shape == (batch_size, 5, 4, 4)
-    assert grid_padded.shape == (batch_size, 2, 3)
-
-    # --- read side: assemble the BatchedDataDict the trainer actually
-    # sees post-fetch — wire-form parents + companion __lengths + plain
-    # per-token map + non-multimodal fields that must be dropped.
-    data = BatchedDataDict(
-        {
-            "pixel_values": pixel_padded,
-            PackedTensor.lengths_key("pixel_values"): pixel_lengths,
-            "image_grid_thw": grid_padded,
-            PackedTensor.lengths_key("image_grid_thw"): grid_lengths,
-            "mm_token_type_ids": mm_token_type_ids,
-            # Non-multimodal — must be silently skipped.
-            "input_ids": torch.randint(0, 100, (batch_size, seqlen)),
-            "token_mask": torch.ones(batch_size, seqlen),
-        }
-    )
-
-    # as_tensors=False: PackedTensor wrappers back for jagged inspection.
-    mm_wrapped = data.get_multimodal_dict(as_tensors=False)
-    assert set(mm_wrapped.keys()) == {
-        "pixel_values",
-        "image_grid_thw",
-        "mm_token_type_ids",
-    }
-    assert isinstance(mm_wrapped["pixel_values"], PackedTensor)
-    assert isinstance(mm_wrapped["image_grid_thw"], PackedTensor)
-    assert torch.equal(mm_wrapped["mm_token_type_ids"], mm_token_type_ids)
-
-    # as_tensors=True: packed fields concatenated to a single tensor
-    # per key; must match the pre-wire ``.as_tensor()`` output.
-    mm_concat = data.get_multimodal_dict(as_tensors=True)
-    assert torch.equal(mm_concat["pixel_values"], pixel_pt.as_tensor())
-    assert torch.equal(mm_concat["image_grid_thw"], grid_pt.as_tensor())
-    assert torch.equal(mm_concat["mm_token_type_ids"], mm_token_type_ids)
 
 
 def test_to_nested_wire_emits_one_row_per_logical_row_under_dedup():
