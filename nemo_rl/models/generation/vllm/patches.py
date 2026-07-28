@@ -82,9 +82,28 @@ def _patch_vllm_init_workers_ray(
        (this includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
        https://github.com/NVIDIA-NeMo/RL/pull/898).
 
+    .. note::
+        Step 1 patches the **v1 Ray executor**, which vLLM 0.25 no longer
+        selects by default: ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND`` flipped from
+        ``"0"`` (0.20) to ``"1"`` (0.25), so ``Executor.get_class`` returns
+        ``RayExecutorV2`` for ray-backed engines. ``RayExecutorV2`` has no
+        ``_init_workers_ray`` at all -- it creates workers inline, and its
+        ``_build_runtime_env`` never sets ``py_executable``.
+
+        The patch is kept because it is still load-bearing when
+        ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`` selects the v1 executor. Under
+        the 0.25 default it is inert, and workers get the right interpreter
+        from Ray's per-field ``runtime_env`` inheritance instead: the parent
+        NeMo-RL actor sets ``py_executable``, and a child created with a
+        ``runtime_env`` that omits it inherits the parent's value.
+
+        So a ``True`` return means "the anchor is in place", not "this is what
+        put the workers on the right interpreter". The caller logs
+        accordingly.
+
     Returns:
-        Whether the runtime_env source patch is in place. The env-var merge in
-        step 2 cannot fail, but step 1 is anchored on a call-site string; if
+        Whether the v1 runtime_env source patch is in place. The env-var merge
+        in step 2 cannot fail, but step 1 is anchored on a call-site string; if
         that moves upstream the py_executable injection silently stops
         happening, so the caller must not report success unconditionally.
     """
@@ -497,7 +516,11 @@ def _apply_vllm_patches(
     patch_logger = init_logger("vllm_patch")
 
     if _patch_vllm_init_workers_ray(py_executable, extra_env_vars):
-        patch_logger.info("Successfully patched vllm _init_workers_ray.")
+        patch_logger.info(
+            "Patched vllm v1 _init_workers_ray (inert under the vLLM 0.25 "
+            "default, which selects RayExecutorV2; workers inherit "
+            "py_executable from this actor's runtime_env instead)."
+        )
     else:
         patch_logger.warning(
             "vllm _init_workers_ray patch did not apply: the "
