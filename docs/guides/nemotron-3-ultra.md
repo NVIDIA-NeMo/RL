@@ -20,7 +20,7 @@ main stages are:
 3. **MOPD** — on-policy distillation from the student into the teacher panel.
 
 Every stage shares the same launcher (`ultra_launch.sh`) and a per-stage YAML
-config under `examples/configs/ultra/`.
+config under `examples/nemo_gym/nemotron-3-ultra/`.
 
 ### Checkpoint flow
 
@@ -202,17 +202,18 @@ enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
 
 ## Launch script
 
-Every stage is submitted with `ultra_launch.sh` at the repo root. The launcher
+Every stage is submitted with `examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh`,
+run from the repo root. The launcher
 handles SLURM submission, code snapshotting, persistent cache management, and
 container mounts — stage-specific hyperparameters (batch size, advantage clip,
 MoE parallelism, learning rate) live in the per-stage YAML.
 
-Set the following before each `bash ultra_launch.sh` invocation:
+Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh` invocation:
 
 | Variable | Purpose |
 |---|---|
 | `EXP_NAME` | Job name, W&B run name, and the suffix for output directories. Must be unique per run; same name across resubmissions resumes from the latest checkpoint. |
-| `CONFIG_PATH` | Path to the per-stage YAML config (e.g. `examples/configs/ultra/student_rlvr1.yaml`). |
+| `CONFIG_PATH` | Path to the per-stage YAML config (e.g. `examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml`). |
 | `MODEL_PATH` | Initial policy checkpoint (HuggingFace repo id or local path). Student RLVR starts from the Ultra SFT checkpoint; the teacher stages start from the Student RLVR checkpoint; MOPD starts from the student (the Student RLVR checkpoint). |
 | `TRAIN_PATH` | Training data JSONL. |
 | `VAL_PATH` | Validation data JSONL. |
@@ -249,7 +250,7 @@ second phase resumes from the first phase's checkpoint:
 
 | | Phase 1 | Phase 2 |
 |---|---|---|
-| Config | `examples/configs/ultra/student_rlvr1.yaml` | `examples/configs/ultra/student_rlvr2.yaml` |
+| Config | `examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml` | `examples/nemo_gym/nemotron-3-ultra/student_rlvr2.yaml` |
 | `max_total_sequence_length` | 49,152 | 65,536 |
 | Steps in this phase | ~128 | ~50 |
 | `NRL_MAX_STEPS` to set | `128` | `178` (= 128 + 50) |
@@ -262,7 +263,7 @@ generations), advantage clip ±20, and the 256-node cluster shape.
 
 ```bash
 EXP_NAME=ultra-student-rlvr \
-CONFIG_PATH=examples/configs/ultra/student_rlvr1.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml \
 ENABLE_MTP_INFERENCE=1 \
 NRL_MAX_STEPS=128 \
 MODEL_PATH=/path/to/ultra_sft_checkpoint \
@@ -280,7 +281,7 @@ SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
 ### Phase 2 — 65k context, ~50 more steps
@@ -292,7 +293,7 @@ checkpoint.
 
 ```bash
 EXP_NAME=ultra-student-rlvr \
-CONFIG_PATH=examples/configs/ultra/student_rlvr2.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/student_rlvr2.yaml \
 ENABLE_MTP_INFERENCE=1 \
 NRL_MAX_STEPS=178 \
 MODEL_PATH=/path/to/ultra_sft_checkpoint \
@@ -310,7 +311,7 @@ SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
 Note: Phase 1 and Phase 2 use different training blends (`rlvr1.train.jsonl` and
@@ -324,7 +325,7 @@ commands, and (on submission) the SLURM job id.
 
 The teacher panel is a set of specialised RL runs that each start from the
 Student RLVR output (Stage 1) (see [Checkpoint flow](#checkpoint-flow) above). Each teacher
-runs independently with its own YAML config under `examples/configs/ultra/`.
+runs independently with its own YAML config under `examples/nemo_gym/nemotron-3-ultra/`.
 
 The teachers don't depend on each other and can run in parallel.
 
@@ -334,7 +335,7 @@ RLHF teacher specializing in instruction following, abstention, and refusal
 behavior. Trained at 49k context with a smaller batch (`GBS=2048`) and lower
 learning rate (`lr=2.5e-6`) than the student RLVR stage.
 
-**Config:** `examples/configs/ultra/ifbench_teacher.yaml`
+**Config:** `examples/nemo_gym/nemotron-3-ultra/ifbench_teacher.yaml`
 - TP=8, EP=64, CP=8, PP=1
 - `max_total_sequence_length=49152`
 - `train_global_batch_size=2048`, `num_prompts_per_step=128`, `num_generations_per_prompt=16`
@@ -343,7 +344,7 @@ learning rate (`lr=2.5e-6`) than the student RLVR stage.
 
 ```bash
 EXP_NAME=ultra-ifbench-teacher \
-CONFIG_PATH=examples/configs/ultra/ifbench_teacher.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/ifbench_teacher.yaml \
 MODEL_PATH=/path/to/student_rlvr_output \
 TRAIN_PATH=$DATA_DIR/ifbench.train.jsonl \
 VAL_PATH=$DATA_DIR/ifbench.val.jsonl \
@@ -363,7 +364,7 @@ SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
 ### RLHF Teacher
@@ -372,7 +373,7 @@ General-purpose RLHF teacher trained against the pairwise GenRM comparison
 signal alone. Same training shape as the IFBench teacher (cluster, batch,
 learning rate, context).
 
-**Config:** `examples/configs/ultra/rlhf_teacher.yaml`
+**Config:** `examples/nemo_gym/nemotron-3-ultra/rlhf_teacher.yaml`
 - TP=8, EP=64, CP=8, PP=1
 - `max_total_sequence_length=49152`
 - `train_global_batch_size=2048`, `num_prompts_per_step=128`, `num_generations_per_prompt=16`
@@ -381,7 +382,7 @@ learning rate, context).
 
 ```bash
 EXP_NAME=ultra-rlhf-teacher \
-CONFIG_PATH=examples/configs/ultra/rlhf_teacher.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/rlhf_teacher.yaml \
 MODEL_PATH=/path/to/student_rlvr_output \
 TRAIN_PATH=$DATA_DIR/rlhf.train.jsonl \
 VAL_PATH=$DATA_DIR/rlhf.val.jsonl \
@@ -399,7 +400,7 @@ GENRM_MODEL=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
 This is the teacher referred to as `NRL_CHAT_TEACHER1` / `NRL_RLHF_TEACHER` in
@@ -415,7 +416,7 @@ serves the `code_gen`, `ns_tools`, `math_with_judge`,
 `equivalence_llm_judge`, and `mcqa` agent slots in MOPD — one checkpoint,
 many roles.
 
-**Config:** `examples/configs/ultra/reasoning_teacher.yaml`
+**Config:** `examples/nemo_gym/nemotron-3-ultra/reasoning_teacher.yaml`
 - TP=8, EP=32, CP=8, PP=1 (half the expert parallelism of Student RLVR)
 - `max_total_sequence_length=65536`
 - `train_global_batch_size=2048`, `num_prompts_per_step=128`, `num_generations_per_prompt=16`
@@ -425,7 +426,7 @@ many roles.
 
 ```bash
 EXP_NAME=ultra-reasoning-teacher \
-CONFIG_PATH=examples/configs/ultra/reasoning_teacher.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/reasoning_teacher.yaml \
 ENABLE_MTP_INFERENCE=1 \
 MODEL_PATH=/path/to/student_rlvr_output \
 TRAIN_PATH=$DATA_DIR/reasoning.train.jsonl \
@@ -443,7 +444,7 @@ NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
 ### SWE Teacher
@@ -453,7 +454,7 @@ Software-engineering RLVR teacher trained against code execution. The
 container images for each SWE-Gym / SWE-rebench-V2 instance and rewards
 the rollout based on test pass/fail.
 
-**Config:** `examples/configs/ultra/swe_teacher.yaml`
+**Config:** `examples/nemo_gym/nemotron-3-ultra/swe_teacher.yaml`
 - TP=8, EP=32, CP=32, PP=1 (large CP for long context)
 - `max_total_sequence_length=196608` (192k context)
 - `train_global_batch_size=512`, `num_prompts_per_step=32`, `num_generations_per_prompt=16`
@@ -552,7 +553,7 @@ With `${SIF_DIR}` populated, launch the SWE teacher:
 
 ```bash
 EXP_NAME=ultra-swe-teacher \
-CONFIG_PATH=examples/configs/ultra/swe_teacher.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/swe_teacher.yaml \
 ENABLE_MTP_INFERENCE=1 \
 MODEL_PATH=/path/to/student_rlvr_output \
 TRAIN_PATH=$DATA_DIR/swe.train.jsonl \
@@ -570,7 +571,7 @@ SLURM_ACCOUNT=$SLURM_ACCOUNT \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
 ## Stage 3 — MOPD
@@ -579,7 +580,7 @@ Multi-Teacher On-Policy Distillation. The Student RLVR output is the student; ea
 Gym agent is routed to one of the Stage 2 teacher checkpoints. Trains the
 student to match per-agent teacher distributions.
 
-**Config:** `examples/configs/ultra/mopd.yaml`
+**Config:** `examples/nemo_gym/nemotron-3-ultra/mopd.yaml`
 - TP=8, EP=64, CP=8, PP=1, max context 192k
 - Teacher parallelism: TP=8, CP=2, EP=16, 4 nodes per teacher
 - Routing: agent → teacher checkpoint baked into the YAML via
@@ -607,7 +608,7 @@ unset.
 ```bash
 STAGE_TYPE=mopd \
 EXP_NAME=ultra-mopd-stage1 \
-CONFIG_PATH=examples/configs/ultra/mopd.yaml \
+CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/mopd.yaml \
 ENABLE_MTP_INFERENCE=1 \
 MODEL_PATH=/path/to/student_rlvr_output \
 TRAIN_PATH=$DATA_DIR/mopd.train.jsonl \
@@ -634,5 +635,5 @@ SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 WANDB_API_KEY=$WANDB_API_KEY \
 HF_HOME=/path/to/hf_cache \
 HF_TOKEN=$HF_TOKEN \
-bash ultra_launch.sh
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```

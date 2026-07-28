@@ -7,7 +7,7 @@ set -euo pipefail
 # Public launcher for Nemotron 3 Ultra post-training stages on a SLURM cluster.
 #
 # Each training stage (Student RLVR, teacher RLVR/RLHF stages, MOPD) has a
-# matching YAML config under examples/configs/ultra/. The stage-specific
+# matching YAML config under examples/nemo_gym/nemotron-3-ultra/. The stage-specific
 # hyperparameters (batch size, advantage clip, MoE parallelism, etc.) live
 # in the YAML; this launcher only handles orchestration: SLURM submission,
 # code snapshotting, persistent cache management, container mounts, and the
@@ -17,7 +17,7 @@ set -euo pipefail
 # Usage:
 #
 #   EXP_NAME=ultra-student-rlvr-001 \
-#   CONFIG_PATH=examples/configs/ultra/student_rlvr1.yaml \
+#   CONFIG_PATH=examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml \
 #   MODEL_PATH=/path/to/sft_checkpoint \
 #   TRAIN_PATH=/path/to/train.jsonl \
 #   VAL_PATH=/path/to/val.jsonl \
@@ -29,7 +29,7 @@ set -euo pipefail
 #   GENRM_MODEL=<HF repo id or local path>      # Or set GENRM_BASE_URL to use a remote service
 #   NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
 #   SAFETY_JUDGE_MODEL=/path/to/safety_checkpoint \
-#   bash ultra_launch.sh
+#   bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 #
 # Optional knobs:
 #   WALLTIME=4:00:00                       Slurm --time
@@ -62,7 +62,7 @@ set -euo pipefail
 #   WANDB_ENTITY=                          W&B entity
 #
 # Hydra overrides are forwarded verbatim as positional arguments:
-#   bash ultra_launch.sh policy.megatron_cfg.optimizer.lr=1e-6 grpo.val_period=50
+#   bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh policy.megatron_cfg.optimizer.lr=1e-6 grpo.val_period=50
 #
 # GB200 NVL72 nodes have 4 GPUs each. SLURM total = NUM_TRAIN + NUM_GEN + NUM_GYM
 # and must be a multiple of SEGMENT_SIZE (default 16, one NVLink domain group).
@@ -72,7 +72,7 @@ set -euo pipefail
 # Required environment
 # =============================================================================
 : "${EXP_NAME:?EXP_NAME is required (used for job name, W&B run, checkpoint/log dirs)}"
-: "${CONFIG_PATH:?CONFIG_PATH is required (e.g. examples/configs/ultra/student_rlvr1.yaml)}"
+: "${CONFIG_PATH:?CONFIG_PATH is required (e.g. examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml)}"
 : "${MODEL_PATH:?MODEL_PATH is required (initial policy checkpoint, HF repo id or local path)}"
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
@@ -516,7 +516,7 @@ fi
 # To overlay additional components (e.g. a local Megatron-LM checkout), pass
 # EXTRA_MOUNTS as a comma-separated list of host:container pairs:
 #
-#   EXTRA_MOUNTS="/path/to/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM" bash ultra_launch.sh
+#   EXTRA_MOUNTS="/path/to/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM" bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 #
 # Container paths for reference:
 #   /opt/nemo-rl/nemo_rl                                              — Python package

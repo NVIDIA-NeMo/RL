@@ -21,13 +21,13 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ULTRA_CONFIG_PATHS = [
-    "examples/configs/ultra/student_rlvr1.yaml",
-    "examples/configs/ultra/student_rlvr2.yaml",
-    "examples/configs/ultra/ifbench_teacher.yaml",
-    "examples/configs/ultra/reasoning_teacher.yaml",
-    "examples/configs/ultra/rlhf_teacher.yaml",
-    "examples/configs/ultra/swe_teacher.yaml",
-    "examples/configs/ultra/mopd.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/student_rlvr2.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/ifbench_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/reasoning_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/rlhf_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/swe_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/mopd.yaml",
 ]
 
 
