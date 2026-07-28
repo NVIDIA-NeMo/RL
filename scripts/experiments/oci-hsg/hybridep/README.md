@@ -26,6 +26,15 @@ DEEPEP_WHEEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/s
 scripts/experiments/oci-hsg/hybridep/submit_grpo.sh
 ```
 
+To run the 32-node Nemotron3 Super 120B async 1-off recipe with the same
+HybridEP overrides:
+
+```bash
+WANDB_ENABLED=False \
+scripts/experiments/oci-hsg/hybridep/submit_grpo.sh \
+  scripts/experiments/oci-hsg/hybridep/models/nemotron3-super-120ba12b-32n4g-async-1off.env
+```
+
 The launcher selects the highest current user-level FairShare account. Set
 `ACCOUNT` only to override that choice. Set `WANDB_ENABLED=True` to enable W&B;
 the launcher requires `WANDB_API_KEY` in the environment and never writes its
