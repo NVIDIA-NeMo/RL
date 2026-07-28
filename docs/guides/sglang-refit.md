@@ -52,13 +52,22 @@ otherwise the Dockerfile fetches NVIDIA NeMo RL `main`. The `release` target is
 also required because the Dockerfile's final target is a cache-export artifact,
 not the runtime image.
 
-Use a registry visible to every Ray node and an immutable commit tag:
+Use a registry visible to every Ray node and an immutable commit tag.
+
+Build for the architecture you will run on. Every evidence run below was
+produced on GB200 (Grace, `linux/arm64`) with four GPUs per node, so
+`linux/arm64` is the validated target. An x86 host builds `linux/amd64` by
+default and yields an untested stack, because the Dockerfile branches on
+`TARGETARCH`. The drivers record no architecture, so nothing downstream catches
+a mismatch:
 
 ```bash
+export NRL_TARGET_PLATFORM=linux/arm64   # linux/amd64 for x86 nodes
 export IMAGE_REPOSITORY="<registry>/<namespace>/nemo-rl-sglang-refit"
 export IMAGE_REF="${IMAGE_REPOSITORY}:${NEMO_RL_SHA}"
 
 docker buildx build \
+  --platform "$NRL_TARGET_PLATFORM" \
   --target release \
   --build-context nemo-rl=. \
   --build-arg NEMO_RL_COMMIT="$NEMO_RL_SHA" \
@@ -76,7 +85,24 @@ export NRL_IMAGE_REF="${IMAGE_REF}@${IMAGE_DIGEST}"
 printf '%s\n' "$NRL_IMAGE_REF"
 ```
 
-Use `NRL_IMAGE_REF`, including its digest, on every node. For NeMo-Gym rollouts,
+Use `NRL_IMAGE_REF`, including its digest, on every node.
+
+Rebuilding this commit does not reproduce a previously built image bit for bit.
+The Dockerfile's base is a mutable tag and its system packages come from live
+apt repositories, so two builds of the same commit can differ, and a build can
+fail outright when an upstream package is temporarily unavailable. The digest is
+immutable only once built. To compare against someone else's result, obtain
+their `NRL_IMAGE_REF` digest rather than rebuilding.
+
+Your scheduler must also be able to run this image on every node. The drivers
+are launched through Pyxis/Enroot (`srun --container-image`), which requires
+those plugins installed, credentials for a private registry readable by the job,
+and an Enroot new enough to accept a `@sha256:` reference. Some sites route
+Enroot transfers through a caching proxy that cannot reach every registry; if
+compute nodes cannot pull, import the image once to a squashfs on shared storage
+and pass that path as the container instead.
+
+For NeMo-Gym rollouts,
 the pinned Gym submodule must include its native SGLang model adapter. The
 adapter sends OpenAI Responses requests through SGLang's `/generate` endpoint
 while preserving the exact sampled token prefix between turns.
@@ -100,10 +126,16 @@ the image.
 | Async Gym integration (`16n8g`) | 16 | 8 | 128 | `world_size=65 engines=32` |
 | Async Gym integration (`32n4g`) | 32 | 4 | 128 | `world_size=65 engines=32` |
 
-The two async variants are the same run on different host shapes: identical
-parallelism, 64 training GPUs, 64 generation GPUs and 32 TP2 engines in both.
-Pick the one matching the GPUs per node your cluster exposes; the preflight
-check rejects a variant whose per-node GPU count the cluster cannot satisfy.
+The two async variants describe the same run on different host shapes:
+identical parallelism, 64 training GPUs, 64 generation GPUs and 32 TP2 engines
+in both. The preflight rejects a variant whose per-node GPU count the cluster
+cannot satisfy, so pick the one matching your nodes.
+
+They are not equally validated. Following this repository's convention that
+four GPUs per node denotes GB200 and eight denotes H100 (see
+`tests/test_suites/README.md`), and given that all evidence here was collected
+on GB200, `32n4g` is the validated topology and `16n8g` is an untested
+portability variant. The smoke recipe is likewise GB200-shaped.
 
 Before running either driver, verify:
 
@@ -259,10 +291,15 @@ PARTITION="<partition>" \
 ## Async GRPO with NeMo-Gym
 
 The public SWE1 integration recipe exercises the complete async path. It is a
-manual 16-node run and is intentionally excluded from nightly CI.
+manual run, in `32n4g` or `16n8g` shape, and is intentionally excluded from
+nightly CI.
 
 Prepare immutable model and dataset snapshots at the exact shared paths used by
-the recipe:
+the recipe. Budget time and space: the model snapshot is roughly 57 GB, and the
+dataset step downloads the whole training blend, which is tens of gigabytes and
+contains several blends this recipe does not use. Its placeholder filler also
+fetches unrelated datasets before SWE1 is produced. Run it somewhere with room
+and egress; on a cluster, a data-mover node is usually the right place:
 
 ```bash
 export NRL_MODEL_REVISION=144afc2f379b542fdd4e85a1fcd5e1f79112d95d
