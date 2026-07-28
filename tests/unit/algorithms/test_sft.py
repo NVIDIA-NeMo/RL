@@ -303,7 +303,6 @@ def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effec
     master_config.logger = {}
     master_config.policy["megatron_cfg"] = {
         "enabled": True,
-        "use_fused_linear_logprobs": False,
         "context_parallel_size": 1,
     }
     master_config.policy["train_micro_batch_size"] = 1
