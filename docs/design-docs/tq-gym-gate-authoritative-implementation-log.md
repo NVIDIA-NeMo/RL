@@ -143,8 +143,24 @@ staging/ subpackage" (the post-review restructure; see Open TODOs).
     `grpo.seed`.
   Flagged for the user at the gate (fixable as a test-fixture patch, but
   left untouched to keep the stage diff clean).
-- SC functional tests (`L1_Functional_Tests_SingleController.sh`, 8×H100)
-  with the flag off: planned as pin-bump regression evidence at the gate.
+- SC functional tests (flag off, dev node GPUs) as pin-bump regression
+  evidence:
+  - `tests/functional/grpo_dp_single_controller.sh` (Qwen3-0.6B, 2 GPUs,
+    Megatron + async vLLM + TQ): **PASS** (2026-07-28) — all 5 metric
+    checks green (`gen_kl_error` max 6.0e-4 < 2e-3; probs-ratio clamps
+    exactly 1.0). Caveat: required `NRL_FORCE_REBUILD_VENVS=true` — the
+    container's prebaked `/opt/ray_venvs` are stale vs the branch lock
+    (Ray 2.54.0 vs 2.55.1; `nvidia-resiliency-ext` 0.6.0.dev33 < 0.6.0's
+    minimum). Both mismatches pre-date the S1 uv.lock regen (Ray 2.55.1
+    was already pinned at branch HEAD); environmental, not this work.
+  - `tests/functional/grpo_async_gym_single_controller.sh` (SC + NeMo-Gym
+    workplace-assistant, Qwen3-0.6B, 2 GPUs, 10 steps): **PASS**
+    (2026-07-28) — metric checks green (`median(gen_kl_error)`=0.041 < 1.3;
+    `max(reward)`=0.5 > 0). Same caveat: needs `NRL_FORCE_REBUILD_VENVS=true`
+    on this node (stale prebaked NemoGym-actor venv, Ray 2.54.0).
+    **This is the flag-off pin-bump evidence for the Gym submodule move
+    `610a08ab` → the tq-gate-capture branch** (disclosure 1): the legacy
+    token-echo path through the new pin trains correctly.
 
 ## S2 — capture core + vLLM adapter + worker hosting
 
@@ -181,6 +197,13 @@ engine-blind capture core + vLLM adapter".
   `nemo_gym.token_id_capture.staging` + `adapters.vllm` beside vllm 0.20.0
   (the prebaked `--extra vllm`-only venv does *not* contain `nemo_gym` —
   hence `VLLM_GYM`, switched in at setup only when capture is enabled).
+- **Splice relocation equivalence** (scratchpad
+  `validate_splice_relocation.py`): Gym's `replace_prefix_tokens` produces
+  byte-identical output to the RL worker's `_replace_prefix_tokens` on the
+  S1-gate templates — Qwen3-0.6B (retokenization_differs=True, the
+  `<think>`-strip drift case) and Qwen2.5-1.5B-Instruct — plus the
+  no-prefix path. The RL original stays in place until S3 hosts the Gym
+  copy on the request path, so both existing callers are untouched.
 
 ### Deviations / disclosures (for S2 sign-off)
 
@@ -197,7 +220,59 @@ engine-blind capture core + vLLM adapter".
 
 ## S3 — Gym gate
 
-Status: not started (blocked on S2 sign-off)
+Status: **code + tests complete (2026-07-28); awaiting user sign-off at the
+S3 gate.** (S2 sign-off was given verbally — "In case S2 is done can you
+start S3" — with the S2 gate summary below still standing for review.)
+
+### Gym fork (submodule branch `tq-gate-capture`)
+
+One commit: `05986b04` "feat(token-id-capture): S3 gate — lineage hosting,
+prefix serving, marker plumbing, control plane". No rebase was needed — the
+fork already sits on #2124's head (`32b555f04`), and its 20-test base suite
+stays green.
+
+| Item | Status | Notes |
+|---|---|---|
+| `token_id_capture/memory_store.py` | done | `MemoryRolloutTokenBuffer` — per-rollout **delta forest** (parent-linked deltas; forks share prefixes through the chain instead of duplicating cumulative sequences; O(total committed tokens)); create-only register, chain-walk `cumulative_ids`, `drop` at seal/fail/TTL. Ids only, never logprobs |
+| `token_id_capture/gate.py` | done | `RolloutCaptureGate` hosting the S1 `lineage.py` machine — **no new lineage logic**: registration (create-only), `find_marker` (deepest `ng_call_id` names the parent; sub-agent forks resolve to interior nodes), `message_fingerprint` (normalized role / text content with `<think>` stripped / tool-call name+args / tool linkage; capture carriers and token fields excluded — pinned by conformance tests), the § 3.3 serving rule in `prepare_call` (token-in only for known marker + matching fingerprint; else text-mode new root with `fallback_reason`), `ingest_coords` = authoritative commit (buffer extend + fingerprint record + marker release; `capture_failed` poisons and releases nothing), `seal_rollout` → token-free receipt + full state drop, `fail_rollout` / `expire_stale` TTL, § 8 metrics counters. `RolloutGateConfig` (enabled=False) |
+| `token_id_capture/control_routes.py` | done | `PUT /ng-control/rollouts/{id}` (create-only, 409 on dup), `POST .../seal` (receipt; 404 after drop), `POST .../fail` (idempotent), `GET /ng-control/metrics`; `RolloutControlClient` for the framework side (aiohttp via `server_utils.request`, deferred import) |
+| `openai_utils.py` | done | `CallMarkerMixin` / `CallMarkerTypedDictMixin` + `WithMarker` variants of the five response items, the assistant chat param, and the chat response message, mirrored on the `ForTraining` pattern; unions extended |
+| `responses_converter.py` | done | outbound: marker attaches to the last content-bearing output item (`RESPONSES_TO_MARKER`, same carrier as the token arrays); inbound: an echoed marker item survives conversion onto the flushed assistant chat message. Both directions are presence-driven — no config, dormant when no gate mints markers |
+| `responses_api_models/vllm_model/app.py` | done | flag-gated gate hosting: `prepare_call` after `_preprocess_chat_completion_create_params` (both sides of the fingerprint see one normalization pipeline); exact prefix into the worker's existing `required_prefix_token_ids` splice seam + `ng_capture` call context; engine logprob/token-id request fields set gate-side (worker extracts natively; the gate strips `logprobs` from the response so they never reach the agent); coords popped off the response = the commit — a **missing-coords response is committed as `capture_failed`** (rollout poisoned loudly, completion still served); marker attach; sha256(rollout_id) → client **affinity** (stateless, no map to leak); control routes installed in `setup_webserver`; backend errors/context-length shortcuts fail the admitted call (no marker → no children); setup-time `ValueError` when gate + legacy token echo are both enabled |
+| tests | done | `tests/unit_tests/test_token_capture_s3_gate.py` — 21 tests: **all 4 S1 golden call sequences replayed through the gate produce receipts byte-identical to the direct `RolloutLineage` drive** (fixture→gate call-id renaming only); fallback matrix (marker stripped / history edited / unknown marker / reasoning-strip fingerprint stability); duplicate + wrong-rollout coords rejection; capture-failed poisoning; seal-drops-state + TTL; buffer fork prefixes; control-route round trips; converter marker echo round trip. `responses_api_models/vllm_model/tests/test_token_capture_gate_app.py` — 5 server e2e tests over HTTP with a fake capture-enabled worker (register → 2-turn conversation with exact prefix service and prev_len chaining → seal receipt; missing-coords poisoning; edited-history two-root fallback; dormant server exposes nothing; config guard). **Full Gym suite 1507 passed / 30 skipped** incl. all prior capture suites and the 72 existing vllm_model app tests |
+
+### Deviations / disclosures (for S3 sign-off)
+
+1. **Buffer interface**: the in-memory buffer exposes a delta-chain interface
+   rather than implementing #2124's `TokenCaptureStore` (JSONL `TokenEntry`
+   append/read) — prefix serving needs parent-linked deltas, not per-call
+   full snapshots. The JSONL store remains untouched as the debug/persistence
+   backend (H1).
+2. **Marker carriers are presence-driven, not config-gated**, in the
+   converter and typed models: markers can only exist when a gate minted
+   them, so the legacy path is byte-identical with the flag off (union
+   additions verified against the full 1507-test suite).
+3. **Rollout affinity is a stable hash** (sha256(rollout_id) mod clients),
+   not the prototype's sticky map — stateless, so nothing leaks when
+   rollouts outlive sessions. Design § 9.2 asked for "rollout affinity in
+   `_resolve_client`"; the mechanism choice is disclosed here.
+4. **Gate-side engine fields**: in gate mode the gate (not
+   `return_token_id_information`) sets `logprobs=True, top_logprobs=0,
+   return_tokens_as_token_ids=True` on the worker request — the S2 adapter's
+   extraction shapes need them until native extraction is wired deeper
+   (worker-side stripping + coords attach is the S4 RL hookup).
+5. **`fail_rollout` control route is idempotent** (returns `failed: false`
+   after seal/TTL instead of erroring) — a cancelled dispatch double-fail
+   must not crash teardown (§ 7 cleanup).
+6. Functional-test side effect: `ng_prepare_data` rewrote
+   `workplace_assistant` metrics JSONs in the submodule working tree during
+   the flag-off evidence run; reverted, not committed.
+
+Not in S3 (lands in S4 with the RL wiring): NeMo-RL's use of
+`RolloutControlClient` (register/seal/fail from `environments/nemo_gym.py`),
+rollout-id minting + metadata plumbing from the SC, worker-side coords
+attach/strip (the serving hookup that pairs with S2's `RolloutTokenCapture`),
+receipts through `run_rollouts`, and the finalizer.
 
 ## S4 — receipts, finalizer, SC integration
 
