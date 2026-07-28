@@ -85,13 +85,13 @@ jobs:
       RUN_ID: ${{ github.run_id }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.build-ref }}
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Resolve TRT-LLM cache configuration
         id: trtllm_cache
@@ -231,7 +231,7 @@ jobs:
 
       - name: Get recently merged PR cache refs
         id: recent_pr_cache_refs
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           REGISTRY: ${{ inputs.registry }}
           IMAGE_NAME: ${{ inputs.image-name }}
@@ -300,7 +300,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
           push: true
@@ -327,7 +327,7 @@ jobs:
         # outputs unset so the cache update steps below retain their old,
         # fail-open behavior and push.
         continue-on-error: true
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
           push: false
@@ -390,7 +390,7 @@ jobs:
         # this step after both successful and failed image builds so completed
         # compiler outputs are preserved for the next retry.
         if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.ccache_has_delta != 'false' }}
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
           push: true
@@ -416,7 +416,7 @@ jobs:
         # Persist the custom wheel even when the release build fails, so a
         # retry can reuse completed compilation work.
         if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.wheel_has_delta != 'false' }}
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
           push: true

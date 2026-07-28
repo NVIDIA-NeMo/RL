@@ -86,7 +86,7 @@ runs:
         echo "id=$(uuidgen)" >> "$GITHUB_OUTPUT"
 
     - name: Checkout NeMo
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       env:
         DIR: ${{ github.run_id }}
       with:
@@ -176,7 +176,7 @@ runs:
         fi
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: ${{ steps.check.outputs.coverage_report != 'none' }}
       with:
         name: ${{ steps.check.outputs.coverage_report }}
@@ -185,7 +185,7 @@ runs:
         include-hidden-files: true
 
     - name: Upload nemo_gym actual test data
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: always()
       with:
         name: actual_test_nemo_gym_sanity-${{ github.run_id }}
