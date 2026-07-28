@@ -21,7 +21,21 @@ Run on 6 GB200 NVL72 nodes (Slurm job 5648757, 2026-07-28):
 | Shape | train 4 nodes (TP2·PP2·CP4, EP1) / gen 2 nodes (vLLM TP2 → 4 engines) |
 | Overrides | `grpo.num_prompts_per_step=2 policy.train_global_batch_size=8 grpo.max_num_steps=5` |
 | Outcome | train steps 1–5 completed, no traceback, no OOM |
-| Launched via | `swe_nano_sc_interactive.sh` (attach + run the driver by hand); `swe_nano_sc.sh` submits the same driver command as a batch job |
+| Launched via | `swe_nano_sc_interactive.sh` (attach + run the driver by hand) |
+
+Reproduced from a clean **batch** submission — job 5667301, 2026-07-28, same
+6-node shape via `swe_nano_sc.sh` with no overrides beyond `max_num_steps=5`, so
+the full 64-rollout batch and `min_groups_for_streaming_train=16`:
+
+```
+train step 5/5  trainer_v=5  lag=1
+step_metrics: loss=6.26e-05  grad_norm=0.0097  num_valid_samples=64  reward=0.0
+ray.sub exiting (exit_code=0)          # 63 min wall, warmup included
+```
+
+Per-step timing was generation-dominated, as an async SWE run should be:
+`total 302s = exposed_generation 193s (64%) + policy_training 69s (23%) +
+logprobs 35s (12%) + weight_sync 4s (1%)`.
 
 The TQ actors were live and serving the rollout→train hop throughout:
 `TransferQueueController` plus two `SimpleStorageUnit` actors logging `PUT_DATA`,
