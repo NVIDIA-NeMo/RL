@@ -39,8 +39,6 @@ from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
 )
 
-pytestmark = pytest.mark.vllm
-
 _TOOL_PARSER_SOURCE = "tool_parsers/utils.py"
 _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
@@ -55,6 +53,7 @@ def patched_tool_parser_source(tmp_path, monkeypatch):
     return copied
 
 
+@pytest.mark.vllm
 def test_namespace_tool_patch_anchor_still_matches_installed_vllm(
     patched_tool_parser_source,
 ):
@@ -68,6 +67,7 @@ def test_namespace_tool_patch_anchor_still_matches_installed_vllm(
     ast.parse(content)  # the edit must leave valid Python
 
 
+@pytest.mark.vllm
 def test_namespace_tool_patch_is_idempotent(patched_tool_parser_source, monkeypatch):
     """Every worker on a node runs the patch against the same file."""
     before = patched_tool_parser_source.read_text()
@@ -78,6 +78,7 @@ def test_namespace_tool_patch_is_idempotent(patched_tool_parser_source, monkeypa
     assert patched_tool_parser_source.read_text() == before
 
 
+@pytest.mark.vllm
 def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
     """The stub must be a plain class, so isinstance() is always False.
 
