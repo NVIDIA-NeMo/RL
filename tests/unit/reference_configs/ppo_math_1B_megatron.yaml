@@ -100,6 +100,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  use_pinned_optimizer_offload: false
+  use_coalesced_optimizer_offload: false
 
   dtensor_cfg:
     _v2: true
