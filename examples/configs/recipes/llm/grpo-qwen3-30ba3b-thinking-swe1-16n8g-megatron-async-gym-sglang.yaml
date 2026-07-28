@@ -134,7 +134,10 @@ policy:
       ep_size: 1
       random_seed: 42
       max_running_requests: null
-      mem_fraction_static: 0.8
+      # Leave headroom for in-place weight updates. At 0.8 a 30B model on
+      # TP2 engines fills the device (184.27 of 184.31 GiB observed) and
+      # the refit fails allocating a 20 MiB receive buffer.
+      mem_fraction_static: 0.7
       skip_server_warmup: true
       disable_piecewise_cuda_graph: true
       disable_cuda_graph: false
