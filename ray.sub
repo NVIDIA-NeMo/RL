@@ -226,6 +226,14 @@ fi
 
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+DEDICATED_RAY_HEAD=${DEDICATED_RAY_HEAD:-0}
+case "$DEDICATED_RAY_HEAD" in
+  0|1) ;;
+  *)
+    echo "Error: DEDICATED_RAY_HEAD must be 0 or 1, got '$DEDICATED_RAY_HEAD'." >&2
+    exit 1
+    ;;
+esac
 
 # Detect GRES support and set GRES_ARG
 log_phase "detecting GRES support (sinfo)"
@@ -367,8 +375,15 @@ export RAY_health_check_period_ms="${RAY_health_check_period_ms:-10000}"
 num_retries=3
 WORKER_NUM_RETRIES=20
 
-# Total Ray worker_units expected once every node has registered with the head.
-NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+# Total Ray worker_units expected once every schedulable GPU node has
+# registered. In dedicated-head mode the first physical node runs only the Ray
+# control plane and driver, and intentionally contributes no GPU worker units.
+NUM_RAY_GPU_NODES=$((SLURM_JOB_NUM_NODES - DEDICATED_RAY_HEAD))
+if (( NUM_RAY_GPU_NODES <= 0 )); then
+  echo "Error: dedicated Ray head requires at least one additional GPU worker node." >&2
+  exit 1
+fi
+NUM_ACTORS=$((GPUS_PER_NODE * NUM_RAY_GPU_NODES))
 
 # Track backgrounded srun client PIDs for head and workers
 declare -A SRUN_PIDS
@@ -665,6 +680,16 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source $LOG_DIR/topology_probe.sh
 
+# Keep model, generation, teacher, and Gym GPU actors off the Ray head. Omitting
+# worker_units and topology resources also prevents topology-constrained
+# placement groups from selecting it as a compute node.
+HEAD_RAY_RESOURCE_ARGS=""
+if [[ "$DEDICATED_RAY_HEAD" == "1" ]]; then
+  RAY_RESOURCES='{\"slurm_managed_ray_cluster\": 1, \"ray_head\": 1}'
+  HEAD_RAY_RESOURCE_ARGS="--num-gpus=0"
+  echo "[INFO] Dedicated Ray head enabled: advertising zero GPUs"
+fi
+
 # Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
 # MPI_Init (in the ray daemon child process below) starts clean.
 # NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
@@ -693,6 +718,7 @@ while [[ \$count -lt $num_retries ]]; do
 ray start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
+    \$HEAD_RAY_RESOURCE_ARGS \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
