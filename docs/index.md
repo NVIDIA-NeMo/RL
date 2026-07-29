@@ -327,6 +327,7 @@ design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/tq-gym-async-single-controller.md
 design-docs/tq-gym-gate-authoritative.md
+design-docs/tq-gym-gate-authoritative-setup.md
 design-docs/tq-gym-gate-authoritative-implementation-log.md
 ```
 
