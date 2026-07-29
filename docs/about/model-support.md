@@ -30,6 +30,6 @@ for model sizes under 70B at up to 32k sequence length.
 
 In addition, please refer to our [performance page](https://docs.nvidia.com/nemo/rl/latest/about/performance-summary.html) for benchmarks and full reproducible yaml recipe configs.
 
-## Diffusion models via [Hugging Face Diffusers](https://github.com/huggingface/diffusers) (experimental)
+## Diffusion models via [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel) (experimental)
 
-- **Qwen**: [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) — Flow-GRPO text-to-image training (see the [Diffusion GRPO guide](../guides/diffusion-grpo.md))
+- **Qwen-Image**: [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) — Flow-GRPO text-to-image training (see the [Diffusion GRPO guide](../guides/diffusion-grpo.md))

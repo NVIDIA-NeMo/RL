@@ -134,9 +134,9 @@ The training loop logs these to TensorBoard / W&B:
 
 | Metric | Healthy signal |
 |---|---|
-| `train/mean_ratio` | ≈ 1.0 — first on-policy update per step (nightly gate asserts `(0.5, 1.5)`) |
+| `train/mean_ratio` | ≈ 1.0 — averaged over the step's optimizer updates; the first is on-policy (nightly gate asserts `(0.5, 1.5)`) |
 | `train/dp_checksum_spread` | exactly `0` — LoRA init and gradient sync identical across DP ranks |
-| `reward/<plugin>_mean` | trending up |
+| `reward/<plugin>/<component>_mean` (and `reward/total_mean`) | trending up |
 | `val/reward_mean` | trending up on the fixed-seed ODE val set |
 | `train/grad_norm` | bounded (nightly gate asserts `< 100`) |
 
@@ -148,7 +148,7 @@ The training loop logs these to TensorBoard / W&B:
 
 | Name | Reward |
 |---|---|
-| `dummy` | constant 0 (pipeline sanity checks) |
+| `dummy` | deterministic prompt-hash + per-image-mean score (rollout-determinism / pipeline sanity checks) |
 | `jpeg_compressibility` | negative JPEG size (classic DDPO sanity task) |
 | `pickscore` | [PickScore_v1](https://huggingface.co/yuvalkirstain/PickScore_v1) human-preference model |
 | `ocr` | 1 − normalized Levenshtein distance between PaddleOCR output and the prompt's quoted target text |

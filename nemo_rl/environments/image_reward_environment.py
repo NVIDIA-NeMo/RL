@@ -109,12 +109,6 @@ class _RewardWorker:  # pragma: no cover
     def __init__(self, plugin_factory: Callable[[], BaseImageReward]) -> None:
         self._plugin = plugin_factory()
 
-    def name(self) -> str:
-        return self._plugin.name
-
-    def weight(self) -> float:
-        return self._plugin.weight
-
     def score(
         self,
         images: torch.Tensor,
@@ -304,13 +298,17 @@ class OcrEditDistanceReward:
             raise ValueError(
                 f"images batch={images.shape[0]} but metadata len={len(metadata)}"
             )
+        for meta in metadata:
+            if "ground_truth" not in meta:
+                raise KeyError(
+                    "ocr reward needs 'ground_truth' in each prompt's metadata "
+                    "(produced by tools/export_ocr_prompts.py)"
+                )
         arr = (
             (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
         ).transpose(0, 2, 3, 1)
         scores = [
-            ocr_edit_distance_score(
-                self._ocr_fn(img_np), str(meta.get("ground_truth", ""))
-            )
+            ocr_edit_distance_score(self._ocr_fn(img_np), str(meta["ground_truth"]))
             for img_np, meta in zip(arr, metadata)
         ]
         return {"ocr": torch.tensor(scores, dtype=torch.float32)}
@@ -417,6 +415,12 @@ class GenRmOcrReward:
             raise ValueError(
                 f"images batch={images.shape[0]} but metadata len={len(metadata)}"
             )
+        for meta in metadata:
+            if "ground_truth" not in meta:
+                raise KeyError(
+                    "genrm_ocr reward needs 'ground_truth' in each prompt's "
+                    "metadata (produced by tools/export_ocr_prompts.py)"
+                )
         arr = (
             (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
         ).transpose(0, 2, 3, 1)
@@ -429,7 +433,7 @@ class GenRmOcrReward:
             ).decode("utf-8")
             transcription = self._transcribe(data_url)
             scores.append(
-                genrm_ocr_score(transcription, str(meta.get("ground_truth", "")))
+                genrm_ocr_score(transcription, str(meta["ground_truth"]))
             )
         return {"genrm_ocr": torch.tensor(scores, dtype=torch.float32)}
 
@@ -471,6 +475,11 @@ class ImageRewardEnvironment:
                 raise KeyError(
                     f"Unknown image reward plugin {spec.name!r}; "
                     f"registered={list(_PLUGIN_REGISTRY)}"
+                )
+            if spec.name in self._names:
+                raise ValueError(
+                    f"Duplicate image reward plugin {spec.name!r}; component keys "
+                    "would collide and its weight would be double-counted"
                 )
             factory = _PLUGIN_REGISTRY[spec.name]
             # Spec keys beyond name/weight (extra="allow") are plugin options,

@@ -277,7 +277,7 @@ class QwenImagePipelineAdapter:
                     return_mean_std=True,
                     forward_override=reference_forward_fn,
                 )
-                reference_means.append(ref_mean)
+                reference_means.append(ref_mean.detach())
 
         curr = torch.stack(curr_logprobs, dim=1)
         means = torch.stack(current_means, dim=1)

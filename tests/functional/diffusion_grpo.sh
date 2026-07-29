@@ -68,7 +68,8 @@ $PY examples/run_diffusion_grpo.py \
   grpo.num_prompts_per_step=1 \
   grpo.num_generations_per_prompt=4 \
   grpo.max_num_steps=5 \
-  +grpo.ppo_epochs=4 \
+  grpo.ppo_epochs=4 \
+  grpo.ppo_mini_batch_size=4 \
   grpo.val_period=0 \
   grpo.val_at_start=false \
   loss_fn.ratio_clip_min=0.2 \
