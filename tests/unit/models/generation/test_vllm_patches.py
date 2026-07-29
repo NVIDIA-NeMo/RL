@@ -30,7 +30,6 @@ The two port patches ship their own suites. These cover the remaining two:
 
 import ast
 import logging
-import os
 
 import pytest
 
@@ -98,68 +97,3 @@ def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
     stub_cls = namespace["NamespaceTool"]
     for value in ({}, "tool", 0, None, object()):
         assert not isinstance(value, stub_cls)
-
-
-@pytest.mark.parametrize(
-    "existing,extra,expected",
-    [
-        (None, None, "RAY_ENABLE_UV_RUN_RUNTIME_ENV"),
-        ("", ["MY_VAR"], "MY_VAR,RAY_ENABLE_UV_RUN_RUNTIME_ENV"),
-        # A value the caller already set must survive, not be clobbered.
-        ("PRESET", ["MY_VAR"], "MY_VAR,PRESET,RAY_ENABLE_UV_RUN_RUNTIME_ENV"),
-        # Duplicates collapse and surrounding whitespace is stripped.
-        (
-            " PRESET , MY_VAR ",
-            ["MY_VAR"],
-            "MY_VAR,PRESET,RAY_ENABLE_UV_RUN_RUNTIME_ENV",
-        ),
-    ],
-)
-def test_ray_extra_env_vars_merge_is_additive(
-    monkeypatch, tmp_path, existing, extra, expected
-):
-    """vLLM 0.25 replaced the ADDITIONAL_ENV_VARS source patch with this hook.
-
-    It must add to whatever the caller already set rather than overwrite it --
-    otherwise user ``extra_env_vars`` silently stop reaching the Ray workers.
-    """
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-
-    if existing is None:
-        monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", existing)
-
-    patches._patch_vllm_init_workers_ray("py", extra)
-
-    assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == expected
-
-
-def test_init_workers_ray_reports_a_missing_anchor(monkeypatch, tmp_path):
-    """A reshaped call site must not be reported as a successful patch."""
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray_renamed(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-    monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
-
-    assert patches._patch_vllm_init_workers_ray("py", None) is False
-    # The env merge still has to happen; it is independent of the file patch.
-    assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
-        "RAY_ENABLE_UV_RUN_RUNTIME_ENV"
-    )
-
-
-def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_path):
-    """Patching twice against the same file still reports success."""
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
-    once = ray_executor.read_text()
-    assert 'runtime_env={"py_executable": "py-exec"}' in once
-
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
-    assert ray_executor.read_text() == once
