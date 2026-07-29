@@ -3173,6 +3173,67 @@ class TestValidateFunction:
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
 
+    def test_grouped_validation_uses_pass_at_k_as_accuracy(self, mock_grpo_components):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.update(
+            {
+                "max_val_samples": 2,
+                "val_batch_size": 2,
+                "num_val_generations_per_prompt": 4,
+            }
+        )
+
+        def run_rollout(_policy, repeated_batch, *_args, **_kwargs):
+            # Each prompt is repeated k=4 times, contiguously.
+            assert repeated_batch["idx"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+            # Prompt 0 passes once out of 4; prompt 1 never passes.
+            repeated_batch["total_reward"] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            )
+            return repeated_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=run_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        # pass@4: 1 of 2 prompts has at least one passing rollout. A plain
+        # mean over the 8 rollouts would be 0.125.
+        assert val_metrics["accuracy"] == pytest.approx(0.5)
+
+
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
         mock_policy_gen = MagicMock()

@@ -679,9 +679,27 @@ class VllmAsyncGenerationWorkerImpl(
             request.top_k = -1
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # If they do not match, the inference will be off policy and destroy training
+            # stability. Validation rollouts are the one exception: they are stamped with
+            # the validation sampling profile (grpo.val_temperature / val_top_p, published
+            # as _validation_generation), which is metric-only and safe to serve.
+            allowed_sampling = {
+                (generation_config["temperature"], generation_config["top_p"]),
+            }
+            validation_generation = generation_config.get("_validation_generation")
+            if validation_generation is not None:
+                allowed_sampling.add(
+                    (
+                        validation_generation["temperature"],
+                        validation_generation["top_p"],
+                    )
+                )
+            request_top_p = 1.0 if request.top_p is None else request.top_p
+            assert (request.temperature, request_top_p) in allowed_sampling, (
+                f"request sampling (temperature={request.temperature}, "
+                f"top_p={request.top_p}) matches neither policy.generation nor "
+                f"the validation sampling profile: {sorted(allowed_sampling)}"
+            )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
