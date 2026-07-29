@@ -1271,6 +1271,8 @@ class TestAsyncTrajectoryCollector:
         async_config = AsyncPPOConfig(
             max_trajectory_age_steps=3,
             warmup_max_trajectory_age_steps=5,
+            in_flight_weight_updates=False,
+            recompute_kv_cache_after_weight_updates=True,
         )
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},
@@ -1293,6 +1295,10 @@ class TestAsyncTrajectoryCollector:
         assert collector.algorithm_config is master_config.ppo
         assert collector.async_config is async_config
         assert collector.async_config.max_trajectory_age_steps == 3
+
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+        collector.resume_after_refit()
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
 
         collector.set_generation_window(
             weight_version=2,
@@ -1452,6 +1458,28 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
+        """Test resume after refit invalidates cache without in-flight updates."""
+        collector = self.create_local_collector()
+        collector.async_config.in_flight_weight_updates = False
+        collector.async_config.recompute_kv_cache_after_weight_updates = True
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+
+    def test_resume_after_refit_skips_cache_invalidation_when_recompute_disabled(self):
+        """Test resume after refit skips cache invalidation when recompute is disabled."""
+        collector = self.create_local_collector()
+        collector.async_config.in_flight_weight_updates = True
+        collector.async_config.recompute_kv_cache_after_weight_updates = False
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""

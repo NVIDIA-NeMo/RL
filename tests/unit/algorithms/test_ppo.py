@@ -1819,16 +1819,16 @@ def test_async_ppo_rejects_fp8_kv_scale_sync():
         _call_async_ppo_until_guard(config, requires_kv_scale_sync=True)
 
 
-def test_async_ppo_config_rejects_invalid_kv_cache_settings():
-    from pydantic import ValidationError
-
+def test_async_ppo_config_allows_cache_recompute_without_in_flight_updates():
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
-    with pytest.raises(ValidationError, match="in_flight_weight_updates"):
-        AsyncPPOConfig(
-            in_flight_weight_updates=False,
-            recompute_kv_cache_after_weight_updates=True,
-        )
+    config = AsyncPPOConfig(
+        in_flight_weight_updates=False,
+        recompute_kv_cache_after_weight_updates=True,
+    )
+
+    assert config.in_flight_weight_updates is False
+    assert config.recompute_kv_cache_after_weight_updates is True
 
 
 def test_async_ppo_config_warmup_age_defaults_to_training_age():

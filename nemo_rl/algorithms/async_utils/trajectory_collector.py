@@ -607,24 +607,27 @@ class AsyncTrajectoryCollector:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
 
-        # Invalidate&recompute vLLM caches after the in-flight weight updates if
+        # Invalidate&recompute generation caches after weight updates (in-flight or
+        # not) if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        if (
-            self.async_config.in_flight_weight_updates
-            and self.async_config.recompute_kv_cache_after_weight_updates
-        ):
+        # Not invalidating KV cache can result in compounding policy KL errors across steps.
+        if self.async_config.recompute_kv_cache_after_weight_updates:
             try:
-                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
+                print(
+                    "🔄 Invalidating generation backend KV caches after weight update"
+                )
                 invalidated = self.policy_generation.invalidate_kv_cache()
                 if invalidated:
-                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    print(
+                        "✅ Invalidated generation backend KV caches after weight update"
+                    )
                 else:
                     print(
-                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
+                        "⚠️ KV cache invalidation not supported or only partially applied by the generation backend"
                     )
             except Exception as e:
-                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+                print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
 
         self._refit_pause_cleared.set()
 

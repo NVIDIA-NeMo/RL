@@ -123,21 +123,13 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     warmup_max_trajectory_age_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = True
-    # Invalidates and rebuilds the generation KV cache after an in-flight update.
+    # Invalidates and rebuilds the generation KV cache after a weight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Regenerates a partial replay-buffer frontier after resume.
     drop_incomplete_targets_on_restore: bool = True
 
     @model_validator(mode="after")
     def validate_settings(self) -> "AsyncPPOConfig":
-        if (
-            self.recompute_kv_cache_after_weight_updates
-            and not self.in_flight_weight_updates
-        ):
-            raise ValueError(
-                "recompute_kv_cache_after_weight_updates requires "
-                "in_flight_weight_updates=true"
-            )
         if (
             self.warmup_max_trajectory_age_steps is not None
             and self.warmup_max_trajectory_age_steps < self.max_trajectory_age_steps
