@@ -310,7 +310,9 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 8
-      gpu_memory_utilization: 0.85
+      # Leave enough headroom for the temporary packed buffer used during
+      # Megatron-to-vLLM weight refits.
+      gpu_memory_utilization: 0.80
       max_model_len: 65536
       enforce_eager: false
       use_deep_gemm: false
@@ -367,10 +369,11 @@ data:
 # =============================================================================
 # Environment — NeMo Gym + Judge Models
 #
-# Judge model paths and the GenRM service URL are set by the launcher:
-#   - genrm_model.base_url      ← GENRM_BASE_URL
-#   - nl2bash_judge_model.model ← NL2BASH_JUDGE_MODEL
-#   - safety_judge_model.model  ← SAFETY_JUDGE_MODEL
+# Judge model paths and external service URLs are set by the launcher:
+#   - genrm_model.model/base_url      ← GENRM_MODEL / GENRM_BASE_URL
+#   - nl2bash_judge_model.model       ← NL2BASH_JUDGE_MODEL
+#   - nl2bash_judge_model.base_url    ← NL2BASH_BASE_URL
+#   - safety_judge_model.model        ← SAFETY_JUDGE_MODEL
 # =============================================================================
 env:
   should_use_nemo_gym: true
@@ -497,7 +500,8 @@ env:
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16]
 
-    # NL2Bash / general judge: TP=4 on GB200 192GB
+    # NL2Bash / general judge: use NL2BASH_BASE_URL for an external service,
+    # otherwise launch TP=4 locally on GB200 192GB.
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
@@ -506,6 +510,7 @@ env:
           return_token_id_information: false
           uses_reasoning_parser: false
           debug: true
+          ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
             VLLM_USE_FLASHINFER_MOE_FP16: "0"
@@ -525,6 +530,7 @@ env:
             tool_call_parser: hermes
             gpu_memory_utilization: 0.85
             max_model_len: 131072
+            max_num_seqs: 256
             enable_prefix_caching: true
             enable_chunked_prefill: true
             model_loader_extra_config:

@@ -545,6 +545,7 @@ env:
           return_token_id_information: false
           uses_reasoning_parser: false
           debug: true
+          ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
             VLLM_USE_FLASHINFER_MOE_FP16: "0"
@@ -564,6 +565,9 @@ env:
             tool_call_parser: hermes
             gpu_memory_utilization: 0.85
             max_model_len: 131072
+            max_num_seqs: 256
+            enable_prefix_caching: true
+            enable_chunked_prefill: true
             model_loader_extra_config:
               enable_multithread_load: true
               num_threads: 112
@@ -651,6 +655,8 @@ env:
             reasoning_parser: deepseek_r1
             gpu_memory_utilization: 0.95
             max_model_len: 60000
+            max_num_seqs: 256
+            max_num_batched_tokens: 8192
             enable_prefix_caching: true
             enable_chunked_prefill: true
             model_loader_extra_config:

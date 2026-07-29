@@ -841,7 +841,7 @@ SBATCH_OUTPUT=$(sbatch \
   ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
   ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
   ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"batch","description":"batch training run"}}' \
+  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
   "${RAY_SUB}")
 
 echo "${SBATCH_OUTPUT}"
