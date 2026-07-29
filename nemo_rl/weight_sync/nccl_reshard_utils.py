@@ -535,6 +535,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     generation = policy.get("generation", {}) or {}
     megatron_cfg = policy.get("megatron_cfg", {}) or {}
     dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
+    policy_precision = policy.get("precision")
     vllm_cfg = generation.get("vllm_cfg", {}) or {}
     vllm_kwargs = generation.get("vllm_kwargs", {}) or {}
 
@@ -552,6 +553,13 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     if backend != "vllm":
         violations.append(
             f"policy.generation.backend must be 'vllm' (got {backend!r})."
+        )
+
+    if policy_precision != "bfloat16":
+        violations.append(
+            "policy.precision must be 'bfloat16' for nccl_reshard_refit "
+            f"(got {policy_precision!r}); the refit byte-copies training storage "
+            "into the generation model."
         )
 
     if vllm_kwargs.get("enable_eplb"):
@@ -626,9 +634,18 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
         # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
-        fp8_param = fp8_cfg.get("fp8_param", False)
+        fp8_enabled = bool(fp8_cfg.get("enabled", False))
+        fp8_param_requested = bool(fp8_cfg.get("fp8_param", False))
+        fp8_param = fp8_enabled and fp8_param_requested
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         gen_precision = vllm_cfg.get("precision", None)
+
+        if fp8_param_requested and not fp8_enabled:
+            violations.append(
+                "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
+                "policy.megatron_cfg.fp8_cfg.enabled=True; disabled FP8 does not "
+                "produce FP8 parameter storage for nccl_reshard_refit."
+            )
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
         # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
@@ -648,7 +665,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             if not fp8_param:
                 violations.append(
                     "policy.generation.vllm_cfg.precision='fp8' requires "
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True "
+                    "policy.megatron_cfg.fp8_cfg.enabled=True and fp8_param=True "
                     "(BF16→FP8 train-side quantization is not implemented yet)."
                 )
             elif fp8_recipe != "blockwise":

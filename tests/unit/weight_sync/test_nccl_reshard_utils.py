@@ -47,6 +47,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 def _valid_nccl_reshard_config() -> SimpleNamespace:
     return SimpleNamespace(
         policy={
+            "precision": "bfloat16",
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
@@ -116,11 +117,36 @@ def test_check_nccl_reshard_refit_support_accepts_matching_blockwise_fp8() -> No
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
     config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
         "fp8_param": True,
         "fp8_recipe": "blockwise",
     }
 
     check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_disabled_fp8_param_storage() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": False,
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="fp8_cfg.enabled=True"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("precision", ["float16", "float32"])
+def test_check_nccl_reshard_refit_support_rejects_non_bfloat16_policy_precision(
+    precision: str,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = precision
+
+    with pytest.raises(ValueError, match="policy.precision must be 'bfloat16'"):
+        check_nccl_reshard_refit_support(config)
 
 
 # --------------------------------------------------------------------------
