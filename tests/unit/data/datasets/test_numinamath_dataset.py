@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``NuminaMath15Dataset`` filtering and formatting."""
+"""Unit tests for ``NuminaMath15Dataset`` filtering and formatting.
+
+Registry dispatch, ``split_validation_size`` and the emitted schema are covered
+for this dataset by the parametrized ``test_build_in_dataset_with_split_validation``
+in ``test_response_dataset.py`` (real data). The tests here are separate because
+the filter behavior needs controlled source rows — one row per exclusion reason —
+which a real-data test cannot express.
+"""
 
 from __future__ import annotations
 
