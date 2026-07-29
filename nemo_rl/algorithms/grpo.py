@@ -180,7 +180,7 @@ class AsyncGRPOConfig(TypedDict):
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: NotRequired[bool]
-    # Recomputes the KV cache after the in-flight weight updates.
+    # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
@@ -1122,7 +1122,9 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None:
+        elif refit_transport is not None and refit_transport != "nccl_reshard":
+            # nccl_reshard is handled below via nccl_reshard_refit_enabled,
+            # not via checkpoint-engine.
             checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
             assert checkpoint_engine_config is not None
 
@@ -1292,6 +1294,16 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    nccl_reshard_refit_enabled = (
+        generation_config.get("refit_transport") == "nccl_reshard"
+    )
+    if nccl_reshard_refit_enabled:
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            check_nccl_reshard_refit_support,
+        )
+
+        check_nccl_reshard_refit_support(master_config)
+
     if generation_config.get("refit_transport") is not None and backend != "vllm":
         raise NotImplementedError(
             "Non-default refit transports are only supported for the vLLM "
@@ -1335,6 +1347,16 @@ def setup(
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
+        elif nccl_reshard_refit_enabled:
+            policy_generation.weight_synchronizer = create_weight_synchronizer(
+                policy=policy,
+                generation=policy_generation,
+                generation_backend=backend,
+                colocated=False,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
+            policy_generation.weight_synchronizer.init_communicator()
         else:
             futures_train = policy.init_collective(
                 ip, port, world_size, train_world_size=train_world_size
@@ -1384,9 +1406,10 @@ def setup(
             flush=True,
         )
     else:
-        state_dict_info = policy.prepare_refit_info()
-        if policy_generation is not None:
-            policy_generation.prepare_refit_info(state_dict_info)
+        if not (nccl_reshard_refit_enabled and not colocated_inference):
+            state_dict_info = policy.prepare_refit_info()
+            if policy_generation is not None:
+                policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -3830,7 +3853,6 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -3847,7 +3869,7 @@ def async_grpo_train(
     # Ensure the buffer has at least one step worth of prompt-groups before training
     min_trajectories_needed = num_prompts_per_step
 
-    print("📊 Buffer requirements calculation:")
+    print("📊 Buffer requirements calculation:", flush=True)
     print(f"   - num_prompts_per_step: {num_prompts_per_step}")
     print(f"   - num_generations_per_prompt: {samples_per_prompt_group}")
     print(f"   - samples_per_prompt_group: {samples_per_prompt_group}")
@@ -3975,12 +3997,16 @@ def async_grpo_train(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
-    print("⏳ Preparing policy generation for training...")
+    print("⏳ Preparing policy generation for training...", flush=True)
     if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...")
+        print("🔄 Refitting policy generation with actual model weights...", flush=True)
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            print("✅ Policy generation refit completed successfully")
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+            )
+            print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
@@ -4530,7 +4556,9 @@ def async_grpo_train(
 
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
-                                policy, policy_generation, colocated_inference
+                                policy,
+                                policy_generation,
+                                colocated_inference,
                             )
                             POLICY_GENERATION_STALE = False
                         else:
