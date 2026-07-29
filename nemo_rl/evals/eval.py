@@ -40,7 +40,7 @@ from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
-    create_nemo_gym_actor,
+    spinup_nemo_gym_actor,
 )
 from nemo_rl.environments.vlm_environment import VLMEnvConfig
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
@@ -226,11 +226,13 @@ def setup_nemo_gym_environment(
             f"The {master_config.generation['backend']} rollout engine did not "
             "expose any OpenAI server endpoints for NeMo Gym"
         )
-    nemo_gym_config = master_config.env["nemo_gym"].model_dump(exclude_none=True)
-    return create_nemo_gym_actor(
-        model_name=master_config.generation["model_name"],
+    return spinup_nemo_gym_actor(
+        env_configs={
+            "nemo_gym": master_config.env["nemo_gym"].model_dump(exclude_none=True)
+        },
         base_urls=base_urls,
-        nemo_gym_config=nemo_gym_config,
+        model_name=master_config.generation["model_name"],
+        enable_router_replay=False,
     )
 
 

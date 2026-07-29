@@ -1043,6 +1043,7 @@ class Logger(LoggerInterface):
         self.wandb_logger: Optional[WandbLogger] = None
         self.swanlab_logger: Optional[SwanlabLogger] = None
         self.gpu_monitor: Optional[RayGpuMonitorLogger] = None
+        self._finished = False
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
@@ -1126,11 +1127,18 @@ class Logger(LoggerInterface):
             logger.log_hyperparams(params)
 
     def finish(self) -> None:
-        """Flush and close backends that need explicit teardown (e.g. wandb)."""
+        """Stop system monitoring and finish backends exactly once."""
+        if self._finished:
+            return
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.stop()
+            self.gpu_monitor = None
         for logger in self.loggers:
             finish = getattr(logger, "finish", None)
             if callable(finish):
                 finish()
+        self.wandb_logger = None
+        self._finished = True
 
     def use_batch_steps(
         self, step_metric: str, metric_patterns: tuple[str, ...]
@@ -1328,15 +1336,6 @@ class Logger(LoggerInterface):
         """Attach buffered Ray system metrics to a caller-defined batch step."""
         if self.gpu_monitor is not None:
             self.gpu_monitor.flush(step=step)
-
-    def close(self) -> None:
-        """Stop background monitoring and finish remote logging backends."""
-        if self.gpu_monitor is not None:
-            self.gpu_monitor.stop()
-            self.gpu_monitor = None
-        if self.wandb_logger is not None:
-            self.wandb_logger.finish()
-            self.wandb_logger = None
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str

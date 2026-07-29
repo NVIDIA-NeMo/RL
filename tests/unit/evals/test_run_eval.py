@@ -88,4 +88,4 @@ def test_main_wires_nemo_gym_rollout_only_eval(monkeypatch) -> None:
         tokenizer=tokenizer,
         logger=logger,
     )
-    logger.close.assert_called_once_with()
+    logger.finish.assert_called_once_with()

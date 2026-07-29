@@ -1637,6 +1637,29 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
 class TestLogger:
     """Test the main Logger class."""
 
+    def test_finish_stops_monitor_before_backends_and_is_idempotent(self):
+        """Logger teardown uses one ordered, idempotent lifecycle entry point."""
+        events = []
+        gpu_monitor = MagicMock()
+        gpu_monitor.stop.side_effect = lambda: events.append("monitor")
+        backend = MagicMock()
+        backend.finish.side_effect = lambda: events.append("backend")
+
+        logger = Logger.__new__(Logger)
+        logger.loggers = [backend]
+        logger.wandb_logger = backend
+        logger.gpu_monitor = gpu_monitor
+        logger._finished = False
+
+        logger.finish()
+        logger.finish()
+
+        assert events == ["monitor", "backend"]
+        gpu_monitor.stop.assert_called_once_with()
+        backend.finish.assert_called_once_with()
+        assert logger.gpu_monitor is None
+        assert logger.wandb_logger is None
+
     @pytest.fixture
     def temp_dir(self):
         """Create a temporary directory for logs."""

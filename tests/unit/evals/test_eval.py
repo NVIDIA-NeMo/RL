@@ -236,8 +236,8 @@ def test_nemo_gym_eval_accepts_megatron_rollout_engine() -> None:
 
 
 def test_setup_nemo_gym_environment_uses_rollout_engine_endpoints(monkeypatch) -> None:
-    create_actor = MagicMock(return_value=object())
-    monkeypatch.setattr("nemo_rl.evals.eval.create_nemo_gym_actor", create_actor)
+    spinup_actor = MagicMock(return_value=object())
+    monkeypatch.setattr("nemo_rl.evals.eval.spinup_nemo_gym_actor", spinup_actor)
     config = _nemo_gym_eval_config()
     config.env["nemo_gym"] = MagicMock()
     config.env["nemo_gym"].model_dump.return_value = {}
@@ -245,11 +245,12 @@ def test_setup_nemo_gym_environment_uses_rollout_engine_endpoints(monkeypatch) -
 
     result = setup_nemo_gym_environment(generation, config)
 
-    assert result is create_actor.return_value
-    create_actor.assert_called_once_with(
-        model_name="test-model",
+    assert result is spinup_actor.return_value
+    spinup_actor.assert_called_once_with(
+        env_configs={"nemo_gym": {}},
         base_urls=["http://worker-0:8000/v1"],
-        nemo_gym_config={},
+        model_name="test-model",
+        enable_router_replay=False,
     )
 
 

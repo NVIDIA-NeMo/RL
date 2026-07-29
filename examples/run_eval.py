@@ -158,7 +158,7 @@ def run_eval(config: MasterConfig) -> EvalRunResult:
         )
     finally:
         if logger is not None:
-            logger.close()
+            logger.finish()
     return result
 
 
