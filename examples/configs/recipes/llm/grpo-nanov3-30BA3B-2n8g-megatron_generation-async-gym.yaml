@@ -3,6 +3,7 @@ grpo:
   async_grpo:
     enabled: true
     in_flight_weight_updates: true
+  overlong_filtering: false
 checkpointing:
   checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym
 policy:
@@ -11,6 +12,9 @@ policy:
     name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   train_global_batch_size: 16
   max_total_sequence_length: 2048
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
   sequence_packing:
     enabled: false
   generation:

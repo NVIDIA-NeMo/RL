@@ -5,15 +5,15 @@ This module provides a suite of tools to enable FP8 quantization for large langu
 ## Supported Features
 
 ### FP8 Generation
-- Implements **Deepseek-style FP8** quantization using **sub-channel scaling**.
+- Implements **DeepSeek-style FP8** quantization using **sub-channel scaling**.
 
 ### FP8 Training
 - Uses **TransformerEngine** for linear layer implementation.
-- Supports both **Deepseek-style sub-channel scaling** and **per-tensor scaling**.
+- Supports both **DeepSeek-style sub-channel scaling** and **per-tensor scaling**.
 
 ### Recommended recipe
-- For Hopper GPUs we recommend to use FP8 (Deepseek-style) precision for both generation and training for best convergence and speedup
-- For Blackwell GPUs, FP8 (deepseek-style) with FP32 scaling factor is not supported in training. Currently we recommend to use FP8 precision for generation and BF16 for training. We are actively exploring other recipes for better performance.
+- For Hopper GPUs we recommend using FP8 (DeepSeek-style) precision for both generation and training for best convergence and speedup
+- For Blackwell GPUs, FP8 (DeepSeek-style) with FP32 scaling factor is not supported in training. Currently we recommend using FP8 precision for generation and BF16 for training. We are actively exploring other recipes for better performance.
 
 ## Integration with NeMo RL
 
@@ -68,7 +68,7 @@ To train with FP8, you need to set the Megatron path and configure it using the 
                 fp8_param: false            # boolean value
 ```
 
-## Compatibility Note for Deepseek-Style FP8 Training
+## Compatibility Note for DeepSeek-Style FP8 Training
 
 The TransformerEngine implementation for this recipe requires **CUDA version ≥ 12.9**. The current NeMo RL container uses CUDA 13.2 (via `docker/Dockerfile`), which satisfies this requirement. Users on older setups should check out the latest code and build the container from `docker/Dockerfile` ([instructions](docker.md)).
 

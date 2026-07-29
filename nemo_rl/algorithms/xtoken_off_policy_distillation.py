@@ -622,6 +622,8 @@ def xtoken_off_policy_distillation_train(
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(val_timings, total_steps, prefix="timing/validation")
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
             f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
@@ -728,6 +730,10 @@ def xtoken_off_policy_distillation_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
                 if master_config.checkpointing["enabled"] and (
@@ -779,7 +785,10 @@ def xtoken_off_policy_distillation_train(
                             dataloader.state_dict(),
                             os.path.join(ckpt_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(ckpt_path)
+                        checkpointer.begin_finalization(
+                            ckpt_path,
+                            wait_fn=student_policy.finalize_async_save,
+                        )
 
             # ===== Logging =====
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -852,11 +861,13 @@ def xtoken_off_policy_distillation_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout reached, stopping training early.", flush=True)
                 for teacher_policy in teacher_policies:
                     teacher_policy.release_ipc_buffer()
                 return
             if total_steps >= max_steps:
+                checkpointer.shutdown()
                 print("Max steps reached, stopping training.", flush=True)
                 for teacher_policy in teacher_policies:
                     teacher_policy.release_ipc_buffer()
@@ -864,6 +875,12 @@ def xtoken_off_policy_distillation_train(
 
         current_epoch += 1
         current_step = 0
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_epochs falls through the while loop and bypasses the
+    # inline shutdown() calls at the max_steps / timeout early returns, so
+    # without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
     for teacher_policy in teacher_policies:
         teacher_policy.release_ipc_buffer()
 

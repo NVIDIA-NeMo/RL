@@ -24,8 +24,8 @@ exit_if_max_steps_reached
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
-    grpo.num_prompts_per_step=64 \
-    grpo.num_generations_per_prompt=8 \
+    grpo.num_prompts_per_step=32 \
+    grpo.num_generations_per_prompt=16 \
     grpo.max_num_steps=$MAX_STEPS \
     policy.model_name=$NRL_DEEPSEEK_V3_BF16_CKPT \
     policy.tokenizer.name=$NRL_DEEPSEEK_V3_BF16_CKPT \

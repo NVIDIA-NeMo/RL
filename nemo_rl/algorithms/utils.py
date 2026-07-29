@@ -28,6 +28,7 @@ from transformers import (
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
@@ -355,6 +356,8 @@ def get_tokenizer(
         >>>
         ```
     """
+    maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
+
     processor = None
 
     if get_processor:
@@ -855,10 +858,17 @@ def print_performance_metrics(
     # FLOPS
     # =====================================================
 
-    if "total_flops" in train_results:
-        total_tflops = (
-            train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+    packing_enabled = master_config.policy.get("sequence_packing", {}).get(
+        "enabled", False
+    )
+    if "total_flops" in train_results and not packing_enabled:
+        # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
+        # over the driver-side policy_training timer, which returns as soon as the Ray
+        # future is submitted and can be much shorter than actual GPU compute time.
+        train_elapsed_seconds = train_results.get(
+            "train_elapsed_seconds", timing_metrics["policy_training"]
         )
+        total_tflops = train_results["total_flops"] / train_elapsed_seconds / 1e12
         num_ranks = train_results["num_ranks"]
         print(
             f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",

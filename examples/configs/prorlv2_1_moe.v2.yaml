@@ -7,10 +7,10 @@
 #
 # ProRL v2.1 = Pure Online Policy Gradient + Seq-Mask-TIS + REINFORCE++-Baseline
 #
-# Inherits from prorlv2.yaml (which inherits from grpo_math_1B.yaml)
+# Inherits from prorlv2.v2.yaml (which inherits from grpo_math_1B.yaml)
 #
 # Usage:
-#   python examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.yaml
+#   uv run examples/run_grpo.py --config examples/configs/prorlv2_1_moe.v2.yaml
 #
 # Reference papers and blogs:
 # ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/

@@ -114,17 +114,20 @@ def main() -> None:
         master_config,
     ) = setup(config, student_tokenizer, teacher_tokenizers, train_dataset, val_dataset)
 
-    xtoken_off_policy_distillation_train(
-        student_policy,
-        teacher_policies,
-        train_dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        off_policy_distillation_state,
-        master_config,
-    )
+    # The checkpointer owns background async-checkpoint finalization threads;
+    # the context manager guarantees they are flushed (rename + delete) on exit.
+    with checkpointer:
+        xtoken_off_policy_distillation_train(
+            student_policy,
+            teacher_policies,
+            train_dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            off_policy_distillation_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":

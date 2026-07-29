@@ -707,7 +707,7 @@ class TestApplyMoeConfig:
             _apply_moe_config(model_cfg, config)
 
         assert model_cfg.moe_flex_dispatcher_backend == "hybridep"
-        assert model_cfg.moe_hybridep_num_sms == 32
+        assert model_cfg.moe_flex_dispatcher_num_sms == 32
         # min(ep_size=8, 64) == 8
         assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
         # int(ep_size=8 > 4) == 1
@@ -718,6 +718,25 @@ class TestApplyMoeConfig:
             for m in warn_messages
         )
         assert any("USE_MNNVL not configured" in m for m in warn_messages)
+
+    def test_hybridep_num_sms_supports_old_mcore(self, monkeypatch):
+        """The existing recipe key still targets legacy MCore releases."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "1")
+        model_cfg = SimpleNamespace()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=32,
+        )
+
+        with patch("nemo_rl.models.megatron.setup.TransformerConfig", new=object):
+            _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_flex_dispatcher_num_sms")
+        assert model_cfg.moe_hybridep_num_sms == 32
 
     def test_hybridep_env_vars_from_explicit_config(self, monkeypatch):
         """Explicit hybridep_* config keys override defaults without warnings."""
@@ -1212,7 +1231,13 @@ class TestCreateCheckpointConfig:
         optimizer_path = str(tmp_path / "optimizer")
 
         checkpoint_config = _create_checkpoint_config(
-            pretrained_path, weights_path, optimizer_path
+            pretrained_path,
+            weights_path,
+            optimizer_path,
+            ckpt_cfg={
+                "async_save": False,
+                "ckpt_assume_constant_structure": False,
+            },
         )
 
         assert checkpoint_config.save == weights_path
@@ -1223,6 +1248,141 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
+
+    def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
+        """An absent checkpoint block keeps Megatron Bridge's default (sync save).
+
+        async_save has no call-site default — it is presence-checked and forwarded
+        only when set — so a Megatron config that omits the checkpoint block (e.g.
+        a config that predates the block or builds megatron_cfg programmatically)
+        keeps working via Bridge's own default instead of crashing with a KeyError.
+        """
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        weights_path = str(tmp_path / "weights")
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            weights_path,
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=None,
+        )
+
+        assert checkpoint_config.async_save is False
+        # No fallback substitution for save when sync.
+        assert checkpoint_config.save == weights_path
+
+    def test_partial_ckpt_cfg_missing_async_save_defaults_to_sync_save(self, tmp_path):
+        """A checkpoint block that omits async_save keeps Bridge's default (sync)."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg={"ckpt_assume_constant_structure": True},
+        )
+
+        assert checkpoint_config.async_save is False
+        assert checkpoint_config.ckpt_assume_constant_structure is True
+
+    def test_absent_ckpt_assume_constant_structure_uses_bridge_default(self, tmp_path):
+        """ckpt_assume_constant_structure is omitted unless set in YAML."""
+        from megatron.bridge.training.config import (
+            CheckpointConfig as BridgeCheckpointConfig,
+        )
+
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        pretrained_path = str(tmp_path / "pretrained")
+        weights_path = str(tmp_path / "weights")
+        optimizer_path = str(tmp_path / "optimizer")
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path,
+            weights_path,
+            optimizer_path,
+            ckpt_cfg={"async_save": False},
+        )
+        bridge_default = BridgeCheckpointConfig(
+            save_interval=100,
+            save=weights_path,
+            load=weights_path,
+            load_optim=True,
+            pretrained_checkpoint=pretrained_path,
+            async_save=False,
+            fully_parallel_save=True,
+            fully_parallel_load=True,
+            load_rng=False,
+            load_main_params_from_ckpt=False,
+        )
+
+        assert (
+            checkpoint_config.ckpt_assume_constant_structure
+            == bridge_default.ckpt_assume_constant_structure
+        )
+
+    def test_async_save_config_wired_through(self, tmp_path):
+        """async_save / ckpt_assume_constant_structure / parallel-IO fields propagate."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        ckpt_cfg = {
+            "async_save": True,
+            "ckpt_assume_constant_structure": True,
+            "ckpt_fully_parallel_save_process_group": "ep_dp",
+            "ckpt_fully_parallel_load_process_group": "ep_dp",
+            "ckpt_fully_parallel_load_exchange_algo": "broadcast",
+        }
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=ckpt_cfg,
+        )
+
+        assert checkpoint_config.async_save is True
+        assert checkpoint_config.ckpt_assume_constant_structure is True
+        assert checkpoint_config.ckpt_fully_parallel_save_process_group == "ep_dp"
+        assert checkpoint_config.ckpt_fully_parallel_load_process_group == "ep_dp"
+        assert checkpoint_config.ckpt_fully_parallel_load_exchange_algo == "broadcast"
+
+    def test_cold_start_save_falls_back_to_pretrained(self, tmp_path):
+        """With async_save and no weights_path (cold start), save falls back to pretrained."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        pretrained_path = str(tmp_path / "pretrained")
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path,
+            None,  # cold start: no prior checkpoint
+            None,
+            ckpt_cfg={
+                "async_save": True,
+                "ckpt_assume_constant_structure": False,
+            },
+        )
+
+        # Megatron-Bridge requires save != None when async_save is enabled.
+        assert checkpoint_config.save == pretrained_path
+        assert checkpoint_config.load is None
+        assert checkpoint_config.async_save is True
+
+    def test_cold_start_no_fallback_when_sync(self, tmp_path):
+        """Without async_save, a None weights_path leaves save=None (no fallback)."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            None,
+            None,
+            ckpt_cfg={
+                "async_save": False,
+                "ckpt_assume_constant_structure": False,
+            },
+        )
+
+        assert checkpoint_config.save is None
+        assert checkpoint_config.async_save is False
 
 
 @pytest.mark.mcore
@@ -1850,11 +2010,12 @@ class TestSetupModelConfig:
             "megatron_cfg": {},
         }
 
-        mock_cfg = MagicMock()
-        mock_cfg.model = self._make_model_cfg_mock()
+        mock_model_cfg = self._make_model_cfg_mock()
 
-        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
-            mock_cc.from_yaml.return_value = mock_cfg
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
             with pytest.warns(
                 UserWarning, match="hf_config_overrides is set but will be ignored"
             ):
@@ -1865,6 +2026,8 @@ class TestSetupModelConfig:
                     hf_model_name="test-model",
                     pretrained_path=str(tmp_path),
                 )
+
+        mock_load_model_config.assert_called_once_with(str(tmp_path))
 
     def test_megatron_bridge_without_hf_config_overrides_no_warning(
         self, tmp_path, request
@@ -1886,11 +2049,12 @@ class TestSetupModelConfig:
             "megatron_cfg": {},
         }
 
-        mock_cfg = MagicMock()
-        mock_cfg.model = self._make_model_cfg_mock()
+        mock_model_cfg = self._make_model_cfg_mock()
 
-        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
-            mock_cc.from_yaml.return_value = mock_cfg
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
             with _warnings.catch_warnings():
                 _warnings.simplefilter("error", UserWarning)
                 # Should not raise
@@ -1901,6 +2065,40 @@ class TestSetupModelConfig:
                     hf_model_name="test-model",
                     pretrained_path=str(tmp_path),
                 )
+
+        mock_load_model_config.assert_called_once_with(str(tmp_path))
+
+    def test_hf_conversion_loads_model_config_from_iteration_dir(
+        self, tmp_path, request
+    ):
+        """Converted HF caches enter through Bridge's compatibility loader."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        iteration_dir = tmp_path / "iter_0000000"
+        iteration_dir.mkdir()
+        (iteration_dir / "run_config.yaml").touch()
+        mock_model_cfg = self._make_model_cfg_mock()
+
+        config = {
+            "pretrained_checkpoint": None,
+            "megatron_cfg": {},
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+
+        mock_load_model_config.assert_called_once_with(str(iteration_dir))
 
 
 @pytest.mark.mcore
@@ -2481,3 +2679,307 @@ class TestDraftSetup:
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
         )
+
+
+@pytest.mark.mcore
+class TestForceSyncOptimizerFp32FromModel:
+    """Tests for _force_sync_optimizer_fp32_from_model.
+
+    Regression coverage for the optimizer_cpu_offload=True bug where the FP32
+    master copies kept by HybridDeviceOptimizer were left at random init after a
+    fine-tune checkpoint load, so the first optimizer step reverted the BF16
+    model to ~random. The helper must propagate the loaded BF16 model params to
+    all three FP32 levels (GPU shards, CPU clones, and the extra FP32 copy).
+    """
+
+    @staticmethod
+    def _patch_hdo_class(monkeypatch, hdo_cls):
+        """Make the in-function ``import HybridDeviceOptimizer`` resolve to hdo_cls.
+
+        The helper imports it lazily from
+        ``megatron.core.optimizer.cpu_offloading.hybrid_optimizer``; that module
+        may be absent (or fail to import) in a CPU-only unit-test env, so we
+        inject a stub module exposing the class we want isinstance() to match.
+        """
+        import sys
+        import types
+
+        pkg_path = "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+        # Ensure every intermediate package exists so the dotted import resolves.
+        accum = ""
+        for part in pkg_path.split("."):
+            accum = f"{accum}.{part}" if accum else part
+            if accum not in sys.modules:
+                monkeypatch.setitem(sys.modules, accum, types.ModuleType(accum))
+        stub_mod = sys.modules[pkg_path]
+        monkeypatch.setattr(stub_mod, "HybridDeviceOptimizer", hdo_cls, raising=False)
+
+    def _make_distrib_opt(
+        self,
+        hdo_cls,
+        *,
+        param_start=0,
+        param_end=4,
+        shard_is_none=False,
+        with_hdo_attrs=True,
+    ):
+        """Build a fake distributed optimizer wrapping a HybridDeviceOptimizer.
+
+        - Level 1: a BF16 model param with distinct per-element values (so a
+          partial shard slice is genuinely exercised) and a stale FP32 GPU shard
+          (zeros) covering ``[param_start:param_end]``.
+        - Level 2: a CPU clone (stale zeros) keyed by a GPU *model* param holding
+          its loaded weights -- mirroring the real
+          ``gpu_params_map_cpu_copy`` semantic where the key IS the model param,
+          so after the sync the clone must hold those loaded weights.
+        - Level 3: tracked via update_fp32_param_by_new_param() being called.
+
+        shard_is_none      -> Level 1 shard param is None (must be skipped).
+        with_hdo_attrs=False -> HDO exposes neither gpu_params_map_cpu_copy nor
+                                update_fp32_param_by_new_param (levels 2 & 3 skip).
+        """
+        model_param = torch.tensor([10.0, 11.0, 12.0, 13.0])
+        shard_len = param_end - param_start
+        shard_main_param = None if shard_is_none else torch.zeros(shard_len)
+
+        # The dict key is a GPU model param holding loaded weights; the helper
+        # copies key.data -> clone, so the clone must end up == these weights.
+        gpu_model_param = torch.tensor([20.0, 21.0])
+        cpu_clone = torch.zeros(2)  # stale "random init"
+
+        level3_called = {"count": 0}
+
+        class _HDO(hdo_cls):
+            def __init__(self):
+                if with_hdo_attrs:
+                    self.gpu_params_map_cpu_copy = {gpu_model_param: cpu_clone}
+
+            if with_hdo_attrs:
+
+                def update_fp32_param_by_new_param(self):
+                    level3_called["count"] += 1
+
+        hdo = _HDO()
+
+        class _DistribOpt:
+            def __init__(self):
+                self.optimizer = hdo
+                self.model_float16_groups = [[model_param]]
+                self.shard_fp32_from_float16_groups = [[shard_main_param]]
+
+            def _get_model_param_range_map(self, param):
+                return {"param": SimpleNamespace(start=param_start, end=param_end)}
+
+        return SimpleNamespace(
+            distrib_opt=_DistribOpt(),
+            model_param=model_param,
+            shard_main_param=shard_main_param,
+            param_start=param_start,
+            param_end=param_end,
+            gpu_model_param=gpu_model_param,
+            cpu_clone=cpu_clone,
+            level3_called=level3_called,
+        )
+
+    def test_syncs_all_three_fp32_levels(self, monkeypatch):
+        """All three FP32 copies must be refreshed from the BF16 model params."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        # Level 1: GPU FP32 shard now matches the model param slice (not zeros).
+        torch.testing.assert_close(
+            fake.shard_main_param, fake.model_param[fake.param_start : fake.param_end]
+        )
+        # Level 2: CPU clone now holds the loaded weights from its model param key.
+        torch.testing.assert_close(fake.cpu_clone, fake.gpu_model_param)
+        # Level 3: the extra FP32 working-copy refresh hook fired exactly once.
+        assert fake.level3_called["count"] == 1
+
+    def test_syncs_partial_shard_slice(self, monkeypatch):
+        """A non-trivial per-DP-rank shard range must copy the right model slice.
+
+        The whole point of the distributed optimizer is partial shards; the
+        helper slices ``model_param.view(-1)[start:end]``. A full-range-only
+        test would pass even if the offset arithmetic were wrong.
+        """
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(
+            _HybridDeviceOptimizer, param_start=2, param_end=4
+        )
+
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        # shard covers elements [2:4] -> must be [12.0, 13.0], not [10.0, 11.0].
+        torch.testing.assert_close(fake.shard_main_param, torch.tensor([12.0, 13.0]))
+
+    def test_skips_none_shard_param(self, monkeypatch):
+        """A None FP32 shard param is skipped without crashing; levels 2/3 run."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer, shard_is_none=True)
+
+        # Must not raise on the None shard, and must still sync levels 2 & 3.
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        torch.testing.assert_close(fake.cpu_clone, fake.gpu_model_param)
+        assert fake.level3_called["count"] == 1
+
+    def test_skips_absent_hdo_attrs(self, monkeypatch):
+        """If the HDO lacks the level-2/3 members, those levels are safely skipped.
+
+        Level 1 (on the distributed optimizer) must still run.
+        """
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer, with_hdo_attrs=False)
+
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        # Level 1 still applied; levels 2/3 silently skipped (no clone sync, no
+        # level-3 call) and no crash.
+        torch.testing.assert_close(
+            fake.shard_main_param, fake.model_param[fake.param_start : fake.param_end]
+        )
+        torch.testing.assert_close(fake.cpu_clone, torch.zeros(2))
+        assert fake.level3_called["count"] == 0
+
+    def test_handles_chained_optimizers(self, monkeypatch):
+        """A ChainedOptimizer is walked sub-optimizer by sub-optimizer."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        a = self._make_distrib_opt(_HybridDeviceOptimizer)
+        b = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+
+        setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
+
+        for fake in (a, b):
+            torch.testing.assert_close(
+                fake.shard_main_param,
+                fake.model_param[fake.param_start : fake.param_end],
+            )
+            torch.testing.assert_close(fake.cpu_clone, fake.gpu_model_param)
+            assert fake.level3_called["count"] == 1
+
+    def test_noop_when_not_hybrid_device_optimizer(self, monkeypatch):
+        """A non-HybridDeviceOptimizer inner optimizer must be left untouched."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        # The real HDO class is patched in, but our optimizer is NOT an instance.
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+
+        shard_main_param = torch.zeros(4)
+        plain_opt = SimpleNamespace(
+            optimizer=object(),  # not a HybridDeviceOptimizer
+            model_float16_groups=[[torch.full((4,), 7.0)]],
+            shard_fp32_from_float16_groups=[[shard_main_param]],
+        )
+
+        setup_mod._force_sync_optimizer_fp32_from_model(plain_opt, model=MagicMock())
+
+        # Untouched: the helper short-circuits before touching the FP32 shard.
+        torch.testing.assert_close(shard_main_param, torch.zeros(4))
+
+    def test_noop_when_hybrid_optimizer_import_unavailable(self, monkeypatch):
+        """If HybridDeviceOptimizer can't be imported, the helper is a safe no-op."""
+        import sys
+
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        # Force the lazy import to fail by removing the module and blocking reimport.
+        pkg_path = "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+        monkeypatch.setitem(sys.modules, pkg_path, None)
+
+        shard_main_param = torch.zeros(4)
+        fake_opt = SimpleNamespace(
+            optimizer=object(),
+            model_float16_groups=[[torch.full((4,), 7.0)]],
+            shard_fp32_from_float16_groups=[[shard_main_param]],
+        )
+
+        # Must not raise even though the import fails.
+        setup_mod._force_sync_optimizer_fp32_from_model(fake_opt, model=MagicMock())
+
+        torch.testing.assert_close(shard_main_param, torch.zeros(4))
+
+    def test_megatron_internals_have_not_drifted(self):
+        """Tripwire: fail loudly if Megatron renames the internals we depend on.
+
+        The helper guards every access with isinstance/hasattr, so if upstream
+        renames any of these members it silently becomes a no-op -- the bug
+        returns while every stub-based test above stays green. This is the one
+        test that catches that, by asserting the real classes still expose the
+        exact names the helper reads. Instance attributes are set in __init__
+        (so not visible on the class object); we assert their names still appear
+        in the class source. Skips when mcore/Megatron is unavailable.
+        """
+        import inspect
+
+        pytest.importorskip(
+            "megatron.core.optimizer.cpu_offloading.hybrid_optimizer",
+            reason="requires the mcore extra (real Megatron)",
+        )
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+            HybridDeviceOptimizer,
+        )
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        # Methods -- directly checkable on the class object.
+        assert hasattr(HybridDeviceOptimizer, "update_fp32_param_by_new_param"), (
+            "HybridDeviceOptimizer.update_fp32_param_by_new_param was renamed/removed; "
+            "_force_sync_optimizer_fp32_from_model's level-3 sync is now a silent no-op."
+        )
+        assert hasattr(DistributedOptimizer, "_get_model_param_range_map"), (
+            "DistributedOptimizer._get_model_param_range_map was renamed/removed; "
+            "_force_sync_optimizer_fp32_from_model's level-1 slicing will break."
+        )
+
+        # Instance attributes -- assert their names still appear in the source.
+        hdo_src = inspect.getsource(HybridDeviceOptimizer)
+        for name in ("gpu_params_map_cpu_copy", "param_to_fp32_param"):
+            assert name in hdo_src, (
+                f"HybridDeviceOptimizer no longer references {name!r}; "
+                "_force_sync_optimizer_fp32_from_model's level-2/3 sync is now a silent no-op."
+            )
+        do_src = inspect.getsource(DistributedOptimizer)
+        for name in ("model_float16_groups", "shard_fp32_from_float16_groups"):
+            assert name in do_src, (
+                f"DistributedOptimizer no longer references {name!r}; "
+                "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
+            )

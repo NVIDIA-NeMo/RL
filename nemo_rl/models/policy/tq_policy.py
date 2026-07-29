@@ -38,7 +38,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
@@ -99,7 +99,7 @@ class TQPolicy(Policy):
     def __init__(
         self,
         *args: Any,
-        dp_cfg: dict[str, Any],
+        dp_cfg: DataPlaneConfig,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -460,8 +460,8 @@ class TQPolicy(Policy):
 
     # ── split-API fanout (SC async path) ───────────────────────────────────
     #
-    # Counterpart to :meth:`train_from_meta`, exposed to ``PolicyTrainerActor``
-    # so :class:`SingleControllerActor` can stream microbatches without
+    # Counterpart to :meth:`train_from_meta`, consumed directly by
+    # :class:`SingleControllerActor` so it can stream microbatches without
     # forcing a full-step optimizer.step on every dispatch.
     #
     # Lifecycle (one step open at a time — workers raise on a second

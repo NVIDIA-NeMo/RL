@@ -415,6 +415,17 @@ def stream_weights_via_ipc_zmq_impl(
     buffer_b: torch.Tensor | None = None
     current_buffer: torch.Tensor | None = None
 
+    def release_staging_buffers() -> None:
+        """Release acyclic IPC buffers without scanning the worker object graph."""
+        nonlocal buffer_a, buffer_b, current_buffer
+
+        had_buffers = buffer_a is not None or buffer_b is not None
+        current_buffer = None
+        buffer_a = None
+        buffer_b = None
+        if had_buffers:
+            torch.cuda.empty_cache()
+
     used_bytes = 0
     param_names = []
     await_recv = False
@@ -462,8 +473,13 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Final synchronization and completion signal
+        # The receiver synchronizes and drops every IPC view before ACKing a
+        # group, so the final data ACK is the staging buffers' safe lifetime
+        # boundary. Reclaim them before asking the receiver to run its final
+        # post-load conversion, which can otherwise retain both large buffers
+        # for the whole conversion and amplify a single-rank tail.
         torch.cuda.current_stream().synchronize()
+        release_staging_buffers()
         zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
         zmq_socket.recv()
 
@@ -488,15 +504,10 @@ def stream_weights_via_ipc_zmq_impl(
         ) from e
 
     finally:
-        # Clean up buffers in finally block to ensure cleanup even on exceptions
-        if buffer_a is not None:
-            del buffer_a
-        if buffer_b is not None:
-            del buffer_b
-
-        # Force garbage collection and clear CUDA cache
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Tensor references are acyclic and deterministic; a full gc.collect()
+        # scans the entire model object graph and can become a multi-second
+        # rank straggler without releasing anything that refcounting cannot.
+        release_staging_buffers()
 
 
 def rebuild_cuda_tensor_from_ipc(

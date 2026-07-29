@@ -27,6 +27,7 @@ policy:
     backend: megatron
     mcore_generation_config:
       transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: "vllm"
       moe_router_num_groups: null
       moe_router_group_topk: null
       activation_checkpointing: false

@@ -422,6 +422,8 @@ def sft_train(
 
     policy.prepare_for_training()
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while (
         current_epoch < max_num_epochs and total_steps < master_config.sft.max_num_steps
     ):
@@ -524,6 +526,10 @@ def sft_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
@@ -591,7 +597,10 @@ def sft_train(
                             train_dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
@@ -644,9 +653,11 @@ def sft_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= master_config.sft.max_num_steps:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -655,3 +666,10 @@ def sft_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()

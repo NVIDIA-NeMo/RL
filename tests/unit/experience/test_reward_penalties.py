@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.experience.rollouts import (
+    _extract_mask_sample_flags,
     apply_reward_penalties,
     resolve_reward_penalty_config,
 )
@@ -83,6 +84,24 @@ class _FakeTokenizer:
     def encode(self, text, add_special_tokens=False):
         assert not add_special_tokens
         return self.token_map[text]
+
+
+class TestExtractMaskSampleFlags:
+    def test_reads_mask_sample_from_instance_config(self):
+        results = [
+            {"full_result": {"instance_config": {"mask_sample": True}}},
+            {"full_result": {"instance_config": {"mask_sample": False}}},
+            {"full_result": {"instance_config": {}}},
+            {"full_result": {}},
+            {"full_result": {"instance_config": None}},
+        ]
+
+        mask_sample = _extract_mask_sample_flags(results)
+
+        assert mask_sample.dtype == torch.bool
+        assert torch.equal(
+            mask_sample, torch.tensor([True, False, False, False, False])
+        )
 
 
 # =====================================================================

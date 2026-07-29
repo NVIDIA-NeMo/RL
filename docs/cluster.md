@@ -152,36 +152,38 @@ sbatch ray.sub \
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
-* - `NODE_MANAGER_PORT=53001`
+* - `NODE_MANAGER_PORT=1301`
   - Port for the Ray node manager on worker nodes.
-* - `OBJECT_MANAGER_PORT=53003`
+* - `OBJECT_MANAGER_PORT=1303`
   - Port for the Ray object manager on worker nodes.
-* - `RUNTIME_ENV_AGENT_PORT=53005`
+* - `RUNTIME_ENV_AGENT_PORT=1305`
   - Port for the Ray runtime environment agent on worker nodes.
-* - `DASHBOARD_AGENT_GRPC_PORT=53007`
+* - `DASHBOARD_AGENT_GRPC_PORT=1307`
   - gRPC port for the Ray dashboard agent on worker nodes.
-* - `METRICS_EXPORT_PORT=53009`
+* - `METRICS_EXPORT_PORT=1309`
   - Port for exporting metrics from worker nodes.
-* - `PORT=6379`
+* - `PORT=1200`
   - Main port for the Ray head node.
-* - `RAY_CLIENT_SERVER_PORT=10001`
+* - `RAY_CLIENT_SERVER_PORT=1201`
   - Port for the Ray client server on the head node.
 * - `DASHBOARD_GRPC_PORT=52367`
   - gRPC port for the Ray dashboard on the head node.
 * - `DASHBOARD_PORT=8265`
   - Port for the Ray dashboard UI on the head node. This is also the port
     used by the Ray distributed debugger.
-* - `DASHBOARD_AGENT_LISTEN_PORT=52365`
+* - `DASHBOARD_AGENT_LISTEN_PORT=1311`
   - Listening port for the dashboard agent on the head node.
-* - `MIN_WORKER_PORT=54001`
+* - `MIN_WORKER_PORT=2000`
   - Minimum port in the range for Ray worker processes.
-* - `MAX_WORKER_PORT=54257`
+* - `MAX_WORKER_PORT=2999`
   - Maximum port in the range for Ray worker processes.
 ``````
 
 > [!NOTE]
 > For the most part, you will not need to change ports unless these
 > are already taken by some other service backgrounded on your cluster.
+> The defaults above are the source-of-truth port layout defined in `ray.sub`;
+> keep this table in sync with that block if the defaults ever change.
 
 ### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
 
