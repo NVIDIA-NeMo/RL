@@ -468,7 +468,12 @@ class VllmAsyncGenerationWorkerImpl(
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                    content = message.get("content")
+                    if content is not None and not isinstance(content, (list, str)):
+                        try:
+                            message["content"] = list(content)
+                        except TypeError:
+                            message["content"] = []
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -517,6 +522,27 @@ class VllmAsyncGenerationWorkerImpl(
                             res[1][0]["prompt_token_ids"],
                         )
                     return res
+
+                # vLLM normalizes reasoning and tool-call message content during
+                # preprocessing.  Reuse that representation for the isolated
+                # prefix render, while removing NeMo-RL's token bookkeeping.
+                excluded_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for message in messages:
+                    if isinstance(message, dict):
+                        messages_for_replace_prefix_tokens.append(
+                            {
+                                key: deepcopy(value)
+                                for key, value in message.items()
+                                if key not in excluded_fields
+                            }
+                        )
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(message))
 
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
