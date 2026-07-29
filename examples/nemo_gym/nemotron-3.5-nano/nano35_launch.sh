@@ -51,6 +51,8 @@ set -euo pipefail
 #   NUM_GEN_NODES=                          Policy-generation nodes
 #   NUM_GYM_NODES=                          In-cluster NeMo Gym judge nodes
 #   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray
+#   GENRM_SEGMENT_SIZE=                      Segment size for the external
+#                                          service hetgroup
 #   BATCH_SCRIPT=ray.sub                    Slurm entrypoint; external services
 #                                          may wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
@@ -75,9 +77,10 @@ set -euo pipefail
 # Hydra overrides are forwarded verbatim as positional arguments:
 #   bash .../nano35_launch.sh swe policy.megatron_cfg.optimizer.lr=1e-6
 #
-# The reference profiles target four-GPU GB200 nodes. Slurm total =
-# NUM_TRAIN + NUM_GEN + NUM_GYM + NUM_EXTERNAL_SERVICE_NODES and must be a
-# multiple of SEGMENT_SIZE.
+# The reference profiles target four-GPU GB200 nodes. With external service
+# nodes, Slurm uses two heterogeneous components so the services remain outside
+# the training Ray cluster. Each component must be divisible by its own segment
+# size.
 # =============================================================================
 
 # =============================================================================
@@ -379,7 +382,8 @@ fi
 NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-0}"
 
 NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
-NUM_TOTAL_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES + NUM_EXTERNAL_SERVICE_NODES))
+NUM_RAY_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
+NUM_TOTAL_NODES=$((NUM_RAY_NODES + NUM_EXTERNAL_SERVICE_NODES))
 
 if (( NUM_TRAIN_NODES <= 0 )); then
   echo "ERROR: NUM_TRAIN_NODES must be > 0 (got ${NUM_TRAIN_NODES})" >&2; exit 1
@@ -394,17 +398,28 @@ if (( NUM_EXTERNAL_SERVICE_NODES < 0 )); then
   echo "ERROR: NUM_EXTERNAL_SERVICE_NODES must be >= 0 (got ${NUM_EXTERNAL_SERVICE_NODES})" >&2; exit 1
 fi
 
-# GB200 NVL72 topology: 18 nodes per NVLink domain, allocate in groups of 16.
+# GB200 NVL72 topology: validate the training and external-service components
+# separately because Slurm schedules them as distinct heterogeneous groups.
 SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
-if (( NUM_TOTAL_NODES < SEGMENT_SIZE )); then
-  echo "ERROR: NUM_TOTAL_NODES=${NUM_TOTAL_NODES} < SEGMENT_SIZE=${SEGMENT_SIZE}" >&2
+GENRM_SEGMENT_SIZE="${GENRM_SEGMENT_SIZE:-${SEGMENT_SIZE}}"
+if (( NUM_RAY_NODES < SEGMENT_SIZE )); then
+  echo "ERROR: NUM_RAY_NODES=${NUM_RAY_NODES} < SEGMENT_SIZE=${SEGMENT_SIZE}" >&2
   exit 1
 fi
-if (( NUM_TOTAL_NODES % SEGMENT_SIZE != 0 )); then
-  echo "ERROR: NUM_TOTAL_NODES=${NUM_TOTAL_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
-  echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Gym=${NUM_GYM_NODES} + External=${NUM_EXTERNAL_SERVICE_NODES} = ${NUM_TOTAL_NODES}" >&2
-  echo "  Adjust node counts so the total is a multiple of ${SEGMENT_SIZE}." >&2
+if (( NUM_RAY_NODES % SEGMENT_SIZE != 0 )); then
+  echo "ERROR: NeMo RL nodes=${NUM_RAY_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
+  echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Gym=${NUM_GYM_NODES} = ${NUM_RAY_NODES}" >&2
   exit 1
+fi
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  if (( GENRM_SEGMENT_SIZE <= 0 )); then
+    echo "ERROR: GENRM_SEGMENT_SIZE must be > 0." >&2
+    exit 1
+  fi
+  if (( NUM_EXTERNAL_SERVICE_NODES % GENRM_SEGMENT_SIZE != 0 )); then
+    echo "ERROR: External service nodes=${NUM_EXTERNAL_SERVICE_NODES} is not divisible by GENRM_SEGMENT_SIZE=${GENRM_SEGMENT_SIZE}." >&2
+    exit 1
+  fi
 fi
 
 # =============================================================================
@@ -753,12 +768,16 @@ echo "  Nemotron 3.5 Nano — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
 echo "  Config:      ${CONFIG_PATH}"
-echo "  Nodes:       ${NUM_TOTAL_NODES} total  (segment=${SEGMENT_SIZE})"
+echo "  Nodes:       ${NUM_TOTAL_NODES} total"
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
+fi
 echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    Gym:       ${NUM_GYM_NODES}  ($((NUM_GYM_NODES * GPUS_PER_NODE)) GPUs)"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
-echo "    External:  ${NUM_EXTERNAL_SERVICE_NODES}  ($((NUM_EXTERNAL_SERVICE_NODES * GPUS_PER_NODE)) GPUs)"
+echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external GenRM nodes  (segment=${GENRM_SEGMENT_SIZE})"
+echo "      GenRM:    ${GENRM_REPLICAS} independent TP=${GENRM_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${GENRM_LB_PORT}"
 fi
 echo "  Walltime:    ${WALLTIME}"
 echo "  Batch script: ${BATCH_SCRIPT}"
@@ -899,24 +918,58 @@ SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 DEPENDENCY="singleton"
 [[ -n "${SLURM_DEPENDENCY}" ]] && DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
 
-SBATCH_OUTPUT=$(sbatch \
-  --nodes="${NUM_TOTAL_NODES}" \
-  --account="${SLURM_ACCOUNT}" \
-  --job-name="${JOB_NAME}" \
-  --partition="${SLURM_PARTITION}" \
-  --time="${WALLTIME}" \
-  --gres=gpu:${GPUS_PER_NODE} \
-  --exclusive \
-  --mem=0 \
-  --dependency="${DEPENDENCY}" \
-  --segment="${SEGMENT_SIZE}" \
-  --output="${SLURM_LOG_DIR}/%j.out" \
-  --error="${SLURM_LOG_DIR}/%j.err" \
-  ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
-  ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
-  ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-  "${SLURM_COMMENT_ARGS[@]}" \
-  "${BATCH_SCRIPT}")
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  SBATCH_OUTPUT=$(sbatch \
+    --nodes="${NUM_RAY_NODES}" \
+    --account="${SLURM_ACCOUNT}" \
+    --job-name="${JOB_NAME}" \
+    --partition="${SLURM_PARTITION}" \
+    --time="${WALLTIME}" \
+    --gres=gpu:${GPUS_PER_NODE} \
+    --exclusive \
+    --mem=0 \
+    --dependency="${DEPENDENCY}" \
+    --segment="${SEGMENT_SIZE}" \
+    --output="${SLURM_LOG_DIR}/%j.out" \
+    --error="${SLURM_LOG_DIR}/%j.err" \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    "${SLURM_COMMENT_ARGS[@]}" \
+    : \
+    --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
+    --account="${SLURM_ACCOUNT}" \
+    --job-name="${JOB_NAME}-genrm" \
+    --partition="${SLURM_PARTITION}" \
+    --time="${WALLTIME}" \
+    --gres=gpu:${GPUS_PER_NODE} \
+    --exclusive \
+    --mem=0 \
+    --segment="${GENRM_SEGMENT_SIZE}" \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    "${BATCH_SCRIPT}")
+else
+  SBATCH_OUTPUT=$(sbatch \
+    --nodes="${NUM_TOTAL_NODES}" \
+    --account="${SLURM_ACCOUNT}" \
+    --job-name="${JOB_NAME}" \
+    --partition="${SLURM_PARTITION}" \
+    --time="${WALLTIME}" \
+    --gres=gpu:${GPUS_PER_NODE} \
+    --exclusive \
+    --mem=0 \
+    --dependency="${DEPENDENCY}" \
+    --segment="${SEGMENT_SIZE}" \
+    --output="${SLURM_LOG_DIR}/%j.out" \
+    --error="${SLURM_LOG_DIR}/%j.err" \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    "${SLURM_COMMENT_ARGS[@]}" \
+    "${BATCH_SCRIPT}")
+fi
 
 echo "${SBATCH_OUTPUT}"
 JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$')
