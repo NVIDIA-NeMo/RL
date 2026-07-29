@@ -230,6 +230,8 @@ fi
 uv sync --link-mode symlink --frozen --extra mcore --no-install-project
 uv sync --link-mode symlink --frozen --extra automodel --no-install-project
 uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
+# Combined env for the diffusion-GRPO policy worker (PY_EXECUTABLES.AUTOMODEL_DIFFUSION)
+uv sync --link-mode symlink --frozen --extra automodel --extra diffusion --no-install-project
 uv sync --link-mode symlink --frozen --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
