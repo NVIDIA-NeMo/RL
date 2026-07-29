@@ -29,6 +29,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
+    _calculate_observed_pass_metrics,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -38,11 +39,14 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _stable_group_ids,
     _validate_use_kl_in_reward_compat,
+    add_grpo_token_loss_masks_and_generation_logprobs,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
+    extract_initial_prompt_messages,
     grpo_train,
     refit_policy_generation,
     validate,
@@ -157,6 +161,29 @@ def test_initial_policy_generation_stale() -> None:
 
     generation.weight_synchronizer.is_stale = True
     assert _initial_policy_generation_stale(generation, completed_steps=0)
+
+
+def test_stable_group_ids_uses_contiguous_prompt_groups():
+    rendered_prompt_ids = torch.tensor(
+        [
+            [10, 11],
+            [10, 12],
+            [20, 21],
+            [20, 22],
+        ]
+    )
+
+    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+
+    assert torch.equal(result, torch.tensor([[0], [0], [1], [1]]))
+
+
+def test_stable_group_ids_falls_back_for_incomplete_group():
+    rendered_prompt_ids = torch.tensor([[10], [11], [20]])
+
+    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+
+    assert result is rendered_prompt_ids
 
 
 @pytest.fixture
@@ -2671,6 +2698,80 @@ def test_periodic_validation_starts_at_configured_step(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+@pytest.mark.parametrize(
+    ("val_at_end", "expected_validation_steps"),
+    [(False, [4]), (True, [4, 5])],
+)
+def test_periodic_validation_starts_at_configured_step(
+    mock_grpo_components, train_func, val_at_end, expected_validation_steps
+):
+    """Both trainers preserve cadence while honoring the validation lower bound."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "val_start_at": 3,
+            "val_at_end": val_at_end,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        if train_func == async_grpo_train:
+            master_config.policy["generation"]["colocated"]["enabled"] = False
+            stack.enter_context(
+                mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=_mock_seq_logprob_error_result(),
+                )
+            )
+
+        mock_validate = stack.enter_context(
+            patch("nemo_rl.algorithms.grpo.validate", return_value=({}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == (
+        expected_validation_steps
+    )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_steps is reached"""
     # Set max steps to 12
@@ -3222,6 +3323,34 @@ def test_reinforce_plus_plus_global_normalization():
 # ============================================================================
 
 
+def test_calculate_observed_pass_metrics():
+    metrics = _calculate_observed_pass_metrics(
+        [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        num_generations_per_prompt=4,
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "pass@4": 2 / 3,
+            "pass^4": 1 / 3,
+            "pass@1[avg-of-4]": 5 / 12,
+        }
+    )
+
+
 class TestValidateFunction:
     """Tests for the validate() function."""
 
@@ -3397,6 +3526,66 @@ class TestValidateFunction:
         # Verify metrics are returned correctly
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
+
+    def test_grouped_validation_uses_pass_at_k_as_accuracy(self, mock_grpo_components):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.update(
+            {
+                "max_val_samples": 2,
+                "val_batch_size": 2,
+                "num_val_generations_per_prompt": 4,
+                "validation_generation": None,
+            }
+        )
+
+        def run_rollout(_policy, repeated_batch, *_args, **_kwargs):
+            assert repeated_batch["idx"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+            repeated_batch["total_reward"] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+            )
+            return repeated_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=run_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        assert val_metrics["accuracy"] == pytest.approx(1.0)
+        assert val_metrics["pass@4"] == pytest.approx(1.0)
+        assert val_metrics["pass^4"] == pytest.approx(0.5)
+        assert val_metrics["pass@1[avg-of-4]"] == pytest.approx(5 / 8)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
@@ -3912,3 +4101,138 @@ def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
 def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
     fields = _train_fields_for_step(skip_prev_logprobs)
     assert ("prev_logprobs" in fields) is expect_prev
+
+
+class TestMultiTurnPromptHelpers:
+    """Tests for GRPO multi-turn prompt extraction and loss masking."""
+
+    def test_prompt_extraction_with_multi_turn_history(self):
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+        ]
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([7, 8]),
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(message["token_ids"]) for message in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+
+        assert [message["role"] for message in result[0]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert generated_message not in result[0]
+
+    def test_prompt_extraction_with_system_message(self):
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "You are a math tutor.",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([4, 5]),
+            },
+        ]
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([6, 7]),
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(message["token_ids"]) for message in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+
+        assert [message["role"] for message in result[0]] == ["system", "user"]
+        assert generated_message not in result[0]
+
+    def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
+        message_log = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+            {
+                "role": "assistant",
+                "content": "6",
+                "token_ids": torch.tensor([7, 8]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[3]["token_loss_mask"], torch.tensor([1, 1]))
+
+    def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
+        message_log = [
+            {
+                "role": "assistant",
+                "content": "prompt history",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "next question",
+                "token_ids": torch.tensor([3, 4]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {
+                "role": "assistant",
+                "content": "generated response",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.5, 0.6]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(
+            message_log[0]["generation_logprobs"], torch.tensor([0.0, 0.0])
+        )
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))

@@ -41,6 +41,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 from nemo_rl.experience.rollouts import (
+    _NEMO_RL_VALIDATION_REQUEST_TYPE,
+    _set_nemo_rl_request_type,
     generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_multi_turn_rollout_groups,
@@ -68,6 +70,42 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+def test_set_nemo_rl_request_type_preserves_template_metadata():
+    params = {
+        "metadata": {
+            "chat_template_kwargs": json.dumps({"enable_thinking": False}),
+            "trace_id": "abc",
+        }
+    }
+
+    _set_nemo_rl_request_type(params, _NEMO_RL_VALIDATION_REQUEST_TYPE)
+
+    assert params["metadata"]["trace_id"] == "abc"
+    assert json.loads(params["metadata"]["chat_template_kwargs"]) == {
+        "enable_thinking": False,
+        "_nemo_rl_request_type": "validation",
+    }
+
+
+def test_set_nemo_rl_request_type_clears_stale_marker():
+    params = {
+        "metadata": {
+            "chat_template_kwargs": json.dumps(
+                {
+                    "enable_thinking": False,
+                    "_nemo_rl_request_type": "validation",
+                }
+            )
+        }
+    }
+
+    _set_nemo_rl_request_type(params, None)
+
+    assert json.loads(params["metadata"]["chat_template_kwargs"]) == {
+        "enable_thinking": False
+    }
 
 
 class TestCalculateSingleMetric:
@@ -1538,7 +1576,6 @@ def test_run_async_nemo_gym_rollout(
             ],
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
-            "mask_sample": torch.tensor([False, False]),
             "total_reward": torch.tensor([0.0, 0.0]),
             "truncated": torch.tensor([False, False]),
         },

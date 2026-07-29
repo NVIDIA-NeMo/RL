@@ -1954,6 +1954,98 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert result == model_token_ids
 
 
+def test_replace_prefix_tokens_empty_model_prefix_returns_template():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = []
+    template_prefix_token_ids = [9, 2]
+    template_token_ids = [9, 2, 33, 44]
+    result = replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+    class _T:
+        eos_token_id = 2
+
+        def decode(self, *args, **kwargs):
+            pass
+
+    tokenizer = _T()
+    model_prefix_token_ids = [7, 2]
+    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
+    template_token_ids = [9, 9, 9, 2, 10]
+    with pytest.raises(AssertionError):
+        replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
+        )
+
+
+def test_replace_prefix_tokens_tokenizer_without_eos_raises():
+    class _T:
+        eos_token_id = None
+
+    tokenizer = _T()
+    with pytest.raises(AssertionError):
+        replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=[1],
+            template_prefix_token_ids=[1, 2],
+            template_token_ids=[1, 2],
+        )
+
+
+def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [100, 2]
+    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
+    template_token_ids = [9, 2, 9, 2, 77, 88]
+    result = replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == [100, 2, 77, 88]
+
+
+def test_replace_prefix_tokens_repairs_qwen_normalized_prefix():
+    """Qwen3.5 re-renders assistant history with normalized reasoning content.
+
+    The isolated prefix render differs token-wise from what the model produced;
+    EOS-count splicing must still keep the original generated tokens and resume
+    from the template after the boundary EOS.
+    """
+
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    result = replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=[10, 11, 2],
+        # Rendering the assistant prefix alone changed token 11 to token 99.
+        template_prefix_token_ids=[10, 99, 2],
+        # Two messages follow that assistant turn, then the generation marker.
+        template_token_ids=[10, 11, 2, 20, 2, 30, 2, 40],
+    )
+
+    assert result == [10, 11, 2, 20, 2, 30, 2, 40]
+
+
 @pytest.mark.asyncio
 async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     cluster, tokenizer
