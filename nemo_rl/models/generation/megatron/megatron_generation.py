@@ -122,13 +122,6 @@ class MegatronGeneration(GenerationInterface):
         # Start the persistent inference engine + HTTP server during construction.
         self.prepare_for_generation()
 
-        url_futures = self._policy.worker_group.run_all_workers_single_data(
-            "report_dp_openai_server_base_url"
-        )
-        self.dp_openai_server_base_urls = [
-            url for url in ray.get(url_futures) if url is not None
-        ]
-
     def init_collective(
         self,
         ip: str,
@@ -209,6 +202,16 @@ class MegatronGeneration(GenerationInterface):
             "prepare_for_generation", **kwargs
         )
         ray.get(futures)
+        if (
+            not self.dp_openai_server_base_urls
+            and self.cfg["mcore_generation_config"]["expose_http_server"]
+        ):
+            url_futures = self._policy.worker_group.run_all_workers_single_data(
+                "report_dp_openai_server_base_url"
+            )
+            self.dp_openai_server_base_urls = [
+                url for url in ray.get(url_futures) if url is not None
+            ]
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:

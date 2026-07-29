@@ -385,6 +385,7 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
@@ -407,6 +408,8 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
         assert config["megatron_cfg"] == megatron_cfg_before
 
         mg.prepare_for_generation()
+        assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
+        assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
         outputs = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(outputs, test_input_data)
 
