@@ -1,0 +1,299 @@
+# WORKSTATION SMOKE, multi-turn: does capture hold up when the harness calls tools?
+#
+# Same path as grpo_rg_claude_code_tokcap_smoke.yaml -- claude CLI -> Gym model server
+# (capture) -> vLLM -> rebuild -> GRPO optimizer step -- on 2 local GPUs, 2 steps. Two
+# things differ: a 3B policy, and a tool-call parser. It is not a convergence test.
+#
+#   uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_rg_claude_code_tokcap_tools.yaml
+#
+# Required environment (all three, see the runbook):
+#   RAY_TMPDIR=/tmp RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096
+#
+# PASS =
+#   token_capture/rebuilt_fraction == 1.0        (every rollout got a trajectory)
+#   token_capture/delivered_fraction_mean ~ 1.0
+#   token_capture/calls_per_rollout_mean > 1     (the point of this config: tools ran)
+#   a non-zero grad_norm on both steps           (training happened)
+#   /tmp/ng_tokcap_smoke is empty at the end
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1 # the CLI runs its own multi-turn loop; NeMo-RL sees one rollout per prompt
+  max_num_epochs: 1
+  max_num_steps: 2
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 100
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
+  max_val_samples: null # NeMo Gym path forbids non-null max_val_samples; it is set to len(val_dataset) at runtime
+  val_batch_size: 256
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  seq_logprob_error_threshold: null
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
+
+  async_grpo:
+    enabled: false # Set to true to enable async training mode
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false # Set to true to enable in-flight weight updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  # Can be set to k1, k2, k3
+  # For more details, see http://joschu.net/blog/kl-approx.html
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: false
+  # Async GRPO requires importance sampling correction enabled
+  # Set to true when async_grpo.enabled is true
+  use_importance_sampling_correction: false
+  # "tis"          – clamp IS weights to max
+  # "icepop"       – zero out tokens with IS weight outside [min, max]
+  # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null  # Lower bound for ICE-POP
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo_math_1B_gym"
+  metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+  hf_config_overrides: {}
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  generation_batch_size: 32 # Only used when generating using HF backend
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 16384  # Claude Code's system prompt + tool defs is the fixed cost; see the runbook
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false  # optimizer state on GPU: the 7B run OOMd host RAM (241/251GB) with this on
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: False
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+
+  generation:
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null # NeMo Gym path rejects a non-null top_k (not OpenAI compatible)
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true  # REQUIRED by the NeMo Gym path (setup_nemo_gym_config enforces async + expose_http_server)
+      # REQUIRED. The Gym path serves model calls over vLLM's OpenAI-compatible HTTP server, which
+      # needs a tokenizer to apply the chat template -- without it every call 500s on
+      # `assert tokenizer is not None` and nothing is generated or captured. The auto-default in
+      # models/generation/__init__.py would set this correctly, but it reads expose_http_server
+      # before setup_nemo_gym_config has set it, so it must be pinned here.
+      skip_tokenizer_init: false
+      # Parse the model's tool calls into STRUCTURED tool_calls. Qwen emits Hermes-style
+      # <tool_call>{...}</tool_call>; without a parser vLLM returns that as plain TEXT, the
+      # Anthropic converter forwards it as text, and Claude Code never sees a tool_use block --
+      # so every rollout is single-turn and NeMo-RL's invalid-tool-call penalty fires on it.
+      # enable_auto_tools already defaults to true in the NeMo-RL serving layer.
+      http_server_serving_chat_kwargs:
+        tool_parser: hermes
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.45
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+    vllm_kwargs: {}
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+# --- NeMo Gym path: data + env (the only blocks that differ from the baseline) ---
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: False
+  num_workers: 1
+  use_multiple_dataloader: false
+  # Materialize these from math_with_judge via `ng_prepare_data` (see header note on
+  # dataset alignment). For a strict A/B, point the baseline arm at the same source data.
+  train:
+    data_path: "${oc.env:GYM_ROOT}/resources_servers/reasoning_gym/data/rg_ext_train.jsonl"
+  validation:
+    data_path: "${oc.env:GYM_ROOT}/resources_servers/reasoning_gym/data/rg_ext_validation.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
+    - resources_servers/reasoning_gym/configs/reasoning_gym_claude_code_agent_model_server.yaml  # claude_code harness bound to the Gym model server
+    # External-harness token-id capture: the harness returns no token ids, so capture them and rebuild.
+    # token_capture_dir is node-local (the model server and the reader are colocated on one node).
+    token_id_capture_enabled: true
+    token_id_capture_dir: /tmp/ng_tokcap_smoke
+    # Guard the token read route. It serves raw training tokens on the same app the harness
+    # calls; harmless in a trusted cluster, required once the harness is sandboxed.
+    token_id_capture_read_token: ${oc.env:NG_TOKCAP_READ_TOKEN,changeme}
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false  # Disable MLflow logging
+  swanlab_enabled: false # Disable SwanLab logging
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "grpo-dev-logger"
+    tracking_uri: "http://localhost:5000"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1
+  master_port_range_low: 25000
+  master_port_range_high: 28000
