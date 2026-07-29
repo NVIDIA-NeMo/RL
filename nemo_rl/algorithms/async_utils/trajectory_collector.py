@@ -552,10 +552,7 @@ class AsyncTrajectoryCollector:
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
         async_cfg = self.master_config.grpo.async_grpo
-        if (
-            async_cfg is not None
-            and async_cfg.recompute_kv_cache_after_weight_updates
-        ):
+        if async_cfg is not None and async_cfg.recompute_kv_cache_after_weight_updates:
             try:
                 print(
                     "🔄 Invalidating generation backend KV caches after weight update"
