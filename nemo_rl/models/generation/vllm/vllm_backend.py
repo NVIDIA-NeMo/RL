@@ -1199,9 +1199,6 @@ class VllmInternalWorkerExtension:
             )
 
         torch.cuda.empty_cache()
-
-        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.
-        self._maybe_process_fp8_kv_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:

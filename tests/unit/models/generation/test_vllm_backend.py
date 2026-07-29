@@ -300,6 +300,41 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
 
 @pytest.mark.vllm
+def test_nccl_reshard_refit_processes_weights_once(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.nccl_reshard_refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+    }
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_config = object()
+    ext.device = object()
+    ext._receive_and_load_misc_params = MagicMock()
+
+    monkeypatch.setattr(vllm_backend.torch.cuda, "Stream", MagicMock)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", MagicMock())
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", MagicMock())
+    monkeypatch.setattr(vllm_backend.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process_weights = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights,
+    )
+
+    assert ext.nccl_reshard_refit() is True
+    process_weights.assert_called_once_with(
+        ext.model_runner.model, ext.model_config, ext.device
+    )
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "method_name",
     ["update_weights_via_ipc_zmq", "update_weights_from_collective"],

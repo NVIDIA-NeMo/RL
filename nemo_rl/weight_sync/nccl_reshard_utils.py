@@ -561,6 +561,13 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "dynamic expert load balancing can change ownership afterwards)."
         )
 
+    if vllm_cfg.get("refit_prequantize", False):
+        violations.append(
+            "policy.generation.vllm_cfg.refit_prequantize must be False "
+            "(nccl_reshard_refit requires matching training and generation "
+            "storage and does not use BF16-to-MXFP8 prequantization)."
+        )
+
     # This initial version supports only the Megatron train + vLLM gen
     # combination; the DTensor train backend refit path is intentionally
     # dropped (Megatron is the path validated end-to-end).
