@@ -173,7 +173,12 @@ def _patch_tq_actor_runtime_env() -> None:
 
     patched_any = False
     try:
-        from transfer_queue.storage.simple_backend import SimpleStorageUnit
+        try:
+            # TQ v0.1.9+
+            from transfer_queue.storage.simple_storage import SimpleStorageUnit
+        except ImportError:
+            # Compatibility with older TQ revisions.
+            from transfer_queue.storage.simple_backend import SimpleStorageUnit
 
         patched_any |= _install(SimpleStorageUnit)
     except ImportError:
