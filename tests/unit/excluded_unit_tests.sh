@@ -78,11 +78,11 @@ EXCLUDED_UNIT_TESTS=(
 
     --ignore=unit/models/generation/test_vllm_large_model.py
 
-    # test_vllm_generation.py — keep 3 key expensive tests + 5 cheap replace_prefix_tokens tests
+    # test_vllm_generation.py — keep 3 key expensive tests + the replace_prefix_tokens integration test
     # Kept: test_vllm_policy_generation (basic generation correctness),
     #        test_vllm_weight_update_and_prefix_cache_reset (weight sync),
     #        test_vllm_generation_with_megatron_training (generation + megatron A+B),
-    #        test_VllmAsyncGenerationWorker_replace_prefix_tokens + 4 replace_prefix_tokens (cheap utility)
+    #        test_VllmAsyncGenerationWorker_replace_prefix_tokens (end-to-end splice with real tokenizer)
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_missing_required_config_key
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_top_p_top_k_validation
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_worker_seed_behavior

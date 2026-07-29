@@ -224,6 +224,22 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, int],
+        gen_parallelism: dict[str, int],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> Any:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
+        """Sync weights to generation workers via the NCCL-reshard path."""
+        raise NotImplementedError
+
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
         pass

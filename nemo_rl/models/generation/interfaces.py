@@ -306,7 +306,7 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         pass
@@ -340,6 +340,14 @@ class GenerationInterface(ABC):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
+        raise NotImplementedError
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard."""
         raise NotImplementedError
 
     # Optional hook; backends may override to invalidate any reusable caches

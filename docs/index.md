@@ -296,6 +296,9 @@ guides/rm.md
 guides/environments.md
 guides/eval.md
 guides/deepseek.md
+guides/models/index.md
+guides/models/qwen/index.md
+guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
@@ -348,6 +351,7 @@ design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
+design-docs/nccl-reshard-refit.md
 ```
 
 ```{toctree}

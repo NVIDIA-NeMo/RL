@@ -16,47 +16,174 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    AsyncRLConfig,
+    MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import Timer
+
+
+class FakeWeightSynchronizer:
+    pass
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
-    cfg = SingleControllerConfig.model_construct(
-        min_groups_per_batch=1,
-        target_groups_per_step=2,
-        group_size=4,
-        train_global_batch_size=4,
-        advantage_enabled=False,
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 4},
+        grpo={
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 4,
+        },
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
+    )
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=None,
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        train_cluster=None,
+        inference_cluster=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     with pytest.raises(
         ValueError,
         match=(
-            r"train_global_batch_size \(4\) must equal "
-            r"target_groups_per_step \(2\) \* group_size \(4\) = 8; "
-            r"multiple optimizer steps per RL step are not supported"
+            r"num_prompts_per_step \* num_generations_per_prompt \(8\) "
+            r"must equal policy.train_global_batch_size \(4\)"
         ),
     ):
         controller_cls(
-            cfg=cfg,
-            dp_client_handle=None,
-            gen_handle=None,
-            trainer_handle=None,
-            weight_synchronizer=None,
-            loss_fn=None,
-            rollout_manager=SimpleNamespace(_tq_buffer=None),
+            master_config=master_config,
+            actor_args=actor_args,
         )
+
+
+def test_logs_concrete_weight_synchronizer(
+    monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 8},
+        grpo={
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 4,
+        },
+        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger={},
+    )
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=FakeWeightSynchronizer(),
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        train_cluster=None,
+        inference_cluster=None,
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+
+    controller_cls(
+        master_config=master_config,
+        actor_args=actor_args,
+    )
+
+    output = capsys.readouterr().out
+    assert "weight_sync=FakeWeightSynchronizer" in output
+    assert "transport=stub" not in output
+
+
+@pytest.mark.parametrize(
+    ("recompute_kv_cache", "expected_invalidation_calls"),
+    [(False, 0), (True, 1)],
+)
+def test_sync_weights_honors_recompute_kv_cache_config(
+    recompute_kv_cache: bool,
+    expected_invalidation_calls: int,
+) -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(
+        recompute_kv_cache_after_weight_updates=recompute_kv_cache
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(),
+        requires_kv_scale_sync=False,
+    )
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 3
+
+    asyncio.run(ctrl._sync_weights())
+
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(3)
+    assert ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(),
+        requires_kv_scale_sync=True,
+    )
+    ctrl._trainer = SimpleNamespace(
+        calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
+    )
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 3
+    calibration_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "input_lengths": torch.tensor([2]),
+        }
+    )
+
+    asyncio.run(ctrl._sync_weights(calibration_data=calibration_data))
+
+    ctrl._trainer.calibrate_qkv_fp8_scales.assert_called_once_with(
+        calibration_data,
+        include_q=True,
+    )
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
+        kv_scales={"layer.0": 0.5}
+    )
 
 
 class _EmptySampler:
@@ -109,21 +236,25 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._cfg = SimpleNamespace(
-        target_groups_per_step=2,
-        min_groups_per_batch=1,
-        max_train_steps=1,
-        advantage_policy_logprobs_field=None,
-        advantage_reference_logprobs_field=None,
-        advantage_enabled=False,
-        partition_id="rollout_data",
+    ctrl._master_config = SimpleNamespace(
+        grpo={
+            "num_prompts_per_step": 2,
+            "max_num_steps": 1,
+        }
     )
+    ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._advantage_estimator = None
+    ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
