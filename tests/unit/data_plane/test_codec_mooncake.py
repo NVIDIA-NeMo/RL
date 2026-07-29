@@ -73,6 +73,44 @@ def test_promote_1d_roundtrip_via_from_wire() -> None:
     assert torch.equal(back["reward"], original)
 
 
+def test_from_wire_densifies_uniform_nested_rows() -> None:
+    """TQ v0.1.9's uniform nested reads are restored to dense tensors."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+
+    rows = [torch.tensor([i], dtype=torch.float32) for i in range(4)]
+    wire = TensorDict(
+        {"reward": torch.nested.as_nested_tensor(rows, layout=torch.jagged)},
+        batch_size=[len(rows)],
+    )
+
+    back = _from_wire(wire)
+
+    assert not back["reward"].is_nested
+    assert back["reward"].shape == (len(rows),)
+    assert torch.equal(back["reward"], torch.arange(len(rows), dtype=torch.float32))
+
+
+def test_from_wire_preserves_ragged_nested_rows() -> None:
+    """Variable-length rollout fields must remain nested."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+
+    rows = [torch.arange(i + 1) for i in range(3)]
+    nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    wire = TensorDict({"token_ids": nested}, batch_size=[len(rows)])
+
+    back = _from_wire(wire)
+
+    assert back["token_ids"].is_nested
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(back["token_ids"].unbind(), rows, strict=True)
+    )
+
+
 # ── P2: pack_per_token_field — tolerates SP padding ──────────────────────────
 
 

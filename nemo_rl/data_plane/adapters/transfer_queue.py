@@ -361,13 +361,26 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
+    """Normalize Mooncake reads and invert :func:`_promote_1d_leaves`.
+
+    TQ v0.1.9 reconstructs every non-scalar field as a nested tensor before
+    attempting a dense representation, including fields whose rows all have
+    the same shape. Densify those uniform nested tensors first so regular
+    batched inputs retain their dense representation. Truly ragged fields
+    remain nested. Finally, squeeze the singleton dimension introduced by
+    :func:`_promote_1d_leaves`.
+    """
     # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
     # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
     new_dict: dict[str, Any] = {}
     changed = False
     for k in td.keys():
         v = td.get(k)
+        if isinstance(v, torch.Tensor) and v.is_nested:
+            rows = list(v.unbind())
+            if rows and all(row.shape == rows[0].shape for row in rows[1:]):
+                v = torch.stack(rows)
+                changed = True
         if (
             isinstance(v, torch.Tensor)
             and not v.is_nested
