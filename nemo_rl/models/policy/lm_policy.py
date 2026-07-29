@@ -97,6 +97,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
+        skip_weight_load: bool = False,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -258,6 +259,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
+        if skip_weight_load:
+            worker_kwargs["skip_weight_load"] = True
 
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid

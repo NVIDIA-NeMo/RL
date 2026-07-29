@@ -1047,6 +1047,7 @@ def setup(
                 tokenizer=tokenizer,
                 processor=processor,
                 weights_path=weights_path,
+                skip_weight_load=True,
             )
         return mg, time.perf_counter() - t0
 
