@@ -139,6 +139,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
+            # MCore's NVSHMEM copy service hard-requires NVSHMEM_MAX_CTAS=2 at init
+            # (megatron/core/resharding/nvshmem_copy_service/core/gpu_resource_manager.py).
+            mcore_gen_cfg = (config.get("generation") or {}).get(
+                "mcore_generation_config"
+            ) or {}
+            if (
+                mcore_gen_cfg.get("refit_backend") == "nvshmem"
+                and "NVSHMEM_MAX_CTAS" not in env_vars
+            ):
+                env_vars["NVSHMEM_MAX_CTAS"] = "2"
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
