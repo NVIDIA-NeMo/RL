@@ -61,11 +61,19 @@ RLVR policy itself serves as the general teacher:
 
 ## Container
 
-These are the instructions to build the training container. The image targets
-**aarch64 (arm64)** for GB200 NVL72 nodes and bundles a custom vLLM build
-required by Ultra.
+Ultra runs on the stock NeMo RL container. The vLLM version is whatever `pyproject.toml` pins (currently the upstream
+aarch64 wheel), so the only requirement is an **aarch64 (arm64)** image for
+GB200 NVL72 nodes.
 
-From the root of the repo:
+The quickest option is to pull a prebuilt nightly image from
+[NGC](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags) and
+skip the build entirely:
+
+```bash
+docker pull nvcr.io/nvidia/nemo-rl:<nightly-tag>
+```
+
+To build it yourself instead, from the root of the repo:
 
 ```bash
 docker buildx build \
@@ -76,22 +84,15 @@ docker buildx build \
   --build-context nemo-rl=. \
   --build-arg MAX_JOBS=8 \
   --build-arg SKIP_SGLANG_BUILD=1 \
-  --build-arg BUILD_CUSTOM_VLLM=1 \
-  --build-arg BUILD_CUSTOM_VLLM_URL=https://github.com/TomerBN-Nvidia/vllm.git \
-  --build-arg BUILD_CUSTOM_VLLM_REF=ultra-rl-v0.17 \
-  --build-arg BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_aarch64.whl \
   .
 ```
 
 Build args:
-- `BUILD_CUSTOM_VLLM=1` with `BUILD_CUSTOM_VLLM_URL` / `BUILD_CUSTOM_VLLM_REF` —
-  builds the Ultra vLLM fork; `BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION`
-  points at the matching upstream aarch64 wheel so the build reuses precompiled
-  kernels instead of compiling from source.
 - `SKIP_SGLANG_BUILD=1` — Ultra runs on vLLM; skip the SGLang build.
 - `MAX_JOBS` — parallel build jobs; tune to your machine.
 - `--build-context nemo-rl=.` — build from your local checkout (otherwise the
   Dockerfile pulls `NVIDIA-NeMo/RL.git#main`).
+
 
 To run on the cluster with Slurm, convert the image to a squashfs (`.sqsh`)
 with [enroot](https://github.com/NVIDIA/enroot):
@@ -151,7 +152,7 @@ For now, each stage takes a JSONL training file and a JSONL validation file
 ## Prepare the code
 
 ```bash
-git clone --recursive -b ultra-v3 https://github.com/NVIDIA-NeMo/RL.git
+git clone --recursive -b main https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 ```
 
@@ -254,7 +255,7 @@ second phase resumes from the first phase's checkpoint:
 | `max_total_sequence_length` | 49,152 | 65,536 |
 | Steps in this phase | ~128 | ~50 |
 | `NRL_MAX_STEPS` to set | `128` | `178` (= 128 + 50) |
-| `group_answer_length_penalty_coeff` | 0.15 | 0.08 |
+| `group_answer_length_penalty_coeff` | 0.25 | 0.08 |
 
 Both phases share TP=8, EP=64, CP=8, PP=1, GBS=8192 (512 prompts × 16
 generations), advantage clip ±20, and the 256-node cluster shape.
@@ -378,7 +379,7 @@ learning rate, context).
 - `max_total_sequence_length=49152`
 - `train_global_batch_size=2048`, `num_prompts_per_step=128`, `num_generations_per_prompt=16`
 - Learning rate `2.5e-6` constant
-- Default cluster shape: 64 nodes (32 training + 28 vLLM + 4 Gym)
+- Default cluster shape: 80 nodes (32 training + 28 vLLM + 20 Gym)
 
 ```bash
 EXP_NAME=ultra-rlhf-teacher \
@@ -388,7 +389,7 @@ TRAIN_PATH=$DATA_DIR/rlhf.train.jsonl \
 VAL_PATH=$DATA_DIR/rlhf.val.jsonl \
 NUM_TRAIN_NODES=32 \
 NUM_GEN_NODES=28 \
-NUM_GYM_NODES=4 \
+NUM_GYM_NODES=20 \
 ENABLE_MTP_INFERENCE=1 \
 CONTAINER=/path/to/nemo-rl-container \
 SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
@@ -422,7 +423,7 @@ many roles.
 - `train_global_batch_size=2048`, `num_prompts_per_step=128`, `num_generations_per_prompt=16`
 - Learning rate `3.0e-6` constant
 - `max_num_epochs=10` — small sub-sampled dataset, multiple passes expected
-- Default cluster shape: 128 nodes (64 training + 60 vLLM + 4 Gym)
+- Default cluster shape: 128 nodes (64 training + 54 vLLM + 10 Gym)
 
 ```bash
 EXP_NAME=ultra-reasoning-teacher \
@@ -432,8 +433,8 @@ MODEL_PATH=/path/to/student_rlvr_output \
 TRAIN_PATH=$DATA_DIR/reasoning.train.jsonl \
 VAL_PATH=$DATA_DIR/reasoning.val.jsonl \
 NUM_TRAIN_NODES=64 \
-NUM_GEN_NODES=60 \
-NUM_GYM_NODES=4 \
+NUM_GEN_NODES=54 \
+NUM_GYM_NODES=10 \
 CONTAINER=/path/to/nemo-rl-container \
 SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
 PERSISTENT_CACHE=/path/to/persistent/cache \
@@ -581,7 +582,7 @@ Gym agent is routed to one of the Stage 2 teacher checkpoints. Trains the
 student to match per-agent teacher distributions.
 
 **Config:** `examples/nemo_gym/nemotron-3-ultra/mopd.yaml`
-- TP=8, EP=64, CP=8, PP=1, max context 192k
+- TP=8, EP=64, CP=32, PP=1, max context 192k
 - Teacher parallelism: TP=8, CP=2, EP=16, 4 nodes per teacher
 - Routing: agent → teacher checkpoint baked into the YAML via
   `${_teachers.<role>}` references; only `_teachers.general` is required and
