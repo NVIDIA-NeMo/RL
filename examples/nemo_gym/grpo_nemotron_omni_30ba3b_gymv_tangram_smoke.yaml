@@ -1,0 +1,33 @@
+# Tangram-QA variant of grpo_nemotron_omni_30ba3b_gymv_smoke.yaml.
+#
+# Extends the FrozenLake smoke recipe and overrides only the data paths (and
+# log labels) — model, parallelism, DDP/scheduler workarounds, and the gym-v
+# agent config are all inherited via `defaults:`.
+#
+# Tangram-QA is single-turn (env `Geometry/Tangram-QA-v0`, horizon_cap=1),
+# same agent (`gym_v_agent`, `max_steps: 1`) and same \boxed{...} answer
+# grammar as the FrozenLake singleturn eval, so no agent-side overrides are
+# needed.
+#
+# Manifest source (copied + max_output_tokens stripped so the model uses the
+# max_model_len - prompt_len fallback):
+#   manifests/game_rlvr_tangram_phase2_{train,eval}/manifest.jsonl
+#     → tangram_phase2/{train,eval}_manifest.jsonl
+#
+# Run with:
+#   uv run --locked --extra mcore --extra vllm \
+#     examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_tangram_smoke.yaml
+
+defaults: grpo_nemotron_omni_30ba3b_gymv_smoke.yaml
+
+data:
+  train:
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/tangram_phase2/train_manifest.jsonl
+  validation:
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/tangram_phase2/eval_manifest.jsonl
+
+logger:
+  log_dir: "logs/grpo-nemotron-omni-30ba3b-gymv-tangram-smoke"
+  wandb:
+    name: "grpo-nemotron-omni-30ba3b-gymv-tangram-smoke"

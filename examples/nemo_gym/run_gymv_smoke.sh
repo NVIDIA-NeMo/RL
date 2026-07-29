@@ -8,6 +8,7 @@
 #   examples/nemo_gym/run_gymv_smoke.sh nemotron                      # Nemotron-Omni-30B sync (2n, 1vllm+1mcore)
 #   examples/nemo_gym/run_gymv_smoke.sh nemotron async                # Nemotron-Omni-30B async, max_trajectory_age_steps=1
 #   examples/nemo_gym/run_gymv_smoke.sh nemotron async wandb          # ... also sets logger.wandb_enabled=true
+#   examples/nemo_gym/run_gymv_smoke.sh tangram                       # Nemotron-Omni-30B on Tangram-QA (single-turn)
 #   examples/nemo_gym/run_gymv_smoke.sh <recipe.yaml>                 # any recipe under examples/nemo_gym/
 #
 # Extra CLI args after the recipe/mode/wandb tokens are forwarded to the
@@ -43,6 +44,11 @@ case "${RECIPE_KEY}" in
         else
             RECIPE="examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke.yaml"
         fi
+        ;;
+    tangram)
+        # Nemotron-Omni-30B on Tangram-QA. No async sibling recipe exists yet;
+        # MODE is silently ignored until one is added.
+        RECIPE="examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_tangram_smoke.yaml"
         ;;
     *)
         RECIPE="${RECIPE_KEY}"
