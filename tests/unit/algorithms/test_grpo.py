@@ -2543,18 +2543,14 @@ def test_clip_grpo_advantages_respects_config_bounds():
 
     clipped = _clip_grpo_advantages(
         extreme_advantages.clone(),
-        GRPOConfig.model_construct(
-            advantage_clip_low=-2.0, advantage_clip_high=3.0
-        ),
+        GRPOConfig.model_construct(advantage_clip_low=-2.0, advantage_clip_high=3.0),
     )
     assert clipped.min().item() == -2.0
     assert clipped.max().item() == 3.0
 
     unclipped = _clip_grpo_advantages(
         extreme_advantages.clone(),
-        GRPOConfig.model_construct(
-            advantage_clip_low=None, advantage_clip_high=None
-        ),
+        GRPOConfig.model_construct(advantage_clip_low=None, advantage_clip_high=None),
     )
     assert torch.equal(unclipped, extreme_advantages)
 
