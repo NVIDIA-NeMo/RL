@@ -563,8 +563,15 @@ def test_attach_token_information_to_chat_response_choices():
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
         outputs=[
-            SimpleNamespace(index=1, token_ids=[]),
-            SimpleNamespace(index=0, token_ids=[201, 202]),
+            SimpleNamespace(index=1, token_ids=[], logprobs=[]),
+            SimpleNamespace(
+                index=0,
+                token_ids=[201, 202],
+                logprobs=[
+                    {201: SimpleNamespace(logprob=-0.1)},
+                    {202: SimpleNamespace(logprob=-10000.0)},
+                ],
+            ),
         ],
     )
     response = SimpleNamespace(
@@ -574,8 +581,8 @@ def test_attach_token_information_to_chat_response_choices():
                 message=SimpleNamespace(),
                 logprobs=SimpleNamespace(
                     content=[
-                        SimpleNamespace(token="token_id:201", logprob=-0.1),
-                        SimpleNamespace(token="token_id:202", logprob=-0.2),
+                        SimpleNamespace(token="decoded token", logprob=-10.0),
+                        SimpleNamespace(token="format is ignored", logprob=-20.0),
                     ]
                 ),
             ),
@@ -604,7 +611,7 @@ def test_attach_token_information_to_chat_response_choices():
     assert response_dict["choices"][0]["message"]["generation_token_ids"] == [201, 202]
     assert response_dict["choices"][0]["message"]["generation_log_probs"] == [
         -0.1,
-        -0.2,
+        -9999.0,
     ]
     assert response_dict["choices"][1]["message"]["prompt_token_ids"] == [
         101,
@@ -613,6 +620,36 @@ def test_attach_token_information_to_chat_response_choices():
     ]
     assert response_dict["choices"][1]["message"]["generation_token_ids"] == []
     assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        (
+            [201, 202],
+            [{201: SimpleNamespace(logprob=-0.1)}],
+            "mismatched generation token IDs and log probabilities",
+        ),
+        (
+            [201],
+            [{999: SimpleNamespace(logprob=-0.1)}],
+            "did not include the selected token",
+        ),
+    ],
+)
+def test_attach_token_information_to_chat_response_choices_rejects_invalid_logprobs(
+    token_ids, logprobs, error_match
+):
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[SimpleNamespace(index=0, token_ids=token_ids, logprobs=logprobs)],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        attach_token_information_to_chat_response_choices(response, final_res)
 
 
 def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():

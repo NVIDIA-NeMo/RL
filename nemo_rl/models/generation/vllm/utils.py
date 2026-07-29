@@ -26,6 +26,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
+VLLM_LOGPROB_FLOOR = -9999.0
 
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
@@ -331,26 +332,34 @@ def attach_token_information_to_chat_response_choices(
             "not include prompt_token_ids."
         )
 
-    outputs_by_index = {
-        output.index: output for output in getattr(final_request_output, "outputs", [])
-    }
-    choices = list(getattr(response, "choices", []))
-    choice_indices = [choice.index for choice in choices]
-    if len(outputs_by_index) != len(
-        getattr(final_request_output, "outputs", [])
-    ) or len(set(choice_indices)) != len(choice_indices):
+    generation_outputs = list(getattr(final_request_output, "outputs", []))
+    generation_output_indices = [output.index for output in generation_outputs]
+    outputs_by_index = {output.index: output for output in generation_outputs}
+    if len(outputs_by_index) != len(generation_outputs):
         raise RuntimeError(
-            "vLLM returned duplicate choice indices while attaching token "
-            "information to the OpenAI-compatible chat response."
+            "vLLM returned duplicate generation output indices while attaching "
+            "token information to the OpenAI-compatible chat response."
         )
 
-    missing_choice_indices = sorted(set(choice_indices) - outputs_by_index.keys())
-    if missing_choice_indices:
+    choices = list(getattr(response, "choices", []))
+    choice_indices = [choice.index for choice in choices]
+    if len(set(choice_indices)) != len(choice_indices):
+        raise RuntimeError(
+            "vLLM returned duplicate response choice indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choice_index_set = set(choice_indices)
+    output_index_set = set(generation_output_indices)
+    missing_choice_indices = sorted(choice_index_set - output_index_set)
+    unexpected_output_indices = sorted(output_index_set - choice_index_set)
+    if missing_choice_indices or unexpected_output_indices:
         raise RuntimeError(
             "vLLM was asked to return token information for the "
             "OpenAI-compatible chat endpoint but response choices could not be "
             "matched to generation outputs: "
-            f"missing_choice_indices={missing_choice_indices}."
+            f"missing_choice_indices={missing_choice_indices}, "
+            f"unexpected_output_indices={unexpected_output_indices}."
         )
 
     for choice in choices:
@@ -364,35 +373,39 @@ def attach_token_information_to_chat_response_choices(
             )
         generation_token_ids = list(output_token_ids)
 
-        logprob_content = getattr(getattr(choice, "logprobs", None), "content", None)
-        if logprob_content is None:
+        generation_logprob_details = getattr(generation_details, "logprobs", None)
+        if generation_logprob_details is None:
             if generation_token_ids:
                 raise RuntimeError(
                     "vLLM was asked to return token information for the "
-                    "OpenAI-compatible chat endpoint but response "
+                    "OpenAI-compatible chat endpoint but generation output "
                     f"choice_idx={choice.index} did not include logprobs."
                 )
             generation_log_probs = []
         else:
-            if len(generation_token_ids) != len(logprob_content):
+            if len(generation_token_ids) != len(generation_logprob_details):
                 raise RuntimeError(
                     "vLLM returned mismatched generation token IDs and log "
                     "probabilities for the OpenAI-compatible chat endpoint: "
                     f"choice_idx={choice.index}, "
                     f"token_count={len(generation_token_ids)}, "
-                    f"logprob_count={len(logprob_content)}."
+                    f"logprob_count={len(generation_logprob_details)}."
                 )
             generation_log_probs = []
-            for token_id, logprob_entry in zip(generation_token_ids, logprob_content):
-                if logprob_entry.token != f"token_id:{token_id}":
+            for token_id, position_logprobs in zip(
+                generation_token_ids, generation_logprob_details
+            ):
+                selected_token_logprob = position_logprobs.get(token_id)
+                if selected_token_logprob is None:
                     raise RuntimeError(
-                        "vLLM returned a log probability for an unexpected "
-                        "token while attaching token information to the "
-                        "OpenAI-compatible chat response: "
-                        f"choice_idx={choice.index}, token_id={token_id}, "
-                        f"logprob_token={logprob_entry.token!r}."
+                        "vLLM generation log probabilities did not include the "
+                        "selected token while attaching token information to "
+                        "the OpenAI-compatible chat response: "
+                        f"choice_idx={choice.index}, token_id={token_id}."
                     )
-                generation_log_probs.append(float(logprob_entry.logprob))
+                generation_log_probs.append(
+                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+                )
 
         choice.message.prompt_token_ids = list(prompt_token_ids)
         choice.message.generation_token_ids = generation_token_ids

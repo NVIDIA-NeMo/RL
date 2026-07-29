@@ -595,6 +595,22 @@ class VllmAsyncGenerationWorkerImpl(
                 *args,
                 **kwargs,
             ):
+                return_as_token_id = (
+                    request.return_tokens_as_token_ids
+                    if request.return_tokens_as_token_ids is not None
+                    else self.return_tokens_as_token_ids
+                )
+                if (
+                    request.logprobs
+                    and return_as_token_id
+                    and request.top_logprobs is None
+                ):
+                    raise VLLMValidationError(
+                        "`top_logprobs` must be set when requesting token "
+                        "information from the NeMo-RL chat endpoint.",
+                        parameter="top_logprobs",
+                    )
+
                 final_res = None
 
                 async def capture_result_generator():
@@ -615,7 +631,7 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     return response
 
-                if request.logprobs and request.return_tokens_as_token_ids:
+                if request.logprobs and return_as_token_id:
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
