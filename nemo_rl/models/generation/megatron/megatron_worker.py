@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import threading
 import gc
 import time
 import warnings
@@ -201,7 +202,7 @@ class MegatronGenerationMixin:
         """Pause + suspend the engine. No-op if already asleep."""
         if self._inference_engine_asleep:
             return
-        asyncio.run(self._sleep_engine())
+        self.llm.run_sync(self._sleep_engine())
         torch.distributed.barrier()
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] paused inference engine")
@@ -214,7 +215,7 @@ class MegatronGenerationMixin:
         """Resume + unpause the engine. No-op if already awake."""
         if not self._inference_engine_asleep:
             return
-        asyncio.run(self._wake_engine())
+        self.llm.run_sync(self._wake_engine())
         torch.distributed.barrier()
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
@@ -240,7 +241,7 @@ class MegatronGenerationMixin:
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
         )
-        asyncio.run(self.llm.serve(serve_config, blocking=False))
+        self.llm.run_sync(self.llm.serve(serve_config, blocking=False))
 
         base_url = f"http://{ip}:{free_port}/v1"
         max_wait_time = 300
@@ -278,7 +279,11 @@ class MegatronGenerationMixin:
         """Stop the engine and tear down the coordinator + HTTP server."""
         if self.llm is None:
             return
-        asyncio.run(self.llm.shutdown())
+        t = threading.Thread(
+            target=asyncio.run, args=(self.llm.shutdown(),), name="mcore-llm-shutdown"
+        )
+        t.start()
+        t.join()
         self.llm = None
         self._inference_engine_initialized = False
         self._inference_engine_asleep = True
@@ -537,7 +542,7 @@ class MegatronGenerationMixin:
             raise RuntimeError(
                 "Inference engine not initialized. Call prepare_for_generation() first."
             )
-        result = asyncio.run(
+        result = self.llm.run_sync(
             self._generate_with_persistent_engine(
                 prompt_tokens_tensor,
                 prompt_lengths_tensor,
