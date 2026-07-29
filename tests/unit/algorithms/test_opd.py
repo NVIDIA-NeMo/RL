@@ -474,6 +474,46 @@ def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
     ]
 
 
+def test_reserve_teacher_clusters_claims_without_topology_constraints(monkeypatch):
+    """Teachers are claimed before Gym even when segment topology is disabled."""
+    from nemo_rl.algorithms import opd
+
+    events = []
+
+    class FakeRayVirtualCluster:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.kwargs = kwargs
+            events.append(("create", self.name))
+
+        def get_placement_groups(self):
+            events.append(("reserve", self.name))
+            return [object()]
+
+        def shutdown(self):
+            events.append(("shutdown", self.name))
+
+    def fail_if_topology_is_prepared(*args, **kwargs):
+        raise AssertionError("topology must not be prepared when segment_size is unset")
+
+    monkeypatch.setattr(opd, "RayVirtualCluster", FakeRayVirtualCluster)
+    monkeypatch.setattr(opd, "prepare_segment_topology", fail_if_topology_is_prepared)
+
+    clusters = opd.reserve_teacher_clusters(_teacher_setup_config())
+
+    assert events == [
+        ("create", "teacher_math"),
+        ("reserve", "teacher_math"),
+        ("create", "teacher_code"),
+        ("reserve", "teacher_code"),
+    ]
+    assert all(cluster.kwargs["segment_size"] is None for cluster in clusters.values())
+    assert all(
+        cluster.kwargs["node_resource_constraints"] is None
+        for cluster in clusters.values()
+    )
+
+
 def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     """Deferred worker initialization uses the already claimed clusters."""
     from types import SimpleNamespace
