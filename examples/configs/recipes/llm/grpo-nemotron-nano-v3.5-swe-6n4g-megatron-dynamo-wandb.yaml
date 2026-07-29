@@ -56,7 +56,7 @@ loss_fn:
   force_on_policy_ratio: true
   use_kl_in_reward: false
 policy:
-  model_name: ${oc.env:MODEL_PATH}
+  model_name: ${oc.env:MODEL_PATH,/path/to/nemotron-nano-v3.5-checkpoint}
   tokenizer:
     chat_template_kwargs:
       enable_thinking: true
@@ -160,9 +160,9 @@ policy:
         num_nodes: 2
 data:
   train:
-    data_path: ${oc.env:TRAIN_PATH}
+    data_path: ${oc.env:TRAIN_PATH,/path/to/swe-train.jsonl}
   validation:
-    data_path: ${oc.env:VAL_PATH}
+    data_path: ${oc.env:VAL_PATH,/path/to/swe-validation.jsonl}
 env:
   nemo_gym:
     skip_venv_if_present: true
@@ -189,7 +189,7 @@ env:
           run_with_mixed_prompts: true
           dataset_path: ${data.train.data_path}
           apptainer_memory_limit_mb: 65536
-          container_formatter: ${oc.decode:${oc.env:SIF_FORMATTERS}}
+          container_formatter: ${oc.decode:${oc.env:SIF_FORMATTERS,'["/path/to/swe/{instance_id}.sif"]'}}
     swe_agents_val:
       responses_api_agents:
         swe_agents:
