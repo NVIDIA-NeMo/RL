@@ -98,6 +98,24 @@ class DiffusionMasterConfig(BaseModel, extra="allow"):
             )
         return self
 
+    @model_validator(mode="after")
+    def _per_element_logprob_pairing(self) -> "DiffusionMasterConfig":
+        if (
+            self.policy.per_element_logprob
+            != self.loss_fn.aggregate_logprobs_per_sample
+        ):
+            raise ValueError(
+                "policy.per_element_logprob must equal "
+                "loss_fn.aggregate_logprobs_per_sample: both keep per-latent-element "
+                "log-probs and are only correct when set together."
+            )
+        if self.policy.per_element_logprob and self.loss_fn.beta > 0:
+            raise ValueError(
+                "policy.per_element_logprob is incompatible with loss_fn.beta > 0; "
+                "the KL reference log-prob is reduced per sample."
+            )
+        return self
+
 
 def _prompt_ids_for_baseline(rep_prompts: list[str]) -> torch.Tensor:
     """Encode prompts as a `(B*K, 1)` integer tensor; identical prompts share an id."""

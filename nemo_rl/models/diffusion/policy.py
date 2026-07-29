@@ -26,7 +26,7 @@ split evenly (e.g. the K=1 validation path); training requires
 ``num_prompts_per_step % num_workers == 0``.
 
 Method names mirror the API the trainer calls: ``sample_trajectory``,
-``compute_transition_logprob``, ``train``, ``save_checkpoint``, ``shutdown``.
+``train``, ``save_checkpoint``, ``shutdown``.
 """
 
 from __future__ import annotations
@@ -204,16 +204,6 @@ class DiffusionPolicy:
                 )
             )
         return self._merge_trajectories(ray.get(futures))
-
-    def compute_transition_logprob(
-        self,
-        data: DiffusionTrainDataSpec,
-        *,
-        use_reference: bool = False,
-    ) -> dict[str, Any]:
-        return self._call_all(
-            "compute_transition_logprob", data=data, use_reference=use_reference
-        )[0]
 
     def train(
         self,
