@@ -568,6 +568,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "storage and does not use BF16-to-MXFP8 prequantization)."
         )
 
+    if vllm_cfg.get("is_mx", False):
+        violations.append(
+            "policy.generation.vllm_cfg.is_mx must be False "
+            "(nccl_reshard_refit does not support MXFP8 storage or scale mapping)."
+        )
+
     # This initial version supports only the Megatron train + vLLM gen
     # combination; the DTensor train backend refit path is intentionally
     # dropped (Megatron is the path validated end-to-end).

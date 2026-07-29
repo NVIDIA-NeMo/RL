@@ -87,6 +87,42 @@ def test_check_nccl_reshard_refit_support_rejects_invalid_config(
     assert expected_violation in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    ("vllm_cfg_update", "expected_violation"),
+    [
+        (
+            {"refit_prequantize": True},
+            "policy.generation.vllm_cfg.refit_prequantize must be False",
+        ),
+        (
+            {"is_mx": True},
+            "policy.generation.vllm_cfg.is_mx must be False",
+        ),
+    ],
+)
+def test_check_nccl_reshard_refit_support_rejects_unsupported_refit_modes(
+    vllm_cfg_update: dict[str, object], expected_violation: str
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(vllm_cfg_update)
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert expected_violation in str(exc_info.value)
+
+
+def test_check_nccl_reshard_refit_support_accepts_matching_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
 # --------------------------------------------------------------------------
 # MeshInfo
 # --------------------------------------------------------------------------
