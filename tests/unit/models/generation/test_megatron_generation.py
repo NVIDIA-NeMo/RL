@@ -28,6 +28,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
 )
+from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
 
@@ -381,11 +382,17 @@ async def test_megatron_policy_generation_async(cluster, test_input_data, tokeni
 
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
-def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
+@pytest.mark.parametrize(
+    "transformer_impl", ["transformer_engine", "inference_optimized"]
+)
+def test_megatron_generation_colocated(
+    cluster, test_input_data, tokenizer, transformer_impl
+):
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
     config["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    config["megatron_cfg"]["transformer_impl"] = transformer_impl
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
@@ -411,6 +418,26 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
         # construction, so the colocated constructor must have collected them.
         assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
         assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+
+        if transformer_impl == "inference_optimized":
+            # Dual-mode: the same shared model must run the trainable TE
+            # fallback (train step, finite loss) before fast-path generation.
+            torch.manual_seed(42)
+            train_data = BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 32000, (4, 64)),
+                    "input_lengths": torch.full((4,), 64, dtype=torch.int32),
+                    "attention_mask": torch.ones(4, 64),
+                    "labels": torch.randint(0, 32000, (4, 64)),
+                    "sample_mask": torch.ones(4),
+                }
+            )
+            policy.prepare_for_training()
+            loss = policy.train(train_data, SimpleLossFn())["loss"]
+            assert not torch.isnan(loss).any() and not torch.isinf(loss).any(), (
+                f"dual-mode train step produced bad loss: {loss}"
+            )
+            policy.finish_training()
 
         # re-entering generation mode must be a no-op on the running engine
         mg.prepare_for_generation()

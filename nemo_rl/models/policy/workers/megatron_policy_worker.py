@@ -473,14 +473,19 @@ class MegatronPolicyWorkerImpl(
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
-        # Training workers cannot use inference_optimized transformer spec.
-        if init_optimizer:
-            assert (
-                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
-            ), (
-                "transformer_impl=inference_optimized must not be set on training workers. "
-                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
-            )
+        if config["megatron_cfg"].get("transformer_impl") == "inference_optimized":
+            if (
+                config["megatron_cfg"]["tensor_model_parallel_size"] > 1
+                and not config["megatron_cfg"]["sequence_parallel"]
+            ):
+                config["megatron_cfg"]["sequence_parallel"] = True
+                print(
+                    "transformer_impl=inference_optimized with TP>1: "
+                    "enabling megatron_cfg.sequence_parallel."
+                )
+            # TODO: Remove the following two lines after Megatron-Bridge#5164 lands.
+            from megatron.bridge.models.conversion.param_mapping import AutoMapping
+            AutoMapping.register_module_type("InferenceColumnParallelLinear", "column")
         runtime_config = validate_and_set_config(
             config,
             self.rank,
