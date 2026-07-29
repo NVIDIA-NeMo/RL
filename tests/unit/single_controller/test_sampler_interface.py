@@ -304,5 +304,93 @@ class TestDefaultEvictSkipsUnready:
         assert _run(s.evict(current_train_weight=5)) == 0
 
 
+class TestSupportsBufferCheckpoint:
+    """Only ungated (over-sampled) policies may checkpoint buffered groups."""
+
+    def test_windowed_supports_buffer_checkpoint(self):
+        assert WindowedSampler(
+            FakeBuffer(), max_staleness_versions=1
+        ).supports_buffer_checkpoint
+
+    def test_gated_samplers_do_not(self):
+        assert not WeightFifoSampler(
+            FakeBuffer(), max_staleness_versions=1
+        ).supports_buffer_checkpoint
+        assert not InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1
+        ).supports_buffer_checkpoint
+
+
+class TestDispatchCursorRestore:
+    """Checkpoint resume passes resume_from_step=current_step, restoring the
+    fresh-start invariant _dispatch_index == trainer_version - 1. Without it,
+    a restored InOrderSampler would stamp target_steps starting at 0 and every
+    dispatched batch would be instantly evicted (target < trainer_version)."""
+
+    def test_resumed_in_order_stamps_from_trainer_version(self):
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1, resume_from_step=7)
+        assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
+        assert _run(s.admit(trainer_version_fn=lambda: 8)) == 8
+
+    def test_resumed_gate_admits_window_then_blocks(self):
+        s = WeightFifoSampler(
+            FakeBuffer(), max_staleness_versions=0, resume_from_step=7
+        )
+        # Resumed at step 7, window 0: one batch admitted, then the gate
+        # closes exactly as it would on a fresh run at step 0.
+        assert _run(s.admit(trainer_version_fn=lambda: 7)) is None
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 7), timeout=0.05))
+
+    def test_negative_resume_step_rejected(self):
+        with pytest.raises(ValueError, match="resume_from_step"):
+            WindowedSampler(FakeBuffer(), max_staleness_versions=1, resume_from_step=-1)
+
+
+class TestFactorySeeding:
+    def test_builtin_receives_resume_step(self):
+        s = create_sampler(
+            FakeBuffer(),
+            InOrderSamplerConfig(max_lookahead_versions=1),
+            resume_from_step=7,
+        )
+        assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
+
+    def test_custom_receives_resume_step_on_restore(self):
+        from nemo_rl.algorithms.async_utils.staleness_sampler import (
+            CustomSamplerConfig,
+        )
+
+        s = create_sampler(
+            FakeBuffer(),
+            CustomSamplerConfig(
+                target=f"{__name__}:EchoSampler", max_lookahead_versions=1
+            ),
+            resume_from_step=6,
+        )
+        assert _run(s.admit(trainer_version_fn=lambda: 6)) == 6
+
+    def test_custom_without_restore_support_fails_only_on_restore(self):
+        from nemo_rl.algorithms.async_utils.staleness_sampler import (
+            CustomSamplerConfig,
+        )
+
+        cfg = CustomSamplerConfig(
+            target=f"{__name__}:NoRestoreSampler", max_lookahead_versions=1
+        )
+        # Fresh start: the kwarg is withheld, existing custom samplers keep working.
+        assert isinstance(create_sampler(FakeBuffer(), cfg), NoRestoreSampler)
+        # Resume: loud TypeError instead of a silently unseeded cursor.
+        with pytest.raises(TypeError):
+            create_sampler(FakeBuffer(), cfg, resume_from_step=5)
+
+
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
+
+
+class NoRestoreSampler(InOrderSampler):
+    """User sampler whose constructor predates resume_from_step."""
+
+    def __init__(self, buffer, *, max_lookahead_versions: int) -> None:
+        super().__init__(buffer, max_lookahead_versions=max_lookahead_versions)

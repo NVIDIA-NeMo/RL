@@ -100,6 +100,16 @@ class PromptGroupSampler(Protocol):
         """True when the policy admits zero staleness (sync mode)."""
         ...
 
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        """True when buffered groups may be checkpointed and restored.
+
+        Gated policies dispatch a fixed quota per trainer step, so groups
+        restored from a checkpoint can never complete an already-consumed
+        quota window — only ungated (over-sampled) policies can consume them.
+        """
+        ...
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
@@ -113,11 +123,26 @@ class BaseSampler(abc.ABC):
     select-finalize / weight-window-evict helpers.
     """
 
-    def __init__(self, buffer: TQReplayBuffer) -> None:
+    def __init__(self, buffer: TQReplayBuffer, *, resume_from_step: int = 0) -> None:
+        """Initialize shared sampler state.
+
+        Args:
+            buffer: Shared TQReplayBuffer holding the candidate slots.
+            resume_from_step: Trainer step this run starts from — 0 for a
+                fresh run, the restored ``current_step`` when resuming from a
+                checkpoint. Seeds the dispatch cursor so gated ``admit`` and
+                ``InOrderSampler``'s target_step stamps line up with the
+                restored trainer version exactly as they would at step 0 of
+                a fresh run.
+        """
+        if resume_from_step < 0:
+            raise ValueError(
+                f"resume_from_step must be non-negative, got {resume_from_step}"
+            )
         self._buffer = buffer
-        # Pre-incremented before each admitted batch, so -1 lets the first
-        # batch through a zero-staleness gate.
-        self._dispatch_index: int = -1
+        # Pre-incremented before each admitted batch, so the cursor trails
+        # the run's starting step by one.
+        self._dispatch_index: int = resume_from_step - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -157,6 +182,10 @@ class BaseSampler(abc.ABC):
     @property
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
+
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        return False
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
@@ -215,8 +244,9 @@ class WindowedSampler(BaseSampler):
         *,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
+        resume_from_step: int = 0,
     ) -> None:
-        super().__init__(buffer)
+        super().__init__(buffer, resume_from_step=resume_from_step)
         if max_staleness_versions < 0:
             raise ValueError(
                 f"max_staleness_versions must be non-negative, got "
@@ -227,6 +257,12 @@ class WindowedSampler(BaseSampler):
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
+
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        # Ungated: restored groups are ordinary in-window candidates, so the
+        # buffer can round-trip through a checkpoint.
+        return True
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         # Over-sampled: dispatch is bounded by buffer capacity, not by version.
@@ -275,8 +311,14 @@ class _GatedSampler(BaseSampler):
     (``gate_window`` versions of lookahead).
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
-        super().__init__(buffer)
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        gate_window: int,
+        resume_from_step: int = 0,
+    ) -> None:
+        super().__init__(buffer, resume_from_step=resume_from_step)
         if gate_window < 0:
             raise ValueError(f"gate_window must be non-negative, got {gate_window}")
         self._gate_window = gate_window
@@ -308,8 +350,18 @@ class WeightFifoSampler(_GatedSampler):
     that weight's batch to fill. Evict uses the weight window (default).
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
-        super().__init__(buffer, gate_window=max_staleness_versions)
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_staleness_versions: int,
+        resume_from_step: int = 0,
+    ) -> None:
+        super().__init__(
+            buffer,
+            gate_window=max_staleness_versions,
+            resume_from_step=resume_from_step,
+        )
         self.max_staleness_versions = max_staleness_versions
 
     async def select(
@@ -349,8 +401,18 @@ class InOrderSampler(_GatedSampler):
     upcoming is never dropped early, and evict/select can't disagree.
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, max_lookahead_versions: int) -> None:
-        super().__init__(buffer, gate_window=max_lookahead_versions)
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_lookahead_versions: int,
+        resume_from_step: int = 0,
+    ) -> None:
+        super().__init__(
+            buffer,
+            gate_window=max_lookahead_versions,
+            resume_from_step=resume_from_step,
+        )
         self.max_lookahead_versions = max_lookahead_versions
 
     def _stamp(self) -> Optional[int]:
@@ -454,20 +516,40 @@ def required_buffer_capacity_for_config(
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
+    *,
+    resume_from_step: int = 0,
 ) -> PromptGroupSampler:
-    """Build a sampler from its config (or import one by FQN)."""
+    """Build a sampler from its config (or import one by FQN).
+
+    Args:
+        buffer: Shared TQReplayBuffer holding the candidate slots.
+        cfg: Discriminated sampler config selecting the policy.
+        resume_from_step: Trainer step this run starts from; 0 for a fresh
+            run, the restored ``current_step`` on checkpoint resume (see
+            ``BaseSampler.__init__``). Custom samplers receive it only on
+            resume, so fresh starts don't constrain their constructor
+            signature — a custom class that doesn't accept the kwarg fails
+            loudly the first time a run actually resumes with it.
+    """
     if isinstance(cfg, WindowedSamplerConfig):
         return WindowedSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
+            resume_from_step=resume_from_step,
         )
     if isinstance(cfg, WeightFifoSamplerConfig):
         return WeightFifoSampler(
-            buffer, max_staleness_versions=cfg.max_staleness_versions
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
+            resume_from_step=resume_from_step,
         )
     if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
+        return InOrderSampler(
+            buffer,
+            max_lookahead_versions=cfg.max_lookahead_versions,
+            resume_from_step=resume_from_step,
+        )
     if isinstance(cfg, CustomSamplerConfig):
         module_name, sep, class_name = cfg.target.partition(":")
         if not sep:
@@ -475,11 +557,15 @@ def create_sampler(
                 f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
             )
         sampler_cls = getattr(importlib.import_module(module_name), class_name)
-        sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
+        custom_kwargs = dict(cfg.model_extra or {})
+        if resume_from_step != 0:
+            custom_kwargs["resume_from_step"] = resume_from_step
+        sampler = sampler_cls(buffer, **custom_kwargs)
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
-                f"interface (needs admit/select/evict)"
+                f"interface (needs admit/select/evict, is_on_policy, "
+                f"supports_buffer_checkpoint, required_buffer_capacity)"
             )
         return sampler
     raise ValueError(f"unknown sampler config {type(cfg).__name__}")
