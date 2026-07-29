@@ -179,6 +179,21 @@ class TestPrefetchVenvs:
             # Should create venvs for all uv-based actors (3 total)
             assert mock_create_venv.call_count == 3 * CALL_MULTIPLIER
 
+    def test_negative_filter_matches_python_executable(self, prefetch_venvs_func):
+        """Test excluding an environment tier when actor FQNs omit its name."""
+        with patch(
+            "nemo_rl.utils.prefetch_venvs.create_local_venv"
+        ) as mock_create_venv:
+            mock_create_venv.return_value = "/path/to/venv/bin/python"
+
+            prefetch_venvs_func(negative_filters=["vllm"])
+
+            assert mock_create_venv.call_count == 1 * CALL_MULTIPLIER
+            assert (
+                mock_create_venv.call_args[0][1]
+                == "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            )
+
     def test_prefetch_venvs_continues_on_error(self, prefetch_venvs_func):
         """Test that prefetching continues even if one venv creation fails."""
         with patch(

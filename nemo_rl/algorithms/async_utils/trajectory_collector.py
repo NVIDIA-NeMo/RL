@@ -562,6 +562,14 @@ class AsyncTrajectoryCollector:
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "dynamo":
+            # Dynamo's native layerwise reload temporarily materializes model
+            # parameters while the NCCL update is in progress.  It is not safe
+            # to execute an already-issued vLLM request concurrently with that
+            # reload (in particular for NemotronH/Mamba parameters), even when
+            # the update route accepts allow_unpaused=True.  Stop new trajectory
+            # starts above and drain every active trajectory before refitting.
+            is_async_engine = False
         else:
             is_async_engine = False
         async_grpo_config = self.master_config.grpo.async_grpo

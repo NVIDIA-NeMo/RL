@@ -1444,6 +1444,20 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
+    def test_dynamo_prepare_for_refit_drains_pending_generations(self):
+        """Dynamo layerwise reload never overlaps an active generation."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "dynamo",
+            "dynamo_cfg": {},
+        }
+        collector.master_config.grpo["async_grpo"]["in_flight_weight_updates"] = True
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        collector.wait_for_pending_generations.assert_called_once_with()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
         buffer = ReplayBuffer.remote(max_size=10)
