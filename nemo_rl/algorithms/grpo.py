@@ -1688,6 +1688,25 @@ def scale_rewards(
     return repeated_batch
 
 
+def _stable_group_ids(prompt_ids_for_adv, num_generations_per_prompt):
+    """Stable per-prompt grouping key for GRPO advantage computation.
+
+    GRPO groups samples by prompt (torch.unique) to compute the leave-one-out baseline. The default
+    key is the rendered prompt token-ids, but for agentic gym rollouts each generation's first-turn
+    prompt tokenizes slightly differently (observed on Qwen3-Instruct + hermes: every generation
+    becomes its own singleton group -> leave-one-out baseline == reward -> advantage == 0 -> zero
+    gradient; Exp 26). The training batch is laid out as contiguous num_gen blocks per prompt
+    (async: BatchedDataDict.from_batches of per-prompt groups; sync: repeat_interleave), so the
+    correct, model-agnostic group id is positional: index // num_gen. Falls back to the original
+    token-id grouping if the batch is not an exact multiple of num_gen (e.g. dynamic sampling).
+    """
+    n = int(prompt_ids_for_adv.shape[0])
+    g = int(num_generations_per_prompt)
+    if g <= 0 or n % g != 0:
+        return prompt_ids_for_adv
+    return (torch.arange(n, device=prompt_ids_for_adv.device) // g).unsqueeze(1)
+
+
 def extract_initial_prompt_messages(
     message_logs: list,
     original_prompt_lengths: torch.Tensor,
@@ -2218,7 +2237,9 @@ def refit_policy_generation(
     """
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
-        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+        sync_metrics = synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+        _invalidate_prefix_cache_after_refit(policy_generation)
+        return sync_metrics
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
@@ -2321,10 +2342,34 @@ def refit_policy_generation(
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
+    _invalidate_prefix_cache_after_refit(policy_generation)
+
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.resume_after_refit()
 
     return {}
+
+
+def _invalidate_prefix_cache_after_refit(
+    policy_generation: GenerationInterface,
+) -> None:
+    """Drop reusable KV blocks after a weight update.
+
+    vLLM prefix-cache blocks are keyed only by token ids, so blocks
+    prefilled under the old weights would be silently reused after refit
+    (stale KV -> train/gen logprob divergence). Called on every refit path;
+    backends without reusable caches inherit the no-op interface default.
+    """
+    generation_cfg = getattr(policy_generation, "cfg", None) or {}
+    vllm_cfg = generation_cfg.get("vllm_cfg") or {}
+    if vllm_cfg.get("enable_prefix_caching"):
+        if not policy_generation.invalidate_kv_cache():
+            raise RuntimeError(
+                "❌ Error: prefix caching is enabled but invalidating the "
+                "vLLM prefix/KV cache after refit failed; continuing would "
+                "sample rollouts against stale KV computed under the "
+                "pre-refit weights."
+            )
 
 
 def _initial_policy_generation_stale(
@@ -2449,6 +2494,30 @@ def compute_and_apply_seq_logprob_error_masking(
                 (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
             )
             masked_correct_pct = masked_correct_count / num_masked_seqs
+
+            # [lp-mask-debug] one parseable line per step attributing train/gen
+            # logprob divergence; opt in via NRL_LP_MASK_DEBUG=1.
+            if os.environ.get("NRL_LP_MASK_DEBUG") == "1":
+                seq_lens = mask.sum(dim=-1)
+                masked_rows = [
+                    (
+                        int(seq_lens[i]),
+                        float(seq_mult_prob_error[i]),
+                        float(rewards.view(-1)[i]),
+                    )
+                    for i in torch.nonzero(diff_mask_bool).flatten().tolist()
+                ]
+                kept_bool = seq_error_mask.bool() & valid_seq_mask
+                kept_lens = seq_lens[kept_bool]
+                print(
+                    "[lp-mask-debug] masked(len,err,rew)="
+                    + ";".join(f"{l},{e:.2f},{r:.0f}" for l, e, r in masked_rows[:200])
+                    + f" | kept_len mean={float(kept_lens.float().mean()):.0f}"
+                    f" p90={float(kept_lens.float().quantile(0.9)):.0f}"
+                    f" max={int(kept_lens.max())}"
+                    f" | masked_len mean={sum(r[0] for r in masked_rows) / len(masked_rows):.0f}",
+                    flush=True,
+                )
 
         # Compute after-mask metrics (only for sequences that passed the threshold)
         kept_mask = seq_error_mask.bool() & valid_seq_mask
@@ -3064,8 +3133,17 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    # Positional grouping is only needed for agentic gym rollouts,
+                    # where per-generation prompt tokenization is non-deterministic;
+                    # keep main's token-id grouping for every other GRPO user.
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config.grpo["num_generations_per_prompt"],
+                        )
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -3972,14 +4050,6 @@ def async_grpo_train(
         next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
-
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
@@ -4008,6 +4078,17 @@ def async_grpo_train(
 
             traceback.print_exc()
             return
+
+    # Start trajectory collection only after generation holds real weights.
+    # The engines come up with load_format=dummy (weights arrive via the refit
+    # above); collecting before the refit fills the buffer with garbage
+    # rollouts sampled from randomly initialized weights.
+    collection_task = trajectory_collector.start_collection.remote(dataloader)  # noqa: F841
+
+    # Ensure collector knows initial weight version
+    trajectory_collector.set_weight_version.remote(weight_version)
+
+    print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -4448,8 +4529,17 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    # Positional grouping is only needed for agentic gym rollouts,
+                    # where per-generation prompt tokenization is non-deterministic;
+                    # keep main's token-id grouping for every other GRPO user.
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config.grpo["num_generations_per_prompt"],
+                        )
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -4558,6 +4648,12 @@ def async_grpo_train(
                     with timer.time("idle/validation"):
                         # Pause trajectory collection during validation to reduce memory pressure
                         trajectory_collector.pause.remote()
+                        # Drain in-flight rollouts too: pause only stops new
+                        # launches, and in-flight train rollouts sharing the
+                        # engines push val agents into timeout.
+                        ray.get(
+                            trajectory_collector.wait_for_pending_generations.remote()
+                        )
 
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
