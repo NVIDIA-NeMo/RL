@@ -104,7 +104,7 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     worker.model = object()
     worker.draft_model = None
     worker.refit_conversion_tasks = []
-    worker.cfg = {}
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
     worker.megatron_bridge = SimpleNamespace(
         export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
     )

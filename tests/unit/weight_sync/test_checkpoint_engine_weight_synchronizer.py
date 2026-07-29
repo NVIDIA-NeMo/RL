@@ -33,6 +33,7 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 def _mock_policy(**overrides):
     policy = MagicMock()
+    policy.cfg = {"megatron_cfg": {"enabled": True}}
     policy.offload_before_refit.return_value = None
     policy.offload_after_refit.return_value = None
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
@@ -187,6 +188,18 @@ class TestCheckpointEngineWeightSynchronizer:
         ):
             sync.init_communicator()
 
+        sync._ensure_checkpoint_engine_ready.assert_not_called()
+
+    def test_init_communicator_rejects_prequantization_without_megatron(self):
+        sync = _checkpoint_sync(MagicMock())
+        sync._ensure_checkpoint_engine_ready = MagicMock()
+        sync._policy.cfg = {"megatron_cfg": {"enabled": False}}
+        sync._generation.prepare_refit_info.return_value = ["layer_0"]
+
+        with pytest.raises(ValueError, match="requires the Megatron policy backend"):
+            sync.init_communicator()
+
+        sync._policy.enable_refit_prequantize.assert_not_called()
         sync._ensure_checkpoint_engine_ready.assert_not_called()
 
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
