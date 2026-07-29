@@ -2,9 +2,9 @@
 defaults: ./performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml
 
 logger:
-  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2
   wandb:
-    name: grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+    name: grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2
 
 # SC does not support validation and checkpointing yet.
 grpo:
@@ -12,7 +12,7 @@ grpo:
 
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2
 
 # TransferQueue data plane is mandatory for the SingleController path.
 data_plane:
