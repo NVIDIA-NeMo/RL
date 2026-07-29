@@ -2335,7 +2335,7 @@ class MegatronPolicyWorkerImpl(
             )
 
         num_hidden_layers = 0
-        if target_precision == "mxfp8":
+        if target_precision in ("mxfp8", "nvfp4"):
             num_hidden_layers = int(
                 getattr(self.megatron_bridge.transformer_config, "num_layers", 0)
             )

@@ -35,6 +35,14 @@ from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
 from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     SKIP_WEIGHT_SUBSTRINGS as MXFP8_SKIP_WEIGHT_SUBSTRINGS,
 )
+from nemo_rl.models.generation.sglang.nvfp4_quantization_core import (
+    nvfp4_quantized_entries,
+    quantize_nvfp4,
+    quantize_nvfp4_pair,
+    should_quantize_nvfp4,
+    should_skip_nvfp4_gated_pair,
+    split_gated_pair_name,
+)
 from nemo_rl.models.generation.sglang.quantization_utils import (
     SglangQuantizationScheme,
     build_dynamic_skip_substrings,
@@ -48,7 +56,7 @@ class MegatronSGLangHfWeightIterator:
     and the conversion-task list precomputed by the policy worker. For each
     refit it walks ``bridge.export_hf_weights`` and packs tensors into buckets
     sized by the *post-transformation* tensor footprint. Companion tensors
-    produced from one source weight remain in the
+    produced from one source weight (and NVFP4 gate/up pairs) remain in the
     same bucket.
     """
 
@@ -80,11 +88,17 @@ class MegatronSGLangHfWeightIterator:
             )
         if target_precision == "mxfp8":
             # MXFP8 additionally excludes norms, embeddings, router/gate and
-            # LM-head weights, which have to stay high precision.
+            # LM-head weights, which have to stay high precision. NVFP4 has no
+            # such static list: it only ever targets MoE expert GEMMs.
             skip_weight_substrings = build_dynamic_skip_substrings(
                 quantization_config=self._quantization_config,
                 num_hidden_layers=self._num_hidden_layers,
                 static_skip_substrings=MXFP8_SKIP_WEIGHT_SUBSTRINGS,
+            )
+        elif target_precision == "nvfp4":
+            skip_weight_substrings = build_dynamic_skip_substrings(
+                quantization_config=self._quantization_config,
+                num_hidden_layers=self._num_hidden_layers,
             )
         elif target_precision == "bf16":
             skip_weight_substrings = None
@@ -128,6 +142,15 @@ class MegatronSGLangHfWeightIterator:
             show_progress=False,
             conversion_tasks=self._conversion_tasks,
         )
+        if target_precision == "nvfp4":
+            if skip_weight_substrings is None:
+                raise RuntimeError("NVFP4 refit requires initialized skip rules.")
+            yield from self._iter_nvfp4_hf_named_tensors(
+                hf_weights,
+                skip_weight_substrings=skip_weight_substrings,
+            )
+            return
+
         for hf_param_name, tensor in hf_weights:
             # AutoBridge yields plain ``torch.Tensor`` for Megatron (no
             # DTensor / async-collective wrapping), so no ``.wait()`` here.
@@ -145,3 +168,76 @@ class MegatronSGLangHfWeightIterator:
                     continue
 
             yield [(hf_param_name, tensor)]
+
+    @staticmethod
+    def _iter_nvfp4_hf_named_tensors(
+        hf_weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        skip_weight_substrings: tuple[str, ...],
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Quantize NVFP4 expert weights, buffering complete gate/up pairs."""
+        pending_pairs: dict[
+            str,
+            dict[str, tuple[str, torch.Tensor]],
+        ] = {}
+
+        for hf_param_name, tensor in hf_weights:
+            if should_skip_nvfp4_gated_pair(
+                hf_param_name,
+                skip_weight_substrings=skip_weight_substrings,
+            ):
+                yield [(hf_param_name, tensor)]
+                continue
+
+            if not should_quantize_nvfp4(
+                hf_param_name,
+                tensor,
+                skip_weight_substrings=skip_weight_substrings,
+            ):
+                yield [(hf_param_name, tensor)]
+                continue
+
+            pair_base, pair_role = split_gated_pair_name(hf_param_name)
+            if pair_base is None or pair_role is None:
+                yield nvfp4_quantized_entries(
+                    hf_param_name,
+                    quantize_nvfp4(tensor),
+                    include_input_scale=False,
+                )
+                continue
+
+            pair = pending_pairs.setdefault(pair_base, {})
+            if pair_role in pair:
+                raise ValueError(
+                    "NVFP4 requires one complete gate/up pair per refit; "
+                    f"found duplicate {pair_role} tensor for {pair_base}."
+                )
+            pair[pair_role] = (hf_param_name, tensor)
+            if set(pair) != {"gate", "up"}:
+                continue
+
+            gate_name, gate_weight = pair["gate"]
+            up_name, up_weight = pair["up"]
+            gate_output, up_output = quantize_nvfp4_pair(gate_weight, up_weight)
+            yield [
+                *nvfp4_quantized_entries(
+                    gate_name,
+                    gate_output,
+                    include_input_scale=False,
+                ),
+                *nvfp4_quantized_entries(
+                    up_name,
+                    up_output,
+                    include_input_scale=False,
+                ),
+            ]
+            del pending_pairs[pair_base]
+
+        if pending_pairs:
+            incomplete = {
+                base: sorted(roles) for base, roles in sorted(pending_pairs.items())
+            }
+            raise ValueError(
+                "NVFP4 gate/up weights must be quantized together; incomplete "
+                f"pairs: {incomplete}."
+            )

@@ -19,8 +19,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Literal, cast
 
-SglangQuantizationScheme = Literal["bf16", "mxfp8"]
-SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8"})
+SglangQuantizationScheme = Literal["bf16", "mxfp8", "nvfp4"]
+SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8", "nvfp4"})
 HF_MOE_EXPERT_NAME_MARKERS = (
     ".experts.",
     ".shared_expert.",
@@ -71,11 +71,21 @@ def ensure_sglang_quantized_checkpoint(
     if scheme == "bf16":
         return model_path
 
-    from nemo_rl.models.generation.sglang.mxfp8_setup import (
-        ensure_mxfp8_checkpoint,
+    if scheme == "mxfp8":
+        from nemo_rl.models.generation.sglang.mxfp8_setup import (
+            ensure_mxfp8_checkpoint,
+        )
+
+        return ensure_mxfp8_checkpoint(
+            model_path=model_path,
+            quantization_cfg=quantization_config,
+        )
+
+    from nemo_rl.models.generation.sglang.nvfp4_setup import (
+        ensure_nvfp4_checkpoint,
     )
 
-    return ensure_mxfp8_checkpoint(
+    return ensure_nvfp4_checkpoint(
         model_path=model_path,
         quantization_cfg=quantization_config,
     )

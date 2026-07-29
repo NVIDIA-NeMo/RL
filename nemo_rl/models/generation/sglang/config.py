@@ -20,13 +20,14 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 class SglangQuantizationConfig(TypedDict, total=False):
     """SGLang weight-precision config.
 
-    ``scheme="bf16"`` means BF16 rollout/refit. Set ``scheme="mxfp8"`` to boot
-    SGLang from a matching quantized HF checkpoint and quantize HF tensors
-    during online refit. High-precision exclusions are shared by conversion
-    and online refit.
+    ``scheme="bf16"`` means BF16 rollout/refit. Set
+    ``scheme="mxfp8"`` or ``scheme="nvfp4"`` to boot SGLang from the
+    corresponding quantized HF checkpoint and quantize HF tensors during
+    online refit. High-precision exclusions are shared by conversion and
+    online refit.
     """
 
-    scheme: Required[Literal["bf16", "mxfp8"]]
+    scheme: Required[Literal["bf16", "mxfp8", "nvfp4"]]
     # HF module-name substrings that the checkpoint loader and refit both skip.
     modules_to_not_convert: list[str]
     # Additional HF weight-name substrings to keep in high precision.

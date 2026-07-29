@@ -57,6 +57,23 @@ def _collect_entries(
     return [entry for bucket in buckets for entry in bucket]
 
 
+def _fake_nvfp4_output(
+    weight: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows, columns = weight.shape
+    if global_scale is None:
+        global_scale = torch.ones((), dtype=torch.float32)
+    return (
+        torch.zeros((rows, columns // 2), dtype=torch.uint8),
+        torch.zeros(
+            (rows, columns // 16),
+            dtype=torch.uint8,
+        ).view(torch.float8_e4m3fn),
+        global_scale,
+    )
+
+
 def test_mxfp8_iterator_respects_head_tail_and_extra_high_precision(
     monkeypatch,
 ) -> None:
@@ -118,3 +135,121 @@ def test_mxfp8_iterator_keeps_synchronized_qkv_group_in_bf16(
     )
 
     assert [name for name, _ in entries] == names
+
+
+def test_nvfp4_iterator_respects_head_tail_and_extra_high_precision(
+    monkeypatch,
+) -> None:
+    weights = [
+        (
+            f"model.layers.{layer}.mlp.experts.0.down_proj.weight",
+            torch.ones((2, 32), dtype=torch.bfloat16),
+        )
+        for layer in range(4)
+    ]
+    monkeypatch.setattr(
+        weight_iterator,
+        "quantize_nvfp4",
+        _fake_nvfp4_output,
+    )
+    iterator = _make_iterator(
+        weights,
+        quantization_config={
+            "num_layers_at_start_in_bf16": 1,
+            "num_layers_at_end_in_bf16": 1,
+            "extra_high_precision_layers_hf": ["model.layers.2."],
+        },
+    )
+
+    names = [name for name, _ in _collect_entries(iterator, target_precision="nvfp4")]
+    scale_names = [name for name in names if name.endswith(".weight_scale")]
+    assert scale_names == ["model.layers.1.mlp.experts.0.down_proj.weight_scale"]
+
+
+def test_nvfp4_live_pair_has_shared_scale_and_no_input_scale(monkeypatch) -> None:
+    gate_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    up_name = "model.layers.1.mlp.experts.0.up_proj.weight"
+    gate = torch.ones((3, 32), dtype=torch.bfloat16)
+    up = torch.ones((5, 32), dtype=torch.bfloat16)
+    pair_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def fake_pair(
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+    ):
+        pair_calls.append((gate_weight, up_weight))
+        shared_scale = torch.tensor(0.25, dtype=torch.float32)
+        return (
+            _fake_nvfp4_output(gate_weight, shared_scale.clone()),
+            _fake_nvfp4_output(up_weight, shared_scale.clone()),
+        )
+
+    monkeypatch.setattr(weight_iterator, "quantize_nvfp4_pair", fake_pair)
+    entries = _collect_entries(
+        _make_iterator([(gate_name, gate), (up_name, up)]),
+        target_precision="nvfp4",
+    )
+    tensors = dict(entries)
+
+    assert pair_calls == [(gate, up)]
+    assert not any(name.endswith(".input_scale") for name in tensors)
+    torch.testing.assert_close(
+        tensors[gate_name.replace(".weight", ".weight_scale_2")],
+        tensors[up_name.replace(".weight", ".weight_scale_2")],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_nvfp4_single_side_skip_keeps_whole_gate_up_pair_in_bf16(
+    monkeypatch,
+) -> None:
+    gate_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    up_name = "model.layers.1.mlp.experts.0.up_proj.weight"
+    gate = torch.ones((3, 32), dtype=torch.bfloat16)
+    up = torch.ones((5, 32), dtype=torch.bfloat16)
+
+    def fail_quantize_pair(*_args: Any, **_kwargs: Any):
+        raise AssertionError("a partially skipped gate/up pair must not be quantized")
+
+    monkeypatch.setattr(
+        weight_iterator,
+        "quantize_nvfp4_pair",
+        fail_quantize_pair,
+    )
+    entries = _collect_entries(
+        _make_iterator(
+            [(gate_name, gate), (up_name, up)],
+            quantization_config={
+                "extra_high_precision_layers_hf": ["gate_proj"],
+            },
+        ),
+        target_precision="nvfp4",
+    )
+    tensors = dict(entries)
+
+    assert set(tensors) == {gate_name, up_name}
+    assert tensors[gate_name] is gate
+    assert tensors[up_name] is up
+
+
+def test_nvfp4_iterator_rejects_incomplete_gate_up_pair() -> None:
+    gate_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    gate = torch.ones((3, 32), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="incomplete pairs"):
+        _collect_entries(
+            _make_iterator([(gate_name, gate)]),
+            target_precision="nvfp4",
+        )
+
+
+def test_nvfp4_iterator_rejects_duplicate_pair_role() -> None:
+    gate_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    gate = torch.ones((3, 32), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="duplicate gate tensor"):
+        _collect_entries(
+            _make_iterator([(gate_name, gate), (gate_name, gate.clone())]),
+            target_precision="nvfp4",
+        )
