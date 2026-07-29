@@ -1345,9 +1345,10 @@ class TestAsyncTrajectoryCollector:
     def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
         """Test resume after refit invalidates cache without in-flight updates."""
         collector = self.create_local_collector()
-        async_cfg = collector.master_config.grpo["async_grpo"]
-        async_cfg["in_flight_weight_updates"] = False
-        async_cfg["recompute_kv_cache_after_weight_updates"] = True
+        async_cfg = collector.master_config.grpo.async_grpo
+        assert async_cfg is not None
+        async_cfg.in_flight_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = True
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
         collector.resume_after_refit()
@@ -1357,9 +1358,10 @@ class TestAsyncTrajectoryCollector:
     def test_resume_after_refit_skips_cache_invalidation_when_recompute_disabled(self):
         """Test resume after refit skips cache invalidation when recompute is disabled."""
         collector = self.create_local_collector()
-        async_cfg = collector.master_config.grpo["async_grpo"]
-        async_cfg["in_flight_weight_updates"] = True
-        async_cfg["recompute_kv_cache_after_weight_updates"] = False
+        async_cfg = collector.master_config.grpo.async_grpo
+        assert async_cfg is not None
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = False
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
         collector.resume_after_refit()
