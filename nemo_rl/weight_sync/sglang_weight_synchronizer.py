@@ -124,8 +124,17 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         )
 
     def _refit(self, buffer_size_bytes: int) -> None:
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            get_sglang_quantization_scheme,
+        )
+
         sglang_quantization_cfg = self._quantization_cfg()
-        target_precision = sglang_quantization_cfg.get("scheme", "bf16")
+        target_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
+        if target_precision != "bf16" and not self._use_megatron:
+            raise NotImplementedError(
+                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                f"got target_precision={target_precision!r}."
+            )
 
         # Restart engines that died since the last refit, so the topology read
         # below reflects the survivors. No-op when nothing died.

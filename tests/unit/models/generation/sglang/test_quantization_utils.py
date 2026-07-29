@@ -22,7 +22,7 @@ from nemo_rl.models.generation.sglang.quantization_utils import (
 )
 
 
-@pytest.mark.parametrize("scheme", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("scheme", ["bf16", "mxfp8", "nvfp4"])
 def test_get_sglang_quantization_scheme_accepts_supported_values(scheme: str) -> None:
     assert get_sglang_quantization_scheme({"scheme": scheme}) == scheme
 
@@ -105,7 +105,13 @@ def test_atomic_high_precision_expands_fused_linear_and_moe_modules() -> None:
 def test_quantized_refit_requires_megatron_backend() -> None:
     validate_sglang_quantized_refit_backend(scheme="bf16", use_megatron=False)
     validate_sglang_quantized_refit_backend(scheme="mxfp8", use_megatron=True)
+    validate_sglang_quantized_refit_backend(scheme="nvfp4", use_megatron=True)
 
+    with pytest.raises(NotImplementedError, match="requires a Megatron policy"):
+        validate_sglang_quantized_refit_backend(
+            scheme="nvfp4",
+            use_megatron=False,
+        )
 
 
 @pytest.mark.parametrize(
