@@ -1562,10 +1562,13 @@ def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
     """Read ``env.should_mask_flagged_samples``; absent means True.
 
     True (the default): env-driven ``mask_sample`` flags are carried in the
-    rollout batch and flagged samples are dropped from the loss. Set false
-    when the loss must see every sample — how many samples an environment
-    flags varies run to run, so masking makes batch composition
-    non-deterministic (e.g. undesirable in controlled benchmark runs).
+    rollout batch and flagged samples are dropped from the loss.
+
+    Set false when the flags are too coarse to honor: for example, Gym flags
+    rollouts that hit max iterations even when they solve the task, and those
+    are samples worth training on. It also keeps batch composition
+    deterministic for controlled benchmark runs — how many samples get
+    flagged varies run to run.
     """
     return env_config.get("should_mask_flagged_samples") is not False
 
