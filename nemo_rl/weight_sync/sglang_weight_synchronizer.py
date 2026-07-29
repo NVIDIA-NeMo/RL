@@ -14,11 +14,12 @@
 
 """Weight synchronizers for the SGLang generation backend.
 
-The refit itself — engine recovery, connect, pause, KV invalidation, bucket
-transfer, post-process, continue — lives in the backend-specific driver
-modules (``megatron_sglang_refit`` / ``dtensor_sglang_refit``). These
-synchronizers only own the GPU phase transitions around that call: which
-side gets offloaded/onloaded, and in what order.
+The refit itself — engine recovery, connect, pause, conditional KV
+invalidation, a begin/end weight-update session around the bucket transfer,
+then continue — lives in the backend-specific driver modules
+(``megatron_sglang_refit`` / ``dtensor_sglang_refit``). These synchronizers
+only own the GPU phase transitions around that call: which side gets
+offloaded/onloaded, and in what order.
 
 Colocated (``weight_transfer_mode="ipc"``):
   1. policy.offload_before_refit()                        -- free GPU for staging

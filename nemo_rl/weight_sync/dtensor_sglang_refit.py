@@ -34,11 +34,25 @@ def refit_sglang_colocated(
     """Refit colocated SGLang engines from the FSDP/DTensor policy.
 
     Lifecycle: optional fault-tolerance recover, connect (when new /
-    recovered engines), pause + KV invalidation, send HF tensor buckets via
-    Ray IPC, post-process, continue. Mirrors the Megatron colocated driver;
-    the FSDP path is BF16-only.
+    recovered engines), pause, open an engine-side update session, send HF
+    tensor buckets via Ray IPC, close the session, continue. Mirrors the
+    Megatron colocated driver; the FSDP path is BF16-only.
     """
-    from nemo_rl.models.policy.utils import fetch_updatable_engines_with_recover
+    from nemo_rl.models.generation.sglang.quantization_utils import (
+        get_sglang_quantization_scheme,
+    )
+    from nemo_rl.models.policy.utils import (
+        fetch_updatable_engines_with_recover,
+        get_sglang_quantization_cfg,
+    )
+
+    sglang_quantization_cfg = get_sglang_quantization_cfg(policy_generation)
+    target_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
+    if target_precision != "bf16":
+        raise NotImplementedError(
+            "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+            f"got target_precision={target_precision!r}."
+        )
 
     (
         rollout_engines,
@@ -72,6 +86,8 @@ def refit_sglang_colocated(
         futures = policy.update_weights_to_sglang_colocated(
             rollout_engines=rollout_engines,
             buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
         )
         ray.get(futures)
     finally:

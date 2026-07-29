@@ -31,7 +31,7 @@ policy:
       rollout_health_check_timeout: 60
       rollout_health_check_first_wait: 60
       # Weight precision for rollout/refit. scheme=bf16 (default) sends BF16
-      # HF tensors; scheme=mxfp8 boots SGLang from a matching quantized
+      # HF tensors; scheme=mxfp8/nvfp4 boots SGLang from a matching quantized
       # HF checkpoint and quantizes refit tensors online.
       quantization:
         scheme: bf16
