@@ -15,7 +15,7 @@ training curves, and known limitations.
 
 | Model             | Training backend          | Validated training parallelism | Generation backend               | Precision                                                        | Status                          |
 | ----------------- | ------------------------- | ------------------------------ | -------------------------------- | ---------------------------------------------------------------- | ------------------------------- |
-| `zai-org/GLM-5.2` | AutoModel (DTensor/FSDP2) | PP8 + EP64; PP8 + EP64 + CP4   | Colocated vLLM with TP32 + EP128 | BF16 model and generation weights; FusedAdam FP32 master weights | Functional Ready (early access) |
+| `zai-org/GLM-5.2` | AutoModel (DTensor/FSDP2) | PP8 + EP64; PP8 + EP64 + CP8   | Colocated vLLM with TP32 + EP128 | BF16 model and generation weights; FusedAdam FP32 master weights | Functional Ready (early access) |
 
 
 Validated scope:
@@ -72,10 +72,10 @@ generation.
 | Recipe                                            | Training topology | Sequence limit                                           | Attention and linear backends     | Packing  | Training global batch |
 | ------------------------------------------------- | ----------------- | -------------------------------------------------------- | --------------------------------- | -------- | --------------------- |
 | `exp/grpo-glm5.2-64n8g-automodel-pp8ep64.yaml`    | PP8 + EP64        | 2,048 total tokens: up to 1,024 prompt + 1,024 generated | SDPA attention + TE linear        | Disabled | 512                   |
-| `exp/grpo-glm5.2-64n8g-automodel-pp8ep64cp4.yaml` | PP8 + EP64 + CP4  | 6,144 total tokens: up to 2,048 prompt + 4,096 generated | TileLang attention + torch linear | Enabled  | 128                   |
+| `exp/grpo-glm5.2-64n8g-automodel-pp8ep64cp8.yaml` | PP8 + EP64 + CP8  | 6,144 total tokens: up to 2,048 prompt + 4,096 generated | TileLang attention + torch linear | Enabled  | 128                   |
 
 
-The CP4 recipe uses packed THD inputs so that GLM-5.2's model-owned context
+The CP8 recipe uses packed THD inputs so that GLM-5.2's model-owned context
 parallel attention path receives `cu_seqlens` and its CP query indices during
 both training and policy-logprob evaluation.
 
@@ -91,36 +91,37 @@ export NRL_FORCE_REBUILD_VENVS=true
 uv run examples/run_grpo.py \
   --config exp/grpo-glm5.2-64n8g-automodel-pp8ep64.yaml
 
-# PP8 + EP64 + CP4 with sequence packing
+# PP8 + EP64 + CP8 with sequence packing
 uv run examples/run_grpo.py \
-  --config exp/grpo-glm5.2-64n8g-automodel-pp8ep64cp4.yaml
+  --config exp/grpo-glm5.2-64n8g-automodel-pp8ep64cp8.yaml
 ```
 
 
 
 ## Reference Training Curves
 
-The following dashboard compares a PP/CP experiment (blue) with the PP/EP
-baseline (magenta). It includes reward, validation accuracy, generated tokens
-per sample, generation KL error, truncation rate, and gradient norm.
+The following dashboard shows a PP8 + EP64 + CP8 experiment. It includes
+reward, validation accuracy, generated tokens per sample, generation KL error,
+truncation rate, and gradient norm.
 
-![GLM-5.2 GRPO training curves for PP8 + EP64 and PP8 + EP64 + CP4](../assets/glm5.2_grpo_curve.png)
+![GLM-5.2 GRPO training curves for PP8 + EP64 + CP8](../assets/glm5.2_grpo_curve.png)
 
-The short runs provide the following integration signals:
+The short run provides the following integration signals:
 
-- Both runs improve reward and reach approximately 0.4 validation accuracy in
-the displayed window.
-- Gradient norms remain finite, and generation KL error stays on the order of
-`1e-2` during the shown steps.
+- The run improves reward and reaches approximately 0.55 validation accuracy
+in the displayed window.
+- Gradient norms remain finite, and generation KL error peaks below `1.5e-2`
+before decreasing to approximately `3e-3`.
 
-These curves validate that both distributed paths execute and learn over a
-short window. They do not establish long-run stability or final convergence.
+These curves validate that the PP8 + EP64 + CP8 distributed path executes and
+learns over a short window. They do not establish long-run stability or final
+convergence.
 
 ## Implementation Requirements
 
 - **CP requires TileLang and sequence packing**: GLM-5.2 owns its CP attention
 path and accepts CP only with `backend.attn: tilelang`. Keep
-`policy.sequence_packing.enabled: true` for the CP4 recipe.
+`policy.sequence_packing.enabled: true` for the CP8 recipe.
 - **HybridEP token alignment**: Keep
 `policy.make_sequence_length_divisible_by: 128`. HybridEP requires its token
 buffers to align to a 128-token chunk.

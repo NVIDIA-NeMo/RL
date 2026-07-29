@@ -34,7 +34,7 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-glm52-4k-pp8-ep64-cp4
+  checkpoint_dir: results/grpo-glm52-4k-pp8-ep64-cp8
   keep_top_k: 2
   save_period: 3
   checkpoint_must_save_by: "00:03:45:00"
@@ -75,7 +75,7 @@ policy:
   - milestones:
     - 10
   dtensor_cfg:
-    context_parallel_size: 4
+    context_parallel_size: 8
     pipeline_parallel_size: 8
     expert_parallel_size: 64
     activation_checkpointing: true
@@ -141,7 +141,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: nemorl-glm52
-    name: grpo-glm52-4k-pp8-ep64-cp4
+    name: grpo-glm52-4k-pp8-ep64-cp8
 cluster:
   gpus_per_node: 8
   num_nodes: 64
