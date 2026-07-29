@@ -35,8 +35,10 @@ from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -45,6 +47,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -3629,3 +3632,58 @@ class TestAggregateRolloutMetrics:
         assert result["total_turns"] == 45
         assert result["accuracy"] == pytest.approx(0.8)
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
+
+
+def _cfg(
+    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+):
+    return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=force,
+            use_kl_in_reward=kl_reward,
+            reference_policy_kl_penalty=kl_penalty,
+        ),
+        grpo={
+            "seq_logprob_error_threshold": threshold,
+            "skip_reference_policy_logprobs_calculation": skip_ref,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "kw, expected",
+    [
+        ({}, (False, None)),
+        ({"force": True}, (True, None)),
+        ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        ({"skip_ref": True}, (False, True)),
+    ],
+    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+)
+def test_resolve_logprob_skip_flags(kw, expected):
+    if kw.get("force") and kw.get("threshold") is not None:
+        with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
+            assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    else:
+        assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():
+    with pytest.raises(AssertionError, match="use_kl_in_reward"):
+        _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True))
+
+
+def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
+    # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
+    # prev_logprobs can't corrupt the advantage.
+    _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))
+
+
+@pytest.mark.parametrize(
+    "skip_prev_logprobs, expect_prev",
+    [(False, True), (True, False)],
+    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+)
+def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
+    fields = _train_fields_for_step(skip_prev_logprobs)
+    assert ("prev_logprobs" in fields) is expect_prev
