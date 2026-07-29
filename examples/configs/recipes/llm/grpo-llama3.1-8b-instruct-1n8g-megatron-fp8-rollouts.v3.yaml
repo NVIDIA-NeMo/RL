@@ -35,13 +35,24 @@ policy:
       max_model_len: 4096
       use_deep_gemm: true
     vllm_kwargs:
-      # At the same gpu_memory_utilization, vLLM 0.25's profiling sizes the
-      # KV cache several GiB larger than 0.20 did, growing the CuMemAllocator
-      # sleep pool past what can be re-mapped at wake-up next to the
-      # colocated Megatron policy ("CUDA Error: out of memory at
+      # At the same gpu_memory_utilization, vLLM 0.25's profiling grows the
+      # CuMemAllocator sleep pool past what can be re-mapped at wake-up next
+      # to the colocated Megatron policy ("CUDA Error: out of memory at
       # csrc/cumem_allocator.cpp"; lowering gpu_memory_utilization to 0.5
-      # still OOM'ed). Pin the KV cache to a 0.20-equivalent size instead
-      # (takes precedence over gpu_memory_utilization).
+      # still OOM'ed). Pin the KV cache instead -- it takes precedence over
+      # gpu_memory_utilization.
+      #
+      # 20 GiB is NOT the 0.20-equivalent size. Measured on this recipe, 0.20
+      # gave this engine "Available KV cache memory: 36.13 GiB" and discarded
+      # 36.19 GiB of sleep pool; this pin is a ~45% reduction from that. It is
+      # the value that stops the wake-up OOM, chosen empirically, not a
+      # like-for-like restoration.
+      #
+      # Caveat worth knowing before tuning this: unlike the moonlight fp8-e2e
+      # recipe, whose driver gates total_step_time and so would notice a
+      # too-small cache, this recipe's driver asserts only
+      # token_mult_prob_error. A throughput regression from an over-tight pin
+      # would pass CI silently. See https://github.com/NVIDIA-NeMo/RL/issues/3412
       kv_cache_memory_bytes: 21474836480  # 20 GiB
 data:
   max_input_seq_length: 4096
