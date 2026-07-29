@@ -36,9 +36,16 @@ fi
 # current source commit as provenance -- so evidence could describe code that
 # never ran. rsync is incremental, so refreshing an up-to-date snapshot is
 # cheap. Deliberately no --delete: run outputs live under this directory.
-echo2 "Copying git-tracked files and submodules..."
+# Deliberately NOT --recurse-submodules. Submodule trees (Megatron-Bridge and
+# its nested Megatron-LM, Automodel, Gym) are already installed in the image;
+# copying them here too puts a second copy of the `megatron` package inside the
+# directory the job runs from, so `megatron.bridge` resolves from the image
+# while `megatron.training` resolves from the snapshot. That split namespace
+# turns Megatron-Bridge's pre-existing circular imports into a fatal
+# ImportError in MegatronPolicyWorker at scale.
+echo2 "Copying git-tracked first-party files (submodules come from the image)..."
 rsync -a --files-from=<(
-  git ls-files --recurse-submodules --cached --full-name
+  git ls-files --cached --full-name
 ) ./ $SNAPSHOT_DIR/
 
 # Record what this snapshot was built from, so a stale or hand-edited tree is
