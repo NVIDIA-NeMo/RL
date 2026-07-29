@@ -939,7 +939,6 @@ class MegatronGenerationRefitMixin:
         if not self._inference_engine_initialized:
             return
         self._sleep()
-        torch.cuda.synchronize()
 
     def resume_after_refit(self) -> None:
         """Resume+unpause the inference engine after a weight refit."""
