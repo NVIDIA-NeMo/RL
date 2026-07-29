@@ -1333,17 +1333,18 @@ class VllmAsyncGenerationWorkerImpl(
             worker_results = cast(list[bool], worker_results)
 
             if not worker_results or not all(worker_results):
-                print(
-                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                # Weight-update failures must abort the step: silently continuing
+                # would train against stale generation weights (off-policy drift).
+                raise RuntimeError(
+                    f"Worker failed to update weights. Results: {worker_results}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
@@ -1369,17 +1370,18 @@ class VllmAsyncGenerationWorkerImpl(
             worker_results = cast(list[bool], worker_results)
 
             if not worker_results or not all(worker_results):
-                print(
-                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                # Weight-update failures must abort the step: silently continuing
+                # would train against stale generation weights (off-policy drift).
+                raise RuntimeError(
+                    f"Worker failed to update weights. Results: {worker_results}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def init_nccl_reshard_comm_group_async(
         self,
