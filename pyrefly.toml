@@ -165,6 +165,7 @@ project-includes = [
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
   "nemo_rl/models/generation/dynamo/__init__.py",
+  "nemo_rl/models/generation/dynamo/arguments.py",
   "nemo_rl/models/generation/dynamo/config.py",
   "nemo_rl/models/generation/dynamo/dynamo_generation.py",
   "nemo_rl/models/generation/dynamo/token_wrapper.py",
