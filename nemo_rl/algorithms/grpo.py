@@ -253,8 +253,8 @@ class GRPOConfig(TypedDict):
     advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
-    # First training step eligible for periodic validation; absent means no delay.
-    val_start_at: NotRequired[int]
+    # First training step eligible for periodic validation; -1 disables the delay.
+    val_start_at: int
     val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
@@ -2588,7 +2588,7 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
-    val_start_at = master_config.grpo.get("val_start_at", None)
+    val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
@@ -3149,7 +3149,7 @@ def grpo_train(
                 # Run validation if it's a validation step or last step with val_at_end
                 if (
                     val_period > 0
-                    and (val_start_at is None or total_steps + 1 >= val_start_at)
+                    and (total_steps + 1) >= val_start_at
                     and (total_steps + 1) % val_period == 0
                 ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
@@ -3855,7 +3855,7 @@ def async_grpo_train(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config.grpo["val_period"]
-    val_start_at = master_config.grpo.get("val_start_at", None)
+    val_start_at = master_config.grpo["val_start_at"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
@@ -4555,7 +4555,7 @@ def async_grpo_train(
                 # Run validation if it's a validation step or last step with val_at_end
                 if (
                     val_period > 0
-                    and (val_start_at is None or step + 1 >= val_start_at)
+                    and (step + 1) >= val_start_at
                     and (step + 1) % val_period == 0
                 ) or (val_at_end and is_last_step):
                     with timer.time("idle/validation"):

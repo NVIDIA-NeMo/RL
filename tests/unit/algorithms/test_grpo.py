@@ -47,7 +47,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -263,6 +263,7 @@ def mock_grpo_components():
                 "num_generations_per_prompt": 1,
                 "max_rollout_turns": 1,
                 "val_period": 100,
+                "val_start_at": -1,
                 "val_batch_size": 1,
                 "val_at_start": False,
                 "val_at_end": False,
@@ -996,6 +997,93 @@ def mock_async_grpo_infrastructure(
             return_value=seq_logprob_error_result,
         )
     )
+
+    return stack
+
+
+def mock_sync_grpo_infrastructure(policy):
+    """Context manager that mocks the TQ/data-plane infrastructure of grpo_train_sync.
+
+    Mirrors ``mock_async_grpo_infrastructure``: the Ray rollout actor and the
+    TQ round-trips are stubbed so the driver loop runs for real, with small
+    real tensors standing in for the per-sample slices the driver computes
+    against. ``validate_sync`` is intentionally left unpatched so tests can
+    install their own capturing mock.
+    """
+    stack = ExitStack()
+
+    # Slice returned by the stubbed rollout actor; baseline/std are computed
+    # for real on the driver from these fields.
+    driver_carry = BatchedDataDict(
+        {
+            "total_reward": torch.tensor([1.0]),
+            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "truncated": torch.tensor([False]),
+            "length": torch.tensor([3]),
+        }
+    )
+    meta = MagicMock()
+    meta.fields = ["input_ids"]
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    rollout_actor = MagicMock()
+    rollout_actor.rollout_to_tq.remote.return_value = (
+        meta,
+        driver_carry,
+        rollout_metrics,
+        {},
+    )
+    rollout_actor_cls = MagicMock()
+    rollout_actor_cls.options.return_value.remote.return_value = rollout_actor
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.SyncRolloutActor", rollout_actor_cls)
+    )
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.make_actor_runtime_env", return_value={})
+    )
+    # The only ray.get on the driver path receives the stub actor's plain tuple.
+    stack.enter_context(patch("ray.get", side_effect=lambda ref: ref))
+
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.refit_policy_generation", return_value=None)
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo_sync._compute_seq_logprob_error_metrics",
+            return_value=(torch.ones(1), _mock_seq_logprob_error_result()),
+        )
+    )
+    adv_estimator = MagicMock()
+    adv_estimator.compute_advantage.return_value = torch.zeros(1, 4)
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo_sync._create_advantage_estimator",
+            return_value=adv_estimator,
+        )
+    )
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.print_performance_metrics", return_value={})
+    )
+
+    # TQ-mediated policy methods: per-token slices read back from the data
+    # plane, and train results in the same shape as ``policy.train``.
+    dp_bank = {
+        "generation_logprobs": torch.zeros(1, 4),
+        "token_mask": torch.ones(1, 4),
+        "prev_logprobs": torch.zeros(1, 4),
+        "reference_policy_logprobs": torch.zeros(1, 4),
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+    }
+    policy.read_from_dataplane.side_effect = lambda meta, select_fields, **kw: (
+        BatchedDataDict({k: dp_bank[k].clone() for k in select_fields})
+    )
+    policy.train_from_meta.return_value = policy.train.return_value
+    policy.tq_partition_id = 0
 
     return stack
 
@@ -2445,7 +2533,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     )
 
 
-@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
 @pytest.mark.parametrize(
     ("val_at_end", "expected_validation_steps"),
     [(False, [4]), (True, [4, 5])],
@@ -2453,7 +2541,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
 def test_periodic_validation_starts_at_configured_step(
     mock_grpo_components, train_func, val_at_end, expected_validation_steps
 ):
-    """Both trainers preserve cadence while honoring the validation lower bound."""
+    """All three trainers preserve cadence while honoring the validation lower bound."""
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.update(
         {
@@ -2471,7 +2559,14 @@ def test_periodic_validation_starts_at_configured_step(
     }
 
     with ExitStack() as stack:
-        if train_func == async_grpo_train:
+        validate_target = "nemo_rl.algorithms.grpo.validate"
+        if train_func is grpo_train_sync:
+            master_config.data_plane = {"enabled": True}
+            stack.enter_context(
+                mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+            )
+            validate_target = "nemo_rl.algorithms.grpo_sync.validate_sync"
+        elif train_func is async_grpo_train:
             master_config.policy["generation"]["colocated"]["enabled"] = False
             stack.enter_context(
                 mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
@@ -2497,7 +2592,7 @@ def test_periodic_validation_starts_at_configured_step(
             )
 
         mock_validate = stack.enter_context(
-            patch("nemo_rl.algorithms.grpo.validate", return_value=({}, {}))
+            patch(validate_target, return_value=({}, {}))
         )
         train_func(
             mock_grpo_components["policy"],
