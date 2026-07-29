@@ -206,6 +206,8 @@ def mock_components():
 
 
 def test_get_distillation_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_distillation_save_state({}) == _initial_distillation_save_state()
+
     loaded_state = {
         "total_steps": 13,
         "current_epoch": 1,
@@ -274,8 +276,8 @@ def test_distillation_train_max_steps(mock_components):
 def test_ft_save_period_triggers_periodic_saves(mock_components):
     """ft_save_period triggers checkpoint saves independent of save_period."""
     cfg = mock_components["master_config"]
-    cfg.distillation["max_num_steps"] = 5
-    cfg.distillation["val_period"] = 0
+    cfg.distillation.max_num_steps = 5
+    cfg.distillation.val_period = 0
     cfg.checkpointing["enabled"] = True
     cfg.checkpointing["save_period"] = 100  # only the final step would save
     cfg.checkpointing["ft_save_period"] = 2
@@ -284,7 +286,7 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     checkpointer = mock_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
 
-    distillation_save_state = _default_distillation_save_state()
+    distillation_save_state = _initial_distillation_save_state()
 
     with patch("nemo_rl.algorithms.distillation.torch.save"):
         distillation_train(
@@ -310,9 +312,9 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
 
 def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
-    master_config.distillation["max_num_steps"] = 1
-    master_config.distillation["max_num_epochs"] = 1
-    master_config.distillation["val_period"] = 0
+    master_config.distillation.max_num_steps = 1
+    master_config.distillation.max_num_epochs = 1
+    master_config.distillation.val_period = 0
     master_config.env["should_use_nemo_gym"] = True
     master_config.policy["generation"]["backend"] = "vllm"
     master_config.policy["generation"]["vllm_cfg"] = {
@@ -347,7 +349,7 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
             mock_components["val_task_to_env"],
             mock_components["logger"],
             mock_components["checkpointer"],
-            _default_distillation_save_state(),
+            _initial_distillation_save_state(),
             master_config,
         )
 
@@ -431,7 +433,7 @@ def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
     call, otherwise the teacher top-k forward OOMs once optimizer state
     materializes after the first training step.
     """
-    mock_components["master_config"].distillation["max_num_steps"] = 2
+    mock_components["master_config"].distillation.max_num_steps = 2
     assert not mock_components["master_config"].policy["generation"]["colocated"][
         "enabled"
     ]
@@ -457,7 +459,7 @@ def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
         mock_components["val_task_to_env"],
         mock_components["logger"],
         mock_components["checkpointer"],
-        _default_distillation_save_state(),
+        _initial_distillation_save_state(),
         mock_components["master_config"],
     )
 
@@ -477,7 +479,7 @@ def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
     mock_components,
 ):
     """In colocated mode refit already offloads the student; the loop must not."""
-    mock_components["master_config"].distillation["max_num_steps"] = 2
+    mock_components["master_config"].distillation.max_num_steps = 2
     mock_components["master_config"].policy["generation"]["colocated"]["enabled"] = True
 
     distillation_train(
@@ -492,7 +494,7 @@ def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
         mock_components["val_task_to_env"],
         mock_components["logger"],
         mock_components["checkpointer"],
-        _default_distillation_save_state(),
+        _initial_distillation_save_state(),
         mock_components["master_config"],
     )
 
@@ -522,8 +524,8 @@ def test_validate_function(mock_components):
 
 def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
-    master_config.distillation["max_val_samples"] = 1
-    master_config.distillation["val_batch_size"] = 1
+    master_config.distillation.max_val_samples = 1
+    master_config.distillation.val_batch_size = 1
     master_config.env["should_use_nemo_gym"] = True
     master_config.env["should_log_nemo_gym_responses"] = False
     master_config.policy["generation"]["backend"] = "vllm"
@@ -629,7 +631,7 @@ def test_validate_logs_data_when_logger_provided(mock_components):
     mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
 
     master_config = mock_components["master_config"]
-    master_config.distillation["val_batch_size"] = 1
+    master_config.distillation.val_batch_size = 1
     master_config.logger["num_val_samples_to_print"] = 1
 
     with (
@@ -1128,21 +1130,21 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
                     "enabled": False,
                 },
             },
-            "loss_fn": {
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            },
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,
-                "max_num_epochs": 1,
-                "max_num_steps": 1,
-                "val_period": 0,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                max_num_epochs=1,
+                max_num_steps=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "env": {
                 "should_use_nemo_gym": True,

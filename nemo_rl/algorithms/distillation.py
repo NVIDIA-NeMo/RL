@@ -142,15 +142,13 @@ def _get_distillation_save_state(
     if loaded_state is None:
         return _initial_distillation_save_state()
 
-    # Backward compatibility: older checkpoints may not contain these fields.
-    loaded_state = loaded_state.copy()
-    loaded_state.setdefault("total_valid_tokens", 0)
-    loaded_state.setdefault("val_reward", -99999999.0)
-    # Checkpoints may carry dynamic validation metrics; regenerate them after resume.
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
     known_fields = {field.name for field in fields(DistillationSaveState)}
-    return DistillationSaveState(
-        **{key: value for key, value in loaded_state.items() if key in known_fields}
+    state_values = vars(_initial_distillation_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
     )
+    return DistillationSaveState(**state_values)
 
 
 class MasterConfig(BaseModel, extra="allow"):
