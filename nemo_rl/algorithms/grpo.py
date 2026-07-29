@@ -4886,17 +4886,32 @@ def async_grpo_train(
                         timer=timer,
                     )
 
+                is_last_step = step + 1 == master_config.grpo.max_num_steps
+                should_save_by_step = (
+                    is_last_step
+                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
+                )
+                should_save_by_timeout = timeout.check_save()
+                will_save_checkpoint = master_config.checkpointing["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                )
+
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 if colocated_inference:
                     # Colocated mode currently does not support weights refit.
-                    print("🔄 Resuming colocated engine after training step...")
                     with timer.time("weight_sync"):
                         policy.offload_before_refit()
-                    policy_generation.prepare_for_generation()
                     POLICY_GENERATION_STALE = False
                     weight_version += 1
                     trajectory_collector.set_weight_version.remote(weight_version)
-                    trajectory_collector.resume_after_refit.remote()
+                    if will_save_checkpoint:
+                        # Don't wake up engine if we're about to send it to sleep for checkpointing.
+                        print("⏸️ Keeping colocated engine asleep for checkpointing...")
+                    else:
+                        print("🔄 Resuming colocated engine after training step...")
+                        policy_generation.prepare_for_generation()
+                        trajectory_collector.resume_after_refit.remote()
                 elif NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
@@ -4935,7 +4950,6 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config.grpo.max_num_steps
                 should_run_validation = (
                     val_period > 0
                     and (step + 1) >= val_start_at
@@ -4961,9 +4975,10 @@ def async_grpo_train(
                 if should_run_validation:
                     with timer.time("idle/validation"):
                         if colocated_inference:
-                            # Colocated engine was already resumed post-training;
-                            # no refit path exists in colocated mode.
-                            pass
+                            # No refit path exists in colocated mode.
+                            # On save-bound steps, engine stayed asleep after training.
+                            if will_save_checkpoint:
+                                policy_generation.prepare_for_generation()
                         elif NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
                                 policy,
@@ -4983,7 +4998,7 @@ def async_grpo_train(
                             logger=logger,
                             processor=processor,
                         )
-                        if not colocated_inference:
+                        if not colocated_inference or will_save_checkpoint:
                             policy_generation.finish_generation()
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
@@ -5097,19 +5112,12 @@ def async_grpo_train(
                 consumed_samples += master_config.grpo.num_prompts_per_step
                 timeout.mark_iteration()
 
-                # +1 because step is 0-indexed
-                should_save_by_step = (
-                    is_last_step
-                    # Early stop saves the final state like a last step.
-                    or early_stop_message is not None
-                    or (step + 1) % master_config.checkpointing["save_period"] == 0
-                    or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
-                )
-                # Check if timeout-based checkpointing is enabled in config.
-                should_save_by_timeout = timeout.check_save()
-
-                if master_config.checkpointing["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
+                # Early stop saves the final state like a last step; it is only
+                # known after validation, so it cannot fold into the earlier
+                # will_save_checkpoint computation.
+                if will_save_checkpoint or (
+                    master_config.checkpointing["enabled"]
+                    and early_stop_message is not None
                 ):
                     grpo_save_state.current_step = step + 1
                     grpo_save_state.total_valid_tokens = total_valid_tokens
@@ -5205,6 +5213,13 @@ def async_grpo_train(
                         _write_latest_checkpoint_status(
                             checkpointer, last_checkpoint_step=step + 1
                         )
+
+                    # On save-bound steps, engine stayed asleep after training.
+                    # (On an early-stop save it is already awake and the loop
+                    # exits right below, so no wake is needed.)
+                    if colocated_inference and will_save_checkpoint:
+                        policy_generation.prepare_for_generation()
+                        trajectory_collector.resume_after_refit.remote()
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity).
