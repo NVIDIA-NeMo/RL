@@ -94,6 +94,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
+    SamplingParams,
     resolve_routed_experts_dtype_name_for_model,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -259,14 +260,10 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
-    # Validation-only sampling overrides for NeMo-Gym rollouts. Absent means
-    # validation uses policy.generation sampling; when only one is set, the
-    # other falls back to its policy.generation value.
-    val_temperature: NotRequired[float]
-    val_top_p: NotRequired[float]
     # Number of independent validation rollouts generated for each prompt;
-    # accuracy is then reported as pass@k over each prompt's k rollouts.
-    num_val_generations_per_prompt: NotRequired[int]
+    # k > 1 additionally reports pass@k over each prompt's k rollouts as the
+    # pass_k metric.
+    val_num_generations_per_prompt: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -397,19 +394,20 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
 
-    val_temperature = grpo_config.get("val_temperature", None)
-    val_top_p = grpo_config.get("val_top_p", None)
-    if val_temperature is not None or val_top_p is not None:
-        generation_config["_validation_generation"] = {
-            "temperature": (
-                val_temperature
-                if val_temperature is not None
-                else generation_config["temperature"]
-            ),
-            "top_p": (
-                val_top_p if val_top_p is not None else generation_config["top_p"]
-            ),
-        }
+    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
+    # path; everywhere else validation must sample exactly like training.
+    val_sampling_overridden = (
+        generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+        or generation_config["val_top_k"] != generation_config["top_k"]
+    )
+    if val_sampling_overridden:
+        assert generation_config["backend"] == "vllm" and _should_use_nemo_gym(
+            master_config
+        ), (
+            "generation.val_temperature/val_top_p/val_top_k differing from the "
+            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+        )
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -3601,11 +3599,11 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
-        num_val_generations_per_prompt = int(
-            master_config.grpo.get("num_val_generations_per_prompt", 1)
-        )
-        assert num_val_generations_per_prompt >= 1, (
-            "grpo.num_val_generations_per_prompt must be >= 1"
+        val_num_generations_per_prompt = master_config.grpo[
+            "val_num_generations_per_prompt"
+        ]
+        assert val_num_generations_per_prompt >= 1, (
+            "grpo.val_num_generations_per_prompt must be >= 1"
         )
 
         total_rewards = []
@@ -3616,33 +3614,27 @@ def validate(
             master_config.grpo["max_val_samples"]
             // master_config.grpo["val_batch_size"]
         )
-        val_temperature = master_config.grpo.get("val_temperature", None)
-        val_top_p = master_config.grpo.get("val_top_p", None)
-        assert (val_temperature is None and val_top_p is None) or _should_use_nemo_gym(
-            master_config
-        ), "grpo.val_temperature/val_top_p are only supported on the NeMo-Gym rollout path."
-        validation_generation_overrides = master_config.policy["generation"]
-        if val_temperature is not None or val_top_p is not None:
-            # Validation-only sampling overrides (e.g. near-greedy validation).
-            # Training rollouts keep policy.generation.
-            validation_generation_overrides = dict(validation_generation_overrides)
-            if val_temperature is not None:
-                validation_generation_overrides["temperature"] = val_temperature
-            if val_top_p is not None:
-                validation_generation_overrides["top_p"] = val_top_p
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
 
-            if num_val_generations_per_prompt > 1:
-                val_batch = val_batch.repeat_interleave(num_val_generations_per_prompt)
+            if val_num_generations_per_prompt > 1:
+                val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
 
             additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
-                generation_config = validation_generation_overrides
+                generation_config = master_config.policy["generation"]
+                # Validation-only sampling (e.g. near-greedy validation);
+                # defaults to the train profile via the exemplar YAML
+                # interpolations. Training rollouts keep policy.generation.
+                val_sampling_params = SamplingParams(
+                    temperature=generation_config["val_temperature"],
+                    top_p=generation_config["val_top_p"],
+                    top_k=generation_config["val_top_k"],
+                )
                 nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -3650,6 +3642,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
+                    sampling_params=val_sampling_params,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],
                         wandb_config=master_config.logger["wandb"],
@@ -3697,26 +3690,26 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics. Grouped validation
-        # (num_val_generations_per_prompt > 1) reports pass@k over each
-        # prompt's k rollouts as accuracy.
+        # Calculate validation metrics. accuracy is the mean reward over all
+        # rollouts; grouped validation (val_num_generations_per_prompt > 1)
+        # additionally reports pass@k over each prompt's k rollouts as pass_k.
         num_samples = len(total_rewards)
+        pass_k = None
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            if num_val_generations_per_prompt > 1:
-                assert num_samples % num_val_generations_per_prompt == 0, (
+            accuracy = rewards_t.mean().item()
+            if val_num_generations_per_prompt > 1:
+                assert num_samples % val_num_generations_per_prompt == 0, (
                     "Validation rewards must be divisible by "
-                    "grpo.num_val_generations_per_prompt"
+                    "grpo.val_num_generations_per_prompt"
                 )
-                accuracy = (
-                    (rewards_t.view(-1, num_val_generations_per_prompt) > 0)
+                pass_k = (
+                    (rewards_t.view(-1, val_num_generations_per_prompt) > 0)
                     .any(dim=1)
                     .float()
                     .mean()
                     .item()
                 )
-            else:
-                accuracy = rewards_t.mean().item()
         else:
             accuracy = 0.0
 
@@ -3729,6 +3722,8 @@ def validate(
             "avg_length": avg_length,
             **additional_metrics_to_report,
         }
+        if pass_k is not None:
+            val_metrics["pass_k"] = pass_k
 
         # Print sample conversations only once at the end of validation
         try:

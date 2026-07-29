@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
@@ -196,6 +197,13 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    # Validation-only sampling. The exemplar YAMLs default these to the train
+    # values above via interpolation (${.temperature}, ...), so validation
+    # samples exactly like training unless overridden. Only honored on the
+    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    val_temperature: NotRequired[float]
+    val_top_p: NotRequired[float]
+    val_top_k: NotRequired[int | None]
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
@@ -207,9 +215,31 @@ class GenerationConfig(TypedDict):
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
-    # Internal: resolved validation sampling profile (grpo.val_temperature /
-    # val_top_p), published by grpo.setup() for OpenAI-compatible servers.
-    _validation_generation: NotRequired[dict[str, float] | None]
+
+
+@dataclass
+class SamplingParams:
+    """Sampling profile threaded explicitly through rollout entry points.
+
+    Rollout callers construct one from the relevant ``GenerationConfig``
+    fields (train or validation) so the sampling used for a rollout is
+    visible at the call site instead of flowing through config side-channels.
+    """
+
+    temperature: float
+    top_p: float
+    top_k: int | None
+
+    @classmethod
+    def from_generation_config(
+        cls, generation_config: "GenerationConfig"
+    ) -> "SamplingParams":
+        """Build the train-time sampling profile from a generation config."""
+        return cls(
+            temperature=generation_config["temperature"],
+            top_p=generation_config["top_p"],
+            top_k=generation_config["top_k"],
+        )
 
 
 class GenerationDatumSpec(TypedDict):

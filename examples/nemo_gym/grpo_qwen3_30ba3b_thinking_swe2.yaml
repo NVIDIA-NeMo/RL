@@ -13,7 +13,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
-  num_val_generations_per_prompt: 1
+  val_num_generations_per_prompt: 1
   max_num_epochs: 100
   advantage_clip_low: -100
   advantage_clip_high: 100
