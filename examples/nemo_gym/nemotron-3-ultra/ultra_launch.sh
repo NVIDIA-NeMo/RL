@@ -48,8 +48,6 @@ set -euo pipefail
 #   NRL_MAX_STEPS=                         Override grpo.max_num_steps
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
-#   USE_CUSTOM_VLLM=1                      1 to require the Ultra vLLM fork;
-#                                          0 to use the container's regular vLLM
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
 #   INTERACTIVE=0                          1 to bring up Ray and idle for attach
 #                                          (no training driver) for debugging
@@ -362,19 +360,6 @@ export NEMO_SKILLS_SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 export RAY_LOG_SYNC_FREQUENCY="${RAY_LOG_SYNC_FREQUENCY:-60}"
 
 CODE_ROOT="/opt/nemo-rl"
-USE_CUSTOM_VLLM="${USE_CUSTOM_VLLM:-1}"
-case "${USE_CUSTOM_VLLM}" in
-  1)
-    VLLM_ENV_SOURCE="source /opt/nemo-rl/3rdparty/vllm/nemo-rl.env && "
-    ;;
-  0)
-    VLLM_ENV_SOURCE=""
-    ;;
-  *)
-    echo "ERROR: USE_CUSTOM_VLLM must be 0 or 1, got: ${USE_CUSTOM_VLLM}" >&2
-    exit 1
-    ;;
-esac
 
 # =============================================================================
 # Persistent cache directories
@@ -495,11 +480,6 @@ if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   fi
   SNAPSHOT_DIR=$(bash "${PROJECT_ROOT}/tools/code_snapshot.sh" "${JOB_NAME}")
 
-  if [[ -d "${PROJECT_ROOT}/3rdparty/vllm" ]] && [[ ! -e "${SNAPSHOT_DIR}/3rdparty/vllm" ]]; then
-    mkdir -p "${SNAPSHOT_DIR}/3rdparty"
-    ln -s "${PROJECT_ROOT}/3rdparty/vllm" "${SNAPSHOT_DIR}/3rdparty/vllm"
-  fi
-
   echo "Code snapshot: ${SNAPSHOT_DIR}"
   OVERLAY_SOURCE="${SNAPSHOT_DIR}"
 else
@@ -524,7 +504,6 @@ fi
 #   /opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM           — Megatron-LM
 #   /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge   — Megatron-Bridge
 #   /opt/nemo-rl/3rdparty/Gym-workspace/Gym                           — NeMo-Gym
-#   /opt/nemo-rl/3rdparty/vllm                                        — vLLM
 # =============================================================================
 _append_mount() {
   if [[ -z "${MOUNTS}" ]]; then
@@ -630,7 +609,6 @@ export SETUP_COMMAND
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
-${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \
@@ -704,7 +682,6 @@ echo "  Model:       ${MODEL_PATH}"
 echo "  Train data:  ${TRAIN_PATH}"
 echo "  Val data:    ${VAL_PATH}"
 echo "  Container:   ${CONTAINER}"
-echo "  Custom vLLM: ${USE_CUSTOM_VLLM}"
 echo "  Sandbox:     ${SANDBOX_CONTAINER}"
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
 echo "  Snapshot:    ${SNAPSHOT_DIR}"
