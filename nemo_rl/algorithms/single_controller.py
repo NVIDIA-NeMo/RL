@@ -92,6 +92,11 @@ class SingleControllerActor:
                 construct a bundle by hand (or with fakes) to bypass the real factories.
         """
         self._advantage_cfg = AdvantageConfig()
+        # Mirror setup.py's init_reference_model condition: with no reference
+        # KL penalty the worker never builds reference_state_dict, so asking
+        # it for reference logprobs dies with AttributeError mid-step.
+        if master_config.loss_fn.reference_policy_kl_penalty <= 0:
+            self._advantage_cfg.reference_logprobs_field = None
         self._weight_sync_cfg = WeightSyncConfig()
         self._partition_id: str = bundle.partition_id
         self._diagnostics: bool = False
