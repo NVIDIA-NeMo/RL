@@ -2543,14 +2543,18 @@ def test_clip_grpo_advantages_respects_config_bounds():
 
     clipped = _clip_grpo_advantages(
         extreme_advantages.clone(),
-        {"advantage_clip_low": -2.0, "advantage_clip_high": 3.0},
+        GRPOConfig.model_construct(
+            advantage_clip_low=-2.0, advantage_clip_high=3.0
+        ),
     )
     assert clipped.min().item() == -2.0
     assert clipped.max().item() == 3.0
 
     unclipped = _clip_grpo_advantages(
         extreme_advantages.clone(),
-        {"advantage_clip_low": None, "advantage_clip_high": None},
+        GRPOConfig.model_construct(
+            advantage_clip_low=None, advantage_clip_high=None
+        ),
     )
     assert torch.equal(unclipped, extreme_advantages)
 
@@ -3534,9 +3538,11 @@ def test_gdpo_advantage_estimator_reward_weights():
     }
 
     def run(weights):
-        config = {"use_leave_one_out_baseline": False, "normalize_rewards": True}
-        if weights is not None:
-            config["reward_weights"] = weights
+        config = AdvEstimatorConfig(
+            use_leave_one_out_baseline=False,
+            normalize_rewards=True,
+            reward_weights=weights,
+        )
         estimator = GDPOAdvantageEstimator(config, loss_config)
         return estimator.compute_advantage(prompt_ids, None, mask, dict(repeated_batch))
 
@@ -4247,10 +4253,10 @@ def _cfg(
             use_kl_in_reward=kl_reward,
             reference_policy_kl_penalty=kl_penalty,
         ),
-        grpo={
-            "seq_logprob_error_threshold": threshold,
-            "skip_reference_policy_logprobs_calculation": skip_ref,
-        },
+        grpo=GRPOConfig.model_construct(
+            seq_logprob_error_threshold=threshold,
+            skip_reference_policy_logprobs_calculation=skip_ref,
+        ),
     )
 
 
