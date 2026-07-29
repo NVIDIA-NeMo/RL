@@ -563,7 +563,7 @@ def test_attach_token_information_to_chat_response_choices():
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
         outputs=[
-            SimpleNamespace(index=1, token_ids=[], logprobs=[]),
+            SimpleNamespace(index=1, token_ids=[], logprobs=None),
             SimpleNamespace(
                 index=0,
                 token_ids=[201, 202],
@@ -646,6 +646,63 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_logpr
     )
     response = SimpleNamespace(
         choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        attach_token_information_to_chat_response_choices(response, final_res)
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "outputs", "choice_indices", "error_match"),
+    [
+        (None, [], [], "did not include prompt_token_ids"),
+        (
+            [101],
+            [
+                SimpleNamespace(index=0, token_ids=[], logprobs=[]),
+                SimpleNamespace(index=0, token_ids=[], logprobs=[]),
+            ],
+            [0],
+            "duplicate generation output indices",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, token_ids=[], logprobs=[])],
+            [0, 0],
+            "duplicate response choice indices",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=1, token_ids=[], logprobs=[])],
+            [0],
+            "could not be matched to generation outputs",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, logprobs=[])],
+            [0],
+            "did not include token_ids",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, token_ids=[201], logprobs=None)],
+            [0],
+            "did not include logprobs",
+        ),
+    ],
+)
+def test_attach_token_information_to_chat_response_choices_rejects_invalid_structure(
+    prompt_token_ids, outputs, choice_indices, error_match
+):
+    final_res = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        outputs=outputs,
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=choice_index, message=SimpleNamespace())
+            for choice_index in choice_indices
+        ]
     )
 
     with pytest.raises(RuntimeError, match=error_match):
