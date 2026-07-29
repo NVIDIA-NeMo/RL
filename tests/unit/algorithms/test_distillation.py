@@ -24,8 +24,8 @@ import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     DistillationConfig,
     MasterConfig,
-    _initial_distillation_save_state,
     _get_distillation_save_state,
+    _initial_distillation_save_state,
     check_vocab_equality,
     distillation_train,
     validate,
