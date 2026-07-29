@@ -2517,9 +2517,9 @@ class MegatronPolicyWorkerImpl(
     ) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """Yield HF tensor buckets for SGLang refit.
 
-        Reuses the shared ``export_hf_weights`` walk and bucket packing. MXFP8
-        expands eligible weights into weight/scale groups that must stay in the
-        same transport bucket.
+        Reuses the shared ``export_hf_weights`` walk and bucket packing.
+        Quantized formats expand eligible weights into companion-tensor groups
+        that must stay in the same transport bucket.
         """
         from nemo_rl.models.generation.sglang.config import (
             get_sglang_quantization_scheme,
@@ -2529,6 +2529,9 @@ class MegatronPolicyWorkerImpl(
         )
         from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
             iter_mxfp8_quantized_tensor_groups,
+        )
+        from nemo_rl.models.generation.sglang.nvfp4_quantization_core import (
+            iter_nvfp4_quantized_tensor_groups,
         )
         from nemo_rl.models.generation.sglang.quantization_utils import (
             build_dynamic_skip_substrings,
@@ -2562,16 +2565,28 @@ class MegatronPolicyWorkerImpl(
         num_hidden_layers = int(
             getattr(self.megatron_bridge.transformer_config, "num_layers", 0)
         )
-        skip_weight_substrings = build_dynamic_skip_substrings(
-            quantization_config=sglang_quantization_cfg,
-            num_hidden_layers=num_hidden_layers,
-            static_skip_substrings=MXFP8_SKIP_WEIGHT_SUBSTRINGS,
-        )
-        return iter_named_tensor_group_buckets(
-            iter_mxfp8_quantized_tensor_groups(
+        if target_precision == "mxfp8":
+            skip_weight_substrings = build_dynamic_skip_substrings(
+                quantization_config=sglang_quantization_cfg,
+                num_hidden_layers=num_hidden_layers,
+                static_skip_substrings=MXFP8_SKIP_WEIGHT_SUBSTRINGS,
+            )
+            quantized_tensor_groups = iter_mxfp8_quantized_tensor_groups(
                 named_tensors,
                 skip_weight_substrings=skip_weight_substrings,
-            ),
+            )
+        else:
+            skip_weight_substrings = build_dynamic_skip_substrings(
+                quantization_config=sglang_quantization_cfg,
+                num_hidden_layers=num_hidden_layers,
+            )
+            quantized_tensor_groups = iter_nvfp4_quantized_tensor_groups(
+                named_tensors,
+                skip_weight_substrings=skip_weight_substrings,
+            )
+
+        return iter_named_tensor_group_buckets(
+            quantized_tensor_groups,
             buffer_size_bytes=buffer_size_bytes,
         )
 

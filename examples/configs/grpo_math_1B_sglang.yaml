@@ -26,7 +26,7 @@ policy:
       cuda_graph_backend_prefill: disabled
       disable_cuda_graph: false
       # Weight precision for rollout/refit. scheme=bf16 (default) sends BF16
-      # HF tensors; scheme=mxfp8 boots SGLang from a matching quantized
+      # HF tensors; scheme=mxfp8/nvfp4 boots SGLang from a matching quantized
       # HF checkpoint and quantizes refit tensors online.
       quantization:
         scheme: bf16

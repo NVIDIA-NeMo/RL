@@ -17,8 +17,8 @@ from typing import Any, Literal, NotRequired, Required, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-SglangQuantizationScheme = Literal["bf16", "mxfp8"]
-SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8"})
+SglangQuantizationScheme = Literal["bf16", "mxfp8", "nvfp4"]
+SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8", "nvfp4"})
 
 
 def get_sglang_quantization_scheme(
@@ -41,10 +41,11 @@ def get_sglang_quantization_scheme(
 class SglangQuantizationConfig(TypedDict, total=False):
     """SGLang weight-precision config.
 
-    ``scheme="bf16"`` means BF16 rollout/refit. Set ``scheme="mxfp8"`` to boot
-    SGLang from a matching quantized HF checkpoint and quantize HF tensors
-    during online refit. High-precision exclusions are shared by conversion
-    and online refit.
+    ``scheme="bf16"`` means BF16 rollout/refit. Set
+    ``scheme="mxfp8"`` or ``scheme="nvfp4"`` to boot SGLang from the
+    corresponding quantized HF checkpoint and quantize HF tensors during
+    online refit. High-precision exclusions are shared by conversion and
+    online refit.
     """
 
     scheme: Required[SglangQuantizationScheme]
