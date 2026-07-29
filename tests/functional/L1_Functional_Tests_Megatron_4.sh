@@ -49,14 +49,14 @@ megatron_generation_supported() {
 }
 
 if megatron_generation_supported; then
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
+    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
+    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
+    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
     # DISABLED: Megatron Inference returns unmasked logprobs
-    # run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
+    # run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
+    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
 fi
 
 cd ${PROJECT_ROOT}/tests

@@ -85,13 +85,14 @@ def _make_real_quant_worker():
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     worker.cfg = {
+        "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
         "generation": {
             "backend": "vllm",
             "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
             "real_quant": True,
             "real_quant_ignore": ["lm_head"],
-            "vllm_cfg": {},
-        }
+            "vllm_cfg": {"kv_cache_dtype": "auto"},
+        },
     }
     worker.model = object()
     worker.draft_model = None
@@ -99,6 +100,44 @@ def _make_real_quant_worker():
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
     return worker
+
+
+@requires_weight_folding
+def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    events = []
+
+    class FakeSocket:
+        def setsockopt(self, option, value):
+            events.append(("setsockopt", option, value))
+
+        def bind(self, address):
+            events.append(("bind", address))
+
+    class FakeContext:
+        def socket(self, socket_type):
+            events.append(("socket", socket_type))
+            return FakeSocket()
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._use_real_quant_refit = lambda: True
+    worker.get_zmq_address = lambda: "ipc:///tmp/modelopt-test.sock"
+    monkeypatch.setattr(megatron_quant_policy_worker.zmq, "Context", FakeContext)
+
+    worker.maybe_init_zmq()
+
+    timeout = megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+    assert events == [
+        ("socket", megatron_quant_policy_worker.zmq.REQ),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, 120_000),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, 120_000),
+        ("setsockopt", megatron_quant_policy_worker.zmq.LINGER, 0),
+        ("bind", "ipc:///tmp/modelopt-test.sock"),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, timeout),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, timeout),
+    ]
 
 
 def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32"):
@@ -144,6 +183,63 @@ def test_modelopt_layer_spec_config_selects_layer_specs():
 
 
 @requires_weight_folding
+def test_quantization_model_specs_support_hybrid_and_legacy_mamba_providers():
+    from nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker import (
+        _set_quantization_model_specs,
+    )
+    from nemo_rl.modelopt.models.policy.workers.utils import (
+        get_quantization_layer_spec,
+        get_quantization_mamba_stack_spec,
+    )
+
+    hybrid_config = SimpleNamespace(hybrid_stack_spec=None)
+    _set_quantization_model_specs(hybrid_config, True)
+    assert hybrid_config.transformer_layer_spec is get_quantization_layer_spec(True)
+    assert hybrid_config.hybrid_stack_spec is get_quantization_mamba_stack_spec(True)
+
+    legacy_config = SimpleNamespace(mamba_stack_spec=None)
+    _set_quantization_model_specs(legacy_config, False)
+    assert (
+        legacy_config.transformer_layer_spec.func
+        is get_quantization_layer_spec(False).func
+    )
+    assert legacy_config.mamba_stack_spec is get_quantization_mamba_stack_spec(False)
+
+
+@requires_weight_folding
+def test_warns_when_other_quantized_startup_caches_exist(tmp_path, monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    base_path = tmp_path / "model"
+    selected_path = tmp_path / "model_modelopt_selected"
+    old_hashed_path = tmp_path / "model_modelopt_old"
+    legacy_path = tmp_path / "model_quantized"
+    invalid_path = tmp_path / "model_modelopt_invalid"
+    for cache_path in (old_hashed_path, legacy_path, invalid_path):
+        (cache_path / "iter_0000000").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "has_modelopt_state",
+        lambda path: "invalid" not in path,
+    )
+
+    with pytest.warns(
+        UserWarning,
+        match=r"checkpointing\.checkpoint_dir",
+    ) as warning_records:
+        megatron_quant_policy_worker._warn_if_other_quant_checkpoint_caches(
+            base_path.as_posix(),
+            selected_path.as_posix(),
+        )
+
+    message = str(warning_records[0].message)
+    assert old_hashed_path.as_posix() in message
+    assert legacy_path.as_posix() in message
+    assert invalid_path.as_posix() not in message
+
+
+@requires_weight_folding
 def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
     worker = _make_real_quant_worker()
 
@@ -175,6 +271,28 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     assert kwargs["show_progress"] is False
     assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
     assert kwargs["ignore_patterns"] == ["lm_head"]
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_exports_w4a4_mode():
+    worker = _make_real_quant_worker()
+    quant_cfg = "NVFP4_EXPERTS_ONLY_CFG"
+    worker.cfg["quant_cfg"] = quant_cfg
+    worker.cfg["generation"]["quant_cfg"] = quant_cfg
+
+    list(worker._iter_real_quant_refit_params())
+
+    _, kwargs = worker.megatron_bridge.calls[0]
+    assert kwargs["quant_mode"] == "nvfp4"
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_rejects_policy_generation_mode_mismatch():
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["quant_cfg"] = "NVFP4_EXPERTS_ONLY_CFG"
+
+    with pytest.raises(ValueError, match="matching policy and generation"):
+        list(worker._iter_real_quant_refit_params())
 
 
 @requires_weight_folding
@@ -244,6 +362,63 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         "model.layers.0.mlp.down_proj.input_quantizer._amax",
     ]
     torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
+def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FailingQuantizer:
+        def __call__(self, _weight):
+            raise ValueError("invalid quantizer state")
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "FP8_DEFAULT_CFG",
+            "real_quant": False,
+        }
+    }
+    worker.rank = 0
+    task = SimpleNamespace(
+        param_name="decoder.layers.0.mlp.linear_fc2.weight",
+        global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+        param_weight=torch.ones(2, 2),
+        megatron_module=object(),
+        mapping=SimpleNamespace(hf_param="model.layers.0.mlp.down_proj.weight"),
+    )
+    worker.refit_conversion_tasks = [task]
+
+    monkeypatch.setattr(
+        worker,
+        "_find_weight_quantizer",
+        lambda *_args: FailingQuantizer(),
+    )
+
+    def access_refit_task_weights(self, kv_scales=None):
+        for refit_task in self.refit_conversion_tasks:
+            yield refit_task.param_name, refit_task.param_weight
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        access_refit_task_weights,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        list(worker._iter_params_with_optional_kv_scales())
+
+    assert (
+        "Failed to apply weight quantizer for param "
+        "'decoder.layers.0.mlp.linear_fc2.weight'"
+    ) in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert str(exc_info.value.__cause__) == "invalid quantizer state"
+    assert worker.refit_conversion_tasks == [task]
 
 
 @requires_weight_folding

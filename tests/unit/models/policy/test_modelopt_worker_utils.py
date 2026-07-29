@@ -66,6 +66,9 @@ def _install_optional_dependency_stubs():
     )
 
     plugins = _ensure_module("modelopt.torch.utils.plugins")
+    plugins.get_megatron_calibration_forward_loop = lambda tokenizer, **kwargs: (
+        lambda model: None
+    )
     plugins.megatron_prefill = lambda model, input_ids, skip_return_logits: None
 
     gpt_provider = _ensure_module("megatron.bridge.models.gpt_provider")
@@ -120,11 +123,18 @@ def test_get_tokenizer_applies_modelopt_calibration_defaults(monkeypatch):
     assert tokenizer.model_max_length == 128
 
 
-def test_megatron_forward_loop_prefills_batch_input_ids(monkeypatch):
+def test_get_forward_loop_func_prefills_random_megatron_data(monkeypatch):
     seen = []
-    dataloader = DataLoader(
-        worker_utils._DictDataset({"input_ids": torch.tensor([[1, 2, 3]])}),
-        batch_size=1,
+    input_ids = torch.tensor([[1, 2, 3]])
+    monkeypatch.setattr(
+        worker_utils.parallel_state,
+        "get_context_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        worker_utils.torch,
+        "randint",
+        lambda *args, **kwargs: input_ids,
     )
     monkeypatch.setattr(
         worker_utils,
@@ -134,12 +144,41 @@ def test_megatron_forward_loop_prefills_batch_input_ids(monkeypatch):
         ),
     )
 
-    loop = worker_utils.get_forward_loop_func(True, dataloader)
+    loop = worker_utils.get_forward_loop_func(
+        is_megatron=True,
+        tokenizer=None,
+        dataset_name="random",
+        batch_size=1,
+        num_samples=1,
+        sample_length=3,
+        device=torch.device("cpu"),
+    )
     loop("model")
 
     assert seen[0][0] == "model"
-    torch.testing.assert_close(seen[0][1], torch.tensor([[1, 2, 3]]))
+    torch.testing.assert_close(seen[0][1], input_ids)
     assert seen[0][2] is True
+
+
+def test_get_forward_loop_func_rejects_random_megatron_context_parallelism(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        worker_utils.parallel_state,
+        "get_context_parallel_world_size",
+        lambda: 2,
+    )
+
+    with pytest.raises(RuntimeError, match="context_parallel_size=1, got 2"):
+        worker_utils.get_forward_loop_func(
+            is_megatron=True,
+            tokenizer="tokenizer",
+            dataset_name="random",
+            batch_size=1,
+            num_samples=1,
+            sample_length=16,
+            device=torch.device("cpu"),
+        )
 
 
 def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
@@ -155,12 +194,15 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(
-            (model_arg, cfg, forward_loop)
-        )
-        or model_arg,
+        lambda model_arg, cfg, forward_loop: (
+            calls.append((model_arg, cfg, forward_loop)) or model_arg
+        ),
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -189,7 +231,7 @@ def test_quantize_model_requires_calibration_data(monkeypatch):
         )
 
 
-def test_quantize_model_uses_random_calibration_loop(monkeypatch):
+def test_quantize_model_delegates_calibration_loop_building(monkeypatch):
     model = torch.nn.Linear(1, 1)
     calls = []
 
@@ -198,41 +240,56 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
     monkeypatch.setattr(
         worker_utils,
         "get_forward_loop_func",
-        lambda is_megatron, dataloader: (
-            "loop",
-            is_megatron,
-            len(dataloader.dataset),
-        ),
+        lambda **kwargs: calls.append(("loop", kwargs)) or "forward-loop",
     )
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(forward_loop) or model_arg,
+        lambda model_arg, cfg, forward_loop: (
+            calls.append(("quantize", model_arg, cfg, forward_loop)) or model_arg
+        ),
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
         "activation-cfg",
         tokenizer=None,
         calib_size=8,
+        batch_size=2,
+        max_sample_length=16,
         is_megatron=True,
         data="random",
     )
 
-    assert calls == [("loop", True, 1)]
+    assert calls == [
+        (
+            "loop",
+            {
+                "is_megatron": True,
+                "tokenizer": None,
+                "dataset_name": "random",
+                "batch_size": 2,
+                "num_samples": 8,
+                "sample_length": 16,
+                "device": model.weight.device,
+            },
+        ),
+        ("quantize", model, {}, "forward-loop"),
+    ]
 
 
-def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
-    model = torch.nn.Linear(1, 1)
+def test_get_forward_loop_func_uses_named_generic_dataset(monkeypatch):
     dataset = worker_utils._DictDataset(
         {"input_ids": torch.ones(2, 3, dtype=torch.long)}
     )
     dataloader = DataLoader(dataset, batch_size=2)
     calls = []
 
-    monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
     monkeypatch.setattr(
         worker_utils,
         "get_dataset_dataloader",
@@ -240,46 +297,85 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
     )
     monkeypatch.setattr(
         worker_utils,
-        "get_forward_loop_func",
-        lambda is_megatron, calib_dataloader: (
-            "loop",
-            is_megatron,
-            calib_dataloader,
+        "create_forward_loop",
+        lambda **kwargs: calls.append(("loop", kwargs)) or "forward-loop",
+    )
+
+    result = worker_utils.get_forward_loop_func(
+        is_megatron=False,
+        tokenizer="tokenizer",
+        dataset_name="cnn_dailymail",
+        batch_size=4,
+        num_samples=8,
+        sample_length=16,
+        device=torch.device("cpu"),
+    )
+
+    assert result == "forward-loop"
+    assert calls == [
+        (
+            "dataset",
+            {
+                "dataset_name": "cnn_dailymail",
+                "tokenizer": "tokenizer",
+                "batch_size": 4,
+                "num_samples": 8,
+                "device": torch.device("cpu"),
+                "include_labels": False,
+                "max_sample_length": 16,
+            },
+        ),
+        ("loop", {"dataloader": dataloader}),
+    ]
+
+
+def test_get_forward_loop_func_uses_modelopt_megatron_calibration_loop(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        worker_utils.parallel_state,
+        "get_context_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        worker_utils,
+        "get_megatron_calibration_forward_loop",
+        lambda tokenizer, **kwargs: (
+            calls.append(("calibration", tokenizer, kwargs)) or "megatron-loop"
         ),
     )
     monkeypatch.setattr(
-        worker_utils.mtq,
-        "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(
-            ("quantize", model_arg, cfg, forward_loop)
-        )
-        or model_arg,
+        worker_utils,
+        "get_dataset_dataloader",
+        lambda **kwargs: pytest.fail("Megatron calibration must use ModelOpt's helper"),
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
 
-    worker_utils.quantize_model(
-        model,
-        "activation-cfg",
+    result = worker_utils.get_forward_loop_func(
+        is_megatron=True,
         tokenizer="tokenizer",
-        calib_size=8,
+        dataset_name="calibration.jsonl",
         batch_size=4,
-        data="cnn_dailymail",
-        max_sample_length=16,
+        num_samples=8,
+        sample_length=16,
+        device=torch.device("cpu"),
     )
 
-    assert calls[0] == (
-        "dataset",
-        {
-            "dataset_name": "cnn_dailymail",
-            "tokenizer": "tokenizer",
-            "batch_size": 4,
-            "num_samples": 8,
-            "device": model.weight.device,
-            "include_labels": False,
-            "max_sample_length": 16,
-        },
-    )
-    assert calls[1] == ("quantize", model, {}, ("loop", False, dataloader))
+    assert result == "megatron-loop"
+    assert calls == [
+        (
+            "calibration",
+            "tokenizer",
+            {
+                "dataset_name": "calibration.jsonl",
+                "batch_size": 4,
+                "num_samples": 8,
+                "seq_length": 16,
+                "device": torch.device("cpu"),
+                "apply_chat_template": False,
+                "pack": True,
+            },
+        ),
+    ]
 
 
 def test_get_modelopt_checkpoint_dir_env_precedence(monkeypatch):

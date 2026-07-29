@@ -20,7 +20,10 @@ from nemo_rl.data.datasets.preference_datasets.preference_dataset import (
     PreferenceDataset,
 )
 from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDataset
-from nemo_rl.data.datasets.utils import resolve_external_dataset_class
+from nemo_rl.data.datasets.utils import (
+    resolve_external_dataset_class,
+    warn_on_unsupported_dataset_config_keys,
+)
 
 DATASET_REGISTRY = {
     # built-in datasets
@@ -60,6 +63,10 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
             "(3) an importable dotted path to a dataset class "
             "(ensure it is installed and importable from PYTHONPATH)."
         )
+
+    # Every dataset class accepts **kwargs, so unsupported config keys are
+    # otherwise swallowed silently (e.g. `split` on Tulu3PreferenceDataset).
+    warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
 
     dataset = dataset_class(
         **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes

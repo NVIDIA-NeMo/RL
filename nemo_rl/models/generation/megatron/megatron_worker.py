@@ -385,6 +385,12 @@ class MegatronGenerationMixin:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
+            # DP inference schedules requests independently, so a forward pre-hook
+            # cannot safely launch a parameter all-gather from only the rank that
+            # received work. Gather once across every worker, then keep the hooks
+            # disabled until the next training step completes.
+            if self._forward_pre_hook_enabled():
+                self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
         lang_module = unwrap_model(self.model)
         lang_module.eval()
@@ -518,13 +524,18 @@ class MegatronGenerationMixin:
             batch_size, dtype=torch.long, device=input_ids.device
         )
         for i in range(batch_size):
-            tokens = result[i].prompt_tokens.tolist() + result[i].generated_tokens
-            seq_len = len(tokens)
-            output_ids_padded[i, :seq_len] = torch.tensor(
-                tokens, dtype=torch.long, device=input_ids.device
-            )
+            # Take the prompt from the request we submitted rather than from the
+            # engine's reply: mcore only echoes prompt_tokens back when
+            # SamplingParams.return_prompt_tokens is set, and asking for them would
+            # ship the whole prompt over ZMQ for data we already hold.
             prompt_len = input_lengths[i].item()
-            generation_lengths[i] = seq_len - prompt_len
+            generated_tokens = result[i].generated_tokens
+            seq_len = prompt_len + len(generated_tokens)
+            output_ids_padded[i, :prompt_len] = input_ids[i, :prompt_len]
+            output_ids_padded[i, prompt_len:seq_len] = torch.tensor(
+                generated_tokens, dtype=torch.long, device=input_ids.device
+            )
+            generation_lengths[i] = len(generated_tokens)
             unpadded_sequence_lengths[i] = seq_len
             gen_logprobs = result[i].generated_log_probs
             logprobs_padded[i, prompt_len : prompt_len + len(gen_logprobs)] = (
@@ -672,7 +683,7 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo" or "nvshmem").
+            refit_backend: Copy-service backend ("gloo", "nccl", or "nvshmem").
         """
         from torch.distributed.distributed_c10d import (
             PrefixStore,
@@ -710,6 +721,29 @@ class MegatronGenerationRefitMixin:
             gloo_backend,
         )
         pg._set_default_backend(ProcessGroup.BackendType.GLOO)
+
+        # The NCCL copy service moves the actual weight bytes with CUDA-tensor P2P
+        # (`torch.distributed.batch_isend_irecv`), which needs an NCCL backend
+        # registered for the cuda device on this cross-world PG. GLOO stays the
+        # default backend so the object collectives in `prepare_swap_model_weights`
+        # (all_gather_object / broadcast_object_list) keep using CPU tensors.
+        if refit_backend == "nccl":
+            from torch.distributed.distributed_c10d import ProcessGroupNCCL
+
+            # Ensure the NCCL communicator binds to this rank's own GPU.
+            torch.cuda.set_device(torch.cuda.current_device())
+            nccl_store = PrefixStore("cuda/", pg_prefix_store)
+            nccl_options = ProcessGroupNCCL.Options()
+            nccl_backend = ProcessGroupNCCL(
+                nccl_store, global_rank, world_size, nccl_options
+            )
+            nccl_backend._set_sequence_number_for_group()
+            pg._register_backend(
+                torch.device("cuda"),
+                ProcessGroup.BackendType.NCCL,
+                nccl_backend,
+            )
+
         pg._set_group_name(group_name)
 
         self.refit_pg = pg
@@ -726,6 +760,12 @@ class MegatronGenerationRefitMixin:
             )
 
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
+        elif refit_backend == "nccl":
+            from megatron.core.resharding.copy_services.nccl_copy_service import (
+                NCCLCopyService,
+            )
+
+            self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
         else:
             from megatron.core.resharding.copy_services.gloo_copy_service import (
                 GlooCopyService,

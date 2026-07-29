@@ -452,6 +452,56 @@ class TestVllmPortAssignment:
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
 
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices,expected_slot",
+        [
+            # expected_slot is the node-local engine index; the port is
+            # DEFAULT_VLLM_PORT_RANGE_LOW + slot * DEFAULT_VLLM_PORTS_PER_ENGINE.
+            # Deriving it from the constants keeps this test correct if the base
+            # of the vLLM port band changes.
+            #
+            # With 8 GPUs per node, engines that fit on one node give the same
+            # slot as the original index, since the bundle id modulo 8 is
+            # unchanged within a node.
+            (8, (0, [0]), 0),
+            (8, (0, [7]), 7),
+            (8, (0, [4, 5, 6, 7]), 1),  # (4 % 8) // 4
+            (8, (0, [0, 1, 2, 3, 4, 5, 6, 7]), 0),  # 8-GPU engine
+            # A model-parallel size larger than the per-node GPU count means the
+            # engine spans several nodes. Each engine's rank-0 process is on a
+            # different node, so they all use node-local slot 0. The original
+            # index would instead climb (the second engine gives 16 // 16 = 1,
+            # and so on).
+            (8, (0, list(range(16))), 0),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(16, 32))), 0),  # second such engine
+            (8, (0, list(range(32, 48))), 0),  # third such engine
+            # 4 GPUs per node, for example GB200 NVL72.
+            (4, (0, [3]), 3),  # 3 % 4
+            (4, (0, [0, 1, 2, 3]), 0),  # 4-GPU engine
+            (4, (0, list(range(8, 16))), 0),  # 8-GPU engine across 2 nodes
+        ],
+    )
+    def test_vllm_port_assignment_respects_num_gpus_per_node(
+        self, num_gpus_per_node, bundle_indices, expected_slot
+    ):
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        expected_port = (
+            DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
     def test_no_vllm_port_without_bundle_indices(self):
         from nemo_rl.models.generation.vllm.vllm_worker import (
             BaseVllmGenerationWorker,

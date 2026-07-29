@@ -1,0 +1,34 @@
+defaults: grpo_math_1B.yaml
+
+policy:
+  generation:
+    backend: "trtllm"
+    trtllm_cfg:
+      tensor_parallel_size: 1
+      moe_tensor_parallel_size: null
+      moe_expert_parallel_size: null
+      max_model_len: ${policy.max_total_sequence_length}
+      precision: ${policy.precision}
+      async_engine: true
+      gpu_memory_utilization: 0.6
+      max_batch_size: 256
+      max_num_tokens: 8192
+      # Track the async-GRPO settings so the backend refit behavior can't
+      # diverge from grpo.async_grpo (single source of truth).
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+    trtllm_kwargs:
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+logger:
+  wandb_enabled: true
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

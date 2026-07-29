@@ -14,6 +14,7 @@ tests/test_suites/llm/performance/grpo-qwen3-32b-4n8g.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-16n8g.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-32n8g.sh
 tests/test_suites/llm/performance/dapo-deepseek-v3-64n8g.v2.sh
+tests/test_suites/llm/performance/grpo-nemotron3-super-120BA12B-32n8g.sh
 
 ## ASYNC 1-off
 tests/test_suites/llm/performance/grpo-deepseek-v3-64n8g-async-1off.sh
@@ -21,6 +22,7 @@ tests/test_suites/llm/performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-32b-8n8g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-32n8g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n8g-async-1off.sh
+tests/test_suites/llm/performance/grpo-nemotron3-super-120BA12B-32n8g-async-1off.sh
 
 ## ASYNC many-off
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-24n8g-async-8off.sh
