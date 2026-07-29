@@ -15,6 +15,7 @@ import math
 import os
 import subprocess
 import sys
+import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator
 from copy import deepcopy
@@ -400,6 +401,63 @@ def _attach_multimodal_data_to_user_message(
         processor=processor,
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
     )
+def _token_capture_metrics(
+    per_rollout: list[dict[str, Any]], rebuilt: int, unbuilt: int
+) -> dict[str, float]:
+    """Summarize a batch's token capture for the training metrics.
+
+    These are the numbers that make silent training loss visible. The failure they
+    exist to catch is a rollout that looks healthy, with a green run and a moving
+    reward, while the chain broke partway and only part of it was trained on.
+    Measured causes so far: a tool-call parser truncating the assistant turn at
+    the tool call and discarding whatever the model generated after it, and a
+    chat template re-tokenizing an assistant turn differently than it was
+    sampled.
+
+    Read ``delivered_fraction`` first. Well below 1.0 means the trainer is seeing
+    a fraction of each rollout. ``calls_per_rollout_mean`` at exactly 1.0 is the
+    other one worth stopping on: it usually means the tool parser is not
+    configured, so the harness never called a tool and the agentic path was never
+    exercised.
+    """
+    if not per_rollout and not rebuilt and not unbuilt:
+        return {}
+
+    def mean(key: str) -> float:
+        values = [
+            float(m[key]) for m in per_rollout if isinstance(m.get(key), (int, float))
+        ]
+        return sum(values) / len(values) if values else 0.0
+
+    def total(key: str) -> float:
+        return float(sum(int(m.get(key) or 0) for m in per_rollout))
+
+    total_rollouts = rebuilt + unbuilt
+    return {
+        "token_capture/rollouts_rebuilt": float(rebuilt),
+        "token_capture/rollouts_unbuilt": float(unbuilt),
+        "token_capture/rebuilt_fraction": (rebuilt / total_rollouts)
+        if total_rollouts
+        else 0.0,
+        "token_capture/delivered_fraction_mean": mean("delivered_fraction"),
+        "token_capture/quarantined_fraction_mean": mean("quarantined_fraction"),
+        "token_capture/calls_per_rollout_mean": mean("n_calls"),
+        "token_capture/chains_per_rollout_mean": mean("chains"),
+        # Calls the model returned with no generated tokens. Non-zero usually means the output
+        # budget or a content filter is truncating generations before the first token.
+        "token_capture/empty_generation_calls": total("empty_generation_calls"),
+        # How often a recorded parent link could not be used, so the builder inferred the parent
+        # from token prefixes instead. Inference is correct but cannot disambiguate a retry.
+        "token_capture/parent_link_fallbacks": float(
+            sum(sum((m.get("parent_link_fallbacks") or {}).values()) for m in per_rollout)
+        ),
+        "token_capture/masked_rollouts": float(
+            sum(1 for m in per_rollout if m.get("mask_sample"))
+        ),
+        "token_capture/incomplete_rollouts": float(
+            sum(1 for m in per_rollout if m.get("capture_incomplete"))
+        ),
+    }
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -578,9 +636,61 @@ Depending on your data shape, you may want to change these values."""
         encode_images_in_examples(nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
+
+        # Correlate each rollout so the Gym model server captures its model calls under a stable id,
+        # and resolve the token-capture dirs so we can rebuild a token-bearing response for training.
+        # NeMo Gym's low-level run_examples (unlike its rollout_collection) does not stamp the
+        # task/rollout indices; without them an external harness's model calls reach the model server
+        # uncorrelated (no /ng-rollout prefix) and nothing is captured.
+        from nemo_gym.base_responses_api_model import maybe_rollout_id_from_run_body
+        from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+        from nemo_gym.token_id_capture import (
+            TokenCaptureStore,
+            token_id_capture_dirs_from_config,
+            trajectories_for_rollout,
+        )
+
+        global_config_dict = self.cfg.get("initial_global_config_dict") or {}
+        token_capture_dirs = token_id_capture_dirs_from_config(global_config_dict)
+        if token_capture_dirs and not getattr(self, "_checked_capture_dirs", False):
+            self._checked_capture_dirs = True
+            # Writer (the Gym model server) and reader (this actor) are on the same node, so the
+            # directory must be node-local. A shared filesystem adds network latency to the capture
+            # hot path for nothing and, under sharding, lets two shards write the same file.
+            for capture_dir in token_capture_dirs:
+                if any(
+                    str(capture_dir).startswith(prefix)
+                    for prefix in ("/lustre", "/gpfs", "/mnt/shared")
+                ):
+                    print(
+                        f"WARNING: token_id_capture_dir={capture_dir} looks like a shared "
+                        "filesystem. Capture is written and read on this node, so a node-local "
+                        "path (/tmp, RAY_TMPDIR, local NVMe) is faster and safer under sharding.",
+                        flush=True,
+                    )
+
+        # A monotonic counter gives each rollout an id unique across steps; the per-step ``_rowidx``
+        # resets every step and would collide token files. The counter is per ACTOR, so under
+        # sharding K actors would each start at 0 and collide across shards -- harmless while the
+        # capture dir is node-local, silently corrupting the moment it is not. A per-actor random
+        # base makes the id unique regardless.
+        if not hasattr(self, "_rollout_seq"):
+            self._rollout_seq = 0
+            self._rollout_id_base = uuid.uuid4().int % (1 << 24)
+        for row in nemo_gym_examples:
+            row[TASK_INDEX_KEY_NAME] = self._rollout_id_base
+            row[ROLLOUT_INDEX_KEY_NAME] = self._rollout_seq
+            self._rollout_seq += 1
+
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
+
+        # Token-capture health, accumulated across this batch and emitted with the timing metrics
+        # on the final result (this is a streaming generator, so there is no end-of-loop).
+        capture_metrics: list[dict[str, Any]] = []
+        rebuilt_rollouts = 0
+        unbuilt_rollouts = 0
 
         num_results = 0
         for task in nemo_gym_result_iterator:
@@ -602,6 +712,65 @@ Depending on your data shape, you may want to change these values."""
                         raise typed from None
                     raise
 
+            # External-harness path: the harness's returned output carries no token ids. Rebuild the
+            # training-facing response.output from this rollout's captured model calls so the
+            # postprocess below sees token-bearing assistant items. No-op when capture is off.
+            if token_capture_dirs and isinstance(nemo_gym_result.get("response"), dict):
+                rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
+                # Only rebuild for agents that opted in. A native agent already returns correct
+                # token ids inline; replacing them with a reconstruction would mean silently
+                # training on the reconstruction wherever the two differ.
+                if rollout_id is not None and _agent_opted_into_token_capture(
+                    global_config_dict, nemo_gym_row
+                ):
+                    try:
+                        built = trajectories_for_rollout(
+                            rollout_id,
+                            token_capture_dirs,
+                            model=str(nemo_gym_result["response"].get("model") or ""),
+                        )
+                    except Exception as error:
+                        # One malformed capture must not take down the batch. The builder contains
+                        # its own errors; this is the backstop for what it cannot (a corrupt file,
+                        # an unreadable directory).
+                        print(
+                            f"WARNING: could not build a trajectory for rollout {rollout_id}: "
+                            f"{type(error).__name__}: {error}",
+                            flush=True,
+                        )
+                        built = None
+
+                    projected = (built or {}).get("rebuilt_response")
+                    capture_metrics.append((built or {}).get("metrics") or {})
+                    if projected is not None:
+                        nemo_gym_result["response"]["output"] = projected["output"]
+                        rebuilt_rollouts += 1
+                    elif built is not None:
+                        unbuilt_rollouts += 1
+                        print(
+                            f"WARNING: rollout {rollout_id} produced no trainable trajectory "
+                            f"({built.get('error') or built.get('metrics')}); it will be "
+                            "token-less.",
+                            flush=True,
+                        )
+                    else:
+                        unbuilt_rollouts += 1
+                        print(
+                            f"WARNING: token capture is enabled but nothing was captured for "
+                            f"rollout {rollout_id}; its response.output was not rebuilt. Check "
+                            "that the agent has token_id_capture: true and that its model calls "
+                            "used the /ng-rollout base URL.",
+                            flush=True,
+                        )
+
+                    # Delete on consume. Rollouts each write hundreds of KB and the store appends,
+                    # so keeping consumed files grows the dir without bound and lets a later run
+                    # with the same id append onto them. A FAILED build keeps its records: they are
+                    # the only evidence of why it failed. (NG_KEEP_TOKCAP=1 retains for debugging.)
+                    if projected is not None and not os.environ.get("NG_KEEP_TOKCAP"):
+                        for capture_dir in token_capture_dirs:
+                            TokenCaptureStore(capture_dir).delete(rollout_id)
+
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                     nemo_gym_row,
@@ -622,6 +791,11 @@ Depending on your data shape, you may want to change these values."""
                     100
                     * timing_metrics[f"{timer_prefix}/postprocess_results"]
                     / total_time
+                )
+                timing_metrics.update(
+                    _token_capture_metrics(
+                        capture_metrics, rebuilt_rollouts, unbuilt_rollouts
+                    )
                 )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
@@ -1017,6 +1191,15 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     if config.policy.get("is_vlm"):
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
+
+    # Publish this trainer's sampling params to NeMo Gym through generic config keys so the Gym
+    # model server can force on-policy sampling regardless of what an external harness requests.
+    # Gym holds no NeMo-RL-specific knowledge; it only reads these keys (see the model server's
+    # sampling_overrides). The vLLM generation worker asserts requests match this config, so
+    # pinning here is required, not optional, for captured rollouts to stay on-policy.
+    nemo_gym_cfg = config.env["nemo_gym"]
+    nemo_gym_cfg["policy_generation_temperature"] = generation_config["temperature"]
+    nemo_gym_cfg["policy_generation_top_p"] = generation_config["top_p"]
 
 
 def spinup_nemo_gym_actor(
