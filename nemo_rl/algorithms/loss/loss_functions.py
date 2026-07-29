@@ -94,9 +94,7 @@ class DraftCrossEntropyLossFn(LossFunction):
         else:
             # teacher_logits is already detached at the call site (utils.py);
             # match DistributedCrossEntropy semantics.
-            teacher_probs = torch.nn.functional.softmax(
-                teacher_logits, dim=-1
-            )
+            teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
             student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
             per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
 

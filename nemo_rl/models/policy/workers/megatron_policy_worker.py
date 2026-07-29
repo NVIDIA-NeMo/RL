@@ -752,9 +752,7 @@ class MegatronPolicyWorkerImpl(
                     # (see build_draft_model) and clipped separately from the
                     # policy so their large early gradients don't shrink the
                     # policy update. None when no draft model is attached.
-                    draft_grad_norm = self.optimizer.grad_norms_by_group.get(
-                        "draft"
-                    )
+                    draft_grad_norm = self.optimizer.grad_norms_by_group.get("draft")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
                     mtp_grad_norm = None
