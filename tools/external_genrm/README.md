@@ -1,25 +1,25 @@
-# In-allocation external GenRM pool
+# Heterogeneous-job external GenRM pool
 
-These helpers reserve part of one Slurm allocation for independent vLLM
-servers while NeMo RL uses the remaining nodes for its Ray cluster. The
-servers are exposed through one OpenAI-compatible load-balancer URL.
+These helpers run independent vLLM servers beside NeMo RL in one two-component
+Slurm heterogeneous job. The servers are exposed through one OpenAI-compatible
+load-balancer URL.
 
 The topology is intentionally opt-in:
 
 ```text
-one Slurm allocation
-├── GenRM nodes: independent private Ray/vLLM replicas
-└── NeMo RL nodes: one Ray cluster started by ray.sub
+one Slurm heterogeneous job
+├── hetgroup 0: NeMo RL Ray cluster started by ray.sub
+└── hetgroup 1: independent private Ray/vLLM replicas
 ```
 
 `run_in_allocation.sh` performs the lifecycle:
 
 1. Validate the launcher configuration before starting any service.
-2. Split the allocation into GenRM and NeMo RL node lists.
+2. Read the NeMo RL nodes from hetgroup 0 and GenRM nodes from hetgroup 1.
 3. Start each GenRM replica in its own private Ray cluster.
 4. Start the load balancer and wait for every backend to become healthy.
 5. Replace `GENRM_URL_PLACEHOLDER` in `COMMAND` with the load-balancer URL.
-6. Export the remaining nodes as `RAY_NODELIST` and start `ray.sub`.
+6. Normalize the component-0 Slurm environment and start `ray.sub`.
 7. Stop the whole job if any required service exits unexpectedly.
 
 The placeholder replacement is textual; neither Gym nor NeMo RL consumes the
@@ -66,18 +66,19 @@ Required variables:
 | `GENRM_TOOLS_DIR_HOST` | `/lustre` path to this directory. |
 | `GENRM_VLLM_PYTHON` | Python executable inside `GENRM_CONTAINER`. |
 | `MOUNTS` | Mounts required by `ray.sub` and `COMMAND`. |
-| `NUM_GENRM_NODES` | Nodes reserved for the external replicas. |
 
-The usual Slurm variables (`SLURM_JOB_ID`, `SLURM_JOB_NODELIST`,
-`SLURM_JOB_ACCOUNT`, `SLURM_JOB_PARTITION`, and `SLURM_SUBMIT_DIR`) must also
-be present, so submit this script with `sbatch` rather than running it on a
-login node.
+The launcher requires exactly two Slurm hetgroups. Slurm provides
+`SLURM_HET_SIZE`, `SLURM_JOB_NODELIST_HET_GROUP_0`, and
+`SLURM_JOB_NODELIST_HET_GROUP_1`; the script fails before starting services if
+those variables are absent or the component count is not two. Submit it with
+the two-component `sbatch` form shown below rather than running it on a login
+node.
 
 Common optional variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GPUS_PER_NODE` | `4` | GPUs claimed on every GenRM and NeMo RL Ray node. The launcher exports this to `ray.sub`. |
+| `GPUS_PER_NODE` | `4` | GPUs claimed on every GenRM and NeMo RL Ray node. |
 | `GENRM_REPLICAS` | `8` | Number of independent vLLM replicas. |
 | `GENRM_TENSOR_PARALLEL_SIZE` | `8` | Tensor parallel size of each replica. |
 | `GENRM_SERVED_MODEL_NAME` | `model` | Model name accepted by the OpenAI-compatible API. |
@@ -99,16 +100,17 @@ The topology must satisfy:
 
 ```text
 nodes per replica = GENRM_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE
-NUM_GENRM_NODES = GENRM_REPLICAS * nodes per replica
+hetgroup 1 nodes = GENRM_REPLICAS * nodes per replica
 ```
 
-The default topology is eight TP=8 replicas on four-GPU nodes, requiring 16
-reserved nodes.
+The default topology is eight TP=8 replicas on four-GPU nodes, so hetgroup 1
+must contain exactly 16 nodes. Hetgroup 0 must contain all nodes used by NeMo
+RL and its in-cluster Gym services.
 
 ## Example
 
-This example requests 80 four-GPU nodes, reserves 16 for eight TP=8 GenRM
-replicas, and gives the remaining 64 nodes to NeMo RL:
+This example co-schedules 64 four-GPU NeMo RL nodes in hetgroup 0 and 16
+four-GPU nodes for eight TP=8 GenRM replicas in hetgroup 1:
 
 ```bash
 cd /lustre/path/to/RL
@@ -127,18 +129,29 @@ GENRM_ENABLE_EXPERT_PARALLEL=1 \
 GENRM_COMPILATION_CONFIG='{"pass_config":{"fuse_allreduce_rms":false}}' \
 GENRM_MODEL_LOADER_EXTRA_CONFIG='{"enable_multithread_load":true,"num_threads":96}' \
 GPUS_PER_NODE=4 \
-NUM_GENRM_NODES=16 \
 COMMAND='uv run examples/nemo_gym/run_grpo_nemo_gym.py --config /lustre/path/to/recipe.yaml ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=__GENRM_BASE_URL__ ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=model' \
 sbatch \
   --account=<account> \
   --partition=<partition> \
-  --nodes=80 \
+  --nodes=64 \
   --exclusive \
   --gres=gpu:4 \
   --time=04:00:00 \
   --export=ALL \
+  : \
+  --account=<account> \
+  --partition=<partition> \
+  --nodes=16 \
+  --exclusive \
+  --gres=gpu:4 \
+  --time=04:00:00 \
   tools/external_genrm/run_in_allocation.sh
 ```
+
+The batch script runs in hetgroup 0. Every GenRM `srun` explicitly targets
+hetgroup 1; the load balancer and `ray.sub` remain in hetgroup 0. Slurm
+co-schedules both components and cancellation of the heterogeneous-job leader
+cancels the complete deployment.
 
 The `++` prefix makes these overrides work whether or not the recipe already
 declares the keys.

@@ -325,3 +325,60 @@ def test_registry_shell_helpers_add_replace_remove(tmp_path):
         "ready=10.0.0.2:8001,10.0.0.9:8009,",
         "count=1",
     ]
+
+
+def test_launcher_requires_a_heterogeneous_job():
+    script = REPO_ROOT / "tools/external_genrm/run_in_allocation.sh"
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        env={"PATH": os.environ["PATH"], "SLURM_JOB_ID": "123"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "This script requires a Slurm heterogeneous job" in result.stderr
+
+
+def test_launcher_rejects_more_than_two_hetgroups():
+    script = REPO_ROOT / "tools/external_genrm/run_in_allocation.sh"
+    env = {
+        "PATH": os.environ["PATH"],
+        "SLURM_JOB_ID": "123",
+        "SLURM_HET_SIZE": "3",
+        "SLURM_JOB_NODELIST_HET_GROUP_0": "ray[01-02]",
+        "SLURM_JOB_NODELIST_HET_GROUP_1": "genrm[01-02]",
+        "SLURM_JOB_ACCOUNT": "account",
+        "SLURM_JOB_PARTITION": "partition",
+        "SLURM_SUBMIT_DIR": "/tmp",
+        "BASE_LOG_DIR": "/lustre/logs",
+        "CONTAINER": "training.sqsh",
+        "MOUNTS": "/lustre:/lustre",
+        "COMMAND": "run __GENRM_BASE_URL__",
+        "GENRM_CONTAINER": "genrm.sqsh",
+        "GENRM_MODEL": "model-id",
+        "GENRM_TOOLS_DIR_HOST": "/lustre/tools",
+        "GENRM_VLLM_PYTHON": "/opt/python",
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Expected exactly two Slurm hetgroups, got 3" in result.stderr
+
+
+def test_launcher_routes_services_to_explicit_hetgroups():
+    script = REPO_ROOT / "tools/external_genrm/run_in_allocation.sh"
+    source = script.read_text()
+
+    assert source.count("--het-group=0") == 2
+    assert source.count("--het-group=1") == 2
+    assert 'SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    assert 'scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}"' in source
+    assert "RAY_NODELIST" not in source

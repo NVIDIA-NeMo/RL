@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run an external GenRM pool beside NeMo RL in one Slurm allocation.
+# Run an external GenRM pool beside NeMo RL in one Slurm heterogeneous job.
 
 set -euo pipefail
 
 : "${SLURM_JOB_ID:?This script must run inside a Slurm allocation}"
-: "${SLURM_JOB_NODELIST:?SLURM_JOB_NODELIST is required}"
+: "${SLURM_HET_SIZE:?This script requires a Slurm heterogeneous job}"
+: "${SLURM_JOB_NODELIST_HET_GROUP_0:?Hetgroup 0 nodelist is required}"
+: "${SLURM_JOB_NODELIST_HET_GROUP_1:?Hetgroup 1 nodelist is required}"
 : "${SLURM_JOB_ACCOUNT:?SLURM_JOB_ACCOUNT is required}"
 : "${SLURM_JOB_PARTITION:?SLURM_JOB_PARTITION is required}"
 : "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}"
@@ -26,7 +28,6 @@ set -euo pipefail
 : "${CONTAINER:?CONTAINER is required}"
 : "${MOUNTS:?MOUNTS is required}"
 : "${COMMAND:?COMMAND is required}"
-: "${NUM_GENRM_NODES:?NUM_GENRM_NODES is required}"
 : "${GENRM_CONTAINER:?GENRM_CONTAINER is required}"
 : "${GENRM_MODEL:?GENRM_MODEL is required}"
 : "${GENRM_TOOLS_DIR_HOST:?GENRM_TOOLS_DIR_HOST is required}"
@@ -62,6 +63,10 @@ GENRM_URL_FILE="${LOG_DIR}/genrm_url"
 GENRM_LOG_DIR="${LOG_DIR}/external_genrm"
 GENRM_STATE_DIR="${GENRM_LOG_DIR}/state"
 
+if [[ "${SLURM_HET_SIZE}" != "2" ]]; then
+  echo "[FATAL] Expected exactly two Slurm hetgroups, got ${SLURM_HET_SIZE}" >&2
+  exit 1
+fi
 if [[ ! -f "${RAY_SUB}" ]]; then
   echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
   exit 1
@@ -109,21 +114,21 @@ fi
 
 GENRM_NODES_PER_REPLICA=$((GENRM_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE))
 EXPECTED_GENRM_NODES=$((GENRM_REPLICAS * GENRM_NODES_PER_REPLICA))
-if (( NUM_GENRM_NODES != EXPECTED_GENRM_NODES )); then
-  echo "[FATAL] NUM_GENRM_NODES=${NUM_GENRM_NODES}, expected ${EXPECTED_GENRM_NODES} for ${GENRM_REPLICAS} TP=${GENRM_TENSOR_PARALLEL_SIZE} replicas" >&2
+
+mapfile -t ray_nodes < <(
+  scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0}" | sort
+)
+mapfile -t genrm_nodes < <(
+  scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}" | sort
+)
+if (( ${#ray_nodes[@]} == 0 )); then
+  echo "[FATAL] Slurm hetgroup 0 contains no NeMo RL nodes" >&2
   exit 1
 fi
-
-mapfile -t all_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sort)
-if (( ${#all_nodes[@]} <= NUM_GENRM_NODES )); then
-  echo "[FATAL] GenRM reservation leaves no nodes for NeMo RL" >&2
+if (( ${#genrm_nodes[@]} != EXPECTED_GENRM_NODES )); then
+  echo "[FATAL] Slurm hetgroup 1 has ${#genrm_nodes[@]} nodes, expected ${EXPECTED_GENRM_NODES} for ${GENRM_REPLICAS} TP=${GENRM_TENSOR_PARALLEL_SIZE} replicas" >&2
   exit 1
 fi
-
-genrm_nodes=("${all_nodes[@]:0:NUM_GENRM_NODES}")
-ray_nodes=("${all_nodes[@]:NUM_GENRM_NODES}")
-RAY_NODELIST=$(IFS=,; echo "${ray_nodes[*]}")
-export RAY_NODELIST
 
 mkdir -p "${LOG_DIR}" "${GENRM_LOG_DIR}" "${GENRM_STATE_DIR}"
 rm -f \
@@ -138,9 +143,9 @@ rm -f \
   printf '%s\n' "${ray_nodes[@]}"
 } > "${LOG_DIR}/node-allocation.txt"
 
-echo "[INFO] One-allocation external GenRM topology"
-echo "[INFO]   GenRM: ${#genrm_nodes[@]} nodes, ${GENRM_REPLICAS} TP=${GENRM_TENSOR_PARALLEL_SIZE} replicas"
-echo "[INFO]   NeMo RL Ray: ${#ray_nodes[@]} nodes (${RAY_NODELIST})"
+echo "[INFO] Heterogeneous-job external GenRM topology"
+echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODELIST_HET_GROUP_0})"
+echo "[INFO]   Hetgroup 1, GenRM: ${#genrm_nodes[@]} nodes, ${GENRM_REPLICAS} TP=${GENRM_TENSOR_PARALLEL_SIZE} replicas"
 
 declare -a genrm_step_pids=()
 lb_step_pid=""
@@ -349,6 +354,7 @@ lb_mounts="${MOUNTS},${GENRM_TOOLS_DIR_HOST}:/opt/external-genrm-tools:ro,${GENR
 
 echo "[INFO] Validating the GenRM container and Python environment"
 srun \
+  --het-group=1 \
   --no-container-mount-home \
   --container-image="${GENRM_CONTAINER}" \
   --container-mounts=/lustre:/lustre \
@@ -367,6 +373,7 @@ srun \
 
 echo "[INFO] Validating the load-balancer container and Python environment"
 srun \
+  --het-group=0 \
   --no-container-mount-home \
   --container-name="genrm-lb-preflight-${SLURM_JOB_ID}" \
   --container-image="${CONTAINER}" \
@@ -396,6 +403,7 @@ for (( replica_index = 0; replica_index < GENRM_REPLICAS; replica_index++ )); do
 
   echo "[INFO] GenRM replica ${replica_index}: ${replica_nodelist}"
   srun \
+    --het-group=1 \
     --no-container-mount-home \
     --container-image="${GENRM_CONTAINER}" \
     --container-mounts=/lustre:/lustre \
@@ -420,6 +428,7 @@ GENRM_LB_URL="http://${ray_head_ip}:${GENRM_LB_PORT}/v1"
 
 echo "[INFO] Starting GenRM load balancer at ${GENRM_LB_URL}"
 srun \
+  --het-group=0 \
   --no-container-mount-home \
   --container-name="genrm-lb-${SLURM_JOB_ID}" \
   --container-image="${CONTAINER}" \
@@ -482,7 +491,13 @@ COMMAND="${COMMAND//${GENRM_URL_PLACEHOLDER}/${GENRM_LB_URL}}"
 export COMMAND
 
 echo "[INFO] External GenRM pool is healthy; starting NeMo RL"
-bash "${RAY_SUB}" &
+(
+  # ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
+  # Restrict those variables to component 0; srun also defaults to hetgroup 0.
+  export SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"
+  export SLURM_JOB_NUM_NODES="${#ray_nodes[@]}"
+  bash "${RAY_SUB}"
+) &
 ray_sub_pid=$!
 
 while kill -0 "${ray_sub_pid}" 2>/dev/null; do
