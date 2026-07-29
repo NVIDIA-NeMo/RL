@@ -178,6 +178,7 @@ table. Expect the multi-turn reduction to land between the S5 floor
 | File | Purpose |
 |---|---|
 | `SWE_RUN.md` | this runbook |
+| `EXPERIMENT_LAUNCH.md` | pinned launch record for the 2026-07-28 A/B (exact commits, snapshot, gates, checklist) |
 | `launch_swe_ab.sh` | arm selector: derives config, names the run, forces venv posture, delegates to your site wrapper |
 | `make_capture_config.py` | derives the arm configs from the site yaml (`token_capture.enabled` + NaN-retry pin) |
 | `aggregate_perf.py` | offline aggregation: per-hop HTTP bytes, bytes/trained-token, timing medians, token_in_rate |
