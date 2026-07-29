@@ -79,6 +79,13 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
+:::{grid-item-card} {octicon}`workflow` Managed Dynamo Generation
+:link: design-docs/dynamo-integration
+:link-type: doc
+
+Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
+:::
+
 ::::
 
 ## Guides and Examples
