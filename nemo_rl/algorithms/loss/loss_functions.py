@@ -1102,6 +1102,147 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
+class ASFTLossConfig(BaseModel, extra="allow"):
+    """Configuration for Anchored Supervised Fine-Tuning loss.
+
+    Based on "Anchored Supervised Fine-Tuning" (arXiv:2509.23753).
+    Combines DFT (Dynamic Fine-Tuning) token-probability weighting with
+    KL divergence anchoring against a reference model. This is the ``sft.asft``
+    block: when present (non-null) it turns plain-CE SFT into Anchored SFT.
+    """
+
+    # KL anchor strength. 0.03 is the paper/bf16 default; internal sweeps found
+    # 0.005-0.01 the sweet spot for Qwen3-8B. kl_weight >= 0.05 over-regularizes.
+    kl_weight: float = 0.03
+    # Schulman KL estimator on the correct-token logprobs: "k1", "k2", or "k3".
+    kl_type: str = "k3"
+    kl_input_clamp_value: Optional[float] = 20.0
+    kl_output_clamp_value: Optional[float] = 10.0
+
+
+class ASFTLossDataDict(TypedDict):
+    """Required keys for the ASFT loss function."""
+
+    input_ids: torch.Tensor
+    reference_policy_logprobs: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+
+
+class ASFTLossFn(LossFunction):
+    """Anchored Supervised Fine-Tuning (ASFT) loss function.
+
+    Implements the ASFT algorithm from "Anchored Supervised Fine-Tuning"
+    (arXiv:2509.23753, ICLR 2026).
+
+    ASFT = DFT weighting + KL anchoring::
+
+        L_ASFT = E_t[ p_θ(y_t).detach() * (-log p_θ(y_t)) + λ * KL(π_θ || π_ref)_t ]
+
+    where:
+    - ``p_θ(y_t)`` is the model's probability for the ground-truth token (the
+      DFT reweighting term; see arXiv:2508.05629). Detaching it makes the
+      weight a constant multiplier, counteracting the implicit ``1/p`` weighting
+      of the standard SFT gradient so confidently-correct tokens are not
+      over-optimized.
+    - ``KL(π_θ || π_ref)`` is a per-token anchor to the frozen reference
+      (pretrained) model, approximated with the Schulman estimator on the
+      correct-token logprobs (nemo-rl exposes per-token logprobs, not the full
+      vocabulary distribution). ``kl_type`` selects the estimator ("k1"/"k2"/"k3").
+    - ``λ`` is ``kl_weight`` (0.03 recommended for bf16; larger values amplify
+      precision noise and can destabilize training).
+
+    Mirrors :class:`NLLLossFn`'s token/sample masking (response tokens only) so
+    the KL anchor never leaks onto prompt/pad tokens, and expects the reference
+    logprobs to be supplied on ``data["reference_policy_logprobs"]`` (computed
+    once per step before the training step, like DPO).
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(self, cfg: ASFTLossConfig, use_fused_linear_logprobs: bool = False):
+        self.kl_weight = cfg.kl_weight
+        self.kl_type = cfg.kl_type
+        self.kl_input_clamp_value = cfg.kl_input_clamp_value
+        self.kl_output_clamp_value = cfg.kl_output_clamp_value
+        # When the Megatron fused-linear-logprobs forward is active, the loss
+        # receives precomputed next-token logprobs instead of full logits; the
+        # loss-input wrapper branches on this flag (see prepare_loss_input).
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[ASFTLossDataDict],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor,
+        **_: Any,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        # reference_policy_logprobs is rolled left by one before the step so that
+        # position i holds the next-token logprob (aligned with next_token_logprobs).
+        ref_logprobs = data["reference_policy_logprobs"][:, :-1]
+        min_len = min(
+            next_token_logprobs.shape[1], ref_logprobs.shape[1], mask.shape[1]
+        )
+        next_token_logprobs = next_token_logprobs[:, :min_len]
+        ref_logprobs = ref_logprobs[:, :min_len]
+        mask = mask[:, :min_len]
+
+        # DFT weighting: weight each token's NLL by the model's own (detached)
+        # probability of the ground-truth token.
+        dft_weights = torch.exp(next_token_logprobs).detach()
+
+        nll_loss = -next_token_logprobs
+        weighted_nll = dft_weights * nll_loss
+
+        # KL anchoring against the reference model (Schulman approximation of
+        # KL(policy || reference) on the correct-token logprobs).
+        kl = calculate_kl(
+            logprobs=next_token_logprobs,
+            logprobs_reference=ref_logprobs,
+            kl_type=self.kl_type,
+            input_clamp_value=self.kl_input_clamp_value,
+            output_clamp_value=self.kl_output_clamp_value,
+        )
+
+        per_token_loss = weighted_nll + self.kl_weight * kl
+
+        loss = masked_mean(
+            per_token_loss,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        with torch.no_grad():
+            nll_only = masked_mean(
+                nll_loss, mask, global_normalization_factor=global_valid_toks
+            )
+            weighted_nll_only = masked_mean(
+                weighted_nll, mask, global_normalization_factor=global_valid_toks
+            )
+            kl_only = masked_mean(
+                kl, mask, global_normalization_factor=global_valid_toks
+            )
+            mean_dft_weight = masked_mean(
+                dft_weights, mask, global_normalization_factor=global_valid_toks
+            )
+
+        return loss, {
+            "loss": loss.item(),
+            "nll_loss": nll_only.item(),
+            "weighted_nll_loss": weighted_nll_only.item(),
+            "kl_penalty": kl_only.item(),
+            "mean_dft_weight": mean_dft_weight.item(),
+            "num_unmasked_tokens": mask.sum().item(),
+            "num_valid_samples": sample_mask.sum().item(),
+        }
+
+
 class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float

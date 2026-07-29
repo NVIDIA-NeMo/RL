@@ -13,6 +13,8 @@ sft:
   val_at_end: false
   seed: 42
   only_unmask_final: false
+  # Anchored SFT block; null => plain cross-entropy SFT (see examples/configs/sft.yaml).
+  asft: null
 
 checkpointing:
   enabled: true
