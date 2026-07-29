@@ -1558,6 +1558,18 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     return list(DEFAULT_THINKING_TAGS)
 
 
+def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
+    """Read ``env.should_mask_flagged_samples``; absent means True.
+
+    True (the default): env-driven ``mask_sample`` flags are carried in the
+    rollout batch and flagged samples are dropped from the loss. Set false
+    when the loss must see every sample — how many samples an environment
+    flags varies run to run, so masking makes batch composition
+    non-deterministic (e.g. undesirable in controlled benchmark runs).
+    """
+    return env_config.get("should_mask_flagged_samples") is not False
+
+
 def _get_reward_penalty_config_value(
     reward_penalty_config: dict[str, Any] | BaseModel | None,
     key: str,
@@ -2024,6 +2036,8 @@ async def run_async_nemo_gym_rollout(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
@@ -2446,10 +2460,8 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
-    # Agent/env-driven mask flag — True means this sample should be masked
-    # from the GRPO gradient (kept for advantage computation). Gated by
-    # grpo.mask_env_flagged_samples so runs can keep the key out of the
-    # batch entirely.
+    # Env/agent mask flag: flagged samples are dropped from the loss but still
+    # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
         final_batch["mask_sample"] = _extract_mask_sample_flags(results)
 
