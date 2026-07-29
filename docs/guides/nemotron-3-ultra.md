@@ -228,6 +228,14 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 | `NL2BASH_JUDGE_MODEL` | NL2Bash / general-purpose judge: HF repo id or local path. Default judge is `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`. |
 | `SAFETY_JUDGE_MODEL` | Content-safety judge: HF repo id or local path. Default is [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B). |
 
+> **Serving GenRM as a standalone service.** The GenRM judge does not have to run
+> inside the training job. You can bring it up separately — any OpenAI-compatible
+> vLLM endpoint, or the external-GenRM service launcher under `tools/external_genrm/`
+> (runs the judge fleet in a second Slurm hetgroup behind a load balancer) — and
+> point the run at it with `GENRM_BASE_URL=http://<host>:<port>/v1`. Judging is then
+> routed to that endpoint instead of being served from the gym pool, which frees
+> those GPUs and lets one GenRM deployment back many training runs.
+
 Optional knobs:
 
 | Variable | Default | Purpose |
