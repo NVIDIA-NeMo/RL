@@ -99,6 +99,9 @@ class MegatronGeneration(GenerationInterface):
             # Reuse the existing training policy.
             self._policy = policy
             self._owns_policy = False
+            if self.cfg["mcore_generation_config"]["expose_http_server"]:
+                self._policy.offload_before_refit()
+                self.prepare_for_generation()
             return
 
         # Stand up a dedicated inference-only policy.

@@ -407,9 +407,13 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
         assert "max_tokens" not in config["megatron_cfg"]
         assert config["megatron_cfg"] == megatron_cfg_before
 
-        mg.prepare_for_generation()
+        # setup() hands dp_openai_server_base_urls to NeMo Gym right after
+        # construction, so the colocated constructor must have collected them.
         assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
         assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+
+        # re-entering generation mode must be a no-op on the running engine
+        mg.prepare_for_generation()
         outputs = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(outputs, test_input_data)
 
