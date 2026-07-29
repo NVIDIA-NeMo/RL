@@ -511,21 +511,45 @@ def _apply_vllm_patches(
     extra_env_vars: list[str] | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
+    import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
 
-    if _patch_vllm_init_workers_ray(py_executable, extra_env_vars):
+    # Whether the v1 patch matters at all depends on which executor vLLM will
+    # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
+    # _init_workers_ray; the patch is only load-bearing when it is set to "0".
+    # Reporting the same way in both cases either cries wolf or hides a real
+    # break, so branch on it.
+    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
+
+    if applied and uses_v1_executor:
         patch_logger.info(
-            "Patched vllm v1 _init_workers_ray (inert under the vLLM 0.25 "
-            "default, which selects RayExecutorV2; workers inherit "
-            "py_executable from this actor's runtime_env instead)."
+            "Successfully patched vllm v1 _init_workers_ray; Ray workers will "
+            "launch under %s.",
+            py_executable,
+        )
+    elif applied:
+        patch_logger.info(
+            "Patched vllm v1 _init_workers_ray, but VLLM_USE_RAY_V2_EXECUTOR_"
+            "BACKEND selects RayExecutorV2, which has no such method. The "
+            "patch is inert here; workers inherit py_executable from this "
+            "actor's runtime_env instead."
+        )
+    elif uses_v1_executor:
+        patch_logger.error(
+            "vllm v1 _init_workers_ray patch did NOT apply: the "
+            "'self._init_workers_ray(placement_group)' anchor was not found, "
+            "and VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor "
+            "that depends on it. Ray workers will launch under the wrong "
+            "interpreter. Either the anchor moved upstream, or unset "
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2."
         )
     else:
-        patch_logger.warning(
-            "vllm _init_workers_ray patch did not apply: the "
-            "'self._init_workers_ray(placement_group)' anchor was not found. "
-            "Ray workers may launch under the wrong interpreter."
+        patch_logger.info(
+            "vllm v1 _init_workers_ray anchor not found, which is harmless "
+            "here: RayExecutorV2 is selected and does not use it."
         )
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
