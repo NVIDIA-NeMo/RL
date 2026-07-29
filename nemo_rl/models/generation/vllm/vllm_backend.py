@@ -850,8 +850,6 @@ class VllmInternalWorkerExtension:
           - dense MLP down       -> ``down_proj`` (direct 1:1).
         """
         vllm_params = dict(self.model_runner.model.named_parameters())
-        # Module lookup: to detect the selected backend off the FusedMoE layer
-        vllm_modules = dict(self.model_runner.model.named_modules())
         mapping = {}
 
         # Collect FFN param names + global shapes from refit_info, plus the
