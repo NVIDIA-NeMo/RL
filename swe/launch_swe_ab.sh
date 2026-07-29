@@ -54,8 +54,13 @@ export EXP_SUFFIX="${EXP_SUFFIX:-swe-ab-${ARM}-$(date +%m%d%H%M)}"
 # unbaked VLLM_GYM worker venv. Forcing rebuild on both arms keeps setup cost
 # out of the A/B.
 export NRL_FORCE_REBUILD_VENVS=true
-# Baked /opt/gym_venvs deps predate the Gym fork's floors; node-local rebuild.
-export GYM_VENV_DIR="${GYM_VENV_DIR:-/tmp/nemo_gym_venvs}"
+# Gym venvs: use the image-baked /opt/gym_venvs (present on EVERY node).
+# A node-local GYM_VENV_DIR=/tmp/... does NOT work multi-node: the venv build
+# runs only on the NemoGym actor's node while Gym spawns servers cluster-wide
+# (learned from job 14542017). The fork's only dep-floor change vs the baked
+# venvs is the aiohttp CVE bump (verified: swe_agents/vllm_model requirements
+# unchanged), and editable installs serve the fork's *code* either way.
+export GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
 
 # ---- Optional per-hop HTTP byte accounting ----------------------------------
 if [ "${BYTES:-0}" = "1" ]; then

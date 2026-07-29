@@ -114,12 +114,21 @@ through the environment: `TP`, `PPS`, `OVER_SAMPLING`, `DRY_RUN=1`, …).
   on both arms keeps setup cost out of the A/B. Pre-warm `LUSTRE_UV_CACHE`
   once (see the launcher header) or the first node-local build is ~30 min —
   the 180-min idle-GPU reaper exemption in the site wrapper covers it.
-- **`GYM_VENV_DIR=/tmp/nemo_gym_venvs` (node-local rebuild) on BOTH arms.**
-  The baked `/opt/gym_venvs` were built against the old Gym pin; the fork
-  bumped dependency floors (e.g. aiohttp). The editable install means *code*
-  comes from the mounted fork either way, but stale *deps* would crash the
-  policy-model server on import. Rebaking the image
-  (`test_assets/SWE/prebuild_gym_venvs.sh`) removes this cost permanently.
+- **`GYM_VENV_DIR=/opt/gym_venvs` (image-baked) on BOTH arms.** A node-local
+  `/tmp` rebuild does NOT work multi-node: the venv build runs only on the
+  NemoGym actor's node while Gym spawns servers cluster-wide (job 14542017
+  failed on exactly this). The baked venvs are dependency-compatible with the
+  fork (verified: `swe_agents`/`vllm_model` requirements unchanged vs the old
+  pin; only the core aiohttp CVE floor moved, irrelevant at runtime), and the
+  editable install serves the fork's *code* on every node. If a future fork
+  commit does change server deps, rebake via
+  `test_assets/SWE/prebuild_gym_venvs.sh`.
+- **Pre-warm `LUSTRE_UV_CACHE` for the branch's `uv.lock`** (single process,
+  inside the job container — the source builds need `nvcc`): without it the
+  16-node venv rebuild exceeds the idle-GPU reaper's *de facto* 60-minute
+  kill (observed twice; the 180-min exemption comment is valid per the
+  exemption guide but not honored beyond 60 — escalate to
+  @job-reaper-support with jobs 14516316/14521677 if 180 is ever needed).
 
 ## 4. What to compare (the perf read)
 
