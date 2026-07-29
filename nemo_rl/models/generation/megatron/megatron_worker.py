@@ -385,6 +385,12 @@ class MegatronGenerationMixin:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
+            # DP inference schedules requests independently, so a forward pre-hook
+            # cannot safely launch a parameter all-gather from only the rank that
+            # received work. Gather once across every worker, then keep the hooks
+            # disabled until the next training step completes.
+            if self._forward_pre_hook_enabled():
+                self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
         lang_module = unwrap_model(self.model)
         lang_module.eval()
@@ -518,13 +524,18 @@ class MegatronGenerationMixin:
             batch_size, dtype=torch.long, device=input_ids.device
         )
         for i in range(batch_size):
-            tokens = result[i].prompt_tokens.tolist() + result[i].generated_tokens
-            seq_len = len(tokens)
-            output_ids_padded[i, :seq_len] = torch.tensor(
-                tokens, dtype=torch.long, device=input_ids.device
-            )
+            # Take the prompt from the request we submitted rather than from the
+            # engine's reply: mcore only echoes prompt_tokens back when
+            # SamplingParams.return_prompt_tokens is set, and asking for them would
+            # ship the whole prompt over ZMQ for data we already hold.
             prompt_len = input_lengths[i].item()
-            generation_lengths[i] = seq_len - prompt_len
+            generated_tokens = result[i].generated_tokens
+            seq_len = prompt_len + len(generated_tokens)
+            output_ids_padded[i, :prompt_len] = input_ids[i, :prompt_len]
+            output_ids_padded[i, prompt_len:seq_len] = torch.tensor(
+                generated_tokens, dtype=torch.long, device=input_ids.device
+            )
+            generation_lengths[i] = len(generated_tokens)
             unpadded_sequence_lengths[i] = seq_len
             gen_logprobs = result[i].generated_log_probs
             logprobs_padded[i, prompt_len : prompt_len + len(gen_logprobs)] = (

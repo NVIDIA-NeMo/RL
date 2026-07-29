@@ -34,16 +34,21 @@ from nemo_rl.algorithms.grpo import (
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
+    _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
+    refit_policy_generation,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -56,6 +61,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
@@ -70,6 +76,33 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    # Match VllmGeneration's default; a bare MagicMock would auto-create a truthy
+    # weight_synchronizer and refit_policy_generation would delegate to it instead
+    # of taking the colocated IPC path under test.
+    policy_generation.weight_synchronizer = None
+    kv_scales = {"layer.0": 0.5}
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=1.0,
+        kv_scales=kv_scales,
+    )
+
+    policy.stream_weights_via_ipc_zmq.assert_called_once_with(
+        buffer_size_bytes=1024**3,
+        kv_scales=kv_scales,
+    )
 
 
 class TestMaskSampleFilter:
@@ -114,6 +147,17 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_initial_policy_generation_stale() -> None:
+    generation = MagicMock()
+    generation.weight_synchronizer.is_stale = False
+
+    assert not _initial_policy_generation_stale(generation, completed_steps=0)
+    assert _initial_policy_generation_stale(generation, completed_steps=1)
+
+    generation.weight_synchronizer.is_stale = True
+    assert _initial_policy_generation_stale(generation, completed_steps=0)
 
 
 @pytest.fixture
@@ -838,6 +882,13 @@ class StubAsyncTrajectoryCollector:
         """
         mock = MagicMock()
         mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def get_rollouts_state(self):
+        """Return a remote-callable mock yielding collector rollout state."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={NEXT_NEMO_GYM_TASK_INDEX_KEY: 0})
         return mock
 
 
@@ -1861,7 +1912,9 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
     )
     monkeypatch.setattr(
-        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None
+        grpo_mod,
+        "refit_policy_generation",
+        lambda *_args, **_kwargs: {"delta/changed_pct": 4.0},
     )
     monkeypatch.setattr(
         grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
@@ -1911,6 +1964,11 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
     assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
     assert train_metrics["masked_correct_pct"] == 0.5
+    assert any(
+        call.args[0] == {"delta/changed_pct": 4.0}
+        and call.kwargs.get("prefix") == "refit"
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+    )
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
@@ -2859,6 +2917,36 @@ def test_gdpo_advantage_estimator_single_reward():
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
 
 
+def test_gdpo_advantage_estimator_reward_weights():
+    """GDPO per-reward weights: uniform weights match the default; non-uniform differ; wrong length raises."""
+    loss_config = ClippedPGLossConfig()
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    mask = torch.ones(3, 2)
+    repeated_batch = {
+        "reward/correctness": torch.tensor([1.0, 0.0, 1.0]),
+        "reward/format": torch.tensor([1.0, 1.0, 0.0]),
+    }
+
+    def run(weights):
+        config = {"use_leave_one_out_baseline": False, "normalize_rewards": True}
+        if weights is not None:
+            config["reward_weights"] = weights
+        estimator = GDPOAdvantageEstimator(config, loss_config)
+        return estimator.compute_advantage(prompt_ids, None, mask, dict(repeated_batch))
+
+    default = run(None)
+
+    # Any positive uniform scaling is invariant after the final per-batch normalization.
+    assert torch.allclose(default, run([2.0, 2.0]), atol=1e-5)
+
+    # Non-uniform weights change the advantages.
+    assert not torch.allclose(default, run([1.0, 0.25]), atol=1e-3)
+
+    # Wrong number of weights -> ValueError.
+    with pytest.raises(ValueError):
+        run([1.0])
+
+
 # ============================================================================
 # Tests for ReinforcePlusPlusAdvantageEstimator class
 # ============================================================================
@@ -3542,3 +3630,58 @@ class TestAggregateRolloutMetrics:
         assert result["total_turns"] == 45
         assert result["accuracy"] == pytest.approx(0.8)
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
+
+
+def _cfg(
+    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+):
+    return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=force,
+            use_kl_in_reward=kl_reward,
+            reference_policy_kl_penalty=kl_penalty,
+        ),
+        grpo={
+            "seq_logprob_error_threshold": threshold,
+            "skip_reference_policy_logprobs_calculation": skip_ref,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "kw, expected",
+    [
+        ({}, (False, None)),
+        ({"force": True}, (True, None)),
+        ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        ({"skip_ref": True}, (False, True)),
+    ],
+    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+)
+def test_resolve_logprob_skip_flags(kw, expected):
+    if kw.get("force") and kw.get("threshold") is not None:
+        with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
+            assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    else:
+        assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():
+    with pytest.raises(AssertionError, match="use_kl_in_reward"):
+        _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True))
+
+
+def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
+    # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
+    # prev_logprobs can't corrupt the advantage.
+    _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))
+
+
+@pytest.mark.parametrize(
+    "skip_prev_logprobs, expect_prev",
+    [(False, True), (True, False)],
+    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+)
+def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
+    fields = _train_fields_for_step(skip_prev_logprobs)
+    assert ("prev_logprobs" in fields) is expect_prev

@@ -40,6 +40,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmAsyncCheckpointEngineRpcMixin,
+)
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     format_prompt_for_vllm_generation,
@@ -47,117 +50,16 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.openai_server_utils import (
+    replace_prefix_tokens,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _replace_prefix_tokens(
-    tokenizer,
-    model_prefix_token_ids: list[int],
-    template_prefix_token_ids: list[int],
-    template_token_ids: list[int],
-) -> list[int]:
-    """This is a subroutine used inside the vLLM Chat Completion server.
-
-    This function is for fixing up the chat template-tokenized messages history
-    to match the model output tokenization up to the last assistant turn,
-    in order to preserve the monotonic tokens property for optimized multi-turn
-    training.
-
-    Some environments (namely NeMo-Gym) require an OpenAI compatible server
-    endpoint rather than an inference engine handle. This is fine for the most
-    part, but it may cause issues when the environment is used as a part of
-    training.
-
-    RL training frameworks train models on token IDs, but the OpenAI compatible
-    server communicates in what is basically de-tokenized text. When multiple
-    model calls are made to the OpenAI compatible server in a single trajectory,
-    model generations in previous model calls may be re-tokenized to something
-    that is different than what was generated. This is not too big of an issue
-    (that we know of) at inference time, but the log probs the model produces
-    are different enough for the differently re-tokenized generation result that
-    it causes the training to be off policy. Off policy isn't necessarily a bad
-    thing in isolation, but this source of off-policyness may cause unexpected
-    issues if not properly accounted for. It also mis-aligns the token ID
-    sequences across model calls, which feels very strange during training.
-
-    There are real cases where the model output string _does not match_ the chat
-    template tokenization of the parsed model output. A concrete example is
-    inconsistent whitespace tokens around tool call special tokens.
-
-    TODO When NeMo RL supports training image generation models, we want to
-    revisit and possibly update this function. This issue occurs when the model
-    generates tokens that are de-tokenized into text or images, and then
-    re-tokenized into tokens. So if there is a situation like that with images
-    and image tokenization is non-unique, then we will need to uppdate this
-    function.
-
-    Example (turn-by-turn, concise; eos_token_id = 2):
-        Turn 1:
-            - prefill_T1 (template prefill) = [11,12,13,40,41]
-            - model output = [220,17,2]  # decodes to " 4" + EOS
-            - model_prefix_token_ids = prefill_T1 + model output
-              => [11,12,13,40,41,220,17,2]
-
-        Turn 2 (template retokenizes prior assistant text differently):
-            - template_prefix_token_ids = [11,12,13,40,41,1001,2]  # 1001 decodes to " 4"
-            - template_token_ids = [11,12,13,40,41,1001,2,21,22,40,41]
-
-        _replace_prefix_tokens keeps the exact prior model tokens up to EOS and
-        resumes from the template after that EOS:
-            output => [11,12,13,40,41,220,17,2,21,22,40,41]
-    """
-    if not model_prefix_token_ids:
-        return template_token_ids
-
-    eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-    model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids:
-        # We are not always guaranteed that the model outputs an EOS token as the stop criteria of the previous model call e.g. when the model reaches max_tokens.
-        # And since chat templates will always add one for us, we just cut the model input to right before the EOS token ID (if applicable)
-        if model_prefix_token_ids[-1] == eos_token_id:
-            model_cut_end -= 1
-
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
-
-    # We take everything starting with the EOS token ID.
-    template_cut_start = -1
-    for pos in reversed(range(len(template_prefix_token_ids))):
-        if template_token_ids[pos] == eos_token_id:
-            template_cut_start = pos
-            break
-
-    # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
-
-    return (
-        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
-    )
-
-
-class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
+class VllmAsyncGenerationWorkerImpl(
+    VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
+):
     def __init__(
         self,
         config,
@@ -429,6 +331,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             await self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self._sparse_refit_receiver is not None:
+            hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
+            self._sparse_refit_receiver.set_worker_hostnames(hostnames)
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -651,7 +556,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = _replace_prefix_tokens(
+                final_prompt_token_ids = replace_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
@@ -911,6 +816,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         app = FastAPI()
 
         app = self._setup_vllm_openai_api_server(app)
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.setup_api_server(app)
 
         ########################################
         # Server spinup
@@ -1423,11 +1330,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            worker_results = cast(list[bool], worker_results)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
@@ -1459,11 +1366,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            worker_results = cast(list[bool], worker_results)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
@@ -1535,6 +1442,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._sparse_refit_receiver is not None:
+                await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())

@@ -29,7 +29,10 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    build_reward_component_columns,
+    extract_reward_components,
     setup_nemo_gym_config,
+    validate_reward_components_match_scalar,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
 
@@ -41,6 +44,91 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_extract_reward_components():
+    """The GDPO multi-reward bridge helper: None for single-reward, normalized dict otherwise."""
+    # Single-reward result (no reward_components) -> None, so callers use scalar reward.
+    assert extract_reward_components({"reward": 1.0}) is None
+    assert extract_reward_components({"reward": 1.0, "reward_components": {}}) is None
+
+    # Multi-reward result -> name->float dict (values coerced to float, keys to str).
+    components = extract_reward_components(
+        {
+            "reward": 2.0,
+            "reward_components": {"correctness": 1, "format": 0.5},
+        }
+    )
+    assert components == {"correctness": 1.0, "format": 0.5}
+    assert all(isinstance(v, float) for v in components.values())
+
+
+def test_build_reward_component_columns():
+    """The bridge emission helper: reward/<name> keys, 0.0-fill, deterministic order.
+
+    Guards the producer->consumer contract end to end — the keys built here must be
+    exactly what get_gdpo_reward_component_keys() selects (this is what would have caught
+    the earlier reward1/reward2 vs reward/<name> mismatch).
+    """
+    from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
+
+    # Keys are reward/<name>; one entry per sample; values preserved.
+    cols = build_reward_component_columns(
+        [
+            {"correctness": 1.0, "format": 0.0},
+            {"correctness": 0.0, "format": 1.0},
+        ]
+    )
+    assert set(cols) == {"reward/correctness", "reward/format"}
+    assert torch.equal(cols["reward/correctness"], torch.tensor([1.0, 0.0]))
+    assert torch.equal(cols["reward/format"], torch.tensor([0.0, 1.0]))
+
+    # Union across the batch, deterministic (sorted) order, 0.0-fill for missing
+    # components (and None samples).
+    cols = build_reward_component_columns([{"b": 2.0}, {"a": 1.0, "b": 3.0}, None])
+    assert list(cols.keys()) == ["reward/a", "reward/b"]
+    assert torch.equal(cols["reward/a"], torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.equal(cols["reward/b"], torch.tensor([2.0, 3.0, 0.0]))
+
+    # The emitted keys are exactly what GDPO's consumer selects.
+    assert get_gdpo_reward_component_keys(cols) == ["reward/a", "reward/b"]
+
+    # No components anywhere -> no columns (single-reward path is untouched).
+    assert build_reward_component_columns([None, None]) == {}
+
+
+def test_validate_reward_components_match_scalar():
+    """Multi-reward verifiers must set reward == sum(reward_components); mismatch raises."""
+    # Contract satisfied: reward equals the component sum -> no error.
+    validate_reward_components_match_scalar(
+        [{"reward": 1.5, "reward_components": {"correctness": 1.0, "format": 0.5}}]
+    )
+    # Float tolerance: tiny rounding differences are accepted.
+    validate_reward_components_match_scalar(
+        [
+            {
+                "reward": 1.5000001,
+                "reward_components": {"correctness": 1.0, "format": 0.5},
+            }
+        ]
+    )
+    # Single-reward results (no reward_components) are skipped entirely.
+    validate_reward_components_match_scalar([{"reward": 2.0}])
+
+    # Mismatch (scalar reward != component sum) -> ValueError naming the offending index.
+    with pytest.raises(ValueError, match="result 1"):
+        validate_reward_components_match_scalar(
+            [
+                {
+                    "reward": 1.5,
+                    "reward_components": {"correctness": 1.0, "format": 0.5},
+                },
+                {
+                    "reward": 2.0,
+                    "reward_components": {"correctness": 1.0, "format": 0.5},
+                },
+            ]
+        )
 
 
 @pytest.mark.nemo_gym
@@ -102,7 +190,6 @@ openai_model:
       model: ${policy_model_name}
       return_token_id_information: true
       uses_reasoning_parser: true
-rollout_max_attempts_to_avoid_lp_nan: 1
 """
 
     config = NemoGymConfig(
@@ -309,11 +396,12 @@ def test_nemo_gym_sanity(
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
         example["_rowidx"] = idx
 
-    actual_result, _ = ray.get(
-        nemo_gym.run_rollouts.remote(
-            nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
-        )
-    )
+    actual_result = [None] * len(nemo_gym_sanity_test_data["input"])
+    for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
+        nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
+    ):
+        rowidx, result, _ = ray.get(result_ref)
+        actual_result[rowidx] = result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
     # These are tensors originally and we swap them back to a list for comparison below

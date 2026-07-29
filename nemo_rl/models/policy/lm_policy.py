@@ -1138,9 +1138,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
+        if not hasattr(self, "worker_group"):
+            return True
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
+        except ray.exceptions.RayActorError:
+            # Workers already dead (e.g., shut down via another handle to the same actors).
+            return True
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
@@ -1148,12 +1153,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
-        This is an extra safety net in case the user forgets to call worker_group.shutdown() and the pointer to
+        This is an extra safety net in case the user forgets to call shutdown() and the pointer to
         the object is lost due to leaving a function scope. It's always recommended that the
-        user calls worker_group.shutdown().
+        user calls shutdown().
         """
-        if hasattr(self, "worker_group"):
-            self.worker_group.shutdown(cleanup_method="shutdown")
+        self.shutdown()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

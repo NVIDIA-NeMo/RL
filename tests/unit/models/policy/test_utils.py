@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 import unittest.mock
+import weakref
 
 import pytest
 import torch
@@ -134,6 +135,63 @@ class _FakeIpcSocket:
 
     def getsockopt(self, _option):
         return 0
+
+
+def test_stream_weights_releases_buffers_before_complete_without_full_gc(
+    monkeypatch,
+):
+    """The final data ACK is sufficient to reclaim both acyclic IPC buffers."""
+
+    tensor = torch.ones(4, dtype=torch.float32)
+    buffer_refs = []
+    events = []
+    original_empty = torch.empty
+
+    def tracking_empty(*args, **kwargs):
+        buffer = original_empty(*args, **kwargs)
+        buffer_refs.append(weakref.ref(buffer))
+        return buffer
+
+    def empty_cache():
+        events.append("empty_cache")
+        assert len(buffer_refs) == 2
+        assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+
+    class ReleaseAwareSocket(_FakeIpcSocket):
+        def send_pyobj(self, payload):
+            if payload == IPCProtocol.COMPLETE:
+                assert events == ["empty_cache"]
+                assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+            super().send_pyobj(payload)
+
+    monkeypatch.setattr(torch, "empty", tracking_empty)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.gc.collect",
+        lambda: pytest.fail("IPC buffer cleanup must not scan the full object graph"),
+    )
+
+    socket = ReleaseAwareSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("weight", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert events == ["empty_cache"]
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
 
 
 def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
