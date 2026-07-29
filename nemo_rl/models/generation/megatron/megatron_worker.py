@@ -171,6 +171,7 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
+            logprobs_mode="processed_logprobs",
             max_requests=max_requests,
         )
 

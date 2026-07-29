@@ -268,13 +268,25 @@ async def _generate_async(mg, tokenizer, test_input_data, greedy=False):
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    "tensor_parallel_size,pipeline_parallel_size",
-    [(1, 1), (2, 1), (1, 2)],
+    "tensor_parallel_size,pipeline_parallel_size,top_p,top_k",
+    [
+        (1, 1, 1.0, None),
+        (2, 1, 1.0, None),
+        (1, 2, 1.0, None),
+        (1, 1, 0.9, 8000),
+        (1, 1, 1.0, 1),
+    ],
 )
 def test_megatron_policy_generation(
-    cluster, test_input_data, tokenizer, tensor_parallel_size, pipeline_parallel_size
+    cluster,
+    test_input_data,
+    tokenizer,
+    tensor_parallel_size,
+    pipeline_parallel_size,
+    top_p,
+    top_k,
 ):
-    """Standalone Megatron generation across tp/pp."""
+    """Standalone Megatron generation across tp/pp and sampling params."""
     if cluster.num_gpus_per_node < tensor_parallel_size * pipeline_parallel_size:
         pytest.skip(
             f"Need {tensor_parallel_size * pipeline_parallel_size} GPUs for "
@@ -284,6 +296,8 @@ def test_megatron_policy_generation(
     config = deepcopy(basic_megatron_test_config)
     config["megatron_cfg"]["tensor_model_parallel_size"] = tensor_parallel_size
     config["megatron_cfg"]["pipeline_model_parallel_size"] = pipeline_parallel_size
+    config["generation"]["top_p"] = top_p
+    config["generation"]["top_k"] = top_k
     # config-level stop string, unioned with the per-sample stop strings below.
     config["generation"]["stop_strings"] = ["</s>"]
 
@@ -302,6 +316,14 @@ def test_megatron_policy_generation(
         # sampling (non-greedy) path still produces a valid contract
         sampled = mg.generate(test_input_data, greedy=False)
         _assert_valid_generation_output(sampled, test_input_data)
+        if top_k == 1:
+            for i in range(len(test_input_data["input_ids"])):
+                start = test_input_data["input_lengths"][i].item()
+                end = start + sampled["generation_lengths"][i].item()
+                gen_logprobs = sampled["logprobs"][i, start:end]
+                assert torch.allclose(
+                    gen_logprobs, torch.zeros_like(gen_logprobs), atol=1e-5
+                ), f"processed logprobs under top_k=1 should be 0, got {gen_logprobs}"
 
         # per-sample stop strings are merged with the config stop string (may stop early,
         # so don't require a generated token)
