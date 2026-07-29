@@ -40,7 +40,7 @@ checkpointing:
   save_period: 10
   ft_keep_latest_k: 1
   ft_save_period: 1
-  checkpoint_must_save_by: "00:23:30:00"
+  checkpoint_must_save_by: "00:23:35:00"
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -54,7 +54,7 @@ grpo:
   num_val_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
-  max_num_steps: 1000000
+  max_num_steps: 100000
   normalize_rewards: true
   use_leave_one_out_baseline: true
   advantage_clip_low: -20
@@ -104,6 +104,7 @@ grpo:
 
   dynamic_sampling_oversample_ratio: 1.0
   seq_logprob_error_threshold: 2
+  skip_reference_policy_logprobs_calculation: true
 
 # =============================================================================
 # Loss Function
@@ -382,6 +383,9 @@ env:
     gzip_responses_enabled: true
     gzip_responses_minimum_size: 4096
     gzip_responses_compresslevel: 1
+    global_aiohttp_client_request_debug: true
+    global_aiohttp_connector_limit: 4096
+    global_aiohttp_connector_limit_per_host: 4096
     global_aiohttp_keepalive_timeout_seconds: 2.0
     uvicorn_timeout_keep_alive_seconds: 15
     run_response_cache_enabled: true
@@ -434,7 +438,6 @@ env:
       - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
       - resources_servers/format_verification/configs/freeform_formatting.yaml
       - resources_servers/format_verification/configs/citation_format.yaml
-      - resources_servers/rdkit_chemistry/configs/rdkit_chemistry.yaml
       - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
       - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
 
@@ -458,6 +461,7 @@ env:
     abstention:
       resources_servers:
         abstention:
+          abstention_reward: 0.5
           judge_model_server:
             type: responses_api_models
             name: nl2bash_judge_model
