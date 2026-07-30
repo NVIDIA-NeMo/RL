@@ -1,6 +1,6 @@
 # Train with Single-Controller (Async GRPO)
 
-The Single-Controller (SC) path is an alternative async GRPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in `[async-grpo.md](./async-grpo.md)`, SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
+The Single-Controller (SC) path is an alternative async GRPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in [async-grpo.md](./async-grpo.md), SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
 
 ## Configure the Single-Controller Path
 
@@ -10,44 +10,44 @@ The SC path is launched via a dedicated entrypoint:
 uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 ```
 
-`run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at `[examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml)`.
+`run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml).
 
 ### Mandatory settings
 
 1. **Enable the TransferQueue data plane** (required — the entrypoint refuses to start otherwise):
 
-```yaml
-data_plane:
-  enabled: true
-```
+    ```yaml
+    data_plane:
+      enabled: true
+    ```
 
 2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
 
-```yaml
-policy:
-  generation:
-    backend: "vllm"
-    vllm_cfg:
-      async_engine: true
-    colocated:
-      enabled: false
-      resources:
-        num_nodes: 1
-        gpus_per_node: 4  # inference GPUs; remainder go to training
-```
+    ```yaml
+    policy:
+      generation:
+        backend: "vllm"
+        vllm_cfg:
+          async_engine: true
+        colocated:
+          enabled: false
+          resources:
+            num_nodes: 1
+            gpus_per_node: 4  # inference GPUs; remainder go to training
+    ```
 
 3. **One RL step = one optimizer step.** The SC train pump does not support multi-mini-step inside a single RL step (see the validator in `single_controller_utils/config.py`):
 
-```yaml
-# num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
-```
+    ```python
+    num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
+    ```
 
 4. **Enable importance sampling correction** whenever the sampler admits off-policy data (any `max_staleness_versions > 0` on the `windowed`/`weight_fifo` samplers, or `max_lookahead_versions > 0` on `in_order`). The correction and its derivation are the same as for legacy async GRPO — see [Why Importance Sampling Correction Is Required for Async](./async-grpo.md#why-importance-sampling-correction-is-required-for-async):
 
-```yaml
-loss_fn:
-  use_importance_sampling_correction: true
-```
+    ```yaml
+    loss_fn:
+      use_importance_sampling_correction: true
+    ```
 
 ## Async-RL Knobs and Sampler Modes
 
