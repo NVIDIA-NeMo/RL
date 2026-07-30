@@ -91,7 +91,8 @@ def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
     buffered = io.BytesIO()
     image.save(buffered, format=format)
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{img_str}"
+    mime_type = format.lower() if format else "png"
+    return f"data:image/{mime_type};base64,{img_str}"
 
 
 def load_dataset_from_path(
