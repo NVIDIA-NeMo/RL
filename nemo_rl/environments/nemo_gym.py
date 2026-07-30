@@ -33,6 +33,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
@@ -390,7 +391,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
                     self.cfg.get("routed_experts_dtype", "int16")
                 ]
-                routed_experts = torch.as_tensor(
+                routed_experts = decode_routed_experts(
                     routed_experts_raw, dtype=routed_experts_dtype
                 )
                 if routed_experts.dim() != 3:
