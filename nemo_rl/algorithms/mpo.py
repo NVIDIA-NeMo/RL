@@ -100,8 +100,9 @@ def _configure_pair_safe_packing(policy_config: PolicyConfig) -> None:
             f"got {configured_grouping!r}."
         )
     packing_config["pair_grouping_key"] = "pair_index"
-    # CP shards the language model but not the vision encoder. One atomic pair
-    # per packed microbatch preserves the unpacked vision-memory envelope.
+    # This grouping is applied before NeMo-RL's Megatron data path packs each
+    # microbatch into full THD input. Keeping one atomic pair per microbatch
+    # both preserves chosen/rejected alignment and bounds vision-encoder memory.
     packing_config.setdefault("max_sequences_per_bin", 1)
 
 

@@ -2,8 +2,9 @@
 
 This path ports offline image MPO to the canonical `NemotronOmniModel`
 from NeMo-RL PR #3290 (which supersedes #3227) and Megatron-Bridge PR #4885.
-Development is based on `aroshanghias/nemotron-omni-base`. It deliberately does
-not restore the legacy `LLaVAModel` collapse/expand flow.
+Development is based on the rewritten
+`aroshanghias/nemotron-omni-main-migration` head. It deliberately does not
+restore the legacy `LLaVAModel` collapse/expand flow.
 
 ## Container
 
@@ -85,8 +86,10 @@ Omni launcher so NVIDIA's 36-character internal keys are accepted. Set
 the container SDK unchanged.
 
 The data processor emits normal processor-expanded image tensors and tokens.
-`NemotronOmniModel` performs media embedding insertion, sequence packing, and
-context-parallel sharding.
+NeMo-RL's Megatron data pipeline keeps each chosen/rejected pair in one
+microbatch and packs its expanded token rows into a full THD sequence.
+`NemotronOmniModel` inserts media embeddings into that full sequence and then
+selects the context-parallel slice.
 
 ## Qualification order
 
