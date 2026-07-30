@@ -135,14 +135,11 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - bump modelopt pin to >=0.44.0a0 to match the runtime venv version; the
-#     venv already has 0.44.0a0 installed, so the TRT-LLM wheel build picks it
-#     up directly without a separate modelopt from-source build step.
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
-assert_patch_target requirements.txt 'nvidia-modelopt[torch]~=0.37.0'
-sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
+# (The old nvidia-modelopt~=0.37.0 pin bump is gone: the TensorRT-LLM ref no
+#  longer lists nvidia-modelopt in requirements.txt.)
 assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
