@@ -1385,6 +1385,7 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
 
 
 def test_sequence_packing_keeps_preference_pairs_atomic():
+    """Pair grouping happens before Megatron converts each microbatch to THD."""
     sequence_lengths = torch.tensor([50, 60, 55, 65, 45, 70, 40, 75])
     batch = BatchedDataDict(
         {

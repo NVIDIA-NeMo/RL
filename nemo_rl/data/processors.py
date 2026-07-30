@@ -373,8 +373,9 @@ def vlm_preference_preprocessor(
     """Process an image preference pair using the canonical VLM processor.
 
     The processor-expanded token sequence and media tensors are retained
-    unchanged. The canonical Megatron-Bridge ``NemotronOmniModel`` inserts
-    media embeddings and owns packing/context-parallel sharding.
+    unchanged. NeMo-RL's Megatron data path packs the expanded rows into full
+    THD input; the canonical ``NemotronOmniModel`` inserts media embeddings
+    before selecting this rank's context-parallel tokens.
     """
     from nemo_rl.data.multimodal_utils import PackedTensor
 

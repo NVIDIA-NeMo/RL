@@ -1,6 +1,6 @@
 # Packing A/B control for vlm_mpo-nemotron-omni-nopack-legacy-parity.yaml.
 # Keep every training, data, model, and parallelism setting identical; only
-# enable pair-atomic, model-owned sequence packing.
+# enable pair-atomic packing in NeMo-RL's Megatron data pipeline.
 defaults: vlm_mpo-nemotron-omni-nopack-legacy-parity.yaml
 
 policy:
