@@ -310,6 +310,18 @@ def test_rollout_pump_writes_expected_tq_data(
             "mlflow_enabled": False,
             "monitor_gpus": False,
         },
+        # Actor __init__ builds a CheckpointManager + TimeoutChecker from
+        # this block; enabled=False keeps the run write-free.
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 10_000,
+            "save_optimizer": False,
+            "checkpoint_must_save_by": None,
+        },
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
