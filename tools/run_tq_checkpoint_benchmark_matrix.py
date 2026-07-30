@@ -277,7 +277,7 @@ def _core_cases() -> list[BenchmarkCase]:
 
 def _production_cases() -> list[BenchmarkCase]:
     cases = []
-    for seq_len in (1024, 4096, 8192):
+    for seq_len in (1024, 4096, 8192, 32768, 65536, 131072):
         for profile in ("generation", "train-ready"):
             cases.append(
                 BenchmarkCase(

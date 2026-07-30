@@ -103,9 +103,9 @@ def test_fixed_token_row_cases_have_equal_token_volume() -> None:
 def test_production_matrix_has_131k_rows_and_expected_profiles() -> None:
     cases = build_cases("production")
 
-    assert len(cases) == 6
+    assert len(cases) == 12
     assert {case.num_rows for case in cases} == {131072}
-    assert {case.min_seq_len for case in cases} == {1024, 4096, 8192}
+    assert {case.min_seq_len for case in cases} == {1024, 4096, 8192, 32768, 65536, 131072}
     assert {case.payload_profile for case in cases} == {
         "generation",
         "train-ready",
