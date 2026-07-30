@@ -35,7 +35,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-nemotron-omni-main-migration}"
 WANDB_NAME="${WANDB_NAME:-${JOB_NAME}}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 WANDB_RESUME="${WANDB_RESUME:-allow}"
-WANDB_PIN_VERSION="${WANDB_PIN_VERSION:-0.21.1}"
+WANDB_PIN_VERSION="${WANDB_PIN_VERSION-0.28.1}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
 MPO_MAX_NUM_STEPS="${MPO_MAX_NUM_STEPS:-}"
 MPO_MAX_SAMPLES="${MPO_MAX_SAMPLES:-}"
@@ -121,9 +121,9 @@ if [[ -n "${WANDB_PIN_VERSION}" ]]; then
     echo "WANDB_PIN_VERSION must be empty or a semantic version" >&2
     exit 2
   }
-  # Internal W&B deployments still issue 36-character keys. Newer SDKs reject
-  # those keys locally, so mirror the legacy Omni launcher and pin only the
+  # Current wandb_v1 tokens require a modern SDK to create runs. Pin only the
   # container driver environment without changing NeMo-RL's global lockfile.
+  # Legacy 36-character keys can still opt into 0.21.1 explicitly.
   # Resolve the interpreter through RUNNER: the container's bare `python` may
   # differ from the /opt/nemo_rl_venv interpreter selected by `uv run`.
   WANDB_PIN_SNIPPET="wandb_python=\$(${RUNNER} python -c \"import sys; print(sys.executable)\") && (\"\${wandb_python}\" -c \"import wandb, sys; sys.exit(0 if wandb.__version__ == '${WANDB_PIN_VERSION}' else 1)\" 2>/dev/null || uv pip install --quiet --no-deps --python \"\${wandb_python}\" 'wandb==${WANDB_PIN_VERSION}') && \"\${wandb_python}\" -c \"import wandb; print('Using wandb', wandb.__version__, 'from', wandb.__file__)\" && "
