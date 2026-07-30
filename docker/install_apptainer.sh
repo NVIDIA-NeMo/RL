@@ -41,13 +41,11 @@ install_arm64_from_source() {
     local build_dir="/tmp/apptainer-build"
     local source_tarball="/tmp/apptainer-${APPTAINER_VERSION}.tar.gz"
     local source_url="https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer-${APPTAINER_VERSION}.tar.gz"
+    # curl, git, and wget are installed by docker/Dockerfile and must remain in the final image.
     local build_packages=(
         autoconf
         automake
-        build-essential
-        curl
         dh-apparmor
-        git
         libfuse3-dev
         liblzo2-dev
         liblz4-dev
@@ -57,10 +55,10 @@ install_arm64_from_source() {
         libtool
         libzstd-dev
         pkg-config
-        wget
         zlib1g-dev
     )
     local runtime_packages=(
+        build-essential
         ca-certificates
         cryptsetup
         fakeroot
@@ -77,6 +75,17 @@ install_arm64_from_source() {
         uidmap
         zlib1g
     )
+    local new_build_packages=()
+    local dependency_download_max_attempts=5
+    local dependency_download_retry_delay=5
+    local dependency_download_status
+    local attempt
+
+    for package in "${build_packages[@]}"; do
+        if ! dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null | grep -q '^ii '; then
+            new_build_packages+=("${package}")
+        fi
+    done
 
     apt-get update
     apt-get install -y --no-install-recommends "${runtime_packages[@]}" "${build_packages[@]}"
@@ -90,8 +99,25 @@ install_arm64_from_source() {
     tar -C "${build_dir}" --strip-components=1 -xzf "${source_tarball}"
     rm -f "${source_tarball}"
 
+    # Anonymous GitHub patch downloads can return transient HTTP 429 responses.
+    # The downloader cleans partial dependency files before every attempt.
     cd "${build_dir}"
-    ./scripts/download-dependencies
+    for ((attempt = 1; attempt <= dependency_download_max_attempts; attempt++)); do
+        if ./scripts/download-dependencies; then
+            break
+        else
+            dependency_download_status=$?
+        fi
+
+        if ((attempt == dependency_download_max_attempts)); then
+            echo "Apptainer dependency download failed after ${attempt} attempts" >&2
+            return "${dependency_download_status}"
+        fi
+
+        echo "Apptainer dependency download attempt ${attempt} failed; retrying in ${dependency_download_retry_delay}s" >&2
+        sleep "${dependency_download_retry_delay}"
+        dependency_download_retry_delay=$((dependency_download_retry_delay * 2))
+    done
     ./scripts/compile-dependencies
     ./mconfig --without-suid
     make -C builddir
@@ -100,7 +126,9 @@ install_arm64_from_source() {
     rm -rf "${build_dir}"
 
     apt-get install -y --no-install-recommends "${runtime_packages[@]}"
-    apt-get purge -y --auto-remove "${build_packages[@]}"
+    if ((${#new_build_packages[@]} > 0)); then
+        apt-get purge -y --auto-remove "${new_build_packages[@]}"
+    fi
     rm -rf /usr/local/go /root/go /root/.cache/go-build
 }
 

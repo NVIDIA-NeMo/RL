@@ -32,9 +32,7 @@ from nemo_rl.algorithms.grpo import _should_use_nemo_gym
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import (
-    setup_nemo_gym_config,
-)
+from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -118,7 +116,7 @@ def main() -> None:
 
     # Validation dataset config setup. Same Gym principle as run_grpo_nemo_gym.py:
     # max_val_samples is derived from len(val_dataset); user-set values are rejected.
-    if config.distillation["max_val_samples"] is not None:
+    if config.distillation.max_val_samples is not None:
         raise ValueError(
             """A non-null `distillation.max_val_samples` parameter is not supported.
 
@@ -131,8 +129,8 @@ The validation set you pass in will directly be used for validation with no addi
         print(
             f"Setting `distillation.max_val_samples` and `distillation.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
         )
-        config.distillation["max_val_samples"] = len(val_dataset)
-        config.distillation["val_batch_size"] = config.distillation["max_val_samples"]
+        config.distillation.max_val_samples = len(val_dataset)
+        config.distillation.val_batch_size = config.distillation.max_val_samples
 
     # Print config
     print("Final config:")
@@ -160,7 +158,7 @@ The validation set you pass in will directly be used for validation with no addi
         raise ValueError("NeMo-Gym distillation setup did not initialize Nemo-Gym")
 
     # Bind task_to_env and val_task_to_env for nemo_gym env
-    # Hardcode here to match `run_async_nemo_gym_rollout`
+    # NeMo-Gym is the only environment used by this runner.
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 

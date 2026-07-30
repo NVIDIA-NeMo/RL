@@ -39,7 +39,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
@@ -154,7 +154,7 @@ class TQPolicy(Policy):
     def __init__(
         self,
         *args: Any,
-        dp_cfg: dict[str, Any],
+        dp_cfg: DataPlaneConfig,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -419,6 +419,7 @@ class TQPolicy(Policy):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
         sample_mask: Optional[torch.Tensor] = None,
         token_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
@@ -437,6 +438,10 @@ class TQPolicy(Policy):
             gbs: Global batch size; defaults to ``cfg["train_global_batch_size"]``.
             mbs: Micro batch size; defaults to ``cfg["train_micro_batch_size"]``.
             timer: Optional timer for nested ``policy_training/*`` measurements.
+            train_fields: TQ columns workers fetch this step; defaults to the
+                full ``DP_TRAIN_FIELDS`` schema. Caller may narrow it to drop
+                columns it skipped writing (e.g. ``prev_logprobs`` when
+                ``force_on_policy_ratio=True``).
             sample_mask: Driver-resident sequence mask used to stamp eager loss
                 normalization metadata when microbatch prefetch is enabled.
             token_mask: Driver-resident token mask used for the same purpose.
@@ -462,14 +467,14 @@ class TQPolicy(Policy):
                 batch_size=batch_size,
             )
         spa, dba = self._packing_args("train_mb_tokens")
-        # Train workers fetch the full DP_TRAIN_FIELDS schema (rollout +
-        # logprob deltas + advantages + sample_mask). Caller is responsible
-        # for ensuring those columns have been written to TQ before this
-        # call (workers + driver delta-writes).
+        # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
+        # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
+        # by workers + driver delta-writes. Caller may narrow to drop columns
+        # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                train_fields, enabled=self._router_replay_enabled
             ),
             task_name="train",
         )

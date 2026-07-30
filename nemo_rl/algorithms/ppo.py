@@ -30,7 +30,6 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
-    _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
     extract_initial_prompt_messages,
@@ -63,20 +62,29 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
+from nemo_rl.utils.logger import (
+    Logger,
+    LoggerConfig,
+    print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
+)
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -228,6 +236,23 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    if generation_config["backend"] == "vllm":
+        vllm_config = cast(VllmConfig, generation_config)
+        normalize_vllm_refit_config(vllm_config)
+        refit_transport = vllm_config.get("refit_transport")
+        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError(
+                "Remote sparse refit is currently supported only by GRPO; PPO "
+                "support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
+        if refit_transport is not None:
+            raise ValueError(
+                "Checkpoint-engine refit requires non-colocated generation, but "
+                "PPO currently requires colocated generation. Non-colocated PPO "
+                "support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
@@ -1042,13 +1067,17 @@ def ppo_train(
 
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                wandb_enabled=master_config.logger["wandb_enabled"],
+                                wandb_config=master_config.logger["wandb"],
+                            ),
                             max_rollout_turns=None,
                             greedy=False,
                         )
@@ -1056,11 +1085,6 @@ def ppo_train(
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
-
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
 
                     elif _should_use_async_rollouts(master_config):
                         (

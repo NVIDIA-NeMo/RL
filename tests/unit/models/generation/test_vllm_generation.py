@@ -35,13 +35,13 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
-    _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -193,9 +193,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
-        "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
+        "vllm.renderers",
         "vllm.tool_parsers",
         "vllm.v1",
         "vllm.v1.engine",
@@ -218,7 +218,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.registry = "registry"
 
-    class OpenAIServingRender:
+    class OnlineRenderer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
@@ -230,7 +230,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class OpenAIServingTokenization:
+    class ServingTokenization:
         instances = []
 
         def __init__(self, **kwargs):
@@ -274,12 +274,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         TokenizeResponse=type("TokenizeResponse", (), {}),
     )
     make_module(
-        "vllm.entrypoints.serve.render.serving",
-        OpenAIServingRender=OpenAIServingRender,
+        "vllm.renderers.online_renderer",
+        OnlineRenderer=OnlineRenderer,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
-        OpenAIServingTokenization=OpenAIServingTokenization,
+        ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
@@ -447,6 +447,29 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
     assert configured["vllm_cfg"]["load_format"] == "auto"
 
 
+@pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
+def test_configure_generation_config_uses_real_delta_baseline(transport: str):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = transport
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = "nixl"
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
     """Speculative training can keep dummy startup weights when draft refit is available."""
     vllm_config = deepcopy(basic_vllm_test_config)
@@ -467,6 +490,96 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+def test_configure_generation_config_keeps_real_quant_export_on_cpu() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = True
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_export_cpu_offload"] is True
+
+
+def test_configure_generation_config_keeps_colocated_real_quant_export_on_gpu() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_export_cpu_offload"] is False
+
+
+def test_configure_generation_config_rejects_missing_real_quant_export_placement() -> (
+    None
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_rejects_non_boolean_real_quant_export() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = "false"
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_rejects_gpu_export_for_non_colocated_refit() -> (
+    None
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+    vllm_config["colocated"]["enabled"] = False
+
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_rejects_gpu_export_without_colocated_config() -> (
+    None
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+    del vllm_config["colocated"]
+
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+@pytest.mark.parametrize("refit_transport", ["vllm_zmq_sparse", "nixl"])
+def test_configure_generation_config_rejects_gpu_export_for_explicit_refit_transport(
+    refit_transport: str,
+) -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+    vllm_config["refit_transport"] = refit_transport
+
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
 
 
 @pytest.mark.parametrize("method", ["deepseek_mtp", "mtp"])
@@ -1558,8 +1671,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     "annotations": None,
                     "audio": None,
                     "function_call": None,
-                    "tool_calls": [],
-                    "reasoning_content": None,
+                    # vLLM 0.25 omits tool_calls when empty and dropped
+                    # reasoning_content in favor of reasoning.
                     "reasoning": None,
                 },
                 "logprobs": {
@@ -1575,6 +1688,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 "finish_reason": "length",
                 "stop_reason": None,
                 "token_ids": None,
+                "routed_experts": None,
             }
         ],
         "service_tier": None,
@@ -1587,13 +1701,18 @@ def test_vllm_http_server(cluster, tokenizer):
         },
         "prompt_logprobs": None,
         "prompt_token_ids": None,
+        "prompt_text": None,
         "kv_transfer_params": None,
+        "metrics": None,
     }
 
     def _standardize(d: dict) -> dict:
         d = deepcopy(d)
         d.pop("id")
         d.pop("created")
+        # vLLM 0.25 populates system_fingerprint with the version + build hash
+        # (e.g. "vllm-0.25.1-<hash>"), which is wheel-specific.
+        d.pop("system_fingerprint", None)
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
@@ -1759,7 +1878,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] == eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1772,7 +1891,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] != eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1786,7 +1905,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     template_prefix_token_ids = template_token_ids[:-15]
     assert template_prefix_token_ids[-2] == eos_token_id
     assert template_prefix_token_ids[-1] != eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1801,7 +1920,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     template_prefix_token_ids = template_token_ids[:-15]
     assert template_prefix_token_ids[-2] == eos_token_id
     assert template_prefix_token_ids[-1] != eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1813,7 +1932,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] == eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
@@ -1826,81 +1945,13 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert model_prefix_token_ids[-1] != eos_token_id
     template_prefix_token_ids = template_token_ids[:-16]
     assert template_prefix_token_ids[-1] == eos_token_id
-    result = _replace_prefix_tokens(
+    result = replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
     )
     assert result == model_token_ids
-
-
-def test_replace_prefix_tokens_empty_model_prefix_returns_template():
-    class _T:
-        eos_token_id = 2
-
-    tokenizer = _T()
-    model_prefix_token_ids = []
-    template_prefix_token_ids = [9, 2]
-    template_token_ids = [9, 2, 33, 44]
-    result = _replace_prefix_tokens(
-        tokenizer=tokenizer,
-        model_prefix_token_ids=model_prefix_token_ids,
-        template_prefix_token_ids=template_prefix_token_ids,
-        template_token_ids=template_token_ids,
-    )
-    assert result == template_token_ids
-
-
-def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
-    class _T:
-        eos_token_id = 2
-
-        def decode(self, *args, **kwargs):
-            pass
-
-    tokenizer = _T()
-    model_prefix_token_ids = [7, 2]
-    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
-    template_token_ids = [9, 9, 9, 2, 10]
-    with pytest.raises(AssertionError):
-        _replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=model_prefix_token_ids,
-            template_prefix_token_ids=template_prefix_token_ids,
-            template_token_ids=template_token_ids,
-        )
-
-
-def test_replace_prefix_tokens_tokenizer_without_eos_raises():
-    class _T:
-        eos_token_id = None
-
-    tokenizer = _T()
-    with pytest.raises(AssertionError):
-        _replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=[1],
-            template_prefix_token_ids=[1, 2],
-            template_token_ids=[1, 2],
-        )
-
-
-def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
-    class _T:
-        eos_token_id = 2
-
-    tokenizer = _T()
-    model_prefix_token_ids = [100, 2]
-    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
-    template_token_ids = [9, 2, 9, 2, 77, 88]
-    result = _replace_prefix_tokens(
-        tokenizer=tokenizer,
-        model_prefix_token_ids=model_prefix_token_ids,
-        template_prefix_token_ids=template_prefix_token_ids,
-        template_token_ids=template_token_ids,
-    )
-    assert result == [100, 2, 77, 88]
 
 
 @pytest.mark.asyncio
@@ -2855,7 +2906,14 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
 
 @pytest.mark.mcore
-@pytest.mark.timeout(120)
+# Raised 120 -> 240 for vLLM 0.25. Measured call time for this test: 103.80s on
+# 0.20 (PR #3308, job 90163013717) and 113.10s on 0.25 (this branch, job
+# 89878378208) -- ~9s / +9% slower, which cut the headroom under the old 120s
+# budget from 16.2s to 6.9s. That is less than normal run-to-run variance on a
+# shared runner, so the test began failing intermittently on wall clock rather
+# than on any assertion. The budget was already marginal before this bump; 240s
+# restores a real margin instead of tracking the regression down to the second.
+@pytest.mark.timeout(240)
 def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     """Test vLLM generation with Megatron pipeline parallel training."""
 
