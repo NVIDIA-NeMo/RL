@@ -112,6 +112,29 @@ def test_production_matrix_has_131k_rows_and_expected_profiles() -> None:
     }
 
 
+def test_production_grid_is_train_ready_cross_product() -> None:
+    cases = build_cases("production-grid")
+    expected_sizes = {8192, 16384, 32768, 65536, 131072}
+
+    assert len(cases) == 25
+    assert {case.num_rows for case in cases} == expected_sizes
+    assert {case.min_seq_len for case in cases} == expected_sizes
+    assert {case.max_seq_len for case in cases} == expected_sizes
+    assert {case.payload_profile for case in cases} == {"train-ready"}
+    assert {case.num_storage_units for case in cases} == {8}
+    assert {
+        case.min_seq_len: case.batch_rows
+        for case in cases
+        if case.num_rows == 8192
+    } == {
+        8192: 256,
+        16384: 128,
+        32768: 64,
+        65536: 32,
+        131072: 16,
+    }
+
+
 def test_metric_stats() -> None:
     assert metric_stats([]) == {
         "mean": None,

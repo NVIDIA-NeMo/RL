@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-SuiteName = Literal["smoke", "core", "production", "all"]
+SuiteName = Literal["smoke", "core", "production", "production-grid", "all"]
 
 GIB = 1024**3
 
@@ -67,6 +67,7 @@ SERIES_TITLES = {
     "row_cardinality": "Row cardinality at fixed token volume",
     "raggedness": "Sequence-length raggedness",
     "production": "Production-scale resident rows",
+    "production_grid": "Production row/context grid",
 }
 
 RUN_COLUMNS = [
@@ -295,6 +296,38 @@ def _production_cases() -> list[BenchmarkCase]:
     return cases
 
 
+def _production_grid_cases() -> list[BenchmarkCase]:
+    cases = []
+    for num_rows in (8192, 16384, 32768, 65536, 131072):
+        for seq_len in (8192, 16384, 32768, 65536, 131072):
+            cases.append(
+                BenchmarkCase(
+                    case_id=f"grid-{num_rows}x{seq_len}-train-ready",
+                    description=(
+                        f"{num_rows:,} resident rows × {seq_len:,} tokens, "
+                        "train-ready"
+                    ),
+                    series=("production_grid",),
+                    num_rows=num_rows,
+                    min_seq_len=seq_len,
+                    max_seq_len=seq_len,
+                    payload_profile="train-ready",
+                    num_storage_units=8,
+                    # Keep each generated put near two million tokens to bound
+                    # transient payload-construction and serialization memory.
+                    batch_rows=max(1, min(256, 2_097_152 // seq_len)),
+                )
+            )
+    cases.sort(
+        key=lambda case: (
+            case.num_rows * case.min_seq_len,
+            case.num_rows,
+            case.min_seq_len,
+        )
+    )
+    return cases
+
+
 def build_cases(suite: SuiteName) -> list[BenchmarkCase]:
     if suite == "smoke":
         return [
@@ -314,7 +347,11 @@ def build_cases(suite: SuiteName) -> list[BenchmarkCase]:
         return _core_cases()
     if suite == "production":
         return _production_cases()
+    if suite == "production-grid":
+        return _production_grid_cases()
     if suite == "all":
+        # The production grid is intentionally opt-in: one repetition contains
+        # over 1 TiB of logical tensors across its 25 cases.
         return [*_core_cases(), *_production_cases()]
     raise ValueError(f"unknown suite: {suite}")
 
@@ -950,7 +987,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-root", required=True)
     parser.add_argument(
         "--suite",
-        choices=("smoke", "core", "production", "all"),
+        choices=("smoke", "core", "production", "production-grid", "all"),
         default="core",
     )
     parser.add_argument(
