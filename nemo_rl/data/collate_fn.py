@@ -226,8 +226,8 @@ def preference_collate_fn(
         data["token_mask"] = cat_and_padded["token_loss_mask"]
 
     # Keep processor-expanded multimodal data in the same batch coordinate
-    # system as input_ids. NemotronOmniModel owns media insertion and packing;
-    # NeMo-RL must not collapse image placeholders here.
+    # system as input_ids. NeMo-RL packs the full THD rows; NemotronOmniModel
+    # inserts media embeddings and selects the context-parallel slice.
     data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
 
     return data
