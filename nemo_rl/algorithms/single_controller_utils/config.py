@@ -92,6 +92,50 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
         return self
 
 
+class FleetHealthConfig(BaseModel, extra="allow"):
+    """Liveness tracking for the vLLM generation fleet.
+
+    Only the knobs P1 actually consumes are declared. Recovery modes beyond
+    ``fail_fast`` need the communicator rebuild that lands later, so the Literal
+    rejects them rather than accepting a value that would silently do nothing.
+    """
+
+    # Master switch. When false, generation-shard selection keeps its historical
+    # health-blind round-robin.
+    enabled: bool = False
+    # Seconds between liveness probes of each shard.
+    probe_interval_s: PositiveFloat = 5.0
+    # Per-probe deadline. Must stay well under probe_interval_s so probes cannot pile up.
+    probe_timeout_s: PositiveFloat = 2.0
+    # Consecutive probe failures before a shard is quarantined. With the defaults a
+    # dead shard is detected in roughly 15s.
+    unhealthy_threshold: PositiveInt = 3
+    # Consecutive successes before a suspect shard is trusted again. Stops a flapping
+    # shard from re-entering rotation on one lucky probe.
+    healthy_threshold: PositiveInt = 2
+    # How a shard is chosen. least_outstanding steers away from a slow or wedged shard
+    # without needing that diagnosed first.
+    selection: Literal["least_outstanding", "round_robin"] = "least_outstanding"
+    # What to do once a shard is quarantined. Recovery modes arrive with the
+    # communicator rebuild.
+    on_dead_shard: Literal["fail_fast"] = "fail_fast"
+    # Attempts to bring a shard back before retiring it permanently, counted across the
+    # whole run rather than per incident.
+    max_restart_attempts_per_shard: PositiveInt = 5
+    # Serving shards below which the run cannot usefully continue.
+    min_healthy_shards: PositiveInt = 1
+
+    @model_validator(mode="after")
+    def _check_consistent(self) -> "FleetHealthConfig":
+        if self.probe_timeout_s >= self.probe_interval_s:
+            raise ValueError(
+                f"async_rl.fleet_health.probe_timeout_s ({self.probe_timeout_s}) must "
+                f"be < probe_interval_s ({self.probe_interval_s}); otherwise probes "
+                "overlap and a slow fleet is reported as a dead one."
+            )
+        return self
+
+
 class WatchdogConfig(BaseModel, extra="allow"):
     """Last-resort detection for stalls that no other layer catches."""
 
@@ -133,6 +177,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     )
     # Stall detection.
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
+    # Generation-fleet liveness tracking and shard eligibility.
+    fleet_health: FleetHealthConfig = Field(default_factory=FleetHealthConfig)
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
