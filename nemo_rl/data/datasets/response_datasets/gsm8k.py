@@ -41,7 +41,6 @@ class GSM8KDataset(RawDataset):
         subset: str = "main",
         split: str = "train",
         extract_answer: bool = True,
-        system_prompt_file: str | None = None,
         **kwargs,
     ) -> None:
         self.task_name = "gsm8k"
