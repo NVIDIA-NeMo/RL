@@ -645,6 +645,22 @@ class BaseVllmGenerationWorker:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
     @staticmethod
+    def _spec_decode_max_tokens(
+        base_max_tokens: int,
+        input_len: int,
+        max_model_len: int,
+        spec_lookahead: int,
+    ) -> int:
+        """Clamp max_tokens so speculative decoding never reads past max_model_len.
+
+        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
+        at least `spec_lookahead + 1` tokens before the boundary.
+        """
+        return max(
+            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
+        )
+
+    @staticmethod
     def _patch_vllm_nsight_config() -> None:
         """Override vLLM's nsight config for internal TP workers to use deferred capture.
 
@@ -820,12 +836,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 self._build_sampling_params(
                     greedy=greedy,
                     stop_strings=stop_strings,
-                    max_new_tokens=max(
-                        1,
-                        min(
-                            base_max_tokens,
-                            max_model_len - int(input_len) - (spec_lookahead + 1),
-                        ),
+                    max_new_tokens=self._spec_decode_max_tokens(
+                        base_max_tokens, int(input_len), max_model_len, spec_lookahead
                     ),
                 )
                 for input_len in data["input_lengths"].tolist()
