@@ -171,17 +171,19 @@ class RewardScalingConfig(TypedDict):
     target_max: NotRequired[float]
 
 
-class AsyncGRPOConfig(TypedDict):
-    enabled: bool
+class AsyncGRPOConfig(BaseModel, extra="allow"):
+    """Configuration for asynchronous GRPO training."""
+
+    enabled: bool = False
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
-    max_trajectory_age_steps: int
+    max_trajectory_age_steps: int = Field(default=1, ge=1)
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
-    in_flight_weight_updates: NotRequired[bool]
+    in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    recompute_kv_cache_after_weight_updates: bool = False
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -954,8 +956,9 @@ def setup(
 
         # When the user opts into recompute-after-refit on the megatron side,
         # override mcore's kv_cache_management_mode to "recompute" directly.
-        if "async_grpo" in grpo_config and grpo_config["async_grpo"].get(
-            "recompute_kv_cache_after_weight_updates", False
+        if (
+            "async_grpo" in grpo_config
+            and grpo_config["async_grpo"].recompute_kv_cache_after_weight_updates
         ):
             mcore_cfg = policy_config["generation"]["mcore_generation_config"]
             prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
@@ -3849,8 +3852,9 @@ def async_grpo_train(
             "has not been merged yet."
         )
 
-    if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
-        if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
+    async_config = master_config.grpo["async_grpo"]
+    if async_config.max_trajectory_age_steps > 1:
+        if not async_config.in_flight_weight_updates:
             print(
                 "⚠️ WARNING: In-flight weight updates must be enabled for async GRPO with max_trajectory_age_steps > 1. "
                 "Without in-flight weight updates, having more max_trajectory_age_steps will not give any performance benefit."

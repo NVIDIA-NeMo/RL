@@ -22,6 +22,14 @@ ppo:
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
 
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    warmup_max_trajectory_age_steps: null
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+    drop_incomplete_targets_on_restore: true
+
   reward_shaping:
     enabled: true
     overlong_buffer_length: 2048
@@ -47,6 +55,7 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  seq_logprob_error_threshold: null
 
 loss_fn:
   disable_ppo_ratio: false
@@ -386,6 +395,7 @@ data:
   max_input_seq_length: 2048
   shuffle: true
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     dataset_name: DAPOMath17K
   validation:

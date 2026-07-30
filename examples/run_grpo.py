@@ -175,7 +175,7 @@ def main() -> None:
     print("=" * 60 + "\n", flush=True)
 
     # Check if async mode is enabled
-    if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
+    if "async_grpo" in config.grpo and config.grpo["async_grpo"].enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
         unsupported_features = [
             "use_dynamic_sampling",
@@ -223,7 +223,7 @@ def main() -> None:
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            max_trajectory_age_steps=async_config.max_trajectory_age_steps,
             teacher_worker_groups=teacher_worker_groups,
             alias_to_group_alias=alias_to_group_alias,
         )

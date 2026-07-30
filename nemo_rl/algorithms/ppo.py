@@ -14,12 +14,15 @@
 import gc
 import os
 import time
+import traceback
 import warnings
+from collections.abc import Iterator
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
+import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -32,6 +35,8 @@ from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    aggregate_rollout_metrics,
+    compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
     refit_policy_generation,
     scale_rewards,
@@ -47,7 +52,11 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import print_performance_metrics, set_seed
+from nemo_rl.algorithms.utils import (
+    print_efficiency_summary,
+    print_performance_metrics,
+    set_seed,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -56,9 +65,14 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -88,11 +102,49 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # ===============================================================================
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+class AsyncPPOConfig(BaseModel, extra="allow"):
+    """Configuration for asynchronous PPO training."""
+
+    # Enables the replay-buffer training loop.
+    enabled: bool = False
+    # Maximum generation-version age accepted for training.
+    max_trajectory_age_steps: int = Field(default=1, ge=1)
+    # Maximum generation-version age for rollouts banked by a frozen policy.
+    # None keeps the normal trajectory-age limit throughout warmup.
+    warmup_max_trajectory_age_steps: int | None = Field(default=None, ge=1)
+    # Allows weight updates while rollout requests are still in flight.
+    in_flight_weight_updates: bool = True
+    # Invalidates and rebuilds the generation KV cache after a weight update.
+    recompute_kv_cache_after_weight_updates: bool = False
+    # Regenerates a partial replay-buffer frontier after resume.
+    drop_incomplete_targets_on_restore: bool = True
+
+    @model_validator(mode="after")
+    def validate_settings(self) -> "AsyncPPOConfig":
+        if (
+            self.warmup_max_trajectory_age_steps is not None
+            and self.warmup_max_trajectory_age_steps < self.max_trajectory_age_steps
+        ):
+            raise ValueError(
+                "warmup_max_trajectory_age_steps must be greater than or equal "
+                "to max_trajectory_age_steps"
+            )
+        return self
+
+    @property
+    def effective_warmup_max_trajectory_age_steps(self) -> int:
+        """Return the configured warmup age or the normal training age."""
+        if self.warmup_max_trajectory_age_steps is None:
+            return self.max_trajectory_age_steps
+        return self.warmup_max_trajectory_age_steps
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -146,6 +198,11 @@ class PPOConfig(TypedDict):
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: NotRequired[int]
+    # Nullable sequence-level multiplicative probability-error threshold.
+    # None logs metrics without masking; values above the threshold are excluded.
+    seq_logprob_error_threshold: float | None
+    # Asynchronous PPO uses a replay buffer with non-colocated generation.
+    async_ppo: NotRequired[AsyncPPOConfig]
 
 
 class PPOSaveState(TypedDict):
@@ -168,6 +225,28 @@ def _default_ppo_save_state() -> PPOSaveState:
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _apply_ppo_seq_logprob_error_masking(
+    train_data: BatchedDataDict,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: float | None,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Apply optional mismatch masking and return the GAE mask and metrics."""
+    metrics = compute_and_apply_seq_logprob_error_masking(
+        train_data=train_data,
+        rewards=rewards,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
+    )
+    metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
+    advantage_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+    if not advantage_mask.bool().any():
+        raise RuntimeError(
+            "PPO has no valid response tokens after filtering. Check overlong "
+            "filtering and ppo.seq_logprob_error_threshold to avoid an optimizer "
+            "step with an empty batch."
+        )
+    return advantage_mask, metrics
 
 
 class PPOLoggerConfig(LoggerConfig):
@@ -393,14 +472,16 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    assert colocated_inference, (
-        "PPO currently requires colocated generation (vLLM / SGLang sharing GPUs "
-        "with the policy worker). Set policy.generation.colocated.enabled=true. "
-        "Non-colocated PPO is not yet supported."
-    )
-    reward_model_enabled = (
-        "env_name" in data_config and data_config["env_name"] == "reward_model"
-    )
+    backend = generation_config["backend"]
+    if not colocated_inference:
+        assert backend == "vllm", (
+            "Non-colocated PPO generation currently supports only vLLM; "
+            f"got backend={backend!r}. SGLang does not yet implement the "
+            "cross-cluster collective weight update path."
+        )
+
+    reward_model_enabled = "reward_model" in extract_necessary_env_names(data_config)
+    segment_size = cluster_config.get("segment_size")
 
     total_nodes = cluster_config["num_nodes"]
     if reward_model_enabled:
@@ -420,39 +501,185 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if total_nodes == 1:
-        policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
-        assert policy_gpus_per_node > 0, (
-            "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-            "when cluster.num_nodes = 1, "
-            f"but got {policy_gpus_per_node}."
+    if colocated_inference:
+        if total_nodes == 1:
+            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            assert policy_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                "when cluster.num_nodes = 1, "
+                f"but got {policy_gpus_per_node}."
+            )
+        else:
+            policy_gpus_per_node = cluster_config["gpus_per_node"]
+
+        cluster = RayVirtualCluster(
+            name="ppo_policy_cluster",
+            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=policy_gpus_per_node,
+            max_colocated_worker_groups=1 if backend == "megatron" else 3,
+        )
+        train_cluster = cluster
+        inference_cluster = cluster
+        print(
+            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
+            flush=True,
         )
     else:
-        policy_gpus_per_node = cluster_config["gpus_per_node"]
+        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_nodes = policy_nodes
 
-    cluster = RayVirtualCluster(
-        name="grpo_policy_cluster",
-        bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
-        use_gpus=True,
-        num_gpus_per_node=policy_gpus_per_node,
-        max_colocated_worker_groups=1
-        if generation_config["backend"] == "megatron"
-        else 3,
-    )
-    train_cluster = cluster
-    inference_cluster = cluster
-    print(
-        f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
-        flush=True,
-    )
+        inference_resources = generation_config["colocated"]["resources"]
+        inference_gpus_per_node = inference_resources["gpus_per_node"]
+        inference_nodes = inference_resources["num_nodes"]
+        shared_node_inference = policy_nodes == 1
+
+        if shared_node_inference:
+            assert (
+                inference_gpus_per_node is not None and inference_gpus_per_node > 0
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
+                "when policy_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
+            )
+            assert inference_nodes is None or inference_nodes == 1, (
+                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
+                "when policy_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+
+            inference_nodes = 1
+            reward_gpus_to_subtract = rm_gpus_per_node if total_nodes == 1 else 0
+            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
+            assert train_gpus_per_node > 0, (
+                "Not enough GPUs for PPO training after reserving non-colocated "
+                "generation resources: "
+                f"train_gpus_per_node={train_gpus_per_node}, "
+                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}, "
+                f"inference_gpus_per_node={inference_gpus_per_node}, "
+                f"reward_gpus_per_node={reward_gpus_to_subtract}."
+            )
+        else:
+            assert inference_nodes is not None and inference_nodes > 0, (
+                "policy.generation.colocated.resources.num_nodes must be > 0 "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            assert (
+                inference_gpus_per_node is not None
+                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, "
+                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+            )
+            train_nodes -= inference_nodes
+
+        assert train_nodes > 0 and inference_nodes > 0, (
+            "Non-colocated PPO requires both training and inference resources, "
+            f"but got train_nodes={train_nodes}, inference_nodes={inference_nodes}."
+        )
+        assert inference_gpus_per_node is not None
+
+        node_resource_constraints = None
+        inference_node_resource_constraints = None
+        inference_segment_size = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            num_alive_nodes = len(topology)
+            required_nodes = (
+                train_nodes if shared_node_inference else train_nodes + inference_nodes
+            )
+            assert num_alive_nodes >= required_nodes, (
+                "Not enough alive Ray nodes for all PPO roles: "
+                f"need {required_nodes} "
+                f"(train={train_nodes}, inference={inference_nodes}, "
+                f"shared_node={shared_node_inference}), "
+                f"but only {num_alive_nodes} alive nodes found"
+            )
+            node_resource_constraints, remaining_node_ids, topology = (
+                prepare_segment_topology(
+                    segment_size,
+                    train_nodes,
+                    topology=topology,
+                    role="training",
+                )
+            )
+            if node_resource_constraints is not None:
+                vllm_cfg = cast(VllmConfig, generation_config)["vllm_cfg"]
+                gpus_per_instance = (
+                    vllm_cfg["tensor_parallel_size"]
+                    * vllm_cfg["pipeline_parallel_size"]
+                )
+                nodes_per_instance = (
+                    gpus_per_instance + inference_gpus_per_node - 1
+                ) // inference_gpus_per_node
+                if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                    remaining_topology = {
+                        node_id: topology[node_id] for node_id in remaining_node_ids
+                    }
+                    (
+                        inference_node_resource_constraints,
+                        _,
+                        _,
+                    ) = prepare_segment_topology(
+                        nodes_per_instance,
+                        inference_nodes,
+                        topology=remaining_topology,
+                        role="inference",
+                    )
+                    inference_segment_size = nodes_per_instance
+                elif nodes_per_instance > 1:
+                    print(
+                        f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                        f"nodes_per_instance={nodes_per_instance}; skipping inference "
+                        "topology constraints",
+                        flush=True,
+                    )
+
+        train_cluster = RayVirtualCluster(
+            name="ppo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=2,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
+        )
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
+
+        inference_cluster = RayVirtualCluster(
+            name="ppo_inference_cluster",
+            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+            use_gpus=True,
+            num_gpus_per_node=inference_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
+        )
+        if inference_node_resource_constraints is not None:
+            VllmGeneration.init_cluster_placement_groups(
+                inference_cluster, generation_config
+            )
+
+        print(
+            "  ✓ Separate PPO clusters initialized: "
+            f"train={train_nodes}x{train_gpus_per_node} GPUs for policy/value, "
+            f"inference={inference_nodes}x{inference_gpus_per_node} GPUs for vLLM",
+            flush=True,
+        )
 
     # ==========================
     #   Training and Inference
     # ==========================
     print("\n▶ Setting up model and training...", flush=True)
 
-    # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
-    backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
     # Dictionary to store worker initialization timing stats for logging
@@ -471,24 +698,20 @@ def setup(
     # Scale train_iters accordingly so the configured warmup/decay horizon
     # matches the actual scheduler-step count.
     ppo_epochs = ppo_config["ppo_epochs"]
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = (
-            min(
-                ppo_config["max_num_steps"],
-                ppo_config["max_num_epochs"] * len(dataloader),
-            )
-            * ppo_epochs
+    async_config = ppo_config.get("async_ppo")
+    if async_config is not None and async_config.enabled:
+        outer_training_steps = ppo_config["max_num_steps"]
+    else:
+        outer_training_steps = min(
+            ppo_config["max_num_steps"],
+            ppo_config["max_num_epochs"] * len(dataloader),
         )
+    total_train_iters = outer_training_steps * ppo_epochs
+
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = (
-            min(
-                ppo_config["max_num_steps"],
-                ppo_config["max_num_epochs"] * len(dataloader),
-            )
-            * ppo_epochs
-        )
         value_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
@@ -552,12 +775,12 @@ def setup(
             worker_init_timing_metrics: Dictionary to store timing metrics
 
         Returns:
-            Tuple of (policy_generation, policy)
+            Tuple of (policy_generation, policy, value_model)
         """
-        # Initialize generation engine first so it claims its GPU memory
-        # before policy/value workers are constructed; then policy, then value.
-        print("  ⚙️  Initializing workers (colocated mode)", flush=True)
+        mode = "colocated" if colocated_inference else "non-colocated"
+        print(f"  ⚙️  Initializing workers ({mode} mode)", flush=True)
 
+        # Policy and value initialize serially because they share training GPUs.
         policy_generation, generation_time = init_generation_fn()
         worker_init_timing_metrics[init_time_key] = generation_time
 
@@ -654,6 +877,26 @@ def setup(
     # Reload policy weights to GPU before refit (they may have been offloaded
     # during setup to free GPU for value model initialization).
     policy.prepare_for_training()
+
+    if not colocated_inference:
+        assert policy_generation is not None
+        t0 = time.perf_counter()
+        ip, port = train_cluster.get_master_address_and_port()
+        print(
+            f"Using ip: {ip}, port: {port} for collective communication",
+            flush=True,
+        )
+        train_world_size = train_cluster.world_size()
+        world_size = train_world_size + inference_cluster.world_size()
+
+        futures_train = policy.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        futures_inference = policy_generation.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )  # type: ignore[call-arg]
+        ray.get(futures_train + futures_inference)
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -878,6 +1121,35 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate value-model metrics under the ``critic/`` namespace."""
+    value_mb_metrics = value_results.get("all_mb_metrics", {})
+    critic_metrics: dict[str, Any] = {
+        "critic/grad_norm": value_results["grad_norm"].numpy(),
+        "critic/loss": value_results["loss"].numpy(),
+    }
+    for key, value in value_mb_metrics.items():
+        metric_name = f"critic/{key}"
+        if key in {"lr", "wd", "global_valid_seqs", "global_valid_toks", "grad_norm"}:
+            critic_metrics[metric_name] = np.mean(value).item()
+        elif key == "values_min":
+            critic_metrics[metric_name] = np.min(value).item()
+        elif key == "values_max":
+            critic_metrics[metric_name] = np.max(value).item()
+        elif isinstance(value, (np.ndarray, list)):
+            critic_metrics[metric_name] = np.sum(value).item()
+        else:
+            raise ValueError(f"Unsupported value-model metric: {key}")
+    returns_mean = critic_metrics.get("critic/returns_mean", 0)
+    values_mean = critic_metrics.get("critic/values_mean", 0)
+    returns_sq_mean = critic_metrics.get("critic/returns_sq_mean", 0)
+    residual_sq_mean = critic_metrics.get("critic/residual_sq_mean", 0)
+    returns_var = returns_sq_mean - returns_mean**2
+    residual_var = residual_sq_mean - (returns_mean - values_mean) ** 2
+    critic_metrics["critic/explained_var"] = 1.0 - residual_var / max(returns_var, 1e-8)
+    return critic_metrics
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -962,6 +1234,11 @@ def ppo_train(
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
+            if not colocated_inference:
+                # Colocated refit offloads policy inside
+                # `refit_policy_generation`. Do it here so the value
+                # model can reuse the training GPUs.
+                policy.offload_to_cpu()
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1055,6 +1332,12 @@ def ppo_train(
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        if not colocated_inference:
+                            # Colocated refit offloads policy inside
+                            # `refit_policy_generation`. Do it here so the value
+                            # model can reuse the training GPUs.
+                            with timer.time("policy_offload_after_refit"):
+                                policy.offload_to_cpu()
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
@@ -1233,6 +1516,17 @@ def ppo_train(
 
                     policy.finish_inference()
 
+                (
+                    advantage_mask,
+                    seq_logprob_error_metrics,
+                ) = _apply_ppo_seq_logprob_error_masking(
+                    train_data=train_data,
+                    rewards=rewards,
+                    seq_logprob_error_threshold=master_config.ppo[
+                        "seq_logprob_error_threshold"
+                    ],
+                )
+
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
                 # Use the token-length-based extractor so multi-turn prompts containing
                 # assistant messages still resolve to the original prompt only.
@@ -1253,7 +1547,7 @@ def ppo_train(
                     adv_kwargs = dict(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
-                        mask=train_data["token_mask"],
+                        mask=advantage_mask,
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
                     )
@@ -1356,6 +1650,12 @@ def ppo_train(
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        if not colocated_inference:
+                            # Colocated refit offloads policy inside
+                            # `refit_policy_generation`. Do it here so the value
+                            # model can reuse the training GPUs.
+                            with timer.time("policy_offload_after_refit"):
+                                policy.offload_to_cpu()
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
@@ -1380,11 +1680,10 @@ def ppo_train(
 
                 # Metrics
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
                 del flat_messages
 
                 response_advantages = torch.masked_select(
-                    flat_advantages, flat_token_mask.bool()
+                    flat_advantages, advantage_mask.bool()
                 )
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
@@ -1405,45 +1704,7 @@ def ppo_train(
 
                 # Extract critic metrics from value training results
                 if value_results is not None:
-                    value_mb_metrics = value_results.get("all_mb_metrics", {})
-                    critic_metrics = {
-                        "critic/grad_norm": value_results["grad_norm"].numpy(),
-                        "critic/loss": value_results["loss"].numpy(),
-                    }
-
-                    for k, v in value_mb_metrics.items():
-                        if k in {
-                            "lr",
-                            "wd",
-                            "global_valid_seqs",
-                            "global_valid_toks",
-                            "grad_norm",
-                        }:
-                            critic_metrics["critic/" + k] = np.mean(v).item()
-                        elif k in {"values_min"}:
-                            critic_metrics["critic/" + k] = np.min(v).item()
-                        elif k in {"values_max"}:
-                            critic_metrics["critic/" + k] = np.max(v).item()
-                        elif isinstance(v, (np.ndarray, list)):
-                            critic_metrics["critic/" + k] = np.sum(v).item()
-                        else:
-                            raise ValueError(
-                                f"Unknown metric for value don't know how to handle: {k}"
-                            )
-
-                    # Compute explained variance from sufficient statistics:
-                    # EV = 1 - Var(returns - values) / Var(returns)
-                    r_mean = critic_metrics.get("critic/returns_mean", 0)
-                    v_mean = critic_metrics.get("critic/values_mean", 0)
-                    r_sq = critic_metrics.get("critic/returns_sq_mean", 0)
-                    res_sq = critic_metrics.get("critic/residual_sq_mean", 0)
-                    var_returns = r_sq - r_mean**2
-                    var_residual = res_sq - (r_mean - v_mean) ** 2
-                    critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(
-                        var_returns, 1e-8
-                    )
-
-                    metrics.update(critic_metrics)
+                    metrics.update(_compute_critic_metrics(value_results))
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
@@ -1493,6 +1754,7 @@ def ppo_train(
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
+                metrics.update(seq_logprob_error_metrics)
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += metrics["global_valid_toks"]
 
@@ -1626,6 +1888,7 @@ def ppo_train(
             print("\n📊 Training Results:")
             if train_results is not None:
                 print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
+                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
             if value_results is not None:
                 print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
                 print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
@@ -1718,6 +1981,1069 @@ def ppo_train(
     checkpointer.shutdown()
 
 
+def _async_ppo_generation_lead_steps(
+    *,
+    step: int,
+    policy_training_start_step: int,
+    max_trajectory_age_steps: int,
+    warmup_max_trajectory_age_steps: int,
+) -> int:
+    """Return the collector lead without crossing the safe warmup frontier."""
+    if step >= policy_training_start_step:
+        return max_trajectory_age_steps
+
+    max_warmup_target = policy_training_start_step + max_trajectory_age_steps
+    remaining_to_frontier = max_warmup_target - step
+    return max(
+        max_trajectory_age_steps,
+        min(warmup_max_trajectory_age_steps, remaining_to_frontier),
+    )
+
+
+def _async_ppo_buffer_max_age(
+    *,
+    step: int,
+    policy_training_start_step: int,
+    max_trajectory_age_steps: int,
+    warmup_max_trajectory_age_steps: int,
+) -> int:
+    """Keep frozen-policy rollouts valid through their safe training frontier."""
+    warmup_rollout_frontier = policy_training_start_step + max_trajectory_age_steps
+    if policy_training_start_step > 0 and step <= warmup_rollout_frontier:
+        return warmup_max_trajectory_age_steps
+    return max_trajectory_age_steps
+
+
+class _CyclingDataLoader:
+    """Repeat a PPO dataloader until collection stops."""
+
+    def __init__(self, dataloader: StatefulDataLoader) -> None:
+        self.dataloader = dataloader
+
+    def __iter__(self) -> Iterator[BatchedDataDict]:
+        consecutive_empty_epochs = 0
+        while True:
+            produced_this_epoch = False
+            for batch in self.dataloader:
+                produced_this_epoch = True
+                yield batch
+
+            if produced_this_epoch:
+                consecutive_empty_epochs = 0
+            else:
+                consecutive_empty_epochs += 1
+                if consecutive_empty_epochs >= 2:
+                    raise RuntimeError(
+                        "Dataloader yielded no batches for two consecutive epochs"
+                    )
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.dataloader.state_dict()
+
+
+def async_ppo_train(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    value_model: ValueInterface,
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    value_loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    ppo_save_state: PPOSaveState,
+    master_config: MasterConfig,
+) -> None:
+    """Run PPO while a background collector fills a replay buffer."""
+    # ------------------------------------------------------------------
+    # Entry guards (fail loud at startup, not deep in the loop)
+    # ------------------------------------------------------------------
+    generation_config = master_config.policy["generation"]
+    backend = generation_config.get("backend", "") if generation_config else ""
+    if backend != "vllm" or not _should_use_async_rollouts(master_config):
+        raise ValueError(
+            "Async PPO requires policy.generation.backend=vllm and "
+            "policy.generation.vllm_cfg.async_engine=true"
+        )
+    if not master_config.loss_fn.use_importance_sampling_correction:
+        raise ValueError(
+            "Async PPO requires loss_fn.use_importance_sampling_correction=true"
+        )
+    if master_config.loss_fn.force_on_policy_ratio:
+        raise ValueError("Async PPO does not support force_on_policy_ratio=true")
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    if colocated_inference:
+        raise ValueError("Async PPO requires non-colocated generation")
+
+    async_config = master_config.ppo["async_ppo"]
+    max_trajectory_age_steps = async_config.max_trajectory_age_steps
+    warmup_max_trajectory_age_steps = (
+        async_config.effective_warmup_max_trajectory_age_steps
+    )
+    policy_training_start_step = master_config.ppo["policy_training_start_step"]
+    if master_config.ppo["ppo_epochs"] < 1:
+        raise ValueError("ppo.ppo_epochs must be at least 1")
+    # Keep launcher restrictions here as defensive checks for direct callers.
+    if master_config.env.get("should_use_nemo_gym"):
+        raise NotImplementedError("NeMo Gym rollout is not supported for async PPO")
+    if master_config.ppo["use_dynamic_sampling"]:
+        raise NotImplementedError("Dynamic sampling is not supported for async PPO")
+    if master_config.ppo["reward_scaling"]["enabled"]:
+        raise NotImplementedError("Reward scaling is not supported for async PPO")
+    if master_config.ppo["reward_shaping"]["enabled"]:
+        raise NotImplementedError("Reward shaping is not supported for async PPO")
+    if master_config.data["use_multiple_dataloader"]:
+        raise NotImplementedError(
+            "Multiple dataloaders are not supported for async PPO"
+        )
+    if max_trajectory_age_steps > 1:
+        print(
+            "⚠️ WARNING: max_trajectory_age_steps > 1 increases off-policy "
+            "bias in GAE. The validated/recommended value is 1."
+        )
+
+    # Import async utilities only when needed (heavy Ray actors).
+    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+
+    timer = Timer(context={"worker": "driver"})
+    training_wall_start = time.perf_counter()
+    timeout = TimeoutChecker(
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
+    # PPO async always uses non-colocated vLLM generation, so a refit is always
+    # required and the generation engine is a real (non-None) actor.
+    assert policy_generation is not None
+    if getattr(policy_generation, "requires_kv_scale_sync", False):
+        raise NotImplementedError("FP8 KV-scale synchronization is not supported yet")
+
+    if master_config.ppo.get("skip_reference_policy_logprobs_calculation"):
+        if master_config.loss_fn.reference_policy_kl_penalty != 0:
+            raise ValueError(
+                "Skipping reference logprobs requires "
+                "loss_fn.reference_policy_kl_penalty=0"
+            )
+
+    # ------------------------------------------------------------------
+    # Training state. `step` is the global monotonic training step; it is what
+    # max_num_steps bounds and what the replay-buffer weight versioning tracks.
+    # ------------------------------------------------------------------
+    step = ppo_save_state["total_steps"]
+    weight_version = step
+    consumed_samples = ppo_save_state["consumed_samples"]
+    total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
+    max_num_steps = master_config.ppo["max_num_steps"]
+    ppo_epochs = master_config.ppo["ppo_epochs"]
+    val_period = master_config.ppo["val_period"]
+    val_at_start = master_config.ppo["val_at_start"]
+    val_at_end = master_config.ppo["val_at_end"]
+    num_prompts_per_step = master_config.ppo["num_prompts_per_step"]
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    max_training_steps = max_num_steps
+
+    replay_buffer: Any = None
+    trajectory_collector: Any = None
+
+    def _shutdown_workers(*, propagate_checkpoint_error: bool) -> None:
+        """Finalize pending saves and stop async PPO workers."""
+        checkpoint_error = None
+        try:
+            checkpointer.shutdown()
+        except Exception as error:
+            checkpoint_error = error
+            print(f"Error finalizing pending checkpoint: {error}")
+
+        print("🛑 Stopping trajectory collection...")
+        for actor, actor_name in (
+            (trajectory_collector, "trajectory collector"),
+            (replay_buffer, "replay buffer"),
+        ):
+            if actor is None:
+                continue
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"Error stopping {actor_name}: {error}")
+
+        for env_dict in (task_to_env, val_task_to_env):
+            if env_dict is None:
+                continue
+            for task_name, env in env_dict.items():
+                print(f"🛑 Shutting down environment {task_name}...")
+                try:
+                    ray.get(env.shutdown.remote(), timeout=10)
+                except Exception:
+                    try:
+                        ray.kill(env)
+                    except Exception as error:
+                        print(f"Error shutting down environment {task_name}: {error}")
+
+        print("🛑 Shutting down generation workers...")
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation workers: {error}")
+        if policy is not policy_generation:
+            print("🛑 Shutting down policy workers...")
+            try:
+                policy.shutdown()
+            except Exception as error:
+                print(f"Error shutting down policy workers: {error}")
+        print("🛑 Shutting down value workers...")
+        try:
+            value_model.shutdown()
+        except Exception as error:
+            print(f"Error shutting down value workers: {error}")
+
+        if checkpoint_error is not None and propagate_checkpoint_error:
+            raise checkpoint_error
+
+    if step >= max_training_steps:
+        print(
+            f"Training is already complete at step {step} "
+            f"(configured limit: {max_training_steps})"
+        )
+        _shutdown_workers(propagate_checkpoint_error=True)
+        return
+
+    adv_estimator = _create_advantage_estimator(master_config)
+
+    # ------------------------------------------------------------------
+    # Spin up the replay buffer + trajectory collector Ray actors.
+    # ------------------------------------------------------------------
+    late_arrival_slack = 2
+    buffer_age = max(
+        max_trajectory_age_steps,
+        warmup_max_trajectory_age_steps,
+    )
+    optimal_buffer_size = num_prompts_per_step * buffer_age * late_arrival_slack
+    print("📊 Async PPO buffer requirements:")
+    print(f"   - num_prompts_per_step: {num_prompts_per_step}")
+    print(f"   - max_trajectory_age_steps: {max_trajectory_age_steps}")
+    print(f"   - warmup_max_trajectory_age_steps: {warmup_max_trajectory_age_steps}")
+    print(f"   - optimal_buffer_size: {optimal_buffer_size}")
+
+    replay_buffer = ReplayBuffer.options(
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.algorithms.async_utils.ReplayBuffer"
+        )
+    ).remote(
+        max_size=optimal_buffer_size,
+        drop_incomplete_targets_on_restore=(
+            async_config.drop_incomplete_targets_on_restore
+        ),
+    )
+
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if last_checkpoint_path is not None:
+        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
+        if os.path.exists(replay_buffer_path):
+            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+            # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
+            # not plain tensors. The checkpoint is a trusted same-job artifact.
+            replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
+            restore_max_age = _async_ppo_buffer_max_age(
+                step=step,
+                policy_training_start_step=policy_training_start_step,
+                max_trajectory_age_steps=max_trajectory_age_steps,
+                warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+            )
+            ray.get(
+                replay_buffer.load_state_dict.remote(
+                    replay_buffer_state,
+                    num_prompts_per_step=num_prompts_per_step,
+                    current_training_step=step,
+                    max_age_steps=restore_max_age,
+                )
+            )
+            print("✅ Replay buffer restored from checkpoint")
+        else:
+            print(
+                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+                "Starting with an empty replay buffer."
+            )
+
+    trajectory_collector = AsyncTrajectoryCollector.options(
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
+        )
+    ).remote(
+        policy_generation=policy_generation,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        master_config=master_config,
+        replay_buffer=replay_buffer,
+        start_step=step,
+    )
+
+    def _raise_if_collector_stopped(waiting_for: str) -> None:
+        status = ray.get(trajectory_collector.get_status.remote())
+        if status["errored"]:
+            raise RuntimeError(
+                f"Trajectory collector failed while {waiting_for}: "
+                f"{status.get('error') or status}"
+            )
+        if (
+            not status["running"]
+            and status["inflight_workers"] == 0
+            and status["data_exhausted"]
+        ):
+            raise RuntimeError(
+                "Trajectory collector exhausted data before the configured "
+                f"training limit while {waiting_for}: {status}"
+            )
+
+    try:
+        # Refit first so resumed runs cannot generate with stale base weights.
+        print("⏳ Preparing policy generation for training (initial refit)...")
+        refit_policy_generation(policy, policy_generation, colocated_inference)
+        policy.offload_to_cpu()
+
+        if val_at_start and step == 0:
+            print("\n🔍 Running initial validation...")
+            val_metrics, validation_timings = validate(
+                policy_generation,
+                val_dataloader,
+                tokenizer,
+                val_task_to_env,
+                step=0,
+                master_config=master_config,
+                logger=logger,
+            )
+            policy_generation.finish_generation()
+            logger.log_metrics(val_metrics, step, prefix="validation")
+            logger.log_metrics(validation_timings, step, prefix="timing/validation")
+
+        policy_generation.clear_logger_metrics()
+
+        initial_generation_lead = _async_ppo_generation_lead_steps(
+            step=step,
+            policy_training_start_step=policy_training_start_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+        )
+        initial_buffer_max_age = _async_ppo_buffer_max_age(
+            step=step,
+            policy_training_start_step=policy_training_start_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+        )
+        ray.get(
+            trajectory_collector.set_generation_window.remote(
+                weight_version=weight_version,
+                generation_lead_steps=initial_generation_lead,
+                max_trajectory_age_steps=initial_buffer_max_age,
+            )
+        )
+        ray.get(
+            trajectory_collector.start_collection.remote(_CyclingDataLoader(dataloader))
+        )
+        print("📦 Started continuous background trajectory collection")
+
+        print(f"⏳ Waiting for replay buffer to be ready for step {step}...")
+        timer.start("init/total")
+        wait_iterations = 0
+        while True:
+            current_step_ready = ray.get(
+                replay_buffer.has_complete_batch.remote(
+                    step, num_prompts_per_step, initial_buffer_max_age
+                )
+            )
+            if current_step_ready:
+                # The initial collector is the only window that can generate
+                # both `step` and `step + 1`. Fill both before the first refit.
+                need_lookahead = step + 1 < max_training_steps
+                if need_lookahead:
+                    lookahead_step_ready = ray.get(
+                        replay_buffer.has_complete_batch.remote(
+                            step + 1,
+                            num_prompts_per_step,
+                            initial_buffer_max_age,
+                        )
+                    )
+                    if not lookahead_step_ready:
+                        if wait_iterations % 10 == 0:
+                            print(
+                                f"  Pipeline barrier: step {step} ready but "
+                                f"step {step + 1} not yet — waiting for lookahead fill"
+                            )
+                        _raise_if_collector_stopped(
+                            "waiting for the initial replay lookahead batch"
+                        )
+                        wait_iterations += 1
+                        time.sleep(1.0)
+                        continue
+                break
+            if wait_iterations % 10 == 0:
+                buffer_size_current = ray.get(replay_buffer.size.remote())
+                print(
+                    f"  Wait iteration {wait_iterations}: "
+                    f"buffer_size={buffer_size_current}, "
+                    f"step {step} ready={current_step_ready}"
+                )
+            _raise_if_collector_stopped("waiting for the initial replay batch")
+            wait_iterations += 1
+            time.sleep(1.0)
+        timer.stop("init/total")
+        print(f"✅ Buffer ready for step {step}! Starting async PPO training loop...")
+    except Exception:
+        _shutdown_workers(propagate_checkpoint_error=False)
+        raise
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+    loop_failed = False
+    try:
+        while step < max_training_steps:
+            print(f"\n{'=' * 25} Step {step + 1}/{max_training_steps} {'=' * 25}")
+            maybe_gpu_profile_step(policy, step + 1)
+            if policy != policy_generation:
+                maybe_gpu_profile_step(policy_generation, step + 1)
+
+            metrics: dict[str, Any] = {}
+            val_metrics, validation_timings = None, None
+
+            with timer.time("total_step_time"):
+                # ---- 1. Sample a fixed batch of trajectories from the buffer ----
+                print("📦 Sampling from replay buffer...")
+                with timer.time("exposed_generation"):
+                    current_buffer_max_age = _async_ppo_buffer_max_age(
+                        step=step,
+                        policy_training_start_step=policy_training_start_step,
+                        max_trajectory_age_steps=max_trajectory_age_steps,
+                        warmup_max_trajectory_age_steps=(
+                            warmup_max_trajectory_age_steps
+                        ),
+                    )
+                    sample_result = ray.get(
+                        replay_buffer.sample.remote(
+                            num_prompt_groups=num_prompts_per_step,
+                            current_weight_version=weight_version,
+                            max_age_steps=current_buffer_max_age,
+                        )
+                    )
+                    if (
+                        sample_result is None
+                        or len(sample_result["trajectories"]) != num_prompts_per_step
+                    ):
+                        print(
+                            "⏳ Buffer empty or not enough groups for a full step, "
+                            "waiting..."
+                        )
+                        _raise_if_collector_stopped(
+                            f"waiting for the replay batch for step {step}"
+                        )
+                        with timer.time("idle/buffer_starvation"):
+                            time.sleep(0.5)
+                        continue
+
+                    trajectories = sample_result["trajectories"]
+                    avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    print(
+                        f"✅ Sampled {len(trajectories)} trajectory groups "
+                        f"(average age: {avg_trajectory_age:.2f} steps)"
+                    )
+
+                    per_prompt_batches = [t["batch"] for t in trajectories]
+                    repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+
+                    per_group_metrics: dict[str, list] = {}
+                    for t in trajectories:
+                        for k, v in t["rollout_metrics"].items():
+                            per_group_metrics.setdefault(k, []).append(v)
+                    rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
+
+                expected_batch_size = (
+                    master_config.ppo["num_prompts_per_step"]
+                    * master_config.ppo["num_generations_per_prompt"]
+                )
+                if repeated_batch.size != expected_batch_size:
+                    raise RuntimeError(
+                        f"Unexpected training batch size: got {repeated_batch.size}, "
+                        f"expected {expected_batch_size}"
+                    )
+
+                # ---- 2. Build PPO training data (rewards + inline loss mask) ----
+                print("▶ Processing rewards...")
+                with timer.time("data_processing"):
+                    rewards = repeated_batch["total_reward"]
+
+                    use_overlong_filtering = master_config.ppo["overlong_filtering"]
+                    if use_overlong_filtering:
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        truncated = repeated_batch["truncated"]
+                        if isinstance(truncated, list):
+                            truncated = torch.tensor(truncated, dtype=torch.bool)
+                        loss_multiplier[truncated] = 0
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # PPO's inline loss-mask setup (unmask all assistant messages),
+                    # matching sync ppo_train — deliberately NOT GRPO's helper,
+                    # which only unmasks generated assistant messages.
+                    for message_log in repeated_batch["message_log"]:
+                        for message in message_log:
+                            if message["role"] == "assistant":
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
+                            else:
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
+                            if "generation_logprobs" not in message:
+                                message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
+
+                    flat_messages, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=master_config.policy[
+                            "make_sequence_length_divisible_by"
+                        ],
+                    )
+
+                    train_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": flat_messages["token_ids"],
+                            "input_lengths": input_lengths,
+                            "generation_logprobs": flat_messages["generation_logprobs"],
+                            "rewards": repeated_batch["total_reward"],
+                            "token_mask": flat_messages["token_loss_mask"],
+                            "sample_mask": repeated_batch["loss_multiplier"],
+                        }
+                    )
+                    extra_multimodal_data = flat_messages.get_multimodal_dict(
+                        as_tensors=False
+                    )
+                    train_data.update(extra_multimodal_data)
+                    train_data.to("cpu")
+
+                # ---- 3. Value forward (critic on GPU, then offloaded) ----
+                # GPU state entering here: policy OFF, value OFF (see refit/step
+                # end below). Load value only.
+                print("▶ Computing values...")
+                with timer.time("value_inference"):
+                    value_model.prepare_for_inference()
+                    train_data["values"] = value_model.get_values(train_data)[
+                        "values"
+                    ].squeeze(-1)
+                    value_model.finish_inference()
+
+                # ---- 4. Policy / reference logprobs (policy on GPU, then off) ----
+                print("▶ Computing logprobs...")
+                with timer.time("logprob_inference_prep"):
+                    policy.prepare_for_lp_inference()
+                with timer.time("policy_and_reference_logprobs"):
+                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": train_data["input_ids"],
+                            "input_lengths": train_data["input_lengths"],
+                            **extra_multimodal_data,
+                        }
+                    )
+                    train_data["prev_logprobs"] = policy.get_logprobs(
+                        logprob_data, timer=timer
+                    )["logprobs"]
+                    if not master_config.ppo.get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        train_data["reference_policy_logprobs"] = (
+                            policy.get_reference_policy_logprobs(
+                                logprob_data,
+                                timer=timer,
+                            )["reference_logprobs"]
+                        )
+                    del logprob_data
+                    del extra_multimodal_data
+                    policy.finish_inference()
+
+                # ---- 5. Sequence-level train/inference mismatch diagnostics ----
+                (
+                    advantage_mask,
+                    seq_logprob_error_metrics,
+                ) = _apply_ppo_seq_logprob_error_masking(
+                    train_data=train_data,
+                    rewards=rewards,
+                    seq_logprob_error_threshold=master_config.ppo[
+                        "seq_logprob_error_threshold"
+                    ],
+                )
+
+                # ---- 6. GAE advantages/returns (uses fresh values) ----
+                with timer.time("advantage_calculation"):
+                    print("▶ Computing advantages...")
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
+                    )
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        initial_prompt_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del initial_prompt_message_logs
+                    del prompt_batched_flat
+
+                    adv_kwargs = dict(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=train_data["rewards"],
+                        mask=advantage_mask,
+                        reference_logprobs=train_data.get("reference_policy_logprobs"),
+                        logprobs=train_data["prev_logprobs"],
+                    )
+                    if "values" in train_data:
+                        adv_kwargs["values"] = train_data["values"]
+                    result = adv_estimator.compute_advantage(**adv_kwargs)
+                    if isinstance(result, tuple):
+                        advantages, returns = result
+                    else:
+                        advantages, returns = result, None
+                    del prompt_ids_for_adv
+                    train_data["advantages"] = advantages
+                    if returns is not None:
+                        train_data["returns"] = returns
+
+                # ---- 7. ppo_epochs inner loop (critic, then actor) ----
+                # Each epoch: value on GPU -> train -> off. Then, once past critic
+                # warmup, policy on GPU -> train -> off (except the last epoch,
+                # which leaves the policy on GPU for the refit broadcast below).
+                # During warmup (step < policy_training_start_step) the policy is
+                # frozen: it is never loaded/trained here, exactly as in sync
+                # ppo_train, so train_results stays None for the step.
+                is_policy_training_step = step >= policy_training_start_step
+                train_results = None
+                value_results = None
+                for epoch in range(ppo_epochs):
+                    print(f"▶ PPO epoch {epoch + 1}/{ppo_epochs}...")
+                    with timer.time("value_training_prep"):
+                        value_model.prepare_for_training()
+                    with timer.time("value_training"):
+                        value_results = value_model.train(
+                            train_data,
+                            value_loss_fn,
+                            timer=timer,
+                        )
+                        value_model.finish_training()
+
+                    if is_policy_training_step:
+                        if (
+                            step == policy_training_start_step
+                            and policy_training_start_step > 0
+                            and epoch == 0
+                        ):
+                            print(
+                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                                "steps). Starting policy training.",
+                                flush=True,
+                            )
+                        with timer.time("training_prep"):
+                            policy.prepare_for_training()
+                        with timer.time("policy_training"):
+                            train_results = policy.train(
+                                train_data, loss_fn, timer=timer
+                            )
+                            if epoch < ppo_epochs - 1:
+                                policy.offload_to_cpu()
+
+                # ---- 8. Refit once after all PPO epochs ----
+                # Warmup still advances the replay-buffer version, but skips the
+                # transfer because the policy has not changed.
+                generation_logger_metrics = None
+                print("🔄 Coordinating with trajectory collector before refit...")
+                next_weight_version = weight_version + 1
+                with timer.time("idle/refit_bubble"):
+                    with timer.time("exposed_generation"):
+                        ray.get(trajectory_collector.prepare_for_refit.remote())
+                    generation_logger_metrics = policy_generation.get_logger_metrics()
+                    with timer.time("weight_sync"):
+                        if is_policy_training_step:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                        else:
+                            print(
+                                "▶ Critic warmup: skipping policy weight transfer "
+                                "(policy frozen; generation already up to date)"
+                            )
+                        weight_version = next_weight_version
+                        next_generation_lead = _async_ppo_generation_lead_steps(
+                            step=weight_version,
+                            policy_training_start_step=policy_training_start_step,
+                            max_trajectory_age_steps=max_trajectory_age_steps,
+                            warmup_max_trajectory_age_steps=(
+                                warmup_max_trajectory_age_steps
+                            ),
+                        )
+                        next_buffer_max_age = _async_ppo_buffer_max_age(
+                            step=weight_version,
+                            policy_training_start_step=policy_training_start_step,
+                            max_trajectory_age_steps=max_trajectory_age_steps,
+                            warmup_max_trajectory_age_steps=(
+                                warmup_max_trajectory_age_steps
+                            ),
+                        )
+                        ray.get(
+                            trajectory_collector.set_generation_window.remote(
+                                weight_version=weight_version,
+                                generation_lead_steps=next_generation_lead,
+                                max_trajectory_age_steps=next_buffer_max_age,
+                            )
+                        )
+                        ray.get(trajectory_collector.resume_after_refit.remote())
+                # Only the policy-training path leaves the policy resident on GPU;
+                # during warmup it is already offloaded, so skip the redundant call.
+                if is_policy_training_step:
+                    policy.offload_to_cpu()
+
+                policy_generation.clear_logger_metrics()
+
+                # ---- Validation ----
+                is_last_step = step + 1 == max_training_steps
+                if (val_period > 0 and (step + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
+                    with timer.time("idle/validation"):
+                        ray.get(trajectory_collector.pause.remote())
+                        ray.get(
+                            trajectory_collector.wait_for_pending_generations.remote()
+                        )
+                        # Policy weights were synced by the refit above.
+                        policy_generation.prepare_for_generation()
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                        policy_generation.finish_generation()
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        ray.get(trajectory_collector.resume.remote())
+
+                # ---- Metrics ----
+                flat_advantages = train_data["advantages"]
+                flat_messages_content = flat_messages.get("content", [])
+                del flat_messages
+                response_advantages = torch.masked_select(
+                    flat_advantages, advantage_mask.bool()
+                )
+
+                metrics.update(
+                    {
+                        "reward": rewards.numpy(),
+                        "mean_prompt_length": repeated_batch["length"].numpy(),
+                        "total_num_tokens": input_lengths.numpy(),
+                        "advantages/mean": torch.mean(response_advantages)
+                        .detach()
+                        .item()
+                        if response_advantages.numel() > 0
+                        else 0.0,
+                        "advantages/max": torch.max(response_advantages).detach().item()
+                        if response_advantages.numel() > 0
+                        else 0.0,
+                        "advantages/min": torch.min(response_advantages).detach().item()
+                        if response_advantages.numel() > 0
+                        else 0.0,
+                    }
+                )
+                # Policy metrics are absent during critic warmup (train_results is
+                # None because the policy was not trained this step).
+                if train_results is not None:
+                    metrics["loss"] = train_results["loss"].numpy()
+                    metrics["grad_norm"] = train_results["grad_norm"].numpy()
+                    if "moe_metrics" in train_results:
+                        metrics.update(
+                            {
+                                f"moe/{k}": v
+                                for k, v in train_results["moe_metrics"].items()
+                            }
+                        )
+                    metrics.update(train_results["all_mb_metrics"])
+                if value_results is not None:
+                    metrics.update(_compute_critic_metrics(value_results))
+
+                for k, v in metrics.items():
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
+                        "lr",
+                        "wd",
+                        "reward",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    elif isinstance(v, (np.ndarray, list)):
+                        metrics[k] = np.sum(v).item()
+
+                metrics.update(rollout_metrics)
+                if generation_logger_metrics is not None:
+                    metrics["generation_logger_metrics"] = generation_logger_metrics
+                if "global_valid_toks" in metrics:
+                    total_valid_tokens += metrics["global_valid_toks"]
+                # Always log seq-level error metrics (useful for tuning threshold).
+                metrics.update(seq_logprob_error_metrics)
+
+                # ---- Checkpointing ----
+                consumed_samples += master_config.ppo["num_prompts_per_step"]
+                timeout.mark_iteration()
+                should_save_by_step = (
+                    is_last_step
+                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
+                )
+                should_save_by_timeout = timeout.check_save()
+                if master_config.checkpointing["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    ppo_save_state["current_step"] = step + 1
+                    ppo_save_state["total_steps"] = step + 1
+                    ppo_save_state["total_valid_tokens"] = total_valid_tokens
+                    if val_metrics is not None:
+                        ppo_save_state["val_reward"] = val_metrics["accuracy"]
+                    elif "val_reward" in ppo_save_state:
+                        del ppo_save_state["val_reward"]
+                    ppo_save_state["consumed_samples"] = consumed_samples
+
+                    # Record the top-k ranking metric into the save state so
+                    # get_best_checkpoint_path / top-k pruning work (parity with
+                    # sync ppo_train and async_grpo_train).
+                    full_metric_name = master_config.checkpointing["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                        )
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
+                                stacklevel=2,
+                            )
+                            if full_metric_name in ppo_save_state:
+                                del ppo_save_state[full_metric_name]
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            ppo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
+
+                    with timer.time("checkpointing"):
+                        print(f"Saving checkpoint for step {step + 1}...")
+                        checkpoint_path = checkpointer.init_tmp_checkpoint(
+                            step + 1, ppo_save_state, master_config
+                        )
+                        policy.prepare_for_training()
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "policy", "optimizer")
+                                if (
+                                    checkpointer.save_optimizer
+                                    and step >= policy_training_start_step
+                                )
+                                else None
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config.checkpointing,
+                        )
+                        policy.offload_to_cpu()
+
+                        value_model.prepare_for_training()
+                        value_model.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "value", "weights"
+                            ),
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "value", "optimizer")
+                                if checkpointer.save_optimizer
+                                else None
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "value", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config.checkpointing,
+                        )
+                        value_model.finish_training()
+
+                        dataloader_state = ray.get(
+                            trajectory_collector.get_dataloader_state.remote()
+                        )
+                        torch.save(
+                            dataloader_state,
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        print("📦 Saving replay buffer state...")
+                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
+                        torch.save(
+                            replay_buffer_state,
+                            os.path.join(checkpoint_path, "replay_buffer.pt"),
+                        )
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
+
+            # ---- Logging ----
+            log_data = {
+                "content": flat_messages_content,
+                "rewards": rewards.tolist(),
+                "input_lengths": input_lengths.tolist(),
+                "token_ids": train_data["input_ids"].tolist(),
+                "token_loss_mask": train_data["token_mask"].tolist(),
+                "sample_loss_mask": train_data["sample_mask"].tolist(),
+                "advantages": train_data["advantages"].tolist(),
+                "generation_logprobs": train_data["generation_logprobs"].tolist(),
+                "prev_logprobs": train_data["prev_logprobs"].tolist(),
+            }
+            logger.log_batched_dict_as_jsonl(
+                log_data, f"train_data_step{step + 1}.jsonl"
+            )
+            del log_data
+            del flat_messages_content
+
+            timing_metrics: dict[str, float] = timer.get_timing_metrics(
+                reduction_op="sum"
+            )  # type: ignore
+
+            buffer_size_current = ray.get(replay_buffer.size.remote())
+            metrics["buffer_size"] = buffer_size_current
+            metrics["avg_trajectory_age"] = avg_trajectory_age
+
+            # Track the worst-mismatch example plot (parity with sync PPO).
+            if metrics.get("token_mult_prob_error", 0) > 1.05:
+                logger.log_plot_token_mult_prob_error(
+                    {
+                        "prompt_lengths": repeated_batch["length"],
+                        "full_lengths": input_lengths,
+                        "generation_logprobs": train_data["generation_logprobs"],
+                        "prev_logprobs": train_data["prev_logprobs"],
+                        "token_mask": train_data["token_mask"],
+                        "sample_mask": train_data["sample_mask"],
+                    },
+                    step + 1,
+                    name="train/token_mult_prob_error_plot_sample",
+                )
+            del train_data
+
+            print("\n📊 Training Results:")
+            if "loss" in metrics:
+                print(f"  • Loss: {metrics['loss']:.4f}")
+                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
+            else:
+                print("  • (critic warmup: policy not trained this step)")
+            if "critic/loss" in metrics:
+                print(f"  • Critic Loss: {metrics['critic/loss']:.4f}")
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(f"  • Buffer Size: {buffer_size_current}")
+            print(
+                f"  • Avg Trajectory Age (gen-version): {avg_trajectory_age:.2f} steps"
+            )
+
+            total_time = timing_metrics.get("total_step_time", 0)
+            total_num_gpus = (
+                master_config.cluster["num_nodes"]
+                * master_config.cluster["gpus_per_node"]
+            )
+            if total_time > 0 and "global_valid_toks" in metrics:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics["global_valid_toks"] / total_time / total_num_gpus
+                )
+            performance_metrics = print_performance_metrics(
+                train_results if train_results is not None else (value_results or {}),
+                metrics,
+                timing_metrics,
+                master_config,
+            )
+
+            collector_efficiency = ray.get(
+                trajectory_collector.get_efficiency_metrics.remote()
+            )
+            driver_efficiency = {
+                cat: timer.reduce(cat, "sum")
+                for cat in [
+                    "init/total",
+                    "idle/buffer_starvation",
+                    "idle/refit_bubble",
+                    "idle/validation",
+                ]
+                if cat in timer._timers
+            }
+            merged_efficiency = {**driver_efficiency}
+            for cat, dur in collector_efficiency.items():
+                merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
+            total_wall_time = time.perf_counter() - training_wall_start
+            efficiency_loggable = print_efficiency_summary(
+                merged_efficiency, total_wall_time, step + 1
+            )
+
+            logger.log_metrics(performance_metrics, step + 1, prefix="performance")
+            logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(efficiency_loggable, step + 1, prefix="")
+            logger.log_metrics(
+                timing_metrics,
+                step + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
+
+            timer.reset()
+            step += 1
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
+            if step >= max_training_steps:
+                print(
+                    "Configured step/epoch limit has been reached, stopping training",
+                    flush=True,
+                )
+                return
+
+    except Exception as e:
+        loop_failed = True
+        print(f"❌ Error in async PPO loop: {e}")
+        traceback.print_exc()
+        raise
+
+    finally:
+        _shutdown_workers(propagate_checkpoint_error=not loop_failed)
+        print("Async PPO training complete!")
+
+
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
@@ -1752,11 +3078,16 @@ def validate(
 
             additional_metrics_to_report = dict()
 
-            val_batch, gen_metrics = run_multi_turn_rollout(
-                policy_generation,
-                val_batch,
-                tokenizer,
-                val_task_to_env,
+            rollout_fn = (
+                run_async_multi_turn_rollout
+                if _should_use_async_rollouts(master_config)
+                else run_multi_turn_rollout
+            )
+            val_batch, gen_metrics = rollout_fn(
+                policy_generation=policy_generation,
+                input_batch=val_batch,
+                tokenizer=tokenizer,
+                task_to_env=val_task_to_env,
                 max_seq_len=master_config.policy["max_total_sequence_length"],
                 max_rollout_turns=master_config.ppo["max_rollout_turns"],
                 greedy=False,

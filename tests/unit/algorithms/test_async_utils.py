@@ -38,6 +38,7 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
     MasterConfig,
     _get_next_nemo_gym_task_index,
     add_grpo_token_loss_masks_and_generation_logprobs,
@@ -177,6 +178,26 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_trajectories_needed(2, 2) == 0
         assert buffer.get_trajectories_needed(3, 2) == 1
 
+    def test_local_restore_can_drop_incomplete_frontier(self):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=True,
+        )
+        state = self._state(
+            trajectory_versions=[1, 1, 2],
+            target_weight_versions=[2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2]
+        assert buffer.get_trajectories_needed(3, 2) == 2
+
     def test_local_restore_empty_state_resets_generation_watermark(self):
         buffer = ReplayBufferImpl(max_size=10)
         state = self._state(
@@ -214,6 +235,27 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_debug_info()["target_weight_versions"] == [5]
         assert not buffer.has_complete_batch(5, 2)
         assert buffer.get_trajectories_needed(5, 2) == 1
+
+    def test_local_restore_drops_target_made_incomplete_by_stale_filter(self):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=True,
+        )
+        state = self._state(
+            trajectory_versions=[4, 1],
+            target_weight_versions=[5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_trajectories_needed(5, 2) == 2
 
     def test_local_restore_truncates_after_resume_cleanup(self):
         buffer = ReplayBufferImpl(max_size=2)
@@ -1040,11 +1082,11 @@ class TestReplayBuffer:
         ray.kill(buffer2)
 
     def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose the async-GRPO resume deadlock.
+        """Regression: restored buffer can expose an async resume deadlock.
 
         After PR #2651 introduced replay-buffer checkpointing, resuming from a
-        checkpoint where target N is complete but target N+1 is absent caused an
-        async-GRPO deadlock:
+        checkpoint where target N is complete but target N+1 is absent can
+        deadlock Async GRPO or Async PPO:
 
           1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
           2. Training consumes all target-N trajectories and triggers a refit.
@@ -1140,7 +1182,6 @@ class TestAsyncTrajectoryCollector:
         collector.running = True
 
     def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
-        """for...else path: iterator drains cleanly -> data_exhausted, not errored."""
         collector = self.create_local_collector()
         self._prime_collection_loop(collector)
         processed = []
@@ -1174,6 +1215,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.data_exhausted is False
         status = collector.get_status()
         assert status["errored"] is True
+        assert status["error"] == "RuntimeError: collection blew up"
         assert status["data_exhausted"] is False
         assert status["running"] is False
 
@@ -1203,7 +1245,7 @@ class TestAsyncTrajectoryCollector:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
                 "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 2},
+                "async_grpo": AsyncGRPOConfig(max_trajectory_age_steps=2),
             },
             "policy": {
                 "max_total_sequence_length": 512,
@@ -1216,6 +1258,82 @@ class TestAsyncTrajectoryCollector:
             },
         }
         return MasterConfig.model_construct(**config)
+
+    def test_collector_selects_ppo_config(self):
+        """The shared collector derives PPO settings from its master config."""
+        from nemo_rl.algorithms.ppo import (
+            AsyncPPOConfig,
+        )
+        from nemo_rl.algorithms.ppo import (
+            MasterConfig as PPOMasterConfig,
+        )
+
+        async_config = AsyncPPOConfig(
+            max_trajectory_age_steps=3,
+            warmup_max_trajectory_age_steps=5,
+            in_flight_weight_updates=False,
+            recompute_kv_cache_after_weight_updates=True,
+        )
+        master_config = PPOMasterConfig.model_construct(
+            policy={"make_sequence_length_divisible_by": 1},
+            ppo={
+                "num_prompts_per_step": 2,
+                "num_generations_per_prompt": 4,
+                "max_rollout_turns": 1,
+                "async_ppo": async_config,
+            },
+        )
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+        )
+
+        assert collector.algorithm_config is master_config.ppo
+        assert collector.async_config is async_config
+        assert collector.async_config.max_trajectory_age_steps == 3
+
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+        collector.resume_after_refit()
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+
+        collector.set_generation_window(
+            weight_version=2,
+            generation_lead_steps=3,
+            max_trajectory_age_steps=5,
+        )
+        assert collector.current_weight_version == 2
+        assert collector._generation_lead_steps == 3
+        assert collector._max_trajectory_age_steps == 5
+        assert collector._calculate_target_weights(2) == [3, 4, 5]
+
+    def test_collector_grpo_window_remains_fixed(self):
+        collector = self.create_local_collector()
+
+        assert collector.current_weight_version == 0
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(0) == [0, 1, 2]
+
+        collector.set_weight_version(5)
+
+        assert collector.current_weight_version == 5
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(5) == [6, 7]
+
+    def test_collector_rejects_generation_lead_above_validity_age(self):
+        collector = self.create_local_collector()
+
+        with pytest.raises(ValueError, match="max_trajectory_age_steps"):
+            collector.set_generation_window(
+                weight_version=1,
+                generation_lead_steps=3,
+                max_trajectory_age_steps=2,
+            )
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
@@ -1344,9 +1462,8 @@ class TestAsyncTrajectoryCollector:
     def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
         """Test resume after refit invalidates cache without in-flight updates."""
         collector = self.create_local_collector()
-        async_cfg = collector.master_config.grpo["async_grpo"]
-        async_cfg["in_flight_weight_updates"] = False
-        async_cfg["recompute_kv_cache_after_weight_updates"] = True
+        collector.async_config.in_flight_weight_updates = False
+        collector.async_config.recompute_kv_cache_after_weight_updates = True
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
         collector.resume_after_refit()
@@ -1356,9 +1473,8 @@ class TestAsyncTrajectoryCollector:
     def test_resume_after_refit_skips_cache_invalidation_when_recompute_disabled(self):
         """Test resume after refit skips cache invalidation when recompute is disabled."""
         collector = self.create_local_collector()
-        async_cfg = collector.master_config.grpo["async_grpo"]
-        async_cfg["in_flight_weight_updates"] = True
-        async_cfg["recompute_kv_cache_after_weight_updates"] = False
+        collector.async_config.in_flight_weight_updates = True
+        collector.async_config.recompute_kv_cache_after_weight_updates = False
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
         collector.resume_after_refit()
@@ -1908,7 +2024,7 @@ class TestAsyncUtilsIntegration:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
                 "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 1},
+                "async_grpo": AsyncGRPOConfig(max_trajectory_age_steps=1),
             },
             "policy": {
                 "max_total_sequence_length": 512,
