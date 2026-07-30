@@ -25,6 +25,13 @@ from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.failures import (
+    FailureClass,
+    GenerationUnavailable,
+    RolloutDataFailure,
+    RolloutFailure,
+    classify_rollout_failure,
+)
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
@@ -42,6 +49,54 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _classify_generation_failure(
+    exc: Exception, *, prompt_idx: Any, traj_idx: int
+) -> RolloutFailure:
+    """Wrap a generation error in the typed failure its class implies.
+
+    The original exception is preserved as ``__cause__``; the prompt and trajectory
+    coordinates are attached because a raw generation traceback does not say which
+    rollout it belonged to.
+
+    Args:
+        exc: The exception raised while generating a turn.
+        prompt_idx: Index of the prompt whose rollout failed.
+        traj_idx: Index of the failing generation within the prompt group.
+
+    Returns:
+        ``GenerationUnavailable`` for infrastructure failures (retriable on another
+        shard), ``RolloutDataFailure`` otherwise.
+    """
+    detail = f"prompt_idx={prompt_idx} traj_idx={traj_idx}: {type(exc).__name__}: {exc}"
+    if classify_rollout_failure(exc) is FailureClass.INFRA:
+        return GenerationUnavailable(f"generation unavailable for {detail}")
+    return RolloutDataFailure(f"generation failed for {detail}")
+
+
+async def _gather_cancelling_siblings(coros: list[Any]) -> list[Any]:
+    """Gather coroutines, cancelling the remainder as soon as one fails.
+
+    ``asyncio.gather`` propagates the first exception but leaves the other awaitables
+    running detached. On the rollout path those keep occupying generation capacity for
+    a prompt group whose result is already being discarded, so they are cancelled and
+    drained before unwinding.
+
+    Args:
+        coros: Coroutines to run concurrently.
+
+    Returns:
+        Their results, in input order.
+    """
+    tasks = [asyncio.ensure_future(coro) for coro in coros]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 class AsyncRolloutImpl:
@@ -82,13 +137,11 @@ class AsyncRolloutImpl:
         timer.start(f"{timer_prefix}/total")
 
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results = list(
-                await asyncio.gather(
-                    *[
-                        self._run_single_rollout(input_sample, traj_idx)
-                        for traj_idx in range(self._num_generations_per_prompt)
-                    ]
-                )
+            results = await _gather_cancelling_siblings(
+                [
+                    self._run_single_rollout(input_sample, traj_idx)
+                    for traj_idx in range(self._num_generations_per_prompt)
+                ]
             )
             completions = [c for c, _ in results]
             all_sample_metrics = [m for _, m in results]
@@ -143,7 +196,10 @@ class AsyncRolloutImpl:
 
             turn_count += 1
 
-            # Generate response for this sample using async generation
+            # Generate response for this sample using async generation.
+            # A failure here must not be absorbed: returning a partial completion
+            # would commit a zero-reward row that still counts toward this prompt
+            # group's GRPO baseline, silently biasing every sibling's advantage.
             try:
                 (
                     assistant_message,
@@ -153,32 +209,31 @@ class AsyncRolloutImpl:
                     current_message_log,
                     current_stop_strings,
                 )
-                current_message_log.append(assistant_message)
-
-                # Check if response was truncated (hit max_tokens without stop token)
-                response_truncated = gen_metrics.pop("_response_truncated", None)
-                if response_truncated is not None and response_truncated[0]:
-                    truncated = True
-
-                # Update token counts
-                gen_token_count = len(assistant_message["token_ids"])
-                assistant_token_count += gen_token_count
-                total_token_count += gen_token_count
-                turn_gen_tokens.append(gen_token_count)
-                turn_input_tokens.append(int(input_lengths))
-                turn_total_tokens.append(int(input_lengths) + gen_token_count)
-                # Per-worker load accounting
-                if "gen_leader_worker_idx" in gen_metrics:
-                    worker_idx = int(gen_metrics["gen_leader_worker_idx"])
-                    per_worker_token_counts[worker_idx] = (
-                        per_worker_token_counts.get(worker_idx, 0) + gen_token_count
-                    )
-
             except Exception as e:
-                print(
-                    f"Error generating response for prompt_idx {input_sample['idx']}, traj_idx {traj_idx}: {e}"
+                raise _classify_generation_failure(
+                    e, prompt_idx=input_sample["idx"], traj_idx=traj_idx
+                ) from e
+
+            current_message_log.append(assistant_message)
+
+            # Check if response was truncated (hit max_tokens without stop token)
+            response_truncated = gen_metrics.pop("_response_truncated", None)
+            if response_truncated is not None and response_truncated[0]:
+                truncated = True
+
+            # Update token counts
+            gen_token_count = len(assistant_message["token_ids"])
+            assistant_token_count += gen_token_count
+            total_token_count += gen_token_count
+            turn_gen_tokens.append(gen_token_count)
+            turn_input_tokens.append(int(input_lengths))
+            turn_total_tokens.append(int(input_lengths) + gen_token_count)
+            # Per-worker load accounting
+            if "gen_leader_worker_idx" in gen_metrics:
+                worker_idx = int(gen_metrics["gen_leader_worker_idx"])
+                per_worker_token_counts[worker_idx] = (
+                    per_worker_token_counts.get(worker_idx, 0) + gen_token_count
                 )
-                break
 
             # Create single-sample batch for environment interaction
             sample_batch = BatchedDataDict[DatumSpec](
@@ -333,7 +388,9 @@ class AsyncRolloutImpl:
                 gen_metrics["gen_leader_worker_idx"] = (
                     int(v[0]) if isinstance(v, list) else int(v)
                 )
-            except Exception as e:
+            except (IndexError, TypeError, ValueError) as e:
+                # Load-accounting metric only -- a malformed value must not fail the
+                # rollout, but the catch stays narrow so a real error still surfaces.
                 print(f"Error extracting gen_leader_worker_idx: {e}")
         if "truncated" in output:
             gen_metrics["_response_truncated"] = output["truncated"]
