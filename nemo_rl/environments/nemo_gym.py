@@ -131,9 +131,13 @@ def _detect_invalid_tool_call_and_malformed_thinking(
         (is_invalid_tool_call, has_malformed_thinking).
     """
     invalid_tool_call_patterns = (
-        invalid_tool_call_patterns or DEFAULT_INVALID_TOOL_CALL_PATTERNS
+        DEFAULT_INVALID_TOOL_CALL_PATTERNS
+        if invalid_tool_call_patterns is None
+        else invalid_tool_call_patterns
     )
-    thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
+    thinking_tags = (
+        DEFAULT_THINKING_TAGS if thinking_tags is None else thinking_tags
+    )
 
     is_output_message = (
         "content" in output_item_dict
