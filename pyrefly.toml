@@ -163,6 +163,7 @@ project-includes = [
   "nemo_rl/models/dtensor/parallelize.py",
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
+  "nemo_rl/models/generation/fleet_health.py",
   "nemo_rl/models/generation/interfaces.py",
   "nemo_rl/models/generation/megatron/__init__.py",
   "nemo_rl/models/generation/megatron/config.py",
