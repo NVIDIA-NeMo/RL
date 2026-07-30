@@ -478,7 +478,6 @@ Depending on your data shape, you may want to change these values."""
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
-        nemo_gym_row: dict,
         nemo_gym_result: dict,
         tokenizer: PreTrainedTokenizerBase,
     ) -> dict:
