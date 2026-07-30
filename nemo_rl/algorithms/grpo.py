@@ -259,6 +259,12 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
+    # Early stop: end training once the chosen validation metric reaches
+    # this threshold; null disables early stopping.
+    stop_at_validation_threshold: float | None
+    # Which validation metric the early stop compares, e.g. accuracy (always
+    # reported) or pass_k (grouped validation).
+    stop_at_validation_metric: str
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -2529,6 +2535,35 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _validation_stop_value(val_metrics: dict[str, Any], stop_metric: str) -> float:
+    """Value of the early-stop metric chosen by grpo.stop_at_validation_metric."""
+    assert stop_metric in val_metrics, (
+        f"grpo.stop_at_validation_metric={stop_metric!r} is not a reported "
+        f"validation metric; available: {sorted(val_metrics)}"
+    )
+    return val_metrics[stop_metric]
+
+
+def _validation_early_stop_message(
+    val_metrics: dict[str, Any],
+    stop_threshold: float | None,
+    stop_metric: str,
+    *,
+    initial: bool = False,
+) -> Optional[str]:
+    """Stop message when the early-stop threshold is reached, else None."""
+    if stop_threshold is None:
+        return None
+    value = _validation_stop_value(val_metrics, stop_metric)
+    if value < stop_threshold:
+        return None
+    prefix = "Initial validation" if initial else "Validation"
+    return (
+        f"{prefix} {stop_metric} reached the early-stop threshold "
+        f"({value:.4f} >= {stop_threshold}); stopping training"
+    )
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2588,6 +2623,8 @@ def grpo_train(
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+    stop_at_validation_threshold = master_config.grpo["stop_at_validation_threshold"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2620,6 +2657,17 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        stop_message = _validation_early_stop_message(
+            val_metrics,
+            stop_at_validation_threshold,
+            stop_at_validation_metric,
+            initial=True,
+        )
+        if stop_message is not None:
+            print(stop_message, flush=True)
+            # Flush pending checkpoint finalization, like the other early returns.
+            checkpointer.shutdown()
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -3143,6 +3191,7 @@ def grpo_train(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
+                early_stop_message: Optional[str] = None
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
                     val_at_end and is_last_step
@@ -3177,6 +3226,14 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    early_stop_message = _validation_early_stop_message(
+                        val_metrics,
+                        stop_at_validation_threshold,
+                        stop_at_validation_metric,
+                    )
+                    if early_stop_message is not None:
+                        # Exit at the end of this step, after checkpointing.
+                        print(early_stop_message, flush=True)
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3262,6 +3319,8 @@ def grpo_train(
                 # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
+                    # Early stop saves the final state like a last step.
+                    or early_stop_message is not None
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                     or (
@@ -3534,6 +3593,10 @@ def grpo_train(
             timer.reset()
             current_step += 1
             total_steps += 1
+            if early_stop_message is not None:
+                checkpointer.shutdown()
+                memory_tracker.snapshot_start_of_stage("", dir())
+                return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
@@ -3853,6 +3916,8 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    stop_at_validation_threshold = master_config.grpo["stop_at_validation_threshold"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -4034,6 +4099,7 @@ def async_grpo_train(
         # Pause trajectory collection during initial validation
         trajectory_collector.pause.remote()
 
+        initial_val_metrics: Optional[dict[str, Any]] = None
         try:
             val_metrics, validation_timings = validate(
                 policy_generation,
@@ -4044,6 +4110,7 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
+            initial_val_metrics = val_metrics
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
@@ -4057,6 +4124,32 @@ def async_grpo_train(
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
+
+        stop_message = (
+            _validation_early_stop_message(
+                initial_val_metrics,
+                stop_at_validation_threshold,
+                stop_at_validation_metric,
+                initial=True,
+            )
+            if initial_val_metrics is not None
+            else None
+        )
+        if stop_message is not None:
+            print(stop_message, flush=True)
+            # Flush pending checkpoint finalization and stop rollout
+            # generation; the remaining actors are reaped when the driver
+            # exits right after this return.
+            checkpointer.shutdown()
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
+            return
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -4148,6 +4241,7 @@ def async_grpo_train(
     try:
         while step < master_config.grpo["max_num_steps"]:
             refit_metrics: dict[str, float] = {}
+            early_stop_message: Optional[str] = None
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
             )
@@ -4577,6 +4671,14 @@ def async_grpo_train(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        early_stop_message = _validation_early_stop_message(
+                            val_metrics,
+                            stop_at_validation_threshold,
+                            stop_at_validation_metric,
+                        )
+                        if early_stop_message is not None:
+                            # Exit at the end of this step, after checkpointing.
+                            print(early_stop_message, flush=True)
 
                         # Explicit GPU memory cleanup after validation in async mode
                         import gc
@@ -4584,8 +4686,9 @@ def async_grpo_train(
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                        # Resume trajectory collection after validation
-                        trajectory_collector.resume.remote()
+                        if early_stop_message is None:
+                            # Resume trajectory collection after validation
+                            trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4667,6 +4770,8 @@ def async_grpo_train(
                 # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
+                    # Early stop saves the final state like a last step.
+                    or early_stop_message is not None
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
@@ -4911,6 +5016,9 @@ def async_grpo_train(
 
             timer.reset()
             step += 1
+            if early_stop_message is not None:
+                checkpointer.shutdown()
+                return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
