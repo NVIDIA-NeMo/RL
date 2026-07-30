@@ -61,6 +61,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -271,7 +272,7 @@ class SingleControllerActor:
             task_started_event.set()
             self._inflight_rollouts += 1
             try:
-                await self._rollout_manager.generate_and_push(
+                outcome = await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
                 )
             except BaseException:
@@ -282,6 +283,12 @@ class SingleControllerActor:
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
+
+            if outcome is RolloutOutcome.SKIPPED:
+                # Nothing was committed, so the train pump will never see this group
+                # and never release its permit on our behalf.
+                self._buffer_capacity.release()
+                return
 
             if self._async_cfg.diagnostics:
                 content = ""

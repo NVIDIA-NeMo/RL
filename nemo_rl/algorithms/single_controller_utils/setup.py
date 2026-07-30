@@ -50,6 +50,11 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutTimeouts
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.experience.rollout_manager import (
+    RolloutManager,
+    RolloutRetryPolicy,
+    RolloutTimeouts,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
@@ -261,6 +266,19 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config["megatron_cfg"]["train_iters"] = grpo_config["max_num_steps"]
 
 
+def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
+    """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
+    failure_config = master_config.async_rl.rollout_failure
+    return RolloutRetryPolicy(
+        max_infra_attempts=failure_config.max_attempts_per_prompt,
+        max_data_attempts=failure_config.max_data_attempts_per_prompt,
+        backoff_base_s=failure_config.backoff_base_s,
+        max_backoff_s=failure_config.max_backoff_s,
+        skip_on_data_exhausted=failure_config.on_data_exhausted == "skip",
+        max_skipped_prompts=failure_config.max_skipped_prompts,
+    )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -450,6 +468,7 @@ def setup_single_controller(
             generation_s=master_config.async_rl.generation_timeout_s,
             env_s=master_config.async_rl.env_timeout_s,
         ),
+        retry_policy=_build_retry_policy(master_config),
     )
 
     return SingleControllerActorArgs(

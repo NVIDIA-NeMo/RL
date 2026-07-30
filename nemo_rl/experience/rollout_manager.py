@@ -14,8 +14,9 @@
 
 import asyncio
 import copy
+import enum
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -32,6 +33,7 @@ from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
+    RolloutRedispatchExhausted,
     RolloutTimeout,
     classify_rollout_failure,
 )
@@ -52,6 +54,91 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+class RolloutOutcome(str, enum.Enum):
+    """How :meth:`RolloutManager.generate_and_push` finished for one prompt."""
+
+    # The prompt group reached the replay buffer.
+    COMMITTED = "committed"
+    # The prompt exhausted its data-failure budget and on_data_exhausted="skip".
+    # No group was committed, so the caller owns releasing its backpressure permit.
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class RolloutRetryPolicy:
+    """Retry budgets for one prompt, resolved from ``async_rl.rollout_failure``.
+
+    The defaults here reproduce the historical single-attempt behaviour so that a
+    directly-constructed ``RolloutManager`` does not silently gain retries;
+    ``setup_single_controller`` passes the configured values in.
+    """
+
+    # Attempts for infrastructure failures. 1 means no retry.
+    max_infra_attempts: int = 1
+    # Attempts for deterministic, prompt-specific failures. 1 means no retry.
+    max_data_attempts: int = 1
+    backoff_base_s: float = 1.0
+    max_backoff_s: float = 30.0
+    # On exhausting max_data_attempts: skip the prompt, or let the failure propagate.
+    skip_on_data_exhausted: bool = False
+    # Run-wide cap on skipped prompts, enforced across every generate_and_push call.
+    max_skipped_prompts: int = 0
+
+    def __post_init__(self) -> None:
+        # A zero budget would mean "never attempt the rollout at all", which no caller
+        # wants and which would leave the retry loop with nothing to report.
+        if self.max_infra_attempts < 1 or self.max_data_attempts < 1:
+            raise ValueError(
+                "RolloutRetryPolicy attempt budgets must be >= 1; got "
+                f"max_infra_attempts={self.max_infra_attempts}, "
+                f"max_data_attempts={self.max_data_attempts}"
+            )
+
+    def backoff_for(self, attempt: int) -> float:
+        """Return the delay before infra attempt ``attempt`` + 1 (1-based attempts)."""
+        return min(self.backoff_base_s * 2 ** (attempt - 1), self.max_backoff_s)
+
+
+@dataclass
+class RolloutStats:
+    """Counters describing what the retry policy has been doing.
+
+    Read by the SingleController for logging. A stall or a rising redispatch count is
+    the only externally visible sign that the fleet is degrading, so these are not
+    optional bookkeeping.
+    """
+
+    committed: int = 0
+    skipped: int = 0
+    redispatches_by_reason: dict[str, int] = field(default_factory=dict)
+    data_failures_by_reason: dict[str, int] = field(default_factory=dict)
+
+    def record_redispatch(self, reason: str) -> None:
+        self.redispatches_by_reason[reason] = (
+            self.redispatches_by_reason.get(reason, 0) + 1
+        )
+
+    def record_data_failure(self, reason: str) -> None:
+        self.data_failures_by_reason[reason] = (
+            self.data_failures_by_reason.get(reason, 0) + 1
+        )
+
+    def as_metrics(self) -> dict[str, float]:
+        """Flatten into a metric dict for the SingleController logger."""
+        metrics: dict[str, float] = {
+            "rollout/committed_total": float(self.committed),
+            "rollout/skipped_total": float(self.skipped),
+            "rollout/redispatch_total": float(
+                sum(self.redispatches_by_reason.values())
+            ),
+        }
+        for reason, count in self.redispatches_by_reason.items():
+            metrics[f"rollout/redispatch_total/{reason}"] = float(count)
+        for reason, count in self.data_failures_by_reason.items():
+            metrics[f"rollout/data_failures_total/{reason}"] = float(count)
+        return metrics
 
 
 @dataclass(frozen=True)
@@ -812,6 +899,7 @@ class RolloutManager:
         mask_env_flagged_samples: bool = True,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
+        retry_policy: Optional[RolloutRetryPolicy] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -846,6 +934,18 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
+        self._retry_policy = (
+            retry_policy if retry_policy is not None else RolloutRetryPolicy()
+        )
+        self._stats = RolloutStats()
+        # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
+        # int: every caller runs on the SingleController's single event loop.
+        self._skipped_prompts: int = 0
+
+    @property
+    def stats(self) -> RolloutStats:
+        """Counters describing retry/skip activity so far."""
+        return self._stats
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -860,31 +960,117 @@ class RolloutManager:
 
     async def generate_and_push(
         self, input_sample: DatumSpec, *, target_step: Optional[int] = None
-    ) -> None:
-        """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
+    ) -> RolloutOutcome:
+        """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
+
+        No prompt is discarded for infrastructure reasons. An infra failure means the
+        fleet is unwell, not the prompt, so the attempt is retried -- and because each
+        retry re-enters generation-shard selection, it naturally lands somewhere else
+        without this method needing to know anything about shard health. Exhausting the
+        infra budget therefore means the failure follows the prompt across the whole
+        fleet, which is reported as fleet-wide failure rather than absorbed.
+
+        Deterministic failures get their own, much smaller budget: another shard would
+        reject the prompt identically, so retrying mostly burns time. One retry is still
+        worth taking because a shard under memory pressure can return an empty
+        generation that looks deterministic and is not.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+
+        Returns:
+            ``COMMITTED`` when the group reached the buffer, ``SKIPPED`` when the prompt
+            exhausted its data budget under ``on_data_exhausted="skip"``.
+
+        Raises:
+            RolloutRedispatchExhausted: The infra budget ran out.
+            RolloutDataFailure: The data budget ran out under ``fail_fast``.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
-        start_version = self._weight_version
-        group_id = self._tq_buffer.reserve(
-            weight_version=start_version, target_step=target_step
-        )
-        try:
-            record = await self.run_rollout(input_sample)
-            end_version = self._weight_version
-            await self._tq_buffer.commit(
-                group_id,
-                record,
-                start_weight_version=start_version,
-                end_weight_version=end_version,
+        policy = self._retry_policy
+        infra_attempts = 0
+        data_attempts = 0
+        last_infra_error: Optional[Exception] = None
+
+        # The loop condition is the infrastructure budget, so running out of it exits
+        # here rather than raising from inside the handler. The data budget is tracked
+        # separately and terminates from within, since exhausting it is a statement
+        # about the prompt rather than about the fleet.
+        while infra_attempts < policy.max_infra_attempts:
+            start_version = self._weight_version
+            # Reserved inside the loop so each attempt owns a fresh group_id: rows a
+            # failed attempt may have written cannot then collide with the retry's.
+            group_id = self._tq_buffer.reserve(
+                weight_version=start_version, target_step=target_step
             )
-        except BaseException:
-            # A failed rollout must not leave an unready slot that can block an
-            # in-order sampler. commit() rolls back any DataPlane rows it wrote.
-            await self._tq_buffer.remove_group(group_id)
-            raise
+            try:
+                record = await self.run_rollout(input_sample)
+                end_version = self._weight_version
+                await self._tq_buffer.commit(
+                    group_id,
+                    record,
+                    start_weight_version=start_version,
+                    end_weight_version=end_version,
+                )
+            except Exception as error:
+                # A failed rollout must not leave an unready slot that can block an
+                # in-order sampler. commit() rolls back any DataPlane rows it wrote.
+                await self._tq_buffer.remove_group(group_id)
+                reason = type(error).__name__
+
+                if classify_rollout_failure(error) is FailureClass.INFRA:
+                    infra_attempts += 1
+                    last_infra_error = error
+                    if infra_attempts >= policy.max_infra_attempts:
+                        break
+                    self._stats.record_redispatch(reason)
+                    # The backpressure permit is held across this sleep, so the wait is
+                    # capped by max_backoff_s rather than growing without bound.
+                    await asyncio.sleep(policy.backoff_for(infra_attempts))
+                    continue
+
+                data_attempts += 1
+                if data_attempts >= policy.max_data_attempts:
+                    self._stats.record_data_failure(reason)
+                    if not policy.skip_on_data_exhausted:
+                        raise
+                    self._skipped_prompts += 1
+                    if self._skipped_prompts > policy.max_skipped_prompts:
+                        raise RolloutDataFailure(
+                            f"skipped {self._skipped_prompts} prompts, exceeding "
+                            f"max_skipped_prompts={policy.max_skipped_prompts}; the "
+                            "dataset or sequence-length configuration is likely wrong"
+                        ) from error
+                    print(
+                        f"skipping prompt idx={input_sample['idx']} after "
+                        f"{data_attempts} deterministic failure(s) ({reason}: {error})",
+                        flush=True,
+                    )
+                    self._stats.skipped += 1
+                    return RolloutOutcome.SKIPPED
+                self._stats.record_redispatch(reason)
+                continue
+            except BaseException:
+                # Cancellation and other non-Exception exits: clean up, never retry.
+                await self._tq_buffer.remove_group(group_id)
+                raise
+
+            self._stats.committed += 1
+            return RolloutOutcome.COMMITTED
+
+        # The infrastructure budget ran out. The same failure followed the prompt across
+        # repeated shard selections, which says the fleet is broken rather than the
+        # prompt, so this is reported rather than absorbed.
+        #
+        # The budget is >= 1 (enforced in RolloutRetryPolicy), so the loop ran at least
+        # once and can only have exited through the infra branch's break.
+        assert last_infra_error is not None
+        raise RolloutRedispatchExhausted(
+            f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+            f"budget after {infra_attempts} attempt(s) (max_attempts_per_prompt="
+            f"{policy.max_infra_attempts}); last failure was "
+            f"{type(last_infra_error).__name__}: {last_infra_error}"
+        ) from last_infra_error

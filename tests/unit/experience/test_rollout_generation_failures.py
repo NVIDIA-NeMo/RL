@@ -39,11 +39,14 @@ from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
+    RolloutRedispatchExhausted,
     RolloutTimeout,
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RolloutManager,
+    RolloutRetryPolicy,
+    RolloutStats,
     RolloutTimeouts,
     _classify_generation_failure,
     _Deadline,
@@ -157,6 +160,22 @@ def _sample(idx=7):
     }
 
 
+def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
+    """Build a RolloutManager without firing the real __init__."""
+    manager = object.__new__(RolloutManager)
+    manager._impl = impl
+    manager._tokenizer = None
+    manager._num_generations_per_prompt = 1
+    manager._tq_buffer = buffer
+    manager._weight_version = 0
+    manager._retry_policy = (
+        retry_policy if retry_policy is not None else RolloutRetryPolicy()
+    )
+    manager._stats = RolloutStats()
+    manager._skipped_prompts = 0
+    return manager
+
+
 class _RecordingBuffer:
     """TQReplayBuffer stand-in that records whether anything was ever committed."""
 
@@ -220,14 +239,11 @@ class TestNoPartialCompletionSurvives:
         buffer = _RecordingBuffer()
         impl = _make_impl(_FakeGeneration([ray.exceptions.RayActorError()]))
 
-        manager = object.__new__(RolloutManager)
-        manager._impl = impl
-        manager._tokenizer = None
-        manager._num_generations_per_prompt = 1
-        manager._tq_buffer = buffer
-        manager._weight_version = 0
+        manager = _make_manager(buffer, impl)
 
-        with pytest.raises(RolloutFailure):
+        # A dead worker is an infra failure, so the single-attempt default budget is
+        # exhausted immediately and surfaces as RolloutRedispatchExhausted.
+        with pytest.raises(RolloutRedispatchExhausted):
             asyncio.run(manager.generate_and_push(_sample()))
 
         assert buffer.commits == [], "a failed generation must not be committed"
@@ -346,13 +362,20 @@ class TestGenerationDeadline:
         assert any(m["role"] == "assistant" for m in completion.message_log)
 
     def test_the_environment_step_has_its_own_deadline(self, monkeypatch):
-        """A hung env actor leaks a rollout permit exactly like a hung generation."""
+        """A hung env actor leaks a rollout permit exactly like a hung generation.
+
+        The sleep is deliberately short. calculate_rewards runs under asyncio.to_thread
+        and Python cannot kill a running thread, so the deadline frees the rollout while
+        the thread keeps its pool slot -- and asyncio.run waits for the default executor
+        on the way out. A long sleep here would stall the test for exactly that reason,
+        which is itself the documented caveat.
+        """
 
         def _hang(sample_batch, task_to_env):
             del sample_batch, task_to_env
             import time
 
-            time.sleep(30)
+            time.sleep(1.0)
 
         monkeypatch.setattr(
             "nemo_rl.experience.rollout_manager.calculate_rewards", _hang, raising=True

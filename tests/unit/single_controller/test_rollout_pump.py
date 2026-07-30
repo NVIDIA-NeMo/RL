@@ -38,6 +38,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_manager import RolloutManager
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -118,6 +119,54 @@ def test_rollout_pump_stamps_target_steps(
 
     assert buffer.target_step_list == expected_target_steps
     assert ctrl._rollout_exhausted.is_set()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expect_permit_released"),
+    [
+        # A committed group transfers permit ownership to the train pump, which
+        # releases it after consuming the group.
+        (RolloutOutcome.COMMITTED, False),
+        # A skipped prompt never reaches the buffer, so the train pump will never
+        # see it and the dispatcher must release the permit itself. Getting this
+        # wrong leaks one backpressure slot per skipped prompt until the pump wedges.
+        (RolloutOutcome.SKIPPED, True),
+    ],
+)
+def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
+    outcome: RolloutOutcome, expect_permit_released: bool
+) -> None:
+    class _OutcomeRolloutManager:
+        async def generate_and_push(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> RolloutOutcome:
+            del prompt, target_step
+            return outcome
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+    ctrl._rollout_manager = _OutcomeRolloutManager()
+    ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    # One prompt was dispatched out of a semaphore sized 2.
+    expected = 2 if expect_permit_released else 1
+    assert ctrl._buffer_capacity._value == expected
+    assert ctrl._inflight_rollouts == 0
 
 
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
