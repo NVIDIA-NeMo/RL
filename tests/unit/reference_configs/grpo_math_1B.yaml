@@ -37,6 +37,7 @@ grpo:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
