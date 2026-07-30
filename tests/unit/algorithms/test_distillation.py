@@ -1275,20 +1275,21 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
 def test_nemo_gym_distillation_runner_uses_setup_actor():
     from examples.nemo_gym import run_distillation_nemo_gym as runner
 
-    config_dict = {
-        "policy": {
+    master_config = MasterConfig.model_construct(
+        policy={
             "tokenizer": {"name": "test-tokenizer"},
             "generation": {"backend": "vllm"},
         },
-        "teacher": {},
-        "loss_fn": {},
-        "distillation": {"max_val_samples": None},
-        "data": {},
-        "env": {"should_use_nemo_gym": True, "nemo_gym": {}},
-        "logger": {"log_dir": "/tmp/logs"},
-        "checkpointing": {"enabled": False},
-        "cluster": {},
-    }
+        teacher={},
+        loss_fn={},
+        distillation=DistillationConfig(max_val_samples=None),
+        data={},
+        env={"should_use_nemo_gym": True, "nemo_gym": {}},
+        logger={"log_dir": "/tmp/logs"},
+        checkpointing={"enabled": False},
+        cluster={},
+    )
+
     tokenizer = MagicMock()
     student_policy = MagicMock()
     teacher_policy = MagicMock()
@@ -1299,7 +1300,6 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
     logger = MagicMock()
     checkpointer = MagicMock()
     distillation_state = MagicMock()
-    master_config = MasterConfig.model_construct(**copy.deepcopy(config_dict))
 
     with (
         patch.object(runner, "register_omegaconf_resolvers"),
@@ -1308,14 +1308,10 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
             "parse_args",
             return_value=(SimpleNamespace(config="config.yaml"), []),
         ),
-        patch.object(runner, "load_config", return_value=config_dict),
+        patch.object(runner, "load_config", return_value=master_config.model_dump()),
         patch.object(runner, "parse_hydra_overrides", side_effect=lambda cfg, _: cfg),
         patch.object(runner, "OmegaConf") as mock_omegaconf,
-        patch.object(
-            runner,
-            "MasterConfig",
-            lambda **kwargs: MasterConfig.model_construct(**kwargs),
-        ),
+        patch.object(runner, "MasterConfig", return_value=master_config),
         patch.object(runner, "get_next_experiment_dir", return_value="/tmp/logs/exp"),
         patch.object(runner, "get_tokenizer", return_value=tokenizer),
         patch.object(
