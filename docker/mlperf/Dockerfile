@@ -13,7 +13,7 @@
 # The base ARG is NOT named FROM_IMAGE_NAME: ci/build.yml force-passes
 # FROM_IMAGE_NAME=<dgx pytorch image>, which would replace cuda-dl-base.
 
-ARG NEMO_RL_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
+ARG NEMO_RL_BASE_IMAGE=urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-sbsa-ubuntu24.04-trt10.16.1.11-20260627-upgraded-v3
 
 ## Stage: base (vendored from nemo-rl docker/Dockerfile)
 FROM ${NEMO_RL_BASE_IMAGE} AS base
@@ -77,7 +77,7 @@ FROM base AS nemo-rl-src
 ## 1. Clone nemo-rl (+ 3rdparty submodules) and record provenance.
 # Submodule ARGs: SKIP = keep the pin from the nemo-rl revision.
 ARG NEMO_RL_REPO=https://github.com/NVIDIA-NeMo/RL.git
-ARG NEMO_RL_REVISION=opt/dev-backup
+ARG NEMO_RL_REVISION=opt/dev-backup-rubin
 ARG NEMO_GYM_REVISION=SKIP
 ARG MBRIDGE_REVISION=SKIP
 ARG AUTOMODEL_REVISION=SKIP
@@ -150,16 +150,16 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # TensorRT-LLM does not publish a cp313 release wheel on PyPI — the official
 # releases target cp312 and below. Until an official cp313 wheel is available,
 # we must build from source. These ARGs control which commit is compiled:
-#   BUILD_CUSTOM_TRTLLM_URL  git remote (default: github.com/NVIDIA/TensorRT-LLM)
+#   BUILD_CUSTOM_TRTLLM_URL  git remote with embedded credentials
 #   BUILD_CUSTOM_TRTLLM_REF  commit hash / branch / tag to checkout
 # The build is handled by 3rdparty/TensorRT-LLM-workspace/_backend.py via the
-# PEP 517 hook invoked during `uv sync --extra trtllm`. Defaults below are used
-# unless overridden with `--build-arg`; promoting the ARGs to ENV puts them in
-# the `uv sync` process environment so _backend.py reads them (an ARG alone is
-# only a build-time substitution var, not an env var).
-ARG BUILD_CUSTOM_TRTLLM_URL=https://github.com/hchings/TensorRT-LLM.git
-ARG BUILD_CUSTOM_TRTLLM_REF=983e7ff57dd26ce662e1b34cce94b76c9181be05
-ENV BUILD_CUSTOM_TRTLLM_URL=${BUILD_CUSTOM_TRTLLM_URL}
+# PEP 517 hook invoked during `uv sync --extra trtllm`. Promoting ARGs to ENV
+# puts them in the `uv sync` process environment so _backend.py reads them.
+# GITLAB_CLONE_ACCESS_TOKEN is declared here (ahead of the mlperf stage) so it
+# can be embedded in the default URL.
+ARG GITLAB_CLONE_ACCESS_TOKEN
+ARG BUILD_CUSTOM_TRTLLM_REF=1f7cd6284a6cc198e9b58bda09e8b15411e796a5
+ENV BUILD_CUSTOM_TRTLLM_URL=https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git
 ENV BUILD_CUSTOM_TRTLLM_REF=${BUILD_CUSTOM_TRTLLM_REF}
 ARG SKIP_VLLM_BUILD
 # SGLang is not used by this benchmark; skip it by default to cut build time.
@@ -178,6 +178,15 @@ ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 ENV CUDNN_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# Prepend the venv's torch lib so nanobind.stubgen (run during TRT-LLM build)
+# loads libtorch_python.so from cp313, not from the base image's Python 3.12.
+# Without this: "undefined symbol: _PyThreadState_UncheckedGet" at stub gen.
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+# Force mamba-ssm to compile from source instead of downloading a prebuilt
+# wheel. On Rubin the CUDA driver reports a non-standard version string
+# ('gpgpu.38400451') that packaging.version.parse() rejects with
+# InvalidVersion — there is no automatic fallback to source compilation.
+ENV MAMBA_FORCE_BUILD=TRUE
 
 # First copy only the dependency files (source COPY happens in release)
 COPY --from=nemo-rl-src /opt/nemo-rl-src/pyproject.toml /opt/nemo-rl-src/uv.lock ./
@@ -490,7 +499,7 @@ RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 
 # INTERNAL
 # ntrace
-RUN NTRACE_BUILD_CUPTI_CPP=ON uv pip install --no-cache-dir "git+https://${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/compute/e2etrain/ntrace.git@main"
+RUN NTRACE_BUILD_CUPTI_CPP=ON uv pip install --no-cache-dir "git+https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/compute/e2etrain/ntrace.git@main"
 # JET
 RUN curl -fsSL https://jet.nvidia.com/docs/assets/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
