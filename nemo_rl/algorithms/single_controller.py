@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 import warnings
 from functools import partial
@@ -233,9 +234,21 @@ class SingleControllerActor:
             rollout_task.cancel()
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
-            # Flush the last checkpoint's background finalization before exit.
-            await asyncio.to_thread(self._checkpointer.shutdown)
-            self._logger.finish()
+            # Flush the last checkpoint's background finalization; a failure
+            # raises on a clean exit but never masks a propagating exception.
+            propagating = sys.exc_info()[0] is not None
+            try:
+                await asyncio.to_thread(self._checkpointer.shutdown)
+            except Exception:
+                if not propagating:
+                    raise
+                warnings.warn(
+                    "Checkpoint finalization failed while handling an "
+                    "exception; the original exception will be re-raised.",
+                    stacklevel=2,
+                )
+            finally:
+                self._logger.finish()
 
         return {
             "train_steps": self._train_steps,
