@@ -904,6 +904,11 @@ class MegatronPolicyWorkerImpl(
                             ),
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
+                            post_forward_hook=(
+                                microbatch_prefetcher.launch_next
+                                if microbatch_prefetcher is not None
+                                else None
+                            ),
                         )
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so

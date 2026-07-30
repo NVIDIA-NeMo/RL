@@ -266,6 +266,60 @@ class TestForwardWithPostProcessingFn:
         assert isinstance(output, torch.Tensor)
 
     @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_post_forward_hook_runs_after_forward_and_postprocessor_setup(
+        self,
+        mock_model_forward,
+    ):
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        events: list[str] = []
+
+        def model_forward_side_effect(**_kwargs):
+            events.append("model_forward")
+            return torch.randn(2, 3, 5)
+
+        def postprocess_side_effect(*_args, **_kwargs):
+            events.append("postprocessor_setup")
+            return MagicMock()
+
+        mock_model_forward.side_effect = model_forward_side_effect
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with patch.object(
+            LogprobsPostProcessor,
+            "__call__",
+            autospec=True,
+            side_effect=postprocess_side_effect,
+        ):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                post_forward_hook=lambda: events.append("post_forward_hook"),
+            )
+
+        assert events == [
+            "model_forward",
+            "postprocessor_setup",
+            "post_forward_hook",
+        ]
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_logprobs_post_processor(self, mock_model_forward):
         """Test forward with LogprobsPostProcessor."""
         from nemo_rl.models.megatron.data import ProcessedMicrobatch

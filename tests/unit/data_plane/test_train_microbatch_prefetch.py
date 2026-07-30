@@ -74,10 +74,38 @@ def _direct_stage_group(
     )
 
 
-def _patch_single_rank_stage_collectives(monkeypatch, prefetch_module) -> None:
+def _patch_single_rank_stage_collectives(
+    monkeypatch,
+    prefetch_module,
+) -> SimpleNamespace:
+    state = SimpleNamespace(
+        async_launches=[],
+        waited_events=[],
+        synchronized_events=[],
+        recorded_streams=[],
+    )
+
+    class FakeEvent:
+        def query(self) -> bool:
+            return True
+
+        def synchronize(self) -> None:
+            state.synchronized_events.append(self)
+
+    class FakeCurrentStream:
+        def wait_event(self, event: FakeEvent) -> None:
+            state.waited_events.append(event)
+
+    current_stream = FakeCurrentStream()
+
     monkeypatch.setattr(
         prefetch_module,
         "_move_stage_payload_to_cuda",
+        lambda data: data,
+    )
+    monkeypatch.setattr(
+        prefetch_module,
+        "_pin_stage_payload",
         lambda data: data,
     )
     monkeypatch.setattr(
@@ -101,6 +129,52 @@ def _patch_single_rank_stage_collectives(monkeypatch, prefetch_module) -> None:
         return data
 
     monkeypatch.setattr(prefetch_module, "_broadcast_batched_data_dict", fake_broadcast)
+    monkeypatch.setattr(
+        prefetch_module.torch.cuda,
+        "current_stream",
+        lambda: current_stream,
+    )
+    monkeypatch.setattr(
+        prefetch_module,
+        "_record_payload_stream",
+        lambda _data, stream: state.recorded_streams.append(stream),
+    )
+
+    def fake_launch_stage_fanout(
+        self,
+        item,
+        *,
+        expected_gb: int,
+        expected_mb: int,
+        expected_ids: tuple[str, ...],
+    ):
+        state.async_launches.append((expected_gb, expected_mb, expected_ids))
+        if isinstance(item, prefetch_module._PrefetchFailure):
+            return prefetch_module._InFlightMicrobatch(
+                item=None,
+                source_data=None,
+                ready_event=None,
+                failure=item,
+            )
+        assert isinstance(item, prefetch_module.PrefetchedMicrobatch)
+        event = FakeEvent()
+        return prefetch_module._InFlightMicrobatch(
+            item=prefetch_module.PrefetchedMicrobatch(
+                expected_gb,
+                expected_mb,
+                expected_ids,
+                item.data,
+            ),
+            source_data=item.data,
+            ready_event=event,
+        )
+
+    monkeypatch.setattr(
+        prefetch_module.TrainMicrobatchPrefetcher,
+        "_launch_stage_fanout",
+        fake_launch_stage_fanout,
+    )
+    return state
 
 
 def _meta(
@@ -926,6 +1000,9 @@ def test_train_prefetch_wires_plan_into_megatron_forward_backward(
             self.plan = plan
             self.raw_iterator = None
 
+        def launch_next(self) -> None:
+            calls["launch_next"] = calls.get("launch_next", 0) + 1
+
         def iter_global_batch(self, global_batch_index):
             calls["iter_global_batch"].append(global_batch_index)
             self.raw_iterator = iter(raw_microbatches)
@@ -992,6 +1069,7 @@ def test_train_prefetch_wires_plan_into_megatron_forward_backward(
     assert forward_kwargs["num_microbatches"] == 2
     assert forward_kwargs["global_valid_seqs"].item() == 3.0
     assert forward_kwargs["global_valid_toks"].item() == 11.0
+    assert forward_kwargs["post_forward_hook"] == prefetcher.launch_next
 
 
 class _RecordingClient:
@@ -1073,8 +1151,11 @@ def _single_rank_prefetcher(monkeypatch, prefetch_module, *, depth: int):
 
     monkeypatch.setattr(prefetch_module, "materialize", fake_materialize)
     monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
-    _patch_single_rank_stage_collectives(monkeypatch, prefetch_module)
-    return client, prefetch_module.TrainMicrobatchPrefetcher(
+    transport_state = _patch_single_rank_stage_collectives(
+        monkeypatch,
+        prefetch_module,
+    )
+    prefetcher = prefetch_module.TrainMicrobatchPrefetcher(
         client=client,
         meta=meta,
         group=group,
@@ -1082,6 +1163,7 @@ def _single_rank_prefetcher(monkeypatch, prefetch_module, *, depth: int):
         depth=depth,
         item_ready_timeout_s=5,
     )
+    return client, prefetcher, transport_state
 
 
 def test_close_is_bounded_after_item_ready_timeout(
@@ -1224,7 +1306,11 @@ def test_depth_one_stays_exactly_one_microbatch_ahead(
     monkeypatch,
     prefetch_module,
 ) -> None:
-    client, prefetcher = _single_rank_prefetcher(monkeypatch, prefetch_module, depth=1)
+    client, prefetcher, _ = _single_rank_prefetcher(
+        monkeypatch,
+        prefetch_module,
+        depth=1,
+    )
     try:
         client.wait_for_call_count(1)
         assert client.calls() == [("A", "B")]
@@ -1267,11 +1353,83 @@ def test_depth_one_stays_exactly_one_microbatch_ahead(
         prefetcher.close()
 
 
+def test_depth_one_launches_after_forward_and_waits_when_consumed(
+    monkeypatch,
+    prefetch_module,
+) -> None:
+    client, prefetcher, transport_state = _single_rank_prefetcher(
+        monkeypatch,
+        prefetch_module,
+        depth=1,
+    )
+    synchronous_fanouts: list[tuple[int, int, tuple[str, ...]]] = []
+    original_stage_fanout = prefetcher._stage_fanout
+
+    def record_stage_fanout(item, *, expected_gb, expected_mb, expected_ids):
+        synchronous_fanouts.append((expected_gb, expected_mb, expected_ids))
+        return original_stage_fanout(
+            item,
+            expected_gb=expected_gb,
+            expected_mb=expected_mb,
+            expected_ids=expected_ids,
+        )
+
+    monkeypatch.setattr(prefetcher, "_stage_fanout", record_stage_fanout)
+    try:
+        client.wait_for_call_count(1)
+        first = next(prefetcher)
+        assert first.sample_ids == ("A", "B")
+        assert synchronous_fanouts == [(0, 0, ("A", "B"))]
+        assert transport_state.async_launches == []
+
+        client.wait_for_call_count(2)
+        prefetcher.launch_next()
+        assert transport_state.async_launches == [(0, 1, ("C",))]
+
+        # The post-forward hook may be invoked more than once by a caller; it
+        # must not dequeue or launch another microbatch while one is in flight.
+        prefetcher.launch_next()
+        assert transport_state.async_launches == [(0, 1, ("C",))]
+
+        time.sleep(0.05)
+        assert client.calls() == [("A", "B"), ("C",)]
+        second = next(prefetcher)
+        assert second.sample_ids == ("C",)
+        assert len(transport_state.waited_events) == 1
+        assert transport_state.recorded_streams
+        assert synchronous_fanouts == [(0, 0, ("A", "B"))]
+        client.wait_for_call_count(3)
+
+        prefetcher.launch_next()
+        assert transport_state.async_launches == [
+            (0, 1, ("C",)),
+            (0, 2, ("D",)),
+        ]
+        third = next(prefetcher)
+        assert third.sample_ids == ("D",)
+        assert len(transport_state.waited_events) == 2
+
+        # There is no fourth plan entry, so the final hook is a no-op.
+        prefetcher.launch_next()
+        assert transport_state.async_launches == [
+            (0, 1, ("C",)),
+            (0, 2, ("D",)),
+        ]
+        with pytest.raises(StopIteration):
+            next(prefetcher)
+    finally:
+        prefetcher.close()
+
+
 def test_depth_zero_waits_for_the_next_consumer_request(
     monkeypatch,
     prefetch_module,
 ) -> None:
-    client, prefetcher = _single_rank_prefetcher(monkeypatch, prefetch_module, depth=0)
+    client, prefetcher, _ = _single_rank_prefetcher(
+        monkeypatch,
+        prefetch_module,
+        depth=0,
+    )
     try:
         client.wait_for_call_count(1)
         assert next(prefetcher).sample_ids == ("A", "B")
@@ -1354,6 +1512,13 @@ class _DistributedClient:
 def _run_nccl_direct_stage_reader(rank: int, world_size: int) -> None:
     from nemo_rl.models.megatron import train_microbatch_prefetch as module
 
+    status_all_reduce_calls = 0
+
+    def count_status_all_reduce(*args, **kwargs):
+        nonlocal status_all_reduce_calls
+        status_all_reduce_calls += 1
+        return original_all_reduce(*args, **kwargs)
+
     def fail_h2d(_data):
         raise RuntimeError("injected H2D failure")
 
@@ -1364,7 +1529,9 @@ def _run_nccl_direct_stage_reader(rank: int, world_size: int) -> None:
     )
     original_materialize = module.materialize
     original_move = module._move_stage_payload_to_cuda
+    original_all_reduce = module.torch.distributed.all_reduce
     module.materialize = lambda wire, **_: wire
+    module.torch.distributed.all_reduce = count_status_all_reduce
     try:
         for source_rank in (0, 1):
             prefetch_group = module.TrainMicrobatchPrefetchGroup(
@@ -1396,6 +1563,8 @@ def _run_nccl_direct_stage_reader(rank: int, world_size: int) -> None:
                         data_ptr = item.data["input_ids"].data_ptr()
                         item.data.to("cuda")
                         assert item.data["input_ids"].data_ptr() == data_ptr
+                        if depth == 1:
+                            prefetcher.launch_next()
                     prefetcher.assert_complete()
 
                     expected_calls = 3 if rank == source_rank else 0
@@ -1406,6 +1575,8 @@ def _run_nccl_direct_stage_reader(rank: int, world_size: int) -> None:
                 finally:
                     prefetcher.close()
                 dist.barrier()
+
+        assert status_all_reduce_calls == 0
 
         source_rank = 1
         prefetch_group = module.TrainMicrobatchPrefetchGroup(
@@ -1459,9 +1630,10 @@ def _run_nccl_direct_stage_reader(rank: int, world_size: int) -> None:
     finally:
         module.materialize = original_materialize
         module._move_stage_payload_to_cuda = original_move
+        module.torch.distributed.all_reduce = original_all_reduce
 
 
-def test_nccl_direct_stage_reader_keeps_payload_on_gpu_and_fans_out_errors(
+def test_nccl_direct_stage_reader_keeps_payload_on_gpu_and_fans_out_bootstrap_errors(
     distributed_test_runner,
 ) -> None:
     distributed_test_runner(_run_nccl_direct_stage_reader, world_size=2)

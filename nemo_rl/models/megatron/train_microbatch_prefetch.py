@@ -15,9 +15,10 @@
 
 NeMo-RL supplies an exact key and packing plan. One TP0/CP0 leader for every
 fixed data-parallel and pipeline-parallel stage reads those keys from TQ and
-materializes every selected train field on a background CPU thread. When that
-stage consumes the microbatch, its foreground training thread broadcasts the
-payload through the existing TP×CP NCCL group.
+materializes every selected train field on a background CPU thread. The first
+microbatch is distributed synchronously. After each model forward is enqueued,
+the foreground training thread stages and broadcasts the next microbatch on a
+dedicated CUDA stream through the existing TP×CP NCCL group.
 
 No collective spans pipeline stages, and no producer thread launches NCCL.
 """
@@ -118,6 +119,22 @@ class PrefetchedMicrobatch:
 class _PrefetchFailure:
     message: str
     from_source: bool
+
+
+@dataclass(frozen=True)
+class _TensorFieldSchema:
+    key: str
+    dtype: torch.dtype
+    trailing_shape: tuple[int, ...]
+
+
+@dataclass
+class _InFlightMicrobatch:
+    item: PrefetchedMicrobatch | None
+    source_data: BatchedDataDict[Any] | None
+    ready_event: Any | None
+    works: tuple[Any, ...] = ()
+    failure: _PrefetchFailure | None = None
 
 
 class _PrefetchEnd:
@@ -385,11 +402,103 @@ def _tensor_bytes(data: BatchedDataDict[Any]) -> int:
     )
 
 
+def _pin_stage_payload(data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
+    """Pin CPU tensors so the foreground thread can enqueue nonblocking H2D."""
+    pinned = BatchedDataDict()
+    for key, value in data.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                "overlapped train-microbatch transport supports tensor fields only; "
+                f"{key!r} has type {type(value).__name__}"
+            )
+        if value.device.type != "cpu":
+            raise ValueError(
+                "the TQ producer must materialize CPU tensors before transport; "
+                f"{key!r} is on {value.device}"
+            )
+        pinned[key] = value if value.is_pinned() else value.pin_memory()
+    return pinned
+
+
 def _move_stage_payload_to_cuda(
     data: BatchedDataDict[Any],
 ) -> BatchedDataDict[Any]:
     """Stage the complete leader payload before peers enter payload collectives."""
     return data.to(torch.cuda.current_device())
+
+
+def _tensor_payload_schema(
+    data: BatchedDataDict[Any],
+) -> tuple[_TensorFieldSchema, ...]:
+    schema: list[_TensorFieldSchema] = []
+    for key, value in data.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                "overlapped train-microbatch transport supports tensor fields only; "
+                f"{key!r} has type {type(value).__name__}"
+            )
+        if value.ndim < 1:
+            raise ValueError(
+                f"train-microbatch field {key!r} must have a batch dimension"
+            )
+        schema.append(
+            _TensorFieldSchema(
+                key=key,
+                dtype=value.dtype,
+                trailing_shape=tuple(value.shape[1:]),
+            )
+        )
+    if not schema:
+        raise ValueError("train-microbatch payload cannot be empty")
+    return tuple(schema)
+
+
+def _validate_tensor_payload(
+    data: BatchedDataDict[Any],
+    *,
+    schema: tuple[_TensorFieldSchema, ...],
+    batch_size: int,
+) -> None:
+    if tuple(data) != tuple(field.key for field in schema):
+        raise ValueError(
+            "train-microbatch tensor fields changed after bootstrap: "
+            f"expected={tuple(field.key for field in schema)}, actual={tuple(data)}"
+        )
+    for field in schema:
+        value = data[field.key]
+        expected_shape = (batch_size, *field.trailing_shape)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"train-microbatch field {field.key!r} is not a tensor")
+        if value.dtype != field.dtype or tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"train-microbatch field {field.key!r} changed schema: expected "
+                f"dtype={field.dtype}, shape={expected_shape}; got "
+                f"dtype={value.dtype}, shape={tuple(value.shape)}"
+            )
+
+
+def _allocate_stage_payload_on_cuda(
+    *,
+    schema: tuple[_TensorFieldSchema, ...],
+    batch_size: int,
+) -> BatchedDataDict[Any]:
+    device = torch.cuda.current_device()
+    return BatchedDataDict(
+        {
+            field.key: torch.empty(
+                (batch_size, *field.trailing_shape),
+                dtype=field.dtype,
+                device=device,
+            )
+            for field in schema
+        }
+    )
+
+
+def _record_payload_stream(data: BatchedDataDict[Any], stream: Any) -> None:
+    for value in data.values():
+        if isinstance(value, torch.Tensor):
+            value.record_stream(stream)
 
 
 class _ThreadPrefetchError(RuntimeError):
@@ -401,8 +510,8 @@ class _ThreadPrefetchError(RuntimeError):
 class _ThreadPrefetchIterator(Iterator[_T], Generic[_T]):
     """Run a finite synchronous iterator ahead on one daemon thread.
 
-    Item zero is prepared eagerly. ``close()`` drains the finite source so that
-    distributed producers and receivers finish the same in-flight operations.
+    Item zero is prepared eagerly. ``close()`` stops unstarted CPU work and
+    bounds the wait for an item already being produced.
     """
 
     def __init__(
@@ -431,6 +540,7 @@ class _ThreadPrefetchIterator(Iterator[_T], Generic[_T]):
         self._consumed = 0
         self._closed = False
         self._ended = False
+        self._next_release_due = False
         self._terminal_failure: _PrefetchFailure | None = None
         self._started_at = time.perf_counter()
         self._metrics_lock = threading.Lock()
@@ -540,7 +650,7 @@ class _ThreadPrefetchIterator(Iterator[_T], Generic[_T]):
         self._record("consumer_wait_s", time.perf_counter() - start)
         return item
 
-    def __next__(self) -> _T:
+    def take(self, *, start_next: bool) -> _T:
         if self._terminal_failure is not None:
             raise _ThreadPrefetchError(
                 "prefetch iterator is terminal after failure: "
@@ -567,33 +677,34 @@ class _ThreadPrefetchIterator(Iterator[_T], Generic[_T]):
         self._consumed += 1
         self._record("consume_count", 1.0)
         if self._lookahead:
-            self._producer_permit.release()
+            self._next_release_due = True
+            if start_next:
+                self.start_next()
         return item
+
+    def __next__(self) -> _T:
+        return self.take(start_next=True)
+
+    def start_next(self) -> None:
+        """Allow one more source item after a deferred lookahead dequeue."""
+        if not self._lookahead or not self._next_release_due:
+            return
+        self._next_release_due = False
+        self._producer_permit.release()
 
     def metrics(self) -> dict[str, float]:
         with self._metrics_lock:
             return dict(self._metrics)
 
     def close(self) -> None:
-        """Drain finite work or bound cleanup after a terminal timeout."""
+        """Stop unstarted work and bound cleanup after a terminal timeout."""
         if self._closed:
             return
         self._closed = True
-        deadline = time.monotonic() + _CLOSE_TIMEOUT_SECONDS
-        while self._producer_thread.is_alive():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                self._queue.get(timeout=min(_QUEUE_POLL_SECONDS, remaining))
-            except queue.Empty:
-                pass
-            self._producer_permit.release()
-        remaining = max(0.0, deadline - time.monotonic())
-        self._producer_thread.join(timeout=remaining)
+        self._stop_event.set()
+        self._producer_permit.release()
+        self._producer_thread.join(timeout=_CLOSE_TIMEOUT_SECONDS)
         if self._producer_thread.is_alive():
-            self._stop_event.set()
-            self._producer_permit.release()
             raise _ThreadPrefetchError(
                 f"prefetch producer did not stop within {_CLOSE_TIMEOUT_SECONDS:.0f}s",
                 from_source=False,
@@ -611,12 +722,14 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
         plan: TrainMicrobatchPlan,
         items: Sequence[tuple[int, int, tuple[str, ...]]],
         pad_value_dict: dict[str, Any],
+        pin_memory: bool,
     ) -> None:
         self._client = client
         self._meta = meta
         self._plan = plan
         self._items = iter(items)
         self._pad_value_dict = pad_value_dict
+        self._pin_memory = pin_memory
         self._metrics_lock = threading.Lock()
         self._metrics: dict[str, float] = {
             "tq_get_s": 0.0,
@@ -669,6 +782,8 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
             missing = [field for field in self._plan.fields if field not in data]
             if missing:
                 raise KeyError(f"materialized microbatch is missing fields {missing}")
+            if self._pin_memory:
+                data = _pin_stage_payload(data)
             payload_bytes = float(_tensor_bytes(data))
             self._record("materialize_s", time.perf_counter() - start)
             self._record("materialized_payload_bytes", payload_bytes)
@@ -690,7 +805,7 @@ class _TrainMicrobatchLoader(Iterator[PrefetchedMicrobatch]):
 
 
 class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
-    """Prefetch on each stage leader and fan out through foreground NCCL."""
+    """Load on a CPU thread and distribute on the foreground training thread."""
 
     def __init__(
         self,
@@ -717,6 +832,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             for mb_idx, sample_ids in enumerate(batch.microbatch_sample_ids)
         )
         self._group = group
+        self._depth = depth
         self._loader: _TrainMicrobatchLoader | None = None
         self._prefetch_iterator: (
             _ThreadPrefetchIterator[PrefetchedMicrobatch] | None
@@ -728,6 +844,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
                 plan=self.plan,
                 items=self._items,
                 pad_value_dict=pad_value_dict,
+                pin_memory=depth == 1,
             )
             self._prefetch_iterator = _ThreadPrefetchIterator(
                 self._loader,
@@ -739,6 +856,12 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
                 item_size=lambda item: _tensor_bytes(item.data),
             )
         self._consumed = 0
+        self._schema: tuple[_TensorFieldSchema, ...] | None = None
+        self._transport_stream: Any | None = None
+        self._in_flight: _InFlightMicrobatch | None = None
+        self._retired: list[_InFlightMicrobatch] = []
+        self._terminal_failure: _PrefetchFailure | None = None
+        self._closed = False
         self._metrics_lock = threading.Lock()
         self._foreground_distribute_s = 0.0
 
@@ -756,6 +879,8 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
 
     def _take_stage_leader_item(
         self,
+        *,
+        start_next: bool = True,
     ) -> PrefetchedMicrobatch | _PrefetchFailure:
         if self._prefetch_iterator is None:
             return _PrefetchFailure(
@@ -763,7 +888,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
                 from_source=False,
             )
         try:
-            return next(self._prefetch_iterator)
+            return self._prefetch_iterator.take(start_next=start_next)
         except Exception as error:
             return _PrefetchFailure(
                 f"{type(error).__name__}: {error}"[:_MAX_ERROR_LENGTH],
@@ -782,7 +907,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         expected_mb: int,
         expected_ids: tuple[str, ...],
     ) -> PrefetchedMicrobatch:
-        """Broadcast one PP-stage payload from TP0/CP0 in the foreground."""
+        """Synchronously distribute a depth-zero or bootstrap microbatch."""
         start = time.perf_counter()
         if self._group.is_stage_leader:
             if isinstance(item, PrefetchedMicrobatch):
@@ -801,12 +926,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
                     )
             if isinstance(item, _PrefetchFailure):
                 envelope: list[Any] = [
-                    (
-                        "error",
-                        expected_gb,
-                        expected_mb,
-                        item.message,
-                    )
+                    ("error", expected_gb, expected_mb, item.message)
                 ]
             elif isinstance(item, PrefetchedMicrobatch):
                 envelope = [
@@ -855,8 +975,6 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             group=self._group.stage_group,
             keep_on_broadcast_device=True,
         )
-        # Complete the shared payload collective before evaluating local
-        # metadata. A rank-local early exit would strand its stage peers.
         expected_status = ("ok", expected_gb, expected_mb, expected_ids)
         if status != expected_status:
             raise self._batch_error(
@@ -869,19 +987,245 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             self._foreground_distribute_s += time.perf_counter() - start
         return PrefetchedMicrobatch(expected_gb, expected_mb, expected_ids, data)
 
-    def __next__(self) -> PrefetchedMicrobatch:
-        if self._consumed >= len(self._items):
-            raise StopIteration
-        expected_gb, expected_mb, expected_ids = self._items[self._consumed]
+    def _get_transport_stream(self) -> Any:
+        if self._transport_stream is None:
+            self._transport_stream = torch.cuda.Stream(priority=0)
+        return self._transport_stream
+
+    def _launch_stage_fanout(
+        self,
+        item: PrefetchedMicrobatch | _PrefetchFailure | None,
+        *,
+        expected_gb: int,
+        expected_mb: int,
+        expected_ids: tuple[str, ...],
+    ) -> _InFlightMicrobatch:
+        """Enqueue one stage payload on the dedicated transport stream."""
+        if self._schema is None:
+            return _InFlightMicrobatch(
+                item=None,
+                source_data=None,
+                ready_event=None,
+                failure=_PrefetchFailure(
+                    "overlapped transport has no bootstrap tensor schema",
+                    from_source=False,
+                ),
+            )
+
+        stream = self._get_transport_stream()
+        source_data: BatchedDataDict[Any] | None = None
+        gpu_data: BatchedDataDict[Any] | None = None
+        local_failure: _PrefetchFailure | None = None
+        try:
+            if self._group.is_stage_leader:
+                if isinstance(item, _PrefetchFailure):
+                    local_failure = item
+                elif not isinstance(item, PrefetchedMicrobatch):
+                    local_failure = _PrefetchFailure(
+                        "stage leader has no prefetched payload",
+                        from_source=False,
+                    )
+                else:
+                    expected_identity = (expected_gb, expected_mb, expected_ids)
+                    actual_identity = (
+                        item.global_batch_index,
+                        item.microbatch_index,
+                        item.sample_ids,
+                    )
+                    if actual_identity != expected_identity:
+                        raise ValueError(
+                            "stage-prefetch order mismatch: expected "
+                            f"{expected_identity}, received {actual_identity}"
+                        )
+                    _validate_tensor_payload(
+                        item.data,
+                        schema=self._schema,
+                        batch_size=len(expected_ids),
+                    )
+                    source_data = item.data
+            if local_failure is None:
+                with torch.cuda.stream(stream):
+                    gpu_data = _allocate_stage_payload_on_cuda(
+                        schema=self._schema,
+                        batch_size=len(expected_ids),
+                    )
+        except Exception as error:
+            local_failure = _PrefetchFailure(
+                f"GPU transport preparation failed: {type(error).__name__}: {error}"[
+                    :_MAX_ERROR_LENGTH
+                ],
+                from_source=False,
+            )
+
+        if local_failure is not None:
+            return _InFlightMicrobatch(
+                item=None,
+                source_data=None,
+                ready_event=None,
+                failure=local_failure,
+            )
+
+        if gpu_data is None:
+            return _InFlightMicrobatch(
+                item=None,
+                source_data=None,
+                ready_event=None,
+                failure=_PrefetchFailure(
+                    "GPU transport preparation completed without a payload buffer",
+                    from_source=False,
+                ),
+            )
+
+        with torch.cuda.stream(stream):
+            if source_data is not None:
+                for field in self._schema:
+                    gpu_data[field.key].copy_(
+                        source_data[field.key],
+                        non_blocking=True,
+                    )
+            works: list[Any] = []
+            for field in self._schema:
+                works.append(
+                    torch.distributed.broadcast(
+                        gpu_data[field.key],
+                        src=self._group.stage_source_rank,
+                        group=self._group.stage_group,
+                        async_op=True,
+                    )
+                )
+            # CUDA Work.wait() inserts the NCCL-stream dependency into the
+            # currently active transport stream without synchronizing the CPU.
+            for work in works:
+                work.wait()
+            ready_event = torch.cuda.Event()
+            ready_event.record(stream)
+
+        return _InFlightMicrobatch(
+            item=PrefetchedMicrobatch(
+                expected_gb,
+                expected_mb,
+                expected_ids,
+                gpu_data,
+            ),
+            source_data=source_data,
+            ready_event=ready_event,
+            works=tuple(works),
+        )
+
+    def _retire_completed(self) -> None:
+        self._retired = [
+            transport
+            for transport in self._retired
+            if transport.ready_event is not None and not transport.ready_event.query()
+        ]
+
+    def launch_next(self) -> None:
+        """Launch the next microbatch after the current forward is enqueued."""
+        if self._depth == 0 or self._closed:
+            return
+        self._retire_completed()
+        target = self._consumed
+        if target >= len(self._items):
+            return
+        expected_gb, expected_mb, expected_ids = self._items[target]
+        if self._in_flight is not None:
+            in_flight_item = self._in_flight.item
+            if in_flight_item is None or (
+                in_flight_item.global_batch_index,
+                in_flight_item.microbatch_index,
+                in_flight_item.sample_ids,
+            ) == (expected_gb, expected_mb, expected_ids):
+                return
+            raise TrainMicrobatchPrefetchError(
+                "overlapped transport already holds a different microbatch"
+            )
+
         leader_item: PrefetchedMicrobatch | _PrefetchFailure | None = None
         if self._group.is_stage_leader:
-            leader_item = self._take_stage_leader_item()
-        item = self._stage_fanout(
+            leader_item = self._take_stage_leader_item(start_next=False)
+        start = time.perf_counter()
+        self._in_flight = self._launch_stage_fanout(
             leader_item,
             expected_gb=expected_gb,
             expected_mb=expected_mb,
             expected_ids=expected_ids,
         )
+        with self._metrics_lock:
+            self._foreground_distribute_s += time.perf_counter() - start
+
+    def _consume_in_flight(
+        self,
+        *,
+        expected_gb: int,
+        expected_mb: int,
+        expected_ids: tuple[str, ...],
+    ) -> PrefetchedMicrobatch:
+        transport = self._in_flight
+        if transport is None:
+            raise self._batch_error(
+                expected_gb,
+                expected_mb,
+                "next microbatch was not launched",
+            )
+        self._in_flight = None
+        if transport.failure is not None:
+            self._terminal_failure = transport.failure
+            raise self._batch_error(
+                expected_gb,
+                expected_mb,
+                transport.failure.message,
+            )
+        if transport.item is None or transport.ready_event is None:
+            failure = _PrefetchFailure(
+                "overlapped transport completed without a payload",
+                from_source=False,
+            )
+            self._terminal_failure = failure
+            raise self._batch_error(expected_gb, expected_mb, failure.message)
+
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(transport.ready_event)
+        _record_payload_stream(transport.item.data, current_stream)
+        if self._prefetch_iterator is not None:
+            self._prefetch_iterator.start_next()
+        self._retired.append(transport)
+        self._retire_completed()
+        return transport.item
+
+    def __next__(self) -> PrefetchedMicrobatch:
+        if self._terminal_failure is not None:
+            raise TrainMicrobatchPrefetchError(
+                "train microbatch prefetch is terminal after failure: "
+                f"{self._terminal_failure.message}"
+            )
+        if self._consumed >= len(self._items):
+            raise StopIteration
+        expected_gb, expected_mb, expected_ids = self._items[self._consumed]
+
+        if self._depth == 0 or self._consumed == 0:
+            leader_item: PrefetchedMicrobatch | _PrefetchFailure | None = None
+            if self._group.is_stage_leader:
+                leader_item = self._take_stage_leader_item()
+            item = self._stage_fanout(
+                leader_item,
+                expected_gb=expected_gb,
+                expected_mb=expected_mb,
+                expected_ids=expected_ids,
+            )
+            if self._depth == 1:
+                self._schema = _tensor_payload_schema(item.data)
+        else:
+            # Correctness fallback for callers that do not provide the
+            # post-forward hook. The integrated Megatron path launches here
+            # after the previous forward, so this branch normally only waits.
+            if self._in_flight is None:
+                self.launch_next()
+            item = self._consume_in_flight(
+                expected_gb=expected_gb,
+                expected_mb=expected_mb,
+                expected_ids=expected_ids,
+            )
+
         if (
             item.global_batch_index != expected_gb
             or item.microbatch_index != expected_mb
@@ -967,9 +1311,34 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         return result
 
     def close(self) -> None:
-        if self._prefetch_iterator is None:
+        if self._closed:
             return
-        try:
-            self._prefetch_iterator.close()
-        except _ThreadPrefetchError as error:
-            raise TrainMicrobatchPrefetchError(str(error)) from error
+        self._closed = True
+        transports = [*self._retired]
+        if self._in_flight is not None:
+            transports.append(self._in_flight)
+        pending_events = [
+            transport.ready_event
+            for transport in transports
+            if transport.ready_event is not None
+        ]
+        deadline = time.monotonic() + _CLOSE_TIMEOUT_SECONDS
+        while pending_events and time.monotonic() < deadline:
+            pending_events = [event for event in pending_events if not event.query()]
+            if pending_events:
+                time.sleep(_QUEUE_POLL_SECONDS)
+        self._retired.clear()
+        self._in_flight = None
+        iterator_error: _ThreadPrefetchError | None = None
+        if self._prefetch_iterator is not None:
+            try:
+                self._prefetch_iterator.close()
+            except _ThreadPrefetchError as error:
+                iterator_error = error
+        if pending_events:
+            raise TrainMicrobatchPrefetchError(
+                "overlapped microbatch transport did not complete within "
+                f"{_CLOSE_TIMEOUT_SECONDS:.0f}s"
+            )
+        if iterator_error is not None:
+            raise TrainMicrobatchPrefetchError(str(iterator_error)) from iterator_error

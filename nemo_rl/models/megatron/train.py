@@ -166,6 +166,7 @@ def forward_with_post_processing_fn(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    post_forward_hook: Optional[Callable[[], None]] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -184,6 +185,9 @@ def forward_with_post_processing_fn(
         straggler_timer: Straggler detector for profiling the forward pass
         draft_model: Draft model for online draft model training
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
+        post_forward_hook: Optional main-thread hook invoked after the current
+            model forward and post-processing closure setup. The closure's
+            loss/logprob work has not executed yet.
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -292,6 +296,9 @@ def forward_with_post_processing_fn(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
         )
 
+    if post_forward_hook is not None:
+        post_forward_hook()
+
     return output_tensor, post_processing_fn_wrapped
 
 
@@ -313,6 +320,7 @@ def megatron_forward_backward(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    post_forward_hook: Optional[Callable[[], None]] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -335,6 +343,8 @@ def megatron_forward_backward(
         straggler_timer: Straggler detector for profiling the forward pass
         draft_model: Draft model for online draft model training
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
+        post_forward_hook: Optional main-thread hook invoked after each model
+            forward and post-processing closure setup.
 
     Returns:
         Results from the forward/backward execution
@@ -352,6 +362,7 @@ def megatron_forward_backward(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
+        post_forward_hook=post_forward_hook,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
