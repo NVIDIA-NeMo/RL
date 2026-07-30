@@ -150,3 +150,43 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         group_id="group",
     )
     assert "routed_experts" not in fields
+
+
+def _failed_completion() -> Completion:
+    """A trajectory whose first generation raised: prompt only, no routes."""
+    return Completion(
+        message_log=[
+            {
+                "role": "user",
+                "content": "prompt",
+                "token_ids": torch.tensor([10, 11]),
+            }
+        ],
+        env_extras=None,
+        truncated=False,
+        reward=0.0,
+    )
+
+
+def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
+    """A group is packable when only some completions generated (and so have routes)."""
+    record = _record([_completion(route_start=10, reward=1.0), _failed_completion()])
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch["input_lengths"].tolist() == [5, 2]
+    routes = train_batch["routed_experts"]
+    assert routes.shape == (2, 5, 2, 2)
+    assert torch.equal(routes[0, :5], torch.cat((_routes(10, 4), _fallback_routes(1))))
+    # The completion that never generated gets the all--1 missing-route sentinel,
+    # so Megatron routes those tokens with its own router.
+    assert torch.equal(routes[1, :2], torch.full((2, 2, 2), -1, dtype=routes.dtype))
+    # It is fully loss-masked either way.
+    assert train_batch["token_mask"][1, :2].tolist() == [0, 0]
+
+    _, fields, _ = pack_payload(train_batch, weight_version=3, group_id="group")
+    assert "routed_experts" in fields
+    assert list(fields["routed_experts"].unbind())[1].shape == (2, 2, 2)

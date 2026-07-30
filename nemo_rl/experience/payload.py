@@ -23,6 +23,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -49,6 +50,7 @@ def record_to_train_batch(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
 
     completions = record.completions
     n = len(completions)
@@ -57,6 +59,11 @@ def record_to_train_batch(
     message_logs = [c.message_log for c in completions]
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
+
+    # Must precede the prompt extraction: it reuses the same message dicts, so
+    # backfilling here also covers the prompt flatten below. Doing it only inside
+    # add_grpo_token_loss_masks_and_generation_logprobs would be too late.
+    backfill_missing_routed_experts(message_logs)
 
     prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
     prompt_flat, _ = batched_message_log_to_flat_message(
@@ -84,8 +91,8 @@ def record_to_train_batch(
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
     }
-    if "routed_experts" in flat:
-        train_data["routed_experts"] = flat["routed_experts"]
+    if ROUTED_EXPERTS_FIELD in flat:
+        train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
     return BatchedDataDict[Any](train_data)
 
 

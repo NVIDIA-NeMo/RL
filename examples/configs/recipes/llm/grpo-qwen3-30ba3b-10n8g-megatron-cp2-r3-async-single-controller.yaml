@@ -1,4 +1,7 @@
 # SingleController async+TQ variant of the Qwen3-30B-A3B R3 recipe.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
 defaults: ./grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.yaml
 
 # SC does not support validation and checkpointing yet.

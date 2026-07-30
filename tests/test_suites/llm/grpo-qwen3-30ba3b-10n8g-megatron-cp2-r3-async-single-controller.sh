@@ -23,6 +23,13 @@ NUM_MINUTES=60
 exit_if_max_steps_reached
 
 cd $PROJECT_ROOT
+
+# check_r3_trace.py cross-checks every record in the trace dir, so a prior
+# attempt's producer records (written before it died) would have no matching
+# fetch and fail this attempt. Trace files are per-host/per-pid and appended,
+# so a retry never overwrites them.
+rm -rf "$NRL_R3_TRACE_DIR"
+
 uv run examples/run_grpo_single_controller.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
