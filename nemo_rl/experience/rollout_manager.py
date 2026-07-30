@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import json
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -28,8 +29,10 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
+    GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
+    RolloutTimeout,
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -49,6 +52,20 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+@dataclass(frozen=True)
+class RolloutTimeouts:
+    """Deadlines for the blocking waits inside one rollout.
+
+    Resolved from ``async_rl.rollout_timeout_s`` / ``generation_timeout_s`` /
+    ``env_timeout_s``, which own the user-facing defaults. ``None`` means no deadline,
+    reproducing the historical behaviour of waiting indefinitely.
+    """
+
+    rollout_s: Optional[float] = None
+    generation_s: Optional[float] = None
+    env_s: Optional[float] = None
 
 
 def _classify_generation_failure(
@@ -99,6 +116,39 @@ async def _gather_cancelling_siblings(coros: list[Any]) -> list[Any]:
         raise
 
 
+class _Deadline:
+    """``asyncio.timeout`` that reports expiry as a typed :class:`RolloutTimeout`.
+
+    A bare ``asyncio.timeout`` surfaces expiry as ``TimeoutError``, which is
+    indistinguishable from a ``TimeoutError`` raised by the wrapped code itself. This
+    consults ``expired()`` so only a real deadline breach is relabelled, and anything
+    else propagates untouched.
+
+    ``seconds=None`` disables the deadline, matching ``asyncio.timeout`` semantics.
+    """
+
+    def __init__(self, seconds: Optional[float], description: str) -> None:
+        self._seconds = seconds
+        self._description = description
+        self._timeout: Optional[asyncio.Timeout] = None
+
+    async def __aenter__(self) -> "_Deadline":
+        self._timeout = asyncio.timeout(self._seconds)
+        await self._timeout.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> Optional[bool]:
+        assert self._timeout is not None
+        try:
+            return await self._timeout.__aexit__(exc_type, exc, tb)
+        except TimeoutError as timeout_error:
+            if not self._timeout.expired():
+                raise
+            raise RolloutTimeout(
+                f"{self._description} exceeded {self._seconds}s"
+            ) from timeout_error
+
+
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
@@ -114,6 +164,7 @@ class AsyncRolloutImpl:
         max_seq_len: int,
         max_rollout_turns: int,
         policy_generation: GenerationInterface,
+        timeouts: RolloutTimeouts,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -122,6 +173,7 @@ class AsyncRolloutImpl:
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._policy_generation = policy_generation
+        self._timeouts = timeouts
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -249,9 +301,15 @@ class AsyncRolloutImpl:
             # blocks every other in-flight rollout coroutine for the entire env
             # step. In this case, need to wrap with asyncio.to_thread to make
             # this function yieldable.
-            env_output = await asyncio.to_thread(
-                calculate_rewards, sample_batch, self._task_to_env
-            )
+            #
+            # The deadline frees this rollout, not the thread: Python cannot kill a
+            # running thread, so a hung env call keeps occupying a thread-pool slot
+            # until its own ray.get returns. Unblocking the rollout is still what
+            # matters -- otherwise it holds a max_inflight_prompts permit forever.
+            async with _Deadline(self._timeouts.env_s, "environment step"):
+                env_output = await asyncio.to_thread(
+                    calculate_rewards, sample_batch, self._task_to_env
+                )
 
             # Update reward and termination statistics
             # Multi-reward isn't supported in RolloutManager now, see
@@ -348,10 +406,11 @@ class AsyncRolloutImpl:
         # Generate response
         # TODO: update generate_async to return a single item directly
         output = None
-        async for _idx, output in self._policy_generation.generate_async(
-            generation_input_data
-        ):
-            pass
+        async with _Deadline(self._timeouts.generation_s, "generation turn"):
+            async for _idx, output in self._policy_generation.generate_async(
+                generation_input_data
+            ):
+                pass
 
         # Build assistant message
         input_len = int(input_lengths[0].item())
@@ -484,6 +543,9 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        # Optional so direct construction does not have to carry the resiliency wiring;
+        # RolloutManager always passes it explicitly.
+        timeouts: Optional[RolloutTimeouts] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -493,6 +555,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
 
         self._validate_init_params()
 
@@ -579,25 +642,33 @@ class AsyncNemoGymRolloutImpl:
             results: list[dict | None] = [None for _ in inputs]
             received_row_indices: set[int] = set()
             env_timing_metrics: dict[str, Any] = {}
-            async for result_ref in nemo_gym_env.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(inputs, self._tokenizer, timer_prefix):
-                rowidx, result, timing_metrics = await result_ref
-                if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
-                    raise ValueError(
-                        f"NeMo-Gym returned invalid row index {rowidx!r} for "
-                        f"{len(inputs)} inputs"
-                    )
-                if rowidx in received_row_indices:
-                    raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
-                received_row_indices.add(rowidx)
-                results[rowidx] = result
-                if timing_metrics is not None:
-                    env_timing_metrics = timing_metrics
+            # The deadline spans the whole stream rather than each await: NeMo-Gym
+            # yields rows as they finish, so a per-await budget would reset every time
+            # a fast row landed and never fire for the slow one holding the group up.
+            async with _Deadline(self._timeouts.rollout_s, "NeMo-Gym prompt group"):
+                async for result_ref in nemo_gym_env.run_rollouts.options(
+                    num_returns="streaming"
+                ).remote(inputs, self._tokenizer, timer_prefix):
+                    rowidx, result, timing_metrics = await result_ref
+                    if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
+                        raise ValueError(
+                            f"NeMo-Gym returned invalid row index {rowidx!r} for "
+                            f"{len(inputs)} inputs"
+                        )
+                    if rowidx in received_row_indices:
+                        raise ValueError(
+                            f"NeMo-Gym returned duplicate row index {rowidx}"
+                        )
+                    received_row_indices.add(rowidx)
+                    results[rowidx] = result
+                    if timing_metrics is not None:
+                        env_timing_metrics = timing_metrics
 
             if any(result is None for result in results):
-                raise RuntimeError(
-                    "NeMo-Gym rollout stream ended before all rows arrived"
+                missing = sorted(set(range(len(inputs))) - received_row_indices)
+                raise GymTransportError(
+                    "NeMo-Gym rollout stream ended before all rows arrived; missing "
+                    f"rows {missing} of {len(inputs)}"
                 )
 
             completed_results = [result for result in results if result is not None]
@@ -740,6 +811,7 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
         tq_buffer: Optional[TQReplayBuffer] = None,
+        timeouts: Optional[RolloutTimeouts] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -766,6 +838,9 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            # None means "no deadlines", which is what async_rl's own defaults resolve
+            # to; callers that have a config pass the resolved values in.
+            timeouts=timeouts if timeouts is not None else RolloutTimeouts(),
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt

@@ -33,23 +33,64 @@ import pytest
 import ray.exceptions
 import torch
 
+from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
+    GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
+    RolloutTimeout,
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RolloutManager,
+    RolloutTimeouts,
     _classify_generation_failure,
+    _Deadline,
     _gather_cancelling_siblings,
 )
+from nemo_rl.utils.timer import Timer
+
+
+@pytest.fixture
+def terminating_env(monkeypatch):
+    """Make calculate_rewards return a terminated, zero-reward step.
+
+    Lets the success-path tests exercise a whole rollout turn without standing up a
+    real environment actor.
+    """
+
+    def _fake(sample_batch, task_to_env):
+        del sample_batch, task_to_env
+        return EnvironmentReturn(
+            observations=[{"role": "environment", "content": ""}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([True]),
+            answers=[None],
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", _fake, raising=True
+    )
+    return _fake
+
+
+class _TokenizedText:
+    def __init__(self, input_ids: torch.Tensor) -> None:
+        self.input_ids = input_ids
 
 
 class _FakeTokenizer:
     def decode(self, ids, skip_special_tokens=True):
         del skip_special_tokens
         return f"<{len(ids)} tokens>"
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        """Tokenize an environment observation to one id per character."""
+        del return_tensors, add_special_tokens
+        return _TokenizedText(torch.tensor([[7] * len(text)], dtype=torch.long))
 
 
 class _FakeGeneration:
@@ -78,6 +119,8 @@ class _FakeGeneration:
             except asyncio.CancelledError:
                 self.cancelled += 1
                 raise
+        if behaviour == "slow":
+            await asyncio.sleep(0.05)
         yield (
             0,
             {
@@ -87,7 +130,9 @@ class _FakeGeneration:
         )
 
 
-def _make_impl(generation, *, num_generations=1, max_turns=1) -> AsyncRolloutImpl:
+def _make_impl(
+    generation, *, num_generations=1, max_turns=1, timeouts=None
+) -> AsyncRolloutImpl:
     """Build an AsyncRolloutImpl without firing its real __init__."""
     impl = object.__new__(AsyncRolloutImpl)
     impl._tokenizer = _FakeTokenizer()
@@ -96,6 +141,7 @@ def _make_impl(generation, *, num_generations=1, max_turns=1) -> AsyncRolloutImp
     impl._max_seq_len = 128
     impl._max_rollout_turns = max_turns
     impl._policy_generation = generation
+    impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     return impl
 
 
@@ -257,6 +303,197 @@ class TestGatherCancellingSiblings:
             ]
 
         asyncio.run(_main())
+
+
+class TestGenerationDeadline:
+    def test_a_hung_generation_raises_rollout_timeout(self):
+        """The wedge this exists to prevent: a generation that never returns."""
+        impl = _make_impl(
+            _FakeGeneration(["hang"]),
+            timeouts=RolloutTimeouts(generation_s=0.05),
+        )
+        with pytest.raises(GenerationUnavailable) as excinfo:
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        # Classified as infra, so the retry policy will re-dispatch it.
+        assert isinstance(excinfo.value.__cause__, RolloutTimeout)
+
+    def test_the_hung_generation_is_cancelled_not_abandoned(self):
+        generation = _FakeGeneration(["hang"])
+        impl = _make_impl(generation, timeouts=RolloutTimeouts(generation_s=0.05))
+        with pytest.raises(GenerationUnavailable):
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        assert generation.cancelled == 1
+
+    def test_no_deadline_configured_means_no_timeout(self, terminating_env):
+        """Default config must behave exactly as before: wait indefinitely."""
+        impl = _make_impl(
+            _FakeGeneration(["slow"]), timeouts=RolloutTimeouts(generation_s=None)
+        )
+        completion, _ = asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        assert completion.reward == 0.0
+
+    def test_slow_but_healthy_generation_does_not_trip_the_deadline(
+        self, terminating_env
+    ):
+        """Guards against over-tightening: a slow success must still succeed."""
+        impl = _make_impl(
+            _FakeGeneration(["slow"]), timeouts=RolloutTimeouts(generation_s=5.0)
+        )
+        completion, metrics = asyncio.run(
+            impl._run_single_rollout(_sample(), traj_idx=0)
+        )
+        assert metrics["turn_count"] == 1
+        assert any(m["role"] == "assistant" for m in completion.message_log)
+
+    def test_the_environment_step_has_its_own_deadline(self, monkeypatch):
+        """A hung env actor leaks a rollout permit exactly like a hung generation."""
+
+        def _hang(sample_batch, task_to_env):
+            del sample_batch, task_to_env
+            import time
+
+            time.sleep(30)
+
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollout_manager.calculate_rewards", _hang, raising=True
+        )
+        impl = _make_impl(_FakeGeneration(["ok"]), timeouts=RolloutTimeouts(env_s=0.05))
+        with pytest.raises(RolloutTimeout, match="environment step"):
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+
+
+class TestDeadlineHelper:
+    def test_expiry_is_reported_as_rollout_timeout(self):
+        async def _main():
+            async with _Deadline(0.01, "unit under test"):
+                await asyncio.sleep(10)
+
+        with pytest.raises(RolloutTimeout, match="unit under test exceeded 0.01s"):
+            asyncio.run(_main())
+
+    def test_an_inner_timeout_error_is_not_relabelled(self):
+        """A TimeoutError from the wrapped code must not read as a deadline breach.
+
+        Otherwise a genuine downstream timeout would be reported with our deadline's
+        duration, sending anyone debugging it to the wrong knob.
+        """
+
+        async def _main():
+            async with _Deadline(30.0, "unit under test"):
+                raise TimeoutError("something downstream timed out")
+
+        with pytest.raises(TimeoutError) as excinfo:
+            asyncio.run(_main())
+        assert not isinstance(excinfo.value, RolloutTimeout)
+
+    def test_none_disables_the_deadline(self):
+        async def _main():
+            async with _Deadline(None, "unit under test"):
+                await asyncio.sleep(0.01)
+            return "completed"
+
+        assert asyncio.run(_main()) == "completed"
+
+    def test_outer_cancellation_still_propagates_as_cancellation(self):
+        """Tearing down the controller must not look like a rollout timeout."""
+
+        async def _main():
+            async def _body():
+                async with _Deadline(30.0, "unit under test"):
+                    await asyncio.Event().wait()
+
+            task = asyncio.ensure_future(_body())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_main())
+
+
+class _FakeGymMethod:
+    """Mimics `env.run_rollouts.options(...).remote(...)` returning a result stream."""
+
+    def __init__(self, rows_to_yield, hang_after) -> None:
+        self._rows_to_yield = rows_to_yield
+        self._hang_after = hang_after
+        self.cancelled = 0
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, tokenizer, timer_prefix):
+        del tokenizer, timer_prefix
+        return self._stream(len(inputs))
+
+    async def _stream(self, num_inputs):
+        async def _result(rowidx):
+            return rowidx, {"input_message_log": [], "message_log": []}, None
+
+        for rowidx in range(min(self._rows_to_yield, num_inputs)):
+            yield _result(rowidx)
+        if self._hang_after:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+
+def _make_gym_impl(gym_method, *, num_generations=2, timeouts=None):
+    from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
+
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._tokenizer = _FakeTokenizer()
+    impl._task_to_env = {"nemo_gym": type("Env", (), {"run_rollouts": gym_method})()}
+    impl._num_generations_per_prompt = num_generations
+    impl._max_seq_len = 128
+    impl._max_rollout_turns = 1
+    impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+    return impl
+
+
+class TestGymRolloutDeadline:
+    """The gym path is where the silent wedge described in the resiliency report lives.
+
+    NeMo-Gym retries a dead vLLM endpoint forever with no HTTP timeout, so without a
+    deadline here the rollout never returns and permanently holds a
+    max_inflight_prompts permit.
+    """
+
+    def test_a_hung_gym_stream_raises_rollout_timeout(self):
+        method = _FakeGymMethod(rows_to_yield=0, hang_after=True)
+        impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.05))
+        with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+        assert method.cancelled == 1, "the hung stream must be cancelled"
+
+    def test_the_deadline_spans_the_whole_stream_not_each_row(self):
+        """A steady drip of fast rows must not keep resetting the budget.
+
+        One slow row holding the group up is exactly the case that has to fire, and a
+        per-await deadline would never see it.
+        """
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=True)
+        impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.05))
+        with pytest.raises(RolloutTimeout):
+            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+
+    def test_a_truncated_stream_is_an_infra_failure_not_a_bare_runtime_error(self):
+        """Rows going missing is a transport problem, so it must be retriable."""
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=False)
+        impl = _make_gym_impl(method)
+        with pytest.raises(GymTransportError, match=r"missing rows \[1\] of 2"):
+            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+
+    def test_no_deadline_configured_leaves_the_stream_unbounded(self):
+        """Default config must not introduce a deadline where there was none."""
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=False)
+        impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=None))
+        # Reaches the missing-rows check rather than timing out first.
+        with pytest.raises(GymTransportError):
+            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
 
 
 class TestClassifyGenerationFailure:

@@ -39,7 +39,10 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
+from nemo_rl.experience.rollout_manager import (
+    AsyncNemoGymRolloutImpl,
+    RolloutTimeouts,
+)
 from nemo_rl.experience.rollouts import (
     generate_responses_async,
     run_async_multi_turn_rollout,
@@ -1389,6 +1392,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    # These tests cover stream ordering/dedup, not deadlines.
+    manager._timeouts = RolloutTimeouts()
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
@@ -1459,6 +1464,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    # These tests cover stream ordering/dedup, not deadlines.
+    manager._timeouts = RolloutTimeouts()
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
