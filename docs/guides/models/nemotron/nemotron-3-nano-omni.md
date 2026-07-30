@@ -128,9 +128,9 @@ To run on a different node count, change `NUM_NODES` and the `--nodes` flag.
 
 ## Megatron backend
 
-The Megatron backend uses a dedicated `NemotronOmniModel` supplied by Megatron Bridge. The Hugging Face processor expands each image placeholder into the complete media-token sequence before the batch reaches the model. NeMo RL passes that expanded sequence and the image tensors to the model; `NemotronOmniModel` replaces the media-token positions with RADIO encoder outputs and then performs sequence packing and context-parallel sharding.
+The Megatron backend uses a dedicated `NemotronOmniModel` supplied by Megatron Bridge. The Hugging Face processor expands each image placeholder into the complete media-token sequence. NeMo RL's Megatron data pipeline packs those expanded rows into a full THD token stream; `NemotronOmniModel` replaces the media-token positions with RADIO encoder outputs and then selects the context-parallel slice.
 
-This is the same model-owned packing boundary used by maintained Megatron VLM integrations. It differs from the historical Nemotron Omni `LLaVAModel` path, which collapsed the expanded media-token sequence before packing and expanded it again inside the model. The dedicated model removes that extra representation change and allows the integration to use Megatron Bridge and Megatron-LM from their maintained main branches.
+This collator-owned packing boundary differs from the historical Nemotron Omni `LLaVAModel` path, which collapsed the expanded media-token sequence before packing and expanded it again inside the model. The dedicated model removes that extra representation change and allows the integration to use Megatron Bridge and Megatron-LM from their maintained main branches.
 
 The current Megatron recipes cover Nano image-and-text GRPO. Super, video, and audio training are follow-up work and are not enabled by these recipes.
 
