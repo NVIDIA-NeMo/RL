@@ -15,9 +15,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -35,11 +42,92 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 # ── User-facing SingleController configs ────────────────────────────────────
 
 
+class RolloutFailureConfig(BaseModel, extra="allow"):
+    """Retry budgets for a rollout that fails, split by failure class.
+
+    Infrastructure failures re-dispatch the prompt onto a different generation shard;
+    data failures are deterministic, so their budget is small and exhausting it is
+    reported rather than absorbed. Nothing here ever discards a prompt silently.
+    """
+
+    # Attempts for infrastructure failures (timeout, dead shard, transport). Each retry
+    # re-enters shard selection, so it lands elsewhere. Exhausting this means the fleet
+    # is broken rather than the prompt, and the run fails.
+    max_attempts_per_prompt: PositiveInt = 5
+    # Attempts for deterministic, prompt-specific failures. One retry separates a
+    # transient empty response from a genuinely bad prompt; a second identical failure
+    # confirms the prompt is at fault.
+    max_data_attempts_per_prompt: PositiveInt = 2
+    # First infra-retry delay, doubled per attempt.
+    backoff_base_s: PositiveFloat = 1.0
+    # Ceiling on the exponential backoff, so a long outage retries at a steady rate.
+    max_backoff_s: PositiveFloat = 30.0
+    # After max_data_attempts_per_prompt: fail the run, or continue without the prompt.
+    on_data_exhausted: Literal["fail_fast", "skip"] = "fail_fast"
+    # Only with on_data_exhausted="skip": distinct prompts that may be skipped before
+    # the run fails anyway.
+    max_skipped_prompts: NonNegativeInt = 0
+
+    @model_validator(mode="after")
+    def _check_consistent(self) -> "RolloutFailureConfig":
+        if self.max_backoff_s < self.backoff_base_s:
+            raise ValueError(
+                f"async_rl.rollout_failure.max_backoff_s ({self.max_backoff_s}) must be "
+                f">= backoff_base_s ({self.backoff_base_s})"
+            )
+        # Otherwise "skip" silently behaves exactly like "fail_fast".
+        if self.on_data_exhausted == "skip" and self.max_skipped_prompts < 1:
+            raise ValueError(
+                "async_rl.rollout_failure.on_data_exhausted='skip' requires "
+                "max_skipped_prompts >= 1; got "
+                f"{self.max_skipped_prompts}, which would skip nothing and fail the run "
+                "on the first exhausted prompt. Set max_skipped_prompts, or use "
+                "on_data_exhausted='fail_fast'."
+            )
+        return self
+
+
+class WatchdogConfig(BaseModel, extra="allow"):
+    """Last-resort detection for stalls that no other layer catches."""
+
+    # How often the watchdog task runs its checks.
+    interval_s: PositiveFloat = 30.0
+    # Rollouts in flight but none committed for this long counts as a stall.
+    stall_timeout_s: PositiveFloat = 600.0
+    # Whether a detected stall only reports, or ends the run.
+    stall_action: Literal["warn", "abort"] = "warn"
+    # Poll NeMo-Gym's own RunHelper for dead subprocess servers each tick.
+    gym_subprocess_check: bool = True
+
+    @model_validator(mode="after")
+    def _check_consistent(self) -> "WatchdogConfig":
+        if self.stall_timeout_s <= self.interval_s:
+            raise ValueError(
+                f"async_rl.watchdog.stall_timeout_s ({self.stall_timeout_s}) must be "
+                f"> interval_s ({self.interval_s}); otherwise the watchdog reports a "
+                "stall before it has had a chance to observe one."
+            )
+        return self
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
     )
+    # Deadline for one NeMo-Gym prompt-group rollout, covering the whole streaming
+    # response. None disables.
+    rollout_timeout_s: Optional[PositiveFloat] = None
+    # Deadline for a single generate_async turn on the native GRPO path. None disables.
+    generation_timeout_s: Optional[PositiveFloat] = None
+    # Deadline for one environment step on the native GRPO path. None disables.
+    env_timeout_s: Optional[PositiveFloat] = None
+    # Retry budgets for failed rollouts.
+    rollout_failure: RolloutFailureConfig = Field(
+        default_factory=RolloutFailureConfig,
+    )
+    # Stall detection.
+    watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
@@ -50,6 +138,22 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+
+    @model_validator(mode="after")
+    def _check_watchdog_outlasts_rollouts(self) -> "AsyncRLConfig":
+        # A rollout that is merely slow already has its own deadline; the watchdog must
+        # give it a chance to fire first, or every long rollout reads as a stall.
+        if (
+            self.rollout_timeout_s is not None
+            and self.watchdog.stall_timeout_s <= self.rollout_timeout_s
+        ):
+            raise ValueError(
+                f"async_rl.watchdog.stall_timeout_s ({self.watchdog.stall_timeout_s}) "
+                f"must be > async_rl.rollout_timeout_s ({self.rollout_timeout_s}); "
+                "otherwise the watchdog reports a stall for rollouts that are merely "
+                "slow and would have timed out on their own."
+            )
+        return self
 
 
 class MasterConfig(BaseModel, extra="allow"):

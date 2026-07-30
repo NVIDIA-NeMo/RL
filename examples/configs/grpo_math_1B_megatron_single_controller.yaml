@@ -21,6 +21,35 @@ async_rl:
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
 
+  # ── Resiliency ─────────────────────────────────────────────────────────────
+  # Deadlines for a single rollout. null disables, which is the default and
+  # reproduces the historical behaviour of waiting forever. Set these in any run
+  # that matters: without them a wedged generation engine parks a rollout
+  # permanently, holding one max_inflight_prompts slot for the rest of the job.
+  rollout_timeout_s: null       # whole NeMo-Gym prompt-group rollout
+  generation_timeout_s: null    # one generate_async turn (native GRPO path)
+  env_timeout_s: null           # one environment step (native GRPO path)
+
+  # What happens to a prompt whose rollout fails. Infrastructure failures are
+  # re-dispatched (the retry re-enters shard selection, so it lands elsewhere);
+  # deterministic per-prompt failures get a much smaller budget because another
+  # shard would fail identically.
+  rollout_failure:
+    max_attempts_per_prompt: 5        # infra budget; exhausting it fails the run
+    max_data_attempts_per_prompt: 2   # data budget; 1 retry separates transient from deterministic
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    on_data_exhausted: fail_fast      # fail_fast | skip
+    max_skipped_prompts: 0            # required >= 1 when on_data_exhausted=skip
+
+  # Last-resort stall detection. stall_timeout_s must exceed both interval_s and
+  # rollout_timeout_s, so a merely-slow rollout is not reported as a stall.
+  watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 600.0
+    stall_action: warn                # warn | abort
+    gym_subprocess_check: true        # polls NeMo-Gym's RunHelper for dead servers
+
 # SC does not support checkpointing yet.
 checkpointing:
   enabled: false
