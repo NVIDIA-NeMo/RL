@@ -22,6 +22,7 @@ grpo:
   advantage_clip_low: -50
   advantage_clip_high: 50
   val_period: -1
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
@@ -526,6 +527,7 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

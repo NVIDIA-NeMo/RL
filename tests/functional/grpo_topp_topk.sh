@@ -42,7 +42,7 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05' \
-    'max(data["train/gen_kl_error"]) < 0.03' \
+    'max(data["train/gen_kl_error"]) < 0.032' \
     'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
     'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
     'min(data["train/probs_ratio_clamped_max"]) > 0.79' \

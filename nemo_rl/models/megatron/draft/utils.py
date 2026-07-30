@@ -1203,6 +1203,28 @@ def copy_policy_lm_head_to_draft(
         )
 
 
+DRAFT_GRAD_NORM_GROUP = "draft"
+
+
+def register_draft_grad_norm_group() -> None:
+    """Register the 'draft' grad-norm group with Megatron's optimizer.
+
+    Megatron clips parameters in a registered group separately from the main
+    gradient norm (see MegatronOptimizer.clip_grad_norm and the 'mtp'
+    precedent in multi_token_prediction.py), so the draft head's large
+    early-training gradients do not shrink the policy update through the
+    shared global clip. Only called when a draft model is built, so baseline
+    (no-draft) runs keep Megatron's stock clipping behavior.
+    """
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+
+    if DRAFT_GRAD_NORM_GROUP not in mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS:
+        mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS = (
+            *mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS,
+            DRAFT_GRAD_NORM_GROUP,
+        )
+
+
 def build_draft_model(
     model_provider,
     draft_config: dict[str, Any],
@@ -1346,5 +1368,12 @@ def build_draft_model(
             policy_model_chunk=policy_model_chunk,
         )
         print("[draft] Initialized draft LM head from the policy output layer.")
+
+    # Tag draft params before optimizer construction so
+    # copy_optimizer_param_metadata propagates the group to the distributed
+    # optimizer's shard/fp32 main params and they are clipped separately.
+    register_draft_grad_norm_group()
+    for param in draft_model.parameters():
+        param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
 
     return draft_model

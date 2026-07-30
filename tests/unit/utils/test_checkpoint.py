@@ -23,6 +23,7 @@ import pytest
 import torch
 import yaml
 
+import nemo_rl.utils.checkpoint as checkpoint_module
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 
@@ -403,6 +404,30 @@ def test_save_optimizer_flag_initialization(checkpoint_config):
 
 
 @pytest.mark.parametrize("model_component", ["policy", "value"])
+@pytest.mark.parametrize("common_state_marker", ["common.pt", "metadata.json"])
+def test_get_resume_paths_detects_megatron_optimizer(
+    checkpoint_dir, monkeypatch, model_component, common_state_marker
+):
+    checkpoint_path = checkpoint_dir / "step_1"
+    iteration_dir = checkpoint_path / model_component / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / common_state_marker).touch()
+    load_common_state = MagicMock(return_value={"optimizer": {}})
+    monkeypatch.setattr(
+        checkpoint_module, "_load_megatron_common_state_dict", load_common_state
+    )
+
+    weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path,
+        model_component=model_component,
+    )
+
+    assert weights_path == checkpoint_path / model_component / "weights"
+    assert optimizer_path == checkpoint_path / model_component / "optimizer"
+    load_common_state.assert_called_once_with(iteration_dir)
+
+
+@pytest.mark.parametrize("model_component", ["policy", "value"])
 def test_get_resume_paths_missing_optimizer(
     checkpoint_manager, checkpoint_dir, model_component
 ):
@@ -461,30 +486,71 @@ def test_get_resume_paths_defaults_to_policy(checkpoint_dir):
     assert optimizer_path == expected_optimizer_path
 
 
-@pytest.mark.parametrize("model_component", ["policy", "value"])
-def test_get_resume_paths_embedded_megatron_optimizer(checkpoint_dir, model_component):
-    """MCore uses a nonexistent optimizer path as an embedded-state load flag."""
+def test_get_resume_paths_warns_when_megatron_optimizer_missing(
+    checkpoint_dir, monkeypatch
+):
     checkpoint_path = checkpoint_dir / "step_1"
-    expected_weights_path = checkpoint_path / model_component / "weights"
-    common_pt_path = expected_weights_path / "iter_0000000" / "common.pt"
-    common_pt_path.parent.mkdir(parents=True)
-    torch.save(
-        {
-            "optimizer": {"state": {}},
-            "opt_param_scheduler": {"num_steps": 8},
-        },
-        common_pt_path,
-    )
-    expected_optimizer_path = checkpoint_path / model_component / "optimizer"
-    assert not expected_optimizer_path.exists()
-
-    weights_path, optimizer_path = CheckpointManager.get_resume_paths(
-        checkpoint_path,
-        model_component=model_component,
+    iteration_dir = checkpoint_path / "policy" / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "metadata.json").touch()
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(return_value={"args": {}}),
     )
 
-    assert weights_path == expected_weights_path
-    assert optimizer_path == expected_optimizer_path
+    with pytest.warns(UserWarning, match="Optimizer state not found"):
+        weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+            checkpoint_path
+        )
+
+    assert weights_path == checkpoint_path / "policy" / "weights"
+    assert optimizer_path is None
+
+
+def test_get_resume_paths_prefers_dtensor_optimizer(checkpoint_dir, monkeypatch):
+    checkpoint_path = checkpoint_dir / "step_1"
+    optimizer_path = checkpoint_path / "policy" / "optimizer"
+    optimizer_path.mkdir(parents=True)
+    iteration_dir = checkpoint_path / "policy" / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "metadata.json").touch()
+    load_common_state = MagicMock(side_effect=AssertionError("must not be called"))
+    monkeypatch.setattr(
+        checkpoint_module, "_load_megatron_common_state_dict", load_common_state
+    )
+
+    weights_path, returned_optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path
+    )
+
+    assert weights_path == checkpoint_path / "policy" / "weights"
+    assert returned_optimizer_path == optimizer_path
+    load_common_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        RuntimeError("Megatron-Core is required"),
+        OSError("checkpoint is unreadable"),
+    ],
+)
+def test_get_resume_paths_propagates_megatron_load_failure(
+    checkpoint_dir, monkeypatch, load_error
+):
+    checkpoint_path = checkpoint_dir / "step_1"
+    iteration_dir = checkpoint_path / "policy" / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "metadata.json").touch()
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(side_effect=load_error),
+    )
+
+    with pytest.raises(type(load_error), match=str(load_error)):
+        CheckpointManager.get_resume_paths(checkpoint_path)
 
 
 def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_dir):

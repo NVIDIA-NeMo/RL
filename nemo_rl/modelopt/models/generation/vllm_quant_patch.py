@@ -22,9 +22,9 @@ import torch
 from modelopt.torch.quantization.calib.max import MaxCalibrator
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from modelopt.torch.quantization.plugins.vllm import disable_compilation
-from vllm.v1.worker.gpu_worker import Worker as BaseWorker
 
 from nemo_rl.modelopt.utils import resolve_quant_cfg
+from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
 
 
 @contextmanager
@@ -100,7 +100,7 @@ def _fakequant_run_prolog_worker(self) -> None:
                 module.disable()
 
 
-class FakeQuantWorker(BaseWorker):
+class FakeQuantWorker(NixlVllmWorker):
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         model = self.model_runner.model
