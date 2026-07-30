@@ -50,6 +50,8 @@ def _make_controller(
     stall_action: str = "warn",
     gym_subprocess_check: bool = False,
     env_handles=None,
+    train_steps: int = 0,
+    max_num_steps: int = 100,
 ):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -63,9 +65,10 @@ def _make_controller(
             gym_subprocess_check=gym_subprocess_check,
         )
     )
+    ctrl._master_config = SimpleNamespace(grpo={"max_num_steps": max_num_steps})
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
-    ctrl._train_steps = 0
+    ctrl._train_steps = train_steps
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
     return ctrl
@@ -101,12 +104,34 @@ class TestStallDetection:
         # stall_timeout_s=0 would fire instantly if progress were not being seen.
         asyncio.run(_main())
 
-    def test_inflight_with_no_commits_aborts_when_configured(self):
+    def test_no_progress_while_work_remains_aborts_when_configured(self):
         stats = RolloutStats()
         ctrl = _make_controller(
             stats=stats, inflight=8, stall_timeout_s=0.0, stall_action="abort"
         )
-        with pytest.raises(RolloutStall, match="8 in flight"):
+        with pytest.raises(RolloutStall, match="8 rollouts in flight"):
+            asyncio.run(ctrl._watchdog_pump())
+
+    def test_a_wedge_with_nothing_in_flight_is_still_a_stall(self):
+        """Regression guard for the gap a fault-injection run walked straight through.
+
+        Killing a generation worker wedged the loop with zero rollouts in flight and
+        zero failures recorded: the rollout pump sat on backpressure behind a train
+        pump that could no longer finish a step, so there was nothing in flight to
+        count. The earlier `inflight > 0` condition meant the watchdog watched six
+        minutes of idleness and said nothing.
+        """
+        stats = RolloutStats()
+        stats.committed = 10  # groups landed before the wedge, then stopped
+        ctrl = _make_controller(
+            stats=stats,
+            inflight=0,
+            stall_timeout_s=0.0,
+            stall_action="abort",
+            train_steps=4,
+            max_num_steps=50,
+        )
+        with pytest.raises(RolloutStall, match="0 rollouts in flight"):
             asyncio.run(ctrl._watchdog_pump())
 
     def test_warn_mode_reports_without_ending_the_run(self, capsys):
@@ -117,14 +142,42 @@ class TestStallDetection:
         asyncio.run(_run_ticks(ctrl, 3))
         assert "rollout stall" in capsys.readouterr().out
 
-    def test_an_idle_controller_with_nothing_in_flight_is_not_a_stall(self):
-        """Between epochs there is legitimately no work; that must not page anyone."""
+    def test_a_finished_run_is_not_a_stall(self):
+        """With every step done there is nothing left to wait for."""
         stats = RolloutStats()
         ctrl = _make_controller(
-            stats=stats, inflight=0, stall_timeout_s=0.0, stall_action="abort"
+            stats=stats,
+            inflight=0,
+            stall_timeout_s=0.0,
+            stall_action="abort",
+            train_steps=50,
+            max_num_steps=50,
         )
-        # Would raise immediately if inflight were not part of the condition.
         asyncio.run(_run_ticks(ctrl, 3))
+
+    def test_train_step_progress_counts_even_without_new_commits(self):
+        """A step draining already-buffered groups is progress, not a stall."""
+        stats = RolloutStats()
+
+        async def _main():
+            # Threshold comfortably above the progress cadence below, so only a real
+            # gap in progress can trip it.
+            ctrl = _make_controller(
+                stats=stats,
+                inflight=0,
+                stall_timeout_s=0.05,
+                stall_action="abort",
+                max_num_steps=100,
+            )
+            task = asyncio.ensure_future(ctrl._watchdog_pump())
+            for _ in range(5):
+                await asyncio.sleep(0.003)
+                ctrl._train_steps += 1  # commits frozen, steps advancing
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_main())
 
 
 class TestMetrics:

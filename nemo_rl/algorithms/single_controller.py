@@ -595,14 +595,24 @@ class SingleControllerActor:
     async def _watchdog_pump(self) -> None:
         """Report rollout health, and detect stalls nothing else catches.
 
-        Progress is measured by the committed-group counter rather than a timestamp:
-        the rollout manager already maintains it, and "the count has not moved" is the
-        property that actually matters. A stall is in-flight rollouts with no commits,
-        which is precisely the shape a wedged generation endpoint produces -- and the
-        shape that, before this, produced no signal at all.
+        Progress is the pair (committed groups, completed train steps) rather than a
+        timestamp: both counters already exist, and "neither has moved" is the property
+        that actually matters.
+
+        Deliberately *not* conditioned on rollouts being in flight. An earlier version
+        required that, on the reasoning that an idle controller has legitimately no
+        work -- and a fault-injection run walked straight through the gap. Killing a
+        generation worker wedged the loop with zero rollouts in flight and zero
+        failures recorded: the rollout pump was blocked on backpressure behind a train
+        pump that could no longer finish a step, so nothing was in flight to count.
+        The watchdog observed six minutes of idleness and said nothing.
+
+        What separates a real stall from an idle gap is whether work remains, so that
+        is what is checked instead.
         """
         watchdog_cfg = self._async_cfg.watchdog
-        last_committed = -1
+        max_num_steps = self._master_config.grpo["max_num_steps"]
+        last_progress = (-1, -1)
         last_progress_at = time.monotonic()
 
         while True:
@@ -610,24 +620,29 @@ class SingleControllerActor:
             now = time.monotonic()
 
             stats = self._rollout_manager.stats
-            if stats.committed != last_committed:
-                last_committed = stats.committed
+            progress = (stats.committed, self._train_steps)
+            if progress != last_progress:
+                last_progress = progress
                 last_progress_at = now
             idle_s = now - last_progress_at
 
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
             metrics["rollout/idle_s"] = idle_s
+            metrics["rollout/train_steps"] = float(self._train_steps)
             self._logger.log_metrics(metrics, step=self._train_steps)
 
             if watchdog_cfg.gym_subprocess_check:
                 await self._check_env_health()
 
-            if self._inflight_rollouts > 0 and idle_s > watchdog_cfg.stall_timeout_s:
+            work_remains = self._train_steps < max_num_steps
+            if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
                 message = (
-                    f"no rollout committed in {idle_s:.0f}s with "
-                    f"{self._inflight_rollouts} in flight "
-                    f"(stall_timeout_s={watchdog_cfg.stall_timeout_s})"
+                    f"no rollout committed and no train step completed in "
+                    f"{idle_s:.0f}s ({self._inflight_rollouts} rollouts in flight, "
+                    f"{stats.committed} groups committed, step "
+                    f"{self._train_steps}/{max_num_steps}, "
+                    f"stall_timeout_s={watchdog_cfg.stall_timeout_s})"
                 )
                 if watchdog_cfg.stall_action == "abort":
                     raise RolloutStall(message)
