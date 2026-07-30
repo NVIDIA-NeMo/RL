@@ -253,7 +253,6 @@ project-includes = [
   "nemo_rl/weight_sync/checkpoint_engine_weight_synchronizer.py",
   "nemo_rl/weight_sync/collective_weight_synchronizer.py",
   "nemo_rl/weight_sync/factory.py",
-  "nemo_rl/weight_sync/http_weight_synchronizer.py",
   "nemo_rl/weight_sync/interfaces.py",
   "nemo_rl/weight_sync/ipc_weight_synchronizer.py",
   "nemo_rl/weight_sync/megatron_weight_synchronizer.py",
