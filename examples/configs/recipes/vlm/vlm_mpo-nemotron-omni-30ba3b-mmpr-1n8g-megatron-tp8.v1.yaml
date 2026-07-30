@@ -57,6 +57,9 @@ policy:
     sequence_parallel: true
     activation_checkpointing: true
     empty_unused_memory_level: 2
+    # Image-only MPO does not exercise the unsupported sound insertion path.
+    freeze_audio_encoder: true
+    freeze_audio_projector: true
     bias_activation_fusion: false
     use_fused_linear_logprobs: false
     defer_fp32_logits: true

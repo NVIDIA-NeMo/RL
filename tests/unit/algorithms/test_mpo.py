@@ -140,6 +140,8 @@ def test_nemotron_omni_mpo_recipe_validates():
     assert megatron_config["moe_router_load_balancing_type"] == "aux_loss"
     assert megatron_config["moe_router_bias_update_rate"] == 1.0e-3
     assert megatron_config["moe_permute_fusion"] is True
+    assert megatron_config["freeze_audio_encoder"] is True
+    assert megatron_config["freeze_audio_projector"] is True
     sequence_packing = cast(
         SequencePackingConfig, master_config.policy["sequence_packing"]
     )

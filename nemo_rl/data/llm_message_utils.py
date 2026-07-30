@@ -382,7 +382,7 @@ def batched_message_log_to_flat_message(
     # Process each key
     result = BatchedDataDict()
     for key in all_keys:
-        values = [seq.get(key) for seq in sequenced_lists]
+        values: list[Any] = [seq.get(key) for seq in sequenced_lists]
         packed_values = _validated_packed_values(key, values)
         # Preserve one logical row for conversations missing this media key.
         # Async replay may concatenate text-only and multimodal prompt groups in
@@ -404,8 +404,8 @@ def batched_message_log_to_flat_message(
             continue
 
         # Filter out None values and validate consistency
-        values: list[Tensor | None] = cast(list[Tensor | None], values)
-        tensors = cast(list[Tensor], [t for t in values if t is not None])
+        tensor_values = cast(list[Tensor | None], values)
+        tensors = cast(list[Tensor], [t for t in tensor_values if t is not None])
         try:
             _validate_tensor_consistency(tensors)
         except RuntimeError as e:
@@ -419,7 +419,7 @@ def batched_message_log_to_flat_message(
                 if v is None
                 else v
             )
-            for v in values
+            for v in tensor_values
         ]
 
         # Pad and stack tensors (always right padding)
