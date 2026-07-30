@@ -1082,11 +1082,11 @@ class TestReplayBuffer:
         ray.kill(buffer2)
 
     def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose the async-GRPO resume deadlock.
+        """Regression: restored buffer can expose an async resume deadlock.
 
         After PR #2651 introduced replay-buffer checkpointing, resuming from a
-        checkpoint where target N is complete but target N+1 is absent caused an
-        async-GRPO deadlock:
+        checkpoint where target N is complete but target N+1 is absent can
+        deadlock Async GRPO or Async PPO:
 
           1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
           2. Training consumes all target-N trajectories and triggers a refit.

@@ -67,7 +67,6 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
@@ -103,7 +102,7 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # ===============================================================================
 # Configuration
@@ -2225,24 +2224,6 @@ def async_ppo_train(
     # ------------------------------------------------------------------
     # Spin up the replay buffer + trajectory collector Ray actors.
     # ------------------------------------------------------------------
-    _replay_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.ReplayBuffer"
-    )
-    if _replay_py_exec.startswith("uv"):
-        _replay_py_exec = create_local_venv_on_each_node(
-            _replay_py_exec,
-            "nemo_rl.algorithms.async_utils.ReplayBuffer",
-        )
-    _replay_py_venv = os.path.dirname(os.path.dirname(_replay_py_exec))
-    _replay_runtime_env = {
-        "py_executable": _replay_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _replay_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _replay_py_venv,
-        },
-    }
-
     late_arrival_slack = 2
     buffer_age = max(
         max_trajectory_age_steps,
@@ -2255,7 +2236,11 @@ def async_ppo_train(
     print(f"   - warmup_max_trajectory_age_steps: {warmup_max_trajectory_age_steps}")
     print(f"   - optimal_buffer_size: {optimal_buffer_size}")
 
-    replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
+    replay_buffer = ReplayBuffer.options(
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.algorithms.async_utils.ReplayBuffer"
+        )
+    ).remote(
         max_size=optimal_buffer_size,
         drop_incomplete_targets_on_restore=(
             async_config.drop_incomplete_targets_on_restore
@@ -2291,26 +2276,10 @@ def async_ppo_train(
                 "Starting with an empty replay buffer."
             )
 
-    _tc_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-    )
-    if _tc_py_exec.startswith("uv"):
-        _tc_py_exec = create_local_venv_on_each_node(
-            _tc_py_exec,
-            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
-        )
-    _tc_py_venv = os.path.dirname(os.path.dirname(_tc_py_exec))
-    _tc_runtime_env = {
-        "py_executable": _tc_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _tc_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
-        },
-    }
-
     trajectory_collector = AsyncTrajectoryCollector.options(
-        runtime_env=_tc_runtime_env
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
+        )
     ).remote(
         policy_generation=policy_generation,
         tokenizer=tokenizer,
@@ -2394,6 +2363,29 @@ def async_ppo_train(
                 )
             )
             if current_step_ready:
+                # The initial collector is the only window that can generate
+                # both `step` and `step + 1`. Fill both before the first refit.
+                need_lookahead = step + 1 < max_training_steps
+                if need_lookahead:
+                    lookahead_step_ready = ray.get(
+                        replay_buffer.has_complete_batch.remote(
+                            step + 1,
+                            num_prompts_per_step,
+                            initial_buffer_max_age,
+                        )
+                    )
+                    if not lookahead_step_ready:
+                        if wait_iterations % 10 == 0:
+                            print(
+                                f"  Pipeline barrier: step {step} ready but "
+                                f"step {step + 1} not yet — waiting for lookahead fill"
+                            )
+                        _raise_if_collector_stopped(
+                            "waiting for the initial replay lookahead batch"
+                        )
+                        wait_iterations += 1
+                        time.sleep(1.0)
+                        continue
                 break
             if wait_iterations % 10 == 0:
                 buffer_size_current = ray.get(replay_buffer.size.remote())

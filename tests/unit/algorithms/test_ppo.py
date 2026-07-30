@@ -2112,8 +2112,8 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
     monkeypatch.setattr(async_utils, "AsyncTrajectoryCollector", collector_type)
     monkeypatch.setattr(
         ppo,
-        "get_actor_python_env",
-        lambda _actor: "/tmp/fake-venv/bin/python",
+        "make_actor_runtime_env",
+        lambda _actor: {"py_executable": "/tmp/fake-venv/bin/python"},
     )
     monkeypatch.setattr(
         ppo,
