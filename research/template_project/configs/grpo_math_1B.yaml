@@ -12,6 +12,8 @@ grpo:
   val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
+  # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  val_num_generations_per_prompt: 1
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
