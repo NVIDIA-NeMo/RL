@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
-VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl"]
+VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
-VLLM_BUILTIN_REFIT_TRANSPORTS = VLLM_SPARSE_REFIT_TRANSPORTS | {"nixl"}
 
 
 class VllmSpecificArgs(TypedDict):
@@ -162,10 +161,13 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     transport = config.get("refit_transport")
     if transport is None:
         return None
-    if transport not in VLLM_BUILTIN_REFIT_TRANSPORTS and ":" not in transport:
+    if transport == "nccl_reshard":
+        # nccl_reshard doesn't takes refit_cfg.
+        return None
+    if transport not in get_args(VllmRefitSelector) and ":" not in transport:
         raise ValueError(
             f"Unknown vLLM refit transport {transport!r}: expected null, "
-            "'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
         )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
