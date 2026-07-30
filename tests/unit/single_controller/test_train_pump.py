@@ -28,6 +28,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
+from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -336,6 +337,8 @@ def test_train_pump_drives_mcore_training_step(
             rollout_manager=rollout_manager,
             tq_buffer=tq_buffer,
             partition_id=_PARTITION_ID,
+            save_state=_default_grpo_save_state(),
+            last_checkpoint_path=None,
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,
