@@ -42,6 +42,7 @@ from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
 )
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
+    SGLangDisaggregatedWeightSynchronizer,
 )
 
 # ---------------------------------------------------------------------------
@@ -231,18 +232,35 @@ class TestIPCWeightSynchronizer:
 
 
 # ---------------------------------------------------------------------------
-# SGLangColocatedWeightSynchronizer
+# SGLang synchronizers
 # ---------------------------------------------------------------------------
 
-_SGLANG_REFIT_DRIVER = "nemo_rl.weight_sync.dtensor_sglang_refit.refit_sglang_colocated"
+_SGLANG_RAY = "nemo_rl.weight_sync.sglang_weight_synchronizer.ray"
 
 
+def _mock_sglang_generation(num_new_engines=0, pause_mode="retract", quantization=None):
+    gen = _mock_generation()
+    gen.sglang_cfg = {"sglang_cfg": {"quantization": quantization}}
+    gen.pause_generation_mode = pause_mode
+    gen.get_updatable_engines_and_lock.return_value = (
+        [MagicMock(), MagicMock()],
+        MagicMock(),
+        num_new_engines,
+        [2, 2],
+        [0, 2],
+    )
+    return gen
+
+
+def _megatron_policy():
+    return _mock_policy(cfg={"megatron_cfg": {"enabled": True}})
+
+
+@patch(_SGLANG_RAY)
 class TestSGLangColocatedWeightSynchronizer:
-    @patch(_SGLANG_REFIT_DRIVER)
-    def test_sync_weights_calls_full_lifecycle(self, mock_refit):
-        mock_refit.return_value = True
+    def test_sync_weights_calls_full_lifecycle(self, mock_ray):
         policy = _mock_policy()
-        gen = _mock_generation()
+        gen = _mock_sglang_generation()
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
         assert sync.is_stale
@@ -251,70 +269,184 @@ class TestSGLangColocatedWeightSynchronizer:
 
         policy.offload_before_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["weights"])
-        mock_refit.assert_called_once()
-        call_kwargs = mock_refit.call_args.kwargs
-        assert call_kwargs["policy"] is policy
-        assert call_kwargs["policy_generation"] is gen
+        gen.pause_generation.assert_called_once_with(mode="retract")
+        gen.invalidate_kv_cache.assert_called_once()
+        gen.begin_weight_update.assert_called_once()
+
+        call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
         assert call_kwargs["buffer_size_bytes"] == int((1024**3) * 0.3)
+        assert call_kwargs["target_precision"] == "bf16"
+        assert call_kwargs["sglang_quantization_cfg"] == {}
+        mock_ray.get.assert_called_once()
+
+        gen.end_weight_update.assert_called_once()
+        gen.continue_generation.assert_called_once()
         policy.offload_after_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
 
-    @patch(_SGLANG_REFIT_DRIVER)
-    def test_fixed_buffer_size(self, mock_refit):
-        mock_refit.return_value = True
+    def test_fixed_buffer_size(self, mock_ray):
         policy = _mock_policy()
-        gen = _mock_generation()
+        gen = _mock_sglang_generation()
         sync = SGLangColocatedWeightSynchronizer(policy, gen, refit_buffer_size_gb=2)
 
         sync.sync_weights()
-        assert mock_refit.call_args.kwargs["buffer_size_bytes"] == 2 * (1024**3)
+        call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
+        assert call_kwargs["buffer_size_bytes"] == 2 * (1024**3)
 
-    def test_init_communicator(self):
+    def test_new_engines_trigger_connect(self, mock_ray):
         policy = _mock_policy()
-        gen = _mock_generation()
+        gen = _mock_sglang_generation(num_new_engines=2)
+        SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        policy.connect_sglang_rollout_engines.assert_called_once_with(
+            engine_gpu_counts=[2, 2], engine_gpu_offsets=[0, 2]
+        )
+        gen.clear_updatable_num_new_engines.assert_called_once()
+
+    def test_no_new_engines_skips_connect(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
+        SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        policy.connect_sglang_rollout_engines.assert_not_called()
+
+    def test_in_place_pause_keeps_kv_cache(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation(pause_mode="in_place")
+        SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        gen.pause_generation.assert_called_once_with(mode="in_place")
+        gen.invalidate_kv_cache.assert_not_called()
+
+    def test_init_communicator(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
         policy.prepare_refit_info.assert_called_once()
         gen.prepare_refit_info.assert_called_once()
 
-    @patch(_SGLANG_REFIT_DRIVER)
-    def test_phase_restoration_on_transfer_failure(self, mock_refit):
-        """offload_after_refit and kv_cache prep run even when transfer raises."""
-        mock_refit.side_effect = RuntimeError("IPC transfer exploded")
+    def test_phase_restoration_on_transfer_failure(self, mock_ray):
+        """The engine session and both sides' phases are restored on failure."""
+        mock_ray.get.side_effect = RuntimeError("IPC transfer exploded")
         policy = _mock_policy()
-        gen = _mock_generation()
+        gen = _mock_sglang_generation()
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
         with pytest.raises(RuntimeError, match="IPC transfer exploded"):
             sync.sync_weights()
 
+        gen.end_weight_update.assert_called_once()
+        gen.continue_generation.assert_called_once()
         policy.offload_after_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
         assert sync.is_stale
 
-    def test_negative_buffer_size_raises(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = SGLangColocatedWeightSynchronizer(policy, gen, refit_buffer_size_gb=-1)
+    def test_negative_buffer_size_raises(self, mock_ray):
+        sync = SGLangColocatedWeightSynchronizer(
+            _mock_policy(), _mock_sglang_generation(), refit_buffer_size_gb=-1
+        )
         with pytest.raises(ValueError, match="refit_buffer_size_gb must be > 0"):
             sync._compute_buffer_size()
 
-    def test_invalid_env_ratio_raises(self, monkeypatch):
+    def test_invalid_env_ratio_raises(self, mock_ray, monkeypatch):
         monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "not_a_number")
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+        sync = SGLangColocatedWeightSynchronizer(
+            _mock_policy(), _mock_sglang_generation()
+        )
         with pytest.raises(ValueError, match="must be a valid float"):
             sync._compute_buffer_size()
 
-    def test_zero_env_ratio_raises(self, monkeypatch):
+    def test_zero_env_ratio_raises(self, mock_ray, monkeypatch):
         monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0")
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+        sync = SGLangColocatedWeightSynchronizer(
+            _mock_policy(), _mock_sglang_generation()
+        )
         with pytest.raises(ValueError, match="must be > 0"):
             sync._compute_buffer_size()
+
+    def test_sync_weights_rejects_kv_scales(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+
+        with pytest.raises(AssertionError, match="do not support kv_scales"):
+            sync.sync_weights(kv_scales={"layer.0": 0.5})
+
+        policy.offload_before_refit.assert_not_called()
+        gen.prepare_for_generation.assert_not_called()
+
+
+@patch(_SGLANG_RAY)
+class TestSGLangDisaggregatedWeightSynchronizer:
+    def test_sync_weights_skips_policy_offload(self, mock_ray):
+        policy = _megatron_policy()
+        gen = _mock_sglang_generation()
+        sync = SGLangDisaggregatedWeightSynchronizer(policy, gen)
+
+        assert sync.is_stale
+        sync.sync_weights()
+        assert not sync.is_stale
+
+        # The trainer keeps its own GPUs; nothing to offload.
+        policy.offload_before_refit.assert_not_called()
+        policy.offload_after_refit.assert_not_called()
+
+        # Generation phases still run; SGLangGeneration no-ops them internally
+        # when the engines own their GPUs.
+        gen.prepare_for_generation.assert_any_call(tags=["weights"])
+        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+
+        call_kwargs = policy.update_weights_to_sglang_distributed.call_args.kwargs
+        assert call_kwargs["buffer_size_bytes"] == int((1024**3) * 0.3)
+        assert call_kwargs["rollout_engine_lock"] is not None
+
+    def test_new_engines_trigger_distributed_connect(self, mock_ray):
+        policy = _megatron_policy()
+        gen = _mock_sglang_generation(num_new_engines=1)
+        SGLangDisaggregatedWeightSynchronizer(policy, gen).sync_weights()
+
+        connect_kwargs = (
+            policy.connect_sglang_rollout_engines_distributed.call_args.kwargs
+        )
+        assert connect_kwargs["engine_gpu_counts"] == [2, 2]
+        gen.clear_updatable_num_new_engines.assert_called_once()
+
+    def test_phase_restoration_on_transfer_failure(self, mock_ray):
+        mock_ray.get.side_effect = RuntimeError("broadcast exploded")
+        policy = _megatron_policy()
+        gen = _mock_sglang_generation()
+        sync = SGLangDisaggregatedWeightSynchronizer(policy, gen)
+
+        with pytest.raises(RuntimeError, match="broadcast exploded"):
+            sync.sync_weights()
+
+        gen.end_weight_update.assert_called_once()
+        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+        policy.offload_after_refit.assert_not_called()
+        assert sync.is_stale
+
+    def test_sync_weights_rejects_kv_scales(self, mock_ray):
+        policy = _megatron_policy()
+        gen = _mock_sglang_generation()
+        sync = SGLangDisaggregatedWeightSynchronizer(policy, gen)
+
+        with pytest.raises(AssertionError, match="do not support kv_scales"):
+            sync.sync_weights(kv_scales={"layer.0": 0.5})
+
+        gen.prepare_for_generation.assert_not_called()
+
+    def test_dtensor_policy_is_unsupported(self, mock_ray):
+        """Only Megatron implements the broadcast path; surface that, don't mask it."""
+        policy = _mock_policy()  # megatron_cfg.enabled = False
+        gen = _mock_sglang_generation()
+        sync = SGLangDisaggregatedWeightSynchronizer(policy, gen)
+
+        with pytest.raises(NotImplementedError, match="Megatron policy backend"):
+            sync.sync_weights()
+
+        gen.prepare_for_generation.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -685,16 +817,17 @@ class TestFactory:
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
 
-    def test_non_colocated_sglang_raises(self):
+    def test_non_colocated_sglang_returns_sglang_disaggregated(self):
+        """SGLang owns its own weight-update group, so no clusters are needed."""
         policy = _mock_policy()
         gen = _mock_generation()
-        with pytest.raises(NotImplementedError, match="SGLang"):
-            create_weight_synchronizer(
-                policy=policy,
-                generation=gen,
-                generation_backend=SGLANG_BACKEND,
-                colocated=False,
-            )
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=gen,
+            generation_backend=SGLANG_BACKEND,
+            colocated=False,
+        )
+        assert isinstance(sync, SGLangDisaggregatedWeightSynchronizer)
 
     def test_non_colocated_missing_clusters_raises(self):
         policy = _mock_policy()

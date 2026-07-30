@@ -18,7 +18,7 @@ End-to-end weight update tests using SGLangGeneration + mock FSDP trainer.
 Verifies the full weight-streaming path:
   1. SGLangGeneration.check_weights("snapshot")  — save original weights
   2. SGLangGeneration.check_weights("reset_tensors") — randomize weights
-  3. Mock FSDP trainer streams Qwen3-1.7B weights via stream_weights_via_http_impl
+  3. Mock FSDP trainer streams weights via send_hf_buckets_via_ipc_actor_impl
   4. SGLangGeneration.check_weights("compare")  — verify restored weights
 
 Parametrised over two configurations (both use 2 GPUs total):
@@ -241,7 +241,7 @@ def test_weight_update_roundtrip(sglang_gen, mock_trainer):
     sglang_gen.prepare_for_generation(tags=["weights"])
     print("[STEP 4/7] Onload weights complete.", flush=True)
 
-    # 5. All 2 mock FSDP workers stream weights simultaneously via CUDA IPC over HTTP.
+    # 5. All 2 mock FSDP workers stream weights simultaneously via Ray CUDA IPC.
     print(
         "[STEP 5/7] Streaming weights from mock FSDP workers via CUDA IPC...",
         flush=True,

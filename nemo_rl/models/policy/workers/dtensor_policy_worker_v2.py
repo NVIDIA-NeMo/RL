@@ -1418,8 +1418,3 @@ class DTensorPolicyWorkerV2Impl(
 )  # pragma: no cover
 class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
     pass
-
-
-# ---------------------------------------------------------------------------
-# Driver-side SGLang weight-update dispatch (FSDP backend)
-# ---------------------------------------------------------------------------
