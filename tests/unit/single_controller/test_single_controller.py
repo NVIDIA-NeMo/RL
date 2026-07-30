@@ -59,6 +59,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         loss_fn=None,
         tq_buffer=None,
         rollout_manager=SimpleNamespace(_tq_buffer=None),
+        env_handles={},
         train_cluster=None,
         inference_cluster=None,
     )
@@ -106,6 +107,7 @@ def test_logs_concrete_weight_synchronizer(
         loss_fn=None,
         tq_buffer=None,
         rollout_manager=SimpleNamespace(_tq_buffer=None),
+        env_handles={},
         train_cluster=None,
         inference_cluster=None,
     )

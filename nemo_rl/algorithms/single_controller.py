@@ -14,9 +14,9 @@
 
 """SingleController: asyncio orchestrator for the RL training loop.
 
-CPU-only Ray actor that runs two concurrent pumps and coordinates the
-other actors via lightweight RPCs. SC sends control signals and reads
-metadata only — model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs two concurrent pumps plus a watchdog, and
+coordinates the other actors via lightweight RPCs. SC sends control signals
+and reads metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
@@ -61,6 +61,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -75,11 +76,14 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
-    Owns two concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows,
-                       then runs _sync_weights (drain gate + weight
-                       synchronization) inline after each optimizer step
+    Owns three concurrent asyncio tasks:
+      - _rollout_pump:  dispatches prompts to GenerationWorkerActor
+      - _train_pump:    claims DataPlane meta, trains, clears consumed rows,
+                        then runs _sync_weights (drain gate + weight
+                        synchronization) inline after each optimizer step
+      - _watchdog_pump: publishes rollout counters and reports stalls or
+                        unhealthy environments, which are the failures that
+                        otherwise produce no signal at all
 
     All other actors are passive — they expose methods and wait to be called.
     """
@@ -118,6 +122,7 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._env_handles = actor_args.env_handles
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -191,22 +196,29 @@ class SingleControllerActor:
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
-        # Start the rollout and train pumps
+        # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
+        watchdog_task = asyncio.create_task(self._watchdog_pump())
+        tasks = (rollout_task, train_task, watchdog_task)
         try:
             done, _ = await asyncio.wait(
-                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+                set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
+            if watchdog_task in done:
+                # The watchdog loops forever, so finishing at all means it raised --
+                # a stall or an unhealthy environment. Surface that ahead of the
+                # pumps, whose own symptom would just be "waiting".
+                await watchdog_task
             if rollout_task in done:
                 # Propagate rollout failures immediately. A normally exhausted
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
         finally:
-            rollout_task.cancel()
-            train_task.cancel()
-            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             self._logger.finish()
 
         return {
@@ -579,6 +591,64 @@ class SingleControllerActor:
                 f"lag={lag}  ",
                 flush=True,
             )
+
+    async def _watchdog_pump(self) -> None:
+        """Report rollout health, and detect stalls nothing else catches.
+
+        Progress is measured by the committed-group counter rather than a timestamp:
+        the rollout manager already maintains it, and "the count has not moved" is the
+        property that actually matters. A stall is in-flight rollouts with no commits,
+        which is precisely the shape a wedged generation endpoint produces -- and the
+        shape that, before this, produced no signal at all.
+        """
+        watchdog_cfg = self._async_cfg.watchdog
+        last_committed = -1
+        last_progress_at = time.monotonic()
+
+        while True:
+            await asyncio.sleep(watchdog_cfg.interval_s)
+            now = time.monotonic()
+
+            stats = self._rollout_manager.stats
+            if stats.committed != last_committed:
+                last_committed = stats.committed
+                last_progress_at = now
+            idle_s = now - last_progress_at
+
+            metrics = dict(stats.as_metrics())
+            metrics["rollout/inflight"] = float(self._inflight_rollouts)
+            metrics["rollout/idle_s"] = idle_s
+            self._logger.log_metrics(metrics, step=self._train_steps)
+
+            if watchdog_cfg.gym_subprocess_check:
+                await self._check_env_health()
+
+            if self._inflight_rollouts > 0 and idle_s > watchdog_cfg.stall_timeout_s:
+                message = (
+                    f"no rollout committed in {idle_s:.0f}s with "
+                    f"{self._inflight_rollouts} in flight "
+                    f"(stall_timeout_s={watchdog_cfg.stall_timeout_s})"
+                )
+                if watchdog_cfg.stall_action == "abort":
+                    raise RolloutStall(message)
+                print(f"WARNING: rollout stall -- {message}", flush=True)
+
+    async def _check_env_health(self) -> None:
+        """Ask each environment actor that exposes a health check whether it is whole.
+
+        Environments without the method are skipped rather than treated as unhealthy;
+        only NeMo-Gym has subprocess servers to lose.
+        """
+        for env_name, handle in self._env_handles.items():
+            health_check = getattr(handle, "health_check", None)
+            if health_check is None:
+                continue
+            try:
+                await self._ray_get(health_check.remote())
+            except Exception as error:
+                raise RuntimeError(
+                    f"environment {env_name!r} reported unhealthy: {error}"
+                ) from error
 
     async def _sync_weights(
         self,

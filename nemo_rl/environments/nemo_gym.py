@@ -180,6 +180,35 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
+        # through __init__, which does not start the Gym servers -- reports what
+        # actually happened instead of an AttributeError from deep inside a rollout.
+        self.rh: Any = None
+        self.rch: Any = None
+        self.head_server_config: Any = None
+        self.node_ip: Optional[str] = None
+        self.head_server_port: Optional[int] = None
+
+    def _require_spinup(self) -> None:
+        """Raise a diagnosable error if this instance never ran :meth:`_spinup`."""
+        if self.rh is None:
+            raise RuntimeError(
+                "NeMo-Gym actor has no running servers: _spinup() was never called on "
+                "this instance. Ray recreates a restarted actor through __init__ only, "
+                "so an actor that died and came back reaches this state and cannot "
+                "serve rollouts until it is spun up again."
+            )
+
+    def health_check(self) -> None:
+        """Raise if the Gym head server or any subprocess server has died.
+
+        Thin wrapper over NeMo-Gym's own ``RunHelper.poll``, which is what ``gym env
+        start`` calls every 60s from ``run_forever``. NeMo-RL only calls ``rh.start``,
+        so without this the check Gym already implements never runs and a dead tool
+        server surfaces as unexplained rollout timeouts instead of a named process.
+        """
+        self._require_spinup()
+        self.rh.poll()
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -283,6 +312,7 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
 
@@ -512,6 +542,10 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
         }
 
     def shutdown(self) -> None:
+        # Teardown runs in a finally block, so it must not turn a real training error
+        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
+        if self.rh is None:
+            return
         self.rh.shutdown()
 
     def step(self, message_log_batch, metadata):
