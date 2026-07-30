@@ -60,6 +60,11 @@ from nemo_rl.experience.rollout_manager import (
     RolloutTimeouts,
 )
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.models.generation.fleet_health import (
+    FleetHealthPolicy,
+    GenerationFleetMonitor,
+    HealthyShardSelector,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
@@ -96,6 +101,9 @@ class SingleControllerActorArgs:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
+    # None when async_rl.fleet_health is disabled; the SingleController drives the
+    # probe loop when it is present.
+    fleet_monitor: Optional[GenerationFleetMonitor] = None
 
 
 def _build_clusters(
@@ -348,6 +356,40 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
 
 
+def _maybe_attach_fleet_health(
+    generation: Any, master_config: MasterConfig
+) -> Optional[GenerationFleetMonitor]:
+    """Route generation through fleet health, when it is enabled and supported.
+
+    Returns:
+        The monitor the SingleController should drive, or None when fleet health is
+        disabled or the backend does not support it.
+    """
+    fleet_config = master_config.async_rl.fleet_health
+    if not fleet_config.enabled:
+        return None
+    if not hasattr(generation, "attach_fleet_health"):
+        # Loud rather than silent: asking for fleet health and not getting it would
+        # otherwise look like it was working.
+        raise NotImplementedError(
+            "async_rl.fleet_health.enabled=true is only supported for the vllm "
+            f"generation backend; got {type(generation).__name__}"
+        )
+
+    monitor = GenerationFleetMonitor(
+        shard_count=generation.worker_group.dp_size,
+        policy=FleetHealthPolicy(
+            unhealthy_threshold=fleet_config.unhealthy_threshold,
+            healthy_threshold=fleet_config.healthy_threshold,
+            max_restart_attempts_per_shard=fleet_config.max_restart_attempts_per_shard,
+            min_healthy_shards=fleet_config.min_healthy_shards,
+        ),
+        base_urls=list(generation.dp_openai_server_base_urls or []) or None,
+    )
+    generation.attach_fleet_health(monitor, HealthyShardSelector(monitor=monitor))
+    return monitor
+
+
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
     failure_config = master_config.async_rl.rollout_failure
@@ -572,6 +614,10 @@ def setup_single_controller(
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time
 
+    # Attach fleet health before any rollout runs, so the very first request is
+    # already health-aware.
+    fleet_monitor = _maybe_attach_fleet_health(generation, master_config)
+
     # ==========================
     # Setup Data Plane Client & Weight Sync
     # ==========================
@@ -646,5 +692,6 @@ def setup_single_controller(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
+        fleet_monitor=fleet_monitor,
     )
     return actor_args, setup_timing_metrics
