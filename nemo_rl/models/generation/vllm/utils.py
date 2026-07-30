@@ -22,6 +22,7 @@ from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
 )
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = -1
 
@@ -292,9 +293,13 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        choice.message.routed_experts = routed_experts.to(
-            dtype=routed_experts_dtype
-        ).tolist()
+        # Base64 envelope instead of .tolist(): nested JSON int lists cost
+        # ~1s of CPU per serialize/parse hop at long context lengths and get
+        # re-validated at every gym HTTP hop; a single string passes through
+        # the gym chain opaquely.
+        choice.message.routed_experts = encode_routed_experts(
+            routed_experts.to(dtype=routed_experts_dtype)
+        )
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(
