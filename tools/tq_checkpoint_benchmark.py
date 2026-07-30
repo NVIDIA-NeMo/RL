@@ -233,6 +233,22 @@ def summarize_records(
     }
 
 
+def _producer_validation_upper_bounds(
+    producer_metrics: dict[str, Any],
+) -> dict[str, int]:
+    """Return the final per-producer acknowledgement counts.
+
+    The snapshot taken immediately after ``save_checkpoint`` can observe a
+    producer after TQ has acknowledged its put but before the producer updates
+    its local counter. Final counts are therefore the safe upper bounds for
+    deciding whether a restored key was ever acknowledged during this run.
+    """
+    return {
+        str(producer_id): int(count)
+        for producer_id, count in producer_metrics["final_acknowledged"].items()
+    }
+
+
 def _base_key(row_id: int) -> str:
     return f"{BASE_KEY_PREFIX}{row_id:012d}"
 
@@ -897,18 +913,12 @@ def _verify_restored_data(
 
 def _load_phase(config: BenchmarkConfig) -> None:
     save_result = _read_json(Path(config.run_dir) / "save_result.json")
+    producer_metrics = save_result["producers"]
     guaranteed_counts = {
         str(key): int(value)
-        for key, value in save_result["producers"][
-            "acknowledged_before_checkpoint"
-        ].items()
+        for key, value in producer_metrics["acknowledged_before_checkpoint"].items()
     }
-    acknowledged_by_return = {
-        str(key): int(value)
-        for key, value in save_result["producers"][
-            "acknowledged_by_checkpoint_return"
-        ].items()
-    }
+    final_acknowledged = _producer_validation_upper_bounds(producer_metrics)
     ray, tq = _init_tq(config)
     try:
         print("[load] fresh TQ process initialized", flush=True)
@@ -947,7 +957,13 @@ def _load_phase(config: BenchmarkConfig) -> None:
                     producer_id, local_index = key[len(PRODUCER_KEY_PREFIX) :].split(
                         "-", 1
                     )
-                    upper_bound = acknowledged_by_return.get(producer_id)
+                    # The immediate post-checkpoint snapshot can race with a
+                    # producer between TQ's acknowledgement and its local
+                    # counter update. The final count is the authoritative
+                    # upper bound for keys acknowledged anywhere in this run;
+                    # the pre-checkpoint count remains the lower-bound recovery
+                    # guarantee checked above.
+                    upper_bound = final_acknowledged.get(producer_id)
                     if upper_bound is None or not 0 <= int(local_index) < upper_bound:
                         unexpected.append(key)
                         continue

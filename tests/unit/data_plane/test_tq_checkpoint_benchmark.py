@@ -23,6 +23,7 @@ from tools.tq_checkpoint_benchmark import (
     _make_payload,
     _producer_key,
     _producer_row_id,
+    _producer_validation_upper_bounds,
     _row_id_from_key,
     logical_tensor_bytes,
     logical_tensor_bytes_for_length,
@@ -116,6 +117,17 @@ def test_key_round_trip() -> None:
     assert _row_id_from_key("base-000000000123") == 123
     with pytest.raises(ValueError, match="unrecognized"):
         _row_id_from_key("not-a-benchmark-key")
+
+
+def test_producer_validation_uses_final_acknowledgements() -> None:
+    metrics = {
+        # Producer 3 has completed its TQ put, but its local counter was not
+        # visible in the immediate post-checkpoint snapshot.
+        "acknowledged_by_checkpoint_return": {"0": 32, "3": 0},
+        "final_acknowledged": {"0": 64, "3": 32},
+    }
+
+    assert _producer_validation_upper_bounds(metrics) == {"0": 64, "3": 32}
 
 
 def test_percentile_and_window_metrics() -> None:
