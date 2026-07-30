@@ -27,11 +27,18 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import ray.exceptions
 
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutStats
+from nemo_rl.models.generation.fleet_health import (
+    FleetHealthPolicy,
+    GenerationFleetExhausted,
+    GenerationFleetMonitor,
+    ShardState,
+)
 
 
 class _RecordingLogger:
@@ -64,7 +71,8 @@ def _make_controller(
             stall_timeout_s=stall_timeout_s,
             stall_action=stall_action,
             gym_subprocess_check=gym_subprocess_check,
-        )
+        ),
+        fleet_health=SimpleNamespace(probe_timeout_s=1.0),
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_steps=max_num_steps)
@@ -74,6 +82,8 @@ def _make_controller(
     ctrl._train_steps = train_steps
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
+    # These tests cover stall detection, not fleet health.
+    ctrl._fleet_monitor = None
     return ctrl
 
 
@@ -199,6 +209,83 @@ class TestMetrics:
         assert published["rollout/inflight"] == 2.0
         # The leading indicator: idle time rises before a wedge becomes a stall.
         assert "rollout/idle_s" in published
+
+
+class TestGenerationFleetProbe:
+    """The probe is the proactive half; the routing adapters supply the reactive half.
+
+    Ray liveness is cheap and authoritative for "the process is gone", which is what
+    this checks. It does not catch a vLLM engine core dying under a live worker, which
+    is why observed failures are reported separately into the same counters.
+    """
+
+    @staticmethod
+    def _with_fleet(monitor, *, worker_alive):
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0
+        )
+        ctrl._fleet_monitor = monitor
+        ctrl._gen = SimpleNamespace(
+            worker_group=SimpleNamespace(
+                get_dp_leader_worker_idx=lambda shard: shard,
+                workers=[
+                    SimpleNamespace(
+                        is_alive=SimpleNamespace(
+                            remote=(lambda alive=alive: _completed())
+                            if alive
+                            else (lambda: _failed(ray.exceptions.ActorDiedError()))
+                        )
+                    )
+                    for alive in worker_alive
+                ],
+            )
+        )
+        return ctrl
+
+    def test_a_live_fleet_stays_serving(self):
+        monitor = GenerationFleetMonitor(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, True])
+        asyncio.run(_run_ticks(ctrl, 3))
+        assert monitor.serving_shards() == [0, 1]
+
+    def test_a_dead_worker_is_quarantined_by_the_probe(self):
+        monitor = GenerationFleetMonitor(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(_run_ticks(ctrl, 3))
+        assert monitor.state_of(1) is ShardState.DEAD
+        assert monitor.serving_shards() == [0]
+
+    def test_fleet_state_is_published(self):
+        monitor = GenerationFleetMonitor(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(_run_ticks(ctrl, 3))
+        published = ctrl._logger.metrics[-1]
+        assert published["fleet/shards/dead"] == 1.0
+        assert published["fleet/serving_shards"] == 1.0
+
+    def test_losing_the_whole_fleet_ends_the_run(self):
+        """Below the floor there is nothing left to generate with."""
+        monitor = GenerationFleetMonitor(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+        with pytest.raises(GenerationFleetExhausted):
+            asyncio.run(ctrl._watchdog_pump())
+
+    def test_no_monitor_means_no_probing(self):
+        """Fleet health off must leave the watchdog exactly as it was."""
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0
+        )
+        ctrl._gen = SimpleNamespace()  # would AttributeError if probed
+        asyncio.run(_run_ticks(ctrl, 3))
 
 
 class TestEnvHealthCheck:
