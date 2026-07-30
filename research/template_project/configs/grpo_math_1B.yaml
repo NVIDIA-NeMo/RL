@@ -8,6 +8,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
