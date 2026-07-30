@@ -94,5 +94,6 @@ class EvalDataConfig(ResponseDatasetConfig):
     include_single_letter_instruction: NotRequired[bool]
 
 
-# Backward-compatible public type name. Eval now uses the response dataset schema.
+# Backward-compatible public alias for downstream imports. Internal code should
+# use EvalDataConfig directly.
 EvalDataConfigType = EvalDataConfig
