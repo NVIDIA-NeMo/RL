@@ -201,6 +201,14 @@ class DTensorConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # dtype the checkpoint is materialized in, independent of `precision` (the
+    # compute dtype). Defaults to "float32" so the optimizer keeps fp32 master
+    # weights; inference-only workers (a frozen distillation teacher) can set
+    # "bfloat16" to halve initialization and resident parameter memory.
+    load_precision: NotRequired[str]
+    # Shard the model before loading its weights instead of loading the
+    # unwrapped model first. Lowers peak memory for large checkpoints.
+    shard_before_load: NotRequired[bool]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
 
@@ -539,6 +547,11 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
+    # Freeze (requires_grad=False) any parameter whose name contains one of these
+    # substrings. Use for submodules that never receive gradients (e.g. the
+    # nemotron_h multi-token-prediction head, ["mtp"], during distillation) to keep
+    # optimizer save/load symmetric and avoid checkpoint-resume key mismatches.
+    freeze_parameter_patterns: NotRequired[list[str] | None]
     refit_buffer_size_gb: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[

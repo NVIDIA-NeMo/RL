@@ -3618,6 +3618,25 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 i,
             )
             has_common_support = common_student_idx_t.numel() > 0
+            if not has_common_support:
+                # Every 1-to-1 chunk would silently fall through to the mismatch
+                # path, zeroing KL/common and KL/partition_first and making
+                # top1_acc_per_chunk meaningless (it is normalized by a common
+                # count of 0). That looks like a converging run, so fail loudly
+                # instead: an empty common vocab means the projection matrix or
+                # subtoks table does not match this (student, teacher) pair.
+                source = (
+                    f"pseudo_target_paths[{i}]={self.pseudo_target_paths[i]!r}"
+                    if self.common_indices_from_subtoks
+                    else f"projection_matrix_paths[{i}]={self.projection_matrix_paths[i]!r}"
+                )
+                raise ValueError(
+                    f"Teacher {i}: the exact 1-to-1 common-vocab map is empty, so "
+                    f"no chunk can take the common path. Derived from {source} "
+                    f"(common_indices_from_subtoks="
+                    f"{self.common_indices_from_subtoks}). Check that this table "
+                    f"was built for this student/teacher tokenizer pair."
+                )
         if requires_pos0_support and not has_common_support:
             coefficient_name = (
                 "prefix_bidir_v3_mismatch_pos0_alpha"
@@ -4681,10 +4700,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         #     a per-chunk KL term and a per-token CE term (consistent
         #     gradient balance by construction of kl_scale). `train:loss`
         #     is also the checkpoint-selection metric.
-        #   - `*_per_chunk`: mean-reduced by the trainer (whitelisted in
-        #     xtoken_distillation.py); final wandb value is the average
-        #     per-mb local chunk-average — a clean per-chunk quantity when
-        #     chunk counts are roughly uniform across microbatches.
+        #   - `*_per_chunk`: mean-reduced by the trainer (listed in
+        #     `xtoken_off_policy_distillation.MEAN_REDUCED_MB_METRICS`); final
+        #     wandb value is the average per-mb local chunk-average — a clean
+        #     per-chunk quantity when chunk counts are roughly uniform across
+        #     microbatches.
         #   - `num_*`: sum-reduced; total count across the step.
         metrics: dict[str, Any] = {
             "loss": final_loss.item(),

@@ -19,6 +19,11 @@ distillation:
   val_period: 0               # validation disabled by default
   val_at_start: false
   val_at_end: false
+  # Offload the student model/optimizer to CPU after each optimizer step. The
+  # student and the teachers share the same GPUs, so on memory-tight pairings
+  # (large MoE teacher) the next step's teacher forward otherwise competes with
+  # resident student optimizer state.
+  offload_student_after_step: false
 
 loss_fn:
   # NOTE: the per-(student, teacher) projection matrix path lives on each
@@ -113,7 +118,18 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    # dtype the checkpoint is materialized in, independent of `precision` (the
+    # compute dtype). "float32" keeps fp32 optimizer master weights.
+    load_precision: "float32"
+    # Shard before loading weights instead of materializing the unwrapped model
+    # on every rank first. Lowers peak memory for large checkpoints.
+    shard_before_load: false
   max_grad_norm: 1.0
+  # Freeze (requires_grad=False) parameters whose name contains any of these
+  # substrings; null => nothing frozen. Use for submodules that never receive a
+  # gradient, e.g. ["mtp"] for a nemotron_h multi-token-prediction head, so the
+  # optimizer state saved at a checkpoint matches what is expected on resume.
+  freeze_parameter_patterns: null
   dynamic_batching:
     enabled: false
     train_mb_tokens: 2048
@@ -185,6 +201,11 @@ teachers:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
+      # A teacher runs inference-only, so "bfloat16" here halves initialization
+      # and resident parameter memory at no cost — there is no optimizer whose
+      # master weights would lose precision.
+      load_precision: "float32"
+      shard_before_load: false
     max_grad_norm: 1.0
     dynamic_batching:
       enabled: false
@@ -236,6 +257,11 @@ teachers:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
+      # A teacher runs inference-only, so "bfloat16" here halves initialization
+      # and resident parameter memory at no cost — there is no optimizer whose
+      # master weights would lose precision.
+      load_precision: "float32"
+      shard_before_load: false
     max_grad_norm: 1.0
     dynamic_batching:
       enabled: false

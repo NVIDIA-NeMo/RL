@@ -48,6 +48,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
+    reduce_mb_metric,
     setup,
     validate,
     xtoken_non_student_seq_keys,
@@ -361,6 +362,62 @@ def test_setup_requires_dtensor_v2_teacher():
     assert mock_cluster.call_count == 0
 
 
+def _dtensor_cfg(*, enabled=True, v2=True, tp=1, cp=1):
+    return {
+        "enabled": enabled,
+        "_v2": v2,
+        "tensor_parallel_size": tp,
+        "context_parallel_size": cp,
+    }
+
+
+def _megatron_cfg(*, enabled=True, tp=1, pp=1, cp=1):
+    return {
+        "enabled": enabled,
+        "tensor_model_parallel_size": tp,
+        "pipeline_model_parallel_size": pp,
+        "context_parallel_size": cp,
+    }
+
+
+def test_entity_parallelism_dtensor_v2_returns_tp_cp():
+    cfg = {"dtensor_cfg": _dtensor_cfg(tp=4, cp=2)}
+    assert xt_mod._xtoken_entity_parallelism(cfg, label="teachers[0]") == (4, 2)
+
+
+def test_entity_parallelism_megatron_pp1cp1_returns_tp_cp():
+    cfg = {
+        "dtensor_cfg": _dtensor_cfg(enabled=False, v2=False),
+        "megatron_cfg": _megatron_cfg(tp=2, pp=1, cp=1),
+    }
+    assert xt_mod._xtoken_entity_parallelism(cfg, label="teachers[0]") == (2, 1)
+
+
+def test_entity_parallelism_megatron_rejects_pp_gt_1():
+    cfg = {
+        "dtensor_cfg": _dtensor_cfg(enabled=False, v2=False),
+        "megatron_cfg": _megatron_cfg(tp=2, pp=2, cp=1),
+    }
+    with pytest.raises(AssertionError, match="pipeline_model_parallel_size == 1"):
+        xt_mod._xtoken_entity_parallelism(cfg, label="teachers[0]")
+
+
+def test_entity_parallelism_megatron_rejects_cp_gt_1():
+    cfg = {
+        "dtensor_cfg": _dtensor_cfg(enabled=False, v2=False),
+        "megatron_cfg": _megatron_cfg(tp=2, pp=1, cp=2),
+    }
+    with pytest.raises(AssertionError, match="context_parallel_size == 1"):
+        xt_mod._xtoken_entity_parallelism(cfg, label="teachers[0]")
+
+
+def test_entity_parallelism_rejects_neither_backend():
+    # dtensor enabled but not _v2, and no megatron_cfg -> neither backend.
+    cfg = {"dtensor_cfg": _dtensor_cfg(enabled=True, v2=False)}
+    with pytest.raises(AssertionError, match="either DTensor-V2"):
+        xt_mod._xtoken_entity_parallelism(cfg, label="teachers[0]")
+
+
 def test_setup_injects_vocab_sizes_into_loss_config():
     cfg = _make_master_config()
     original_loss_cfg = deepcopy(cfg.loss_fn)
@@ -671,6 +728,34 @@ def test_skip_keys_builder_cross_and_same_vocab():
     assert "teacher_1_full_logits_ipc" in keys
     assert not any(k.startswith("alignment_1_") for k in keys)
     assert "teacher_1_input_ids" not in keys
+
+
+def test_reduce_mb_metric_means_per_chunk_diagnostics_and_sums_shares():
+    """v6 per-chunk diagnostics are per-mb averages: mean-reduce, never sum.
+
+    Summing them scales the reported value with the microbatch count — the
+    defect that produced a ``top1_acc_per_chunk`` of 110.60 on a 128-microbatch
+    step. The KD/CE terms are normalized by a *global* denominator in the loss,
+    so those stay sum-reduced, as do the ``num_*`` counts.
+    """
+    n_mb = 128
+    acc = [0.8] * n_mb
+    # Mean-reduced, both bare and with the per-teacher ``_t{i}`` suffix.
+    for key in (
+        "top1_acc_per_chunk",
+        "kl_common_per_chunk",
+        "kl_partition_first_per_chunk",
+        "kl_partition_last_per_chunk",
+    ):
+        assert reduce_mb_metric(key, acc) == pytest.approx(0.8)
+        assert reduce_mb_metric(f"{key}_t0", acc) == pytest.approx(0.8)
+        assert reduce_mb_metric(f"{key}_t11", acc) == pytest.approx(0.8)
+    assert reduce_mb_metric("kl_loss_scale", [4.0] * n_mb) == pytest.approx(4.0)
+    # Sum-reduced: global-denominator loss shares and counts, suffixed or not.
+    assert reduce_mb_metric("kl_loss", [0.5] * 4) == pytest.approx(2.0)
+    assert reduce_mb_metric("kl_loss_t0", [0.5] * 4) == pytest.approx(2.0)
+    assert reduce_mb_metric("ce_loss", [0.5] * 4) == pytest.approx(2.0)
+    assert reduce_mb_metric("num_common_chunks_t0", [10] * 4) == pytest.approx(40)
 
 
 def test_skip_keys_builder_same_vocab_full_logits():

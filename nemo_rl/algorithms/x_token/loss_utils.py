@@ -864,7 +864,7 @@ def build_exact_token_map(
     student row's projection weights descending, then picks an exact-token
     map per the ``xtoken_loss`` flag:
 
-    - ``xtoken_loss=False`` (strict): ``has_exact_map = (sorted_values[:, 0] == 1.0) & (projection_indices[:, 1] == -1)``.
+    - ``xtoken_loss=False`` (strict): ``has_exact_map = sorted_values[:, 0] == 1.0``.
       On collision (multiple students mapping to the same teacher id),
       the earliest (lowest) student index wins.
     - ``xtoken_loss=True`` (relaxed): ``has_exact_map = sorted_values[:, 0] >= 0.6``.
@@ -902,11 +902,18 @@ def build_exact_token_map(
     if xtoken_loss:
         has_exact_map = sorted_values[:, 0] >= 0.6
     else:
-        # Strict: exactly one top-k entry with weight 1.0, no second
-        # mapping. `indices[:, 1] == -1` is the sentinel used by the
-        # `_exact_map_remapped` projection files for "no second
-        # mapping".
-        has_exact_map = (sorted_values[:, 0] == 1.0) & (indices[:, 1] == -1)
+        # Strict: top-k entry with weight 1.0 (no probability mass leaks to
+        # other teacher ids — the student token maps 1-to-1). The legacy
+        # `_exact_map_remapped` files used `indices[:, 1] == -1` as a sentinel
+        # for "no second mapping", but modern projection builders
+        # (tools/x_token/minimal_projection_via_multitoken.py with
+        # --enable-exact-match) leave indices[:, 1+] filled with valid ids whose
+        # weight is 0. Do NOT re-add the sentinel guard: it silently empties the
+        # common vocab for every such matrix (e.g. nemotron-nano-3.5 <- Qwen3-30B
+        # went 68131 -> 0 common tokens, routing all 496k 1-to-1 chunks down the
+        # mismatch path). The top1 == 1.0 check is sufficient, since by
+        # normalization weight 1.0 on one entry means 0 elsewhere.
+        has_exact_map = sorted_values[:, 0] == 1.0
 
     # Gather (s_idx, t_idx, prob) for each exact-map candidate.
     s_candidates = torch.where(has_exact_map)[0]

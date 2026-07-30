@@ -72,6 +72,11 @@ class RuntimeConfig(NamedTuple):
     # Reward model flag
     is_reward_model: bool
 
+    # dtype the checkpoint is materialized in (dtensor_cfg.load_precision).
+    # Trails the required fields with a default so existing keyword
+    # constructions stay valid.
+    model_load_dtype: torch.dtype = torch.float32
+
 
 class ModelAndOptimizerState(NamedTuple):
     """Container for model and optimizer state.

@@ -19,6 +19,11 @@ distillation:
   val_period: 0               # validation disabled by default
   val_at_start: false
   val_at_end: false
+  # Offload the student model/optimizer to CPU after each optimizer step. The
+  # student and the teachers share the same GPUs, so on memory-tight pairings
+  # (large MoE teacher) the next step's teacher forward otherwise competes with
+  # resident student optimizer state.
+  offload_student_after_step: false
 
 loss_fn:
   # NOTE: the per-(student, teacher) projection matrix path lives on each
@@ -113,7 +118,94 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    # dtype the checkpoint is materialized in, independent of `precision` (the
+    # compute dtype). "float32" keeps fp32 optimizer master weights.
+    load_precision: "float32"
+    # Shard before loading weights instead of materializing the unwrapped model
+    # on every rank first. Lowers peak memory for large checkpoints.
+    shard_before_load: false
+  # Megatron-Core backend base for the student (disabled by default). xToken
+  # cross-tokenizer distillation supports Megatron only at
+  # pipeline_model_parallel_size == 1 and context_parallel_size == 1 (v0).
+  # Recipes select it by setting megatron_cfg.enabled: true and
+  # dtensor_cfg.enabled: false. A Megatron student's optimizer / scheduler live
+  # HERE (megatron_cfg.optimizer / .scheduler), not at policy.optimizer / .scheduler.
+  megatron_cfg:
+    enabled: false
+    empty_unused_memory_level: 0
+    activation_checkpointing: false
+    recompute_granularity: "full"
+    recompute_modules: null
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: false
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    force_reconvert_from_hf: false
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-5
+      min_lr: 5.0e-5
+      weight_decay: 0.001
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: ${policy.max_grad_norm}
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 1000
+      lr_warmup_iters: 10
+      lr_warmup_init: 5.0e-6
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
   max_grad_norm: 1.0
+  # Freeze (requires_grad=False) parameters whose name contains any of these
+  # substrings; null => nothing frozen. Use for submodules that never receive a
+  # gradient, e.g. ["mtp"] for a nemotron_h multi-token-prediction head, so the
+  # optimizer state saved at a checkpoint matches what is expected on resume.
+  freeze_parameter_patterns: null
   dynamic_batching:
     enabled: false
     train_mb_tokens: 2048
@@ -185,6 +277,84 @@ teachers:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
+      # A teacher runs inference-only, so "bfloat16" here halves initialization
+      # and resident parameter memory at no cost — there is no optimizer whose
+      # master weights would lose precision.
+      load_precision: "float32"
+      shard_before_load: false
+    # Megatron-Core backend base for this teacher (inference-only; disabled by
+    # default). Recipes set megatron_cfg.enabled: true + dtensor_cfg.enabled:
+    # false to run the teacher on Megatron. xToken requires PP == 1 and CP == 1.
+    megatron_cfg:
+      enabled: false
+      empty_unused_memory_level: 0
+      activation_checkpointing: false
+      recompute_granularity: "full"
+      recompute_modules: null
+      tensor_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      num_layers_in_first_pipeline_stage: null
+      num_layers_in_last_pipeline_stage: null
+      context_parallel_size: 1
+      pipeline_dtype: "bfloat16"
+      sequence_parallel: false
+      freeze_moe_router: true
+      moe_router_dtype: "fp64"
+      moe_router_load_balancing_type: "none"
+      moe_router_bias_update_rate: 0.0
+      moe_permute_fusion: true
+      apply_rope_fusion: true
+      bias_activation_fusion: true
+      defer_fp32_logits: false
+      moe_per_layer_logging: false
+      moe_enable_deepep: false
+      moe_token_dispatcher_type: "alltoall"
+      moe_shared_expert_overlap: false
+      use_gloo_process_groups: false
+      gradient_accumulation_fusion: false
+      use_fused_weighted_squared_relu: false
+      checkpoint:
+        async_save: false
+        ckpt_assume_constant_structure: false
+      force_reconvert_from_hf: false
+      optimizer:
+        optimizer: "adam"
+        lr: 5.0e-5
+        min_lr: 5.0e-5
+        weight_decay: 0.001
+        bf16: true
+        fp16: false
+        params_dtype: "float32"
+        adam_beta1: 0.9
+        adam_beta2: 0.95
+        adam_eps: 1e-8
+        sgd_momentum: 0.9
+        use_distributed_optimizer: true
+        use_precision_aware_optimizer: true
+        optimizer_cpu_offload: false
+        optimizer_offload_fraction: 0.0
+        clip_grad: 1.0
+      scheduler:
+        start_weight_decay: 0.001
+        end_weight_decay: 0.001
+        weight_decay_incr_style: "constant"
+        lr_decay_style: "constant"
+        lr_decay_iters: 1000
+        lr_warmup_iters: 10
+        lr_warmup_init: 5.0e-6
+      distributed_data_parallel_config:
+        grad_reduce_in_fp32: false
+        overlap_grad_reduce: true
+        overlap_param_gather: true
+        use_custom_fsdp: false
+        data_parallel_sharding_strategy: "optim_grads_params"
+      fp8_cfg:
+        enabled: false
+        fp8: "e4m3"
+        fp8_recipe: "blockwise"
+        fp8_param: false
     max_grad_norm: 1.0
     dynamic_batching:
       enabled: false

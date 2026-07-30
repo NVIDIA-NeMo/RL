@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -75,7 +76,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # pre-flight (which assumes [B, student_seq, ...] for every 2+D tensor) must
 # skip them. Sources:
 #   - teacher_full_logits_ipc: list[B] of CUDA IPC handle dicts produced by
-#     FullLogitsPostProcessor in dtensor_policy_worker_v2.get_full_logits_ipc.
+#     FullLogitsPostProcessor in the DTensor/Megatron worker's get_full_logits_ipc.
 #     Not a tensor at all — list of dicts — but listed here so the worker's
 #     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by
@@ -112,6 +113,45 @@ def xtoken_non_student_seq_keys(
     return frozenset(keys)
 
 
+# Per-microbatch metrics that are *intensive* — rates, ratios, per-chunk
+# averages, and global-batch constants replicated onto every microbatch. Their
+# per-step value is the mean over the flat per-(microbatch, DP rank) list;
+# everything else is an *extensive* per-microbatch contribution (loss shares
+# normalized by a global denominator, counts) whose per-step value is the sum.
+MEAN_REDUCED_MB_METRICS = frozenset(
+    {
+        "lr",
+        "wd",
+        "global_valid_seqs",
+        "global_valid_toks",
+        "accuracy",
+        "proj_accuracy",
+        "kl_loss_scale",
+        # Gold-loss path: per-mb local chunk average.
+        "kl_common",
+        "l1_uncommon",
+        # v6 (prefix_bidir_partition_kl_v3) diagnostics. Each microbatch
+        # reports an average over *its own* chunks, so summing them scales
+        # with the microbatch count instead of staying per-chunk (which is
+        # how top1_acc_per_chunk reached an impossible 110.60).
+        "kl_common_per_chunk",
+        "kl_partition_first_per_chunk",
+        "kl_partition_last_per_chunk",
+        "top1_acc_per_chunk",
+    }
+)
+
+# Per-teacher metrics are suffixed ``_t{i}`` by the loss fn's aggregation.
+_TEACHER_METRIC_SUFFIX = re.compile(r"_t\d+$")
+
+
+def reduce_mb_metric(key: str, values: Any) -> float:
+    """Reduce one metric's per-(microbatch, DP rank) list to its per-step scalar."""
+    if _TEACHER_METRIC_SUFFIX.sub("", key) in MEAN_REDUCED_MB_METRICS:
+        return float(np.mean(values))
+    return float(np.sum(values))
+
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
@@ -128,6 +168,10 @@ class OffPolicyDistillationConfig(TypedDict):
         val_period: Validation cadence in steps. ``0`` disables validation.
         val_at_start: Run validation before training begins.
         val_at_end: Run validation on the final step.
+        offload_student_after_step: Offload the student model and optimizer to
+            CPU after each optimizer step. Student and teachers are colocated on
+            the same GPUs, so the next step's teacher forward otherwise competes
+            with resident student optimizer state.
     """
 
     num_prompts_per_step: int
@@ -137,6 +181,7 @@ class OffPolicyDistillationConfig(TypedDict):
     val_period: int
     val_at_start: bool
     val_at_end: bool
+    offload_student_after_step: NotRequired[bool]
 
 
 class OffPolicyDistillationSaveState(TypedDict):
@@ -219,6 +264,46 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
+def _xtoken_entity_parallelism(cfg: PolicyConfig, *, label: str) -> tuple[int, int]:
+    """Return ``(tensor_parallel, context_parallel)`` for a policy/teacher config.
+
+    xToken distillation accepts either the DTensor-V2 backend
+    (``dtensor_cfg.enabled`` and ``dtensor_cfg._v2``) or the Megatron backend
+    (``megatron_cfg.enabled``). For Megatron, the cross-tokenizer full-logits IPC
+    path currently requires ``pipeline_model_parallel_size == 1`` and
+    ``context_parallel_size == 1`` (v0); both are asserted here.
+
+    Args:
+        cfg: The policy or teacher policy config.
+        label: Human-readable name of the entity for error messages, e.g.
+            ``"teachers[0]"``.
+
+    Returns:
+        The entity's tensor- and context-parallel sizes, read from whichever
+        backend block is enabled.
+    """
+    if "megatron_cfg" in cfg and cfg["megatron_cfg"]["enabled"]:
+        mcfg = cfg["megatron_cfg"]
+        assert mcfg["pipeline_model_parallel_size"] == 1, (
+            f"xtoken distillation on Megatron requires "
+            f"{label}.megatron_cfg.pipeline_model_parallel_size == 1 (v0)."
+        )
+        assert mcfg["context_parallel_size"] == 1, (
+            f"xtoken distillation on Megatron requires "
+            f"{label}.megatron_cfg.context_parallel_size == 1 (v0)."
+        )
+        return mcfg["tensor_model_parallel_size"], mcfg["context_parallel_size"]
+    assert cfg["dtensor_cfg"]["enabled"] and cfg["dtensor_cfg"].get("_v2"), (
+        f"xtoken distillation requires {label} to enable either DTensor-V2 "
+        f"(dtensor_cfg.enabled=true and _v2=true) or Megatron "
+        f"(megatron_cfg.enabled=true)."
+    )
+    return (
+        cfg["dtensor_cfg"]["tensor_parallel_size"],
+        cfg["dtensor_cfg"]["context_parallel_size"],
+    )
+
+
 def setup(
     master_config: MasterConfig,
     student_tokenizer: PreTrainedTokenizerBase,
@@ -251,18 +336,16 @@ def setup(
         f"tokenizers for {len(teachers)} teachers."
     )
 
-    # Backend gate: DTensor V2 only, for the student and every teacher. Unlike
-    # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
-    # sharding (the loss is parallelism-invariant), so there is deliberately NO
-    # tensor/context_parallel_size==1 assert.
-    assert policy_config["dtensor_cfg"]["enabled"] and policy_config["dtensor_cfg"].get(
-        "_v2"
-    ), "xtoken distillation requires policy.dtensor_cfg.enabled=true and _v2=true."
+    # Backend gate. The student and each teacher may be DTensor V2 or Megatron
+    # (Megatron requires pipeline_model_parallel_size == 1 and
+    # context_parallel_size == 1 for the v0 full-logits IPC path). This path
+    # supports TP/CP/diff-DP sharding (the loss is parallelism-invariant), so
+    # there is deliberately NO tensor/context_parallel_size==1 assert on the
+    # DTensor entities. ``_xtoken_entity_parallelism`` validates each entity's
+    # backend as a side effect (raising on an unsupported / misconfigured one).
+    _xtoken_entity_parallelism(policy_config, label="policy")
     for i, tc in enumerate(teacher_configs):
-        assert tc["dtensor_cfg"]["enabled"] and tc["dtensor_cfg"].get("_v2"), (
-            f"xtoken distillation requires teachers[{i}].dtensor_cfg.enabled=true "
-            "and _v2=true."
-        )
+        _xtoken_entity_parallelism(tc, label=f"teachers[{i}]")
 
     # A null projection path marks a same-vocab teacher (direct KL, no
     # projection/alignment); that only makes sense when it shares the student's
@@ -438,8 +521,7 @@ def setup(
     # order) and tile it cleanly into per-DP-rank chunks and whole microbatches.
     # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
     student_dp = student_policy.data_parallel_size
-    student_tp = policy_config["dtensor_cfg"]["tensor_parallel_size"]
-    student_cp = policy_config["dtensor_cfg"]["context_parallel_size"]
+    student_tp, student_cp = _xtoken_entity_parallelism(policy_config, label="policy")
     # Each teacher may differ from the student (and from each other) in
     # DP/MBS/TP/CP, so check the batch grid and node-local IPC layout per
     # teacher. Train and validation share the grid (the student reuses its train
@@ -458,14 +540,17 @@ def setup(
         )
         # Node-local CUDA IPC: on >1 node it only works when teacher/student
         # share DP and a node-aligned model-parallel group, else a student rank
-        # would read teacher shards from another node.
+        # would read teacher shards from another node. The teacher's TP/CP are
+        # read per backend (DTensor or Megatron); PP is 1 (asserted above), so
+        # its model-parallel group is exactly teacher_tp * teacher_cp.
+        teacher_tp, teacher_cp = _xtoken_entity_parallelism(tc, label=f"teachers[{i}]")
         assert_xtoken_ipc_node_local(
             num_nodes=cluster_config["num_nodes"],
             gpus_per_node=cluster_config["gpus_per_node"],
             student_tp=student_tp,
             student_cp=student_cp,
-            teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
-            teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
+            teacher_tp=teacher_tp,
+            teacher_cp=teacher_cp,
             student_dp=student_dp,
             teacher_dp=teacher_dp,
         )
@@ -492,9 +577,7 @@ def setup(
         # v6 pseudo-target tables (student<->teacher sub-token chains) per
         # cross-tokenizer teacher; None for same-tokenizer teachers.
         "pseudo_target_paths": [t.pseudo_target_path for t in teachers],
-        "reverse_pseudo_target_paths": [
-            t.reverse_pseudo_target_path for t in teachers
-        ],
+        "reverse_pseudo_target_paths": [t.reverse_pseudo_target_path for t in teachers],
     }
     loss_fn = CrossTokenizerDistillationLossFn(loss_config)
 
@@ -621,6 +704,15 @@ def xtoken_off_policy_distillation_train(
     val_at_end = distill_cfg["val_at_end"]
     max_epochs = distill_cfg["max_num_epochs"]
     max_steps = distill_cfg["max_num_steps"]
+    offload_student_after_step = bool(
+        distill_cfg.get("offload_student_after_step", False)
+    )
+    if offload_student_after_step:
+        print(
+            "Student post-step offload enabled: the student model/optimizer are "
+            "offloaded after each optimizer step, before the next teacher pass.",
+            flush=True,
+        )
     # Per-teacher export MBS (each teacher's own train MBS) and the
     # non-student-seq keys the worker's check_sequence_dim must skip
     # (teacher-count-dependent, so built from the loss fn).
@@ -689,6 +781,10 @@ def xtoken_off_policy_distillation_train(
                             teacher_policy.release_ipc_buffer()
                         raise
 
+                if offload_student_after_step:
+                    with timer.time("student_step_offload"):
+                        student_policy.offload_after_refit()
+
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
                     and (current_step + 1 == len(dataloader))
@@ -722,23 +818,11 @@ def xtoken_off_policy_distillation_train(
                 metrics.update(train_results["all_mb_metrics"])
                 # Reduce per-microbatch metrics to per-step scalars. The
                 # P-KL path emits kl_loss/ce_loss/kl_loss_scale/proj_accuracy;
-                # the gold-loss path emits kl_common/l1_uncommon. Either set
-                # may be present — reduce both via the same rules.
+                # the gold-loss path emits kl_common/l1_uncommon; the v6 path
+                # emits the *_per_chunk diagnostics. Any set may be present —
+                # reduce all via the same rules.
                 for k, v in metrics.items():
-                    if k in {
-                        "lr",
-                        "wd",
-                        "global_valid_seqs",
-                        "global_valid_toks",
-                        "accuracy",
-                        "proj_accuracy",
-                        "kl_loss_scale",
-                        "kl_common",
-                        "l1_uncommon",
-                    }:
-                        metrics[k] = float(np.mean(v))
-                    else:
-                        metrics[k] = float(np.sum(v))
+                    metrics[k] = reduce_mb_metric(k, v)
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += int(metrics["global_valid_toks"])
 

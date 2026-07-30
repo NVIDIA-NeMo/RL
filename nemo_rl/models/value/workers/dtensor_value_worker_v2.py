@@ -259,6 +259,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             self.is_generation_colocated,
             _runtime_sampling_params,
             _runtime_is_reward_model,
+            _runtime_model_load_dtype,
         ) = runtime_config
 
     @wrap_with_nvtx_name("dtensor_value_worker_v2/train")

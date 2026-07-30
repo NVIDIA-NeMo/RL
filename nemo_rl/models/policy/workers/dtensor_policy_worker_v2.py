@@ -360,6 +360,7 @@ class DTensorPolicyWorkerV2Impl(
             self.is_generation_colocated,
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
+            self.model_load_dtype,
         ) = runtime_config
 
         # Rollout topology constant for SGLang colocated refit: set once via

@@ -17,6 +17,7 @@
 import importlib
 import inspect
 import os
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -79,6 +80,43 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+def _precision_to_dtype(precision: str, field_name: str) -> torch.dtype:
+    if precision not in STRING_TO_DTYPE:
+        raise ValueError(f"Unknown {field_name}: {precision}")
+    return STRING_TO_DTYPE[precision]
+
+
+@contextmanager
+def _force_shard_before_load(enabled: bool):
+    """Make Automodel shard the model before loading its weights.
+
+    Automodel decides load-vs-shard order from the parallelism sizes; with
+    tp_size == 1 it loads the unwrapped model first, which materializes the
+    whole checkpoint on every rank. Forcing the post-shard path caps peak
+    memory at the per-rank shard, which is what makes 30B-class teachers fit.
+    """
+    if not enabled:
+        yield
+        return
+
+    import nemo_automodel._transformers.infrastructure as automodel_infrastructure
+
+    original_should_load_before_shard = (
+        automodel_infrastructure._should_load_before_shard
+    )
+
+    def _always_load_after_shard(**_kwargs: Any) -> bool:
+        return False
+
+    automodel_infrastructure._should_load_before_shard = _always_load_after_shard
+    try:
+        yield
+    finally:
+        automodel_infrastructure._should_load_before_shard = (
+            original_should_load_before_shard
+        )
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -284,9 +322,9 @@ def validate_and_prepare_config(
 
     # Parse precision
     precision = config["precision"]
-    if precision not in STRING_TO_DTYPE:
-        raise ValueError(f"Unknown precision: {precision}")
-    dtype = STRING_TO_DTYPE[precision]
+    dtype = _precision_to_dtype(precision, "precision")
+    load_precision = config["dtensor_cfg"].get("load_precision", "float32")
+    model_load_dtype = _precision_to_dtype(load_precision, "dtensor_cfg.load_precision")
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
@@ -327,7 +365,9 @@ def validate_and_prepare_config(
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        # Defaults to float32 so the optimizer keeps fp32 master weights;
+        # inference-only workers can set dtensor_cfg.load_precision=bfloat16.
+        torch_dtype=model_load_dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -397,6 +437,7 @@ def validate_and_prepare_config(
         model_class=model_class,
         model_config=model_config,
         hf_config_overrides=hf_config_overrides,
+        model_load_dtype=model_load_dtype,
         allow_flash_attn_args=allow_flash_attn_args,
         attn_impl=attn_impl,
         dtype=dtype,
@@ -752,31 +793,47 @@ def setup_model_and_optimizer(
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
     _disable_automodel_checkpoint_dtype_restore()
 
+    shard_before_load = bool(config["dtensor_cfg"].get("shard_before_load", False))
+    print(
+        f"[Rank {rank}] Initializing model via from_pretrained "
+        f"(load_dtype={runtime_config.model_load_dtype}, precision={runtime_config.dtype}, "
+        f"shard_before_load={shard_before_load})..."
+    )
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
-    model = model_class.from_pretrained(
-        model_name,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=fsdp2_config,
-        moe_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
-        peft_config=peft_config,
-        attn_implementation=attn_impl,
-        torch_dtype=str(model_config.torch_dtype),
-        trust_remote_code=True,
-        sdpa_method=sdpa_method,
-        **from_pretrained_kwargs,
-        **automodel_kwargs,
-    )
+    with _force_shard_before_load(shard_before_load):
+        model = model_class.from_pretrained(
+            model_name,
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=fsdp2_config,
+            moe_config=moe_config if ep_size > 1 else None,
+            activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+            peft_config=peft_config,
+            attn_implementation=attn_impl,
+            torch_dtype=str(model_config.torch_dtype),
+            trust_remote_code=True,
+            sdpa_method=sdpa_method,
+            **from_pretrained_kwargs,
+            **automodel_kwargs,
+        )
 
     print(model)
 
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+    # force_hf means the HF implementation was loaded even though the architecture
+    # has a custom entry in ModelRegistry, so the registry lookup alone would
+    # misreport it as non-HF. That matters for the autocast gate below: an HF MoE
+    # model needs autocast to reconcile the fp32 activations produced by
+    # MixedPrecisionPolicy(output_dtype=float32) with its bf16 params, and without
+    # it the first unwrapped matmul raises "expected mat1 and mat2 to have the same
+    # dtype, float != c10::BFloat16" at lm_head.
     is_hf_model = (
-        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+        automodel_kwargs.get("force_hf", False)
+        or model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
     )
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)
@@ -792,6 +849,28 @@ def setup_model_and_optimizer(
     )
     if is_tied_lm_head:
         model.tie_weights()
+
+    # Freeze parameters matching the configured substrings. A submodule that never
+    # receives gradients (e.g. the nemotron_h `mtp.*` head during distillation, where
+    # loss flows only through lm_head) still has requires_grad=True by default, so the
+    # optimizer expects state for it on resume but none was saved -> "Missing key in
+    # checkpoint state_dict: optim.state.mtp...". Setting requires_grad=False makes
+    # save/load symmetric. Default [] -> no-op.
+    freeze_patterns = config.get("freeze_parameter_patterns") or []
+    if freeze_patterns:
+        n_matched = 0
+        n_frozen = 0
+        for name, param in model.named_parameters():
+            if any(pat in name for pat in freeze_patterns):
+                n_matched += 1
+                if param.requires_grad:
+                    param.requires_grad_(False)
+                    n_frozen += 1
+        if rank == 0:
+            print(
+                f"Freeze patterns matched {n_matched} parameters; newly froze "
+                f"{n_frozen}: freeze_parameter_patterns={list(freeze_patterns)}"
+            )
 
     # CPU offload if needed
     if cpu_offload:
