@@ -31,6 +31,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
 )
+from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -343,6 +344,8 @@ def test_rollout_pump_writes_expected_tq_data(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
+        save_state=_default_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config, actor_args=actor_args

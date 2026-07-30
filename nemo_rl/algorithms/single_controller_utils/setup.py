@@ -21,8 +21,10 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, cast
 
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -32,7 +34,9 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
 from nemo_rl.algorithms.grpo import (
+    GRPOSaveState,
     _create_advantage_estimator,
+    _default_grpo_save_state,
     _should_use_nemo_gym,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -43,7 +47,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -61,6 +65,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -85,6 +90,8 @@ class SingleControllerActorArgs:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
+    save_state: GRPOSaveState
+    last_checkpoint_path: Optional[str]
 
 
 def _build_clusters(
@@ -197,6 +204,9 @@ def _build_trainer(
     master_config: MasterConfig,
     tokenizer,
     processor,
+    *,
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
 ):
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -212,8 +222,8 @@ def _build_trainer(
         config=master_config.policy,
         tokenizer=tokenizer,
         processor=processor,
-        weights_path=None,
-        optimizer_path=None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
@@ -296,12 +306,6 @@ def setup_single_controller(
             "SingleController doesn't support validation now, will support "
             "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
         )
-    if master_config.checkpointing["enabled"]:
-        raise NotImplementedError(
-            "SingleController doesn't support checkpointing now, will support "
-            "later. Set checkpointing.enabled=false."
-        )
-
     if dp_config is None or not dp_config.get("enabled", False):
         raise ValueError(
             "single_controller_utils.setup requires "
@@ -319,7 +323,23 @@ def setup_single_controller(
             "data.use_multiple_dataloader=True yet."
         )
 
+    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+
     set_seed(grpo_config["seed"])
+
+    # ==========================
+    # Checkpointing
+    # ==========================
+    checkpointer = CheckpointManager(master_config.checkpointing)
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    save_state = cast(
+        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
+    )
+    if save_state is None:
+        save_state = _default_grpo_save_state()
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     # ==========================
     # Setup Dataset & Environments
@@ -352,6 +372,20 @@ def setup_single_controller(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
+    if last_checkpoint_path is not None:
+        dataloader_state_path = os.path.join(
+            last_checkpoint_path, "train_dataloader.pt"
+        )
+        if os.path.exists(dataloader_state_path):
+            print(
+                f"📦 Restoring dataloader state from checkpoint: {dataloader_state_path}"
+            )
+            load_dataloader_state(dataloader, last_checkpoint_path, data_config)
+        else:
+            print(
+                f"⚠️ No dataloader state found at {dataloader_state_path}. "
+                "Starting with a fresh dataloader position."
+            )
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
@@ -365,7 +399,14 @@ def setup_single_controller(
         # Colocated: vLLM prefers a clean GPU at load time, so generation
         # comes up before the policy.
         generation = _build_generation(inference_cluster, master_config)
-        policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
+        policy = _build_trainer(
+            train_cluster,
+            master_config,
+            tokenizer,
+            processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+        )
     else:
         # Non-colocated: generation + policy run on disjoint GPUs, so
         # bring them up in parallel.
@@ -374,7 +415,13 @@ def setup_single_controller(
                 _build_generation, inference_cluster, master_config
             )
             policy_future = executor.submit(
-                _build_trainer, train_cluster, master_config, tokenizer, processor
+                _build_trainer,
+                train_cluster,
+                master_config,
+                tokenizer,
+                processor,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
             )
             generation = gen_future.result()
             policy = policy_future.result()
@@ -458,4 +505,6 @@ def setup_single_controller(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
+        save_state=save_state,
+        last_checkpoint_path=last_checkpoint_path,
     )
