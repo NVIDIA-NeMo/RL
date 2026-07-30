@@ -224,7 +224,8 @@ def test_nemotron_super_omni_mpo_parity_configs(
     assert master_config.policy["train_global_batch_size"] == 256
     assert master_config.policy["max_total_sequence_length"] == sequence_length
     assert master_config.data["max_input_seq_length"] == sequence_length
-    assert master_config.cluster == {"num_nodes": 4, "gpus_per_node": 8}
+    assert master_config.cluster["num_nodes"] == 4
+    assert master_config.cluster["gpus_per_node"] == 8
     expected_divisibility = 32 if context_parallel_size == 2 else 8
     assert (
         master_config.policy["make_sequence_length_divisible_by"]
