@@ -80,10 +80,10 @@ The launcher explicitly enables online W&B logging. It defaults to entity
 `joc`, project `nemotron-omni-main-migration`, and a unique run name; override
 these with `WANDB_ENTITY`, `WANDB_PROJECT`, and `WANDB_NAME`. It forwards
 `WANDB_API_KEY` or read-only mounts the submit host's `$HOME/.netrc`. The
-container driver defaults to `WANDB_PIN_VERSION=0.21.1`, matching the legacy
-Omni launcher so NVIDIA's 36-character internal keys are accepted. Set
-`WANDB_PIN_VERSION` to another semantic version, or to an empty string to use
-the container SDK unchanged.
+container driver defaults to `WANDB_PIN_VERSION=0.28.1`, which supports current
+`wandb_v1_...` tokens. Legacy 36-character keys can explicitly select
+`WANDB_PIN_VERSION=0.21.1`. Set it to another semantic version, or to an empty
+string to use the container SDK unchanged.
 
 The data processor emits normal processor-expanded image tensors and tokens.
 NeMo-RL's Megatron data pipeline keeps each chosen/rejected pair in one
