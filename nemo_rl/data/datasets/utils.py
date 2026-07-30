@@ -75,7 +75,7 @@ def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> N
             ), "Found double BOS token in the first two positions of the message."
     else:
         name = getattr(_tok, "name_or_path", str(type(_tok).__name__))
-        print(f"skip assert_start_single_bos since Tokenizer {name} has no BOS token")
+        print(f"skip assert_no_double_bos since Tokenizer {name} has no BOS token")
 
 
 def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
