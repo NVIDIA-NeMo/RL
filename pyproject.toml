@@ -155,8 +155,13 @@ vllm = [
   "nvidia-cutlass-dsl[cu13]==4.5.2",
 ]
 sglang = [
-  "sglang==0.5.12.post1",
-  "sglang-kernel==0.4.2.post2",         # Direct dep for explicit version control
+  # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
+  # begin_weight_update / end_weight_update refit session: quantized weights
+  # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
+  # re-materialized once, after the last bucket lands. No tagged release has
+  # those endpoints, and re-running the finalize per bucket is not idempotent.
+  "sglang",
+  "sglang-kernel==0.4.5",               # Direct dep for explicit version control; required by sglang-miles
   "sglang-router",                      # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
   "kernels>=0.12.0,<0.13",
   "flashinfer-python==0.6.11.post1",
@@ -268,6 +273,7 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
