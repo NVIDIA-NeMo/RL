@@ -34,7 +34,10 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -105,8 +108,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info()
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()

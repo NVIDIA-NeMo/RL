@@ -158,8 +158,26 @@ class VllmConfig(GenerationConfig):
     real_quant_ignore: NotRequired[list[str]]
 
 
+def validate_vllm_quantization_config(config: VllmConfig) -> None:
+    """Reject quantization options that would otherwise be silently ignored."""
+    vllm_cfg = config["vllm_cfg"]
+    refit_prequantize = vllm_cfg.get("refit_prequantize")
+    if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize must be a boolean."
+        )
+    if refit_prequantize and not (
+        vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize requires "
+            "precision='fp8' and is_mx=true."
+        )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
+    validate_vllm_quantization_config(config)
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
         raise ValueError(
             "policy.generation.checkpoint_engine was replaced by "

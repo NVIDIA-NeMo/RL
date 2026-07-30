@@ -37,7 +37,7 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
-from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize, set_seed
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -90,6 +90,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -630,10 +631,7 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info()
-        maybe_enable_refit_prequantize(
-            student_policy, student_generation, state_dict_info, master_config.policy
-        )
+        initialize_refit_metadata(student_policy, student_generation)
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference and checkpoint_engine_config is None:

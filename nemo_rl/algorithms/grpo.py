@@ -54,7 +54,6 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
-    maybe_enable_refit_prequantize,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -128,6 +127,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -1432,11 +1432,10 @@ def setup(
         )
     else:
         if not (nccl_reshard_refit_enabled and not colocated_inference):
-            state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
-                maybe_enable_refit_prequantize(
-                    policy, policy_generation, state_dict_info, master_config.policy
-                )
+                initialize_refit_metadata(policy, policy_generation)
+            else:
+                policy.prepare_refit_info()
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore

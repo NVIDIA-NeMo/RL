@@ -70,15 +70,14 @@ def mxfp8_e4m3_quantize_for_refit(
     the torch reference elsewhere.
     """
     x_q = x_scales = None
-    # Kernel dispatch keys off the TRAINER GPU while the receiver keys off the
-    # inference GPU. On homogeneous clusters both take the same path; on mixed
-    # Hopper/Blackwell clusters the flashinfer and torch paths may differ in
-    # boundary rounding - validate with the parity test before relying on it.
     if x.is_cuda and torch.cuda.get_device_capability(x.device) >= (10, 0):
         try:
             from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
-        except ImportError:
-            pass
+        except ImportError as exc:
+            raise RuntimeError(
+                "Trainer-side MXFP8 refit prequantization on sm100+ requires "
+                "FlashInfer so it matches the vLLM receiver quantization path."
+            ) from exc
         else:
             x_q, x_scales = flashinfer_mxfp8_quantize(
                 x, is_sf_swizzled_layout=False, alignment=32

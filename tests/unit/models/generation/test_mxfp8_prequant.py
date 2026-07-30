@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+
 import pytest
 import torch
 
@@ -73,7 +75,25 @@ def test_last_dim_not_divisible_raises():
         _mxfp8_e4m3_quantize_torch(x)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_blackwell_refit_prequantization_requires_flashinfer(monkeypatch):
+    class FakeBlackwellTensor:
+        is_cuda = True
+        device = "cuda"
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    monkeypatch.setitem(sys.modules, "flashinfer", None)
+
+    with pytest.raises(RuntimeError, match=r"sm100\+ requires FlashInfer"):
+        mxfp8_e4m3_quantize_for_refit(FakeBlackwellTensor())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason=(
+        "requires sm100+; below it both sides fall back to the shared torch "
+        "reference and the comparison is vacuous"
+    ),
+)
 def test_refit_quantize_matches_receiver_path():
     """Bitwise parity with the vLLM receiver path (mxfp8_e4m3_quantize + squeeze)."""
     vllm_mxfp8 = pytest.importorskip(
@@ -82,9 +102,12 @@ def test_refit_quantize_matches_receiver_path():
 
     torch.manual_seed(0)
     x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    x[0].zero_()
 
     ref_lp, ref_scale = vllm_mxfp8.mxfp8_e4m3_quantize(x)
     ref_scale = torch.squeeze(ref_scale, dim=-1)
+    assert torch.any(ref_scale == 0)
+    ref_scale = torch.where(ref_scale == 0, torch.ones_like(ref_scale), ref_scale)
 
     got_lp, got_scale = mxfp8_e4m3_quantize_for_refit(x)
 
@@ -149,3 +172,42 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert got.shape == want.shape, name
         assert got.dtype == want.dtype, name
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), name
+
+
+def test_mxfp8_shuffle_verification_runs_once_per_layer(monkeypatch):
+    fp8 = pytest.importorskip("nemo_rl.models.generation.vllm.quantization.fp8")
+
+    class Layer:
+        pass
+
+    monkeypatch.setenv("NRL_MXFP8_SHUFFLE_VERIFY", "1")
+    fp8.mxfp8_shuffle_verified_layers.clear()
+    tensors = (
+        torch.arange(8, dtype=torch.uint8),
+        torch.arange(8, dtype=torch.uint8),
+        torch.arange(8, dtype=torch.uint8),
+        torch.arange(8, dtype=torch.uint8),
+    )
+    calls = []
+
+    def reference(*args):
+        calls.append(args[0])
+        return tensors
+
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", reference)
+    layers = [Layer(), Layer()]
+    for layer in layers:
+        for _ in range(2):
+            fp8._verify_mxfp8_moe_shuffle(
+                layer,
+                tensors[0],
+                tensors[1],
+                tensors[2],
+                tensors[3],
+                False,
+                128,
+                tensors,
+            )
+
+    assert len(calls) == len(layers)
+    assert all(layer in fp8.mxfp8_shuffle_verified_layers for layer in layers)

@@ -21,6 +21,7 @@ policy:
       gpu_memory_utilization: 0.8
       precision: "fp8"
       is_mx: true
+      refit_prequantize: true
       quantization_ignored_layer_kws:
         - q_proj
         - k_proj

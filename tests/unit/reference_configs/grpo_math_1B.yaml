@@ -371,6 +371,8 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
+      refit_prequantize: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1

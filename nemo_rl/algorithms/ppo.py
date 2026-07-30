@@ -48,7 +48,6 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
-    maybe_enable_refit_prequantize,
     print_performance_metrics,
     set_seed,
 )
@@ -92,6 +91,7 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -660,11 +660,10 @@ def setup(
     policy.prepare_for_training()
 
     # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
-        maybe_enable_refit_prequantize(
-            policy, policy_generation, state_dict_info, master_config.policy
-        )
+        initialize_refit_metadata(policy, policy_generation)
+    else:
+        policy.prepare_refit_info()
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
