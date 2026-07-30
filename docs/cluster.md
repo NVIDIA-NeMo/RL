@@ -150,6 +150,16 @@ sbatch ray.sub \
     allocation or to override detection.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
+* - `CPUS_PER_HEAD`
+  - CPUs the Ray head node claims. Only meaningful with `DEDICATED_RAY_HEAD=1`,
+    where the head may be a different node shape than the workers; otherwise the
+    head is a worker and uses `CPUS_PER_WORKER`. Auto-detected from the head's
+    own component when unset.
+* - `DEDICATED_RAY_HEAD=0`
+  - Set to `1` to run the Ray head as a control-plane-only node that advertises
+    zero GPUs and is excluded from worker-unit accounting. Requires submitting a
+    two-component heterogeneous job (head in component 0, GPU workers in
+    component 1); see [Dedicated Ray head node](#dedicated-ray-head-node).
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `NODE_MANAGER_PORT=1301`
@@ -250,6 +260,44 @@ GPUS_PER_NODE=4
 SEGMENT_SIZE=2     # nodes per NVLink-domain segment; -> sbatch --segment
 ...
 # ===== END CONFIG =====
+```
+
+### Dedicated Ray head node
+
+By default the Ray head is also a compute node: it is the first node of the
+allocation and contributes its GPUs to Ray. Setting `DEDICATED_RAY_HEAD=1` makes
+it control-plane-only — it advertises zero GPUs, is excluded from worker-unit
+accounting, and is skipped by topology-aware placement (it registers no NVLink
+domain, and `select_segment_nodes` ignores such nodes).
+
+This requires a **two-component heterogeneous job**, because a dedicated head
+cannot be expressed in a flat allocation once `--segment` is in play. Slurm
+requires the node count to be divisible by the segment size, and so does
+`cluster.segment_size`; reserving one node out of `N` leaves `N-1` GPU nodes,
+which is never divisible by a segment size greater than 1. Putting the head in
+its own component sidesteps the divisibility constraint entirely, and lets the
+head come from a different (e.g. GPU-free, cheaper) partition than the workers:
+
+```sh
+sbatch \
+  --account=<account> --partition=batch,cpu --nodes=1 --gres=gpu:0 --time=4:0:0 \
+  : \
+  --account=<account> --partition=batch --nodes=64 --segment=8 --gres=gpu:8 \
+  ray.sub
+```
+
+Here component 0 is the head and component 1 is the 64 GPU workers, whose count
+stays divisible by `--segment=8`. `ray.sub` reads each component's own nodelist,
+partition, account, and GRES, so the two halves may differ in every respect.
+Set `DEDICATED_RAY_HEAD=1` in the environment along with the usual variables.
+
+Your recipe's `cluster.num_nodes` should be the **worker** count (64 above), not
+the total allocation size.
+
+```{note}
+Leaving `DEDICATED_RAY_HEAD` unset (the default) preserves the existing behavior
+exactly: a flat allocation whose first node is both the Ray head and a compute
+node.
 ```
 
 ## Kubernetes
