@@ -78,6 +78,7 @@ from nemo_rl.models.megatron.setup import (
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (
+    FullLogitsPostProcessor,
     LogprobsPostProcessor,
     LossPostProcessor,
     TopkLogitsPostProcessor,
@@ -90,7 +91,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    ensure_teacher_ipc_buffer,
+    get_runtime_env_for_policy_worker,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
@@ -292,6 +296,11 @@ class MegatronPolicyWorkerImpl(
         bind_to_gpu_numa(local_rank)
 
         self.cfg = config
+        # Persistent CUDA IPC buffer for cross-tokenizer teacher full logits,
+        # lazily allocated on the first ``get_full_logits_ipc`` call (grown as
+        # needed), reused across calls, and freed via ``release_ipc_buffer``.
+        self._teacher_ipc_storage: Optional[torch.Tensor] = None
+        self._teacher_ipc_handle: Optional[tuple[Any, ...]] = None
         self._router_replay_enabled = router_replay_enabled(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
@@ -550,15 +559,12 @@ class MegatronPolicyWorkerImpl(
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
-        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
-        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
-        student sequence axis). Megatron doesn't run cross-tokenizer, so it
-        must be None.
+        ``check_dim_skip_keys`` names cross-tokenizer ride-along tensors whose
+        dim 1 is NOT the student sequence axis (teacher tokenization / alignment
+        keys); it is forwarded to the microbatch iterator's sequence-dim
+        validation so those keys pass through untouched, matching the v2 DTensor
+        worker.
         """
-        assert check_dim_skip_keys is None, (
-            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
-            "Megatron does not run cross-tokenizer distillation."
-        )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -645,6 +651,7 @@ class MegatronPolicyWorkerImpl(
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                     delegate_pack_to_model=self.delegate_pack_to_model,
+                    skip_keys=check_dim_skip_keys,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1727,6 +1734,154 @@ class MegatronPolicyWorkerImpl(
         return BatchedDataDict.from_batches(
             [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
         )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/get_full_logits_ipc")
+    def get_full_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
+
+        Megatron counterpart of ``DTensorPolicyWorkerV2.get_full_logits_ipc`` for
+        cross-tokenizer distillation. Each microbatch's raw logit shard is
+        written into ``self._teacher_ipc_storage`` and shared through one cached
+        IPC handle. Returns ``{"per_sample_handles": list, "dp_rank": int}``
+        where each handle carries the ``buf_idx`` / ``sample_index_in_buf`` slot
+        index plus the TP/CP shard metadata (``vocab_start_index``,
+        ``global_seq_start``, ...) the loss consumer uses to reassemble the
+        global ``[T_t, V_t]`` teacher logits from the per-rank shards.
+
+        v0 limitations: ``pipeline_model_parallel_size == 1`` and
+        ``context_parallel_size == 1`` (asserted here); no sequence packing
+        (enforced by :class:`FullLogitsPostProcessor`).
+        """
+        assert parallel_state.get_pipeline_model_parallel_world_size() == 1, (
+            "get_full_logits_ipc requires pipeline_model_parallel_size == 1: the "
+            "IPC producer exports the last-stage GPU shards directly, which is "
+            "only node-local-safe at PP=1."
+        )
+        assert parallel_state.get_context_parallel_world_size() == 1, (
+            "get_full_logits_ipc requires context_parallel_size == 1 (v0)."
+        )
+
+        forward_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        self.model.eval()
+
+        (
+            mb_iterator,
+            num_microbatches,
+            forward_mbs,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            forward_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+        )
+
+        list_of_outputs = megatron_forward_backward(
+            model=self.model,
+            data_iterator=mb_iterator,
+            seq_length=padded_seq_length,
+            mbs=forward_mbs,
+            num_microbatches=num_microbatches,
+            post_processing_fn=FullLogitsPostProcessor(cfg=self.cfg),
+            forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=None,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        world_rank = torch.distributed.get_rank()
+        # CP == 1 (asserted above): the whole padded teacher sequence is local.
+        cp_rank = 0
+        cp_size = 1
+        target_local_seq = padded_seq_length
+        global_seq_start = 0
+        full_seq_len = target_local_seq
+
+        per_sample_handles: list[dict[str, Any]] = []
+        for buf_idx, out in enumerate(list_of_outputs):
+            vals = out["full_logits"]  # [B_mb, S, V_local] fp32
+            # Pad the seq dim to the canonical length so the cached IPC handle
+            # stays shape-stable across microbatches (mirrors the DTensor path).
+            pad_needed = target_local_seq - vals.shape[1]
+            if pad_needed > 0:
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+            batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
+
+            self._teacher_ipc_storage, self._teacher_ipc_handle = (
+                ensure_teacher_ipc_buffer(
+                    self._teacher_ipc_storage,
+                    self._teacher_ipc_handle,
+                    num_microbatches,
+                    batch_size_mb,
+                    target_local_seq,
+                    local_vocab_size,
+                    vals.dtype,
+                    vals.device,
+                )
+            )
+            storage = self._teacher_ipc_storage
+            payload_ipc = self._teacher_ipc_handle
+            storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(vals)
+            del vals
+
+            full_vocab_size = local_vocab_size * tp_size
+            vocab_start_index = tp_rank * local_vocab_size
+            vocab_end_index = (tp_rank + 1) * local_vocab_size
+            for sample_index_in_buf in range(batch_size_mb):
+                per_sample_handles.append(
+                    {
+                        "payload_ipc": payload_ipc,
+                        "buf_idx": buf_idx,
+                        "sample_index_in_buf": sample_index_in_buf,
+                        "storage_shape": tuple(storage.shape),
+                        "actual_shape": (target_local_seq, local_vocab_size),
+                        "dtype": storage.dtype,
+                        "tp_rank": tp_rank,
+                        "cp_rank": cp_rank,
+                        "tp_size": tp_size,
+                        "cp_size": cp_size,
+                        "world_rank": world_rank,
+                        "vocab_start_index": vocab_start_index,
+                        "vocab_end_index": vocab_end_index,
+                        "global_seq_start": global_seq_start,
+                        "full_vocab_size": full_vocab_size,
+                        "full_seq_len": full_seq_len,
+                        "vocab_sharded": tp_size > 1,
+                        "sequence_sharded": cp_size > 1,
+                    }
+                )
+        # Force the async copies above to complete before the IPC handles are
+        # consumed by the student process, so the consumer can't observe a
+        # partially written buffer.
+        torch.cuda.synchronize()
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
+    def release_ipc_buffer(self) -> None:
+        """Free the persistent teacher-logit IPC storage.
+
+        Called once at the end of training / validation (and on error) by the
+        driver, not per call.
+        """
+        self._teacher_ipc_storage = None
+        self._teacher_ipc_handle = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")

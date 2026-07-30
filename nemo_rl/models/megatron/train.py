@@ -67,6 +67,7 @@ PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
+    "FullLogitsPostProcessor",
 ]
 
 
@@ -283,6 +284,11 @@ def forward_with_post_processing_fn(
             cu_seqlens_padded=cu_seqlens_padded,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(
+            data_dict=data_dict,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+    elif isinstance(post_processing_fn, FullLogitsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
@@ -757,6 +763,60 @@ class TopkLogitsPostProcessor:
                     "topk_logits": topk_vals_full,
                     "topk_indices": topk_idx_full,
                 }
+
+        return processor_fn_inner
+
+
+class FullLogitsPostProcessor:
+    """Export this rank's raw teacher logits (full local vocab shard, no reduction).
+
+    Cross-tokenizer distillation ships the teacher's full-vocab logits to the
+    student and does all vocab reduction student-side, so each tensor-parallel
+    rank emits its local vocab shard untouched (fp32). The IPC consumer
+    reassembles the global ``[B, T_t, V_t]`` from the per-rank shards. This is
+    the Megatron counterpart of the DTensor ``FullLogitsPostProcessor``.
+
+    v0 limitations (asserted at call time): sequence packing is unsupported and
+    ``context_parallel_size`` must be 1.
+    """
+
+    def __init__(self, cfg: PolicyConfig):
+        self.cfg = cfg
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+        cu_seqlens_padded: torch.Tensor,
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Create a post-processing function that emits raw full-vocab logit shards.
+
+        Args:
+            data_dict: Batched data dictionary.
+            cu_seqlens_padded: Cumulative padded sequence lengths (unused; the v0
+                path forbids sequence packing).
+
+        Returns:
+            Callable that maps the model output tensor to
+            ``(dummy_loss, {"full_logits": local_vocab_shard})`` where the shard
+            is ``[B, S, V_local]`` in fp32.
+        """
+        if self.cfg["sequence_packing"]["enabled"]:
+            raise NotImplementedError(
+                "FullLogitsPostProcessor does not support sequence packing (v0)."
+            )
+        if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
+            raise NotImplementedError(
+                "FullLogitsPostProcessor does not support context parallelism "
+                "(context_parallel_size > 1) yet (v0)."
+            )
+
+        def processor_fn_inner(output_tensor):
+            # fp32 for the consumer's precision-sensitive log_softmax / projection
+            # (KL math) and a dtype-consistent IPC buffer producer<->consumer. No
+            # vocab reduction: the local TP shard is emitted as-is and the student
+            # reassembles the full vocab.
+            logits = output_tensor.to(torch.float32)
+            return output_tensor.new_zeros(()), {"full_logits": logits}
 
         return processor_fn_inner
 

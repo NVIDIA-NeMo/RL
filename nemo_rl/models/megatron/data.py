@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Optional, Tuple
 
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -148,6 +148,7 @@ def get_microbatch_iterator(
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
     delegate_pack_to_model: bool = False,
+    skip_keys: Optional[Iterable[str]] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -160,6 +161,9 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        skip_keys: Keys whose dim 1 is NOT the sequence axis and must be exempt
+            from the sequence-dim validation (e.g. cross-tokenizer ride-along
+            tensors). Forwarded to ``get_and_validate_seqlen``.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -174,7 +178,7 @@ def get_microbatch_iterator(
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
 
-    _, seq_dim_size = get_and_validate_seqlen(data)
+    _, seq_dim_size = get_and_validate_seqlen(data, skip_keys=skip_keys)
 
     # Auto-detect seq_length_key if not provided
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
@@ -1250,11 +1254,21 @@ def _unpack_sequences_from_megatron(
     return unpacked_output
 
 
-def get_and_validate_seqlen(data: BatchedDataDict[Any]):
-    # dim 1 is always assumed to be the sequence dim, sanity check this here
+def get_and_validate_seqlen(
+    data: BatchedDataDict[Any],
+    skip_keys: Optional[Iterable[str]] = None,
+):
+    # dim 1 is always assumed to be the sequence dim, sanity check this here.
+    # ``skip_keys`` exempts ride-along tensors whose dim 1 is NOT the student
+    # sequence axis (e.g. cross-tokenizer teacher/alignment keys, whose dim 1 is
+    # the teacher seq / max_pairs axis); mirrors ``check_sequence_dim(...,
+    # skip_keys=...)`` on the DTensor worker.
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
+    skip = set(skip_keys) if skip_keys is not None else set()
     for k, v in data.items():
+        if k in skip:
+            continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape} for key {k}"
