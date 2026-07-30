@@ -1876,8 +1876,8 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
     master_config = mock_grpo_components["master_config"]
     master_config.cluster["num_nodes"] = 3
     master_config.cluster["gpus_per_node"] = 4
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["batch_multiplier"] = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
     master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
         {
             "enabled": True,
