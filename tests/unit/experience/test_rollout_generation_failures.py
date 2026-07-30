@@ -434,6 +434,56 @@ class TestDeadlineHelper:
         asyncio.run(_main())
 
 
+def _gym_rows(count: int) -> list[dict]:
+    """Rows shaped the way _build_inputs stamps them: each carries its own index."""
+    return [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(count)]
+
+
+class _PartialGymMethod:
+    """Gym stream that fails partway through, then succeeds on re-dispatch.
+
+    Reproduces the shape that matters: NeMo-Gym's stream dies on its first failing row,
+    so every later row is lost with it even though nothing was wrong with them.
+    """
+
+    def __init__(self, fail_after_rows: int, failures_before_success: int) -> None:
+        self._fail_after_rows = fail_after_rows
+        self._failures_before_success = failures_before_success
+        self.attempts = 0
+        self.dispatched: list[list[int]] = []
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, tokenizer, timer_prefix):
+        del tokenizer, timer_prefix
+        self.dispatched.append([row["_rowidx"] for row in inputs])
+        attempt = self.attempts
+        self.attempts += 1
+        return self._stream(inputs, attempt)
+
+    async def _stream(self, inputs, attempt):
+        should_fail = attempt < self._failures_before_success
+        for position, row in enumerate(inputs):
+            if should_fail and position >= self._fail_after_rows:
+                raise ConnectionResetError("gym stream died mid-flight")
+            yield _row_result(row["_rowidx"])
+
+
+async def _row_result(rowidx: int):
+    """A minimally complete NeMo-Gym result, enough to build a Completion."""
+    return (
+        rowidx,
+        {
+            "input_message_log": [{"role": "user", "token_ids": [1]}],
+            "message_log": [{"role": "assistant", "token_ids": [2]}],
+            "full_result": {"reward": 1.0},
+        },
+        None,
+    )
+
+
 class _FakeGymMethod:
     """Mimics `env.run_rollouts.options(...).remote(...)` returning a result stream."""
 
@@ -464,7 +514,7 @@ class _FakeGymMethod:
                 raise
 
 
-def _make_gym_impl(gym_method, *, num_generations=2, timeouts=None):
+def _make_gym_impl(gym_method, *, num_generations=2, timeouts=None, row_attempts=1):
     from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
     impl = object.__new__(AsyncNemoGymRolloutImpl)
@@ -474,6 +524,9 @@ def _make_gym_impl(gym_method, *, num_generations=2, timeouts=None):
     impl._max_seq_len = 128
     impl._max_rollout_turns = 1
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+    impl._max_gym_row_attempts = row_attempts
+    # Upstream default; this fixture is about re-dispatch, not sample masking.
+    impl._mask_env_flagged_samples = True
     return impl
 
 
@@ -489,7 +542,7 @@ class TestGymRolloutDeadline:
         method = _FakeGymMethod(rows_to_yield=0, hang_after=True)
         impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.05))
         with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
-            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
         assert method.cancelled == 1, "the hung stream must be cancelled"
 
     def test_the_deadline_spans_the_whole_stream_not_each_row(self):
@@ -501,14 +554,14 @@ class TestGymRolloutDeadline:
         method = _FakeGymMethod(rows_to_yield=1, hang_after=True)
         impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.05))
         with pytest.raises(RolloutTimeout):
-            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
 
     def test_a_truncated_stream_is_an_infra_failure_not_a_bare_runtime_error(self):
         """Rows going missing is a transport problem, so it must be retriable."""
         method = _FakeGymMethod(rows_to_yield=1, hang_after=False)
         impl = _make_gym_impl(method)
         with pytest.raises(GymTransportError, match=r"missing rows \[1\] of 2"):
-            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
 
     def test_no_deadline_configured_leaves_the_stream_unbounded(self):
         """Default config must not introduce a deadline where there was none."""
@@ -516,7 +569,113 @@ class TestGymRolloutDeadline:
         impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=None))
         # Reaches the missing-rows check rather than timing out first.
         with pytest.raises(GymTransportError):
-            asyncio.run(impl._run_rollouts([{}, {}], Timer(), "timing/rollout"))
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+
+class TestPartialGymRedispatch:
+    """Only the rows that never arrived are re-sent.
+
+    At num_generations_per_prompt=16, one bad row killing the stream costs 16
+    regenerations if the whole group is redone. It should cost the rows that were lost.
+    """
+
+    def test_only_the_missing_rows_are_re_dispatched(self):
+        # Rows 0-1 land, then the stream dies; the retry should carry rows 2-3 only.
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout")
+        )
+
+        assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
+        assert len(completions) == 4
+
+    def test_completed_rows_survive_across_attempts(self):
+        """The point of the exercise: work already done is not thrown away.
+
+        Attempt 1 lands rows 0-2 before the stream dies. Only 3-4 are re-sent, and the
+        group finishes there -- 7 row-generations instead of the 10 a whole-group retry
+        would have cost.
+        """
+        method = _PartialGymMethod(fail_after_rows=3, failures_before_success=2)
+        impl = _make_gym_impl(method, num_generations=5, row_attempts=3)
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(_gym_rows(5), Timer(), "timing/rollout")
+        )
+
+        assert method.dispatched == [[0, 1, 2, 3, 4], [3, 4]]
+        assert len(completions) == 5
+        assert sum(len(d) for d in method.dispatched) == 7
+
+    def test_exhausting_the_row_budget_reports_a_transport_failure(self):
+        method = _PartialGymMethod(fail_after_rows=1, failures_before_success=99)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=2)
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+        assert method.attempts == 2, "the budget bounds the re-dispatches"
+
+    def test_a_data_failure_is_not_re_dispatched(self):
+        """Another dispatch cannot help a prompt NeMo-Gym is unable to serve."""
+
+        class _DataFailingMethod(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                del attempt
+                yield _row_result(inputs[0]["_rowidx"])
+                raise ValueError("NeMo Gym returned a result with no generation data")
+
+        method = _DataFailingMethod(fail_after_rows=1, failures_before_success=99)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=5)
+
+        with pytest.raises(ValueError, match="no generation data"):
+            asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+        assert method.attempts == 1, "a deterministic failure must not be retried"
+
+    def test_a_single_attempt_budget_reproduces_the_old_behaviour(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=1)
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+        assert method.attempts == 1
+
+    def test_rows_must_carry_their_own_index(self):
+        """Re-dispatch maps Gym's echoed _rowidx back onto the group, so this is a contract."""
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+
+        with pytest.raises(ValueError, match="must be stamped with their own position"):
+            asyncio.run(
+                impl._run_rollouts(
+                    [{"agent_ref": {"name": "a"}}], Timer(), "timing/rollout"
+                )
+            )
+
+    def test_the_group_deadline_spans_re_dispatches(self):
+        """The budget belongs to the prompt group, not to each attempt.
+
+        Otherwise N attempts silently multiply rollout_timeout_s by N.
+        """
+
+        class _SlowThenHang(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    yield _row_result(inputs[0]["_rowidx"])
+                    raise ConnectionResetError("died")
+                await asyncio.Event().wait()
+                yield _row_result(inputs[0]["_rowidx"])  # pragma: no cover
+
+        method = _SlowThenHang(fail_after_rows=1, failures_before_success=1)
+        impl = _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=5,
+            timeouts=RolloutTimeouts(rollout_s=0.1),
+        )
+        with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
 
 
 class TestClassifyGenerationFailure:

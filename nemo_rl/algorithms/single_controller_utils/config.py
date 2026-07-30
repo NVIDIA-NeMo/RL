@@ -67,6 +67,11 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # Only with on_data_exhausted="skip": distinct prompts that may be skipped before
     # the run fails anyway.
     max_skipped_prompts: NonNegativeInt = 0
+    # NeMo-Gym only. Attempts to re-dispatch just the rows that never arrived, before
+    # falling back to retrying the whole prompt group. Gym's stream dies on its first
+    # failing row, so one bad row takes every later row with it; recovering those
+    # individually is much cheaper than redoing all num_generations_per_prompt of them.
+    max_gym_row_attempts: PositiveInt = 3
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "RolloutFailureConfig":

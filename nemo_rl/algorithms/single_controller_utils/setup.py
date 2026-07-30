@@ -51,9 +51,7 @@ from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutTimeouts
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
 from nemo_rl.experience.rollout_manager import (
-    RolloutManager,
     RolloutRetryPolicy,
-    RolloutTimeouts,
 )
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
@@ -276,6 +274,7 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
         max_backoff_s=failure_config.max_backoff_s,
         skip_on_data_exhausted=failure_config.on_data_exhausted == "skip",
         max_skipped_prompts=failure_config.max_skipped_prompts,
+        max_gym_row_attempts=failure_config.max_gym_row_attempts,
     )
 
 

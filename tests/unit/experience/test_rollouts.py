@@ -1392,8 +1392,9 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
-    # These tests cover stream ordering/dedup, not deadlines.
+    # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
@@ -1407,8 +1408,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
             inputs=[
-                {"agent_ref": {"name": "agent"}},
-                {"agent_ref": {"name": "agent"}},
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
             ],
             timer=rollouts_mod.Timer(),
             timer_prefix="timing/test",
@@ -1464,8 +1465,9 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
-    # These tests cover stream ordering/dedup, not deadlines.
+    # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
@@ -1475,8 +1477,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         asyncio.run(
             manager._run_rollouts(
                 inputs=[
-                    {"agent_ref": {"name": "agent"}},
-                    {"agent_ref": {"name": "agent"}},
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
                 ],
                 timer=rollouts_mod.Timer(),
                 timer_prefix="timing/test",

@@ -41,6 +41,10 @@ async_rl:
     max_backoff_s: 30.0
     on_data_exhausted: fail_fast      # fail_fast | skip
     max_skipped_prompts: 0            # required >= 1 when on_data_exhausted=skip
+    # NeMo-Gym only: re-send just the rows that never arrived before retrying the
+    # whole group. Gym's stream dies on its first failing row, so one bad row loses
+    # every later one; recovering those individually beats redoing all N.
+    max_gym_row_attempts: 3
 
   # Last-resort stall detection. stall_timeout_s must exceed both interval_s and
   # rollout_timeout_s, so a merely-slow rollout is not reported as a stall.

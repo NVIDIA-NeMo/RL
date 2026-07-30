@@ -85,15 +85,23 @@ class RolloutRetryPolicy:
     skip_on_data_exhausted: bool = False
     # Run-wide cap on skipped prompts, enforced across every generate_and_push call.
     max_skipped_prompts: int = 0
+    # Attempts to re-dispatch only the NeMo-Gym rows that never arrived, before the
+    # whole prompt group is retried. 1 means no row-level retry.
+    max_gym_row_attempts: int = 1
 
     def __post_init__(self) -> None:
         # A zero budget would mean "never attempt the rollout at all", which no caller
         # wants and which would leave the retry loop with nothing to report.
-        if self.max_infra_attempts < 1 or self.max_data_attempts < 1:
+        if (
+            self.max_infra_attempts < 1
+            or self.max_data_attempts < 1
+            or self.max_gym_row_attempts < 1
+        ):
             raise ValueError(
                 "RolloutRetryPolicy attempt budgets must be >= 1; got "
                 f"max_infra_attempts={self.max_infra_attempts}, "
-                f"max_data_attempts={self.max_data_attempts}"
+                f"max_data_attempts={self.max_data_attempts}, "
+                f"max_gym_row_attempts={self.max_gym_row_attempts}"
             )
 
     def backoff_for(self, attempt: int) -> float:
@@ -631,8 +639,9 @@ class AsyncNemoGymRolloutImpl:
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
         # Optional so direct construction does not have to carry the resiliency wiring;
-        # RolloutManager always passes it explicitly.
+        # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
+        retry_policy: Optional[RolloutRetryPolicy] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -643,6 +652,9 @@ class AsyncNemoGymRolloutImpl:
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+        self._max_gym_row_attempts = (
+            retry_policy if retry_policy is not None else RolloutRetryPolicy()
+        ).max_gym_row_attempts
 
         self._validate_init_params()
 
@@ -718,44 +730,121 @@ class AsyncNemoGymRolloutImpl:
             rows.append(row)
         return rows
 
+    async def _stream_rows(
+        self,
+        nemo_gym_env: Any,
+        pending: list[dict],
+        results: list[Optional[dict]],
+        total_rows: int,
+        timer_prefix: str,
+    ) -> Optional[dict[str, Any]]:
+        """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
+
+        Args:
+            nemo_gym_env: The NeMo-Gym environment actor handle.
+            pending: Rows still awaiting a result; each carries its original ``_rowidx``.
+            results: Full-length result list, mutated in place.
+            total_rows: Size of the original prompt group, used to validate row indices.
+            timer_prefix: Timer namespace forwarded to the environment.
+
+        Returns:
+            The environment's timing metrics, or None if the stream ended without them.
+        """
+        dispatched = {row["_rowidx"] for row in pending}
+        received: set[int] = set()
+        env_timing_metrics: Optional[dict[str, Any]] = None
+
+        async for result_ref in nemo_gym_env.run_rollouts.options(
+            num_returns="streaming"
+        ).remote(pending, self._tokenizer, timer_prefix):
+            rowidx, result, timing_metrics = await result_ref
+            # Validated against the original group, not the pending subset: on a
+            # re-dispatch the row keeps its original index so results stay ordered.
+            if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
+                raise ValueError(
+                    f"NeMo-Gym returned invalid row index {rowidx!r} for "
+                    f"{total_rows} inputs"
+                )
+            if rowidx not in dispatched:
+                raise ValueError(
+                    f"NeMo-Gym returned row index {rowidx}, which was not dispatched "
+                    f"in this attempt ({sorted(dispatched)})"
+                )
+            if rowidx in received:
+                raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
+            received.add(rowidx)
+            results[rowidx] = result
+            if timing_metrics is not None:
+                env_timing_metrics = timing_metrics
+
+        return env_timing_metrics
+
     async def _run_rollouts(
         self, inputs: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
-        """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
+        """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
+
+        Rows that never arrive are re-dispatched on their own rather than by redoing the
+        whole group. NeMo-Gym's stream dies on the first failing row, so one bad row
+        takes every later row with it; at num_generations_per_prompt=16 a naive whole
+        group retry pays 16 generations to recover one. Completed rows are kept across
+        attempts, which is the same shape as the legacy collector's pending-group retry.
+        """
         nemo_gym_env = self._task_to_env["nemo_gym"]
+        total_rows = len(inputs)
+        # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
+        # the rows must carry the index _build_inputs stamped on them. Checked here
+        # because the alternative is a KeyError several frames deeper.
+        for position, row in enumerate(inputs):
+            if row.get("_rowidx") != position:
+                raise ValueError(
+                    f"NeMo-Gym input row {position} carries _rowidx="
+                    f"{row.get('_rowidx')!r}; rows must be stamped with their own "
+                    "position for re-dispatch to preserve ordering"
+                )
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results: list[dict | None] = [None for _ in inputs]
-            received_row_indices: set[int] = set()
             env_timing_metrics: dict[str, Any] = {}
-            # The deadline spans the whole stream rather than each await: NeMo-Gym
-            # yields rows as they finish, so a per-await budget would reset every time
-            # a fast row landed and never fire for the slow one holding the group up.
+            # One deadline for the whole prompt group, re-dispatches included -- it is
+            # the group that has a budget, not each attempt. It also spans the stream
+            # rather than each await: NeMo-Gym yields rows as they finish, so a
+            # per-await budget would reset every time a fast row landed and never fire
+            # for the slow one holding the group up.
             async with _Deadline(self._timeouts.rollout_s, "NeMo-Gym prompt group"):
-                async for result_ref in nemo_gym_env.run_rollouts.options(
-                    num_returns="streaming"
-                ).remote(inputs, self._tokenizer, timer_prefix):
-                    rowidx, result, timing_metrics = await result_ref
-                    if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
-                        raise ValueError(
-                            f"NeMo-Gym returned invalid row index {rowidx!r} for "
-                            f"{len(inputs)} inputs"
+                for attempt in range(1, self._max_gym_row_attempts + 1):
+                    pending = [row for row in inputs if results[row["_rowidx"]] is None]
+                    if not pending:
+                        break
+                    if attempt > 1:
+                        print(
+                            f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
+                            f"row(s) (attempt {attempt}/{self._max_gym_row_attempts})",
+                            flush=True,
                         )
-                    if rowidx in received_row_indices:
-                        raise ValueError(
-                            f"NeMo-Gym returned duplicate row index {rowidx}"
+                    try:
+                        timing_metrics = await self._stream_rows(
+                            nemo_gym_env, pending, results, total_rows, timer_prefix
                         )
-                    received_row_indices.add(rowidx)
-                    results[rowidx] = result
-                    if timing_metrics is not None:
-                        env_timing_metrics = timing_metrics
+                    except Exception as error:
+                        # Only transport-shaped failures are worth another dispatch; a
+                        # prompt NeMo-Gym cannot serve fails the same way every time.
+                        if (
+                            classify_rollout_failure(error) is not FailureClass.INFRA
+                            or attempt == self._max_gym_row_attempts
+                        ):
+                            raise
+                    else:
+                        if timing_metrics is not None:
+                            env_timing_metrics = timing_metrics
 
-            if any(result is None for result in results):
-                missing = sorted(set(range(len(inputs))) - received_row_indices)
+            missing = [i for i, result in enumerate(results) if result is None]
+            if missing:
                 raise GymTransportError(
                     "NeMo-Gym rollout stream ended before all rows arrived; missing "
-                    f"rows {missing} of {len(inputs)}"
+                    f"rows {missing} of {total_rows} after "
+                    f"{self._max_gym_row_attempts} attempt(s)"
                 )
 
             completed_results = [result for result in results if result is not None]
@@ -904,6 +993,11 @@ class RolloutManager:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
+        # budget out of it at construction time.
+        self._retry_policy = (
+            retry_policy if retry_policy is not None else RolloutRetryPolicy()
+        )
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -929,14 +1023,13 @@ class RolloutManager:
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),
+            # Only the NeMo-Gym impl reads this; the native impl absorbs it via kwargs.
+            retry_policy=self._retry_policy,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
-        self._retry_policy = (
-            retry_policy if retry_policy is not None else RolloutRetryPolicy()
-        )
         self._stats = RolloutStats()
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
