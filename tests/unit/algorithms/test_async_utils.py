@@ -1040,22 +1040,18 @@ class TestReplayBuffer:
         ray.kill(buffer2)
 
     def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose the async-GRPO resume deadlock.
+        """Restoring at step N leaves target N complete and target N+1 absent.
 
-        After PR #2651 introduced replay-buffer checkpointing, resuming from a
-        checkpoint where target N is complete but target N+1 is absent caused an
-        async-GRPO deadlock:
+        This is a normal, safe resume state: the collector's target window
+        includes N+1, so it fills the lookahead while training runs step N.
 
-          1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
-          2. Training consumes all target-N trajectories and triggers a refit.
-          3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
-          4. Training waits for target N+1, which nobody generates — stall forever.
-
-        The fix is a startup pipeline barrier: before breaking, also require
-        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
-        constructs the exact precondition state — current step complete, lookahead
-        absent — to ensure it remains detectable and to document the expected
-        buffer readiness values that the barrier logic branches on.
+        This test only pins the buffer readiness values after a restore. It is
+        NOT a regression guard for the orphaned-target deadlock — it touches no
+        collector logic and passes regardless of the target-window behaviour.
+        The guards for that live in
+        ``TestAsyncTrajectoryCollector.test_target_window_includes_current_weight_version``
+        and
+        ``TestAsyncTrajectoryCollector.test_incomplete_target_is_reservable_after_refit_advances_onto_it``.
         """
         num_prompts = 8
         resume_step = 30
@@ -1086,17 +1082,15 @@ class TestReplayBuffer:
             )
         )
 
-        # Step 30 is complete — this is what makes the broken startup return early.
+        # Step 30 is complete, so startup can enter the training loop at once.
         assert ray.get(
             buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
         ), "target step must be complete after restore"
 
-        # Step 31 is absent — this is the deadlock precondition.
-        # The startup pipeline barrier must detect this and continue waiting
-        # instead of breaking, giving the collector time to generate step 31.
+        # Step 31 is absent; the collector fills it while step 30 trains.
         assert not ray.get(
             buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
-        ), "lookahead step must be absent; barrier should block here"
+        ), "lookahead step must be absent after a restore at step 30"
 
         ray.kill(buffer2)
 
@@ -1365,32 +1359,6 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
-    def test_calculate_target_weights(self):
-        """Test target weight calculation logic."""
-        buffer = ReplayBuffer.remote(max_size=10)
-        mock_generation = MockGenerationInterface()
-        mock_tokenizer = mock.MagicMock()
-        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
-        task_to_env = {"test": mock_env}
-        master_config = self.create_mock_config()
-
-        collector = AsyncTrajectoryCollector.remote(
-            policy_generation=mock_generation,
-            tokenizer=mock_tokenizer,
-            task_to_env=task_to_env,
-            master_config=master_config,
-            replay_buffer=buffer,
-            start_step=0,
-        )
-
-        # Test target weight calculation with different scenarios
-        # Note: We can't directly test the private method, but we can test its effects
-        # through the public interface behavior
-
-        ray.kill(collector)
-        ray.kill(buffer)
-        ray.kill(mock_env)
-
     def test_release_target_is_idempotent(self):
         """A batch worker can safely release its target exactly once."""
         collector = self.create_local_collector()
@@ -1401,6 +1369,234 @@ class TestAsyncTrajectoryCollector:
         collector._release_target(target_weight)
 
         assert target_weight not in collector._generating_targets
+
+    def test_target_window_includes_current_weight_version(self):
+        """The target window starts at the current version, not the next one.
+
+        Excluding the current version is what strands a target that was not
+        completed before the refit that advanced onto it: the window moves past
+        it and nothing can ever gap-fill it again.
+        """
+        collector = self.create_local_collector()
+        max_age = collector.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+
+        for version in (0, 1, 7):
+            window = collector._calculate_target_weights(version)
+            assert window == list(range(version, version + max_age + 1))
+            assert version in window, (
+                "current version must be targetable so an incomplete target can "
+                "be gap-filled at age 0 after the refit that advanced onto it"
+            )
+
+    def test_incomplete_target_is_reservable_after_refit_advances_onto_it(
+        self, monkeypatch
+    ):
+        """Regression: a partially filled target must not be orphaned by a refit.
+
+        A batch worker releases its reservation whether or not it buffered every
+        prompt group, so target W+1 can be left incomplete and unreserved. If the
+        refit to W+1 lands before it is gap-filled, the collector must still be
+        able to reserve W+1 -- otherwise training stalls on it forever with no
+        error. Before the fix the post-refit window was [W+2, ...] and this
+        returned W+2, permanently skipping W+1.
+        """
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        orphan_target = 6
+
+        class RemoteValue:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            """Target 6 is half filled; every later target is untouched."""
+
+            def __init__(self):
+                # Training consumed target 5, so the watermark sits at 5.
+                self.get_last_target_weight_already_generated = RemoteValue(
+                    orphan_target - 1
+                )
+                # Target 6 still needs one group; later targets are untouched.
+                self.get_trajectories_needed = SimpleNamespace(
+                    remote=lambda target, num, max_age: 1
+                    if target == orphan_target
+                    else num
+                )
+
+        buffer = FakeReplayBuffer()
+
+        collector = self.create_local_collector(replay_buffer=buffer)
+
+        # The refit already advanced the collector onto the orphaned target.
+        reserved = collector._get_next_target_for_generation(orphan_target)
+
+        assert reserved == orphan_target, (
+            f"expected the incomplete target {orphan_target} to be reserved for "
+            f"gap-filling, got {reserved}"
+        )
+        assert orphan_target in collector._generating_targets
+
+    def test_consumed_target_is_not_regenerated_when_consumed_mid_query(
+        self, monkeypatch
+    ):
+        """Regression: a target consumed between the two buffer queries is skipped.
+
+        ``_get_next_target_for_generation`` reads the consumed-target watermark
+        and the per-target deficit in two separate calls. Training can consume
+        the target in between, leaving the collector looking at an empty target
+        it must not refill: ``sample`` only accepts trajectories whose target
+        equals the current training step, so anything generated for a consumed
+        target is unusable and merely burns a rollout batch and buffer space.
+        ``get_trajectories_needed`` resolves the watermark under the buffer lock
+        so this interleaving cannot be observed.
+        """
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        num_prompts = 2
+        consumed_target = 6
+
+        buffer = ReplayBufferImpl(max_size=20)
+        # Target 6 is complete and about to be consumed; target 7 is untouched.
+        for _ in range(num_prompts):
+            buffer.add(
+                {"batch": {"data": "x"}, "rollout_metrics": {}},
+                weight_version=consumed_target - 1,
+                target_weight_version=consumed_target,
+            )
+
+        collector = self.create_local_collector(replay_buffer=buffer)
+
+        # Stale watermark: read before training consumed target 6.
+        collector.replay_buffer = SimpleNamespace(
+            get_last_target_weight_already_generated=SimpleNamespace(
+                remote=lambda: consumed_target - 1
+            ),
+            get_trajectories_needed=SimpleNamespace(
+                remote=buffer.get_trajectories_needed
+            ),
+        )
+
+        # Training consumes target 6, advancing the watermark to 6.
+        assert buffer.sample(num_prompts, consumed_target, 1) is not None
+        assert buffer.get_last_target_weight_already_generated() == consumed_target
+
+        reserved = collector._get_next_target_for_generation(consumed_target)
+
+        assert reserved != consumed_target, (
+            "must not regenerate a target training already consumed"
+        )
+        assert consumed_target not in collector._generating_targets
+
+    def test_persistent_batch_failures_stop_collection(self):
+        """Repeated terminal batch failures must reach the driver, not starve it.
+
+        A failed batch releases its target and is silently refilled from a fresh
+        dataloader batch, substituting different prompts. That is acceptable
+        once, but a persistent fault would otherwise consume the dataset forever
+        while training waits, with no error surfaced anywhere.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+
+        async def always_fails(**kwargs):
+            raise RuntimeError("rollout backend exploded")
+
+        collector._collect_rollout_batch = always_fails
+
+        limit = trajectory_collector_mod._MAX_CONSECUTIVE_BATCH_FAILURES
+        for _ in range(limit - 1):
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=mock.MagicMock(),
+                    generation_weight_version=0,
+                    target_weight_version=1,
+                    num_generations=1,
+                    use_nemo_gym=False,
+                )
+            )
+
+        assert collector.running, "a transient failure must not stop collection"
+        assert not collector.collection_failed
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=mock.MagicMock(),
+                generation_weight_version=0,
+                target_weight_version=1,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector.collection_failed, (
+            "persistent batch failures must mark the collector failed"
+        )
+        assert not collector.running
+        status = collector.get_status()
+        assert status["errored"] is True
+        assert "rollout backend exploded" in status["last_batch_error"], (
+            "the driver's error must carry the originating failure"
+        )
+
+    def test_batch_failure_counter_resets_on_success(self):
+        """A successful batch clears the consecutive-failure count."""
+        collector = self.create_local_collector()
+        collector.running = True
+
+        async def fails(**kwargs):
+            raise RuntimeError("transient")
+
+        async def succeeds(**kwargs):
+            return None
+
+        collector._collect_rollout_batch = fails
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=mock.MagicMock(),
+                generation_weight_version=0,
+                target_weight_version=1,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+        assert collector._consecutive_batch_failures == 1
+
+        collector._collect_rollout_batch = succeeds
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=mock.MagicMock(),
+                generation_weight_version=0,
+                target_weight_version=1,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector._consecutive_batch_failures == 0
+        assert collector.running
+        assert not collector.collection_failed
+
+    def test_release_target_wakes_parked_collection_loop(self):
+        """Releasing a reservation must wake the loop parked on generation limits.
+
+        The loop parks on ``_generation_limit_cleared`` once every target in the
+        window is reserved. That event is otherwise only set by a weight update,
+        which only happens after a training step -- and the training step is
+        exactly what is blocked when a released target was left incomplete.
+        """
+        collector = self.create_local_collector()
+        target_weight = 4
+
+        collector._generating_targets.add(target_weight)
+        collector._generation_limit_cleared.clear()
+
+        collector._release_target(target_weight)
+
+        assert collector._generation_limit_cleared.is_set(), (
+            "a released reservation must wake the collection loop so it can "
+            "re-evaluate targets at the current weight version"
+        )
 
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""

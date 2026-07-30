@@ -47,6 +47,11 @@ from nemo_rl.utils.timer import ThreadSafeTimer
 TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
+# Consecutive terminal batch-worker failures tolerated before the collector
+# gives up and lets the driver raise. Each failure silently substitutes fresh
+# prompts for the failed ones via gap-filling, so this bounds how long a
+# persistent fault can burn through the dataset while training starves.
+_MAX_CONSECUTIVE_BATCH_FAILURES = 3
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
@@ -92,6 +97,15 @@ class AsyncTrajectoryCollector:
         self.data_exhausted = False
         self.collection_failed = False
 
+        # Consecutive terminal batch-worker failures. A failed batch releases its
+        # target so the collector can gap-fill it from a fresh dataloader batch,
+        # which silently substitutes different prompts. That is fine for a
+        # transient blip, but a persistent fault would otherwise consume the
+        # dataset forever while training starves, with no error anywhere.
+        self._consecutive_batch_failures = 0
+        self._last_batch_error: str | None = None
+        self._failure_lock: _threading.Lock = _threading.Lock()
+
         self._pg_lock: _threading.Lock = _threading.Lock()
 
         # Event for manual pause/resume control
@@ -102,7 +116,6 @@ class AsyncTrajectoryCollector:
         self._refit_pause_cleared.set()  # Start in cleared state
 
         self.current_weight_version: int = start_step
-        self.initial_weight_version: int = start_step
         self.dataloader: StatefulDataLoader | None = None
         self.collection_thread: _threading.Thread | None = None
 
@@ -134,26 +147,33 @@ class AsyncTrajectoryCollector:
         step they can target. If all target versions are exhausted, this generation
         server will remain idle until the next weight update.
 
+        The window starts at the current version rather than the next one. A
+        trajectory generated at version V is valid for target V (age 0), and
+        including V is what lets an incomplete target be gap-filled after the
+        refit that advanced the version onto it. Excluding it would strand any
+        target that was not completed before its own refit: the window would
+        move to V+1 and nothing could ever add to V again, stalling training
+        forever with no error. Targets already consumed are skipped by the
+        ``last_target_weight_already_generated`` watermark in
+        ``_get_next_target_for_generation``, so including V costs nothing on
+        the healthy path.
+
         Example:
         generation_weight_version = 10
         max_trajectory_age_steps = 4
 
         Returns:
-            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
+            [10, 11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 10, 11, 12, 13, 14
         """
         # Read async config strictly from grpo.async_grpo
         async_cfg = self.master_config.grpo.get("async_grpo", {})
         max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-        if generation_weight_version == self.initial_weight_version:
-            return [
-                i
-                for i in range(
-                    self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
-                )
-            ]
-
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        return list(
+            range(
+                generation_weight_version,
+                generation_weight_version + max_trajectory_age + 1,
+            )
+        )
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int
@@ -261,12 +281,18 @@ class AsyncTrajectoryCollector:
         """Return a snapshot of the collector's internal state for driver-side diagnostics."""
         with self._threads_lock:
             inflight_workers = len(self._inflight_threads)
-        return {
+        status = {
             "running": self.running,
             "data_exhausted": self.data_exhausted,
             "errored": self.collection_failed,
             "inflight_workers": inflight_workers,
         }
+        # The driver embeds this dict in the RuntimeError it raises, so carrying
+        # the originating error text is how a batch-worker failure reaches the
+        # user instead of dying in the collector's stdout.
+        if self._last_batch_error is not None:
+            status["last_batch_error"] = self._last_batch_error
+        return status
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
@@ -292,16 +318,25 @@ class AsyncTrajectoryCollector:
                         self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
+                # Check if generation limits require pausing collection.
+                # Clear the event *before* testing the condition so a wake that
+                # arrives while we evaluate is not lost: it leaves the event set
+                # and the wait() below returns immediately. Clearing inside the
+                # once-per-version log guard instead would make a same-version
+                # wake (e.g. a released reservation) spin without ever waiting.
+                while self.running:
+                    self._generation_limit_cleared.clear()
+                    if not self._should_pause_for_generation_limits():
+                        break
+
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
+                        # Report the same window the reservation loop uses, rather
+                        # than re-deriving it (which previously dropped the last
+                        # target and now would also drop the current one).
+                        target_weights = self._calculate_target_weights(
+                            self.current_weight_version
+                        )
 
                         print(
                             f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
@@ -309,16 +344,11 @@ class AsyncTrajectoryCollector:
                         )
                         self._last_limit_warning_version = self.current_weight_version
 
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
                     # Efficiently wait for generation limits to be cleared (no polling!)
                     with self._efficiency_timer.time("idle/generation_limit_pause"):
                         self._generation_limit_cleared.wait()
 
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
-
+                # Double-check we're still running after being woken up
                 if not self.running:
                     break
 
@@ -628,6 +658,17 @@ class AsyncTrajectoryCollector:
                     f"🧹 Released reservation for target weight {target_weight_version}"
                 )
 
+        # Wake the collection loop so it re-evaluates targets at the *current*
+        # weight version. A batch worker releases its reservation whether or not
+        # it managed to buffer every prompt group, so this release may have left
+        # the target incomplete and unreserved. Without this wake the loop stays
+        # parked on the generation-limit event until the next weight update --
+        # but that update only happens after a training step, and the training
+        # step is exactly what is blocked on the incomplete target. The loop
+        # re-tests its condition after waking and parks again if there is
+        # genuinely nothing to do.
+        self._generation_limit_cleared.set()
+
     def _compute_teacher_logprobs(
         self,
         input_ids: torch.Tensor,
@@ -822,6 +863,8 @@ class AsyncTrajectoryCollector:
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
             )
+            with self._failure_lock:
+                self._consecutive_batch_failures = 0
         except Exception as error:
             self._efficiency_timer.record(
                 "wasted/failed_trajectory", time.perf_counter() - worker_start
@@ -834,6 +877,29 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+
+            # Gap-filling refills this target from a fresh dataloader batch, so
+            # the failed prompts are silently replaced. Tolerate that for a
+            # transient failure, but stop once it is clearly persistent and let
+            # the driver surface the original error rather than starving.
+            with self._failure_lock:
+                self._consecutive_batch_failures += 1
+                self._last_batch_error = f"{type(error).__name__}: {error}"
+                give_up = (
+                    self._consecutive_batch_failures >= _MAX_CONSECUTIVE_BATCH_FAILURES
+                )
+            if give_up:
+                print(
+                    f"❌ {_MAX_CONSECUTIVE_BATCH_FAILURES} consecutive batch-worker "
+                    "failures; stopping collection so the driver reports the error"
+                )
+                self.collection_failed = True
+                self.running = False
+                # Unblock the collection loop so it observes running=False and
+                # exits instead of parking until a weight update that will not come.
+                self._generation_limit_cleared.set()
+                self._manual_pause_cleared.set()
+                self._refit_pause_cleared.set()
         finally:
             self._release_target(target_weight_version)
             with self._threads_lock:

@@ -570,8 +570,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Return additional trajectories needed for ``target_step``.
+
+        Returns 0 for a target training has already consumed. The collector
+        checks the consumed-target watermark separately before asking for a
+        deficit, so without this guard training can consume ``target_step``
+        between those two queries: the collector would then see an empty
+        target and reserve it again, and every trajectory it generated would
+        be unusable because ``sample`` only accepts trajectories whose target
+        equals the current training step. Reading the watermark under the same
+        lock as the count closes that window.
+        """
         with self._lock:
+            if target_step <= self.last_target_weight_already_generated:
+                return 0
             current_count = self._count_for_target(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 
