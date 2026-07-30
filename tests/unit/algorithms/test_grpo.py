@@ -1722,6 +1722,62 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
+    mock_grpo_components,
+):
+    """Reject teacher placement groups wider than a physical cluster node."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.grpo import setup
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.cluster["num_nodes"] = 3
+    master_config.cluster["gpus_per_node"] = 4
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "default_teacher": "/checkpoints/default_teacher"
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "num_nodes": 1,
+                },
+            },
+        }
+    )
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.opd_module.reserve_teacher_clusters"
+        ) as mock_reserve_teacher_clusters,
+        pytest.raises(
+            AssertionError,
+            match=(
+                "OPD teacher 'default_teacher' requests gpus_per_node=8 > "
+                "cluster.gpus_per_node=4"
+            ),
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+    mock_reserve_teacher_clusters.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "initial_skip_flag",
     [None, False],
