@@ -378,6 +378,7 @@ class DTensorPolicyWorkerV2Impl(
             self.is_generation_colocated,
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
+            self.model_load_dtype,
         ) = runtime_config
 
     def _update_moe_gate_bias_if_supported(self) -> None:
