@@ -328,6 +328,7 @@ Generation-specific parameters are added under `policy.generation`:
 | `quant_cfg` | Quantization config used by the vLLM generation worker. For QARL, this should normally match `policy.quant_cfg`. |
 | `real_quant` | When `true`, vLLM uses ModelOpt NVFP4 real kernels and receives packed quantized weights during refit. The effective `quant_cfg` selects W4A4 or W4A16; unsupported and mismatched formats fail during setup. When unset or `false`, vLLM uses fake-quantized generation. |
 | `real_quant_ignore` | Optional list of vLLM parameter name patterns that should stay in native dtype during real-quant rollout. If omitted, NeMo RL uses the default ModelOpt NVFP4 ignore set for sensitive layers such as attention and output heads. For Nano3 hybrid MoE/Mamba W4A16 real-quant rollout, use the model-specific list shown in the Nano3 example recipe. |
+| `real_quant_export_cpu_offload` | Optional boolean, default `true`. When `true`, packed NVFP4 export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
 
 ## Megatron Checkpoint Directory
 
