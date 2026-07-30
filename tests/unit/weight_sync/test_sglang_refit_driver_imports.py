@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Keep the SGLang refit drivers importable from the driver process.
+"""Keep the SGLang refit path importable from the driver process.
 
 The driver runs in the project environment, which is synced without a
 training-backend extra, so it cannot import ``megatron_policy_worker``
@@ -31,15 +31,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 REFIT_DRIVER_MODULES = (
-    "nemo_rl/weight_sync/megatron_sglang_refit.py",
-    "nemo_rl/weight_sync/dtensor_sglang_refit.py",
-)
-
-# Dispatch sites that select a refit driver at runtime, and the enclosing
-# function whose imports must stay backend free.
-SGLANG_REFIT_DISPATCH_SITES = (
-    ("nemo_rl/algorithms/grpo.py", "_refit_sglang_dispatch"),
-    ("nemo_rl/weight_sync/sglang_weight_synchronizer.py", "_refit_colocated"),
+    "nemo_rl/weight_sync/sglang_weight_synchronizer.py",
+    "nemo_rl/weight_sync/factory.py",
 )
 
 BACKEND_ONLY_ROOTS = frozenset({"megatron", "nemo_automodel", "transformer_engine"})
@@ -47,16 +40,6 @@ BACKEND_ONLY_ROOTS = frozenset({"megatron", "nemo_automodel", "transformer_engin
 POLICY_WORKER_MODULES = frozenset(
     {"megatron_policy_worker", "dtensor_policy_worker_v2"}
 )
-
-
-def _find_function(tree: ast.Module, name: str) -> ast.FunctionDef | None:
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == name
-        ):
-            return node
-    return None
 
 
 @pytest.mark.parametrize("relative_path", REFIT_DRIVER_MODULES)
@@ -80,26 +63,20 @@ def test_refit_drivers_import_no_training_backend(relative_path: str) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("relative_path", "function_name"), SGLANG_REFIT_DISPATCH_SITES
-)
-def test_sglang_refit_dispatch_imports_no_policy_worker(
-    relative_path: str, function_name: str
-) -> None:
-    """Driver-side dispatch must not reach a refit driver through a policy worker."""
+@pytest.mark.parametrize("relative_path", REFIT_DRIVER_MODULES)
+def test_refit_path_never_imports_a_policy_worker(relative_path: str) -> None:
+    """The refit must reach the workers through the policy facade, not directly."""
     tree = ast.parse((REPO_ROOT / relative_path).read_text())
-    function = _find_function(tree, function_name)
-    assert function is not None, f"{function_name} not found in {relative_path}"
 
     imported = {
         alias.name.split(".")[-1]
-        for node in ast.walk(function)
-        if isinstance(node, ast.ImportFrom)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
 
     offenders = sorted(imported & POLICY_WORKER_MODULES)
     assert not offenders, (
-        f"{relative_path}::{function_name} imports {offenders}, which import a "
-        "training backend at module scope and are unavailable in the driver."
+        f"{relative_path} imports {offenders}, which import a training backend "
+        "at module scope and are unavailable in the driver."
     )
