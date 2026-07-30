@@ -660,6 +660,7 @@ class RolloutManager:
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
+        mask_env_flagged_samples: bool = True,
         tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -685,6 +686,7 @@ class RolloutManager:
             max_rollout_turns=max_rollout_turns,
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
+            mask_env_flagged_samples=mask_env_flagged_samples,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
