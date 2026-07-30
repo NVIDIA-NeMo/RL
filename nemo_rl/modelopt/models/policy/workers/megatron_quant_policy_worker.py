@@ -431,6 +431,24 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             "positive_amax": positive_amax,
         }
 
+    def get_logprobs(self, *args, **kwargs):
+        """Compute logprobs, optionally caching the frozen-weight snap.
+
+        When ``policy.quant_cache_frozen_weight_snap`` is set, wrap the (no-grad)
+        re-scoring pass so each weight is fake-quantized once and reused across all
+        microbatches instead of re-snapped on every forward. Off by default; when off
+        this is exactly the base implementation.
+        """
+        if not self.cfg.get("quant_cache_frozen_weight_snap"):
+            return super().get_logprobs(*args, **kwargs)
+
+        from nemo_rl.modelopt.models.policy.workers.snap_cache import (
+            weight_snap_cache,
+        )
+
+        with weight_snap_cache(self.model, verbose=True, rank=self.rank):
+            return super().get_logprobs(*args, **kwargs)
+
     def generate(self, **kwargs):
         """Quantized Megatron generation is not supported.
 
