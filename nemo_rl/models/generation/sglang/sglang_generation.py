@@ -49,6 +49,7 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -75,6 +76,11 @@ class SGLangGeneration(GenerationInterface):
     ):
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
+        # GenerationInterface consumers (create_weight_synchronizer, the refit
+        # transports) read ``cfg``; keep the sglang-specific name as the alias.
+        self.cfg = sglang_cfg
+        # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
+        self.weight_synchronizer: WeightSynchronizer | None = None
         self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
         self._http_client: HttpClient | None = None
 
@@ -129,8 +135,9 @@ class SGLangGeneration(GenerationInterface):
         if init_handles:
             ray.get(init_handles)
 
-        # Serializes weight refits against concurrent engine operations.
+        # Serializes weight refits against engine recovery across processes.
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -331,9 +338,9 @@ class SGLangGeneration(GenerationInterface):
         Args:
             mode: Pause mode override. When ``None`` (default), the mode
                 configured in ``sglang_server_config.pause_generation_mode``
-                is used. Callers (e.g. the SGLang refit dispatch helpers)
-                pass an explicit mode when they also need to gate follow-up
-                steps such as ``invalidate_kv_cache`` on the same value.
+                is used. Callers (e.g. the SGLang weight synchronizers) pass
+                an explicit mode when they also need to gate follow-up steps
+                such as ``invalidate_kv_cache`` on the same value.
         """
         engines = [e for e in self.engines if e is not None]
         if not engines:
@@ -364,6 +371,12 @@ class SGLangGeneration(GenerationInterface):
         ray.get([e.end_weight_update.remote() for e in engines])
 
     def shutdown(self) -> bool:
+        if self.weight_synchronizer is not None:
+            # ``shutdown`` is reachable twice (explicit call + ``__del__``);
+            # drop the handle so teardown stays one-shot.
+            self.weight_synchronizer.shutdown()
+            self.weight_synchronizer = None
+
         ok = True
         engines = [e for e in self.all_engines if e is not None]
         if engines:
@@ -813,13 +826,11 @@ class SGLangGeneration(GenerationInterface):
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
-        if not self.needs_offload:
-            return
         tags = kwargs.get("tags", None)
-        engines = [e for e in self.engines if e is not None]
-        if not engines:
-            return
-        ray.get([e.resume_memory_occupation.remote(tags=tags) for e in engines])
+        if self.needs_offload:
+            engines = [e for e in self.engines if e is not None]
+            if engines:
+                ray.get([e.resume_memory_occupation.remote(tags=tags) for e in engines])
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""

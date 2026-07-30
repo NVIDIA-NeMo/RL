@@ -1836,6 +1836,8 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
+        cfg: dict = {}
+        weight_synchronizer = None
 
         def finish_generation(self):
             pass
@@ -1880,6 +1882,7 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
         "dp_size": 1,
         "pp_size": 1,
         "ep_size": 1,
+        "sglang_server_config": {"weight_transfer_mode": "ipc"},
     }
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo["val_period"] = 0
