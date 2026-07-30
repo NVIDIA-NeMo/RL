@@ -38,6 +38,15 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
 
+FILEEXT2TYPE = {
+    ".arrow": "arrow",
+    ".csv": "csv",
+    ".json": "json",
+    ".jsonl": "json",
+    ".parquet": "parquet",
+    ".txt": "text",
+}
+
 
 def load_audio_from_file(path: str, sampling_rate: int = 16000) -> np.ndarray:
     """Decode an audio file (or the audio track of a video) as a 1-D float32 array."""
@@ -106,14 +115,6 @@ def load_dataset_from_path(
         data_subset: The subset to load from the dataset. Only supported for huggingface datasets.
         data_split: The split to load from the dataset.
     """
-    FILEEXT2TYPE = {
-        ".arrow": "arrow",
-        ".csv": "csv",
-        ".json": "json",
-        ".jsonl": "json",
-        ".parquet": "parquet",
-        ".txt": "text",
-    }
     suffix = os.path.splitext(data_path)[-1]
     # load from local file (not save_to_disk format)
     if dataset_type := FILEEXT2TYPE.get(suffix):
