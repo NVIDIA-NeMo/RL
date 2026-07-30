@@ -15,7 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Optional, Tuple
 
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
@@ -248,6 +248,7 @@ def get_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     mtp_enabled: bool = False,
+    skip_keys: Optional[Iterable[str]] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -261,6 +262,9 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
         mtp_enabled: Whether the model uses multi-token prediction layers.
+        skip_keys: Keys whose dim 1 is NOT the sequence axis and must be exempt
+            from the sequence-dim validation (e.g. cross-tokenizer ride-along
+            tensors). Forwarded to ``get_and_validate_seqlen``.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -277,7 +281,7 @@ def get_microbatch_iterator(
     create_packed_seq_padding_mask = False
     prepad_packed_seq_for_hybridep = False
 
-    _, seq_dim_size = get_and_validate_seqlen(data)
+    _, seq_dim_size = get_and_validate_seqlen(data, skip_keys=skip_keys)
 
     # Auto-detect seq_length_key if not provided
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
@@ -1594,14 +1598,21 @@ def _unpack_sequences_from_megatron(
     return unpacked_output
 
 
-def get_and_validate_seqlen(data: BatchedDataDict[Any]):
+def get_and_validate_seqlen(
+    data: BatchedDataDict[Any],
+    skip_keys: Optional[Iterable[str]] = None,
+):
     # dim 1 is always assumed to be the sequence dim, sanity check this here.
-    # Skip multimodal fields: their dim 1 is num_images / num_patches, not
-    # seqlen.
+    # Multimodal fields and ``skip_keys`` ride-along tensors do not use dim 1 as
+    # the student sequence axis (e.g. image patches, teacher sequences, and
+    # alignment pairs), so exempt them from sequence-length validation.
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
+    skip = set(PACKED_MULTIMODAL_FIELDS)
+    if skip_keys is not None:
+        skip.update(skip_keys)
     for k, v in data.items():
-        if k in PACKED_MULTIMODAL_FIELDS:
+        if k in skip:
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
