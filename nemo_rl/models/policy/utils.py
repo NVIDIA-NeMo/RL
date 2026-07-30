@@ -996,15 +996,6 @@ def disconnect_rollout_engines_from_distributed(
         )
 
 
-def get_sglang_quantization_cfg(policy_generation: Any) -> dict:
-    """Read the active SGLang quantization block from the generation handle.
-
-    Returns an empty dict when no quantization config is set, so callers can
-    treat the result as a stable mapping without ``None`` checks.
-    """
-    return dict(policy_generation.sglang_cfg["sglang_cfg"].get("quantization") or {})
-
-
 def broadcast_hf_buckets_via_distributed_impl(
     *,
     bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
