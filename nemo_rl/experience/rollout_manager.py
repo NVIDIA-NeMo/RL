@@ -686,6 +686,7 @@ class RolloutManager:
             max_rollout_turns=max_rollout_turns,
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
+            # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
         )
         self._tokenizer = tokenizer
