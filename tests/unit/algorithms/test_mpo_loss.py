@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -43,8 +45,8 @@ def _mpo_batch() -> tuple[torch.Tensor, BatchedDataDict]:
     return next_token_logprobs, data
 
 
-def _loss_config(**overrides) -> MPOLossConfig:
-    config = {
+def _loss_config(**overrides: Any) -> MPOLossConfig:
+    config: dict[str, Any] = {
         "reference_policy_kl_penalty": 1.0,
         "preference_loss_weight": 1.0,
         "sft_loss_weight": 0.25,

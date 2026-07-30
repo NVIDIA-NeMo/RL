@@ -1,6 +1,6 @@
 # Packing A/B control for the Super 2K no-packing experiment.
 # Keep model, data, optimizer, batch size, and parallelism identical; only
-# enable pair-atomic, model-owned sequence packing.
+# enable pair-atomic packing in NeMo-RL's Megatron data pipeline.
 defaults: vlm_mpo-nemotron-super-omni-nopack-2k-parity.yaml
 
 policy:
