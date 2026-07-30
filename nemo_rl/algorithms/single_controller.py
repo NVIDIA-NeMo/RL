@@ -125,14 +125,16 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
-        # getattr, not attribute access: `env_handles` is a real field of
-        # SingleControllerActorArgs, so every production caller has it -- but upstream's
-        # unit tests build actor_args as a SimpleNamespace listing only what upstream's
-        # own __init__ reads, and upstream never reads this one. Requiring it here turns
-        # our feature into a construction requirement for tests that do not exercise it,
-        # which is how test_logs_setup_timing_metrics broke on the main sync. Same shape
-        # as the `timeouts` regression in the previous sync.
+        # getattr, not attribute access: these are real fields of
+        # SingleControllerActorArgs, so every production caller has them -- but
+        # upstream's unit tests build actor_args as a SimpleNamespace listing only what
+        # upstream's own __init__ reads, and upstream reads neither. Requiring them here
+        # turns our features into construction requirements for tests that do not
+        # exercise them, which is how test_logs_setup_timing_metrics broke on the main
+        # sync. Same shape as the `timeouts` regression in the previous sync.
         self._env_handles = getattr(actor_args, "env_handles", {})
+        # None means fleet health is off, which is also the default.
+        self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -640,14 +642,24 @@ class SingleControllerActor:
                 last_progress_at = now
             idle_s = now - last_progress_at
 
+            # Probe before publishing so the metrics describe this tick, not the last.
+            await self._probe_generation_fleet()
+
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
             metrics["rollout/idle_s"] = idle_s
             metrics["rollout/train_steps"] = float(self._train_steps)
+            if self._fleet_monitor is not None:
+                metrics.update(self._fleet_monitor.as_metrics())
             self._logger.log_metrics(metrics, step=self._train_steps)
 
             if watchdog_cfg.gym_subprocess_check:
                 await self._check_env_health()
+
+            if self._fleet_monitor is not None:
+                # Raises once too few shards remain for the run to be worth continuing.
+                # Checked after publishing so the final state is on record.
+                self._fleet_monitor.raise_if_exhausted()
 
             work_remains = self._train_steps < max_num_steps
             if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
@@ -661,6 +673,38 @@ class SingleControllerActor:
                 if watchdog_cfg.stall_action == "abort":
                     raise RolloutStall(message)
                 print(f"WARNING: rollout stall -- {message}", flush=True)
+
+    async def _probe_generation_fleet(self) -> None:
+        """Ask every serving generation shard whether it is still alive.
+
+        Ray actor liveness is the cheap authoritative signal for "the process is gone",
+        and it is what the probe uses. It does not catch every failure -- a vLLM engine
+        core can die while the worker process and its HTTP thread survive -- which is
+        why the routing adapters also report the failures they observe. The two signals
+        feed the same counters.
+
+        Only serving shards are probed: a quarantined shard answering again says nothing
+        about whether its weights are current, and the monitor ignores such probes
+        anyway.
+        """
+        if self._fleet_monitor is None:
+            return
+
+        fleet_cfg = self._async_cfg.fleet_health
+        worker_group = self._gen.worker_group
+        for shard_idx in self._fleet_monitor.serving_shards():
+            worker_idx = worker_group.get_dp_leader_worker_idx(shard_idx)
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(worker_group.workers[worker_idx].is_alive.remote()),
+                    timeout=fleet_cfg.probe_timeout_s,
+                )
+            except (Exception, asyncio.TimeoutError) as error:
+                self._fleet_monitor.record_probe(
+                    shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
+                )
+            else:
+                self._fleet_monitor.record_probe(shard_idx, ok=True)
 
     async def _check_env_health(self) -> None:
         """Ask each environment actor that exposes a health check whether it is whole.
@@ -719,7 +763,11 @@ class SingleControllerActor:
             kv_scales=kv_scales,
         )
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
-            self._gen.invalidate_kv_cache()
+            # to_thread, like every other call into the workers here. Run directly on
+            # the loop this is a blocking Ray call, and a wedged generation worker would
+            # freeze the event loop itself -- taking the watchdog, which is an asyncio
+            # task on that same loop, down with it.
+            await asyncio.to_thread(self._gen.invalidate_kv_cache)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
