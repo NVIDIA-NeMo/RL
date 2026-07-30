@@ -536,6 +536,7 @@ def setup(
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
                     invalid_tool_call_patterns=invalid_tool_call_patterns,
                     thinking_tags=thinking_tags,
+                    use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
                     initial_global_config_dict=nemo_gym_dict,
                 )
                 nemo_gym_opts = {

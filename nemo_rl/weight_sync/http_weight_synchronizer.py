@@ -53,7 +53,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         self,
         policy: Any,
         generation: Any,
-        refit_buffer_size_gb: Optional[int] = None,
+        refit_buffer_size_gb: Optional[float | int] = None,
     ):
         self._policy = policy
         self._generation = generation
@@ -66,6 +66,12 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        assert kv_scales is None, (
+            "HTTP transport (SGLang) does not support FP8 KV cache scale sync. "
+            "`kv_scales` is accepted only for interface uniformity; if this "
+            "assertion fires, calibrated scales were routed through a path that "
+            "would otherwise silently ignore them."
+        )
         self._policy.offload_before_refit()
         self._generation.prepare_for_generation(tags=["weights"])
 
@@ -108,7 +114,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         if self._refit_buffer_size_gb is not None:
             if self._refit_buffer_size_gb <= 0:
                 raise ValueError("refit_buffer_size_gb must be > 0")
-            return self._refit_buffer_size_gb * (1024**3)
+            return int(self._refit_buffer_size_gb * (1024**3))
 
         memory_ratio_raw = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
         try:

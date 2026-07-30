@@ -35,15 +35,19 @@ from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
+    refit_policy_generation,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -71,6 +75,33 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    # Match VllmGeneration's default; a bare MagicMock would auto-create a truthy
+    # weight_synchronizer and refit_policy_generation would delegate to it instead
+    # of taking the colocated IPC path under test.
+    policy_generation.weight_synchronizer = None
+    kv_scales = {"layer.0": 0.5}
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=1.0,
+        kv_scales=kv_scales,
+    )
+
+    policy.stream_weights_via_ipc_zmq.assert_called_once_with(
+        buffer_size_bytes=1024**3,
+        kv_scales=kv_scales,
+    )
 
 
 class TestMaskSampleFilter:
@@ -1689,6 +1720,62 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
+    mock_grpo_components,
+):
+    """Reject teacher placement groups wider than a physical cluster node."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.grpo import setup
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.cluster["num_nodes"] = 3
+    master_config.cluster["gpus_per_node"] = 4
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "default_teacher": "/checkpoints/default_teacher"
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "num_nodes": 1,
+                },
+            },
+        }
+    )
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.opd_module.reserve_teacher_clusters"
+        ) as mock_reserve_teacher_clusters,
+        pytest.raises(
+            AssertionError,
+            match=(
+                "OPD teacher 'default_teacher' requests gpus_per_node=8 > "
+                "cluster.gpus_per_node=4"
+            ),
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+    mock_reserve_teacher_clusters.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -3601,3 +3688,58 @@ class TestAggregateRolloutMetrics:
         assert result["total_turns"] == 45
         assert result["accuracy"] == pytest.approx(0.8)
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
+
+
+def _cfg(
+    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+):
+    return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=force,
+            use_kl_in_reward=kl_reward,
+            reference_policy_kl_penalty=kl_penalty,
+        ),
+        grpo={
+            "seq_logprob_error_threshold": threshold,
+            "skip_reference_policy_logprobs_calculation": skip_ref,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "kw, expected",
+    [
+        ({}, (False, None)),
+        ({"force": True}, (True, None)),
+        ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        ({"skip_ref": True}, (False, True)),
+    ],
+    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+)
+def test_resolve_logprob_skip_flags(kw, expected):
+    if kw.get("force") and kw.get("threshold") is not None:
+        with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
+            assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    else:
+        assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():
+    with pytest.raises(AssertionError, match="use_kl_in_reward"):
+        _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True))
+
+
+def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
+    # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
+    # prev_logprobs can't corrupt the advantage.
+    _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))
+
+
+@pytest.mark.parametrize(
+    "skip_prev_logprobs, expect_prev",
+    [(False, True), (True, False)],
+    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+)
+def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
+    fields = _train_fields_for_step(skip_prev_logprobs)
+    assert ("prev_logprobs" in fields) is expect_prev

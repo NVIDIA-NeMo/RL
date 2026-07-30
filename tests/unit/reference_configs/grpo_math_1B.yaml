@@ -50,7 +50,7 @@ grpo:
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -115,6 +115,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
   hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4

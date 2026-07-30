@@ -17,6 +17,9 @@ tests/test_suites/llm/grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.sh
 # Long Megatron Qwen3 30B-A3B run
 tests/test_suites/llm/grpo-qwen3-30ba3b-8n4g-megatron.sh
 
+# Nemotron-3 Nano 30B-A3B DAPO, Megatron + TRT-LLM generation (colocated)
+tests/test_suites/llm/grpo-dapomath17k-nanov3-30BA3B-8n4g-megatron-trtllm.sh
+
 # DAPO 4h run
 tests/test_suites/llm/dapo-qwen2.5-7b-16n4g-fsdp2cp2.v2.sh
 

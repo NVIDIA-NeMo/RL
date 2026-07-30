@@ -22,8 +22,10 @@ issue #1020).
 
 from __future__ import annotations
 
+import functools
 import sys
 import types
+import warnings
 
 import pytest
 
@@ -39,7 +41,10 @@ from nemo_rl.data.datasets.response_datasets import (
 from nemo_rl.data.datasets.response_datasets import (
     load_response_dataset,
 )
-from nemo_rl.data.datasets.utils import resolve_external_dataset_class
+from nemo_rl.data.datasets.utils import (
+    resolve_external_dataset_class,
+    warn_on_unsupported_dataset_config_keys,
+)
 
 
 class _StubResponseDataset:
@@ -184,4 +189,106 @@ def test_load_preference_dataset_unknown_bare_name_errors():
 def test_load_preference_dataset_bad_dotted_path_errors():
     config = {"dataset_name": "nemo_rl_missing_module.MyDataset"}
     with pytest.raises(ValueError, match="Could not import module"):
+        load_preference_dataset(config)
+
+
+# ---------------------------------------------------------------------------
+# warn_on_unsupported_dataset_config_keys (dispatcher guard, issue #3270)
+# ---------------------------------------------------------------------------
+
+
+class _SplitOnlyDataset:
+    """Stub declaring only ``split``; other behavioral keys are unsupported."""
+
+    def __init__(self, split="train", **kwargs):
+        pass
+
+
+class _KwargsForwardingDataset(_SplitOnlyDataset):
+    """Consumes keys via ``**kwargs`` and forwards to a base that declares
+    them (mirrors the intent datasets)."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("split", "train")
+        super().__init__(**kwargs)
+
+
+def test_warn_on_unsupported_subset():
+    with pytest.warns(UserWarning, match="subset='socratic'.*_SplitOnlyDataset"):
+        warn_on_unsupported_dataset_config_keys(
+            _SplitOnlyDataset, {"subset": "socratic"}
+        )
+
+
+def test_warn_on_unsupported_split_validation_size_and_seed():
+    with pytest.warns(UserWarning) as record:
+        warn_on_unsupported_dataset_config_keys(
+            _SplitOnlyDataset, {"split_validation_size": 0.05, "seed": 42}
+        )
+    messages = [str(w.message) for w in record]
+    assert any("split_validation_size=0.05" in m for m in messages)
+    assert any("seed=42" in m for m in messages)
+
+
+def test_no_warning_for_supported_key():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_on_unsupported_dataset_config_keys(_SplitOnlyDataset, {"split": "test"})
+
+
+def test_no_warning_for_none_or_zero_values():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_on_unsupported_dataset_config_keys(
+            _SplitOnlyDataset, {"subset": None, "split_validation_size": 0.0}
+        )
+
+
+def test_no_warning_when_base_class_declares_key():
+    """MRO-aware: subclasses forwarding **kwargs to a declaring base must
+    not be flagged."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_on_unsupported_dataset_config_keys(
+            _KwargsForwardingDataset, {"split": "validation"}
+        )
+
+
+def test_warns_through_functools_partial():
+    """Registry entries like the AIME variants are ``functools.partial``."""
+    wrapped = functools.partial(_SplitOnlyDataset, split="train")
+    with pytest.warns(UserWarning, match="_SplitOnlyDataset"):
+        warn_on_unsupported_dataset_config_keys(wrapped, {"subset": "all"})
+
+
+def test_load_response_dataset_warns_on_swallowed_key(monkeypatch, stub_module):
+    """End-to-end: the dispatcher warns before instantiating a class that
+    would silently swallow a behavioral key."""
+    config = {
+        "dataset_name": f"{stub_module}.StubResponseDataset",
+        "subset": "socratic",
+    }
+    with pytest.warns(UserWarning, match="subset='socratic'"):
+        load_response_dataset(config)
+
+
+def test_warn_on_unsupported_data_path_and_input_key():
+    """Constructor-consumed keys beyond the HF-loading four are checked too
+    (e.g. `data_path` on a loader that hardcodes its source)."""
+    with pytest.warns(UserWarning) as record:
+        warn_on_unsupported_dataset_config_keys(
+            _SplitOnlyDataset, {"data_path": "/tmp/my.jsonl", "input_key": "question"}
+        )
+    messages = [str(w.message) for w in record]
+    assert any("data_path='/tmp/my.jsonl'" in m for m in messages)
+    assert any("input_key='question'" in m for m in messages)
+
+
+def test_load_preference_dataset_warns_on_swallowed_key(stub_module):
+    """The preference dispatcher applies the same guard as the response one."""
+    config = {
+        "dataset_name": f"{stub_module}.StubPreferenceDataset",
+        "split": "test",
+    }
+    with pytest.warns(UserWarning, match="split='test'"):
         load_preference_dataset(config)
