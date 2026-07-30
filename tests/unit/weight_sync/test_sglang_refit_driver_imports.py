@@ -33,13 +33,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 REFIT_DRIVER_MODULES = (
     "nemo_rl/weight_sync/megatron_sglang_refit.py",
     "nemo_rl/weight_sync/dtensor_sglang_refit.py",
+    # The synchronizer is the only driver-side entry point into the two above.
+    "nemo_rl/weight_sync/sglang_weight_synchronizer.py",
+    # The drivers' only function-scope import; it has to load in the driver
+    # env too, or they fail at the first refit rather than at import.
+    "nemo_rl/models/policy/utils.py",
 )
 
 # Dispatch sites that select a refit driver at runtime, and the enclosing
 # function whose imports must stay backend free.
 SGLANG_REFIT_DISPATCH_SITES = (
-    ("nemo_rl/algorithms/grpo.py", "_refit_sglang_dispatch"),
-    ("nemo_rl/weight_sync/sglang_weight_synchronizer.py", "_refit_colocated"),
+    ("nemo_rl/weight_sync/sglang_weight_synchronizer.py", "_refit_driver"),
 )
 
 BACKEND_ONLY_ROOTS = frozenset({"megatron", "nemo_automodel", "transformer_engine"})

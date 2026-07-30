@@ -50,6 +50,7 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -76,6 +77,11 @@ class SGLangGeneration(GenerationInterface):
     ):
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
+        # GenerationInterface consumers (create_weight_synchronizer, the refit
+        # transports) read ``cfg``; keep the sglang-specific name as the alias.
+        self.cfg = sglang_cfg
+        # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
+        self.weight_synchronizer: WeightSynchronizer | None = None
         self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
         self._http_client: HttpClient | None = None
 
@@ -429,6 +435,12 @@ class SGLangGeneration(GenerationInterface):
     def shutdown(self) -> bool:
         if self._health_monitor:
             self._health_monitor.stop()
+
+        if self.weight_synchronizer is not None:
+            # ``shutdown`` is reachable twice (explicit call + ``__del__``);
+            # drop the handle so teardown stays one-shot.
+            self.weight_synchronizer.shutdown()
+            self.weight_synchronizer = None
 
         ok = True
         engines = [e for e in self.all_engines if e is not None]

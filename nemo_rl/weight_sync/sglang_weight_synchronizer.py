@@ -12,21 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weight synchronizer for colocated SGLang generation.
+"""Weight synchronizers for the SGLang generation backend.
 
-Handles weight transfer between a colocated policy and the SGLang generation
-backend via the backend-specific colocated refit drivers
-(``refit_sglang_colocated`` in ``megatron_policy_worker`` /
-``dtensor_policy_worker_v2``), which gather HF tensor buckets per engine and
-push them over Ray CUDA IPC (``send_hf_buckets_via_ipc_actor_impl``).
+The refit itself — engine recovery, connect, pause, KV invalidation, bucket
+transfer, post-process, continue — lives in the backend-specific driver
+modules (``megatron_sglang_refit`` / ``dtensor_sglang_refit``). These
+synchronizers only own the GPU phase transitions around that call: which
+side gets offloaded/onloaded, and in what order.
 
-Lifecycle per sync:
-  1. policy.offload_before_refit()       -- free GPU for weight staging
-  2. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
-  3. refit_sglang_colocated()            -- pause, send buckets via Ray IPC,
-                                            post-process, continue
-  4. policy.offload_after_refit()        -- restore optimizer state
-  5. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
+Colocated (``weight_transfer_mode="ipc"``):
+  1. policy.offload_before_refit()                        -- free GPU for staging
+  2. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
+  3. refit_sglang_colocated()                              -- Ray CUDA-IPC transfer
+  4. policy.offload_after_refit()                          -- restore optimizer state
+  5. generation.prepare_for_generation(tags=["kv_cache"])  -- rebuild KV cache
+
+Disaggregated (``weight_transfer_mode="broadcast"``):
+  1. generation.prepare_for_generation(tags=["weights"])
+  2. refit_sglang_distributed()                            -- NCCL broadcast
+  3. generation.prepare_for_generation(tags=["kv_cache"])
+
+The policy offload steps are skipped when disaggregated: the trainer keeps
+its GPUs to itself, so there is nothing to make room for.
+
+``prepare_for_generation`` runs on both paths. It is gated internally on
+``sglang_server_config.needs_offload``, which is an independent knob — with
+``needs_offload: true`` (what every shipped config sets) these calls issue
+real ``resume_memory_occupation`` RPCs even when disaggregated, and the
+engines need them because ``finish_generation`` released that memory. They
+are only a no-op when ``needs_offload`` is false.
 """
 
 import os
@@ -37,76 +51,26 @@ from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
-class SGLangColocatedWeightSynchronizer(WeightSynchronizer):
-    """Weight synchronizer for colocated SGLang deployments.
-
-    Both the policy and generation workers run on the same GPUs. Weights are
-    bucketed on the trainer, gathered per engine, and handed to SGLang via
-    Ray CUDA-IPC actor RPCs — the same path used by
-    ``refit_policy_generation`` in the GRPO loop.
+class _SGLangWeightSynchronizer(WeightSynchronizer):
+    """Shared plumbing for the SGLang synchronizers.
 
     Args:
         policy: Policy object implementing ColocatablePolicyInterface.
         generation: SGLangGeneration instance.
-        refit_buffer_size_gb: Fixed buffer size in GB for weight staging.
-            If None, buffer size is computed dynamically from free GPU memory.
+        refit_buffer_size_gb: Fixed bucket size in GB for the weight transfer.
+            If None, it is computed dynamically from free GPU memory.
     """
 
     def __init__(
         self,
         policy: Any,
         generation: Any,
-        refit_buffer_size_gb: Optional[int] = None,
+        refit_buffer_size_gb: Optional[float] = None,
     ):
         self._policy = policy
         self._generation = generation
         self._refit_buffer_size_gb = refit_buffer_size_gb
         self._stale = True
-
-    def sync_weights(
-        self,
-        *,
-        timer: Optional[Timer] = None,
-        kv_scales: Optional[dict[str, float]] = None,
-    ) -> None:
-        self._policy.offload_before_refit()
-        self._generation.prepare_for_generation(tags=["weights"])
-
-        sync_succeeded = False
-        try:
-            timer_context = (
-                timer.time("prepare_for_generation/transfer_and_update_weights")
-                if timer is not None
-                else nullcontext()
-            )
-            with timer_context:
-                buffer_size_bytes = self._compute_buffer_size()
-                sync_succeeded = bool(self._refit_colocated(buffer_size_bytes))
-        finally:
-            self._policy.offload_after_refit()
-            self._generation.prepare_for_generation(tags=["kv_cache"])
-
-        self._stale = not sync_succeeded
-
-    def _refit_colocated(self, buffer_size_bytes: int) -> bool:
-        """Route to the backend-specific colocated SGLang refit driver."""
-        use_megatron = bool(
-            self._policy.cfg.get("megatron_cfg", {}).get("enabled", False)
-        )
-        if use_megatron:
-            from nemo_rl.weight_sync import (
-                megatron_sglang_refit as _backend,
-            )
-        else:
-            from nemo_rl.weight_sync import (
-                dtensor_sglang_refit as _backend,
-            )
-
-        return _backend.refit_sglang_colocated(
-            policy=self._policy,
-            policy_generation=self._generation,
-            buffer_size_bytes=buffer_size_bytes,
-        )
 
     @property
     def is_stale(self) -> bool:
@@ -122,11 +86,59 @@ class SGLangColocatedWeightSynchronizer(WeightSynchronizer):
     def shutdown(self) -> None:
         pass
 
+    def _refit_driver(self, name: str):
+        """Resolve ``name`` on the driver module for the policy's backend.
+
+        Imported lazily and by module so the driver process never pulls in
+        ``megatron.bridge`` / ``nemo_automodel`` at import time.
+        """
+        use_megatron = bool(
+            self._policy.cfg.get("megatron_cfg", {}).get("enabled", False)
+        )
+        if use_megatron:
+            from nemo_rl.weight_sync import megatron_sglang_refit as _backend
+        else:
+            from nemo_rl.weight_sync import dtensor_sglang_refit as _backend
+
+        return getattr(_backend, name)
+
+    def _reject_kv_scales(self, kv_scales: Optional[dict[str, float]]) -> None:
+        # The SGLang refit carries no KV-cache scales. Reject them rather than
+        # dropping them silently, so an FP8-KV config fails loudly.
+        assert kv_scales is None, (
+            "The SGLang weight transports do not support kv_scales; "
+            f"got {sorted(kv_scales)!r}."
+        )
+
+    def _transfer(self, driver_name: str, timer: Optional[Timer]) -> None:
+        """Run ``driver_name`` under the refit timer, raising if it reports failure."""
+        timer_context = (
+            timer.time("prepare_for_generation/transfer_and_update_weights")
+            if timer is not None
+            else nullcontext()
+        )
+        with timer_context:
+            update_success = bool(
+                self._refit_driver(driver_name)(
+                    policy=self._policy,
+                    policy_generation=self._generation,
+                    buffer_size_bytes=self._compute_buffer_size(),
+                )
+            )
+
+        if not update_success:
+            raise RuntimeError(
+                "❌ Error: Updating weights for the generation policy failed "
+                f"during refit ({driver_name}).\n"
+                "This often indicates an issue with the SGLang weight transport "
+                "or a problem within the SGLang engine.\n"
+            )
+
     def _compute_buffer_size(self) -> int:
         if self._refit_buffer_size_gb is not None:
             if self._refit_buffer_size_gb <= 0:
                 raise ValueError("refit_buffer_size_gb must be > 0")
-            return self._refit_buffer_size_gb * (1024**3)
+            return int(self._refit_buffer_size_gb * (1024**3))
 
         memory_ratio_raw = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
         try:
@@ -139,3 +151,59 @@ class SGLangColocatedWeightSynchronizer(WeightSynchronizer):
             raise ValueError("NRL_REFIT_BUFFER_MEMORY_RATIO must be > 0")
 
         return int(self._policy.get_free_memory_bytes() * memory_ratio)
+
+
+class SGLangColocatedWeightSynchronizer(_SGLangWeightSynchronizer):
+    """Policy and SGLang engines share GPUs; weights move over Ray CUDA IPC.
+
+    The trainer offloads before staging weights and re-offloads afterwards so
+    the engines can take the memory back for their KV cache.
+    """
+
+    def sync_weights(
+        self,
+        *,
+        timer: Optional[Timer] = None,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Optional[dict[str, float]]:
+        self._reject_kv_scales(kv_scales)
+        self._policy.offload_before_refit()
+        self._generation.prepare_for_generation(tags=["weights"])
+
+        sync_succeeded = False
+        try:
+            self._transfer("refit_sglang_colocated", timer)
+            sync_succeeded = True
+        finally:
+            self._policy.offload_after_refit()
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+
+        self._stale = not sync_succeeded
+        return None
+
+
+class SGLangDisaggregatedWeightSynchronizer(_SGLangWeightSynchronizer):
+    """SGLang engines run on their own GPUs; weights move over NCCL broadcast.
+
+    No policy offload: the trainer is not competing with the engines for
+    memory, and ``prepare_for_training`` onloads unconditionally anyway.
+    """
+
+    def sync_weights(
+        self,
+        *,
+        timer: Optional[Timer] = None,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Optional[dict[str, float]]:
+        self._reject_kv_scales(kv_scales)
+        self._generation.prepare_for_generation(tags=["weights"])
+
+        sync_succeeded = False
+        try:
+            self._transfer("refit_sglang_distributed", timer)
+            sync_succeeded = True
+        finally:
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+
+        self._stale = not sync_succeeded
+        return None

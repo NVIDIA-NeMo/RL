@@ -88,6 +88,7 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -655,10 +656,22 @@ def setup(
     # during setup to free GPU for value model initialization).
     policy.prepare_for_training()
 
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if isinstance(policy_generation, SGLangGeneration):
+        # SGLang refits are owned end-to-end by its weight synchronizer;
+        # `refit_policy_generation` dispatches on this attribute.
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+    else:
+        # prepare refit info
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time

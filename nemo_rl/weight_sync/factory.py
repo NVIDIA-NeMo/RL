@@ -15,8 +15,12 @@
 """Factory for creating WeightSynchronizer instances.
 
 Selects the appropriate weight synchronizer based on the deployment
-topology (colocated vs. non-colocated) and the generation backend
-(vLLM uses IPC/ZMQ, SGLang uses Ray CUDA-IPC, non-colocated uses NCCL).
+topology (colocated vs. non-colocated) and the generation backend:
+
+- vLLM / Megatron colocated -> IPC (ZMQ + CUDA IPC handles)
+- vLLM / Megatron non-colocated -> NCCL collective
+- SGLang colocated -> Ray CUDA-IPC bucket transfer
+- SGLang non-colocated -> NCCL broadcast over SGLang's own weight-update group
 """
 
 from typing import Any, Optional
@@ -48,9 +52,11 @@ def create_weight_synchronizer(
         generation: Generation object (GenerationInterface).
         generation_backend: Name of the generation backend ("vllm", "sglang", "megatron").
         colocated: Whether policy and generation share the same GPUs.
-        train_cluster: RayVirtualCluster for training workers (required for non-colocated).
-        inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
-        refit_buffer_size_gb: Optional fixed buffer size for IPC weight staging.
+        train_cluster: RayVirtualCluster for training workers. Required for
+            non-colocated deployments except SGLang, which owns its own group.
+        inference_cluster: RayVirtualCluster for inference workers. Same
+            requirement as ``train_cluster``.
+        refit_buffer_size_gb: Optional fixed buffer size for weight staging.
 
     Returns:
         A WeightSynchronizer instance appropriate for the deployment topology.
@@ -95,9 +101,22 @@ def create_weight_synchronizer(
 
     if not colocated:
         if generation_backend == SGLANG_BACKEND:
-            raise NotImplementedError(
-                "SGLang does not support non-colocated inference mode."
+            # NOTE: this must stay *below* the checkpoint-engine guard above,
+            # which rejects non-vLLM backends. Hoisting it would hand a
+            # checkpoint-engine config to the SGLang synchronizer instead.
+            #
+            # SGLang owns its own weight-update process group, established
+            # lazily on the first refit, so it needs neither cluster handle.
+            from nemo_rl.weight_sync.sglang_weight_synchronizer import (
+                SGLangDisaggregatedWeightSynchronizer,
             )
+
+            return SGLangDisaggregatedWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                refit_buffer_size_gb=refit_buffer_size_gb,
+            )
+
         if train_cluster is None or inference_cluster is None:
             raise ValueError(
                 "train_cluster and inference_cluster are required "
