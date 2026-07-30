@@ -36,6 +36,7 @@ from typing import Any
 import pytest
 import ray
 import torch
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 
 from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
@@ -44,6 +45,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 pytestmark = pytest.mark.automodel
 
@@ -177,6 +179,43 @@ def _make_checkpointing_cfg(checkpoint_dir) -> dict:
         "checkpoint_must_save_by": None,
         "save_optimizer": True,
     }
+
+
+def _load_dcp_state(checkpoint_dir: Path, output_path: Path) -> dict[str, Any]:
+    """Consolidate a small test DCP checkpoint into a logical state dict."""
+    dcp_to_torch_save(checkpoint_dir, output_path)
+    return torch.load(output_path, map_location="cpu", weights_only=True)
+
+
+def _assert_state_equal(actual: Any, expected: Any) -> None:
+    """Recursively compare checkpoint state, including tensor values."""
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_state_equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert isinstance(actual, type(expected))
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_state_equal(actual_item, expected_item)
+    elif isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        assert actual == expected
+
+
+def _state_has_key(state: Any, expected_key: str) -> bool:
+    """Return whether a nested or flattened checkpoint key is present."""
+    if isinstance(state, dict):
+        return any(
+            str(key).split(".")[-1] == expected_key
+            or _state_has_key(value, expected_key)
+            for key, value in state.items()
+        )
+    if isinstance(state, (list, tuple)):
+        return any(_state_has_key(value, expected_key) for value in state)
+    return False
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
@@ -497,21 +536,7 @@ def test_value_worker_train_decreases_loss(value_setup):
     ids=["2gpu_dp2"],
 )
 def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
-    """Full save → shutdown → restore round-trip with state correctness checks.
-
-    Captures `get_values` outputs at three model states and cross-checks them
-    to prove the checkpoint round-trip actually persists trained weights:
-
-      * **fresh** — Value just constructed, no training done
-      * **saved** — same Value after one train step (right before save)
-      * **resumed** — fresh Value constructed with `weights_path=<ckpt>` after
-        the original is shut down
-
-    Hard assertion: ``resumed != fresh`` — proves the load did something
-    non-trivial (it did NOT silently fall back to a fresh init).
-    Hard assertion: ``resumed ≈ saved`` — DTensor checkpoints are bit-exact
-    across reload (unlike Megatron's sharded dist_checkpoint).
-    """
+    """Round-trip DTensor model, optimizer, and scheduler checkpoint state."""
     value, cluster, data, loss_fn = value_setup
 
     # State 1: fresh — capture get_values output before any training.
@@ -541,19 +566,19 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         f"weights_path {weights_path} should exist after save"
     )
     assert os.listdir(weights_path), "weights_path should contain saved files"
+    assert os.path.isdir(os.path.join(optimizer_path, "optim"))
 
     # Free GPU memory before re-init on the same cluster.
     saved_model_name = value.cfg["model_name"]
     value.shutdown()
 
-    # Mirror the T12 resume path in `ppo.setup()` — directly probe value
-    # subdir paths with .exists() rather than going through
-    # `CheckpointManager.get_resume_paths`.
-    _value_weights = Path(ckpt_root) / "value" / "weights"
-    _value_optim = Path(ckpt_root) / "value" / "optimizer"
-    assert _value_weights.exists(), f"saved value weights missing at {_value_weights}"
-    resume_weights_path = _value_weights
-    resume_optimizer_path = _value_optim if _value_optim.exists() else None
+    # Use the same value-component resolver as PPO resume.
+    resume_weights_path, resume_optimizer_path = CheckpointManager.get_resume_paths(
+        ckpt_root,
+        model_component="value",
+    )
+    assert resume_weights_path == Path(weights_path)
+    assert resume_optimizer_path == Path(optimizer_path)
 
     config = _create_value_test_config(model_name=saved_model_name)
     tokenizer = get_tokenizer(config["tokenizer"])
@@ -591,5 +616,29 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         # DTensor weights are deterministic across save/reload — values must
         # match what we captured just before save.
         torch.testing.assert_close(values_resumed, values_saved, rtol=1e-4, atol=1e-4)
+
+        # Re-save without another update to prove optimizer and scheduler state
+        # were restored, not merely present in the original checkpoint.
+        resaved_root = tmp_path / "value_ckpt_resaved"
+        resaved_weights_path = str(resaved_root / "value" / "weights")
+        resaved_optimizer_path = str(resaved_root / "value" / "optimizer")
+        resumed.save_checkpoint(
+            weights_path=resaved_weights_path,
+            optimizer_path=resaved_optimizer_path,
+            checkpointing_cfg=_make_checkpointing_cfg(resaved_root),
+        )
+
+        saved_state = _load_dcp_state(
+            Path(optimizer_path) / "optim",
+            tmp_path / "saved_optimizer.pt",
+        )
+        resaved_state = _load_dcp_state(
+            Path(resaved_optimizer_path) / "optim",
+            tmp_path / "resaved_optimizer.pt",
+        )
+        assert _state_has_key(saved_state, "exp_avg")
+        assert _state_has_key(saved_state, "exp_avg_sq")
+        assert _state_has_key(saved_state, "sched")
+        _assert_state_equal(resaved_state, saved_state)
     finally:
         resumed.shutdown()

@@ -1,0 +1,42 @@
+defaults: ./performance/grpo-qwen3-30ba3b-4n8g.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 50
+  val_period: 1000
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated
+
+policy:
+  train_global_batch_size: 128
+  generation_batch_size: 16
+  max_total_sequence_length: 2048
+  sequence_packing:
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 4096
+  megatron_cfg:
+    activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  generation:
+    refit_transport: vllm_zmq_sparse
+    refit_cfg:
+      sparse:
+        delta_compression:
+          encoding: xor
+        verify_samples_per_payload: 0
+        baseline:
+          in_memory: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated
+  wandb:
+    project: nemo-rl-refit
+    name: grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated

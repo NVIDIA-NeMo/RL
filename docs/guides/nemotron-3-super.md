@@ -22,7 +22,7 @@ docker buildx build \
 FROM nvcr.io/nvidia/nemo-rl:v0.7.0
 
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.17.0
+ARG NEMO_GYM_VLLM_VERSION=0.20.0
 ARG WHEEL_ARCH=x86_64
 RUN <<'RUNEOF' bash -exu -o pipefail
 cd /opt/nemo-rl

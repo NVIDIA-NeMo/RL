@@ -118,9 +118,10 @@ class TestTopoRankValues:
     """Ray stores resource values as floats; int(float) must round-trip correctly."""
 
     def test_slurm_procid_value_as_float(self):
-        # SLURM_PROCID fallback: $(( 10#7 )) -> TOPO_RANK=7, stored as 7.0 by Ray
-        topo_rank = int(7.0)
-        assert topo_rank == 7
+        # SLURM_PROCID fallback (worker): $(( 10#7 + 2 )) -> TOPO_RANK=9, stored as 9.0 by Ray
+        # (head node is pinned to TOPO_RANK=1)
+        topo_rank = int(9.0)
+        assert topo_rank == 9
 
     def test_hostname_digits_value_as_float(self):
         # hostname node007 -> $(( 10#007 )) -> 7, stored as 7.0 by Ray
@@ -133,15 +134,15 @@ class TestTopoRankValues:
         assert topo_rank == 20000000015
 
     def test_sorting_with_slurm_procid_ranks(self):
-        # Nodes labelled by SLURM_PROCID (0..7) across two domains
+        # Nodes labelled by SLURM_PROCID (1..8) across two domains
         bundle_data = _make_bundle_data(
             {
-                "nvlink_domain_A": [4, 5, 6, 7],  # higher SLURM_PROCID
-                "nvlink_domain_B": [0, 1, 2, 3],  # lower SLURM_PROCID
+                "nvlink_domain_A": [5, 6, 7, 8],  # higher TOPO_RANK
+                "nvlink_domain_B": [1, 2, 3, 4],  # lower TOPO_RANK
             }
         )
         result = _sort_bundle_indices_by_topology(bundle_data)
-        # Domain B min rank=0 < domain A min rank=4 → B comes first
+        # Domain B min rank=1 < domain A min rank=5 → B comes first
         node_ids = [bundle_data[i][3] for i in result]
         # First 4 nodes should all be from domain B (nodes 4..7 in bundle_data list)
         for node_id in node_ids[:4]:

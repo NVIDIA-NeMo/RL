@@ -17,25 +17,6 @@ exit_if_max_steps_reached
 
 cd $PROJECT_ROOT
 
-DATA_DIR=$EXP_DIR/data
-RAW_DATA_DIR=$DATA_DIR/raw
-TRAIN_PATH=$DATA_DIR/swe1_train.jsonl
-VALIDATION_PATH=$DATA_DIR/swe1_validation.jsonl
-mkdir -p $RAW_DATA_DIR
-
-if [[ ! -f $RAW_DATA_DIR/swe1.jsonl ]]; then
-    uv run hf download nvidia/Nemotron-RL-Super-Training-Blends swe1.jsonl \
-        --repo-type dataset \
-        --local-dir $RAW_DATA_DIR
-fi
-
-if [[ ! -f $TRAIN_PATH ]]; then
-    head -n 512 $RAW_DATA_DIR/swe1.jsonl > $TRAIN_PATH
-fi
-if [[ ! -f $VALIDATION_PATH ]]; then
-    tail -n 32 $RAW_DATA_DIR/swe1.jsonl > $VALIDATION_PATH
-fi
-
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
@@ -47,8 +28,6 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    data.train.data_path=$TRAIN_PATH \
-    data.validation.data_path=$VALIDATION_PATH \
     $@ \
     2>&1 | tee $RUN_LOG
 
