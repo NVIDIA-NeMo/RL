@@ -226,6 +226,48 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_float32_policy_is_supported(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Policy CP preserves its existing float32 ring-efficient path."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["precision"] = "float32"
+        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.dtype == torch.float32
+        assert result.is_reward_model is False
+
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_float32_regression_reward_model_raises_error(
+        self,
+        mock_dynamo,
+        mock_config,
+    ):
+        """Value-style regression models require ring-flash-compatible precision."""
+        mock_config["precision"] = "float32"
+        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "regression",
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="Context parallel for regression reward models requires",
+        ):
+            validate_and_prepare_config(mock_config, None, 0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_sequence_parallel_with_tp_size_one_prints_warning(
         self,
         mock_dynamo,

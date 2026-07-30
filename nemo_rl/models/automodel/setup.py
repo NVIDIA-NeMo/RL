@@ -294,6 +294,11 @@ def validate_and_prepare_config(
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
+    reward_model_cfg = config.get("reward_model_cfg", {})
+    is_reward_model = reward_model_cfg.get("enabled", False)
+    is_regression_reward_model = (
+        is_reward_model and reward_model_cfg.get("reward_model_type") == "regression"
+    )
 
     # Validate sequence packing
     if enable_seq_packing:
@@ -323,9 +328,14 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
-    if cp_size_cfg > 1 and dtype not in (torch.float16, torch.bfloat16):
+    if (
+        is_regression_reward_model
+        and cp_size_cfg > 1
+        and dtype not in (torch.float16, torch.bfloat16)
+    ):
         raise ValueError(
-            "Context parallel requires precision='float16' or 'bfloat16' "
+            "Context parallel for regression reward models requires "
+            "precision='float16' or 'bfloat16' "
             "because its ring-flash attention kernel does not support float32 inputs."
         )
     attn_impl = (
@@ -351,14 +361,9 @@ def validate_and_prepare_config(
     ):
         allow_flash_attn_args = False
 
-    # Determine if reward model
-    is_reward_model = (
-        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
-    )
-
     if is_reward_model:
         # Validate reward model configuration
-        rm_type = config["reward_model_cfg"]["reward_model_type"]
+        rm_type = reward_model_cfg["reward_model_type"]
         if enable_seq_packing and rm_type != "regression":
             raise NotImplementedError(
                 "Sequence packing is only supported for token-level regression "
@@ -718,11 +723,23 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # PyTorch's ring-efficient CP kernel cannot merge GQA outputs when
-        # num_attention_heads != num_key_value_heads (for example Qwen2):
-        # its output and logsumexp head dimensions diverge. Force the ring-flash
-        # kernel, which supports the GQA layout used by these models.
-        sdpa_method = [SDPBackend.FLASH_ATTENTION]
+        is_regression_reward_model = (
+            is_reward_model
+            and config["reward_model_cfg"]["reward_model_type"] == "regression"
+        )
+        if is_regression_reward_model:
+            # PyTorch's ring-efficient CP kernel cannot merge GQA outputs when
+            # num_attention_heads != num_key_value_heads (for example Qwen2):
+            # its output and logsumexp head dimensions diverge. Force ring-flash
+            # for DTensor value models, which use regression reward model setup.
+            sdpa_method = [SDPBackend.FLASH_ATTENTION]
+        else:
+            # Preserve policy CP support for float32 through ring-efficient
+            # attention while preferring ring-flash for lower precision inputs.
+            sdpa_method = [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+            ]
     elif config["dtensor_cfg"]["activation_checkpointing"]:
         # For activation checkpointing, we must disable the cudnn SDPA backend because
         # it may not be selected during recomputation.
