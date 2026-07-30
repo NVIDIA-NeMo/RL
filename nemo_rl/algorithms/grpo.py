@@ -261,12 +261,13 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
-    # Early stop: end training once the chosen validation metric reaches
-    # this threshold; null disables early stopping.
+    # Early stop: end training once this validation metric (e.g. accuracy,
+    # always reported, or pass_k with grouped validation) reaches
+    # stop_at_validation_threshold; null disables early stopping.
+    stop_at_validation_metric: str | None
+    # Threshold for the early stop; required when stop_at_validation_metric
+    # is set.
     stop_at_validation_threshold: float | None
-    # Which validation metric the early stop compares, e.g. accuracy (always
-    # reported) or pass_k (grouped validation).
-    stop_at_validation_metric: str
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -435,6 +436,13 @@ def setup(
     else:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
+        )
+
+    # Validate the early-stop pairing
+    if grpo_config["stop_at_validation_metric"] is not None:
+        assert grpo_config["stop_at_validation_threshold"] is not None, (
+            "grpo.stop_at_validation_threshold must be set when "
+            "grpo.stop_at_validation_metric is set"
         )
 
     # Validate number of prompts per step
@@ -2580,13 +2588,18 @@ def _validation_stop_value(val_metrics: dict[str, Any], stop_metric: str) -> flo
 def _validation_early_stop_message(
     val_metrics: dict[str, Any],
     stop_threshold: float | None,
-    stop_metric: str,
+    stop_metric: str | None,
     *,
     initial: bool = False,
 ) -> Optional[str]:
     """Stop message when the early-stop threshold is reached, else None."""
-    if stop_threshold is None:
+    if stop_metric is None:
         return None
+    # setup() guards this pairing at startup; keep the invariant visible here.
+    assert stop_threshold is not None, (
+        "grpo.stop_at_validation_threshold must be set when "
+        "grpo.stop_at_validation_metric is set"
+    )
     value = _validation_stop_value(val_metrics, stop_metric)
     if value < stop_threshold:
         return None
