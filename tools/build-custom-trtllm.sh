@@ -19,8 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Parse command line arguments
-GIT_URL=${1:-https://github.com/NVIDIA/TensorRT-LLM.git}
-GIT_REF=${2:-bf2ef86f9a2652132b11773d4041e292c553c142}
+GIT_URL=${1:-https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git}
+GIT_REF=${2:-1f7cd6284a6cc198e9b58bda09e8b15411e796a5}
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty")/TensorRT-LLM
 if [[ -e "$BUILD_DIR" ]]; then
@@ -34,7 +34,7 @@ WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-/opt/trtllm_wheels}
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
-echo "  TRT-LLM Git URL: $GIT_URL"
+echo "  TRT-LLM Git URL: $(echo "$GIT_URL" | sed -E 's#(https?://)[^@/]*@#\1***@#')"
 echo "  TRT-LLM Git ref: $GIT_REF"
 
 # git-lfs is required because TRT-LLM ships its `internal_cutlass_kernels`
@@ -80,7 +80,7 @@ git submodule update --init --recursive --depth=1
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
-sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
+sed -i 's|nvidia-modelopt\[torch\]~=0\.39\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
 # cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
@@ -96,16 +96,18 @@ sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAK
     cpp/tensorrt_llm/deep_ep/CMakeLists.txt
 
 # Build the wheel.
-#   -a 100-real: Blackwell (sm_100) only — gb200 target. Bump to include
-#                90 for Hopper or 100,90 for both.
+#   --cuda_architectures 107-real: Rubin (sm_107) target. Adjust to include
+#                other SKUs (e.g. 100 for Blackwell/gb200, 90 for Hopper) as needed.
 #   --nvrtc_dynamic_linking: required so the wheel links against the venv's
 #                            libnvrtc-builtins lazily instead of statically.
+#   Parallelism defaults to the host core count (no explicit -j).
 echo "Building TensorRT-LLM wheel (this takes ~30-60 minutes)..."
 python3 scripts/build_wheel.py \
-    -a "100-real;103-real" \
+    --cuda_architectures "107-real" \
     -G Ninja \
     --clean \
     --nvrtc_dynamic_linking \
+    --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl \
     -D "ENABLE_UCX=OFF"
 
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."

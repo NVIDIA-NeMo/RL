@@ -26,23 +26,27 @@
 
 [project]
 name = "tensorrt-llm"
-version = "1.3.0rc21"
+version = "1.3.0rc22"
 requires-python = ">=3.13"
 dependencies = [
   "tensorrt~=10.16.1",
   "mpi4py",
   "numpy>=2.0.0,<2.4",
-  "torch>=2.11.0",
+  "torch",
   "torchvision",
-  "nvidia-modelopt>=0.37.0",
+  # Relaxed from the ref's `nvidia-modelopt[torch]~=0.39.0`: nemo-rl pins
+  # nvidia-modelopt[torch]>=0.44.0a0 (git source), so the ~=0.39 upper cap would
+  # conflict. build-custom-trtllm.sh patches the build-time requirements.txt to
+  # >=0.44.0a0 to match the runtime venv.
+  "nvidia-modelopt>=0.39.0",
   "nvidia-nccl-cu13>=2.28.9,<=2.29.7",
   "nvidia-cuda-nvrtc",
   "nvidia-cutlass-dsl[cu13]==4.5.0",
   "nvidia-ml-py>=13",
   "cuda-python>=13",
   "flash-attn-4==4.0.0b11",
-  "flashinfer-python==0.6.12",
-  "torchao>=0.14.1,<0.16.0",
+  "flashinfer-python",
+  "torchao",
   "apache-tvm-ffi==0.1.6",
   "torch-c-dlpack-ext==0.1.3",
   "xdsl>=0.59.0",
@@ -54,22 +58,22 @@ dependencies = [
   "mistral-common>=1.10.0",
   "tiktoken",
   "diffusers>=0.37.1",
-  "peft>=0.18.1",
+  "peft>=0.18.1,<0.19.0",
   "optimum",
   "ftfy",
-  "xgrammar>=0.1.32",
+  "xgrammar==0.1.32",
   "lark",
   "partial_json_parser",
   "onnx>=1.21.0",
   "onnx_graphsurgeon>=0.5.2",
-  "fastapi>=0.120.1",
+  "fastapi>=0.120.1,<=0.121.3",
   "starlette>=0.49.1",
   "uvicorn",
   "pydantic>=2.9.1",
   "pydantic-settings[yaml]",
   "python-multipart",
   "prometheus_client",
-  "prometheus-fastapi-instrumentator>=8.0.2",
+  "prometheus-fastapi-instrumentator",
   "openai-harmony==0.0.4",
   "etcd-sdk-python==0.0.7",
   "smg-grpc-proto>=0.4.2",
@@ -92,7 +96,7 @@ dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   "backoff",
   "jsonschema",
-  "click>=8.3.1",
+  "click>=8.3.1,<8.4",
   "click_option_group",
   "ordered-set",
   "msgpack",
@@ -104,6 +108,9 @@ dependencies = [
   "plotly",
   "matplotlib",
   "openai",
+  "lazy_loader~=0.5",
+  "nvidia-matmul-heuristics==0.1.0.27",
+  "uvloop>=0.19.0",
 ]
 
 [build-system]

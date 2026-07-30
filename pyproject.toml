@@ -204,7 +204,7 @@ mcore = [
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
 trtllm = [
-  "tensorrt-llm==1.3.0rc21",
+  "tensorrt-llm==1.3.0rc22",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -413,8 +413,9 @@ constraint-dependencies = [
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",
   "diffusers>=0.38.0",
-  # 8.0.1 fixed _IncludedRouter.path crash on fastapi>=0.137 (github.com/trallnag/prometheus-fastapi-instrumentator/issues/370)
-  "prometheus-fastapi-instrumentator>=8.0.2",
+  # NOTE: dropped the `prometheus-fastapi-instrumentator>=8.0.2` floor. It fixed
+  # a crash on fastapi>=0.137, but tensorrt-llm now pins fastapi<=0.121.3, and
+  # >=8.0.2 requires starlette>=1.0.0 which conflicts with that pin.
 ]
 
 # Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base

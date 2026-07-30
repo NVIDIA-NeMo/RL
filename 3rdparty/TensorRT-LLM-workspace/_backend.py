@@ -126,9 +126,9 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     env = os.environ.copy()
     git_url = env.get(
         "BUILD_CUSTOM_TRTLLM_URL",
-        "https://github.com/NVIDIA/TensorRT-LLM.git",
+        f"https://oauth2:{env.get('GITLAB_CLONE_ACCESS_TOKEN', '')}@gitlab-master.nvidia.com/ftp/tekit.git",
     )
-    git_ref = env.get("BUILD_CUSTOM_TRTLLM_REF", "bf2ef86f9a2652132b11773d4041e292c553c142")
+    git_ref = env.get("BUILD_CUSTOM_TRTLLM_REF", "1f7cd6284a6cc198e9b58bda09e8b15411e796a5")
 
     # Our own cache keyed by (git_url, git_ref, version, platform_tag).
     # uv's built-in build cache misses across venvs for no-build-isolation
