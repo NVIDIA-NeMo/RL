@@ -235,7 +235,7 @@ def summarize_records(
 
 def _producer_validation_upper_bounds(
     producer_metrics: dict[str, Any],
-) -> dict[str, int]:
+) -> dict[int, int]:
     """Return the final per-producer acknowledgement counts.
 
     The snapshot taken immediately after ``save_checkpoint`` can observe a
@@ -244,7 +244,7 @@ def _producer_validation_upper_bounds(
     deciding whether a restored key was ever acknowledged during this run.
     """
     return {
-        str(producer_id): int(count)
+        int(producer_id): int(count)
         for producer_id, count in producer_metrics["final_acknowledged"].items()
     }
 
@@ -954,16 +954,18 @@ def _load_phase(config: BenchmarkConfig) -> None:
                         unexpected.append(key)
                         continue
                 else:
-                    producer_id, local_index = key[len(PRODUCER_KEY_PREFIX) :].split(
-                        "-", 1
-                    )
+                    producer_id_text, local_index = key[
+                        len(PRODUCER_KEY_PREFIX) :
+                    ].split("-", 1)
                     # The immediate post-checkpoint snapshot can race with a
                     # producer between TQ's acknowledgement and its local
                     # counter update. The final count is the authoritative
                     # upper bound for keys acknowledged anywhere in this run;
                     # the pre-checkpoint count remains the lower-bound recovery
                     # guarantee checked above.
-                    upper_bound = final_acknowledged.get(producer_id)
+                    # Key IDs are zero-padded ("0003"), whereas metrics use
+                    # canonical integer strings ("3"). Normalize before lookup.
+                    upper_bound = final_acknowledged.get(int(producer_id_text))
                     if upper_bound is None or not 0 <= int(local_index) < upper_bound:
                         unexpected.append(key)
                         continue
@@ -991,7 +993,7 @@ def _load_phase(config: BenchmarkConfig) -> None:
         restored_producer_counts: dict[str, int] = {}
         for key in restored_keys:
             if key.startswith(PRODUCER_KEY_PREFIX):
-                producer_id = key[len(PRODUCER_KEY_PREFIX) :].split("-", 1)[0]
+                producer_id = str(int(key[len(PRODUCER_KEY_PREFIX) :].split("-", 1)[0]))
                 restored_producer_counts[producer_id] = (
                     restored_producer_counts.get(producer_id, 0) + 1
                 )

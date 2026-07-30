@@ -127,7 +127,13 @@ def test_producer_validation_uses_final_acknowledgements() -> None:
         "final_acknowledged": {"0": 64, "3": 32},
     }
 
-    assert _producer_validation_upper_bounds(metrics) == {"0": 64, "3": 32}
+    upper_bounds = _producer_validation_upper_bounds(metrics)
+    assert upper_bounds == {0: 64, 3: 32}
+
+    padded_producer_id = int(
+        _producer_key(3, 0).removeprefix("producer-").split("-", 1)[0]
+    )
+    assert upper_bounds[padded_producer_id] == 32
 
 
 def test_percentile_and_window_metrics() -> None:
