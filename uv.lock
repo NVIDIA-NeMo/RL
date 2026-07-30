@@ -101,7 +101,7 @@ overrides = [
     { name = "timm", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.17" },
     { name = "xgrammar", specifier = "==0.1.33" },
 ]
 excludes = ["nvidia-cutlass-dsl-libs-base"]
@@ -170,12 +170,12 @@ version = "10.16.1.11"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
+version = "2.17.0+2e559f0"
 requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
+version = "2.17.0+2e559f0"
 requires-dist = ["torch", "transformer-engine"]
 
 [[package]]
@@ -4422,7 +4422,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = "==0.26.0", index = "https://pypi.org/simple" },
     { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=b266d39" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.17" },
     { name = "transformers", specifier = ">=5.5.0,<5.9.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.5.0,<5.6.0" },
     { name = "transformers", marker = "extra == 'sglang'", specifier = "==5.6.0" },
@@ -7890,8 +7890,8 @@ dependencies = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15#42b840051647eef89761a16dfdff87e82bb253ab" }
+version = "2.17.0+2e559f0"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.17#2e559f062497bef768dfbe9d7e45548fadeca80a" }
 dependencies = [
     { name = "importlib-metadata" },
     { name = "packaging" },

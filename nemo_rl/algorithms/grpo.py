@@ -1268,6 +1268,34 @@ def setup(
         if "model_path" not in generation_config["sglang_cfg"]:
             generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
+        # Quantized online refit requires SGLang to boot from a checkpoint
+        # with the exact same tensor layout and high-precision exclusions.
+        # Resolve it before ``init_sglang`` starts the engines.
+        sglang_quantization_cfg = (
+            generation_config["sglang_cfg"].get("quantization") or {}
+        )
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            ensure_sglang_quantized_checkpoint,
+            get_sglang_quantization_scheme,
+            validate_sglang_quantized_refit_backend,
+        )
+
+        sglang_quantization_scheme = get_sglang_quantization_scheme(
+            sglang_quantization_cfg
+        )
+        validate_sglang_quantized_refit_backend(
+            scheme=sglang_quantization_scheme,
+            use_megatron=bool(
+                policy_config.get("megatron_cfg", {}).get("enabled", False)
+            ),
+        )
+        generation_config["sglang_cfg"]["model_path"] = (
+            ensure_sglang_quantized_checkpoint(
+                model_path=generation_config["sglang_cfg"]["model_path"],
+                quantization_config=sglang_quantization_cfg,
+            )
+        )
+
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
@@ -1275,9 +1303,6 @@ def setup(
             colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
-
-        # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
 
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
@@ -1339,9 +1364,13 @@ def setup(
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
-    # if it is not colocated inference, initialize collective communication for update weights
+    # if it is not colocated inference, initialize collective communication for update weights.
+    # SGLang owns its own weight-update process group (set up lazily on the
+    # first refit through ``connect_sglang_rollout_engines_distributed``), so
+    # skip the legacy trainer/vLLM init_collective handshake for SGLang.
     if (
         not colocated_inference
+        and backend != "sglang"
         and remote_transport is None
         and checkpoint_engine_config is None
     ):
@@ -1392,6 +1421,21 @@ def setup(
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+
+    if backend == "sglang":
+        weight_transfer_mode = (
+            generation_config["sglang_cfg"]
+            .get("sglang_server_config", {})
+            .get("weight_transfer_mode", "ipc" if colocated_inference else "broadcast")
+        )
+        expected = "ipc" if colocated_inference else "broadcast"
+        if weight_transfer_mode != expected:
+            raise ValueError(
+                f"sglang_server_config.weight_transfer_mode={weight_transfer_mode!r} "
+                f"is inconsistent with colocated.enabled={colocated_inference}: "
+                f"expected {expected!r}."
+            )
+
     if remote_transport is not None:
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)
@@ -1430,6 +1474,21 @@ def setup(
         print(
             f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
             flush=True,
+        )
+    elif backend == "sglang":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        )
+        # Only exchanges refit metadata. SGLang's own weight-update group is
+        # established lazily on the first refit.
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["sglang_weight_sync_init_time_s"] = (
+            time.perf_counter() - t0
         )
     else:
         if not (nccl_reshard_refit_enabled and not colocated_inference):
@@ -2225,9 +2284,21 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
+    # Every SGLang deployment reaches its refit through this hook: `setup`
+    # attaches an SGLang synchronizer that owns the whole lifecycle (phase
+    # transitions, engine recovery, pause/flush, transport), so SGLang never
+    # touches the branches below.
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+
+    if isinstance(policy_generation, SGLangGeneration):
+        # Fail loudly rather than falling through to the vLLM branches, which
+        # would call methods the SGLang path does not implement.
+        raise RuntimeError(
+            "SGLang refits require policy_generation.weight_synchronizer to be "
+            "set. Attach one with create_weight_synchronizer(...) during setup."
+        )
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
@@ -2260,7 +2331,6 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
-            # get model param keys, which is grouped by size
             if _refit_buffer_size_gb is not None:
                 buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
             else:
@@ -2271,36 +2341,21 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
-            if isinstance(policy_generation, SGLangGeneration):
-                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
-                futures_train = policy.stream_weights_via_http(
-                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
-                    buffer_size_bytes=buffer_size_bytes,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
-                # streams CUDA IPC handles in chunks; receiver reconstructs
-                # tensors in-place and feeds them into the inference engine's
-                # loader.
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes,
-                    kv_scales=kv_scales,
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+            # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+            # streams CUDA IPC handles in chunks; receiver reconstructs
+            # tensors in-place and feeds them into the inference engine's
+            # loader.
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl (vLLM) or megatron reshard
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
