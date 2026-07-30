@@ -427,11 +427,14 @@ class SGLangGenerationWorker:
             "log_level",
             "mem_fraction_static",
             "allow_auto_truncate",
-            "disable_piecewise_cuda_graph",
             "disable_cuda_graph",
             "disable_cuda_graph_padding",
-            "cuda_graph_max_bs",
-            "cuda_graph_bs",
+            "cuda_graph_backend_decode",
+            "cuda_graph_backend_prefill",
+            "cuda_graph_max_bs_decode",
+            "cuda_graph_max_bs_prefill",
+            "cuda_graph_bs_decode",
+            "cuda_graph_bs_prefill",
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]
