@@ -223,7 +223,7 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 | `PERSISTENT_CACHE` | Directory on a shared filesystem (e.g. Lustre) where vLLM/Triton/Inductor compile caches are persisted across runs. |
 | `EXTRA_MOUNTS` | Comma-separated `host:container` mount pairs for any shared filesystems holding your data, model checkpoints, and `PERSISTENT_CACHE` (e.g. `EXTRA_MOUNTS=/lustre:/lustre,/scratch:/scratch`). |
 | `SLURM_PARTITION`, `SLURM_ACCOUNT` | Your SLURM cluster credentials. |
-| `GENRM_MODEL` | GenRM judge: HF repo id or local path. Default is [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM). Served in-cluster from the gym pool at TP=4 DP=4 (16 GPUs). Required unless `GENRM_BASE_URL` is set. |
+| `GENRM_MODEL` | GenRM judge: HF repo id or local path. Default is [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM). Served in-cluster from the gym pool at TP=4 (DP varies by stage). Required unless `GENRM_BASE_URL` is set. |
 | `GENRM_BASE_URL` | _Optional._ URL of a separately-deployed GenRM service (e.g. `http://genrm-host:9213/v1`). If set, routes judging to that endpoint and ignores `GENRM_MODEL`. Useful when sharing a single GenRM deployment across many training jobs. |
 | `NL2BASH_JUDGE_MODEL` | NL2Bash / general-purpose judge: HF repo id or local path. Default judge is `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`. |
 | `SAFETY_JUDGE_MODEL` | Content-safety judge: HF repo id or local path. Default is [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B). |

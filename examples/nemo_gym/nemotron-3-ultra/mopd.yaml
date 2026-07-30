@@ -1,8 +1,3 @@
-# NOTE: Disabled on main because this config requires OPD/MOPD runtime support
-# from the ultra-v3 branch (OPDAdvantageEstimator, on_policy_distillation,
-# and non-colocated teacher worker groups). Rename to .yaml only after that
-# support lands on main.
-
 # =============================================================================
 # Nemotron 3 Ultra — MOPD Stage 1 (on-policy distillation from teacher panel)
 # =============================================================================
