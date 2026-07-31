@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from unittest.mock import patch
 
 import ray
@@ -75,6 +76,7 @@ global_fp8_config: FP8Config = None
 fp8_state: FP8State = FP8State()
 
 fp8_patches_applied = False
+FP8_CONFIG_ENV = "NRL_VLLM_FP8_CONFIG"
 
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
@@ -94,6 +96,15 @@ def my_run_engine_core(*args, **kwargs):
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
+        from vllm import envs
+
+        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+            # RayExecutorV2 has no collective_rpc before model loading. Its Ray
+            # workers inherit the engine process environment, so initialize the
+            # FP8 patches when each worker imports the NeMo-RL extension instead.
+            os.environ[FP8_CONFIG_ENV] = json.dumps(asdict(fp8_config))
+            return
+
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
         from vllm.v1.executor.ray_executor import RayDistributedExecutor
@@ -121,7 +132,8 @@ def monkey_patch_vllm_ray_executor(fp8_config):
         fp8_patches_applied = True
 
 
-def apply_fp8_patches(self, fp8_config):
+def apply_fp8_patches(_worker_self, fp8_config):
+    """Apply process-local patches; the Ray-injected actor argument is unused."""
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
 
@@ -184,6 +196,13 @@ def apply_fp8_patches(self, fp8_config):
         p.start()
 
     fp8_patches_applied = True
+
+
+def apply_fp8_patches_from_env():
+    """Initialize FP8 in a RayExecutorV2 worker before model construction."""
+    config_json = os.environ.get(FP8_CONFIG_ENV)
+    if config_json is not None and not fp8_patches_applied:
+        apply_fp8_patches(None, FP8Config(**json.loads(config_json)))
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
@@ -528,6 +547,66 @@ def load_weights(weights, model_runner):
             weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
+
+
+def _quantize_grouped_experts_blockwise(grouped_moe_expert):
+    """Block-FP8 quantize a grouped MoE expert slab in bounded chunks."""
+    block0, block1 = FP8_BLOCK_QUANT_KWARGS["weight_block_size"]
+    num_experts, out_features, in_features = grouped_moe_expert.shape
+    assert out_features % block0 == 0 and in_features % block1 == 0, (
+        f"Grouped expert shape {tuple(grouped_moe_expert.shape)} is not aligned to "
+        f"FP8 block size {(block0, block1)}; per-expert block quantization would "
+        "pad across expert boundaries."
+    )
+    weight_fp8 = torch.empty_like(grouped_moe_expert, dtype=torch.float8_e4m3fn)
+    scale_inv = torch.empty(
+        (num_experts, out_features // block0, in_features // block1),
+        dtype=torch.float32,
+        device=grouped_moe_expert.device,
+    )
+    # Amortize launch overhead while limiting full-precision temporaries to
+    # 1/16 of Qwen3.5's 512-expert slab.
+    experts_per_chunk = 32
+    for start in range(0, num_experts, experts_per_chunk):
+        end = min(start + experts_per_chunk, num_experts)
+        chunk = grouped_moe_expert[start:end]
+        chunk_fp8, chunk_scale_inv = cast_tensor_to_fp8_blockwise(
+            chunk.reshape(-1, in_features),
+            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+        )
+        weight_fp8[start:end].copy_(
+            chunk_fp8.reshape(end - start, out_features, in_features)
+        )
+        scale_inv[start:end].copy_(
+            torch.squeeze(chunk_scale_inv, dim=-1).reshape(
+                end - start, out_features // block0, in_features // block1
+            )
+        )
+    return weight_fp8, scale_inv
+
+
+def _expand_grouped_moe_expert_to_fp8(key, weight):
+    """Expand a grouped Qwen3.5 expert slab into per-expert FP8 weights."""
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    else:
+        shards = (("down_proj", weight),)
+
+    entries = []
+    for shard_name, grouped_moe_expert in shards:
+        weight_fp8, scale_inv = _quantize_grouped_experts_blockwise(
+            grouped_moe_expert.contiguous()
+        )
+        for expert_id in range(weight_fp8.shape[0]):
+            name = f"{base}.{expert_id}.{shard_name}.weight"
+            entries.append((name, weight_fp8[expert_id]))
+            entries.append((name + "_scale_inv", scale_inv[expert_id]))
+    return entries
 
 
 def cast_tensor_to_fp8_blockwise(

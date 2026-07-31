@@ -48,6 +48,10 @@ try:
     import vllm  # noqa: F401
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.v1.worker.gpu_worker import Worker as VllmWorker
+
+    from nemo_rl.models.generation.vllm.quantization.fp8 import (
+        apply_fp8_patches_from_env,
+    )
 except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -55,6 +59,8 @@ except ImportError:
         "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
+
+apply_fp8_patches_from_env()
 
 
 WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]

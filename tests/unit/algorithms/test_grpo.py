@@ -48,7 +48,6 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
-    _should_use_async_rollouts,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import types
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -517,6 +518,43 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         for path in patched_paths
     )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
+
+def test_ray_executor_v2_initializes_fp8_from_worker_environment(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    config = fp8.FP8Config(
+        use_weight_pow2_scale=True,
+        model_parallel_size=4,
+    )
+    applied_configs = []
+    monkeypatch.setenv(fp8.FP8_CONFIG_ENV, fp8.json.dumps(asdict(config)))
+    monkeypatch.setattr(
+        fp8,
+        "apply_fp8_patches",
+        lambda _self, fp8_config: applied_configs.append(fp8_config),
+    )
+
+    fp8.apply_fp8_patches_from_env()
+
+    assert applied_configs == [config]
+
+
+def test_ray_executor_v2_exports_fp8_config(fp8_module, monkeypatch):
+    from vllm import envs
+
+    fp8 = fp8_module
+    config = fp8.FP8Config(
+        use_weight_pow2_scale=True,
+        model_parallel_size=4,
+    )
+    monkeypatch.setattr(envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True)
+    monkeypatch.delenv(fp8.FP8_CONFIG_ENV, raising=False)
+
+    fp8.monkey_patch_vllm_ray_executor(config)
+
+    assert fp8.json.loads(fp8.os.environ[fp8.FP8_CONFIG_ENV]) == asdict(config)
 
 
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
