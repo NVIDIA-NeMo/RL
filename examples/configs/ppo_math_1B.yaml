@@ -25,8 +25,8 @@ ppo:
   # critic values / GAE advantages / logprobs (plus decoded text and per-sample
   # context) to {logger.log_dir}/ppo_rollout_dump_step{N}.pt. Tensors reflect
   # the state entering the PPO-epoch loop (before any update this step).
-  log_rollout_dump: false
-  rollout_dump_period: 1  # dump every N PPO steps (when log_rollout_dump is true)
+  log_rollout_dump: true
+  rollout_dump_period: 5  # dump every N PPO steps (when log_rollout_dump is true)
 
   reward_shaping:
     enabled: true
@@ -53,7 +53,7 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
-  seq_logprob_error_threshold: null
+  seq_logprob_error_threshold: 2
 
   async_ppo:
     enabled: false  # Set to true for async PPO (requires non-colocated vLLM generation)
@@ -74,7 +74,7 @@ ppo:
     # short rollouts => a dip in mean_gen_tokens_per_sample + reward spike after
     # each resume). true drops it and regenerates fresh (unbiased, one-target
     # bubble at resume). See AsyncPPOConfig in nemo_rl/algorithms/ppo.py.
-    drop_incomplete_targets_on_restore: false
+    drop_incomplete_targets_on_restore: true
     # Heartbeat frequency for the collector/replay-buffer per-rollout progress
     # prints (they flood the log at large num_prompts_per_step). Log every Nth
     # event (plus the final one per target); 0 silences them; unset => every event.
@@ -486,3 +486,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: 2

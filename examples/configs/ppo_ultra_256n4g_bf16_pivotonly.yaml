@@ -1,28 +1,46 @@
 # =============================================================================
-# GRPO Ultra V3 — 256-node GB200 NVL72 Config (bf16)
+# PPO Ultra V3 — Multienv Pivot-Only Config (bf16), GB200 NVL72
 # =============================================================================
-# Config for GRPO training on 256 nodes × 4 GPUs/node (1024 GPUs).
-# Full batch sizes and sequence lengths for convergence runs.
+# PPO/VAPO port of grpo_ultra_256n4g_bf16_pivotonly.yaml (multienv pivot data:
+# code_gen, instruction_following, calendar, tool-use pivots, structured
+# outputs, format verification). Run with examples/nemo_gym/run_ppo_nemo_gym.py.
+# The GRPO->PPO transformation mirrors ppo_nano_v3_5_swe_cmh.yaml (the
+# validated SWE PPO port):
+#   - `grpo:` section replaced by `ppo:` (GAE adv_estimator, ppo_epochs,
+#     critic warmup via policy_training_start_step, async_ppo instead of
+#     async_grpo). max_val_samples / val_batch_size MUST stay null — the
+#     NeMo-Gym PPO runner rejects preset values and sets both to
+#     len(val_dataset). GRPO-only keys are dropped (not in PPOConfig):
+#     normalize_rewards, use_leave_one_out_baseline, advantage_clip_low/high,
+#     num_val_generations_per_prompt, use_best_at_k*, use_combined_training*,
+#     dynamic_sampling_oversample_ratio.
+#   - grpo's penalize_invalid_tool_call / invalid_tool_call_advantage (-5.0)
+#     are DROPPED: ppo setup() raises NotImplementedError on *_advantage keys
+#     (message-level advantage overwrites break GAE advantage/return
+#     consistency). NOTE this means PPO does NOT reproduce the GRPO baseline's
+#     invalid-tool-call advantage penalty; the PPO-compatible mechanism is the
+#     reward-zeroing `reward_penalties:` block below (carried over unchanged),
+#     which has no invalid-tool-call entry.
+#   - new `value:` block — Megatron-backend value model initialized from the
+#     policy checkpoint (fresh scalar value head), mirroring the policy's
+#     parallelism/MoE settings. The nano hybrid (mamba+MoE) critic is
+#     experimental (megatron value worker validated on GPT-style dense only).
+#   - new `value_loss_fn:` block (clipped MSE, scale=1.0 / cliprange=0.5 from
+#     the validated 7B math PPO run).
+#   - loss_fn: force_on_policy_ratio false (PPO trains on the real
+#     prev/current logprob ratio; GRPO forced ratio=1 and leaned on TIS only),
+#     ratio_clip_c 3 (dual-clip).
+#   - policy/value megatron checkpoint blocks omit the fully_parallel_* keys
+#     (present in the GRPO parent): this container's megatron-bridge
+#     CheckpointConfig dropped them and raises InstantiationException
+#     "Unexpected config keys" (see ppo_nano_v3_5_swe_cmh.yaml).
+#   - vllm_kwargs adds disable_custom_all_reduce: true — validated fix for the
+#     GB200 TP-4 custom-allreduce generation-engine deadlock seen on the SWE
+#     PPO runs (same container/hardware).
 #
-# Node allocation (256 total, set via launch script env vars):
-#   - Training:   64 nodes  (256 GPUs) — 4 segments of 16
-#   - vLLM:      182 nodes  (728 GPUs) — 91 instances at TP=8 EP=8 (2 nodes each)
-#   - Gym/Judge:  10 nodes  ( 40 GPUs) — judges scaled for production throughput
-#
-# Generation-heavy split follows the SuperV3 production ratio (~25/71/4).
-#
-# Training parallelism (256 GPUs = 64 nodes):
-#   - TP: 8
-#   - EP: 64
-#   - CP: 8
-#   - PP: 1
-#   - SP: true
-#
-# vLLM parallelism (bf16, TP=8, EP=8):
-#   NeMo Gym requires async_engine=true, but vLLM DP+EP (EP > TP) requires
-#   async_engine=false (see https://github.com/NVIDIA-NeMo/RL/issues/1101).
-#   This forces EP <= TP. With EP=8 (=TP), vllm_dp_size = 8/8 = 1 so
-#   async_engine=true works.
+# Static algorithm, loss, and environment settings live here. Per-run
+# overrides (model path, data paths, parallelism, batch sizes) are applied by
+# the launch script (scripts/multienv/nano_pivot_ppo.sh) or Hydra CLI.
 # =============================================================================
 
 # =============================================================================
@@ -38,7 +56,7 @@ cluster:
 # =============================================================================
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo_ultra_v3"
+  checkpoint_dir: "results/ppo_ultra_v3_pivotonly"
   metric_name: "val:total_reward/mean"
   higher_is_better: true
   keep_top_k: 1000000
@@ -51,33 +69,53 @@ checkpointing:
   save_consolidated: false
 
 # =============================================================================
-# GRPO Algorithm
+# PPO Algorithm (replaces the parent's grpo: section)
 # =============================================================================
-grpo:
+ppo:
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
-  normalize_rewards: true
-  use_leave_one_out_baseline: true
-  advantage_clip_low: -50
-  advantage_clip_high: 50
-  val_period: -1
+  # One optimizer pass per rollout batch (PPO-epochs>1 reuses the batch).
+  ppo_epochs: 1
+  # Critic-only warmup: policy training is skipped for the first N steps while
+  # the (fresh-head) value model trains on rollouts from the frozen policy.
+  # Overridden by the launch script.
+  policy_training_start_step: 100
+  val_period: 10000
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  # NeMo-Gym principle: the validation set is used verbatim (no hidden pre/post
+  # processing). run_ppo_nemo_gym.py rejects a preset max_val_samples and sets
+  # both to len(val_dataset), so they must start null (the GRPO parent's
+  # val_batch_size: 256 must NOT carry over).
   max_val_samples: null
-  val_batch_size: 256
+  val_batch_size: null
   seed: 42
 
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
 
-  penalize_invalid_tool_call: true
-  invalid_tool_call_advantage: -5.0
+  # loss_fn.reference_policy_kl_penalty is 0 (GRPO pivot baseline), so skip the
+  # reference-policy logprob forward. The launch script flips this to false
+  # automatically when a nonzero KL penalty is requested.
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+
+  # GAE with VAPO decoupled lambdas (defaults match the validated 7B math PPO
+  # run; the launch script sets length_adaptive_alpha).
+  adv_estimator:
+    name: "gae"
+    gae_lambda: 1.0
+    gae_gamma: 1
+    normalize_advantages: true
+    gae_lambda_value: 1.0
+    gae_lambda_policy: 1
+    # Length-adaptive lambda_policy = 1 - 1/(alpha*l). 0 = disabled.
+    length_adaptive_alpha: null
 
   reward_shaping:
     enabled: false
@@ -92,23 +130,25 @@ grpo:
     target_min: 0.0
     target_max: 1.0
 
-  async_grpo:
+  # NOTE: grpo's penalize_invalid_tool_call / invalid_tool_call_advantage are
+  # intentionally absent: setup() raises NotImplementedError if the *_advantage
+  # keys are set on the PPO path (advantage overwrites break GAE consistency).
+
+  async_ppo:
     enabled: true
+    # lag-1: at most one policy version off-policy (recommended/validated).
+    # During critic warmup the frozen actor makes any-age trajectories
+    # on-policy for free (warmup_max_trajectory_age_steps; null => same value).
     max_trajectory_age_steps: 1
+    warmup_max_trajectory_age_steps: 8
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
-
-  use_best_at_k: false
-  best_at_k_k: 8
-  best_at_k_m: 1000
-
-  use_combined_training: false
-  combined_training_weight_mode: "auto"
-  combined_training_best_at_k_weight: 0.2
-  combined_training_pass_at_1_weight: 1.0
-
-  dynamic_sampling_oversample_ratio: 1.0
-  seq_logprob_error_threshold: 2
+    # Drop the incomplete (survivorship-biased) frontier target on resume and
+    # regenerate it fresh — unbiased batches at the cost of a one-target
+    # generation bubble per resume.
+    drop_incomplete_targets_on_restore: false
+    # Throttle collector/replay-buffer per-rollout heartbeat prints.
+    log_every: 500
 
 # =============================================================================
 # Loss Function
@@ -119,18 +159,31 @@ loss_fn:
   kl_input_clamp_value: null
   kl_output_clamp_value: null
 
+  # clip_min/max carried from the GRPO pivot baseline (DAPO 0.2/0.28); the
+  # launch script overrides clip_max to the validated PPO recipe's 0.2.
+  # Dual-clip c=3 from the validated 7B math PPO run.
   ratio_clip_min: 0.2
   ratio_clip_max: 0.28
-  ratio_clip_c: null
+  ratio_clip_c: 3
   use_on_policy_kl_approximation: true
+  # Async PPO requires the off-policy importance-sampling correction.
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
   token_level_loss: true
-  force_on_policy_ratio: true
+  # PPO trains on the real prev/current-logprob ratio; forcing ratio=1 (as the
+  # GRPO parent does) would disable PPO clipping entirely.
+  force_on_policy_ratio: false
   use_kl_in_reward: false
+
+# =============================================================================
+# Value Loss (MSE with PPO-style clipping)
+# =============================================================================
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
 
 # =============================================================================
 # Policy
@@ -271,9 +324,11 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
-      fully_parallel_save_process_group: "ep_dp"
-      fully_parallel_load_process_group: "ep_dp"
-      fully_parallel_load_exchange_algo: "broadcast"
+      # NOTE: the GRPO parent's fully_parallel_{save,load}_process_group /
+      # fully_parallel_load_exchange_algo are dropped: this container's
+      # megatron-bridge CheckpointConfig no longer has them and raises
+      # InstantiationException "Unexpected config keys" (see the SWE PPO
+      # config, ppo_nano_v3_5_swe_cmh.yaml).
 
     env_vars: null
 
@@ -315,6 +370,8 @@ policy:
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
     # Same memory as EP=1 but uses all-to-all for expert routing.
     # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
+    # The launch script overrides TP and EP together (TP=EP=4 by default) to
+    # keep the EP<=TP constraint when it shrinks TP.
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
@@ -333,7 +390,7 @@ policy:
       expose_http_server: true
       skip_tokenizer_init: false
       # nano_v3 is a CUSTOM reasoning parser; its plugin file is registered at vllm_cfg
-      # top level (read by vllm_worker_async.py:481 -> ReasoningParserManager.import_reasoning_parser).
+      # top level (read by vllm_worker_async.py -> ReasoningParserManager.import_reasoning_parser).
       # It must NOT sit inside http_server_serving_chat_kwargs: that dict is splatted into
       # OpenAIServingChat(**kwargs), which has no reasoning_parser_plugin arg -> TypeError.
       reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
@@ -346,6 +403,12 @@ policy:
       attention_backend: FLASH_ATTN
       moe_backend: triton
       mamba_ssm_cache_dtype: "float32"
+      # Route TP allreduces through NCCL instead of vLLM's custom CUDA-IPC
+      # spin kernel. On the SWE PPO runs (same container/GB200 nodes), TP-4
+      # engines deadlocked in the custom-allreduce kernel (all 4 TP ranks with
+      # the next collective enqueued-but-never-started, symmetric cross-GPU
+      # deadlock). Costs a few % decode latency on TP-4.
+      disable_custom_all_reduce: true
       compilation_config:
         cudagraph_mode: PIECEWISE
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
@@ -357,6 +420,168 @@ policy:
       resources:
         gpus_per_node: 4
         num_nodes: 182   # Overridden by launch script
+
+# =============================================================================
+# Value Model (GAE critic) — Megatron backend, initialized from the policy
+# checkpoint with a fresh scalar value head. Parallelism/MoE settings mirror
+# the policy block; the launch script overrides them together.
+# =============================================================================
+value:
+  model_name: ${policy.model_name}
+  tokenizer:
+    name: ${value.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+
+  train_global_batch_size: ${policy.train_global_batch_size}
+  train_micro_batch_size: ${policy.train_micro_batch_size}
+  logprob_batch_size: ${policy.logprob_batch_size}
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  precision: "bfloat16"
+
+  reward_model_cfg:
+    enabled: false  # only used for the DTensor V2 value worker
+    reward_model_type: "regression"
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 64
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${value.precision}
+    sequence_parallel: true
+
+    # MoE — mirror the policy
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+
+    # Compute — mirror the policy
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    # MTP — fully disabled for the critic. The value model replaces the LM
+    # head with a scalar head, so MTP next-token heads are dead weight; null
+    # skips the MTP block on all ranks (no partial-rank EP collective).
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: true
+    mtp_num_layers: null
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      # Critic LR (fresh value head trains faster than the pretrained actor).
+      # Overridden by the launch script.
+      lr: 6.0e-6
+      min_lr: 6.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${value.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${value.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${value.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 6.0e-7
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${mul:${mul:${value.megatron_cfg.tensor_model_parallel_size}, ${value.megatron_cfg.context_parallel_size}}, 2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
 
 # =============================================================================
 # Data
@@ -378,7 +603,8 @@ data:
     processor: "nemo_gym_data_processor"
 
 # =============================================================================
-# Environment — NeMo Gym + Judge Models
+# Environment — NeMo Gym multienv pivot servers (copied verbatim from the
+# GRPO parent grpo_ultra_256n4g_bf16_pivotonly.yaml)
 # =============================================================================
 env:
   should_use_nemo_gym: true
@@ -401,212 +627,18 @@ env:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - resources_servers/math_with_judge/configs/math_with_judge.yaml
       - resources_servers/code_gen/configs/code_gen.yaml
-      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
-      - resources_servers/mcqa/configs/mcqa.yaml
       - resources_servers/instruction_following/configs/instruction_following.yaml
-      - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
       - resources_servers/calendar/configs/calendar.yaml
-      - resources_servers/genrm_compare/configs/genrm_compare.yaml
-      - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
-      - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
       - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
-      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
       - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
-      - resources_servers/ns_tools/configs/ns_tools.yaml
-      - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
-      # swerl_gen disabled: requires Apptainer/Singularity (not available on aarch64)
-      # - resources_servers/swerl_gen/configs/swerl_gen.yaml
-      - resources_servers/multichallenge/configs/multichallenge.yaml
-      - resources_servers/inverse_if/configs/inverse_if.yaml
       - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
       - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
       - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
-      - resources_servers/abstention/configs/abstention.yaml
-      - resources_servers/nvarc/configs/inductive.yaml
-      - resources_servers/nvarc/configs/transductive.yaml
       - resources_servers/single_step_tool_use_with_argument_comparison/configs/droid_pivot_single_step_tool_use_with_argument_comparison.yaml
-      - resources_servers/equivalence_rule/configs/lc.yaml
-      - resources_servers/ether0/configs/ether0.yaml
       - resources_servers/structured_outputs/configs/structured_outputs_json_yaml_xml_v1.yaml
       - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
       - resources_servers/format_verification/configs/freeform_formatting.yaml
       - resources_servers/format_verification/configs/citation_format.yaml
-      - resources_servers/rdkit_chemistry/configs/rdkit_chemistry.yaml
-      - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
-      - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
-
-    abstention:
-      resources_servers:
-        abstention:
-          judge_model_server:
-            type: responses_api_models
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    # Safety Model: 4B — TP=4 ensures each PG claims a full node,
-    # avoiding GPU fragmentation that can block larger-TP models.
-    jailbreak_detection:
-      resources_servers:
-        jailbreak_detection:
-          judge_model_server:
-            type: responses_api_models
-            name: safety_judge_model
-
-    safety_judge_model:
-      responses_api_models:
-        local_vllm_model:
-          entrypoint: app.py
-          model: null   # Set by launch script
-          return_token_id_information: false
-          uses_reasoning_parser: false
-          debug: true
-          vllm_serve_env_vars:
-            VLLM_RAY_DP_PACK_STRATEGY: strict
-            # The gym `local_vllm_model` venv has no deep_gemm (nemo_rl's policy venv
-            # does, but this stock-vLLM judge venv doesn't). On an FP8 model, vLLM's
-            # deep_gemm warmup then hard-fails. Disable it -> fall back to vLLM's other
-            # FP8 kernels, consistent with the policy running use_deep_gemm=false.
-            VLLM_USE_DEEP_GEMM: "0"
-
-          vllm_serve_kwargs:
-            attention_backend: TRITON_ATTN
-            tensor_parallel_size: 4
-            data_parallel_size: 2
-            data_parallel_size_local: 1
-            pipeline_parallel_size: 1
-            gpu_memory_utilization: 0.85
-            max_model_len: 96000
-            max_num_seqs: 16
-            model_loader_extra_config:
-              enable_multithread_load: true
-              num_threads: 112
-            compilation_config:
-              cudagraph_capture_sizes: [1,2,4,8,16]
- 
-
-    # nl2bash / General Judge: TP=4 on GB200 192GB
-    nl2bash_judge_model:
-      responses_api_models:
-        local_vllm_model:
-          entrypoint: app.py
-          model: null   # Set by launch script
-          return_token_id_information: false
-          uses_reasoning_parser: false
-          debug: true
-          vllm_serve_env_vars:
-            VLLM_RAY_DP_PACK_STRATEGY: strict
-            # The gym `local_vllm_model` venv has no deep_gemm (nemo_rl's policy venv
-            # does, but this stock-vLLM judge venv doesn't). On an FP8 model, vLLM's
-            # deep_gemm warmup then hard-fails. Disable it -> fall back to vLLM's other
-            # FP8 kernels, consistent with the policy running use_deep_gemm=false.
-            VLLM_USE_DEEP_GEMM: "0"
-
-          vllm_serve_kwargs:
-            attention_backend: FLASH_ATTN
-            tensor_parallel_size: 4
-            data_parallel_size: 4
-            data_parallel_size_local: 1
-            pipeline_parallel_size: 1
-            enable_expert_parallel: true
-            enable_auto_tool_choice: true
-            tool_call_parser: hermes
-            gpu_memory_utilization: 0.85
-            max_model_len: 131072
-            max_num_seqs: 256
-            model_loader_extra_config:
-              enable_multithread_load: true
-              num_threads: 112
-            compilation_config:
-              cudagraph_capture_sizes: [1,2,4,8,16,32]
-          server_env:
-            NCCL_MNNVL_ENABLE: "0"
-
-    inverse_if:
-      resources_servers:
-        inverse_if:
-          judge_model_server:
-            type: responses_api_models
-            name: nl2bash_judge_model
-
-    multichallenge:
-      resources_servers:
-        multichallenge:
-          judge_model_server:
-            type: responses_api_models
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    equivalence_llm_judge:
-      resources_servers:
-        equivalence_llm_judge:
-          judge_model_server:
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    # GenRM: TP=4 on GB200 192GB
-    genrm_compare_resources_server:
-      resources_servers:
-        genrm_compare:
-          num_rollouts_per_prompt: ${grpo.num_generations_per_prompt}
-          genrm_model_server:
-            type: responses_api_models
-            name: genrm_model
-          genrm_responses_create_params:
-            max_output_tokens: 24576
-            temperature: 1.0
-            top_p: 0.95
-          comparison_strategy: "circular"
-          use_golden_anchor: true
-          num_judges_per_comparison: 1
-          use_principle: true
-          default_principle: "You will be given one or more evaluation criteria (rubrics).\nEvaluate both responses on EACH criterion individually first, then synthesize an overall judgment.\nCriteria:\n\n1. Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt."
-          aggregator_method: "simple_tiebreaker"
-          reasoning_bonus: 0.5
-          answer_bonus: 0.5
-          top_percentile: 0.2
-          group_reasoning_length_penalty_coeff: 0.12
-          group_answer_length_penalty_coeff: 0.12
-          group_style_penalty_coeff: 0.0
-          default_score: 3.0
-          default_ranking: 3.5
-          genrm_parse_retries: 1
-
-    # GenRM: external server managed by genrm_server_manager.sh
-    # Setting base_url triggers external mode — no local vLLM launch.
-    genrm_model:
-      responses_api_models:
-        genrm_model:
-          entrypoint: app.py
-          base_url: http://10.109.28.142:9213/v1   # Set by launch script: env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=http://...
-          model: "model"   # Must match --served-model-name in external vLLM server
-          uses_reasoning_parser: true
-          return_token_id_information: false
-          debug: true
-          vllm_serve_env_vars: {}
-          vllm_serve_kwargs:
-            tensor_parallel_size: 1
-            data_parallel_size: 1
-            pipeline_parallel_size: 1
-
-    lc_judge:
-      resources_servers:
-        equivalence_llm_judge:
-          judge_model_server:
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    math_with_judge:
-      resources_servers:
-        math_with_judge:
-          judge_model_server:
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-          should_use_judge: true
 
     code_gen:
       resources_servers:
@@ -615,31 +647,34 @@ env:
           unit_test_timeout_secs: 10
           debug: false
 
-
 # =============================================================================
 # Logger
 # =============================================================================
 logger:
-  log_dir: "/lustre/fsw/portfolios/llmservice/users/ansubramania/ultra_v3/runs/logs"
+  log_dir: "logs"
   num_val_samples_to_print: 0
+  # The GRPO parent shipped wandb_enabled: false (and the launch script does
+  # not override it) — enabled here so W&B logging actually works.
   wandb_enabled: true
   tensorboard_enabled: false
   mlflow_enabled: false
   monitor_gpus: true
   swanlab_enabled: false
   wandb:
-    project: "grpo-ultra-v3"
-    name: "grpo-ultra-v3-256n"
+    project: "ppo-ultra-v3-pivotonly"
+    name: "ppo-ultra-v3-pivotonly-256n"
   tensorboard: {}
   mlflow:
-    experiment_name: "grpo-ultra-v3"
-    run_name: "grpo-ultra-v3-256n"
+    experiment_name: "ppo-ultra-v3-pivotonly"
+    run_name: "ppo-ultra-v3-pivotonly-256n"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 
 # =============================================================================
-# Effort Levels
+# Effort Levels — carried over from the GRPO parent for parity. The parent's
+# other top-level keys (token_ids, penalize_*) are inert in this checkout and
+# were dropped on the PPO path (matching ppo_nano_v3_5_swe_cmh.yaml).
 # =============================================================================
 effort_levels:
   low_string: "{reasoning effort: efficient}"
@@ -647,23 +682,9 @@ effort_levels:
   low_penalty: 1
   low_ub: 15000
 
-# =============================================================================
-# Token IDs (model-specific, used by token-based penalties)
-# =============================================================================
-token_ids:
-  eos: 2           # </s>
-  think_open: 12   # <think>
-  think_close: 13  # </think>
-
-# =============================================================================
-# Reward Penalties (set reward to 0 when triggered)
-# =============================================================================
-penalize_duplicated_reasoning: true   # reasoning content == final answer
-penalize_empty_final_answer: true     # last message output has empty content
-penalize_eos_token: true              # eos token appears in generation
-penalize_malformed_think_tag: true     # <think>/<\/think> count != 1 per turn
-
-# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+# Reward-zeroing penalties applied to NeMo-Gym rollout results (the
+# PPO-compatible penalty path: applied to rewards pre-GAE, unlike grpo's
+# advantage-overwrite penalties). Carried over unchanged from the GRPO parent.
 reward_penalties:
   penalize_duplicated_reasoning: true
   penalize_empty_final_answer: true
