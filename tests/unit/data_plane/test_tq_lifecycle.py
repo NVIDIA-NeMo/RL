@@ -134,10 +134,11 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
         consumer_tasks=["read"],
     )
     keys = ["a", "b", "c", "d"]
+    values = torch.arange(12).reshape(4, 3)
     client.put_samples(
         sample_ids=keys,
         partition_id="smoke-backend",
-        fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
+        fields=TensorDict({"x": values}, batch_size=[4]),
     )
 
     meta = client.claim_meta(
@@ -150,7 +151,9 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
     assert meta.size == 4
 
     data = client.get_data(meta)
-    expected = torch.tensor([keys.index(k) for k in meta.sample_ids])
+    expected = torch.stack([values[keys.index(k)] for k in meta.sample_ids])
+    assert not data["x"].is_nested
+    assert data["x"].shape == expected.shape
     assert torch.equal(data["x"], expected)
 
     client.clear_samples(sample_ids=None, partition_id="smoke-backend")
