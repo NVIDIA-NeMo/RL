@@ -29,6 +29,122 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 
 logger = logging.getLogger(__name__)
 
+# Env-var driven local editable installs.
+#
+#   NRL_<TIER>_EDITABLE — a *replacement*: syncs the tier's extra from the lockfile
+#                         but skips building the pinned `skip_package` (e.g. no
+#                         ~60-min tensorrt-llm wheel build), then installs the local
+#                         path with `uv pip install --no-deps -e`. The extra provides
+#                         the (locked) runtime deps; the pre-built editable provides
+#                         the package itself. e.g. NRL_TRTLLM_EDITABLE.
+# Value is a comma-separated list of local paths.
+# Each entry: (env_var, venv-name substring, distribution to skip building).
+_TIER_EDITABLE_ENV_VARS = (("NRL_TRTLLM_EDITABLE", "trtllm", "tensorrt-llm"),)
+
+
+def _tier_editable_paths_for_venv(venv_name: str) -> list[str]:
+    """Return replacement-editable paths (from NRL_<TIER>_EDITABLE) for this venv."""
+    paths: list[str] = []
+    for env_key, tier, _skip_package in _TIER_EDITABLE_ENV_VARS:
+        if tier in venv_name.lower():
+            paths += [p.strip() for p in os.environ.get(env_key, "").split(",") if p.strip()]
+    return paths
+
+
+def _tier_skip_package_for_venv(venv_name: str) -> str | None:
+    """Return the pinned distribution to exclude from `uv sync` (the editable
+    replaces it) for this venv's active tier editable, or None."""
+    for env_key, tier, skip_package in _TIER_EDITABLE_ENV_VARS:
+        if tier in venv_name.lower() and os.environ.get(env_key, "").strip():
+            return skip_package
+    return None
+
+
+# Main-venv path whose cuDNN is treated as authoritative (all NeMo-RL containers
+# ship it here). Overridable for non-standard images.
+_MAIN_VENV = os.environ.get("NRL_MAIN_VENV", "/opt/nemo_rl_venv")
+
+
+def _cudnn_link(target: str, linkname: str) -> None:
+    """Idempotently (re)create a symlink; log, don't raise, on failure."""
+    try:
+        if os.path.islink(linkname) or os.path.exists(linkname):
+            os.remove(linkname)
+        os.symlink(target, linkname)
+    except OSError as exc:  # pragma: no cover
+        logger.warning(f"cuDNN symlink {linkname} -> {target} failed: {exc}")
+
+
+def _cudnn_minor_suffix(cudnn_lib_dir: str) -> str:
+    """Return the '.MINOR.PATCH' suffix the loader appends to libcudnn*.so.9
+    (e.g. '.20.0' for cuDNN 9.20.0), or '' if it can't be determined.
+
+    Derived from the installed nvidia-cudnn wheel's dist-info version: pure
+    filesystem, so no GPU, no dlopen, and no system-wide cuDNN are needed (the
+    /usr/lib soname the previous implementation relied on is absent in the
+    baked containers). Falls back to a system versioned soname if present.
+    """
+    import glob
+    import re
+
+    # .../nvidia/cudnn/lib -> .../site-packages
+    site_packages = os.path.dirname(os.path.dirname(os.path.dirname(cudnn_lib_dir)))
+    for dist_info in glob.glob(
+        os.path.join(site_packages, "nvidia_cudnn_cu*-*.dist-info")
+    ):
+        # nvidia_cudnn_cu13-9.20.0.48 -> minor=20 patch=0 -> ".20.0"
+        m = re.search(
+            r"nvidia_cudnn_cu[0-9]+-[0-9]+\.([0-9]+)\.([0-9]+)",
+            os.path.basename(dist_info),
+        )
+        if m:
+            return f".{m.group(1)}.{m.group(2)}"
+    for soname in glob.glob("/usr/lib/*/libcudnn.so.9.*"):
+        suffix = os.path.basename(soname)[len("libcudnn.so.9") :]
+        if suffix:
+            return suffix
+    return ""
+
+
+def _fix_cudnn_symlinks(venv_path: str) -> None:
+    """Reconcile cuDNN after a freshly-built editable venv so it doesn't hit
+    CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED / _VERSION_MISMATCH in conv ops.
+
+    pip's nvidia-cudnn wheels ship only the major soname (libcudnn_*.so.9), but
+    TE / the cuDNN frontend dlopen the full minor-versioned name
+    (libcudnn_*.so.9.X.Y). (1) add those versioned symlinks for the SUBLIBRARIES
+    in the main venv (not the main lib — the `cudnn` python pkg globs
+    libcudnn.so.* and asserts exactly one match); (2) point this venv's cuDNN at
+    the main venv's copies so the preloaded main lib and the dlopen'd sublibs
+    share one build. Best-effort no-op if dirs are absent.
+
+    Only called after an editable install below. Baked images get the same fix
+    at build time via docker/mlperf/Dockerfile.cudnn-fix.
+    """
+    import glob
+
+    main_dirs = glob.glob(
+        os.path.join(_MAIN_VENV, "lib/python*/site-packages/nvidia/cudnn/lib")
+    )
+    trt_dirs = glob.glob(
+        os.path.join(venv_path, "lib/python*/site-packages/nvidia/cudnn/lib")
+    )
+    if not (main_dirs and trt_dirs):
+        return
+    main_dir, trt_dir = main_dirs[0], trt_dirs[0]
+    suffix = _cudnn_minor_suffix(main_dir)
+    if not suffix:
+        return
+    # (1) minor-versioned names for the sublibraries in the authoritative dir.
+    for f in glob.glob(os.path.join(main_dir, "libcudnn_*.so.9")):
+        _cudnn_link(os.path.basename(f), f + suffix)  # relative, within main_dir
+    # (2) point this venv's cuDNN (main lib + sublibs + versioned) at the main venv.
+    for f in glob.glob(os.path.join(main_dir, "libcudnn*.so.9")) + glob.glob(
+        os.path.join(main_dir, "libcudnn_*.so.9" + suffix)
+    ):
+        _cudnn_link(f, os.path.join(trt_dir, os.path.basename(f)))  # absolute -> main
+    logger.info(f"Applied cuDNN symlink fix ({trt_dir} -> {main_dir}, minor {suffix})")
+
 
 @lru_cache(maxsize=None)
 def create_local_venv(
@@ -95,10 +211,51 @@ def create_local_venv(
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
-    subprocess.run(exec_cmd, env=env, check=True)
+
+    # A tier replacement editable (e.g. NRL_TRTLLM_EDITABLE) means: sync the tier's
+    # extra from the lockfile but SKIP building the pinned package (e.g. avoid the
+    # ~60-min tensorrt-llm wheel build), so all of the extra's locked runtime deps
+    # land while the package itself is provided by the local editable below.
+    tier_editable_paths = _tier_editable_paths_for_venv(venv_name)
+    skip_package = _tier_skip_package_for_venv(venv_name)
+    if skip_package:
+        # Derive the sync command from py_executable (`uv run --locked --extra
+        # <tier> --directory <root>`): swap `run` -> `sync`, exclude the pinned pkg.
+        sync_cmd = shlex.split(py_executable)
+        sync_cmd[1] = "sync"  # `uv run ...` -> `uv sync ...`
+        sync_cmd += ["--no-install-package", skip_package]
+        subprocess.run(sync_cmd, env=env, check=True)
+    else:
+        subprocess.run(exec_cmd, env=env, check=True)
+
+    # Path to the python executable in the virtual environment
+    python_path = os.path.join(venv_path, "bin", "python")
+
+    # Install the local editable (NRL_<TIER>_EDITABLE) into this venv. Workers
+    # launch via <venv>/bin/python directly (not `uv run`), so a
+    # `uv run --with-editable` overlay would not reach them — the editable must
+    # land inside UV_PROJECT_ENVIRONMENT. This runs after `uv sync` so it isn't
+    # pruned. Installed with --no-deps: the extra sync above already provided the
+    # (locked) runtime deps, and the pre-built editable's own metadata would
+    # otherwise trigger an unsatisfiable PyPI resolution.
+    for path in tier_editable_paths:
+        logger.info(f"Installing editable '{path}' into {venv_path}")
+        subprocess.run(
+            ["uv", "pip", "install", "--no-deps", "--python", python_path, "-e", path],
+            env=env,
+            check=True,
+        )
+
+    # A tier editable (e.g. trtllm) pulls in cuDNN vision/conv ops; reconcile the
+    # cuDNN sublibs so the freshly-built venv doesn't fail with
+    # CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED / _VERSION_MISMATCH at runtime. Baked
+    # images get this at build time via docker/mlperf/Dockerfile.cudnn-fix.
+    # Set NRL_SKIP_CUDNN_FIX=1 to skip (e.g. containers whose cuDNN is already OK).
+    _skip_cudnn = os.environ.get("NRL_SKIP_CUDNN_FIX", "").lower() in ("1", "true", "yes")
+    if tier_editable_paths and not _skip_cudnn:
+        _fix_cudnn_symlinks(venv_path)
 
     # Return the path to the python executable in the virtual environment
-    python_path = os.path.join(venv_path, "bin", "python")
     return python_path
 
 
@@ -172,6 +329,14 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.get(pg.ready())
 
     force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
+    # When a local editable is requested for this venv's tier (NRL_<TIER>_EDITABLE),
+    # rebuild just this venv (not every venv) so it is rebuilt as base + editable
+    # instead of syncing the pinned wheel.
+    if not force_rebuild and _tier_editable_paths_for_venv(venv_name):
+        logger.info(
+            f"Editable install requested for {venv_name}; forcing rebuild of this venv."
+        )
+        force_rebuild = True
     # Launch one actor per node
     actors = [
         _env_builder.options(placement_group=pg).remote(
