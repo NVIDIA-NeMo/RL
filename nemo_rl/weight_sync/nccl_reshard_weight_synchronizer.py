@@ -231,7 +231,9 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             f"generation shards {sorted(absent_shards)} are not in the collective. The "
             "nccl_reshard transport cannot drop a rank without regenerating the refit "
             "plan, whose destination placements are derived from gen_world_size; "
-            "resizing alone would leave survivors holding unwritten weights."
+            "resizing alone would leave survivors holding unwritten weights. The plain "
+            "collective transport (policy.generation.refit_transport=null) does recover "
+            "from this; reshard recovery still has to regenerate the plan."
         )
 
     def shutdown(self) -> None:
