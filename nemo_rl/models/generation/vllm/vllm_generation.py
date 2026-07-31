@@ -633,6 +633,41 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def set_refit_membership(self, membership: "RefitMembership") -> None:
+        """Record which shards take part in refits from now on.
+
+        Rebuilding the communicator is not enough on its own. Every refit dispatch --
+        ``update_weights_from_collective``, ``nccl_reshard_refit`` -- goes through
+        ``run_all_workers_*``, which walks the whole worker group. Left alone they would
+        keep calling the dead shard's Ray actor after the rebuild and fail the refit with
+        RayActorError, so the run would still die, just differently.
+        """
+        self._refit_membership = membership
+
+    def _refit_leader_workers(self) -> list[Any]:
+        """DP leaders that should receive refit calls, in rank order.
+
+        Falls back to every leader when no membership has been recorded, which is the
+        state for the entire life of a run that never loses a shard.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        workers = self.worker_group.workers
+        membership = getattr(self, "_refit_membership", None)
+        if membership is None:
+            per_shard = len(workers) // self.dp_size
+            return [workers[idx * per_shard] for idx in range(self.dp_size)]
+        leaders = []
+        for shard_idx in membership.shard_prefixes:
+            leader_idx = shard_idx * membership.workers_per_shard
+            if leader_idx >= len(workers):
+                raise RuntimeError(
+                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
+                    f"{len(workers)} workers"
+                )
+            leaders.append(workers[leader_idx])
+        return leaders
+
     def rebuild_collective(
         self, membership: "RefitMembership", ip: str, port: int
     ) -> list[ray.ObjectRef]:
@@ -1089,11 +1124,13 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_from_collective"
         )
 
-        # Use run_all_workers_single_data for methods that don't need data
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        # Addressed per surviving leader rather than via run_all_workers_single_data,
+        # which walks the whole group: after a shard is lost that would call its dead
+        # actor and fail the refit, undoing the rebuild that just happened.
+        futures = [
+            getattr(worker, method_name).remote()
+            for worker in self._refit_leader_workers()
+        ]
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
@@ -1145,12 +1182,55 @@ class VllmGeneration(GenerationInterface):
             if self.cfg["vllm_cfg"]["async_engine"]
             else "prepare_nccl_reshard_refit_info"
         )
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            refit_info=refit_info,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        # Surviving leaders only; see update_weights_from_collective. This one matters
+        # doubly: the plan being distributed is the *regenerated* one, sized for the
+        # surviving fleet, and handing it to a shard that is not in that fleet is
+        # meaningless even if its actor happened to answer.
+        futures = [
+            getattr(worker, method_name).remote(refit_info=refit_info)
+            for worker in self._refit_leader_workers()
+        ]
         ray.get(futures)
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: "RefitMembership",
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Re-init the bulk-path comm groups over the surviving shards only.
+
+        The bulk groups are sized ``train_ranks_per_stage + inference_world_size``, so
+        losing a shard changes their world size as well as the shared
+        ``model_update_group``'s -- both families have to be rebuilt together or the two
+        disagree about who is present.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_nccl_reshard_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_nccl_reshard_comm_group"
+        )
+        workers = self.worker_group.workers
+        futures: list[ray.ObjectRef] = []
+        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+            leader = workers[shard_idx * membership.workers_per_shard]
+            futures.append(
+                getattr(leader, method_name).remote(
+                    rank_prefix=rank_prefix,
+                    pp_ips=pp_ips,
+                    pp_ports=pp_ports,
+                    pp_size=pp_size,
+                    train_ranks_per_stage=train_ranks_per_stage,
+                    sub_world_size=sub_world_size,
+                )
+            )
+        return futures
 
     def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
         """Receive weights from training workers via nccl_reshard (xferdtensor)."""
@@ -1162,11 +1242,11 @@ class VllmGeneration(GenerationInterface):
             if self.cfg["vllm_cfg"]["async_engine"]
             else "nccl_reshard_refit"
         )
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        return futures
+        # Surviving leaders only; see update_weights_from_collective.
+        return [
+            getattr(worker, method_name).remote()
+            for worker in self._refit_leader_workers()
+        ]
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

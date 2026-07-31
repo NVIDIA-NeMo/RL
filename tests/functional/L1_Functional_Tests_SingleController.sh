@@ -61,6 +61,10 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # a shard remains. Opposite behaviours, and a regression in either is invisible to the
 # other.
 run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+# Same scenario on the reshard transport, which recovers by a different route: it also
+# rebuilds its per-PP-stage bulk groups and regenerates the refit plan. Only this path
+# has to keep a plan and a communicator agreeing about the fleet size.
+run_test env REFIT_TRANSPORT=nccl_reshard uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
