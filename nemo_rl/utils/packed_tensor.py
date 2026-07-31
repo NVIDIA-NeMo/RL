@@ -101,6 +101,10 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
 
+    # Join all packing/broadcast side streams before returning. Without this,
+    # the caller may mutate or offload the source weights while the final
+    # broadcasts are still in flight on the side streams (vLLM >= 0.25's
+    # PyNcclCommunicator enqueues on the current stream without blocking).
     for s in streams:
         s.synchronize()
 
@@ -212,5 +216,10 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                     )
                 break
 
+    # Join all recv/unpack/load side streams before returning. Without this,
+    # generation can start reading model weights while the final unpack/load
+    # copies are still in flight on the side streams, producing garbage
+    # logprobs (vLLM >= 0.25's PyNcclCommunicator enqueues on the current
+    # stream without blocking).
     for s in streams:
         s.synchronize()

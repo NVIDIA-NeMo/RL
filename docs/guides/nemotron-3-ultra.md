@@ -156,29 +156,6 @@ git clone --recursive -b main https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 ```
 
-## Prepare the starting checkpoint
-
-If your starting checkpoint comes from Hugging Face or is the result of SFT with
-Megatron-Bridge, it is a **transformers v5** checkpoint. NeMo RL runs an older
-**transformers v4**, so convert the checkpoint to a v4-compatible version before
-using it as `MODEL_PATH`.
-
-The converter rewrites `config.json`, adds the v4 modeling files, and symlinks
-the weight shards back to the source checkpoint.
-
-```bash
-python examples/converters/ultra/convert_ultra_ckpt_t5_to_t4.py \
-  --source /path/to/ultra_sft_checkpoint_v5 \
-  --output /path/to/ultra_sft_checkpoint_v4 \
-  --force
-```
-
-Use the converted directory (`/path/to/ultra_sft_checkpoint_v4`) as `MODEL_PATH`
-in the launch commands below. The converter copies the bundled v4 NemotronH
-modeling files (`configuration_nemotron_h.py` / `modeling_nemotron_h.py` in `examples/converters/ultra/`) into the output
-automatically (the default `--runtime-source`); pass `--runtime-source <dir>` to
-override.
-
 ## Build the sandbox container
 
 Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during

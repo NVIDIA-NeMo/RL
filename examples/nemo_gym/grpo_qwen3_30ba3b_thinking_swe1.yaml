@@ -219,6 +219,8 @@ data:
 env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
+  # false: ignore env mask_sample flags so the loss trains on every sample.
+  should_mask_flagged_samples: true
   nemo_gym:
     skip_venv_if_present: true
     port_range_low: 5000
