@@ -128,13 +128,16 @@ class SingleControllerActor:
         # getattr, not attribute access: these are real fields of
         # SingleControllerActorArgs, so every production caller has them -- but
         # upstream's unit tests build actor_args as a SimpleNamespace listing only what
-        # upstream's own __init__ reads, and upstream reads neither. Requiring them here
-        # turns our features into construction requirements for tests that do not
+        # upstream's own __init__ reads, and upstream reads none of them. Requiring them
+        # here turns our features into construction requirements for tests that do not
         # exercise them, which is how test_logs_setup_timing_metrics broke on the main
         # sync. Same shape as the `timeouts` regression in the previous sync.
         self._env_handles = getattr(actor_args, "env_handles", {})
-        # None means fleet health is off, which is also the default.
+        # None means the feature is off, which is also the default for both.
         self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
+        self._policy_router = getattr(actor_args, "policy_router", None)
+        # Forces the first reconcile: the router starts believing every backend serves.
+        self._pushed_membership_epoch: int = -1
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -644,6 +647,7 @@ class SingleControllerActor:
 
             # Probe before publishing so the metrics describe this tick, not the last.
             await self._probe_generation_fleet()
+            await self._push_router_membership()
 
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
@@ -705,6 +709,29 @@ class SingleControllerActor:
                 )
             else:
                 self._fleet_monitor.record_probe(shard_idx, ok=True)
+
+    async def _push_router_membership(self) -> None:
+        """Tell the NeMo-Gym router which backends are currently serving.
+
+        Pushed as the full set rather than a delta, so a dropped or reordered update --
+        or a restarted router, which comes up believing every backend serves -- converges
+        on the next tick without sequence numbers or replay.
+
+        Re-pushed whenever the membership epoch has moved. The epoch tracks the serving
+        set, not per-shard state, so a shard merely going SUSPECT does not churn the
+        router.
+        """
+        if self._policy_router is None or self._fleet_monitor is None:
+            return
+        epoch = self._fleet_monitor.membership_epoch
+        if epoch == self._pushed_membership_epoch:
+            return
+        await self._ray_get(
+            self._policy_router.set_serving_backends.remote(
+                self._fleet_monitor.serving_base_urls()
+            )
+        )
+        self._pushed_membership_epoch = epoch
 
     async def _check_env_health(self) -> None:
         """Ask each environment actor that exposes a health check whether it is whole.

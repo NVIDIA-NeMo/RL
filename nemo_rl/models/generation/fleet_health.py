@@ -176,6 +176,15 @@ class GenerationFleetMonitor:
     def state_of(self, shard_idx: int) -> ShardState:
         return self._shards[shard_idx].state
 
+    def serving_base_urls(self) -> list[str]:
+        """Base URLs of the serving shards, for pushing to the NeMo-Gym router."""
+        urls: list[str] = []
+        for idx in self.serving_shards():
+            url = self._shards[idx].base_url
+            if url:
+                urls.append(url)
+        return urls
+
     def counts_by_state(self) -> dict[ShardState, int]:
         # __members__ rather than iterating the class: a str/Enum mixin is iterable at
         # runtime but not modelled as such by the type checker.
