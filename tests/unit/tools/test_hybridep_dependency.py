@@ -17,8 +17,12 @@ from pathlib import Path
 from typing import Any
 
 HYBRIDEP_COMMIT = "f725d29699f5bda9ba789456bb9579af69844685"  # pragma: allowlist secret
-PREVIOUS_X86_COMMIT = "29d31c095796f3c8ece47ee9cdcc167051bbeed9"  # pragma: allowlist secret
-PREVIOUS_ARM_COMMIT = "a48493600c4886c1b297aaa78db0e1ebc2d8dd6c"  # pragma: allowlist secret
+PREVIOUS_X86_COMMIT = (
+    "29d31c095796f3c8ece47ee9cdcc167051bbeed9"  # pragma: allowlist secret
+)
+PREVIOUS_ARM_COMMIT = (
+    "a48493600c4886c1b297aaa78db0e1ebc2d8dd6c"  # pragma: allowlist secret
+)
 HYBRIDEP_VERSION = "1.2.1+f725d29"
 
 
@@ -55,7 +59,9 @@ def test_deep_ep_dependencies_are_unmarked_and_use_hybridep_commit() -> None:
         "mcore",
         "override-dependencies",
     }
-    assert sum(len(dependencies) for dependencies in dependencies_by_group.values()) == 4
+    assert (
+        sum(len(dependencies) for dependencies in dependencies_by_group.values()) == 4
+    )
     for dependencies in dependencies_by_group.values():
         assert len(dependencies) == 1
         assert HYBRIDEP_COMMIT in dependencies[0]
