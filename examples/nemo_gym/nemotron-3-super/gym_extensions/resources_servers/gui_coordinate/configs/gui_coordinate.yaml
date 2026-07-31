@@ -1,0 +1,18 @@
+gui_coordinate:
+  resources_servers:
+    gui_coordinate:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      description: GUI coordinate grounding verifier for visual pointing tasks
+      value: Verify GUI coordinate predictions using smooth quadratic reward based on Euclidean distance
+gui_coordinate_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: gui_coordinate
+      model_server:
+        type: responses_api_models
+        name: policy_model

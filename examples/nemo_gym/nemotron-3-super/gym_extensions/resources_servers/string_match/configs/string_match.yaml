@@ -1,0 +1,18 @@
+string_match:
+  resources_servers:
+    string_match:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+      description: General-purpose string matching verifier for free-form text answers
+      value: Verify answers via case-insensitive string matching with multiple extraction strategies
+string_match_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: string_match
+      model_server:
+        type: responses_api_models
+        name: policy_model
