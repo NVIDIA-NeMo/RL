@@ -7,6 +7,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1
   val_at_start: true
   val_at_end: false
   overlong_filtering: false
@@ -48,7 +49,7 @@ grpo:
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 loss_fn:
   reference_policy_kl_penalty: 0
