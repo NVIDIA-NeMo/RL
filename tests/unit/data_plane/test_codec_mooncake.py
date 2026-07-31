@@ -92,6 +92,126 @@ def test_from_wire_densifies_uniform_nested_rows() -> None:
     assert torch.equal(back["reward"], torch.arange(len(rows), dtype=torch.float32))
 
 
+def test_from_wire_preserves_genuine_length_one_token_column() -> None:
+    """Only fields promoted from ``(N,)`` are squeezed after a TQ read."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+
+    n = 4
+    wire = TensorDict(
+        {
+            "reward": torch.nested.as_nested_tensor(
+                [torch.tensor([float(i)]) for i in range(n)], layout=torch.jagged
+            ),
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.tensor([i]) for i in range(n)], layout=torch.jagged
+            ),
+        },
+        batch_size=[n],
+    )
+
+    back = _from_wire(wire, promoted_1d_fields={"reward"})
+
+    assert back["reward"].shape == (n,)
+    assert back["input_ids"].shape == (n, 1)
+    assert torch.equal(back["input_ids"], torch.arange(n).unsqueeze(-1))
+
+
+def test_wire_shape_tags_roundtrip_promoted_field_names() -> None:
+    """Durable tags distinguish scalar and length-one tensor columns."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _add_wire_shape_tags,
+        _promoted_1d_fields_from_tags,
+        _strip_wire_shape_tags,
+    )
+
+    n = 3
+    fields = TensorDict(
+        {
+            "reward": torch.arange(n, dtype=torch.float32),
+            "input_ids": torch.arange(n).unsqueeze(-1),
+        },
+        batch_size=[n],
+    )
+    user_tags = [{"weight_version": 7} for _ in range(n)]
+
+    wire_tags = _add_wire_shape_tags(user_tags, fields)
+
+    assert _promoted_1d_fields_from_tags(wire_tags, ["reward", "input_ids"]) == {
+        "reward"
+    }
+    assert _strip_wire_shape_tags(wire_tags) == user_tags
+    assert all(
+        not any(key.startswith("__nemo_rl_promoted_1d__:") for key in tag)
+        for tag in user_tags
+    )
+
+
+def test_get_samples_uses_persisted_shape_tags(monkeypatch) -> None:
+    """The Mooncake adapter restores ranks using TQ's durable row metadata."""
+    from tensordict import TensorDict
+
+    import nemo_rl.data_plane.adapters.transfer_queue as tq_adapter
+
+    n = 3
+    original = TensorDict(
+        {
+            "reward": torch.arange(n, dtype=torch.float32),
+            "input_ids": torch.arange(n).unsqueeze(-1),
+        },
+        batch_size=[n],
+    )
+    wire_tags = tq_adapter._add_wire_shape_tags([{} for _ in range(n)], original)
+    wire_data = TensorDict(
+        {
+            "reward": torch.nested.as_nested_tensor(
+                [row for row in original["reward"].unsqueeze(-1)],
+                layout=torch.jagged,
+            ),
+            "input_ids": torch.nested.as_nested_tensor(
+                [row for row in original["input_ids"]], layout=torch.jagged
+            ),
+        },
+        batch_size=[n],
+    )
+
+    class FakeMeta:
+        size = n
+        is_ready = True
+        custom_meta = wire_tags
+
+        def select_fields(self, fields):
+            assert fields == ["reward", "input_ids"]
+            return self
+
+    class FakeClient:
+        def kv_retrieve_meta(self, *, keys, partition_id, create):
+            assert keys == ["a", "b", "c"]
+            assert partition_id == "train"
+            assert create is False
+            return FakeMeta()
+
+        def get_data(self, meta):
+            assert isinstance(meta, FakeMeta)
+            return wire_data
+
+    monkeypatch.setattr(
+        tq_adapter.tq, "get_client", lambda: FakeClient(), raising=False
+    )
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._promote_1d = True
+
+    restored = client.get_samples(["a", "b", "c"], "train", ["reward", "input_ids"])
+
+    assert restored["reward"].shape == (n,)
+    assert restored["input_ids"].shape == (n, 1)
+    assert torch.equal(restored["reward"], original["reward"])
+    assert torch.equal(restored["input_ids"], original["input_ids"])
+
+
 def test_from_wire_preserves_ragged_nested_rows() -> None:
     """Variable-length rollout fields must remain nested."""
     from tensordict import TensorDict
