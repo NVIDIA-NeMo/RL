@@ -47,11 +47,15 @@ def _patch_transformers_tokenizer_class_set():
     # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
     # its transformers upper bound to >=5.12, we can drop this workaround.
     # TODO: remove this patch (and the assert below) once MBridge relaxes its
-    # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
+    # transformers upper bound past the deepseek_v3 fix.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
+    # Ceiling re-checked at transformers 5.12.1 (pulled in by the automodel extra
+    # after the Automodel r0.6.0 bump): "deepseek_v3" is still present in both
+    # MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS and TOKENIZER_MAPPING_NAMES, so
+    # the upstream fix has NOT landed yet and the patch is still required.
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "The deepseek_v3 tokenizer-blocklist patch was written for <5.13. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
