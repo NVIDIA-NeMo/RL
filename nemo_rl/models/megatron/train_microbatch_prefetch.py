@@ -424,7 +424,7 @@ def _move_stage_payload_to_cuda(
     data: BatchedDataDict[Any],
 ) -> BatchedDataDict[Any]:
     """Stage the complete leader payload before peers enter payload collectives."""
-    return data.to(torch.cuda.current_device())
+    return data.to(torch.device("cuda", torch.cuda.current_device()))
 
 
 def _tensor_payload_schema(
