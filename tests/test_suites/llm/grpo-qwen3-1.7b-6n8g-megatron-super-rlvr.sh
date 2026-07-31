@@ -16,6 +16,10 @@ JOB_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","re
 
 exit_if_max_steps_reached
 
+# PyTorch alters behaviour (disabling certain optimizations) when CI=true.
+# Unset it here so the training environment is identical to a local run.
+unset CI
+
 # Run the experiment
 cd $PROJECT_ROOT
 VLLM_CACHE_DIR=${HF_HOME}/vllm_compile_cache \
