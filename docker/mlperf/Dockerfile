@@ -497,9 +497,7 @@ WORKDIR /opt/nemo-rl
 # Regenerate the container fingerprint (frozen-environment support)
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 
-# INTERNAL
-# ntrace
-RUN NTRACE_BUILD_CUPTI_CPP=ON uv pip install --no-cache-dir "git+https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/compute/e2etrain/ntrace.git@main"
-# JET
-RUN curl -fsSL https://jet.nvidia.com/docs/assets/install.sh | sh
+# INTERNAL: ntrace + JET merged into one layer to stay under overlay2 max depth
+RUN NTRACE_BUILD_CUPTI_CPP=ON uv pip install --no-cache-dir "git+https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/compute/e2etrain/ntrace.git@main" && \
+    curl -fsSL https://jet.nvidia.com/docs/assets/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
