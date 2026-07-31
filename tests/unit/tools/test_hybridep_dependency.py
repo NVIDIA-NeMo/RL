@@ -16,9 +16,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-HYBRIDEP_COMMIT = "f725d29699f5bda9ba789456bb9579af69844685"
-PREVIOUS_X86_COMMIT = "29d31c095796f3c8ece47ee9cdcc167051bbeed9"
-PREVIOUS_ARM_COMMIT = "a48493600c4886c1b297aaa78db0e1ebc2d8dd6c"
+HYBRIDEP_COMMIT = "f725d29699f5bda9ba789456bb9579af69844685"  # pragma: allowlist secret
+PREVIOUS_X86_COMMIT = "29d31c095796f3c8ece47ee9cdcc167051bbeed9"  # pragma: allowlist secret
+PREVIOUS_ARM_COMMIT = "a48493600c4886c1b297aaa78db0e1ebc2d8dd6c"  # pragma: allowlist secret
 HYBRIDEP_VERSION = "1.2.1+f725d29"
 
 
@@ -26,41 +26,40 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _deep_ep_dependencies(project: dict[str, Any]) -> list[str]:
+def _deep_ep_dependencies(project: dict[str, Any]) -> dict[str, list[str]]:
     optional_dependencies = project["project"]["optional-dependencies"]
-    dependency_groups = (
-        optional_dependencies["automodel"],
-        optional_dependencies["vllm"],
-        optional_dependencies["mcore"],
-        project["tool"]["uv"]["override-dependencies"],
-    )
-    return [
-        dependency
-        for group in dependency_groups
-        for dependency in group
-        if dependency.startswith("deep_ep @ git+")
-    ]
+    dependency_groups = {
+        "automodel": optional_dependencies["automodel"],
+        "vllm": optional_dependencies["vllm"],
+        "mcore": optional_dependencies["mcore"],
+        "override-dependencies": project["tool"]["uv"]["override-dependencies"],
+    }
+    return {
+        name: [
+            dependency
+            for dependency in group
+            if dependency.startswith("deep_ep @ git+")
+        ]
+        for name, group in dependency_groups.items()
+    }
 
 
-def test_all_platform_deep_ep_dependencies_use_same_hybridep_commit() -> None:
+def test_deep_ep_dependencies_are_unmarked_and_use_hybridep_commit() -> None:
     pyproject_path = _project_root() / "pyproject.toml"
     project = tomllib.loads(pyproject_path.read_text())
-    dependencies = _deep_ep_dependencies(project)
-    x86_dependencies = [
-        dependency
-        for dependency in dependencies
-        if "platform_machine == 'x86_64'" in dependency
-    ]
-    arm_dependencies = [
-        dependency
-        for dependency in dependencies
-        if "platform_machine == 'aarch64'" in dependency
-    ]
+    dependencies_by_group = _deep_ep_dependencies(project)
 
-    assert len(x86_dependencies) == 4
-    assert all(HYBRIDEP_COMMIT in dependency for dependency in x86_dependencies)
-    assert len(arm_dependencies) == 4
-    assert all(HYBRIDEP_COMMIT in dependency for dependency in arm_dependencies)
+    assert set(dependencies_by_group) == {
+        "automodel",
+        "vllm",
+        "mcore",
+        "override-dependencies",
+    }
+    assert sum(len(dependencies) for dependencies in dependencies_by_group.values()) == 4
+    for dependencies in dependencies_by_group.values():
+        assert len(dependencies) == 1
+        assert HYBRIDEP_COMMIT in dependencies[0]
+        assert "platform_machine" not in dependencies[0]
 
 
 def test_deep_ep_dependency_metadata_matches_hybridep() -> None:
