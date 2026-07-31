@@ -62,6 +62,13 @@ class ShardState(str, enum.Enum):
 # transient blip cost a shard's worth of throughput.
 _SERVING_STATES = frozenset({ShardState.HEALTHY, ShardState.SUSPECT})
 
+# States whose process cannot take part in a collective, because it is gone or coming
+# back. This is deliberately NOT the complement of _SERVING_STATES: SUSPECT and STALE are
+# not handed traffic but their processes are alive and join a refit normally. Refitting a
+# STALE shard is precisely how it stops being stale, so counting it absent would break
+# the recovery this distinction exists to enable.
+_ABSENT_STATES = frozenset({ShardState.DEAD, ShardState.RESTARTING, ShardState.RETIRED})
+
 
 @dataclass
 class ShardHealth:
@@ -172,6 +179,19 @@ class GenerationFleetMonitor:
     def serving_shards(self) -> list[int]:
         """Shard indices currently eligible to be handed traffic."""
         return [idx for idx in sorted(self._shards) if self._shards[idx].is_serving]
+
+    def absent_shards(self) -> list[int]:
+        """Shard indices whose process cannot take part in a collective.
+
+        The set the weight-refit path cares about, and deliberately not the complement of
+        :meth:`serving_shards`: a SUSPECT or STALE shard is withheld from traffic but its
+        process is alive and joins the refit normally.
+        """
+        return [
+            idx
+            for idx in sorted(self._shards)
+            if self._shards[idx].state in _ABSENT_STATES
+        ]
 
     def state_of(self, shard_idx: int) -> ShardState:
         return self._shards[shard_idx].state

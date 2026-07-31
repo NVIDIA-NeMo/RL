@@ -28,13 +28,14 @@ No offload/restore steps are needed since policy and generation run on
 separate GPUs with dedicated memory.
 """
 
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
 
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import RefitMembershipChanged, WeightSynchronizer
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -120,6 +121,26 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             ip, port, world_size, train_world_size=train_world_size
         )
         ray.get(futures_train + futures_inference)
+
+    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+        """Refuse the refit when the communicator contains a rank that is gone.
+
+        ``model_update_group`` spans every train and inference rank and was built once,
+        at setup, over the full fleet. The refit is a broadcast on that group, so a
+        missing rank blocks it forever -- inside NCCL, where it produces no error and no
+        progress while Ray still reports every actor healthy. That silent wedge is the
+        bug this whole effort exists to remove, so fail loudly instead.
+
+        Rebuilding over the survivors is what turns this from a stop into a recovery; it
+        needs survivor-aware rank assignment and is not wired up yet.
+        """
+        if not absent_shards:
+            return False
+        raise RefitMembershipChanged(
+            f"generation shards {sorted(absent_shards)} are not in the collective, but "
+            "the refit communicator still contains their ranks; broadcasting would "
+            "block forever. Rebuilding over the survivors is not implemented yet."
+        )
 
     def shutdown(self) -> None:
         # The NCCL process group lifecycle is managed by Ray actor teardown.

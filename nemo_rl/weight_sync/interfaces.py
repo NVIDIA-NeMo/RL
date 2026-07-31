@@ -38,9 +38,20 @@ at the synchronizer level.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Optional
 
 from nemo_rl.utils.timer import Timer
+
+
+class RefitMembershipChanged(RuntimeError):
+    """The generation fleet lost a rank the refit communicator still contains.
+
+    Raised instead of entering a collective that cannot complete. Every rank in a NCCL
+    communicator must take part in a broadcast; when one of them is gone the call blocks
+    forever, and because it blocks inside NCCL the job shows no error, no progress, and a
+    healthy-looking Ray cluster. Failing here converts that into a diagnosis.
+    """
 
 
 class WeightSynchronizer(ABC):
@@ -127,6 +138,34 @@ class WeightSynchronizer(ABC):
         process group.
         """
         pass
+
+    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+        """Bring the transport's communicator in line with the live generation fleet.
+
+        Called immediately before every refit, rather than in response to a death event.
+        Reconciling on a schedule is idempotent and converges after a missed or reordered
+        notification, and it is the only point where the refit group is provably idle and
+        every rank is synchronized -- which matters because the collectives that change
+        membership are themselves collectives.
+
+        Args:
+            absent_shards: shard indices whose process cannot take part in a collective
+                (see ``GenerationFleetMonitor.absent_shards``). Note this is not the
+                complement of the serving set: a shard withheld from traffic may still be
+                alive and able to refit.
+
+        Returns:
+            True if the communicator was rebuilt.
+
+        Raises:
+            RefitMembershipChanged: if the fleet lost a rank and this transport cannot
+                yet adapt.
+
+        The default is a no-op: transports that own no NCCL world of their own -- IPC,
+        HTTP, checkpoint-engine -- have no membership to reconcile.
+        """
+        del absent_shards
+        return False
 
     @abstractmethod
     def shutdown(self) -> None:
