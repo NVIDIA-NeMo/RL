@@ -453,7 +453,7 @@ env:
       - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
       - resources_servers/format_verification/configs/freeform_formatting.yaml
       - resources_servers/format_verification/configs/citation_format.yaml
-      - resources_servers/rdkit_chemistry/configs/rdkit_chemistry.yaml
+      - resources_servers/litmus_agent/configs/litmus_agent.yaml
       - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
       - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
       - resources_servers/swe_pivot/configs/swe_pivot.yaml
@@ -463,6 +463,11 @@ env:
       - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_codex.yaml
       - resources_servers/format_verification/configs/citation_format.yaml
       - resources_servers/format_verification/configs/freeform_formatting.yaml
+
+    # The MOPD blend still uses the superseded rdkit_chemistry agent
+    # name. Keep that data reference while running the replacement Litmus agent.
+    rdkit_chemistry_agent:
+      _inherit_from: litmus_agent_agent
 
     # Increase the num workers to help with the serialization/deserialization overhead of token IDs
     policy_model:
@@ -786,6 +791,7 @@ on_policy_distillation:
     lc_judge_simple_agent:                   ${_teachers.general}
     ns_tools_simple_agent:                   ${_teachers.reasoning}
     code_gen_simple_agent:                   ${_teachers.reasoning}
+    rdkit_chemistry_agent:                   ${_teachers.general}
 
     # IFBench / abstention / multichallenge (all share IFBench teacher)
     instruction_following_simple_agent:      ${_teachers.ifbench}
