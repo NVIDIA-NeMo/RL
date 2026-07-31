@@ -652,21 +652,19 @@ class VllmGeneration(GenerationInterface):
         """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
-        workers = self.worker_group.workers
         membership = getattr(self, "_refit_membership", None)
-        if membership is None:
-            per_shard = len(workers) // self.dp_size
-            return [workers[idx * per_shard] for idx in range(self.dp_size)]
-        leaders = []
-        for shard_idx in membership.shard_prefixes:
-            leader_idx = shard_idx * membership.workers_per_shard
-            if leader_idx >= len(workers):
-                raise RuntimeError(
-                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
-                    f"{len(workers)} workers"
-                )
-            leaders.append(workers[leader_idx])
-        return leaders
+        shard_indices = (
+            range(self.dp_size) if membership is None else membership.shard_prefixes
+        )
+        # get_dp_leader_worker_idx rather than shard_idx * workers_per_shard: the group
+        # owns the shard-to-worker mapping, and reproducing it by arithmetic here would
+        # be a second source of truth that silently disagrees if the layout ever changes.
+        return [
+            self.worker_group.workers[
+                self.worker_group.get_dp_leader_worker_idx(shard_idx)
+            ]
+            for shard_idx in shard_indices
+        ]
 
     def rebuild_collective(
         self, membership: "RefitMembership", ip: str, port: int
@@ -693,14 +691,9 @@ class VllmGeneration(GenerationInterface):
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
         for shard_idx, rank_prefix in membership.shard_prefixes.items():
-            leader_idx = shard_idx * membership.workers_per_shard
-            if leader_idx >= len(workers):
-                raise RuntimeError(
-                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
-                    f"{len(workers)} workers"
-                )
+            leader = workers[self.worker_group.get_dp_leader_worker_idx(shard_idx)]
             futures.append(
-                getattr(workers[leader_idx], method_name).remote(
+                getattr(leader, method_name).remote(
                     rank_prefix=rank_prefix,
                     ip=ip,
                     port=port,
@@ -1219,7 +1212,7 @@ class VllmGeneration(GenerationInterface):
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
         for shard_idx, rank_prefix in membership.shard_prefixes.items():
-            leader = workers[shard_idx * membership.workers_per_shard]
+            leader = workers[self.worker_group.get_dp_leader_worker_idx(shard_idx)]
             futures.append(
                 getattr(leader, method_name).remote(
                     rank_prefix=rank_prefix,
