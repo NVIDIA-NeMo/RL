@@ -781,6 +781,28 @@ class SingleControllerActor:
         )
         self._pushed_membership_epoch = epoch
 
+    async def _reconcile_refit_membership(self) -> None:
+        """Ask the weight transport to match the live fleet before the refit runs.
+
+        A no-op without fleet health: with no monitor there is no notion of a shard being
+        gone, so the transport keeps the membership it was built with -- which is the
+        pre-existing behaviour, and why this is inert by default.
+        """
+        if self._fleet_monitor is None:
+            return
+        absent = self._fleet_monitor.absent_shards()
+        # to_thread like every other call that reaches the workers: this can rebuild
+        # communicators via blocking Ray calls, and running it on the loop would freeze
+        # the watchdog, which is an asyncio task on that same loop.
+        rebuilt = await asyncio.to_thread(
+            self._weight_synchronizer.reconcile_communicator, absent
+        )
+        if rebuilt:
+            print(
+                f"  _sync_weights: rebuilt refit communicator, absent={sorted(absent)}",
+                flush=True,
+            )
+
     async def _check_env_health(self) -> None:
         """Ask each environment actor that exposes a health check whether it is whole.
 
@@ -818,6 +840,13 @@ class SingleControllerActor:
         self._rollout_permitted.clear()
 
         # TODO(#2625): Add drain-gate support during refit.
+
+        # Reconcile before the refit, not on a death event. The refit group is provably
+        # idle here and every rank is synchronized, which is required because the
+        # operations that change membership are themselves collectives. Doing it every
+        # time is also idempotent, so a missed or reordered health update converges on
+        # the next step instead of needing replay.
+        await self._reconcile_refit_membership()
 
         t0 = time.monotonic()
         kv_scales = None
