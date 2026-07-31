@@ -133,6 +133,71 @@ def _quantized_weight_modules(model):
 
 
 @contextlib.contextmanager
+def plain_module_attr_lookup(model, verbose: bool = False, rank: int = 0):
+    """Restore plain ``nn.Module`` attribute lookup on ModelOpt modules for the stage.
+
+    On ``nn.Module`` parameters, buffers and submodules live in ``_parameters`` /
+    ``_buffers`` / ``_modules``, not in ``__dict__`` — so ``self.weight`` always misses
+    normal lookup and lands in ``__getattr__``. ModelOpt's modules are ``DynamicModule``s,
+    whose override does, per access: fetch the attribute manager, check ``hp_keys()``,
+    check ``da_keys()``, then enter a ``_dict_with_special()`` context manager which
+    fetches the manager and rebuilds *both* key sets again — before finally delegating to
+    ``nn.Module.__getattr__``.
+
+    Megatron's linear forward reads ``self.weight`` and ``self.bias`` on every call, so at
+    257 linears x 1024 microbatches this runs ~526k times per rank per logprobs stage.
+    None of it is removed by :func:`weight_snap_cache` or :func:`materialized_weight_snap`
+    — it is inherent to the module being a ``DynamicModule``.
+
+    When a module has registered no hparams and no dynamic attributes, that whole path
+    provably reduces to ``nn.Module.__getattr__``: ``_dict_with_special`` only does work
+    when a special key is itself an hparam or dynamic attribute. This asserts exactly that
+    and otherwise **refuses** — ``QuantLinearConvBase`` registers ``weight`` with a
+    ``_get_quantized_weight`` callback, and bypassing there would silently drop weight
+    quantization. (Megatron's ``_ParallelLinear`` extends ``QuantModule``, not
+    ``QuantLinearConvBase``, so it registers neither.)
+
+    Measured at 32B/TP8 on 8xH100: 2.0 s (step 1) and 7.3 s (step 2) off the logprobs
+    stage. Safe for any frozen-weight stage; it changes lookup cost, never values.
+    """
+    from modelopt.torch.opt.dynamic import DynamicModule
+
+    classes: set[type] = set()
+    for module in model.modules():
+        if not isinstance(module, DynamicModule):
+            continue
+        manager = module._get_dm_attribute_manager(use_default=True)
+        dynamic_attrs, hparams = list(manager.da_keys()), list(manager.hp_keys())
+        if dynamic_attrs or hparams:
+            raise ValueError(
+                f"plain_module_attr_lookup refused: {type(module).__name__} has dynamic "
+                f"attributes {dynamic_attrs} / hparams {hparams}, so "
+                "DynamicModule.__getattr__ is load-bearing there and cannot be bypassed."
+            )
+        classes.add(type(module))
+
+    patched = [
+        (klass, klass.__dict__.get("__getattr__"), "__getattr__" in klass.__dict__)
+        for klass in classes
+    ]
+    for klass, _, _ in patched:
+        klass.__getattr__ = torch.nn.Module.__getattr__
+    try:
+        yield
+    finally:
+        for klass, previous, had_own in patched:
+            if had_own:
+                klass.__getattr__ = previous
+            else:
+                del klass.__getattr__
+        if verbose and rank == 0:
+            print(
+                f"[snap_cache] plain attribute lookup restored on {len(classes)} "
+                f"DynamicModule class(es) for the frozen-weight stage."
+            )
+
+
+@contextlib.contextmanager
 def materialized_weight_snap(model, verbose: bool = False, rank: int = 0):
     """Snap every weight once, then bypass ModelOpt's per-forward wrapper for the stage.
 

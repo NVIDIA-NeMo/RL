@@ -451,9 +451,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if self.cfg.get("quant_materialize_frozen_weight_snap"):
             from nemo_rl.modelopt.models.policy.workers.snap_cache import (
                 materialized_weight_snap,
+                plain_module_attr_lookup,
             )
 
-            with materialized_weight_snap(self.model, verbose=True, rank=self.rank):
+            with (
+                plain_module_attr_lookup(self.model, verbose=True, rank=self.rank),
+                materialized_weight_snap(self.model, verbose=True, rank=self.rank),
+            ):
                 return super().get_logprobs(*args, **kwargs)
 
         if not self.cfg.get("quant_cache_frozen_weight_snap"):
