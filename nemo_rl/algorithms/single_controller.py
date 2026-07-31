@@ -63,6 +63,7 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -125,6 +126,14 @@ class SingleControllerActor:
         self._env_handles = actor_args.env_handles
         self._fleet_monitor = actor_args.fleet_monitor
         self._policy_router = actor_args.policy_router
+        # Only with fleet health: without a monitor nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        self._engine_supervisor = (
+            EngineSupervisor(generation=self._gen, monitor=self._fleet_monitor)
+            if self._fleet_monitor is not None
+            and master_config.async_rl.fleet_health.restart_dead_shards
+            else None
+        )
         # Forces the first reconcile: the router starts believing every backend serves.
         self._pushed_membership_epoch: int = -1
         # Rebind so writer and sampler share one buffer instance even
@@ -633,6 +642,12 @@ class SingleControllerActor:
 
             # Probe before publishing so the metrics describe this tick, not the last.
             await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
             await self._push_router_membership()
 
             metrics = dict(stats.as_metrics())
@@ -641,6 +656,8 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._fleet_monitor is not None:
                 metrics.update(self._fleet_monitor.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.metrics())
             self._logger.log_metrics(metrics, step=self._train_steps)
 
             if watchdog_cfg.gym_subprocess_check:

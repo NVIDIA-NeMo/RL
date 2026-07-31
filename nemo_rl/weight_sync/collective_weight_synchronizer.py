@@ -183,6 +183,13 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             flush=True,
         )
 
+        # Re-run for the whole fleet, not just for new shards. A restarted engine has no
+        # state_dict_info at all -- update_weights_from_collective asserts on it -- and
+        # this is metadata rather than weights, so redistributing it to shards that
+        # already have it is cheap and removes the need to track who is new.
+        state_dict_info = self._policy.prepare_refit_info()
+        self._generation.prepare_refit_info(state_dict_info)
+
         futures_train = self._policy.init_collective(
             ip,
             port,
