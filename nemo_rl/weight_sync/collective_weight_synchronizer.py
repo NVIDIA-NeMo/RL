@@ -36,7 +36,7 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import plan_refit_membership
+from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -69,6 +69,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._stale = True
+        # What the communicator was last built over. None until init_communicator.
+        self._built_membership: Optional[RefitMembership] = None
 
     def sync_weights(
         self,
@@ -128,6 +130,13 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             ip, port, world_size, train_world_size=train_world_size
         )
         ray.get(futures_train + futures_inference)
+        # Recorded so the first reconcile can tell "unchanged" from "never built".
+        self._built_membership = desired_membership(
+            absent_shards=[],
+            dp_size=self._generation.worker_group.dp_size,
+            total_gen_workers=len(self._generation.worker_group.workers),
+            train_world_size=train_world_size,
+        )
 
     def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
         """Rebuild the refit communicator over the surviving generation shards.
@@ -147,24 +156,36 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         recovered engine back. One mechanism that works in both directions beats two that
         each work in one.
         """
-        if not absent_shards:
-            return False
-
-        dp_size = self._generation.worker_group.dp_size
-        surviving = [idx for idx in range(dp_size) if idx not in set(absent_shards)]
-        membership = plan_refit_membership(
-            surviving_shards=surviving,
-            dp_size=dp_size,
+        membership = desired_membership(
+            absent_shards=absent_shards,
+            dp_size=self._generation.worker_group.dp_size,
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
         )
+        # Compared against what was built, not against "is anything absent". Keyed off
+        # the absent set alone this would return False the moment a restarted shard came
+        # back, leaving it permanently excluded from a communicator it should rejoin.
+        #
+        # An unrecorded membership means the full fleet: init_communicator builds over
+        # everything, so "not recorded" is not "unknown", and treating it as a difference
+        # would rebuild pointlessly on the very first refit of every run.
+        if self._built_membership is None:
+            self._built_membership = desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
+                total_gen_workers=len(self._generation.worker_group.workers),
+                train_world_size=membership.train_world_size,
+            )
+        if membership.shard_prefixes == self._built_membership.shard_prefixes:
+            return False
 
         # A fresh port every time: the rendezvous store for the previous world may still
         # be bound, and the cluster hands out a unique port per call for exactly this.
         ip, port = self._train_cluster.get_master_address_and_port()
         print(
-            f"  refit: rebuilding communicator without shards {sorted(absent_shards)}; "
-            f"world_size {membership.world_size}, port {port}",
+            f"  refit: rebuilding communicator over shards "
+            f"{membership.surviving_shards}; world_size {membership.world_size}, "
+            f"port {port}",
             flush=True,
         )
 
@@ -182,6 +203,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._generation.set_refit_membership(membership)
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
+        self._built_membership = membership
         return True
 
     def shutdown(self) -> None:
