@@ -1226,13 +1226,13 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
     keep the original in-place shuffle behavior.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         swap_w13_to_w31,
     )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         MXFP8_BLOCK_SIZE,
     )
-    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.parameter import ModelWeightParameter
     from vllm.model_executor.utils import set_weight_attrs
 
