@@ -565,3 +565,12 @@ class PolicyConfig(TypedDict):
     # no_grad with no optimizer step. Costs a second bf16 copy of the weight shard
     # for the duration of the stage. Absent/False = disabled. Megatron QAT only.
     quant_cache_frozen_weight_snap: NotRequired[bool]
+    # Opt-in (QAT only): stronger form of the above. Fake-quantize every weight ONCE
+    # at the start of the frozen-weight logprob stage, write the result into the
+    # parameter, and bypass ModelOpt's per-forward functional replacement entirely for
+    # the duration. Equivalent because weight-only fake-quant is elementwise, so
+    # GEMM(x, snap(W)) == GEMM(x, W') for W' = snap(W) -- but it removes the wrapper
+    # (~263k invocations/rank/stage at 32B), not just the snap arithmetic. Supersedes
+    # quant_cache_frozen_weight_snap; if both are set this one wins. Same memory cost
+    # (one extra copy of the weights, held only for the stage). Megatron QAT only.
+    quant_materialize_frozen_weight_snap: NotRequired[bool]

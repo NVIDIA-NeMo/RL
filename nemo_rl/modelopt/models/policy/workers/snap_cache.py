@@ -34,6 +34,14 @@ computation and reuses it. Three gates keep it correct:
 
 Covers both the dense TE path (``te_quantized_linear_fn``) and the MoE grouped path
 (``te_grouped_quantized_linear_fn``); both route through ``TensorQuantizer.forward``.
+
+:func:`materialized_weight_snap` is a stronger variant for weight-only recipes. Caching
+removes the snap *arithmetic* but leaves ModelOpt's per-forward machinery in place, and
+measurement on 8xH100 at 32B showed that machinery -- not the snap -- is most of what
+remains of the QAT logprobs tax. Since weight-only fake-quant is elementwise,
+``GEMM(x, snap(W)) == GEMM(x, W')`` for ``W' = snap(W)``, so the snap can be materialized
+into the parameter once and the wrapper dropped for the whole stage. See that function
+for the constraint that makes it weight-only.
 """
 
 import contextlib
@@ -113,6 +121,101 @@ def _weight_tensor_quantizers(model):
             for sub in wq.modules():
                 if isinstance(sub, TensorQuantizer):
                     yield sub
+
+
+def _quantized_weight_modules(model):
+    """Yield ``(module, weight_quantizer)`` for every module that fake-quantizes a weight."""
+    for module in model.modules():
+        wq = getattr(module, "weight_quantizer", None)
+        weight = getattr(module, "weight", None)
+        if isinstance(wq, torch.nn.Module) and isinstance(weight, torch.Tensor):
+            yield module, wq
+
+
+@contextlib.contextmanager
+def materialized_weight_snap(model, verbose: bool = False, rank: int = 0):
+    """Snap every weight once, then bypass ModelOpt's per-forward wrapper for the stage.
+
+    :func:`weight_snap_cache` removes the *arithmetic* of re-snapping but leaves
+    ModelOpt's machinery running on every forward: ``_QuantFunctionalMixin.forward``
+    swaps Megatron's linear functional in and out (``replace_function`` ->
+    ``getattr`` + 2x ``setattr`` on entry, ``setattr`` + ``delattr`` on exit, per
+    functional) and calls three quantizers, ~263k times per rank per logprobs stage at
+    32B. Measured on 8xH100, that machinery -- not the snap -- is the bulk of what is
+    left of the QAT logprobs tax.
+
+    Weight-only fake-quant is an elementwise transform of the weight, so::
+
+        GEMM(x, snap(W))  ==  GEMM(x, W')     with  W' = snap(W)
+
+    which means the wrapper is unnecessary once the snap has been materialized. This
+    context manager therefore snaps each weight once into ``weight.data``, makes
+    ``functionals_to_replace`` yield nothing so ``_QuantFunctionalMixin.forward``
+    degenerates to the original linear, and restores both on exit.
+
+    Only valid while the weights are frozen (``no_grad``, no optimizer step), which is
+    exactly the ``get_logprobs`` re-scoring stage. Memory cost matches
+    :func:`weight_snap_cache`: one extra copy of the weight shard, freed on exit.
+    """
+    from modelopt.torch.quantization.plugins.custom import (
+        _ParallelLinear,
+        _QuantFunctionalMixin,
+    )
+
+    # Bypassing the wrapper also bypasses the linear's input/output quantizers, so this
+    # is only equivalent for WEIGHT-ONLY recipes (W4A16). Under W4A4 the activation
+    # quantizers do real work and skipping them would silently change the numerics --
+    # refuse rather than produce wrong logprobs. (Attention q/k/v bmm quantizers are
+    # called directly by the attention module, not through this wrapper, so they are
+    # unaffected either way.)
+    for module, _ in _quantized_weight_modules(model):
+        for attr in ("input_quantizer", "output_quantizer"):
+            q = getattr(module, attr, None)
+            if q is not None and getattr(q, "is_enabled", False):
+                raise ValueError(
+                    "quant_materialize_frozen_weight_snap requires a weight-only "
+                    f"quantization recipe, but {attr} is enabled on a linear "
+                    "(e.g. W4A4). Bypassing the ModelOpt wrapper would skip activation "
+                    "quantization and change the logprobs. Use "
+                    "quant_cache_frozen_weight_snap instead."
+                )
+
+    saved: list[tuple[torch.nn.Module, torch.Tensor]] = []
+    skipped = 0
+    with torch.no_grad():
+        for module, wq in _quantized_weight_modules(model):
+            snapped = wq(module.weight)
+            if snapped is module.weight:
+                # Quantizer disabled (e.g. output_layer) -- nothing to materialize.
+                skipped += 1
+                continue
+            saved.append((module, module.weight.data))
+            module.weight.data = snapped
+
+    # NOTE: `_ParallelLinear` OVERRIDES `_QuantFunctionalMixin.functionals_to_replace`,
+    # so patching only the mixin is a silent no-op for every linear in the model.
+    empty = property(lambda self: iter(()))
+    patched = [
+        (klass, klass.__dict__.get("functionals_to_replace"))
+        for klass in (_ParallelLinear, _QuantFunctionalMixin)
+    ]
+    for klass, _ in patched:
+        klass.functionals_to_replace = empty
+    try:
+        yield
+    finally:
+        for klass, original in patched:
+            if original is None:
+                del klass.functionals_to_replace
+            else:
+                klass.functionals_to_replace = original
+        for module, original_weight in saved:
+            module.weight.data = original_weight
+        if verbose and rank == 0:
+            print(
+                f"[snap_cache] frozen-weight stage: {len(saved)} weight snaps "
+                f"materialized once, wrapper bypassed ({skipped} quantizers disabled)."
+            )
 
 
 @contextlib.contextmanager

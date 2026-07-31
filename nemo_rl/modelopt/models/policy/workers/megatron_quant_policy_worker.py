@@ -432,13 +432,30 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         }
 
     def get_logprobs(self, *args, **kwargs):
-        """Compute logprobs, optionally caching the frozen-weight snap.
+        """Compute logprobs, optionally optimizing the frozen-weight snap.
 
-        When ``policy.quant_cache_frozen_weight_snap`` is set, wrap the (no-grad)
-        re-scoring pass so each weight is fake-quantized once and reused across all
-        microbatches instead of re-snapped on every forward. Off by default; when off
-        this is exactly the base implementation.
+        Two opt-in modes, both off by default; when neither is set this is exactly the
+        base implementation.
+
+        ``policy.quant_materialize_frozen_weight_snap`` (preferred, weight-only recipes)
+            Fake-quantize each weight once for the stage, write it into the parameter,
+            and bypass ModelOpt's per-forward functional replacement entirely.
+
+        ``policy.quant_cache_frozen_weight_snap``
+            Memoize the snap per weight, but keep the wrapper. Use this when the recipe
+            quantizes activations too (W4A4), where the wrapper cannot be bypassed.
+
+        Both are safe only because the re-scoring pass runs under ``no_grad`` with no
+        optimizer step. If both are set, materialize wins -- it subsumes the cache.
         """
+        if self.cfg.get("quant_materialize_frozen_weight_snap"):
+            from nemo_rl.modelopt.models.policy.workers.snap_cache import (
+                materialized_weight_snap,
+            )
+
+            with materialized_weight_snap(self.model, verbose=True, rank=self.rank):
+                return super().get_logprobs(*args, **kwargs)
+
         if not self.cfg.get("quant_cache_frozen_weight_snap"):
             return super().get_logprobs(*args, **kwargs)
 
