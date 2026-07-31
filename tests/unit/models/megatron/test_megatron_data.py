@@ -1405,7 +1405,9 @@ def test_hybridep_padding_mask_uses_cp_local_layout_for_cp2():
     input_ids_cp_sharded = torch.cat(
         (
             _get_tokens_on_this_cp_rank(input_ids[:, 0:4], cp_rank, cp_size, seq_dim=1),
-            _get_tokens_on_this_cp_rank(input_ids[:, 4:12], cp_rank, cp_size, seq_dim=1),
+            _get_tokens_on_this_cp_rank(
+                input_ids[:, 4:12], cp_rank, cp_size, seq_dim=1
+            ),
         ),
         dim=1,
     )
