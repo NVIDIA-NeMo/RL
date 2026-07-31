@@ -44,16 +44,6 @@ from typing import Optional
 from nemo_rl.utils.timer import Timer
 
 
-class RefitMembershipChanged(RuntimeError):
-    """The generation fleet lost a rank the refit communicator still contains.
-
-    Raised instead of entering a collective that cannot complete. Every rank in a NCCL
-    communicator must take part in a broadcast; when one of them is gone the call blocks
-    forever, and because it blocks inside NCCL the job shows no error, no progress, and a
-    healthy-looking Ray cluster. Failing here converts that into a diagnosis.
-    """
-
-
 class WeightSynchronizer(ABC):
     """Abstract base class for weight synchronization between policy and generation.
 
@@ -158,8 +148,8 @@ class WeightSynchronizer(ABC):
             True if the communicator was rebuilt.
 
         Raises:
-            RefitMembershipChanged: if the fleet lost a rank and this transport cannot
-                yet adapt.
+            NoSurvivingShards: if every generation shard is gone, so there is nothing
+                left to rebuild onto.
 
         The default is a no-op: transports that own no NCCL world of their own -- IPC,
         HTTP, checkpoint-engine -- have no membership to reconcile.

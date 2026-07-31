@@ -18,6 +18,7 @@
 # Usage:
 #   bash tests/functional/grpo_sc_generation_shard_recovery.sh
 #   NUM_GPUS=8 bash tests/functional/grpo_sc_generation_shard_recovery.sh
+#   REFIT_TRANSPORT=nccl_reshard bash tests/functional/grpo_sc_generation_shard_recovery.sh
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR"/../..)
@@ -56,8 +57,13 @@ KILL_AFTER_STEP=${KILL_AFTER_STEP:-3}
 # Generous: a rebuild plus the next refit, not a hang budget. The pass condition is
 # completion, so this only bounds a wedge.
 COMPLETION_DEADLINE_S=${COMPLETION_DEADLINE_S:-1800}
+# Both NCCL transports rebuild, by different routes: the plain collective re-inits one
+# group, nccl_reshard also rebuilds its per-PP-stage bulk groups and regenerates the
+# refit plan. Worth running both, since only the reshard path has to keep a plan and a
+# communicator agreeing about the fleet.
+REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
 
-echo "[recovery] $NUM_GPUS GPUs -> $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS)"
+echo "[recovery] $NUM_GPUS GPUs -> $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
 uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     --config "$PROJECT_ROOT"/examples/configs/grpo_math_1B_megatron_single_controller.yaml \
@@ -66,6 +72,7 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     policy.generation.colocated.resources.gpus_per_node="$GEN_GPUS" \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
+    policy.generation.refit_transport="$REFIT_TRANSPORT" \
     cluster.gpus_per_node="$NUM_GPUS" \
     grpo.max_num_steps="$MAX_STEPS" \
     grpo.val_period=-1 \
@@ -134,23 +141,24 @@ echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
 
 if (( EXIT_CODE != 0 )); then
     echo "[recovery] FAIL: a surviving shard should have carried the run to completion"
-    grep -E "Error|Traceback|RefitMembershipChanged|NoSurvivingShards" "$RUN_LOG" | tail -20
+    grep -E "Error|Traceback|NoSurvivingShards|RayActorError" "$RUN_LOG" | tail -20
     exit 1
 fi
 
 # Completion alone is not enough: a run that never noticed the death would also exit 0.
 # These pin that the death was seen AND that the communicator was actually rebuilt.
-if ! grep -q "rebuilding communicator without shards" "$RUN_LOG"; then
+REBUILD_RE="rebuilding (nccl_reshard )?communicators? without shards"
+if ! grep -Eq "$REBUILD_RE" "$RUN_LOG"; then
     echo "[recovery] FAIL: job completed but never rebuilt the refit communicator."
     echo "[recovery] Either the death went unnoticed, or a refit was never needed after it."
     grep -E "refit|fleet|shard" "$RUN_LOG" | tail -20
     exit 1
 fi
-echo "[recovery] rebuild observed:"; grep "rebuilding communicator without shards" "$RUN_LOG" | head -3
+echo "[recovery] rebuild observed:"; grep -E "$REBUILD_RE" "$RUN_LOG" | head -3
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 uv run tests/check_metrics.py "$JSON_METRICS" \
     "len(data[\"train/reward\"]) == $MAX_STEPS" \
     'max(data["train/reward"]) > 0'
 
-echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps"
+echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"

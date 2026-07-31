@@ -34,7 +34,6 @@ from nemo_rl.models.generation.fleet_health import (
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
-from nemo_rl.weight_sync.interfaces import RefitMembershipChanged
 from nemo_rl.weight_sync.membership import NoSurvivingShards
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
@@ -68,26 +67,6 @@ class TestNothingAbsent:
     def test_repeated_calls_stay_no_ops(self, synchronizer):
         for _ in range(5):
             assert synchronizer.reconcile_communicator([]) is False
-
-
-class TestAbsentRanks:
-    def test_a_missing_shard_still_stops_the_reshard_transport(self):
-        with pytest.raises(RefitMembershipChanged, match=r"\[2\]"):
-            _reshard().reconcile_communicator([2])
-
-    def test_the_message_names_every_absent_shard(self):
-        with pytest.raises(RefitMembershipChanged, match=r"\[1, 3\]"):
-            _reshard().reconcile_communicator([3, 1])
-
-    def test_the_reshard_message_explains_the_extra_constraint(self):
-        """Resizing a reshard world without regenerating the plan corrupts weights.
-
-        Worth a distinct message: the plain broadcast could in principle just drop a
-        receiver, but the reshard's destination placements are derived from
-        gen_world_size, so survivors would hold slices nobody wrote.
-        """
-        with pytest.raises(RefitMembershipChanged, match="gen_world_size"):
-            _reshard().reconcile_communicator([0])
 
 
 class _FakeWorker:
@@ -129,6 +108,9 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
+    generation.set_refit_membership = lambda membership: setattr(
+        generation, "_refit_membership", membership
+    )
     generation.rebuild_collective = (
         lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
@@ -359,17 +341,16 @@ class TestControllerCallSite:
 
         assert calls == [[1]]
 
-    def test_a_refusal_propagates_rather_than_being_swallowed(self):
-        """If this were swallowed the job would proceed into the hang it prevents.
-
-        Uses the reshard transport because it is the one that still refuses; the plain
-        collective now rebuilds instead.
-        """
-        monitor = _monitor()
+    def test_a_refusal_propagates_rather_than_being_swallowed(self, monkeypatch):
+        """If this were swallowed the job would proceed into the failure it prevents."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        monitor = _monitor(shard_count=2)
         _condemn(monitor, 0)
-        ctrl = self._controller(monitor, _reshard())
+        _condemn(monitor, 1)
+        sync, _, _ = _rebuildable(dp_size=2, dead_shards=(0, 1))
+        ctrl = self._controller(monitor, sync)
 
-        with pytest.raises(RefitMembershipChanged):
+        with pytest.raises(NoSurvivingShards):
             asyncio.run(ctrl._reconcile_refit_membership())
 
     def test_a_rebuild_is_driven_all_the_way_from_the_controller(self, monkeypatch):

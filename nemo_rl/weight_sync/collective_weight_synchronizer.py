@@ -168,6 +168,12 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             membership.world_size,
             train_world_size=membership.train_world_size,
         )
+        # Recorded before dispatching, so nothing downstream can fall back to the old
+        # membership. Rebuilding the communicator is only half of it: the refit dispatch
+        # walks the worker group, so without this it keeps calling the dead shard's actor
+        # and the next sync_weights fails with RayActorError -- the run still dies, just
+        # later and with a less obvious cause.
+        self._generation.set_refit_membership(membership)
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
         return True
