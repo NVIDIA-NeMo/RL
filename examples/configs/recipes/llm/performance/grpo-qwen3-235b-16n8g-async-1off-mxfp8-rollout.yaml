@@ -1,6 +1,6 @@
 defaults: ./grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-16n8g-async-1off-mxfp8-rollout
+  checkpoint_dir: results/grpo-qwen3-235b-16n8g-async-1off-mxfp8-rollout  # pragma: allowlist secret
 policy:
   generation:
     colocated:
