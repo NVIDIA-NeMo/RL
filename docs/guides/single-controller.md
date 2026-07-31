@@ -74,12 +74,12 @@ The exemplars shipped in this PR stack cover the four canonical setups:
 | Mode                             | `sampler.name` | Sampler knob                   | `min_groups_for_streaming_train` | `max_buffered_rollouts`                               | Exemplar |
 | -------------------------------- | -------------- | ------------------------------ | -------------------------------- | ----------------------------------------------------- | -------- |
 | Sync / on-policy                 | `in_order`     | `max_lookahead_versions: 0`    | `${grpo.num_prompts_per_step}`   | `num_prompts_per_step × 1`                            | [`grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml`](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml) |
-| Async, exact batch→step matching | `in_order`     | `max_lookahead_versions: >= 1` | `${grpo.num_prompts_per_step}`   | `num_prompts_per_step × (max_lookahead_versions + 1)` | [`grpo_math_1B_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml) |
+| Async, exact batch→step matching | `in_order`     | `max_lookahead_versions: >= 1` | `x <= num_prompts_per_step`   | `num_prompts_per_step × (max_lookahead_versions + 1)` | [`grpo_math_1B_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml) |
 | Streaming, gated dispatch        | `weight_fifo`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | / |
 | Streaming, over-sampled          | `windowed`     | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | Larger than the gated capacity (dispatch is ungated)  | [`grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml`](../../examples/configs/recipes/llm/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml) |
 
 
-Other `async_rl` fields:
+Field definitions:
 
 - `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking.
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming.
