@@ -6,6 +6,8 @@ checkpointing:
 policy:
   disable_modelopt_layer_spec: true
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
+  quant_cache_frozen_weight_snap: false
+  quant_materialize_frozen_weight_snap: true
   generation:
     quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
     real_quant: true

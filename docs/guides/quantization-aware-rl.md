@@ -39,6 +39,25 @@ for most models, but it is not guaranteed for every architecture or recipe. If
 you encounter errors with the standard Megatron layer specs, leave it unset or
 set it to `false` to exercise ModelOpt's Megatron layer-spec path.
 
+## Frozen-Weight Logprob Optimization
+
+QARL can avoid repeatedly fake-quantizing the same frozen weights during the
+no-gradient policy and reference logprob passes. Both modes are opt-in and use one
+temporary copy of each quantized weight shard for the duration of the pass:
+
+- Set `policy.quant_materialize_frozen_weight_snap: true` for weight-only recipes
+  such as W4A16. NeMo RL snaps each weight once into its existing parameter storage
+  and temporarily bypasses ModelOpt's per-forward quantization wrappers. The original
+  weight values, storage, and wrappers are restored before training resumes.
+- Set `policy.quant_cache_frozen_weight_snap: true` for recipes that quantize
+  activations, such as W4A4. This reuses each snapped weight while retaining the
+  wrappers needed for input, output, and attention quantization.
+
+Both options default to `false`. Materialization takes precedence if both are true,
+but it rejects enabled linear input or output quantizers rather than silently changing
+W4A4 logprobs. Configure exactly one mode according to the effective policy
+quantization format.
+
 ## Quantization-Aware GRPO (QA-GRPO)
 
 ### Configuration
@@ -51,6 +70,8 @@ defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 policy:
   quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+  quant_cache_frozen_weight_snap: false
+  quant_materialize_frozen_weight_snap: true
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
@@ -289,6 +310,8 @@ defaults: "../configs/distillation_math_megatron.yaml"
 
 policy:
     quant_cfg: "NVFP4_DEFAULT_CFG"
+    quant_cache_frozen_weight_snap: true
+    quant_materialize_frozen_weight_snap: false
     quant_calib_data: "cnn_dailymail"
     quant_calib_size: 512
     quant_batch_size: 1
@@ -318,6 +341,8 @@ These parameters are added under the `policy` section:
 | `quant_calib_size` | Number of samples for the calibration pass |
 | `quant_batch_size` | Batch size during calibration |
 | `quant_sequence_length` | Sequence length for calibration data |
+| `quant_cache_frozen_weight_snap` | Optional boolean, default `false`. During frozen-weight logprob passes, cache each fake-quantized weight while retaining ModelOpt's per-forward wrappers. Use this mode for activation-quantized recipes such as W4A4. |
+| `quant_materialize_frozen_weight_snap` | Optional boolean, default `false`. During frozen-weight logprob passes, snap each weight once into its existing parameter storage and bypass ModelOpt's per-forward wrappers. Use this faster mode only for weight-only recipes such as W4A16. It takes precedence over the cache option and rejects enabled linear activation quantizers. |
 
 The `policy.generation.quant_cfg` should match `policy.quant_cfg` to ensure consistent quantization between training and generation.
 

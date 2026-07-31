@@ -12,6 +12,8 @@ checkpointing:
   checkpoint_must_save_by: 00:03:45:00
 policy:
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+  quant_cache_frozen_weight_snap: true
+  quant_materialize_frozen_weight_snap: false
   generation:
     quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
     real_quant: true
