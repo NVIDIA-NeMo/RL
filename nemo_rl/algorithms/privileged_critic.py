@@ -192,6 +192,29 @@ def build_privileged_value_inputs(
             )
         critic_message_logs.append(critic_msgs)
 
+    # A missing/empty ground truth silently degrades the sample to a blind critic
+    # (the grader note renders with an empty answer). Tolerate stragglers but fail
+    # loudly if the WHOLE batch lacks privilege — that means extra_env_info didn't
+    # survive the data path (e.g. a buffer/collector change) and the run would
+    # silently measure a blind critic while labelled privileged.
+    n_empty = sum(
+        1
+        for info in env_infos
+        if not (info or {}).get("ground_truth")
+    )
+    if n_empty == len(message_logs):
+        raise AssertionError(
+            "privileged critic: ground_truth missing for EVERY sample in the batch "
+            "(extra_env_info absent or empty) — the privilege would be silently "
+            "inert. Check that the data path carries extra_env_info."
+        )
+    if n_empty:
+        print(
+            f"⚠️  privileged critic: {n_empty}/{len(message_logs)} samples have no "
+            "ground_truth — those critic inputs are effectively blind.",
+            flush=True,
+        )
+
     flat, input_lengths = batched_message_log_to_flat_message(
         critic_message_logs,
         pad_value_dict={"token_ids": tokenizer.pad_token_id},

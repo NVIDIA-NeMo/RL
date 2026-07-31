@@ -1456,20 +1456,47 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     return critic_metrics
 
 
+def _calibration_ece(
+    v: torch.Tensor, r: torch.Tensor, n_conf_bins: int = 10
+) -> float:
+    """Expected Calibration Error of V as an estimate of P(success).
+
+    With outcome returns in [0, 1], a well-calibrated critic satisfies
+    ``mean(R | V ≈ p) == p``. Tokens are binned by predicted value (clamped to
+    [0, 1]); ECE is the token-weighted mean |mean(V) - mean(R)| over bins. A critic
+    can have decent explained variance yet be systematically over/under-confident —
+    that distorts advantage MAGNITUDES even when the ranking is right.
+    """
+    vc = v.clamp(0.0, 1.0)
+    n_total = v.numel()
+    ece = 0.0
+    for i in range(n_conf_bins):
+        lo, hi = i / n_conf_bins, (i + 1) / n_conf_bins
+        m = (vc >= lo) & ((vc < hi) if i < n_conf_bins - 1 else (vc <= 1.0))
+        n = int(m.sum())
+        if n == 0:
+            continue
+        ece += (n / n_total) * abs((v[m].mean() - r[m].mean()).item())
+    return ece
+
+
 def _positional_value_metrics(
     values: torch.Tensor,
     returns: torch.Tensor,
     token_mask: torch.Tensor,
     n_bins: int = 3,
 ) -> dict[str, float]:
-    """Explained variance of V(s_t) vs the GAE return, bucketed by RELATIVE position
-    within each response (early / mid / late thirds).
+    """Critic-quality diagnostics bucketed by RELATIVE position within each response
+    (early / mid / late thirds): explained variance, calibration (ECE), and signed
+    bias of V(s_t) vs the GAE return.
 
-    Answers "where does the critic do its job well?" — expected to rise early->late,
-    since near the end the outcome is nearly determined. Comparing a privileged
-    (answer-conditioned) run against a blind one, the golden answer should lift the
-    EARLY/MID buckets most (a large early-bucket gap = the privileged-critic mechanism
-    working; a flat gap = the answer isn't buying sharper early credit). Cheap:
+    EV is expected to rise early->late (the outcome is nearly determined near the
+    end). Empirically (priv vs blind 7B DAPO runs), an answer-conditioned critic
+    matches the blind one at EARLY tokens and wins mostly at LATE tokens — the
+    privilege acts as a *verifier* (matching written content against the gold
+    answer), not a forecaster of the policy's future behavior. ECE/bias add the
+    calibration axis: V should literally be P(success | prefix), and miscalibration
+    distorts advantage magnitudes even when EV/ranking looks fine. Cheap:
     driver-side tensor ops on tensors already in ``train_data``.
     """
     mask = token_mask.bool()
@@ -1495,6 +1522,10 @@ def _positional_value_metrics(
         out[f"critic/abs_err_{names[i]}"] = (r - v).abs().mean().item()
         out[f"critic/mean_v_{names[i]}"] = v.mean().item()
         out[f"critic/n_tokens_{names[i]}"] = float(n)
+        # Calibration: ECE (magnitude of miscalibration across confidence bins) and
+        # signed bias (direction: >0 = overconfident/optimistic, <0 = pessimistic).
+        out[f"critic/ece_{names[i]}"] = _calibration_ece(v, r)
+        out[f"critic/bias_{names[i]}"] = (v - r).mean().item()
     return out
 
 
@@ -3474,6 +3505,17 @@ def async_ppo_train(
                     metrics.update(train_results["all_mb_metrics"])
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
+                    # Positional critic-quality diagnostic (early/mid/late tokens): how
+                    # well V predicts the return along the trajectory, and — for the
+                    # privileged critic — where the golden answer sharpens it.
+                    if "values" in train_data and "returns" in train_data:
+                        metrics.update(
+                            _positional_value_metrics(
+                                train_data["values"],
+                                train_data["returns"],
+                                train_data["token_mask"],
+                            )
+                        )
 
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:

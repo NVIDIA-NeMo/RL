@@ -158,18 +158,27 @@ def test_build_answer_lengthens_only_the_prompt():
     response_ids = [77, 78, 79, 80]
     pcfg = {"enabled": True, "placement": "user_suffix", "max_answer_tokens": 256}
 
-    with_answer = build_privileged_value_inputs(
+    long_answer = build_privileged_value_inputs(
         _make_repeated_batch(response_ids, gold="the answer is 42 with reasoning"),
         tok,
         pcfg,
     )
-    no_answer = build_privileged_value_inputs(
-        _make_repeated_batch(response_ids, gold=""), tok, pcfg
+    short_answer = build_privileged_value_inputs(
+        _make_repeated_batch(response_ids, gold="4"), tok, pcfg
     )
     # a longer reference answer only grows the prompt; response count is unchanged
-    assert with_answer["input_lengths"][0] > no_answer["input_lengths"][0]
-    assert int(with_answer["token_mask"][0].sum()) == len(response_ids)
-    assert int(no_answer["token_mask"][0].sum()) == len(response_ids)
+    assert long_answer["input_lengths"][0] > short_answer["input_lengths"][0]
+    assert int(long_answer["token_mask"][0].sum()) == len(response_ids)
+    assert int(short_answer["token_mask"][0].sum()) == len(response_ids)
+
+
+def test_build_raises_when_privilege_missing_for_whole_batch():
+    # gold absent for EVERY sample => the "privileged" critic would silently be blind;
+    # the builder must fail loudly instead.
+    tok = _FakeTokenizer()
+    batch = _make_repeated_batch([77, 78], gold="")
+    with pytest.raises(AssertionError, match="ground_truth missing for EVERY sample"):
+        build_privileged_value_inputs(batch, tok, {"enabled": True})
 
 
 def test_build_truncates_long_answer():
