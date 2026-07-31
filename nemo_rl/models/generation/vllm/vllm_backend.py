@@ -448,7 +448,9 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.connect(self.get_zmq_address())
 
     def prepare_refit_info(
-        self, state_dict_info: dict[str, Any]
+        self,
+        state_dict_info: dict[str, Any],
+        serialized_fp8_config: Optional[dict[str, Any]] = None,
     ) -> Optional[list[str]]:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
@@ -467,6 +469,7 @@ class VllmInternalWorkerExtension:
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
+        fp8.install_fp8_config(serialized_fp8_config)
         if not (
             fp8.global_fp8_config is not None
             and fp8.global_fp8_config.is_mx

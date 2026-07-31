@@ -88,31 +88,6 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
-def test_async_engine_core_keeps_fp8_config_for_local_driver_worker(
-    fp8_module, monkeypatch
-):
-    fp8 = fp8_module
-    config = fp8.FP8Config(
-        use_fp8_weights=True,
-        model_parallel_size=2,
-        is_mx=True,
-    )
-    vllm_config = types.SimpleNamespace(nrl_fp8_cfg=config)
-    applied_configs = []
-
-    monkeypatch.setattr(
-        fp8,
-        "monkey_patch_vllm_ray_executor",
-        lambda fp8_config: applied_configs.append(fp8_config),
-    )
-    monkeypatch.setattr(fp8, "original_run_engine_core", lambda **_kwargs: "done")
-
-    assert fp8.my_run_engine_core(vllm_config=vllm_config) == "done"
-    assert fp8.global_fp8_config is config
-    assert applied_configs == [config]
-    assert not hasattr(vllm_config, "nrl_fp8_cfg")
-
-
 @pytest.mark.parametrize(
     ("field", "error"),
     [

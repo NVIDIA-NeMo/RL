@@ -143,17 +143,21 @@ def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
         checked_names.append(name)
         return name == "model.linear.weight"
 
-    monkeypatch.setattr(
-        fp8,
-        "global_fp8_config",
-        SimpleNamespace(is_mx=True, refit_prequantize=enabled),
+    source_config = fp8.FP8Config(
+        is_mx=True,
+        refit_prequantize=enabled,
+        use_fp8_weights=True,
     )
+    monkeypatch.setattr(fp8, "global_fp8_config", source_config)
+    serialized_config = fp8.serialize_fp8_config()
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
     monkeypatch.setattr(fp8, "is_fp8_model", is_fp8_model)
     monkeypatch.setattr(fp8, "_is_fp8_weight", is_fp8_weight)
 
-    result = ext.prepare_refit_info(state_dict_info)
+    result = ext.prepare_refit_info(state_dict_info, serialized_config)
 
     assert ext.state_dict_info is state_dict_info
+    assert fp8.global_fp8_config == source_config
     if enabled:
         assert result == ["model.linear.weight"]
         is_fp8_model.assert_called_once_with(config)
@@ -165,13 +169,16 @@ def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
 
 
 @pytest.mark.vllm
-def test_sync_prepare_refit_info_unions_worker_names():
+def test_sync_prepare_refit_info_unions_worker_names(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker import (
         VllmGenerationWorkerImpl,
     )
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    serialized_config = {"is_mx": True, "refit_prequantize": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
     worker.llm = SimpleNamespace(
         collective_rpc=MagicMock(
             return_value=[
@@ -188,19 +195,22 @@ def test_sync_prepare_refit_info_unions_worker_names():
     ]
     worker.llm.collective_rpc.assert_called_once_with(
         "prepare_refit_info",
-        args=(state_dict_info,),
+        args=(state_dict_info, serialized_config),
     )
 
 
 @pytest.mark.vllm
 @pytest.mark.asyncio
-async def test_async_prepare_refit_info_unions_worker_names():
+async def test_async_prepare_refit_info_unions_worker_names(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    serialized_config = {"is_mx": True, "refit_prequantize": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
     worker.llm = SimpleNamespace(
         collective_rpc=AsyncMock(
             return_value=[None, ["model.b.weight"], ["model.a.weight"]]
@@ -213,7 +223,7 @@ async def test_async_prepare_refit_info_unions_worker_names():
     ]
     worker.llm.collective_rpc.assert_awaited_once_with(
         "prepare_refit_info",
-        args=(state_dict_info,),
+        args=(state_dict_info, serialized_config),
     )
 
 

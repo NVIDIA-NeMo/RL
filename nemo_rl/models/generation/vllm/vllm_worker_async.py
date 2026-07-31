@@ -1304,8 +1304,11 @@ class VllmAsyncGenerationWorkerImpl(
         self, state_dict_info: dict[str, Any]
     ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
         results = await self.llm.collective_rpc(
-            "prepare_refit_info", args=(state_dict_info,)
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
         )
         # Union across the engine's TP/PP workers: with pipeline parallelism
         # each shard only classifies its local parameters as fp8-eligible.

@@ -14,7 +14,8 @@
 
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -74,7 +75,7 @@ class FP8State:
 
 # Global FP8 config that can be accessed by patched vLLM functions
 # initialized by 'init_fp8_cfg()'
-global_fp8_config: FP8Config = None
+global_fp8_config: FP8Config | None = None
 # Global FP8 state that holds runtime fp8 objects
 fp8_state: FP8State = FP8State()
 
@@ -90,14 +91,23 @@ def my_init(*args, **kwargs):
 
 
 def my_run_engine_core(*args, **kwargs):
-    global global_fp8_config
     fp8_cfg = kwargs["vllm_config"].nrl_fp8_cfg
     del kwargs["vllm_config"].nrl_fp8_cfg
-    # vLLM 0.25 executes the TP0 driver worker in the EngineCore process. Keep
-    # the config process-local as well as forwarding it to remote TP workers.
-    global_fp8_config = fp8_cfg
     monkey_patch_vllm_ray_executor(fp8_cfg)
     return original_run_engine_core(*args, **kwargs)
+
+
+def serialize_fp8_config() -> dict[str, Any] | None:
+    if global_fp8_config is None:
+        return None
+    return asdict(global_fp8_config)
+
+
+def install_fp8_config(config: dict[str, Any] | None) -> None:
+    if config is None:
+        return
+    global global_fp8_config
+    global_fp8_config = FP8Config(**config)
 
 
 def monkey_patch_vllm_ray_executor(fp8_config):
