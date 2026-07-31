@@ -135,14 +135,11 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - bump modelopt pin to >=0.44.0a0 to match the runtime venv version; the
-#     venv already has 0.44.0a0 installed, so the TRT-LLM wheel build picks it
-#     up directly without a separate modelopt from-source build step.
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
-assert_patch_target requirements.txt 'nvidia-modelopt[torch]~=0.37.0'
-sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
+# (The old nvidia-modelopt~=0.37.0 pin bump is gone: the TensorRT-LLM ref no
+#  longer lists nvidia-modelopt in requirements.txt.)
 assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
@@ -155,15 +152,24 @@ assert_patch_target cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt \
 sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
     cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
 
+# nvshmem doesn't accept '100f-real' (CMake >= 3.31 generates this for GB300).
+# Hardcode '100' only for the nvshmem cmake call; DeepEP kernels keep '100f' for
+# FP4 support.
+assert_patch_target cpp/tensorrt_llm/deep_ep/CMakeLists.txt \
+    '-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}'
+sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100|' \
+    cpp/tensorrt_llm/deep_ep/CMakeLists.txt
+
 # SM arch list. Sourced from BUILD_CUSTOM_TRTLLM_ARCH so it stays in sync with
 # _backend.py, which folds the same value into the wheel cache key (a change to
 # the arch list must invalidate the cached wheel). The default below MUST match
 # _backend.py's _DEFAULT_ARCH.
-#   90-real;100-real: build Hopper (sm_90) and Blackwell (sm_100) kernels,
-#                     i.e. H100/GB200/B200 only (B200 is also sm_100) — other
-#                     SKUs (e.g. A100 sm_80, L40 sm_89, consumer Blackwell
-#                     RTX 50-series sm_120) need this list extended.
-ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-90-real;100-real}"
+#   100-real;103-real: build Blackwell (sm_100) and Blackwell-Ultra (sm_103)
+#                      kernels, i.e. GB200/B200 (sm_100) + GB300/B300 (sm_103)
+#                      only — other SKUs (e.g. H100 sm_90, A100 sm_80, L40
+#                      sm_89, consumer Blackwell RTX 50-series sm_120) need this
+#                      list extended.
+ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;103-real}"
 JOBS="${TRTLLM_BUILD_JOBS:-24}"
 NPROC=$(nproc 2>/dev/null || echo "$JOBS")
 if (( JOBS > NPROC )); then
