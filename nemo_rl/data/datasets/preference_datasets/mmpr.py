@@ -203,15 +203,11 @@ class MMPRPreferenceDataset(RawDataset):
             # leading validation rows. Reproduce that ordering for curve parity
             # instead of performing RawDataset's second random split.
             requested_val_size = (
-                int(split_validation_size)
-                if split_validation_size >= 1
-                else 2000
+                int(split_validation_size) if split_validation_size >= 1 else 2000
             )
             val_size = min(requested_val_size, len(self.dataset) // 10)
             if val_size > 0:
                 self.val_dataset = self.dataset.select(range(val_size))
-                self.dataset = self.dataset.select(
-                    range(val_size, len(self.dataset))
-                )
+                self.dataset = self.dataset.select(range(val_size, len(self.dataset)))
         else:
             self.split_train_validation(split_validation_size, seed)
