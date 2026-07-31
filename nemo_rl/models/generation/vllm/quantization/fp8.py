@@ -90,8 +90,12 @@ def my_init(*args, **kwargs):
 
 
 def my_run_engine_core(*args, **kwargs):
+    global global_fp8_config
     fp8_cfg = kwargs["vllm_config"].nrl_fp8_cfg
     del kwargs["vllm_config"].nrl_fp8_cfg
+    # vLLM 0.25 executes the TP0 driver worker in the EngineCore process. Keep
+    # the config process-local as well as forwarding it to remote TP workers.
+    global_fp8_config = fp8_cfg
     monkey_patch_vllm_ray_executor(fp8_cfg)
     return original_run_engine_core(*args, **kwargs)
 
