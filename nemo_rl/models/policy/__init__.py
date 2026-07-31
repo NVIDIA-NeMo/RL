@@ -387,8 +387,10 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
-    # When mtp_num_layers=0, Multi-Token Prediction is disabled.
-    mtp_num_layers: NotRequired[int]
+    # None disables Multi-Token Prediction entirely. For hybrid (mamba) models
+    # None is the only full off-switch: hybrid_model.py gates the MTP block on
+    # `mtp_num_layers is not None`, so 0 still enters it and asserts > 0.
+    mtp_num_layers: NotRequired[int | None]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.

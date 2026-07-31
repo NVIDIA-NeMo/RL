@@ -439,6 +439,20 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
+            if not input_messages:
+                # The agent failed before issuing any model request (e.g. its
+                # in-container setup command crashed), so the gym result carries
+                # neither output items nor input messages. Raise something
+                # actionable instead of letting apply_chat_template([]) throw a
+                # bare IndexError that masks the diagnosis.
+                raise ValueError(
+                    "NeMo Gym returned a result with no generation data AND an "
+                    "empty input message list. This usually means the agent "
+                    "failed before its first model request (e.g. the SWE agent's "
+                    "in-container setup command crashed on this node — check the "
+                    "gym server logs around this time). Gym result (truncated): "
+                    f"{str(nemo_gym_result)[:2000]}"
+                )
             prompt_token_ids = tokenizer.apply_chat_template(
                 input_messages, tokenize=True
             )

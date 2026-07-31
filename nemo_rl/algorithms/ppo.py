@@ -483,7 +483,19 @@ def setup(
         num_workers=data_config["num_workers"],
     )
     if last_checkpoint_path is not None:
-        load_dataloader_state(dataloader, last_checkpoint_path, data_config)
+        # Fabricated warm-start seeds (a step_0 checkpoint holding only a
+        # pretrained value/ dir — see scripts/swe/ppo/prep_warm_start.sh) carry
+        # no dataloader state; start the dataloader fresh instead of failing,
+        # mirroring how a missing policy/ falls back to base weights below.
+        if os.path.exists(os.path.join(last_checkpoint_path, "train_dataloader.pt")):
+            load_dataloader_state(dataloader, last_checkpoint_path, data_config)
+        else:
+            print(
+                f"  ⚠ No train_dataloader.pt in checkpoint {last_checkpoint_path} "
+                "(e.g. a fabricated warm-start seed); starting dataloader from "
+                "the beginning.",
+                flush=True,
+            )
 
     print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
 
@@ -654,7 +666,12 @@ def setup(
         # across multiple nodes, so the inference cluster below gets no
         # topology constraints and falls back to default PACK placement.
         node_resource_constraints = None
-        if segment_size is not None:
+        # Segment topology only applies to multi-node clusters: in the single-node
+        # carve case train and inference SHARE the one node (GPUs split between
+        # them), so counting train_nodes + inference_nodes would double-count the
+        # roles and demand 2 alive nodes on a 1-node cluster. NVLink-domain
+        # placement is meaningless for a single node anyway.
+        if segment_size is not None and total_nodes > 1:
             topology = get_ray_cluster_topology()
             num_alive_nodes = len(topology)
             required_nodes = train_nodes + inference_nodes
