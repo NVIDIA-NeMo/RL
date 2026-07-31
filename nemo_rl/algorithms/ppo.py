@@ -185,13 +185,14 @@ def _apply_ppo_seq_logprob_error_masking(
     rewards: torch.Tensor,
     seq_logprob_error_threshold: float | None,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
-    """Apply optional mismatch masking and return the GAE mask and metrics."""
+    """Apply optional mismatch masking and return the advantage mask and metrics."""
     metrics = compute_and_apply_seq_logprob_error_masking(
         train_data=train_data,
         rewards=rewards,
         seq_logprob_error_threshold=seq_logprob_error_threshold,
     )
     metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
+
     advantage_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
     if not advantage_mask.bool().any():
         raise RuntimeError(
@@ -199,6 +200,7 @@ def _apply_ppo_seq_logprob_error_masking(
             "filtering and ppo.seq_logprob_error_threshold to avoid an optimizer "
             "step with an empty batch."
         )
+
     return advantage_mask, metrics
 
 
@@ -426,8 +428,8 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
-    if not colocated_inference:
-        assert backend == "vllm", (
+    if not colocated_inference and backend != "vllm":
+        raise NotImplementedError(
             "Non-colocated PPO generation currently supports only vLLM; "
             f"got backend={backend!r}. SGLang does not yet implement the "
             "cross-cluster collective weight update path."
