@@ -2095,7 +2095,7 @@ def _tool_call_metrics(results: list[dict[str, Any]], prefix: str) -> dict[str, 
     ):
         if values:
             metrics.update(
-                _calculate_single_metric(values, len(values), f"{prefix}/{metric_name}")
+                calculate_single_metric(values, len(values), f"{prefix}/{metric_name}")
             )
     return metrics
 
@@ -2207,21 +2207,21 @@ def _calculate_refine_metrics(
         )
 
         metrics.update(
-            _calculate_single_metric(
+            calculate_single_metric(
                 tool_call_turns,
                 active_count,
                 f"{prefix}/tool_call_turns_per_sample",
             )
         )
         metrics.update(
-            _calculate_single_metric(
+            calculate_single_metric(
                 assistant_tokens,
                 active_count,
                 f"{prefix}/gen_tokens_per_sample",
             )
         )
         metrics.update(
-            _calculate_single_metric(
+            calculate_single_metric(
                 total_tokens,
                 active_count,
                 f"{prefix}/total_tokens_per_sample",
