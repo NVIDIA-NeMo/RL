@@ -308,6 +308,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         else:
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+    if global_fp8_config.is_mx:
+        # vLLM 0.25 also applies ModelOpt MXFP8 to ParallelLMHead, while refit
+        # sends lm_head in BF16 without a matching block-scale tensor.
+        fp8_block_quant_kwargs.setdefault("ignored_layers", [])
+        if "lm_head" not in fp8_block_quant_kwargs["ignored_layers"]:
+            fp8_block_quant_kwargs["ignored_layers"].append("lm_head")
     if "ignored_layers" in fp8_block_quant_kwargs:
         fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
 
@@ -478,8 +484,8 @@ def load_weights(weights, model_runner):
                 v.to(torch.float),
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
-        param_scale = torch.squeeze(param_scale, dim=-1)
         if global_fp8_config.is_mx:
+            # vLLM 0.25 returns row-major [M, K / 32] E8M0 scales.
             # All-zero blocks quantize to E8M0 byte 0, which destabilizes the
             # TRTLLM MXFP8 kernel; clamp to byte 1 (weights are 0 anyway).
             param_scale = torch.where(
@@ -488,6 +494,7 @@ def load_weights(weights, model_runner):
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
+            param_scale = torch.squeeze(param_scale, dim=-1)
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm. Deferred: importing vllm_backend at
@@ -1399,33 +1406,40 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         layer.w13_weight.copy_(w13_weight_shuffled)
         layer.w2_weight.copy_(w2_weight_shuffled)
 
+    runtime_w13_scale = getattr(layer, "w13_scale_for_apply", layer.w13_weight_scale)
+    runtime_w2_scale = getattr(layer, "w2_scale_for_apply", layer.w2_weight_scale)
+    assert self.moe is layer.moe_config
 
-def _get_mxfp8_moe_activation_param(
-    quant_method: object,
-    layer: RoutedExperts,
-    name: str,
-    local_num_experts: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    value = getattr(layer, name, None)
-    if value is None:
-        return None
-
-    cache_name = f"_nrl_{name}"
-    cached = getattr(quant_method, cache_name, None)
-    if (
-        cached is None
-        or cached.shape != (local_num_experts,)
-        or cached.device != device
-    ):
-        cached = torch.full(
-            (local_num_experts,),
-            float(value),
-            dtype=torch.float32,
-            device=device,
+    if self.moe_kernel is None:
+        from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+            make_fp8_moe_kernel,
+            make_fp8_moe_quant_config,
         )
-        setattr(quant_method, cache_name, cached)
-    return cached
+
+        self.moe_quant_config = make_fp8_moe_quant_config(
+            fp8_backend=self.mxfp8_backend,
+            w1_scale=runtime_w13_scale,
+            w2_scale=runtime_w2_scale,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=self.weight_block_size,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
+            layer=layer,
+        )
+        self.moe_kernel = make_fp8_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            fp8_backend=self.mxfp8_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+            layer=layer,
+        )
+    else:
+        assert self.moe_quant_config is not None
+        assert self.moe_quant_config.w1_scale is runtime_w13_scale
+        assert self.moe_quant_config.w2_scale is runtime_w2_scale
 
 
 def apply_monolithic_mxfp8_moe(
@@ -1437,59 +1451,13 @@ def apply_monolithic_mxfp8_moe(
 ) -> torch.Tensor:
     """Forward for the FlashInfer TRTLLM MXFP8 MoE with hidden-dim padding.
 
-    Mirrors vLLM 0.25.1 ModelOptMxFp8FusedMoE.apply_monolithic, with three
-    changes: reads the *_for_apply tensors built by
+    Uses vLLM 0.25.1's modular MoE kernel with the *_for_apply tensors built by
     process_weights_after_loading_mxfp8_moe when padding is active, pads x's
-    hidden dim to mxfp8_padded_hidden_size before the kernel and narrows the
-    output back, and allows RELU2_NO_MUL for non-gated MoEs (Nemotron-3-Nano).
+    hidden dim to mxfp8_padded_hidden_size before the kernel, and narrows the
+    output back.
     """
-    from flashinfer.fused_moe import (
-        ActivationType,
-        Fp8QuantizationType,
-        WeightLayout,
-    )
-    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
-    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        mxfp8_e4m3_quantize,
-    )
-    from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
-
-    assert self.mxfp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
-
-    moe_config = self.moe
-    parallel_config = moe_config.moe_parallel_config
-    if parallel_config.enable_eplb:
-        raise NotImplementedError(
-            "EPLB is not supported for FlashInfer TRTLLM MXFP8 MoE backend."
-        )
-
-    # Map vLLM MoEActivation to FlashInfer ActivationType.
-    activation_map = {
-        MoEActivation.SILU: ActivationType.Swiglu,
-        MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
-    }
-    if moe_config.activation not in activation_map:
-        raise NotImplementedError(
-            "FlashInfer TRTLLM MXFP8 MoE supports only "
-            f"{list(activation_map)}, got {moe_config.activation}."
-        )
-    fi_activation_type = activation_map[moe_config.activation]
-
-    # DeepSeekV3 routing requires float32 logits; others expect bfloat16.
-    if moe_config.routing_method == RoutingMethodType.DeepSeekV3:
-        assert router_logits.dtype == torch.float32, (
-            "DeepSeekV3 routing requires float32 router_logits, "
-            f"got {router_logits.dtype}."
-        )
-    else:
-        router_logits = router_logits.to(torch.bfloat16)
-
-    # Treat 0 as "unset" for compatibility with ungrouped routing configs.
-    n_group = layer.num_expert_group or None
-    topk_group = layer.topk_group or None
-
+    assert self.is_monolithic
+    assert self.moe_kernel is not None
     unpadded_hidden_size = x.shape[-1]
     padded_hidden_size = getattr(
         layer, "mxfp8_padded_hidden_size", unpadded_hidden_size
@@ -1499,59 +1467,19 @@ def apply_monolithic_mxfp8_moe(
             x, (0, padded_hidden_size - unpadded_hidden_size), value=0.0
         )
 
-    hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
+    output = self.moe_kernel.apply_monolithic(
         x,
-        is_sf_swizzled_layout=False,
-    )
-    local_num_experts = moe_config.num_local_experts
-
-    output = flashinfer_trtllm_fp8_block_scale_moe(
-        routing_logits=router_logits,
-        routing_bias=layer.e_score_correction_bias,
-        hidden_states=hidden_states_mxfp8,
-        hidden_states_scale=hidden_states_scale,
-        gemm1_weights=getattr(layer, "w13_weight_for_apply", layer.w13_weight),
-        gemm1_weights_scale=getattr(
-            layer, "w13_scale_for_apply", layer.w13_weight_scale
-        ),
-        gemm2_weights=getattr(layer, "w2_weight_for_apply", layer.w2_weight),
-        gemm2_weights_scale=getattr(layer, "w2_scale_for_apply", layer.w2_weight_scale),
-        num_experts=moe_config.num_experts,
-        top_k=moe_config.experts_per_token,
-        # Keep Optional semantics: FlashInfer expects None for non-grouped
-        # routing (e.g. Qwen3 Renormalize), not 0.
-        n_group=n_group,
-        topk_group=topk_group,
-        intermediate_size=moe_config.intermediate_size_per_partition,
-        local_expert_offset=parallel_config.ep_rank * local_num_experts,
-        local_num_experts=local_num_experts,
+        getattr(layer, "w13_weight_for_apply", layer.w13_weight),
+        getattr(layer, "w2_weight_for_apply", layer.w2_weight),
+        router_logits,
+        activation=layer.activation,
+        global_num_experts=layer.global_num_experts,
+        expert_map=layer.expert_map,
+        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        num_expert_group=layer.num_expert_group,
+        topk_group=layer.topk_group,
+        e_score_correction_bias=layer.e_score_correction_bias,
         routed_scaling_factor=layer.routed_scaling_factor,
-        routing_method_type=moe_config.routing_method,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.MajorK,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
-        activation_type=fi_activation_type,
-        gemm1_alpha=_get_mxfp8_moe_activation_param(
-            self,
-            layer,
-            "swiglu_alpha",
-            local_num_experts,
-            x.device,
-        ),
-        gemm1_beta=_get_mxfp8_moe_activation_param(
-            self,
-            layer,
-            "swiglu_beta",
-            local_num_experts,
-            x.device,
-        ),
-        gemm1_clamp_limit=_get_mxfp8_moe_activation_param(
-            self,
-            layer,
-            "swiglu_limit",
-            local_num_experts,
-            x.device,
-        ),
     )
     if output.shape[-1] != unpadded_hidden_size:
         output = output[..., :unpadded_hidden_size].contiguous()
