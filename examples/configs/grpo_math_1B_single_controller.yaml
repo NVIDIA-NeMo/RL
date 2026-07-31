@@ -373,6 +373,20 @@ token_capture:
   # Gate-side cleanup backstops (seconds).
   registration_ttl_s: 3600.0
   staging_ttl_s: 3600.0
+  # Gym LineageIndex capacity (each in-flight rollout's cumulative tokens
+  # live in the gate process). null = derived from the training config:
+  # rollouts = 2 x max in-flight, tokens = rollouts x max sequence length.
+  # Size explicitly for agentic workloads with deep per-rollout call trees.
+  lineage_max_rollouts: null
+  lineage_max_tokens: null
+  # Bearer token for the gate's /ng-control/* routes. null = minted per run.
+  control_auth_token: null
+  # Hard deadline per control-plane call (gate death must surface as failed
+  # dispatches + placeholders, not a silent retry stall).
+  control_timeout_s: 60.0
+  # Directory for the Gym base capture layer the gate rides on (stays
+  # essentially empty on the gate path). null = <logger.log_dir>/gym_token_capture.
+  capture_dir: null
 
 cluster:
   gpus_per_node: 2

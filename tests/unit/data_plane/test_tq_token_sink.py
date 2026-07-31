@@ -33,10 +33,10 @@ from nemo_gym.token_id_capture.staging.conformance import (  # noqa: E402
     run_sink_source_conformance,
 )
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
-    TokenSink as TokenSinkProtocol,
+    StagingSink as TokenSinkProtocol,
 )
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
-    TokenSource as TokenSourceProtocol,
+    StagingSource as TokenSourceProtocol,
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402

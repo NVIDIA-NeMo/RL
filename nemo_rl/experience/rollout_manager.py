@@ -493,8 +493,10 @@ class AsyncNemoGymRolloutImpl:
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             if rollout_ids is not None:
-                metadata = row["responses_create_params"].setdefault("metadata", {})
-                metadata["ng_rollout_id"] = rollout_ids[i]
+                # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
+                # derives the id from the run body and stamps /ng-rollout/<id>
+                # on every model call, so the TQ sample id IS the capture key.
+                row["_ng_rollout_id"] = rollout_ids[i]
             rows.append(row)
         return rows
 

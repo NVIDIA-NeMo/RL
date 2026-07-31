@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -306,6 +307,36 @@ def setup_single_controller(
         ACTOR_ENVIRONMENT_REGISTRY[
             "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
         ] = PY_EXECUTABLES.VLLM_GYM
+
+        # Fill the derived gate-hosting fields (see TokenCaptureConfig):
+        # a per-run control-plane bearer token, the base capture dir the
+        # gate rides on, and LineageIndex capacity sized from the training
+        # config (finding M: eviction of a live rollout must not happen
+        # under normal operation).
+        if token_capture_cfg.control_auth_token is None:
+            # Deferred import: only needed on the capture path.
+            import secrets
+
+            token_capture_cfg.control_auth_token = secrets.token_hex(32)
+        if token_capture_cfg.capture_dir is None:
+            token_capture_cfg.capture_dir = os.path.abspath(
+                os.path.join(
+                    master_config.logger.get("log_dir") or "logs",
+                    "gym_token_capture",
+                )
+            )
+        if token_capture_cfg.lineage_max_rollouts is None:
+            group_size = grpo_config["num_generations_per_prompt"]
+            in_flight = (
+                master_config.async_rl.max_buffered_rollouts
+                + master_config.async_rl.max_inflight_prompts
+            ) * group_size
+            token_capture_cfg.lineage_max_rollouts = 2 * in_flight
+        if token_capture_cfg.lineage_max_tokens is None:
+            token_capture_cfg.lineage_max_tokens = (
+                token_capture_cfg.lineage_max_rollouts
+                * int(master_config.policy["max_total_sequence_length"])
+            )
 
     set_seed(grpo_config["seed"])
 

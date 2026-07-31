@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -89,9 +90,11 @@ class NemoGymConfig(TypedDict):
 
 
 # Gym control-plane server name (the model server hosting the gate) and the
-# metadata key rollout ids ride on (defined in Gym's token_id_capture.gate).
+# opaque run-body key rollout ids ride on (Gym's ROLLOUT_ID_KEY_NAME): the
+# agent derives the id from the run body and stamps /ng-rollout/<id> on every
+# model call, so the TQ sample id IS the capture key end to end.
 _POLICY_SERVER_NAME = "policy_model"
-_NG_ROLLOUT_ID_METADATA_KEY = "ng_rollout_id"
+_NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -258,6 +261,8 @@ Depending on your data shape, you may want to change these values."""
             token_capture and token_capture.get("enabled")
         )
         self._server_client = None
+        self._control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
         if self._token_capture_enabled:
             if self.rollout_max_attempts_to_avoid_lp_nan != 1:
                 raise ValueError(
@@ -274,7 +279,41 @@ Depending on your data shape, you may want to change these values."""
             policy_overrides["token_capture_gate"] = {
                 "enabled": True,
                 "registration_ttl_s": token_capture["registration_ttl_s"],
+                # Finding M: the LineageIndex holds each in-flight rollout's
+                # cumulative tokens; capacity is sized from the training
+                # config at setup, never left at the eval-sized defaults.
+                "lineage_max_rollouts": token_capture["lineage_max_rollouts"],
+                "lineage_max_tokens": token_capture["lineage_max_tokens"],
+                # Finding S: control routes are bearer-authed,
+                # default-required; the token is minted per run at setup.
+                "control_auth_token": token_capture["control_auth_token"],
             }
+            # #2124-c1 workaround: the capture middleware mints model_call_id
+            # (and sets the capture context the gate keys on) only when the
+            # base token capture is active, which requires a capture dir.
+            # The base's own capture_tokens no-ops on the gate path (the
+            # worker strips token fields before responding), so the dir
+            # stays essentially empty.
+            initial_global_config_dict["token_id_capture_enabled"] = True
+            initial_global_config_dict["token_id_capture_dir"] = token_capture[
+                "capture_dir"
+            ]
+            # Agents apply the /ng-rollout/<id> correlation prefix for token
+            # capture only when they opt in (the global enabled switch alone
+            # gates the infrastructure, not the prefix). In an RL training
+            # run every agent must correlate, and the SC cannot enumerate
+            # agent servers configured via config_paths — so flip the
+            # run-wide opt-in the Gym branch adds for exactly this case.
+            initial_global_config_dict["token_id_capture_all_agents"] = True
+            self._control_headers = {
+                "Authorization": f"Bearer {token_capture['control_auth_token']}"
+            }
+            # S5 chaos finding: Gym's shared request() retries connection
+            # errors indefinitely; a dead gate must surface as a failed
+            # dispatch (placeholders + TTL), not a silent stall.
+            self._control_timeout_s = float(
+                token_capture.get("control_timeout_s") or 60.0
+            )
 
         self.rh = RunHelper()
         self.rh.start(
@@ -306,9 +345,23 @@ Depending on your data shape, you may want to change these values."""
         return self._server_client
 
     async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
-        response = await self._control_client().request(
-            server_name=_POLICY_SERVER_NAME, url_path=path, method=method, **kwargs
-        )
+        headers = {**kwargs.pop("headers", {}), **self._control_headers}
+        try:
+            response = await asyncio.wait_for(
+                self._control_client().request(
+                    server_name=_POLICY_SERVER_NAME,
+                    url_path=path,
+                    method=method,
+                    headers=headers,
+                    **kwargs,
+                ),
+                timeout=self._control_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"gate control call {method} {path} exceeded "
+                f"{self._control_timeout_s}s (gate unreachable or stalled)"
+            ) from None
         if response.status != 200:
             raise RuntimeError(
                 f"gate control call {method} {path} failed: "
@@ -347,13 +400,10 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
 
         if self._token_capture_enabled:
-            # Receipt mode: register the gate-registered ids riding each
-            # row's metadata before dispatch; seal at completion.
+            # Receipt mode: register the ids riding each row's run body
+            # before dispatch; seal at completion.
             rollout_ids = [
-                example["responses_create_params"]["metadata"][
-                    _NG_ROLLOUT_ID_METADATA_KEY
-                ]
-                for example in nemo_gym_examples
+                example[_NG_ROLLOUT_ID_BODY_KEY] for example in nemo_gym_examples
             ]
             await self.register_rollouts(rollout_ids)
 
@@ -442,9 +492,7 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        rollout_id = nemo_gym_row["responses_create_params"]["metadata"][
-            _NG_ROLLOUT_ID_METADATA_KEY
-        ]
+        rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         try:
             receipt = await self._control(
                 "POST",

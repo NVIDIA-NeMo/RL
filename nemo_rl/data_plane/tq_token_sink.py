@@ -63,7 +63,7 @@ def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
 
 
 class TQTokenSink:
-    """Gym ``TokenSink`` over ``DataPlaneClient.put_samples``.
+    """Gym ``StagingSink`` over ``DataPlaneClient.put_samples``.
 
     ``stage`` is synchronous and returns only after TQ acknowledged the
     write, so the capture layer's fail-closed ordering (bytes durable before
@@ -136,7 +136,7 @@ class TQTokenSink:
 
 
 class TQTokenSource:
-    """Gym ``TokenSource`` over ``DataPlaneClient.get_samples``.
+    """Gym ``StagingSource`` over ``DataPlaneClient.get_samples``.
 
     Rows are fetched one key at a time (deltas are jagged across calls) in
     the order requested. A missing or unreadable row raises ``KeyError`` per
