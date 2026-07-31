@@ -7,6 +7,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1
   val_at_start: true
   val_at_end: false
   overlong_filtering: false
@@ -48,7 +49,7 @@ grpo:
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -101,6 +102,8 @@ policy:
 
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
     bias_activation_fusion: false
     tensor_model_parallel_size: 2
     # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
@@ -287,14 +290,14 @@ data:
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  # true: skip expensive train_data_step*.jsonl; false: write jsonl (heavy). Prefer true if disk is tight.
+  should_log_nemo_gym_responses: true
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
-    # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or
-    # vLLM (20001+). See ray.sub for the full port layout.
-    port_range_low: 15001
-    port_range_high: 20000
-    rollout_max_attempts_to_avoid_lp_nan: 1
+    # (below the 9000 ephemeral floor on some GB200 nodes) and non-overlapping with NeMo
+    # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.
+    port_range_low: 5000
+    port_range_high: 5999
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
@@ -329,6 +332,7 @@ logger:
   wandb:
     project: "grpo-workplace-assistant"
     name: "nemotron-nano-v2-9b-workplace-assistant"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-workplace-assistant"

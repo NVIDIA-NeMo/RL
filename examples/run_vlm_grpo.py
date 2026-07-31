@@ -15,6 +15,7 @@
 import argparse
 import os
 import pprint
+import time
 
 from omegaconf import OmegaConf
 
@@ -28,7 +29,8 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.timer import Timer
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -44,7 +46,10 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     """Main entry point."""
-    # Parse arguments
+    main_start = time.perf_counter()
+    log_container_init_timing()
+    rl_init_timer = Timer(context={"worker": "driver"})
+
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
@@ -53,16 +58,17 @@ def main() -> None:
             os.path.dirname(__file__), "configs", "vlm_grpo_3B.yaml"
         )
 
-    config = load_config(args.config)
-    print(f"Loaded configuration from: {args.config}")
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
 
-    if overrides:
-        print(f"Overrides: {overrides}")
-        config = parse_hydra_overrides(config, overrides)
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
 
-    config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
-    print("Applied CLI overrides")
+        config = OmegaConf.to_container(config, resolve=True)
+        config = MasterConfig(**config)
+        print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
@@ -76,10 +82,11 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    init_ray()
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
 
-    # init processor
-    processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
+    with rl_init_timer.time("tokenizer"):
+        processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
     tokenizer = processor.tokenizer
 
     assert config.policy["generation"] is not None, (
@@ -95,30 +102,36 @@ def main() -> None:
             "VLMs require tokenizer to be initialized before generation, so skip_tokenizer_init must be set to False."
         )
 
-    # setup data
-    # this function is local to this script, and can be extended to other VLM datasets
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(processor, config.data, config.env, is_vlm=True)
+    with rl_init_timer.time("data"):
+        dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
+            processor, config.data, config.env, is_vlm=True
+        )
 
-    (
-        policy,
-        policy_generation,
-        _nemo_gym,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-        _teacher_worker_groups,
-        _alias_to_group_alias,
-    ) = setup(config, tokenizer, dataset, val_dataset, processor=processor)
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            _nemo_gym,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            _teacher_worker_groups,
+            _alias_to_group_alias,
+        ) = setup(config, tokenizer, dataset, val_dataset, processor=processor)
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
 
     grpo_train(
         policy,

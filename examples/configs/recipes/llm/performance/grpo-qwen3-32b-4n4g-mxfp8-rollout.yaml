@@ -1,0 +1,23 @@
+defaults: ./grpo-qwen3-32b-4n4g.yaml
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-4n4g-mxfp8-rollout
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      is_mx: true
+      quantization_ignored_layer_kws:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+logger:
+  log_dir: logs/grpo-qwen3-32b-4n4g-mxfp8-rollout
+  wandb:
+    name: grpo-qwen3-32b-4n4g-mxfp8-rollout
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 4

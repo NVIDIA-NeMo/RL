@@ -47,7 +47,7 @@ data:
   env_name: vlm
 
 env:
-  mmau:
+  vlm:
     num_workers: 8
     reward_functions:
     - name: exact_alnum

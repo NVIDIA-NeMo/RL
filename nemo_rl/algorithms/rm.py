@@ -16,6 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -57,6 +58,21 @@ def _initial_rm_save_state() -> RMSaveState:
     return RMSaveState(
         epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
+
+
+def _get_rm_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> RMSaveState:
+    if loaded_state is None:
+        return _initial_rm_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(RMSaveState)}
+    state_values = vars(_initial_rm_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return RMSaveState(**state_values)
 
 
 class RMConfig(BaseModel, extra="allow"):
@@ -156,17 +172,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known RMSaveState fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        # Backcompat: checkpoints saved before total_valid_tokens was added.
-        loaded_state.setdefault("total_valid_tokens", 0)
-        known_fields = {f.name for f in fields(RMSaveState)}
-        rm_save_state = RMSaveState(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        rm_save_state = _initial_rm_save_state()
+    rm_save_state = _get_rm_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -508,6 +514,8 @@ def rm_train(
 
     policy.prepare_for_training()
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while current_epoch < max_num_epochs and (
         master_config.rm.max_num_steps == -1
         or total_steps < master_config.rm.max_num_steps
@@ -583,6 +591,10 @@ def rm_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
@@ -668,7 +680,10 @@ def rm_train(
                             train_dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
@@ -707,12 +722,14 @@ def rm_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if (
                 master_config.rm.max_num_steps != -1
                 and total_steps >= master_config.rm.max_num_steps
             ):
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -721,3 +738,10 @@ def rm_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()

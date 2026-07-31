@@ -54,7 +54,7 @@
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1u5lmjHOsYpJqXaeYstjw7Qbzvbo67U0v?usp=sharing) to get a head start on your experimentation.  
 * [9/30/2025] [Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4) 
 * [8/15/2025] [NeMo-RL: Journey of Optimizing Weight Transfer in Large MoE Models by 10x](https://github.com/NVIDIA-NeMo/RL/discussions/1189)
-* [7/31/2025] [NeMo-RL V0.3: Scalable and Performant Post-training with Nemo-RL via Megatron-Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
+* [7/31/2025] [NeMo RL V0.3: Scalable and Performant Post-training with NeMo RL via Megatron Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Announcement](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
@@ -104,10 +104,10 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
 - 🔜 **Resiliency** - Fault tolerance and auto-scaling support
-- 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
+- 🔜 **On-Policy Cross-Tokenizer Distillation** - cross-tokenizer support for the on-policy (MOPD) recipe (today MOPD is same-tokenizer; cross-tokenizer xToken is off-policy)
 - 🔜 **New Models** - Qwen3-Next, Minimax 
 
-- ✅ **X-Token Off-Policy Distillation** - Off-policy distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
+- ✅ **X-Token Off-Policy Distillation** - Distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
 - ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
 - ✅ **SGLang Inference** - SGLang rollout support for optimized inference.
@@ -142,7 +142,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
+    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Off-Policy Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Off-Policy Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
     |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
@@ -160,7 +160,41 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends. 
+> [!TIP]
+> **Recommended:** Use the pre-built NGC container to skip manual system dependency setup. The container ships with CUDA, cuDNN, vLLM, and SGLang already installed.
+>
+> ```sh
+> docker pull nvcr.io/nvidia/nemo-rl:latest
+> git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+> cd nemo-rl
+> # export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
+> # export HF_HOME=~/.cache/huggingface           # model and tokenizer cache
+> # export HF_DATASETS_CACHE=~/.cache/huggingface/datasets  # dataset cache
+> docker run --rm -it \
+>   -u root \
+>   --runtime=nvidia \
+>   --gpus all \
+>   --shm-size=64g \
+>   --ulimit memlock=-1 \
+>   -v $PWD:/opt/nemo-rl \
+>   -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+>   -v ${HF_DATASETS_CACHE:-$HOME/.cache/huggingface/datasets}:/hf_datasets_cache \
+>   -e HF_HOME=/hf_home \
+>   -e HF_DATASETS_CACHE=/hf_datasets_cache \
+>   -e HF_TOKEN \
+>   -e WANDB_API_KEY \
+>   -w /opt/nemo-rl \
+>   nvcr.io/nvidia/nemo-rl:latest \
+>   bash
+> ```
+>
+> Then inside the container: `uv run python examples/run_grpo.py`
+>
+> See the [Installation guide](docs/about/installation.md#docker-quickstart) for details.
+
+### Bare-Metal Quick Start
+
+Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
@@ -211,7 +245,7 @@ Clone **NeMo RL**.
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
-# If you are already cloned without the recursive option, you can initialize the submodules recursively
+# If you have already cloned without the recursive option, you can initialize the submodules recursively
 git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
@@ -233,9 +267,9 @@ dpkg -l | grep cudnn.*cuda
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
-sudo apt install cudnn  # Will install cuDNN meta packages which points to the latest versions
-# sudo apt install cudnn9-cuda-12  # Will install cuDNN version 9.x.x compiled for cuda 12.x
-# sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
+sudo apt install cudnn  # Will install cuDNN meta packages that point to the latest versions
+# sudo apt install cudnn9-cuda-13  # Will install cuDNN version 9.x.x compiled for cuda 13.x (CUDA 13 — current primary)
+# sudo apt install cudnn9-cuda-13-2  # Will install cuDNN version 9.x.x compiled for cuda 13.2 specifically
 ```
 
 If you encounter problems when installing vllm's dependency deep_ep on bare-metal (outside of a container), you may need to install libibverbs-dev as well. Here is how you can install it:
@@ -262,7 +296,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > ```sh
 > export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
 > export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
-> # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
+> # Verify (should match nvidia-cudnn-cu13 version in pyproject.toml, currently 9.20.0):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
 > See [docs/about/installation.md](docs/about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only) for details.
@@ -277,7 +311,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 
 ## GRPO
 
-We provide a reference GRPO configuration for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
+We provide a reference GRPO configuration for math benchmarks using the [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
 
 You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
 
@@ -382,6 +416,15 @@ Reference example for training to play a Sliding Puzzle Game:
 uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
+## Distillation
+
+NeMo RL supports two distillation recipes:
+
+| Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
+|---|---|---|---|---|---|---|
+| MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
+| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor V2 |
+
 ## On-policy Distillation
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
@@ -429,7 +472,7 @@ sbatch \
 
 We support off-policy distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
 
-You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md), including how the (student, teacher) projection matrix is built and how the loss modes work.
+You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
 
 Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
 
@@ -446,20 +489,20 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 
 ### X-Token Off-Policy Distillation Single Node
 
-To run x-token off-policy distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
+To run x-token distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
+  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
 
-By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path is the only required override. You can customize other parameters with command-line overrides. For example:
+By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path (per teacher) is the only required override. You can customize other parameters with command-line overrides. For example:
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
   policy.model_name="meta-llama/Llama-3.2-1B" \
-  teacher.model_name="Qwen/Qwen3-4B" \
+  teachers.0.model_name="Qwen/Qwen3-4B" \
   cluster.gpus_per_node=8
 ```
 
@@ -469,7 +512,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml loss_fn.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
+COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -710,7 +753,7 @@ Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that c
 
 ## Set Up Clusters
 
-For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Cluster Start](docs/cluster.md) documentation.
+For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Set Up Clusters](docs/cluster.md) documentation.
 
 ## Tips and Tricks
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:

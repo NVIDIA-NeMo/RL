@@ -18,11 +18,10 @@
 import asyncio
 import copy
 import json
-import math
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -30,7 +29,7 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
+from wandb import Table
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -47,6 +46,9 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -82,6 +84,21 @@ def _add_r3_fallback_metrics(
     gen_metrics["r3/routed_experts_actual_token_routes"] = actual_routes
     gen_metrics["r3/routed_experts_fallback_token_route_fraction"] = (
         float(missing_routes / expected_routes) if expected_routes > 0 else 0.0
+    )
+
+
+def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+    """Return True for samples the environment asks GRPO to mask from loss."""
+    return torch.tensor(
+        [
+            bool(
+                (result["full_result"].get("instance_config") or {}).get(
+                    "mask_sample", False
+                )
+            )
+            for result in results
+        ],
+        dtype=torch.bool,
     )
 
 
@@ -345,6 +362,12 @@ async def generate_responses_async(
         use_async_generation = bool(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
+    elif backend == "trtllm":
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        use_async_generation = True
     elif backend == "megatron":
         use_async_generation = bool(
             generation_config.get("mcore_generation_config", {}).get(
@@ -1096,6 +1119,9 @@ async def run_sample_multi_turn_rollout(
         for name, acc in reward_acc_dict.items():
             final_sample_state[name] = torch.tensor(acc)
 
+    # max_gen_tokens_per_turn: Diagnostic for long single generations
+    max_gen_tokens_per_turn = max(turn_gen_tokens) if turn_gen_tokens else 0
+
     # Sample metrics
     sample_metrics = {
         "turn_count": turn_count,
@@ -1109,11 +1135,197 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
+        "max_gen_tokens_per_turn": max_gen_tokens_per_turn,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
 
     return final_sample_state, sample_metrics
+
+
+@dataclass
+class RolloutGroupResult:
+    """One prompt group's rollout batch and metrics."""
+
+    group_index: int
+    final_batch: BatchedDataDict[DatumSpec]
+    rollout_metrics: dict[str, Any]
+    task_index: Optional[int] = None
+
+
+def _aggregate_multi_turn_rollout_metrics(
+    all_sample_metrics: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate native rollout metrics over an arbitrary set of samples."""
+    if not all_sample_metrics:
+        raise ValueError("Cannot aggregate metrics for an empty rollout batch")
+
+    batch_size = len(all_sample_metrics)
+    turn_counts = [m["turn_count"] for m in all_sample_metrics]
+    max_gen_tokens_per_turn_values = [
+        m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+    ]
+
+    rollout_metrics = {
+        # Overall metrics
+        "total_turns": sum(turn_counts),
+        "avg_turns_per_sample": sum(turn_counts) / batch_size,
+        "max_turns_per_sample": max(turn_counts),
+        "turns_per_sample/p95": pct(turn_counts, 95),
+        "turns_per_sample/p99": pct(turn_counts, 99),
+        "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+        / batch_size,
+        "truncation_rate": sum(m["truncated"] for m in all_sample_metrics) / batch_size,
+        "max_turns_reached_rate": sum(
+            m["max_turns_reached"] for m in all_sample_metrics
+        )
+        / batch_size,
+        # Token usage metrics
+        "mean_total_tokens_per_sample": sum(
+            m["total_tokens"] for m in all_sample_metrics
+        )
+        / batch_size,
+        "mean_gen_tokens_per_sample": sum(
+            m["assistant_tokens"] for m in all_sample_metrics
+        )
+        / batch_size,
+        "max_gen_tokens_per_sample": max(
+            m["assistant_tokens"] for m in all_sample_metrics
+        ),
+        "mean_env_tokens_per_sample": sum(m["env_tokens"] for m in all_sample_metrics)
+        / batch_size,
+        # Diagnostics for long single generations.
+        "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn_values),
+        "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn_values)
+        / batch_size,
+        "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn_values, 95),
+        # Reward metrics
+        "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
+        / batch_size,
+        "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
+        "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+    }
+
+    if "per_worker_token_counts" in all_sample_metrics[0]:
+        per_worker_token_counts = {}
+        for sample_metrics in all_sample_metrics:
+            for worker, token_count in sample_metrics[
+                "per_worker_token_counts"
+            ].items():
+                per_worker_token_counts[worker] = (
+                    per_worker_token_counts.get(worker, 0) + token_count
+                )
+        rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
+
+    rollout_metrics["histogram/gen_tokens_length"] = [
+        token_count
+        for sample_metrics in all_sample_metrics
+        for token_count in sample_metrics["turn_gen_tokens"]
+    ]
+    rollout_metrics["histogram/input_tokens_length"] = [
+        token_count
+        for sample_metrics in all_sample_metrics
+        for token_count in sample_metrics["turn_input_tokens"]
+    ]
+    rollout_metrics["histogram/total_tokens_length"] = [
+        token_count
+        for sample_metrics in all_sample_metrics
+        for token_count in sample_metrics["turn_total_tokens"]
+    ]
+    return rollout_metrics
+
+
+async def _run_multi_turn_rollout_async(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
+    """Run one native rollout batch and retain metrics at sample granularity."""
+    batch_size = len(input_batch["message_log"])
+
+    sample_initial_states = []
+    for i in range(batch_size):
+        sample_initial_states.append(
+            {
+                "message_log": input_batch["message_log"][i],
+                "extra_env_info": input_batch["extra_env_info"][i],
+                "task_name": input_batch["task_name"][i],
+                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
+                "idx": input_batch.get("idx", list(range(batch_size)))[i],
+            }
+        )
+
+    async def run_single_sample_with_error_handling(i, sample_state):
+        try:
+            return await run_sample_multi_turn_rollout(
+                sample_idx=i,
+                initial_sample_state=sample_state,
+                policy_generation=policy_generation,
+                tokenizer=tokenizer,
+                task_to_env=task_to_env,
+                max_seq_len=max_seq_len,
+                max_rollout_turns=max_rollout_turns,
+                greedy=greedy,
+            )
+        except Exception as error:
+            raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
+
+    sample_results = await asyncio.gather(
+        *(
+            run_single_sample_with_error_handling(i, sample_state)
+            for i, sample_state in enumerate(sample_initial_states)
+        ),
+        return_exceptions=False,
+    )
+    final_sample_states = [result[0] for result in sample_results]
+    all_sample_metrics = [result[1] for result in sample_results]
+
+    # Reconstruct the batch in input order. asyncio.gather preserves the order
+    # of the sample coroutines even when they finish out of order.
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [state["message_log"] for state in final_sample_states],
+            "extra_env_info": [
+                state["extra_env_info"] for state in final_sample_states
+            ],
+            "task_name": [state["task_name"] for state in final_sample_states],
+            "total_reward": torch.stack(
+                [state["total_reward"] for state in final_sample_states]
+            ),
+            "idx": [state.get("idx", i) for i, state in enumerate(final_sample_states)],
+            "truncated": torch.tensor(
+                [metrics["truncated"] for metrics in all_sample_metrics],
+                dtype=torch.bool,
+            ),
+        }
+    )
+
+    # Preserve named per-component rewards for GDPO. Mixed environment batches
+    # use zero for samples that do not expose a given reward component.
+    reward_component_keys = sorted(
+        set(
+            key
+            for state in final_sample_states
+            for key in get_gdpo_reward_component_keys(state)
+        )
+    )
+    for key in reward_component_keys:
+        final_batch[key] = torch.stack(
+            [
+                state[key] if key in state else torch.tensor(0.0, dtype=torch.float32)
+                for state in final_sample_states
+            ]
+        )
+
+    for key in input_batch.keys():
+        if key not in final_batch:
+            final_batch[key] = input_batch[key]
+
+    return final_batch, all_sample_metrics
 
 
 def run_async_multi_turn_rollout(
@@ -1125,184 +1337,103 @@ def run_async_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
-    """Run multi-turn rollouts with sample-level processing.
+    """Run a complete native rollout batch from a synchronous call site.
 
-    Each sample in the batch proceeds through its interaction independently.
-    Async generation is used internally when available but the function is synchronous.
+    Each sample proceeds through its interaction independently. Generation is
+    asynchronous internally, while this compatibility API returns only after
+    the full batch and its aggregate metrics are ready.
 
     Args:
-        policy_generation: The generation interface (policy)
-        input_batch: The starting batch containing initial message logs
-        tokenizer: The tokenizer
-        task_to_env: Dictionary mapping task names to environment instances
-        max_seq_len: Maximum sequence length allowed
-        max_rollout_turns: Maximum number of agent-environment interaction turns
-        greedy: Whether to use greedy decoding
+        policy_generation: Generation interface used to produce policy responses.
+        input_batch: Batch containing the initial message logs and environment data.
+        tokenizer: Tokenizer used to encode and decode rollout messages.
+        task_to_env: Mapping from task names to their environment implementations.
+        max_seq_len: Maximum total token length for each rollout sample.
+        max_rollout_turns: Maximum number of agent-environment interaction turns.
+        greedy: Whether policy generation should use greedy decoding.
 
     Returns:
-        Tuple containing:
-            - BatchedDataDict with the full interaction history and accumulated rewards
-            - Dictionary of rollout metrics
+        A tuple containing the completed rollout batch and metrics aggregated over
+        every sample in that batch.
+
+    Raises:
+        RuntimeError: If an individual sample rollout fails.
     """
+    final_batch, sample_metrics = asyncio.run(
+        _run_multi_turn_rollout_async(
+            policy_generation=policy_generation,
+            input_batch=input_batch,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,
+            greedy=greedy,
+        )
+    )
+    return final_batch, _aggregate_multi_turn_rollout_metrics(sample_metrics)
 
-    async def _async_rollout_implementation():
-        """Internal async implementation."""
-        batch_size = len(input_batch["message_log"])
 
-        # Prepare initial states for each sample
-        sample_initial_states = []
-        for i in range(batch_size):
-            sample_state = {
-                "message_log": input_batch["message_log"][i],
-                "extra_env_info": input_batch["extra_env_info"][i],
-                "task_name": input_batch["task_name"][i],
-                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
-                "idx": input_batch.get("idx", list(range(batch_size)))[i],
-            }
-            sample_initial_states.append(sample_state)
+async def run_async_multi_turn_rollout_groups(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    num_generations: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> AsyncGenerator[RolloutGroupResult, None]:
+    """Run one native batch, then yield prompt groups with group-local metrics.
 
-        # Run all samples concurrently
-        async def run_single_sample_with_error_handling(i, sample_state):
-            """Wrapper to handle errors for individual sample rollouts."""
-            try:
-                result = await run_sample_multi_turn_rollout(
-                    sample_idx=i,
-                    initial_sample_state=sample_state,
-                    policy_generation=policy_generation,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=max_seq_len,
-                    max_rollout_turns=max_rollout_turns,
-                    greedy=greedy,
-                )
-                return result
-            except Exception as e:
-                raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
+    This intentionally retains the native path's full-batch completion barrier.
+    The group iterator gives the collector a common interface with NeMo-Gym
+    without changing native rollout scheduling semantics.
 
-        # Create tasks for all samples and run them concurrently
-        sample_tasks = [
-            run_single_sample_with_error_handling(i, sample_state)
-            for i, sample_state in enumerate(sample_initial_states)
-        ]
+    Args:
+        policy_generation: Generation interface used to produce policy responses.
+        input_batch: Batch containing prompts repeated contiguously by group.
+        tokenizer: Tokenizer used to encode and decode rollout messages.
+        task_to_env: Mapping from task names to their environment implementations.
+        max_seq_len: Maximum total token length for each rollout sample.
+        num_generations: Number of contiguous rollout samples in each prompt group.
+        max_rollout_turns: Maximum number of agent-environment interaction turns.
+        greedy: Whether policy generation should use greedy decoding.
 
-        # Execute all sample rollouts concurrently
-        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=False)
+    Yields:
+        Complete prompt groups in input order. Each ``RolloutGroupResult`` contains
+        exactly ``num_generations`` samples and metrics aggregated only over those
+        samples.
 
-        # Process results
-        final_sample_states = []
-        all_sample_metrics = []
-
-        for final_state, sample_metrics in sample_results:
-            final_sample_states.append(final_state)
-            all_sample_metrics.append(sample_metrics)
-
-        # Reconstruct batch from sample results
-        batch_size = len(final_sample_states)
-        final_batch = BatchedDataDict[DatumSpec](
-            {
-                "message_log": [state["message_log"] for state in final_sample_states],
-                "extra_env_info": [
-                    state["extra_env_info"] for state in final_sample_states
-                ],
-                "task_name": [state["task_name"] for state in final_sample_states],
-                "total_reward": torch.stack(
-                    [state["total_reward"] for state in final_sample_states]
-                ),
-                "idx": [
-                    state.get("idx", i) for i, state in enumerate(final_sample_states)
-                ],
-                "truncated": torch.tensor(
-                    [metrics["truncated"] for metrics in all_sample_metrics],
-                    dtype=torch.bool,
-                ),
-            }
+    Raises:
+        ValueError: If ``num_generations`` is not positive or the batch size is not
+            divisible by ``num_generations``.
+        RuntimeError: If an individual sample rollout fails.
+    """
+    if num_generations <= 0:
+        raise ValueError("num_generations must be greater than zero")
+    if input_batch.size % num_generations != 0:
+        raise ValueError(
+            "Native rollout batch size must be divisible by num_generations"
         )
 
-        # Expose per-component rewards for multi-reward envs (GDPO advantage calculation).
-        # Collect named reward keys (e.g. "reward/correctness") from sample states.
-        reward_component_keys = sorted(
-            set(
-                k
-                for state in final_sample_states
-                for k in get_gdpo_reward_component_keys(state)
-            )
-        )
-        for key in reward_component_keys:
-            # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
-            final_batch[key] = torch.stack(
-                [
-                    state[key]
-                    if key in state
-                    else torch.tensor(0.0, dtype=torch.float32)
-                    for state in final_sample_states
-                ]
-            )
-
-        # Preserve additional fields from the original input_batch
-        for key in input_batch.keys():
-            if key not in final_batch:
-                final_batch[key] = input_batch[key]
-
-        # Aggregate metrics across all samples
-        rollout_metrics = {
-            # Overall metrics
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
-            "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
-            / batch_size,
-            "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_reached_rate": sum(
-                m["max_turns_reached"] for m in all_sample_metrics
-            )
-            / batch_size,
-            # Token usage metrics
-            "mean_total_tokens_per_sample": sum(
-                m["total_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            "mean_gen_tokens_per_sample": sum(
-                m["assistant_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            "max_gen_tokens_per_sample": max(
-                m["assistant_tokens"] for m in all_sample_metrics
+    final_batch, sample_metrics = await _run_multi_turn_rollout_async(
+        policy_generation=policy_generation,
+        input_batch=input_batch,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        greedy=greedy,
+    )
+    for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
+        end = start + num_generations
+        yield RolloutGroupResult(
+            group_index=group_index,
+            final_batch=final_batch.slice(start, end),
+            rollout_metrics=_aggregate_multi_turn_rollout_metrics(
+                sample_metrics[start:end]
             ),
-            "mean_env_tokens_per_sample": sum(
-                m["env_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            # Reward metrics
-            "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
-            / batch_size,
-            "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
-            "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
-        }
-
-        # Calculate per-worker token counts
-        if "per_worker_token_counts" in all_sample_metrics[0]:
-            per_worker_token_counts = {}
-            for m in all_sample_metrics:
-                for k, v in m["per_worker_token_counts"].items():
-                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
-            rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
-
-        # Collect ISL, OSL, and ISL+OSL metrics for all samples
-        rollout_metrics["histogram/gen_tokens_length"] = [
-            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
-        ]
-        rollout_metrics["histogram/input_tokens_length"] = [
-            t for m in all_sample_metrics for t in m["turn_input_tokens"]
-        ]
-        rollout_metrics["histogram/total_tokens_length"] = [
-            t for m in all_sample_metrics for t in m["turn_total_tokens"]
-        ]
-
-        return final_batch, rollout_metrics
-
-    return asyncio.run(_async_rollout_implementation())
+        )
 
 
 def _tensorize_by_key(message_logs: list, key: str):
@@ -1314,37 +1445,604 @@ def _tensorize_by_key(message_logs: list, key: str):
 
 
 @dataclass
-class AsyncNemoGymRolloutResult:
+class NemoGymRolloutResult:
+    """Processed NeMo-Gym rollouts for one prompt group or synchronous batch."""
+
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
+    # Stable prompt identity used by the async collector; absent for sync callers.
+    task_index: Optional[int]
 
 
-def _calculate_single_metric(
-    values: Sequence[float | int], batch_size: int, key_name: str
-) -> dict:
-    return {
-        f"{key_name}/mean": sum(values) / batch_size,
-        f"{key_name}/max": max(values),
-        f"{key_name}/min": min(values),
-        f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
-        f"{key_name}/histogram": Histogram(values),
+@dataclass(frozen=True)
+class _CompletedNemoGymGroup:
+    """One complete Gym prompt group restored to input-row order."""
+
+    group_index: int
+    rows: list[dict]
+    results: list[dict]
+
+
+class _NemoGymStreamAccumulator:
+    """Validate streamed Gym rows and assemble complete prompt groups.
+
+    NeMo Gym returns rows in completion order. This accumulator owns all ordering
+    and completeness rules so the rollout loop only needs to postprocess completed
+    groups.
+    """
+
+    def __init__(
+        self,
+        rows: list[dict],
+        num_generations: int,
+        allow_mixed_agents: bool,
+    ) -> None:
+        self._rows = rows
+        self._num_generations = num_generations
+        self._allow_mixed_agents = allow_mixed_agents
+        self._received_row_indices: set[int] = set()
+        self._pending_results: dict[int, dict[int, dict]] = defaultdict(dict)
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self._received_row_indices) == len(self._rows)
+
+    def add(self, row_index: int, result: dict) -> _CompletedNemoGymGroup | None:
+        """Add one streamed row and return its group when that group is complete."""
+        if not isinstance(row_index, int):
+            raise TypeError(
+                f"NeMo-Gym row index must be an int, got {type(row_index).__name__}"
+            )
+        if row_index < 0 or row_index >= len(self._rows):
+            raise ValueError(
+                f"NeMo-Gym returned row index {row_index} outside the expected "
+                f"range [0, {len(self._rows)})"
+            )
+        if row_index in self._received_row_indices:
+            raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
+
+        self._received_row_indices.add(row_index)
+        group_index = row_index // self._num_generations
+        group_results = self._pending_results[group_index]
+        group_results[row_index] = result
+        if len(group_results) < self._num_generations:
+            return None
+
+        start = group_index * self._num_generations
+        end = start + self._num_generations
+        expected_row_indices = range(start, end)
+        missing_row_indices = [
+            index for index in expected_row_indices if index not in group_results
+        ]
+        if missing_row_indices:
+            raise RuntimeError(
+                f"NeMo-Gym prompt group {group_index} completed with unexpected row "
+                f"indices; missing {missing_row_indices}"
+            )
+
+        rows = self._rows[start:end]
+        if not self._allow_mixed_agents:
+            agent_names = [row["agent_ref"]["name"] for row in rows]
+            if len(set(agent_names)) != 1:
+                raise ValueError(
+                    f"Expected one NeMo-Gym agent per prompt group, got {agent_names}"
+                )
+
+        ordered_results = [group_results[index] for index in expected_row_indices]
+        del self._pending_results[group_index]
+        return _CompletedNemoGymGroup(
+            group_index=group_index,
+            rows=rows,
+            results=ordered_results,
+        )
+
+    def finish(self) -> None:
+        """Raise when the stream ended before every expected row arrived."""
+        if self.is_complete:
+            return
+        missing_row_indices = sorted(
+            set(range(len(self._rows))) - self._received_row_indices
+        )
+        raise RuntimeError(
+            "NeMo-Gym rollout stream ended before all rows arrived; missing row "
+            f"indices {missing_row_indices}"
+        )
+
+
+def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
+    """Return thinking tags used by the Gym-side detector."""
+    nemo_gym_config = env_config.get("nemo_gym")
+    if isinstance(nemo_gym_config, dict) and nemo_gym_config.get("thinking_tags"):
+        return list(nemo_gym_config["thinking_tags"])
+    return list(DEFAULT_THINKING_TAGS)
+
+
+def _get_reward_penalty_config_value(
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+    key: str,
+) -> Any:
+    if reward_penalty_config is None:
+        return None
+    if isinstance(reward_penalty_config, dict):
+        return reward_penalty_config.get(key)
+
+    return getattr(reward_penalty_config, key, None)
+
+
+def _get_reward_penalty_token_id(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> int | None:
+    token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
+    value = _get_reward_penalty_config_value(token_ids, key)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _get_required_reward_penalty_token_id(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> int:
+    value = _get_reward_penalty_token_id(reward_penalty_config, key)
+    if value is None:
+        raise ValueError(f"reward_penalties.token_ids.{key} must be set")
+    return value
+
+
+def _get_reward_penalty_token_ids(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> list[int] | None:
+    token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
+    value = _get_reward_penalty_config_value(token_ids, key)
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return [int(value)]
+    return [int(token_id) for token_id in value]
+
+
+def _get_required_reward_penalty_token_ids(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> list[int]:
+    values = _get_reward_penalty_token_ids(reward_penalty_config, key)
+    if not values:
+        raise ValueError(f"reward_penalties.token_ids.{key} must be set")
+    return values
+
+
+def _infer_single_token_id(tokenizer: Any, text: str) -> int | None:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) != 1:
+        return None
+    return int(token_ids[0])
+
+
+def resolve_reward_penalty_config(
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+    tokenizer: Any,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve tokenizer-derived reward penalty fields.
+
+    User config must explicitly provide unwanted token IDs when
+    penalize_unwanted_tokens is enabled.
+    Think-tag IDs are inferred only when each configured tag is exactly one
+    token.
+    """
+    if reward_penalty_config is None:
+        return None
+
+    resolved: dict[str, Any] = {}
+    for flag in (
+        "penalize_duplicated_reasoning",
+        "penalize_empty_final_answer",
+        "penalize_unwanted_tokens",
+        "penalize_malformed_think_tag",
+    ):
+        value = _get_reward_penalty_config_value(reward_penalty_config, flag)
+        if value is not None:
+            resolved[flag] = value
+
+    token_ids: dict[str, Any] = {}
+    unwanted_token_ids = _get_reward_penalty_token_ids(
+        reward_penalty_config, "unwanted"
+    )
+    if unwanted_token_ids is not None:
+        token_ids["unwanted"] = unwanted_token_ids
+
+    for key in ("think_open", "think_close"):
+        value = _get_reward_penalty_token_id(reward_penalty_config, key)
+        if value is not None:
+            token_ids[key] = value
+
+    if resolved.get("penalize_unwanted_tokens") and not token_ids.get("unwanted"):
+        raise ValueError(
+            "reward_penalties.token_ids.unwanted must be set when "
+            "reward_penalties.penalize_unwanted_tokens is true"
+        )
+
+    if resolved.get("penalize_malformed_think_tag"):
+        configured_thinking_tags = _get_reward_penalty_config_value(
+            reward_penalty_config, "thinking_tags"
+        )
+        tags = tuple(thinking_tags or configured_thinking_tags or DEFAULT_THINKING_TAGS)
+        resolved["thinking_tags"] = tags
+        if len(tags) >= 2:
+            explicit_open = "think_open" in token_ids
+            explicit_close = "think_close" in token_ids
+            inferred_open = None
+            inferred_close = None
+            if not explicit_open:
+                inferred_open = _infer_single_token_id(tokenizer, tags[0])
+            if not explicit_close:
+                inferred_close = _infer_single_token_id(tokenizer, tags[1])
+
+            if (
+                explicit_open
+                or explicit_close
+                or (inferred_open is not None and inferred_close is not None)
+            ):
+                if inferred_open is not None:
+                    token_ids["think_open"] = inferred_open
+                if inferred_close is not None:
+                    token_ids["think_close"] = inferred_close
+
+    if token_ids:
+        resolved["token_ids"] = token_ids
+
+    return resolved
+
+
+def apply_reward_penalties(
+    results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
+) -> dict[str, int]:
+    """Apply reward penalties to results, setting reward to 0.0 when triggered.
+
+    All penalties are gated by reward_penalty_config flags. Returns a dict of penalty
+    counts keyed by penalty name.
+
+    NOTE: These penalties assume Gym-path message_log structure where roles
+    strictly alternate "user" → "assistant". Tool responses are folded into
+    user prompt tokens by _postprocess_nemo_gym_to_nemo_rl_result and never
+    appear as separate message_log entries. Do not call from non-Gym rollout paths.
+
+    Penalties:
+      1. penalize_duplicated_reasoning (text-based)
+         Checks response["output"] items. If a "reasoning" item's summary text
+         exactly matches the next item's content text (after strip), the model
+         is copying its thinking into the final answer verbatim.
+         Data: full_result["response"]["output"] — reasoning has summary[0]["text"],
+         message has content[0]["text"].
+
+      2. penalize_empty_final_answer (text-based)
+         Walks response["output"] in reverse to find the last message-type item.
+         If no message item exists or its content text is empty, the model failed
+         to produce a final answer. Skipped when the last output item is a
+         function_call (model was mid-agentic-loop, not producing an empty answer).
+         Data: full_result["response"]["output"] — message items have content[0]["text"].
+
+      3. penalize_unwanted_tokens (token-based)
+         Currently checks that none of the explicitly configured unwanted
+         token IDs appear anywhere in an assistant generation, including as the terminal
+         token. A turn may contain multiple unwanted tokens, so the whole assistant
+         token sequence is checked rather than excluding the trailing position.
+         Data: message_log[i]["token_ids"] where role == "assistant".
+
+      4. penalize_malformed_think_tag (message flag + token/string fallback)
+         Three complementary checks to catch malformed think tags:
+         a) Existing Gym flag: honors assistant message has_malformed_thinking.
+         b) Token ID check: when think tag IDs are resolved from config override
+            or single-token tokenizer encodings, infers thinking mode from
+            prompt token counts. If prompt has open==close:
+            enable_thinking=False, expect 0 open
+            and 0 close in generation. If prompt has open==close+1:
+            enable_thinking=True, expect 0 open and 1 close in generation.
+            Any other prompt pattern or mismatched generation counts is a violation.
+            This fallback is skipped when the tags do not resolve to one token
+            each.
+         c) String check: the model can spell out thinking tags with piecemeal
+            regular tokens (e.g. "<", "/", "thi", "nk", ">") that bypass special
+            token IDs. Checks generation_str (decoded generation text) per output
+            item: open-tag count must be 0 (always in prompt, never generated),
+            close-tag count must be 0 or 1.
+         Data: message_log pairs for token IDs, full_result output items for strings.
+    """
+    counts = {
+        "duplicated_reasoning": 0,
+        "empty_final_answer": 0,
+        "unwanted_token": 0,
+        "malformed_think_tag": 0,
     }
+    if not reward_penalty_config or not results:
+        return counts
+
+    # Guard: penalties rely on Gym-path message_log (strictly alternating user/assistant roles).
+    # Non-Gym paths may have "environment", "tool", or "system" roles which these checks don't handle.
+    any_penalty_enabled = any(
+        _get_reward_penalty_config_value(reward_penalty_config, flag)
+        for flag in (
+            "penalize_duplicated_reasoning",
+            "penalize_empty_final_answer",
+            "penalize_unwanted_tokens",
+            "penalize_malformed_think_tag",
+        )
+    )
+    if any_penalty_enabled:
+        for result in results:
+            roles = {msg.get("role") for msg in result["message_log"]}
+            assert roles <= {"user", "assistant"}, (
+                f"apply_reward_penalties requires Gym-path message_log with only 'user' and 'assistant' roles, "
+                f"but found roles: {roles}. These penalties are not supported for non-Gym rollout paths."
+            )
+
+    # --- Penalty 1: Duplicated reasoning / final answer ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_duplicated_reasoning"
+    ):
+        for result in results:
+            output_items = result["full_result"].get("response", {}).get("output", [])
+            is_duplicated = False
+            for item1, item2 in zip(output_items, output_items[1:]):
+                if item1.get("type") != "reasoning":
+                    continue
+                summary = item1.get("summary", [])
+                if not summary or "text" not in summary[0]:
+                    continue
+                reasoning_text = summary[0]["text"].strip()
+                content = item2.get("content", "")
+                if isinstance(content, list) and content and "text" in content[0]:
+                    chat_text = content[0]["text"].strip()
+                elif isinstance(content, str):
+                    chat_text = content.strip()
+                else:
+                    continue
+                if reasoning_text and chat_text and reasoning_text == chat_text:
+                    is_duplicated = True
+                    break
+            if is_duplicated:
+                result["full_result"]["reward"] = 0.0
+
+                counts["duplicated_reasoning"] += 1
+
+    # --- Penalty 2: Empty final answer ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_empty_final_answer"
+    ):
+        for result in results:
+            output_items = result["full_result"].get("response", {}).get("output", [])
+            # Skip if the last output item is a function_call — it is legit for model to
+            # produce reasoning and then a function_call as the last output item in PivotRL
+            if output_items and output_items[-1].get("type") == "function_call":
+                continue
+            final_answer_text = None
+            for item in reversed(output_items):
+                # Skip items without content (function_call, function_call_output, etc.)
+                if "content" not in item:
+                    continue
+                content = item["content"]
+                if isinstance(content, list) and content and "text" in content[0]:
+                    final_answer_text = content[0]["text"].strip()
+                    break
+                elif isinstance(content, str):
+                    final_answer_text = content.strip()
+                    break
+            if final_answer_text is None or final_answer_text == "":
+                result["full_result"]["reward"] = 0.0
+
+                counts["empty_final_answer"] += 1
+
+    # --- Penalty 3: unwanted token in generation ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_unwanted_tokens"
+    ):
+        unwanted_token_ids = _get_required_reward_penalty_token_ids(
+            reward_penalty_config, "unwanted"
+        )
+        for result in results:
+            has_unwanted_token = False
+            for msg in result["message_log"]:
+                if msg["role"] != "assistant":
+                    continue
+                # Penalize any configured unwanted token in the assistant generation,
+                # including the terminal position.
+                if any(token_id in msg["token_ids"] for token_id in unwanted_token_ids):
+                    has_unwanted_token = True
+                    break
+            if has_unwanted_token:
+                result["full_result"]["reward"] = 0.0
+
+                counts["unwanted_token"] += 1
+
+    # --- Penalty 4: Malformed think tags (existing flag + optional token ID + string) ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_malformed_think_tag"
+    ):
+        think_open_token_id = _get_reward_penalty_token_id(
+            reward_penalty_config, "think_open"
+        )
+        think_close_token_id = _get_reward_penalty_token_id(
+            reward_penalty_config, "think_close"
+        )
+        if (think_open_token_id is None) != (think_close_token_id is None):
+            raise ValueError(
+                "reward_penalties.token_ids.think_open and "
+                "reward_penalties.token_ids.think_close must both be set"
+            )
+        for result in results:
+            has_violation = any(
+                msg.get("role") == "assistant"
+                and msg.get("has_malformed_thinking", False)
+                for msg in result["message_log"]
+            )
+
+            # 4a) Token ID check per (user, assistant) turn pair.
+            # Infer thinking mode from prompt token counts:
+            #   enable_thinking=True:  prompt has open=close+1 (trailing <think>), expect asst: 0 open, 1 close
+            #   enable_thinking=False: prompt has open=close (balanced), expect asst: 0 open, 0 close
+            msgs = result["message_log"]
+            if (
+                not has_violation
+                and think_open_token_id is not None
+                and think_close_token_id is not None
+            ):
+                for i in range(len(msgs) - 1):
+                    if msgs[i]["role"] != "user" or msgs[i + 1]["role"] != "assistant":
+                        continue
+                    user_ids = msgs[i]["token_ids"]
+                    asst_ids = msgs[i + 1]["token_ids"]
+                    prompt_open = (user_ids == think_open_token_id).sum().item()
+                    prompt_close = (user_ids == think_close_token_id).sum().item()
+                    asst_open = (asst_ids == think_open_token_id).sum().item()
+                    asst_close = (asst_ids == think_close_token_id).sum().item()
+                    if prompt_open == prompt_close:
+                        # enable_thinking=False: both tags in prompt, none in generation
+                        expected_open, expected_close = 0, 0
+                    elif prompt_open == prompt_close + 1:
+                        # enable_thinking=True: trailing <think> in prompt, expect </think> in generation
+                        expected_open, expected_close = 0, 1
+                    else:
+                        # Unexpected prompt pattern - flag as violation
+                        has_violation = True
+                        break
+                    if asst_open != expected_open or asst_close != expected_close:
+                        has_violation = True
+                        break
+
+            # 4b) String check on generation_str per output item.
+            if not has_violation:
+                thinking_tags = (
+                    _get_reward_penalty_config_value(
+                        reward_penalty_config, "thinking_tags"
+                    )
+                    or DEFAULT_THINKING_TAGS
+                )
+                if len(thinking_tags) < 2:
+                    raise ValueError(
+                        "reward_penalties.thinking_tags must contain open and close tags"
+                    )
+                think_open_text, think_close_text = thinking_tags[:2]
+                output_items = (
+                    result["full_result"].get("response", {}).get("output", [])
+                )
+                for item in output_items:
+                    gen_str = item.get("generation_str", "")
+                    if not gen_str:
+                        continue
+                    if (
+                        gen_str.count(think_open_text) > 0
+                        or gen_str.count(think_close_text) > 1
+                    ):
+                        has_violation = True
+                        break
+            if has_violation:
+                result["full_result"]["reward"] = 0.0
+
+                counts["malformed_think_tag"] += 1
+
+    return counts
 
 
-def run_async_nemo_gym_rollout(
+def _prepare_nemo_gym_rows(
+    rows: list[dict], generation_config: GenerationConfig
+) -> None:
+    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    for row_index, row in enumerate(rows):
+        responses_create_params = row.get("responses_create_params")
+        if not isinstance(responses_create_params, dict):
+            raise TypeError(
+                "Each NeMo-Gym row must contain a responses_create_params dict"
+            )
+
+        responses_create_params["temperature"] = generation_config["temperature"]
+        responses_create_params["top_p"] = generation_config["top_p"]
+        configured_max_tokens = generation_config["max_new_tokens"]
+        row_max_tokens = responses_create_params.get("max_output_tokens")
+        responses_create_params["max_output_tokens"] = (
+            min(row_max_tokens, configured_max_tokens)
+            if row_max_tokens is not None
+            else configured_max_tokens
+        )
+        row["_rowidx"] = row_index
+
+
+def _tensorize_nemo_gym_result(result: dict) -> None:
+    """Convert token fields returned by the Gym actor back to tensors."""
+    _tensorize_by_key(result["input_message_log"], "token_ids")
+    _tensorize_by_key(result["message_log"], "token_ids")
+    _tensorize_by_key(
+        [
+            message
+            for message in result["message_log"]
+            if message["role"] == "assistant"
+        ],
+        "generation_logprobs",
+    )
+
+
+async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
+    num_generations: int,
+    log_full_result_tables: bool,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
-) -> AsyncNemoGymRolloutResult:
-    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
+    returns_entire_batch: bool = False,
+) -> AsyncGenerator[NemoGymRolloutResult, None]:
+    """Stream complete NeMo-Gym prompt groups in group-completion order.
+
+    The actor streams individual rows in arbitrary completion order. Rows are
+    validated and restored to input order within each ``num_generations`` group
+    before the group is postprocessed and yielded. Synchronous call sites should
+    use :func:`run_nemo_gym_rollout_sync`.
+
+    Args:
+        policy_generation: Generation interface whose configuration supplies the
+            model's maximum sequence length.
+        input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
+        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
+        generation_config: Sampling parameters forwarded to every NeMo-Gym row.
+        num_generations: Number of contiguous rows belonging to each prompt group.
+        log_full_result_tables: Whether to include complete per-agent result
+            payloads as W&B Tables in the rollout metrics.
+        max_seq_len: Policy sequence-length limit used for compatibility validation.
+            NeMo-Gym still relies on the generation engine's configured limit.
+        max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
+        greedy: Must be ``False`` because this path does not support greedy mode.
+        effort_config: Optional configuration for effort-based reward shaping.
+        reward_penalty_config: Optional reward-penalty configuration.
+        thinking_tags: Optional opening and closing tags used by thinking penalties.
+        returns_entire_batch: Whether to treat the input as one potentially
+            heterogeneous group. This requires ``num_generations`` to equal the
+            batch size and is used by synchronous callers.
+
+    Yields:
+        ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
+        inside each result are restored to input order. The final result also
+        carries actor-wide and rollout-wide timing metrics.
+
+    Raises:
+        AssertionError: If an unsupported generation option is requested.
+        TypeError: If a row lacks a valid ``responses_create_params`` dictionary or
+            the actor returns a non-integer row index.
+        ValueError: If ``num_generations`` is not positive, the batch is empty or
+            not divisible by ``num_generations``, ``returns_entire_batch`` has an
+            incompatible size, a streamed row index is out of range or duplicated,
+            a prompt group mixes agents, or its task indices disagree.
+        RuntimeError: If the actor fails, returns NaN generation logprobs, ends the
+            stream before all expected rows arrive, or produces no final group.
+    """
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
     # still relies on the underlying model server's configured context/window limits.
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
@@ -1382,46 +2080,185 @@ def run_async_nemo_gym_rollout(
     assert not generation_config["top_k"], (
         "Top k is not supported in the generation config in NeMo-Gym path!"
     )
+    if num_generations <= 0:
+        raise ValueError("num_generations must be greater than zero")
+    if not nemo_gym_rows:
+        raise ValueError("NeMo-Gym rollout batch must not be empty")
+    if len(nemo_gym_rows) % num_generations != 0:
+        raise ValueError(
+            "NeMo-Gym rollout batch size must be divisible by num_generations"
+        )
+    if returns_entire_batch and len(nemo_gym_rows) != num_generations:
+        raise ValueError(
+            "returns_entire_batch requires num_generations to equal the batch size"
+        )
 
     timer = Timer()
     timer_prefix = "timing/rollout"
-    timer.start(f"{timer_prefix}/total")
+    total_timer_label = f"{timer_prefix}/total"
+    run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
-    for rowidx, row in enumerate(nemo_gym_rows):
-        # We do not translate max_seq_len into row-level max_tokens here because that would
-        # change semantics from "total sequence length" to "max new tokens".
-        responses_create_params = row["responses_create_params"]
-        responses_create_params["temperature"] = generation_config["temperature"]
-        responses_create_params["top_p"] = generation_config["top_p"]
-
-        # Configure max_output_tokens to respect the max_new_tokens setting.
-        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
-        existing_max_output_tokens = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(existing_max_output_tokens, generation_config["max_new_tokens"])
-            if existing_max_output_tokens is not None
-            else generation_config["max_new_tokens"]
+    with timer.time(total_timer_label):
+        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config)
+        accumulator = _NemoGymStreamAccumulator(
+            rows=nemo_gym_rows,
+            num_generations=num_generations,
+            allow_mixed_agents=returns_entire_batch,
         )
-
-        row["_rowidx"] = rowidx
-
-    with timer.time(f"{timer_prefix}/run_rollouts"):
+        final_rollout_result: NemoGymRolloutResult | None = None
+        actor_timing_metrics: dict[str, Any] = {}
         nemo_gym_environment = task_to_env["nemo_gym"]
-        results, rollout_loop_timing_metrics = ray.get(
-            nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
-            )
-        )
+        with timer.time(run_rollouts_timer_label):
+            rollout_gen = nemo_gym_environment.run_rollouts.options(
+                num_returns="streaming"
+            ).remote(nemo_gym_rows, tokenizer, timer_prefix)
+        rollout_iterator = rollout_gen.__aiter__()
 
-        # Tensorize all token ids
-        for r in results:
-            _tensorize_by_key(r["input_message_log"], "token_ids")
-            _tensorize_by_key(r["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in r["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
+    while True:
+        stream_finished = False
+        group_to_yield: NemoGymRolloutResult | None = None
+        with timer.time(total_timer_label):
+            with timer.time(run_rollouts_timer_label):
+                try:
+                    future = await anext(rollout_iterator)
+                except StopAsyncIteration:
+                    stream_finished = True
+                else:
+                    rowidx, result, timing_metrics = await future
+
+            if not stream_finished:
+                if timing_metrics is not None:
+                    actor_timing_metrics = timing_metrics
+
+                _tensorize_nemo_gym_result(result)
+                completed_group = accumulator.add(rowidx, result)
+                if completed_group is not None:
+                    rollout_result = _postprocess_single_nemo_gym_group(
+                        nemo_gym_rows=completed_group.rows,
+                        results=completed_group.results,
+                        timer=timer,
+                        timer_prefix=timer_prefix,
+                        policy_generation=policy_generation,
+                        input_batch=input_batch.slice(
+                            completed_group.group_index * num_generations,
+                            (completed_group.group_index + 1) * num_generations,
+                        ),
+                        tokenizer=tokenizer,
+                        log_full_result_tables=log_full_result_tables,
+                        effort_config=effort_config,
+                        reward_penalty_config=reward_penalty_config,
+                        thinking_tags=thinking_tags,
+                    )
+                    if accumulator.is_complete:
+                        final_rollout_result = rollout_result
+                    else:
+                        group_to_yield = rollout_result
+
+        if stream_finished:
+            break
+        if group_to_yield is not None:
+            yield group_to_yield
+
+    with timer.time(total_timer_label):
+        accumulator.finish()
+        if final_rollout_result is None:
+            raise RuntimeError(
+                "NeMo-Gym completed without producing a final prompt group"
             )
 
+    final_rollout_result.rollout_metrics.update(actor_timing_metrics)
+    final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
+    yield final_rollout_result
+
+
+def run_nemo_gym_rollout_sync(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    generation_config: GenerationConfig,
+    log_full_result_tables: bool,
+    max_seq_len: Optional[int] = None,
+    max_rollout_turns: Optional[int] = None,
+    greedy: bool = False,
+    effort_config: Optional[EffortLevelsConfig] = None,
+    reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
+) -> NemoGymRolloutResult:
+    """Run and return one complete NeMo-Gym batch synchronously.
+
+    This compatibility API drains :func:`run_async_nemo_gym_rollout` with the
+    whole input treated as one heterogeneous group, restoring input order and
+    returning only after every row is complete.
+
+    Args:
+        policy_generation: Generation interface whose configuration supplies the
+            model's maximum sequence length.
+        input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
+        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
+        generation_config: Sampling parameters forwarded to every NeMo-Gym row.
+        log_full_result_tables: Whether to include complete per-agent result
+            payloads as W&B Tables in the rollout metrics.
+        max_seq_len: Policy sequence-length limit used for compatibility validation.
+        max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
+        greedy: Must be ``False`` because this path does not support greedy mode.
+        effort_config: Optional configuration for effort-based reward shaping.
+        reward_penalty_config: Optional reward-penalty configuration.
+        thinking_tags: Optional opening and closing tags used by thinking penalties.
+
+    Returns:
+        The fully postprocessed NeMo-Gym rollout batch in input-row order.
+
+    Raises:
+        AssertionError: If an unsupported generation option is requested.
+        TypeError: If a NeMo-Gym row or streamed row index has an invalid type.
+        ValueError: If streamed rows violate the ordering, uniqueness, grouping, or
+            task-index invariants documented by :func:`run_async_nemo_gym_rollout`.
+        RuntimeError: If called from a running event loop, the actor or stream fails,
+            or NeMo-Gym returns no complete rollout batch.
+    """
+
+    async def _consume_rollout() -> NemoGymRolloutResult:
+        rollout_result = None
+        async for rollout_result in run_async_nemo_gym_rollout(
+            policy_generation=policy_generation,
+            input_batch=input_batch,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            generation_config=generation_config,
+            num_generations=input_batch.size,
+            log_full_result_tables=log_full_result_tables,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,
+            greedy=greedy,
+            effort_config=effort_config,
+            reward_penalty_config=reward_penalty_config,
+            thinking_tags=thinking_tags,
+            returns_entire_batch=True,
+        ):
+            pass
+        if rollout_result is None:
+            raise RuntimeError("NeMo-Gym did not return any rollouts")
+        return rollout_result
+
+    return asyncio.run(_consume_rollout())
+
+
+def _postprocess_single_nemo_gym_group(
+    nemo_gym_rows: list[dict],
+    results: list[dict],
+    timer: Timer,
+    timer_prefix: str,
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    log_full_result_tables: bool,
+    effort_config: Optional[EffortLevelsConfig] = None,
+    reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
+) -> NemoGymRolloutResult:
+    """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
@@ -1429,11 +2266,20 @@ def run_async_nemo_gym_rollout(
     low_lengths = shaping.low_lengths
     high_lengths = shaping.high_lengths
 
+    resolved_reward_penalty_config = resolve_reward_penalty_config(
+        reward_penalty_config, tokenizer, thinking_tags=thinking_tags
+    )
+    penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
         if "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
+                "max_model_len"
+            ]
+        elif "trtllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"][
                 "max_model_len"
             ]
         elif "mcore_generation_config" in policy_generation.cfg:
@@ -1456,30 +2302,51 @@ def run_async_nemo_gym_rollout(
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
                 "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
                 == max_total_tokens_per_sample,
+                # max_gen_tokens_per_turn: Diagnostic for long single generations
+                "max_gen_tokens_per_turn": max(
+                    (
+                        len(m["token_ids"])
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                    default=0,
+                ),
             }
             for r in results
         ]
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
         rollout_metrics = {
-            **rollout_loop_timing_metrics,
-            **_calculate_single_metric(
-                [m["turn_count"] for m in all_sample_metrics],
+            **calculate_single_metric(
+                turn_counts,
                 batch_size,
                 "turns_per_sample",
             ),
-            **_calculate_single_metric(
+            "turns_per_sample/p95": pct(turn_counts, 95),
+            "turns_per_sample/p99": pct(turn_counts, 99),
+            **calculate_single_metric(
                 [m["total_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "total_tokens_per_sample",
             ),
-            **_calculate_single_metric(
+            **calculate_single_metric(
                 [m["assistant_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "gen_tokens_per_sample",
             ),
-            **_calculate_single_metric(
+            **calculate_single_metric(
+                max_gen_tokens_per_turn_values,
+                batch_size,
+                "max_gen_tokens_per_turn",
+            ),
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn_values, 95),
+            **calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
                 "total_reward",
@@ -1518,16 +2385,18 @@ def run_async_nemo_gym_rollout(
                 ]
                 if values:
                     per_agent_metrics.update(
-                        _calculate_single_metric(
+                        calculate_single_metric(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
 
-            # Log the full result
-            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
-            per_agent_metrics[f"{agent_name}/full_result"] = Table(
-                data=to_log, columns=["Full result"]
-            )
+            if log_full_result_tables:
+                to_log = [
+                    [json.dumps(r, separators=((",", ":")))] for r in agent_results
+                ]
+                per_agent_metrics[f"{agent_name}/full_result"] = Table(
+                    data=to_log, columns=["Full result"]
+                )
 
         rollout_metrics.update(per_agent_metrics)
 
@@ -1535,8 +2404,6 @@ def run_async_nemo_gym_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
-    timer.stop(f"{timer_prefix}/total")
-    rollout_metrics.update(timer.get_timing_metrics("sum"))
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
@@ -1570,6 +2437,9 @@ def run_async_nemo_gym_rollout(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # Agent/env-driven mask flag — True means this sample should be masked
+            # from the GRPO gradient (kept for advantage computation).
+            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
 
@@ -1586,8 +2456,64 @@ def run_async_nemo_gym_rollout(
         rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
         rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
 
-    return AsyncNemoGymRolloutResult(
+    # Penalty metrics — map count keys to (config flag, metric name)
+    _PENALTY_METRICS = {
+        "duplicated_reasoning": (
+            "penalize_duplicated_reasoning",
+            "reasoning_equal_to_final_answer_rate",
+        ),
+        "empty_final_answer": (
+            "penalize_empty_final_answer",
+            "empty_final_answer_rate",
+        ),
+        "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
+        "malformed_think_tag": (
+            "penalize_malformed_think_tag",
+            "malformed_think_tag_rate",
+        ),
+    }
+    if resolved_reward_penalty_config and results:
+        for key, (flag, metric_name) in _PENALTY_METRICS.items():
+            if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
+                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+
+    # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
+    # Gym environments so GDPO can compute per-component advantages; single-reward envs
+    # are unaffected. Mirrors the native rollout path's reward-component handling above.
+    from nemo_rl.environments.nemo_gym import (
+        build_reward_component_columns,
+        extract_reward_components,
+        validate_reward_components_match_scalar,
+    )
+
+    component_dicts = [extract_reward_components(r["full_result"]) for r in results]
+    if any(c is not None for c in component_dicts):
+        # Emit each component under a `reward/<name>` key (see
+        # build_reward_component_columns): matches the native multi-reward path and what
+        # get_gdpo_reward_component_keys() consumes.
+        final_batch.update(build_reward_component_columns(component_dicts))
+        # Leave total_reward as the verifier's scalar `reward` (set above); do not
+        # silently overwrite it. When a verifier emits reward_components, the contract is
+        # reward == sum(components), so overwriting would be a no-op in the correct case
+        # and would only mask a misconfigured verifier when it isn't. Validate that
+        # contract instead and fail fast on a real mismatch.
+        validate_reward_components_match_scalar([r["full_result"] for r in results])
+
+    group_task_index = None
+    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
+        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
+        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
+        if any(
+            task_index is None or int(task_index) != group_task_index
+            for task_index in task_indices
+        ):
+            raise ValueError(
+                f"Expected one _ng_task_index per prompt group, got {task_indices}"
+            )
+
+    return NemoGymRolloutResult(
         input_ids=input_ids,
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
+        task_index=group_task_index,
     )

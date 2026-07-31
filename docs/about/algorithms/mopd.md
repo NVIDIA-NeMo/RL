@@ -133,7 +133,7 @@ override them for your local data:
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
   data.train.data_path=/path/to/train.jsonl \
-  data.val.data_path=/path/to/val.jsonl
+  data.validation.data_path=/path/to/val.jsonl
 ```
 
 The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across

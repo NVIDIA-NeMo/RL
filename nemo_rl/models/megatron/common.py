@@ -167,10 +167,17 @@ def get_moe_metrics(
     return metrics
 
 
-def get_mtp_metrics() -> dict[str, Any]:
+def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
     """Returns Multi-Token Prediction (MTP) loss and acceptance rate metrics.
 
     This function reduces MTP metrics across ranks and returns a dictionary of metrics.
+
+    Args:
+        loss_scale: Scale factor applied to each MTP layer's loss (e.g., 1/num_microbatches).
+            ``MTPLossLoggingHelper`` accumulates the per-microbatch loss across microbatches
+            without dividing, so callers must pass 1/num_microbatches to recover the mean
+            (mirroring ``get_moe_metrics``). Acceptance rate is a ratio of counts and is not
+            scaled. Defaults to 1.0.
 
     Returns:
         dict[str, Any]: A flat dict of metrics. Each MTP layer's loss is returned
@@ -182,7 +189,7 @@ def get_mtp_metrics() -> dict[str, Any]:
 
     metrics: dict[str, Any] = {}
     if "loss_values" in tracker:
-        mtp_losses = tracker["loss_values"].float()
+        mtp_losses = tracker["loss_values"].float() * loss_scale
         mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
         mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
         mtp_num_layers = mtp_losses.shape[0]

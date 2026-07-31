@@ -178,13 +178,18 @@ class ColocatablePolicyInterface(PolicyInterface):
     def offload_after_refit(self) -> None:
         pass
 
+    def offload_to_cpu(self) -> None:
+        pass
+
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
-        self, *args: Any, **kwargs: Any
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -218,6 +223,22 @@ class ColocatablePolicyInterface(PolicyInterface):
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
         pass
+
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, int],
+        gen_parallelism: dict[str, int],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> Any:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
+        """Sync weights to generation workers via the NCCL-reshard path."""
+        raise NotImplementedError
 
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:

@@ -207,70 +207,11 @@ def _patch_sglang_custom_all_reduce_v2_tms_cudagraph() -> None:
     """Backport sglang#27948 for colocated TMS CUDA graph capture.
 
     With ``SGLANG_MEMORY_SAVER_CUDA_GRAPH=true``, custom all-reduce v2 must
-    avoid registering captured IPC addresses. TMS will otherwise replace those
-    addresses during capture and custom_all_reduce.cuh can fail at replay time.
+    not flag the kernel as capturing. TMS replaces the IPC addresses during
+    capture, so the addresses registered while ``set_cuda_graph_capture`` is
+    on become stale and custom_all_reduce.cuh can fail at replay time. Passing
+    ``not self.tms_cudagraph`` keeps the capture flag off in that mode.
     """
-    _patch_sglang_file_replacements(
-        "jit_kernel/all_reduce.py",
-        (
-            (
-                "        def set_cuda_graph_register_inputs(self, register_inputs: bool) -> None: ...\n",
-                "        def set_cuda_graph_capture(self, is_capturing: bool) -> None: ...\n",
-                "        def set_cuda_graph_capture(self, is_capturing: bool) -> None: ...\n"
-                "        def set_cuda_graph_register_inputs(self, register_inputs: bool) -> None: ...\n",
-            ),
-        ),
-        "custom all-reduce type stub graph-input registration toggle",
-    )
-    _patch_sglang_file_replacements(
-        "jit_kernel/csrc/distributed/custom_all_reduce_base.cuh",
-        (
-            (
-                '      .def("set_cuda_graph_register_inputs", &Class::set_cuda_graph_register_inputs)\n',
-                '      .def("set_cuda_graph_capture", &Class::set_cuda_graph_capture)\n',
-                '      .def("set_cuda_graph_capture", &Class::set_cuda_graph_capture)\n'
-                '      .def("set_cuda_graph_register_inputs", &Class::set_cuda_graph_register_inputs)\n',
-            ),
-        ),
-        "custom all-reduce C++ binding graph-input registration toggle",
-    )
-    _patch_sglang_file_replacements(
-        "jit_kernel/include/sgl_kernel/distributed/custom_all_reduce.cuh",
-        (
-            (
-                "  void set_cuda_graph_register_inputs(bool enabled) {\n",
-                "  void set_cuda_graph_capture(bool enabled) {\n"
-                "    m_is_graph_capturing = enabled;\n"
-                "  }\n\n",
-                "  void set_cuda_graph_capture(bool enabled) {\n"
-                "    m_is_graph_capturing = enabled;\n"
-                "  }\n\n"
-                "  void set_cuda_graph_register_inputs(bool enabled) {\n"
-                "    m_register_graph_inputs = enabled;\n"
-                "  }\n\n",
-            ),
-            (
-                "  bool m_register_graph_inputs = true;\n",
-                "  bool m_is_graph_capturing = false;\n"
-                "  int64_t m_cum_registered_count = 0;\n",
-                "  bool m_is_graph_capturing = false;\n"
-                "  bool m_register_graph_inputs = true;\n"
-                "  int64_t m_cum_registered_count = 0;\n",
-            ),
-        ),
-        "custom all-reduce graph-input registration flag",
-    )
-    _patch_sglang_file_replacements(
-        "jit_kernel/csrc/distributed/custom_all_reduce_pull.cuh",
-        (
-            (
-                "    if (check_capturing() && m_register_graph_inputs) {\n",
-                "    if (check_capturing()) {\n",
-                "    if (check_capturing() && m_register_graph_inputs) {\n",
-            ),
-        ),
-        "custom all-reduce pull graph-input registration gate",
-    )
     _patch_sglang_file_replacements(
         "srt/distributed/device_communicators/custom_all_reduce_v2.py",
         (
@@ -282,33 +223,24 @@ def _patch_sglang_custom_all_reduce_v2_tms_cudagraph() -> None:
             ),
             (
                 "        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()\n",
-                "        self.override_shot(None)  # set default config based on world size\n"
                 "        self.override_algo: Optional[AllReduceAlgo] = None\n"
                 "        self.obj = get_custom_all_reduce_cls()(\n",
-                "        self.override_shot(None)  # set default config based on world size\n"
                 "        self.override_algo: Optional[AllReduceAlgo] = None\n"
                 "        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()\n"
                 "        self.obj = get_custom_all_reduce_cls()(\n",
             ),
             (
-                '            log_info_on_rank0(logger, "Registering 0 cuda graph addresses because tms is used")\n',
+                "            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
+                "        try:\n            self.obj.set_cuda_graph_capture(True)\n",
                 "        try:\n"
-                "            self.obj.set_cuda_graph_capture(True)\n"
-                "            yield\n"
-                "        finally:\n"
-                "            self.obj.set_cuda_graph_capture(False)\n"
-                "        # cannot call when graph is capturing\n",
-                "        try:\n"
-                "            self.obj.set_cuda_graph_register_inputs(not self.tms_cudagraph)\n"
-                "            self.obj.set_cuda_graph_capture(True)\n"
-                "            yield\n"
-                "        finally:\n"
-                "            self.obj.set_cuda_graph_capture(False)\n"
-                "            self.obj.set_cuda_graph_register_inputs(True)\n"
-                "        if self.tms_cudagraph:\n"
-                '            log_info_on_rank0(logger, "Registering 0 cuda graph addresses because tms is used")\n'
-                "            return\n"
-                "        # cannot call when graph is capturing\n",
+                "            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
+            ),
+            (
+                "                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
+                "            finally:\n"
+                "                self.obj.set_cuda_graph_capture(True)\n",
+                "            finally:\n"
+                "                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
             ),
         ),
         "custom all-reduce v2 TMS CUDA graph capture path",

@@ -18,7 +18,7 @@ This document focuses on ProRLv2-specific knobs and gotchas. For foundational co
 Use the example configuration [`examples/configs/prorlv2.v2.yaml`](../../examples/configs/prorlv2.v2.yaml):
 
 ```bash
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2.v2.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/prorlv2.v2.yaml {overrides}
 ```
 
 `prorlv2.v2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
@@ -209,7 +209,7 @@ Use [`examples/configs/prorlv2_1_moe.v2.yaml`](../../examples/configs/prorlv2_1_
 
 ```bash
 # Launch ProRL v2.1 for MoE models
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.v2.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/prorlv2_1_moe.v2.yaml {overrides}
 ```
 
 ## Full Example Configs
@@ -222,7 +222,7 @@ uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.v2.yaml
 A few common overrides when launching:
 
 ```bash
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/prorlv2.v2.yaml \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   logger.wandb_enabled=true \
@@ -234,7 +234,7 @@ uv run examples/run_grpo_math.py \
 If you want to enable DAPO overlong reward shaping instead of stop-properly:
 
 ```bash
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/prorlv2.v2.yaml \
   grpo.reward_shaping.stop_properly_penalty_coef=null \
   grpo.reward_shaping.overlong_buffer_length=4096 \

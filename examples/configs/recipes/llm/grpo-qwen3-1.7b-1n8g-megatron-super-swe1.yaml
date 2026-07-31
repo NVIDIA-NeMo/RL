@@ -32,6 +32,7 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: 1
     expert_model_parallel_size: 1
+    context_parallel_size: 8
     sequence_parallel: false
     activation_checkpointing: false
     mtp_num_layers: 0  # Qwen3-1.7B has no MTP layers; override base stage default of 5
@@ -44,6 +45,8 @@ policy:
       reasoning_parser_plugin: null
       http_server_serving_chat_kwargs:
         reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      mamba_cache_mode: "none"
 
 data:
   train:

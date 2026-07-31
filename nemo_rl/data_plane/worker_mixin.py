@@ -516,3 +516,84 @@ class TQWorkerMixin:
             tq_field="reference_policy_logprobs",
         )
         del result
+
+    # ── split-API entrypoints (SC async path) ──────────────────────────────
+    #
+    # The split path lets SingleController drive forward/backward per
+    # microbatch (or per pipeline-batch on Megatron) without stepping the
+    # optimizer until a full logical batch has accumulated. Backend
+    # methods (``begin_train_step``, ``train_microbatch``,
+    # ``finish_train_step``, ``abort_train_step``) own the train-step
+    # state machine; this mixin just gates them on TQ-presharded data.
+
+    @wrap_with_nvtx_name("policy_worker/begin_train_step_presharded")
+    def begin_train_step_presharded(
+        self,
+        loss_fn: Any,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open a logical train step. No fetch — pure lifecycle.
+
+        The backend stores ``loss_fn`` / ``gbs`` / ``mbs``, clears
+        gradients, and initialises accumulators for ``local_valid_seqs``
+        / ``local_valid_toks`` and any per-microbatch metrics. Only one
+        step can be open at a time — the backend raises on a second
+        ``begin`` — so no step identifier is needed. Optimizer state is
+        untouched here.
+        """
+        self.begin_train_step(  # type: ignore[attr-defined]
+            loss_fn=loss_fn,
+            gbs=gbs,
+            mbs=mbs,
+        )
+
+    @wrap_with_nvtx_name("policy_worker/train_microbatch_presharded")
+    def train_microbatch_presharded(
+        self,
+        meta: "KVBatchMeta",
+    ) -> None:
+        """Per-rank microbatch entrypoint. Fetch → packing prep → forward+backward.
+
+        Gradients accumulate into ``.grad`` across calls; no
+        ``optimizer.step`` here. Returns nothing — per-microbatch metrics
+        accumulate in the backend's open-step state and surface once via
+        ``finish_train_step_presharded``.
+        """
+        data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
+        self.train_microbatch(  # type: ignore[attr-defined]
+            data=data,
+        )
+
+    @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")
+    def finish_train_step_presharded(self) -> dict[str, Any]:
+        """Close a logical train step. No fetch — pure lifecycle.
+
+        Backend all-reduces accumulated ``local_valid_seqs/toks``,
+        rescales gradients to the final global normalization, runs grad
+        clip, steps the optimizer + scheduler, then zeros gradients.
+        Returns the aggregated step result (``loss``, ``grad_norm``,
+        ``all_mb_metrics``, …).
+
+        Tags the result with ``is_replica_leader`` so the driver-side
+        aggregator can dedupe TP/CP/non-last-PP-stage twins that hold
+        identical copies of this DP shard's metrics. Without it the
+        driver's ``run_all_workers_single_data`` returns one dict per
+        GPU and the metric list ends up TP×CP×PP times too long, which
+        inflates every per-token aggregate (gen_kl_error, probs_ratio,
+        etc.) by that same factor.
+        """
+        result = self.finish_train_step()  # type: ignore[attr-defined]
+        result["is_replica_leader"] = bool(self._is_replica_leader())
+        return result
+
+    @wrap_with_nvtx_name("policy_worker/abort_train_step_presharded")
+    def abort_train_step_presharded(self) -> None:
+        """Discard partial train-step state without stepping the optimizer.
+
+        Used when SC decides the logical batch will not complete (e.g.
+        weight-sync triggered mid-step). Backend drops accumulators and
+        zeros gradients.
+        """
+        self.abort_train_step()  # type: ignore[attr-defined]

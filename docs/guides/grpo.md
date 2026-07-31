@@ -143,7 +143,7 @@ The class must be importable — install it as a package or add its
 parent directory to `PYTHONPATH` before launching training.
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
-[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
 ```python
 # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
@@ -367,6 +367,38 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
+
+### Chunked Fused Linear Logprobs
+
+During standard GRPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for the policy forward-backward pass as well as for the previous-policy and reference-policy logprob computations. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked fused linear logprobs** path avoids this by computing the per-token log probabilities directly from the hidden states with a fused linear cross-entropy kernel: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers the realized-token log probabilities, and discards the logits before moving to the next chunk. (GRPO uses the kernel only to read logprobs; it does not compute a cross-entropy loss.)
+
+This works for GRPO because [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) only consumes the per-token log probability of the realized token (`next_token_logprobs`), which is exactly what the fused forward returns.
+
+**Benefits:**
+
+- Extends the maximum trainable sequence length significantly by eliminating the large logit tensor from GPU memory.
+- Applies to both the training forward-backward pass and the previous/reference-policy logprob computations.
+- Produces numerically equivalent loss values to the standard path.
+
+**How to enable:**
+
+Add the following to your Megatron config in your YAML file:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    use_fused_linear_logprobs: true
+    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+```
+
+**Notes:**
+
+- Only supported on the Megatron backend (`policy.megatron_cfg.enabled: true`).
+- Context parallelism is not supported when fused linear logprobs are enabled.
+- Sequence packing is not supported with fused linear logprobs; set `policy.sequence_packing.enabled: false`. The fused forward rolls labels over the whole packed sequence and would mix tokens across packed-sequence boundaries.
+- Top-k/top-p training-time filtering is not supported with fused linear logprobs (set `policy.generation.top_k: null` and `policy.generation.top_p: 1.0`), because the fused path gathers logprobs from the unfiltered logits.
+- The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Loss
 We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) to calculate the loss for GRPO. Formally,
@@ -599,7 +631,53 @@ grpo:
     normalize_rewards: true
     use_leave_one_out_baseline: false
 ```
-Note that this method only has an effect when training involve more than one reward function.
+Note that this method only has an effect when training involves more than one reward function.
+
+#### Per-reward weights
+
+The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\)
+are configurable via `reward_weights`, an optional list with one entry per reward
+component, ordered alphabetically by component name (matching the sorted `reward/<name>`
+keys). When omitted, all weights default to `1.0` (equal weighting). For example, to
+down-weight the second and third rewards:
+```
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    reward_weights: [1.0, 0.5, 0.25]
+```
+The number of weights must equal the number of reward components, or a `ValueError` is raised.
+
+#### Comparing GDPO against a GRPO baseline
+
+The clearest way to see GDPO's effect is a matched comparison on the same multi-reward environment, changing only the advantage estimator. `examples/configs/gdpo_math_1B.yaml` runs GDPO; the GRPO control is the same config with `adv_estimator.name=grpo` (plus a separate checkpoint dir and logger run name so the two runs don't clobber each other):
+
+```
+# GDPO
+uv run examples/run_grpo.py --config examples/configs/gdpo_math_1B.yaml
+# GRPO control on the SAME multi-reward env — only the advantage estimator changes
+uv run examples/run_grpo.py --config examples/configs/gdpo_math_1B.yaml \
+    grpo.adv_estimator.name=grpo \
+    checkpointing.checkpoint_dir=results/grpo_math_1B_control \
+    logger.wandb.name=grpo-math-1b-control
+```
+
+For intuition on why this matters, see the advantage-collapse example in the [GDPO paper](https://arxiv.org/abs/2601.05242): two responses with the same total reward but different composition (e.g. `(1, 0)` vs. `(0, 1)`) receive an identical advantage under GRPO but distinct advantages under GDPO.
+
+#### What to measure
+
+The headline metric is per-reward convergence, not just aggregate reward. NeMo-RL does not log per-component rewards out of the box (only `total_reward` aggregates are logged), but the components are available as `reward/<name>` keys (e.g. `reward/correctness`) in the rollout batch — add your own logging for them and compare the GDPO and GRPO curves:
+
+- Under GRPO, expect components to move together, or low-variance components to stall as their signal is swamped by the dominant term in the sum.
+- Under GDPO, expect each component to improve on its own schedule.
+- Watch the per-prompt advantage spread: if distinct reward combinations produce near-identical advantages under GRPO, that is the collapse GDPO is meant to fix.
+
+#### Practical notes
+
+- **Reward scaling applies per component.** `reward_scaling` rescales each `reward/<name>` component as well as `total_reward`, so keep components on comparable scales or rely on GDPO's per-component normalization.
+- **Final batch normalization always runs.** In `GDPOAdvantageEstimator`, the final per-batch normalization applies regardless of `normalize_rewards` (which only gates the per-component std division). Account for this when reasoning about advantage magnitudes.
 
 ## LoRA Configuration
 

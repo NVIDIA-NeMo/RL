@@ -51,6 +51,8 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
+    _placeholder_seq_logprob_error_metrics,
+    _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
     compute_and_apply_seq_logprob_error_masking,
@@ -71,7 +73,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
@@ -112,6 +114,13 @@ def _raise_if_message_level_advantage_penalties_enabled(
         "data_plane.enabled=true yet. Disable "
         f"{', '.join(f'grpo.{key}' for key in unsupported_keys)} or use the "
         "legacy GRPO trainer."
+    )
+
+
+def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
+    """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
+    return tuple(
+        f for f in DP_TRAIN_FIELDS if not (skip_prev_logprobs and f == "prev_logprobs")
     )
 
 
@@ -434,6 +443,7 @@ def grpo_train_sync(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
@@ -521,6 +531,8 @@ def grpo_train_sync(
             "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
             "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used."
         )
+
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -656,11 +668,6 @@ def grpo_train_sync(
                         )
                     )
 
-                    if not _should_log_nemo_gym_responses(master_config):
-                        for key in list(rollout_metrics):
-                            if "full_result" in key:
-                                rollout_metrics.pop(key)
-
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
@@ -780,9 +787,23 @@ def grpo_train_sync(
                 baseline_for_log = baseline.clone()
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                print("▶ Preparing for logprob inference...", flush=True)
-                with timer.time("logprob_inference_prep"):
-                    policy.prepare_for_lp_inference()
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
+                compute_prev = not skip_prev_logprobs
+                compute_ref = not skip_reference_logprobs
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                # Worker-side fetch schema for this step. Same skip decision
+                # as ``select_fields`` below, but consumed only by
+                # ``train_from_meta`` (driver read uses ``select_fields``).
+                train_fields = _train_fields_for_step(skip_prev_logprobs)
+
+                if compute_prev or compute_ref:
+                    print("▶ Preparing for logprob inference...", flush=True)
+                    with timer.time("logprob_inference_prep"):
+                        policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -794,15 +815,21 @@ def grpo_train_sync(
                     # batched fetch to avoid double-shipping the per-token
                     # tensor through Ray's plasma store on top of the TQ
                     # writeback.
-                    policy.get_logprobs_from_meta(meta, timer=timer)
-                    compute_ref = not master_config.grpo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    )
+                    select_fields = ["generation_logprobs", "token_mask"]
+                    if compute_prev:
+                        policy.get_logprobs_from_meta(meta, timer=timer)
+                        select_fields.append("prev_logprobs")
+                    else:
+                        print(
+                            "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                            flush=True,
+                        )
                     if compute_ref:
                         policy.get_reference_policy_logprobs_from_meta(
                             meta,
                             timer=timer,
                         )
+                        select_fields.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs
                     # for masking / advantage. Bulk (input_ids, multimodal,
@@ -810,21 +837,26 @@ def grpo_train_sync(
                     # TQ — workers will fetch it via ``train_presharded``.
                     extras_bdd = policy.read_from_dataplane(
                         meta,
-                        select_fields=[
-                            "prev_logprobs",
-                            "generation_logprobs",
-                            "token_mask",
-                            *(["reference_policy_logprobs"] if compute_ref else []),
-                        ],
+                        select_fields=select_fields,
                         pad_value_dict=_pad_dict,
                     )
-                    prev_logprobs = extras_bdd["prev_logprobs"]
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
+                    prev_logprobs = (
+                        extras_bdd["prev_logprobs"]
+                        if compute_prev
+                        else torch.zeros_like(generation_logprobs)
+                    )
                     reference_policy_logprobs = (
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
+                # Seq-level logprob error metrics/masking require real prev_logprobs
+                if skip_prev_logprobs:
+                    sample_mask = loss_multiplier
+                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
                             token_mask=token_mask,
@@ -832,9 +864,7 @@ def grpo_train_sync(
                             prev_logprobs=prev_logprobs,
                             generation_logprobs=generation_logprobs,
                             rewards=rewards,
-                            seq_logprob_error_threshold=master_config.grpo[
-                                "seq_logprob_error_threshold"
-                            ],
+                            seq_logprob_error_threshold=seq_logprob_error_threshold,
                         )
                     )
 
@@ -903,6 +933,7 @@ def grpo_train_sync(
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
+                        train_fields=train_fields,
                     )
 
                 if sync_kv_scales:
@@ -960,9 +991,11 @@ def grpo_train_sync(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and (total_steps + 1) >= val_start_at
+                    and (total_steps + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -1075,6 +1108,10 @@ def grpo_train_sync(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
@@ -1158,7 +1195,10 @@ def grpo_train_sync(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             # Per-step log_data jsonl. The 1-hop driver holds per-token
@@ -1308,10 +1348,12 @@ def grpo_train_sync(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -1321,3 +1363,10 @@ def grpo_train_sync(
 
         current_epoch += 1
         current_step = 0
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()

@@ -77,7 +77,8 @@ class DataConfig(TypedDict):
 # ===============================================================================
 # Eval Dataset Configs
 # ===============================================================================
-# These configs correspond to the eval datasets in data/datasets/eval_datasets/
+# These configs are used by the evaluation entrypoint. Migrated datasets such
+# as AIME use the response registry; the rest still use eval_datasets/.
 # Note: TypedDict doesn't allow narrowing types in child classes, so each config
 # is defined independently with common fields repeated.
 
@@ -123,12 +124,14 @@ class MMLUProEvalDataConfig(TypedDict):
 
 
 class AIMEEvalDataConfig(TypedDict):
-    """Config for AIME datasets."""
+    """Config for AIME datasets loaded from the response registry."""
 
     max_input_seq_length: int
-    dataset_name: Literal["aime2024", "aime2025", "aime2026"]
+    dataset_name: Literal["AIME2024", "AIME2025", "AIME2026"]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
+    processor: NotRequired[str]
+    repeat: NotRequired[int]
 
 
 class GPQAEvalDataConfig(TypedDict):
@@ -177,6 +180,32 @@ class MMAUEvalDataConfig(TypedDict):
     env_name: NotRequired[str]
 
 
+class DailyOmniEvalDataConfig(TypedDict):
+    """Config for the Daily-Omni audio-visual eval dataset.
+
+    Mirrors the MMAU multimodal schema but with its own ``dataset_name`` literal
+    so the eval-config union resolves daily-omni unambiguously. Kept as a
+    ``TypedDict`` for consistency with the other (still v1) eval-data configs in
+    this union, whose consumers access the resolved config by key
+    (``config.data["dataset_name"]``).
+
+    Fields:
+        max_input_seq_length: Max prompt length passed to the generation backend.
+        dataset_name: Must be ``"daily-omni"``.
+        split: HuggingFace split to load.
+        prompt_file: Optional prompt template path.
+        system_prompt_file: Optional system prompt path.
+        env_name: Reward/eval environment name (e.g. ``"vlm"``).
+    """
+
+    max_input_seq_length: int
+    dataset_name: Literal["daily-omni"]
+    split: NotRequired[str | None]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+
+
 # Union type for all eval dataset configs
 EvalDataConfigType = Union[
     MMLUEvalDataConfig,
@@ -185,5 +214,6 @@ EvalDataConfigType = Union[
     GPQAEvalDataConfig,
     MathEvalDataConfig,
     MMAUEvalDataConfig,
+    DailyOmniEvalDataConfig,
     LocalMathEvalDataConfig,
 ]

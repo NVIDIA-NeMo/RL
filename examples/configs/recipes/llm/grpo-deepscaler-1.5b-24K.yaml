@@ -13,4 +13,3 @@ policy:
   generation:
     vllm_cfg:
       gpu_memory_utilization: 0.8
-      enforce_eager: true
