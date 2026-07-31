@@ -126,6 +126,12 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
+    pad_dynamic_image_shapes: NotRequired[
+        bool
+    ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+    sanitize_image_placeholders: NotRequired[
+        bool
+    ]  # Let structured image items, rather than literal text tokens, place media
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -210,6 +216,76 @@ def _looks_like_image_src(src: str) -> bool:
     return src.startswith(_IMAGE_SRC_PREFIXES)
 
 
+def _normalize_image_placeholders(text: str, replacement: str) -> str:
+    """Replace image-control tokens embedded in ordinary text."""
+    return (
+        text.replace("<img>", "").replace("</img>", "").replace("<image>", replacement)
+    )
+
+
+def _count_image_payloads(nemo_gym_example: dict) -> int:
+    """Count structured image items in a Responses-API Gym example."""
+    count = 0
+    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    if not isinstance(input_items, list):
+        return count
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("input_image", "image", "image_url"):
+                count += 1
+            elif part.get("image_url") is not None or part.get("image") is not None:
+                count += 1
+    return count
+
+
+def sanitize_nemo_gym_example_image_placeholders(nemo_gym_example: dict) -> dict:
+    """Remove literal media-control tokens when images are already structured.
+
+    OpenAI-style content lists carry images as structured ``input_image`` items,
+    and the model chat template turns those items into image blocks. Chat
+    templates that treat a literal ``<image>`` in the text as the placement
+    anchor suppress their own generated block, so a row carrying more literal
+    tokens than attached images emits placeholders with no projected feature
+    behind them. For multimodal examples, structured items remain the source of
+    truth and literal tokens are removed. For text-only examples, the tokens are
+    rendered as the ordinary word ``image`` instead of a model control token.
+
+    The input is not mutated because rollout batches may share example objects.
+    """
+    sanitized = deepcopy(nemo_gym_example)
+    replacement = "" if _count_image_payloads(sanitized) > 0 else "image"
+    input_items = sanitized.get("responses_create_params", {}).get("input", [])
+    if not isinstance(input_items, list):
+        return sanitized
+
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", "")
+        if isinstance(content, str):
+            item["content"] = _normalize_image_placeholders(content, replacement)
+            continue
+        if not isinstance(content, list):
+            continue
+        for index, part in enumerate(content):
+            if isinstance(part, str):
+                content[index] = _normalize_image_placeholders(part, replacement)
+                continue
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                part["text"] = _normalize_image_placeholders(text, replacement)
+    return sanitized
+
+
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """Pull PIL images out of a non-assistant Responses-API item.
 
@@ -242,6 +318,16 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
             continue
         images.append(resolve_to_image(src))
     return images
+
+
+def _is_trainable_output_item(item: dict) -> bool:
+    """Report whether an output item becomes a trainable assistant turn.
+
+    The postprocess loop skips items whose ``generation_token_ids`` is missing
+    *or* empty, so per-turn image binning has to use the same predicate or the
+    two walks disagree and every later turn gets the wrong images.
+    """
+    return bool(item.get("generation_token_ids"))
 
 
 def _index_per_turn_images(
@@ -331,6 +417,7 @@ def _attach_multimodal_data_to_user_message(
     *,
     images: list[Image.Image],
     processor: Any,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -346,6 +433,7 @@ def _attach_multimodal_data_to_user_message(
         user_message,
         images=images,
         processor=processor,
+        pad_dynamic_image_shapes=pad_dynamic_image_shapes,
     )
 
 
@@ -355,6 +443,19 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        initial_global_config_dict = cfg.get("initial_global_config_dict") or {}
+        self._pad_dynamic_image_shapes = bool(
+            cfg.get(
+                "pad_dynamic_image_shapes",
+                initial_global_config_dict.get("pad_dynamic_image_shapes", False),
+            )
+        )
+        self._sanitize_image_placeholders = bool(
+            cfg.get(
+                "sanitize_image_placeholders",
+                initial_global_config_dict.get("sanitize_image_placeholders", False),
+            )
+        )
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -402,6 +503,8 @@ class NemoGym(EnvironmentInterface):
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
+        initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
+        initial_global_config_dict.pop("sanitize_image_placeholders", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -483,6 +586,13 @@ Depending on your data shape, you may want to change these values."""
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
+
+        # Runs before the base64 inflation below so the copies stay cheap.
+        if self._sanitize_image_placeholders:
+            nemo_gym_examples = [
+                sanitize_nemo_gym_example_image_placeholders(example)
+                for example in nemo_gym_examples
+            ]
 
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
@@ -636,10 +746,7 @@ Depending on your data shape, you may want to change these values."""
 
             # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
             # Also skip if generation_token_ids is present but empty, e.g. all-EOS generation stripped to [] — torch.tensor([]) defaults to float32 and breaks batch dtype consistency.
-            if (
-                "generation_token_ids" not in output_item_dict
-                or not output_item_dict["generation_token_ids"]
-            ):
+            if not _is_trainable_output_item(output_item_dict):
                 continue
 
             assert (
@@ -717,6 +824,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     user_message,
                     images=images_this_turn,
                     processor=processor,
+                    pad_dynamic_image_shapes=self._pad_dynamic_image_shapes,
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
