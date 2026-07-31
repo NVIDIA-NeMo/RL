@@ -171,3 +171,40 @@ checkpointing:
   # 4. The checkpoint time for this model is around 10 mins.
   checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
+
+# Gate-authoritative token capture (token-in/token-out via NeMo-Gym; see
+# docs/design-docs/tq-gym-tokidcap-migration.md). Dormant by default: with
+# enabled=false every legacy codepath behaves exactly as before. Requires the
+# SingleController path with data_plane.enabled=true and the async vLLM
+# backend; defaults live on TokenCaptureConfig
+# (nemo_rl/algorithms/single_controller_utils/config.py).
+token_capture:
+  enabled: false
+  # TQ partition holding per-call staged token deltas (finalizer-cleared).
+  staging_partition: "rollout_staging"
+  # continue: a failed worker-side stage poisons the rollout (placeholder row);
+  # abort: fails the whole rollout at the gate.
+  on_capture_failure: "continue"
+  # allow: train groups whose calls span a refit (staleness = group's oldest
+  # call version); reject: placeholder such rollouts.
+  mixed_weight_version_policy: "allow"
+  # Drop the whole group when fewer than this fraction of its rollouts
+  # produced valid rows (null keeps every group).
+  min_valid_fraction_per_group: null
+  # Gate-side cleanup backstops (seconds).
+  registration_ttl_s: 3600.0
+  staging_ttl_s: 3600.0
+  # Gym LineageIndex capacity (each in-flight rollout's cumulative tokens
+  # live in the gate process). null = derived from the training config:
+  # rollouts = 2 x max in-flight, tokens = rollouts x max sequence length.
+  # Size explicitly for agentic workloads with deep per-rollout call trees.
+  lineage_max_rollouts: null
+  lineage_max_tokens: null
+  # Bearer token for the gate's /ng-control/* routes. null = minted per run.
+  control_auth_token: null
+  # Hard deadline per control-plane call (gate death must surface as failed
+  # dispatches + placeholders, not a silent retry stall).
+  control_timeout_s: 60.0
+  # Directory for the Gym base capture layer the gate rides on (stays
+  # essentially empty on the gate path). null = <logger.log_dir>/gym_token_capture.
+  capture_dir: null

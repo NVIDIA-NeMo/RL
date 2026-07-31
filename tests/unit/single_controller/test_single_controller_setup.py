@@ -438,6 +438,7 @@ class TestSetup:
             enable_router_replay=False,
             routed_experts_dtype="int16",
             use_fastokens=False,
+            token_capture=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 

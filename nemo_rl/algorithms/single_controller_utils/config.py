@@ -256,6 +256,55 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class TokenCaptureConfig(BaseModel, extra="allow"):
+    """Gate-authoritative token capture (token-in/token-out via NeMo-Gym).
+
+    Dormant by default: with ``enabled=False`` every legacy codepath behaves
+    exactly as before — no staging partition is registered, no gate is
+    installed, and rollouts ride the token-echo path. See
+    docs/design-docs/tq-gym-gate-authoritative.md.
+    """
+
+    enabled: bool = False
+    # TQ partition holding per-call staged token deltas (cleared by the
+    # finalizer; distinct from the canonical rollout partition).
+    staging_partition: str = "rollout_staging"
+    # A failed worker-side stage poisons the rollout; "continue" serves the
+    # completion and lets the finalizer emit a placeholder row, "abort" fails
+    # the whole rollout at the gate.
+    on_capture_failure: Literal["continue", "abort"] = "continue"
+    # "allow" trains groups whose calls span a refit (staleness accounted via
+    # group_min_wv); "reject" placeholders them. Strict modes beyond the MVP
+    # matrix raise NotImplementedError at setup.
+    mixed_weight_version_policy: Literal["allow", "reject"] = "allow"
+    # Drop the whole group when fewer than this fraction of its rollouts
+    # produced valid rows (None keeps every group).
+    min_valid_fraction_per_group: Optional[float] = None
+    # Gate-side cleanup backstops.
+    registration_ttl_s: float = 3600.0
+    staging_ttl_s: float = 3600.0
+    # Gym LineageIndex capacity (finding M: it holds each in-flight rollout's
+    # full cumulative token sequence, and eviction of a live rollout silently
+    # degrades token-in to fallbacks). None = derived at setup from the
+    # training config: rollouts ≈ 2 × max in-flight; tokens ≈ rollouts × max
+    # sequence length. Set explicitly for agentic workloads whose per-rollout
+    # call trees hold more than one context of tokens.
+    lineage_max_rollouts: Optional[int] = None
+    lineage_max_tokens: Optional[int] = None
+    # Bearer token for the gate's /ng-control/* routes (finding S). None =
+    # minted per run at setup; set explicitly only for multi-controller
+    # setups that must share one gate.
+    control_auth_token: Optional[str] = None
+    # Hard deadline per control-plane call (S5 finding: gate death must
+    # surface as a failed dispatch, not a silent retry stall).
+    control_timeout_s: float = 60.0
+    # Directory for the Gym base capture layer the gate rides on (#2124-c1:
+    # the capture middleware only engages with a capture dir configured; the
+    # dir stays essentially empty on the gate path). None = derived at setup
+    # under the run's log dir.
+    capture_dir: Optional[str] = None
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -267,6 +316,7 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
 
 def validate_sampler_buffer_capacity(

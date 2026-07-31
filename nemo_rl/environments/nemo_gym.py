@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import math
 import os
 import subprocess
@@ -21,6 +22,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
+import aiohttp
 import ray
 import torch
 from PIL import Image
@@ -167,6 +169,19 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+    # Gate-authoritative token capture (token_capture.enabled): the dumped
+    # TokenCaptureConfig. Turns on the gate in Gym's policy model server,
+    # switches run_rollouts to receipt mode, and adds the register/seal/fail
+    # control-plane helpers. None/absent = legacy token-echo path.
+    token_capture: NotRequired[Dict[str, Any] | None]
+
+
+# Gym control-plane server name (the model server hosting the gate) and the
+# opaque run-body key rollout ids ride on (Gym's ROLLOUT_ID_KEY_NAME): the
+# agent derives the id from the run body and stamps /ng-rollout/<id> on every
+# model call, so the TQ sample id IS the capture key end to end.
+_POLICY_SERVER_NAME = "policy_model"
+_NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -536,6 +551,79 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
+            "rollout_max_attempts_to_avoid_lp_nan", 1
+        )
+
+        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
+            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
+        )
+
+        # Gate-authoritative token capture: turn on the gate in the policy
+        # model server (via the policy_model global-config override block the
+        # env yamls already use) and disable the legacy token echo. Receipt
+        # mode is incompatible with re-dispatching a batch under the same
+        # rollout ids, so the NaN retry must be exactly 1 (create-only
+        # registration would fail the retry loudly anyway; fail at setup).
+        token_capture = self.cfg.get("token_capture") or None
+        self._token_capture_enabled = bool(
+            token_capture and token_capture.get("enabled")
+        )
+        self._server_client = None
+        self._control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
+        if self._token_capture_enabled:
+            if self.rollout_max_attempts_to_avoid_lp_nan != 1:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
+                    "would re-register create-only rollout ids at the gate"
+                )
+            policy_overrides = (
+                initial_global_config_dict.setdefault("policy_model", {})
+                .setdefault("responses_api_models", {})
+                .setdefault("vllm_model", {})
+            )
+            policy_overrides["return_token_id_information"] = False
+            policy_overrides["token_capture_gate"] = {
+                "enabled": True,
+                "registration_ttl_s": token_capture["registration_ttl_s"],
+                # Finding M: the LineageIndex holds each in-flight rollout's
+                # cumulative tokens; capacity is sized from the training
+                # config at setup, never left at the eval-sized defaults.
+                "lineage_max_rollouts": token_capture["lineage_max_rollouts"],
+                "lineage_max_tokens": token_capture["lineage_max_tokens"],
+                # Finding S: control routes are bearer-authed,
+                # default-required; the token is minted per run at setup.
+                "control_auth_token": token_capture["control_auth_token"],
+            }
+            # #2124-c1 workaround: the capture middleware mints model_call_id
+            # (and sets the capture context the gate keys on) only when the
+            # base token capture is active, which requires a capture dir.
+            # The base's own capture_tokens no-ops on the gate path (the
+            # worker strips token fields before responding), so the dir
+            # stays essentially empty.
+            initial_global_config_dict["token_id_capture_enabled"] = True
+            initial_global_config_dict["token_id_capture_dir"] = token_capture[
+                "capture_dir"
+            ]
+            # Agents apply the /ng-rollout/<id> correlation prefix for token
+            # capture only when they opt in (the global enabled switch alone
+            # gates the infrastructure, not the prefix). In an RL training
+            # run every agent must correlate, and the SC cannot enumerate
+            # agent servers configured via config_paths — so flip the
+            # run-wide opt-in the Gym branch adds for exactly this case.
+            initial_global_config_dict["token_id_capture_all_agents"] = True
+            self._control_headers = {
+                "Authorization": f"Bearer {token_capture['control_auth_token']}"
+            }
+            # S5 chaos finding: Gym's shared request() retries connection
+            # errors indefinitely; a dead gate must surface as a failed
+            # dispatch (placeholders + TTL), not a silent stall.
+            self._control_timeout_s = float(
+                token_capture.get("control_timeout_s") or 60.0
+            )
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -552,6 +640,65 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
+
+    # ── gate control plane (token-capture mode) ─────────────────────────────
+
+    def _control_client(self):
+        """Gym ServerClient resolving servers by name from the head server."""
+        if self._server_client is None:
+            from nemo_gym.server_utils import ServerClient
+
+            self._server_client = ServerClient.load_from_global_config(
+                self.head_server_config
+            )
+        return self._server_client
+
+    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+        headers = {**kwargs.pop("headers", {}), **self._control_headers}
+        try:
+            response = await asyncio.wait_for(
+                self._control_client().request(
+                    server_name=_POLICY_SERVER_NAME,
+                    url_path=path,
+                    method=method,
+                    headers=headers,
+                    **kwargs,
+                ),
+                timeout=self._control_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"gate control call {method} {path} exceeded "
+                f"{self._control_timeout_s}s (gate unreachable or stalled)"
+            ) from None
+        if response.status != 200:
+            raise RuntimeError(
+                f"gate control call {method} {path} failed: "
+                f"HTTP {response.status} {await response.text()}"
+            )
+        return await response.json()
+
+    async def register_rollouts(self, rollout_ids: list[str]) -> None:
+        """Create-only registration before dispatch (§ 3.1)."""
+        for rollout_id in rollout_ids:
+            await self._control("PUT", f"/ng-control/rollouts/{rollout_id}")
+
+    async def fail_rollouts(self, rollout_ids: list[str], *, reason: str) -> None:
+        """Best-effort gate cleanup for a cancelled/failed dispatch (§ 7)."""
+        for rollout_id in rollout_ids:
+            try:
+                await self._control(
+                    "POST",
+                    f"/ng-control/rollouts/{rollout_id}/fail",
+                    json={"reason": reason},
+                )
+            except (RuntimeError, OSError) as error:
+                # The registration TTL is the backstop when the gate is
+                # unreachable during teardown.
+                print(f"fail_rollout({rollout_id}) failed: {error}", flush=True)
+
+    async def gate_metrics(self) -> dict:
+        return await self._control("GET", "/ng-control/metrics")
 
     async def run_rollouts(
         self,
@@ -577,6 +724,14 @@ Depending on your data shape, you may want to change these values."""
         # examples carry no `input_image` items (text-only case).
         encode_images_in_examples(nemo_gym_examples)
 
+        if self._token_capture_enabled:
+            # Receipt mode: register the ids riding each row's run body
+            # before dispatch; seal at completion.
+            rollout_ids = [
+                example[_NG_ROLLOUT_ID_BODY_KEY] for example in nemo_gym_examples
+            ]
+            await self.register_rollouts(rollout_ids)
+
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
@@ -587,6 +742,15 @@ Depending on your data shape, you may want to change these values."""
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
                     nemo_gym_row, nemo_gym_result = await task
+                except aiohttp.ClientResponseError as e:
+                    # aiohttp exceptions carry CIMultiDictProxy headers that
+                    # Ray cannot pickle across the actor boundary, masking the
+                    # real error with a TypeError; re-raise as a plain,
+                    # picklable RuntimeError.
+                    raise RuntimeError(
+                        f"NemoGym rollout HTTP error: {e.status} "
+                        f"{e.message} url={e.request_info.real_url}"
+                    ) from None
                 except Exception as error:
                     if hasattr(error, "response_content"):
                         print(
@@ -603,15 +767,22 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_row,
-                    nemo_gym_result,
-                    tokenizer,
-                    include_initial_multimodal_data=not deduplicate_multimodal_data,
-                )
-                if _has_nan_generation_logprobs(nemo_rl_result):
-                    raise RuntimeError("Generation logprobs contain NaN")
-
+                if self._token_capture_enabled:
+                    # Receipt mode: seal at the gate; token-free result. The
+                    # canonical row is rebuilt by the finalizer, so no
+                    # message_log walk (and no NaN check) applies here.
+                    nemo_rl_result = await self._postprocess_receipt_mode(
+                        nemo_gym_row, nemo_gym_result
+                    )
+                else:
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_row,
+                        nemo_gym_result,
+                        tokenizer,
+                        include_initial_multimodal_data=not deduplicate_multimodal_data,
+                    )
+                    if _has_nan_generation_logprobs(nemo_rl_result):
+                        raise RuntimeError("Generation logprobs contain NaN")
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
@@ -641,6 +812,40 @@ Depending on your data shape, you may want to change these values."""
                 )
 
             yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+
+    async def _postprocess_receipt_mode(
+        self, nemo_gym_row: dict, nemo_gym_result: dict
+    ) -> dict:
+        """Seal the rollout and return a token-free result (§ 9.1).
+
+        The legacy token walk (and its contiguity assert) does not run: the
+        gate owns lineage now, output items carry no token arrays, and the
+        canonical row is rebuilt by the finalizer from staged deltas. The
+        Ray return carries only the receipt (~100 B/call) beside the
+        agent-level result.
+        """
+        assert isinstance(nemo_gym_result, dict), (
+            f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
+        )
+        rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
+        try:
+            receipt = await self._control(
+                "POST",
+                f"/ng-control/rollouts/{rollout_id}/seal",
+                json={"reward": float(nemo_gym_result.get("reward") or 0.0)},
+            )
+        except (RuntimeError, OSError) as error:
+            # An unsealable rollout finalizes as a placeholder; the gate's
+            # registration TTL sweeps its state.
+            print(f"seal({rollout_id}) failed: {error}", flush=True)
+            receipt = None
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": nemo_gym_result,
+            "rollout_id": rollout_id,
+            "receipt": receipt,
+        }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -1027,6 +1232,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1085,6 +1291,7 @@ def spinup_nemo_gym_actor(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         **multimodal_flags,
+        token_capture=token_capture,
     )
 
     nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")

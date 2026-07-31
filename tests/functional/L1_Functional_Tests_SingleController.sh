@@ -57,6 +57,10 @@ run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_
 # Checkpoint save/restore (upstream #3429).
 run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 
+# Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
+# custodying token lineage and the finalizer publishing training rows.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
     coverage combine .coverage*

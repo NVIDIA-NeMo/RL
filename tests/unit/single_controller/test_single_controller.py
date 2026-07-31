@@ -232,7 +232,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._inflight_by_group_id = {}
     # env={} -> _should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     asyncio.run(ctrl._sync_weights())
 
@@ -261,7 +263,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._inflight_by_group_id = {}
     # env={} -> _should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),
