@@ -421,6 +421,7 @@ class TestSetup:
             ].return_value.dp_openai_server_base_urls,
             model_name="test-model",
             enable_router_replay=False,
+            token_capture=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 

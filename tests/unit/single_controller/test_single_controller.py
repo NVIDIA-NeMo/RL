@@ -143,6 +143,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
+    ctrl._master_config = SimpleNamespace(token_capture=SimpleNamespace(enabled=False))
 
     asyncio.run(ctrl._sync_weights())
 
@@ -168,6 +169,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
+    ctrl._master_config = SimpleNamespace(token_capture=SimpleNamespace(enabled=False))
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),
