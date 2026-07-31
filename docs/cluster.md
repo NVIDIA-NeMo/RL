@@ -279,20 +279,40 @@ its own component sidesteps the divisibility constraint entirely, and lets the
 head come from a different (e.g. GPU-free, cheaper) partition than the workers:
 
 ```sh
+DEDICATED_RAY_HEAD=1 \
+CONTAINER=nemo_rl.sqsh \
+MOUNTS="/lustre:/lustre" \
+COMMAND="uv run examples/run_grpo_math.py" \
 sbatch \
-  --account=<account> --partition=batch,cpu --nodes=1 --gres=gpu:0 --time=4:0:0 \
+  --account=<account> --partition=batch,cpu --nodes=1  --gres=gpu:0 --exclusive --time=4:0:0 \
   : \
-  --account=<account> --partition=batch --nodes=64 --segment=8 --gres=gpu:8 \
+  --account=<account> --partition=batch     --nodes=64 --gres=gpu:8 --segment=8 --exclusive \
   ray.sub
 ```
 
 Here component 0 is the head and component 1 is the 64 GPU workers, whose count
 stays divisible by `--segment=8`. `ray.sub` reads each component's own nodelist,
 partition, account, and GRES, so the two halves may differ in every respect.
-Set `DEDICATED_RAY_HEAD=1` in the environment along with the usual variables.
 
 Your recipe's `cluster.num_nodes` should be the **worker** count (64 above), not
 the total allocation size.
+
+```{important}
+Repeat per-component options on **both** sides of the `:`. A batch script's
+`#SBATCH` directives apply only to the first component, and Slurm re-evaluates
+non-propagated options (`--exclusive`, `--nodes`, `--partition`, `--gres`,
+`--segment`) for each component. Omitting `--exclusive` on the worker component
+in particular leaves those nodes subject to the partition's default
+oversubscribe policy, which breaks the whole-node assumption behind
+`CPUS_PER_WORKER` auto-detection. Options such as `--account`, `--job-name`,
+`--time`, and `--dependency` do propagate forward and need only be given once.
+```
+
+```{note}
+`tools/launch` submits a single flat `sbatch --nodes=<N>` and has no
+heterogeneous-job path, so `DEDICATED_RAY_HEAD=1` is currently available only
+when invoking `sbatch` directly.
+```
 
 ```{note}
 Leaving `DEDICATED_RAY_HEAD` unset (the default) preserves the existing behavior

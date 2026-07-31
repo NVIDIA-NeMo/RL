@@ -79,8 +79,9 @@ detect_cpus_per_node() {
   # NOT query every node: each `scontrol show node` is an RPC to the SLURM
   # controller, and issuing one per node across many jobs launched in a burst
   # (e.g. CI) can overwhelm the controller. If your allocation is
-  # heterogeneous, set CPUS_PER_WORKER explicitly instead. On any failure we
-  # exit (no heuristic fallback); set CPUS_PER_WORKER explicitly to override.
+  # heterogeneous, set the relevant override explicitly instead. On any failure
+  # we exit (no heuristic fallback); set CPUS_PER_WORKER (or CPUS_PER_HEAD, when
+  # probing a dedicated head's component) explicitly to override.
   #
   # Args:
   #   $1: nodelist to probe. A heterogeneous job passes each component's own
@@ -99,7 +100,7 @@ detect_cpus_per_node() {
   cpus=${raw#*CPUTot=}
   cpus=${cpus%% *}
   if ! [[ "$cpus" =~ ^[0-9]+$ ]] || [[ "$cpus" -le 0 ]]; then
-    echo "Error: Could not determine CPUTot for node '$first_node' from SLURM. Set CPUS_PER_WORKER explicitly to override." >&2
+    echo "Error: Could not determine CPUTot for node '$first_node' from SLURM. Set CPUS_PER_WORKER (or CPUS_PER_HEAD for the head component) explicitly to override." >&2
     exit 1
   fi
   echo "$cpus"
@@ -275,11 +276,23 @@ esac
 
 HET_HEAD=0
 if (( DEDICATED_RAY_HEAD )); then
-  if [[ -z "${SLURM_HET_SIZE:-}" ]] || (( SLURM_HET_SIZE < 2 )); then
-    echo "Error: DEDICATED_RAY_HEAD=1 requires a heterogeneous job with at least two components (head in component 0, GPU workers in component 1). Submit with 'sbatch <head opts> : <worker opts> ray.sub'." >&2
+  # Exactly two: this script only ever addresses components 0 and 1, so a third
+  # would be allocated and then silently ignored.
+  if [[ -z "${SLURM_HET_SIZE:-}" ]] || (( SLURM_HET_SIZE != 2 )); then
+    echo "Error: DEDICATED_RAY_HEAD=1 requires a heterogeneous job with exactly two components (head in component 0, GPU workers in component 1), got SLURM_HET_SIZE=${SLURM_HET_SIZE:-unset}. Submit with 'sbatch <head opts> : <worker opts> ray.sub'." >&2
     exit 1
   fi
   HET_HEAD=1
+elif [[ -n "${SLURM_HET_SIZE:-}" ]] && (( SLURM_HET_SIZE > 1 )); then
+  # Slurm populates the unsuffixed SLURM_JOB_* variables from the heterogeneous
+  # job leader, so the flat path below scopes Ray to component 0 alone. That is
+  # intended when another component runs a side service (tools/external_genrm
+  # does exactly this), but it silently strands every other node if the caller
+  # meant them all to be Ray workers. We cannot tell those apart, so warn rather
+  # than fail.
+  echo "[WARN] Heterogeneous job detected (SLURM_HET_SIZE=$SLURM_HET_SIZE) with DEDICATED_RAY_HEAD unset." >&2
+  echo "[WARN] Ray will use component 0 only ($SLURM_JOB_NUM_NODES node(s)); other components are left to whatever launched them." >&2
+  echo "[WARN] To run the Ray head on its own component instead, set DEDICATED_RAY_HEAD=1." >&2
 fi
 
 # Read a field of one heterogeneous-job component. Slurm documents the
@@ -294,6 +307,12 @@ het_job_field() {
   fi
   value=${raw#*${field}=}
   value=${value%% *}
+  # A multi-partition request (e.g. --partition=batch,cpu) keeps the whole list
+  # on the running job, selected partition first. Everything downstream -- srun
+  # -p and `sinfo -p` -- wants a single name.
+  if [[ "$field" == "Partition" ]]; then
+    value=${value%%,*}
+  fi
   printf '%s' "$value"
 }
 
@@ -416,10 +435,12 @@ fi
 # ---------------------------------------------------------------------------
 
 # --- GCS RPC thread pools ---
-# Size the GCS gRPC pools from the head node's core count (CPUS_PER_WORKER, the
+# Size the GCS gRPC pools from the head node's core count (CPUS_PER_HEAD, the
 # per-node CPUTot resolved above) so they scale with the hardware instead of a
-# fixed guess. Ray's own default is hardware_concurrency / 4; we use the full
-# core count for the request-poll pool and half for the reply pool to drain
+# fixed guess. The GCS runs on the head, so these must follow the head's core
+# count -- with a dedicated head that is a different node shape than the
+# workers. Ray's own default is hardware_concurrency / 4; we use the full core
+# count for the request-poll pool and half for the reply pool to drain
 # registration bursts faster on high-core-count nodes (e.g. 128 on H100, 144 on
 # GB200/Grace).
 # gcs_server_rpc_server_thread_num: threads that poll for incoming gRPC requests.
@@ -428,16 +449,16 @@ fi
 #   replies to the GCS's own outbound RPCs to raylets/workers. Match it to the
 #   inbound server pool so the outbound reply path does not become the
 #   bottleneck once the request pool is widened.
-export RAY_gcs_server_rpc_server_thread_num="${RAY_gcs_server_rpc_server_thread_num:-$CPUS_PER_WORKER}"
-export RAY_num_server_call_thread="${RAY_num_server_call_thread:-$(( CPUS_PER_WORKER / 2 > 0 ? CPUS_PER_WORKER / 2 : 1 ))}"
-export RAY_gcs_server_rpc_client_thread_num="${RAY_gcs_server_rpc_client_thread_num:-$CPUS_PER_WORKER}"
+export RAY_gcs_server_rpc_server_thread_num="${RAY_gcs_server_rpc_server_thread_num:-$CPUS_PER_HEAD}"
+export RAY_num_server_call_thread="${RAY_num_server_call_thread:-$(( CPUS_PER_HEAD / 2 > 0 ? CPUS_PER_HEAD / 2 : 1 ))}"
+export RAY_gcs_server_rpc_client_thread_num="${RAY_gcs_server_rpc_client_thread_num:-$CPUS_PER_HEAD}"
 
 # --- GCS active RPC headroom ---
 # gcs_max_active_rpcs_per_handler (default gcs_server_rpc_server_thread_num*100):
 #   max concurrent in-flight RPCs per GCS handler. Give 2x the auto default so
 #   the handler queue does not cap out when thousands of actors register
 #   simultaneously without staggering.
-export RAY_gcs_max_active_rpcs_per_handler="${RAY_gcs_max_active_rpcs_per_handler:-$(( CPUS_PER_WORKER * 200 ))}"
+export RAY_gcs_max_active_rpcs_per_handler="${RAY_gcs_max_active_rpcs_per_handler:-$(( CPUS_PER_HEAD * 200 ))}"
 
 # --- Registration and RPC timeouts ---
 # With thread tuning, GCS should drain even the worst burst in ~60s. 120s gives
@@ -612,7 +633,10 @@ for _pair in "${_sorted_pairs[@]}"; do
   ip_addresses_array+=("${_pair##*|}")
 done
 # Keep `nodes` in sync with the sorted array: the generated attach script indexes
-# into it, and worker K must map to the same node as ray-worker-(K-1).log.
+# into it, so worker K and ray-worker-(K-1).log agree for the zero-padded
+# hostnames our clusters use. (Unpadded names still diverge, since lexicographic
+# sort and Slurm's numeric-aware task order disagree -- node1, node10, node2 vs
+# node1, node2, ..., node10. Pre-existing.)
 nodes=$(printf '%s\n' "${nodes_array[@]}")
 unset _sorted_pairs _pinned_pairs _pair _si
 echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
@@ -832,11 +856,15 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source $LOG_DIR/topology_probe.sh
 
-# A dedicated head runs only the Ray control plane and the driver. Advertising
-# no worker_units keeps model, generation, teacher, and Gym GPU actors off it,
-# and omitting the topology resources keeps topology-constrained placement
-# groups from selecting it as a compute node (nemo_rl/distributed/
-# virtual_cluster.py skips nodes with no NVLink-domain resource).
+# A dedicated head runs only the Ray control plane and the driver.
+#   * --num-gpus=0 (below) is what actually keeps model, generation, teacher,
+#     and Gym GPU actors off it: their bundles all request GPU > 0.
+#   * Dropping worker_units keeps it out of ray.sub's own readiness gate, which
+#     counts worker_units against NUM_ACTORS. Nothing outside this file reads it.
+#   * Dropping the topology resources keeps topology-constrained placement
+#     groups off it: select_segment_nodes() in nemo_rl/distributed/
+#     virtual_cluster.py skips nodes with no NVLink-domain resource.
+# ray_head is advertised for introspection (`ray status`); nothing requests it.
 if [[ "$HET_HEAD" == "1" ]]; then
   RAY_RESOURCES='{\"slurm_managed_ray_cluster\": 1, \"ray_head\": 1}'
   export RAY_RESOURCES
@@ -1144,7 +1172,14 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   # SLURM_MASTER_NODE, and GPU actors use their node-local instance. With a
   # dedicated head that spans both components, and partition/account are dropped
   # because each component carries its own (they may differ).
-  _sandbox_scope_args=(-A "$SLURM_JOB_ACCOUNT" -p "$SLURM_JOB_PARTITION")
+  #
+  # --nodes is deliberately omitted in the heterogeneous case: srun re-parses the
+  # same argv once per named component, so a cluster-wide --nodes would also be
+  # applied to component 0 and rejected ("Minimum node count > allocated node
+  # count"). With it omitted each component takes all of its own nodes, and
+  # --ntasks-per-node=1 still yields one sidecar per node.
+  _sandbox_scope_args=(-A "$SLURM_JOB_ACCOUNT" -p "$SLURM_JOB_PARTITION"
+                       --nodes="$NUM_CLUSTER_NODES")
   if (( HET_HEAD )); then
     # Quoted: the comma is Slurm's het-group set syntax, not an array separator.
     _sandbox_scope_args=("--het-group=0,1")
@@ -1160,7 +1195,6 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --wait=60 \
     --kill-on-bad-exit=1 \
     --overlap \
-    --nodes="$NUM_CLUSTER_NODES" \
     --ntasks-per-node=1 \
     --export="$SANDBOX_EXPORTS" \
     bash -xc '

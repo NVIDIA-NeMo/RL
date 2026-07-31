@@ -120,9 +120,8 @@ def stub_dir(tmp_path_factory) -> Path:
     return path
 
 
-def _run(prologue: Path, stub_dir: Path, tmp_path: Path, env: dict[str, str]):
-    """Source the prologue with `env` and return (CompletedProcess, vars)."""
-    full_env = {
+def _base_env(stub_dir: Path, tmp_path: Path, env: dict[str, str]) -> dict[str, str]:
+    return {
         "PATH": f"{stub_dir}:/usr/bin:/bin",
         "BASE_LOG_DIR": str(tmp_path / "logs"),
         "CONTAINER": "img.sqsh",
@@ -134,20 +133,56 @@ def _run(prologue: Path, stub_dir: Path, tmp_path: Path, env: dict[str, str]):
         "SLURM_JOB_PARTITION": "batch",
         **env,
     }
-    script = textwrap.dedent(f"""
-        source {prologue} >/dev/null 2>&1 || exit $?
+
+
+def _run(
+    prologue: Path,
+    stub_dir: Path,
+    tmp_path: Path,
+    env: dict[str, str],
+    capture: str | None = None,
+):
+    """Source the prologue with `env` and return (CompletedProcess, vars).
+
+    ``capture`` overrides what is emitted on stdout, for asserting on generated
+    artifacts such as ``head_cmd`` rather than the derived variables. The
+    prologue's own stdout is discarded but its stderr is kept, so an aborted run
+    still reports why.
+    """
+    emit = capture or textwrap.dedent(f"""
         for name in {" ".join(_CAPTURED)}; do
           printf '%s=%s\\n' "$name" "${{!name}}"
         done
         printf 'nodes_array=%s\\n' "${{nodes_array[*]}}"
     """)
+    script = f"source {prologue} >/dev/null || exit $?\n{emit}"
     proc = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, env=full_env
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=_base_env(stub_dir, tmp_path, env),
     )
+    # ray.sub's EXIT trap logs a timestamped line to stdout; it is not output.
     parsed = dict(
-        line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
+        line.split("=", 1)
+        for line in proc.stdout.splitlines()
+        if "=" in line and not line.startswith("[NRL_PHASE]")
     )
     return proc, parsed
+
+
+FLAT_ENV = {"SLURM_JOB_NODELIST": "node[01-04]", "SLURM_JOB_NUM_NODES": "4"}
+
+HET_ENV = {
+    "DEDICATED_RAY_HEAD": "1",
+    "SLURM_HET_SIZE": "2",
+    "SLURM_JOB_NODELIST_HET_GROUP_0": "head01",
+    "SLURM_JOB_NODELIST_HET_GROUP_1": "node[01-08]",
+    "SLURM_JOB_NODELIST": "head01,node[01-08]",
+    "SLURM_JOB_NUM_NODES": "9",
+    "STUB_HEAD_PARTITION": "cpu",
+    "STUB_WORKER_PARTITION": "batch",
+}
 
 
 pytestmark = pytest.mark.skipif(
@@ -157,12 +192,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_flat_allocation_is_unchanged(prologue, stub_dir, tmp_path):
     """Without DEDICATED_RAY_HEAD the head is still a compute node."""
-    proc, v = _run(
-        prologue,
-        stub_dir,
-        tmp_path,
-        {"SLURM_JOB_NODELIST": "node[01-04]", "SLURM_JOB_NUM_NODES": "4"},
-    )
+    proc, v = _run(prologue, stub_dir, tmp_path, FLAT_ENV)
     assert proc.returncode == 0, proc.stderr
 
     assert v["HET_HEAD"] == "0"
@@ -180,21 +210,7 @@ def test_flat_allocation_is_unchanged(prologue, stub_dir, tmp_path):
 
 def test_dedicated_head_scopes_each_component(prologue, stub_dir, tmp_path):
     """The head and workers get their own nodelist, partition, GRES, and CPUs."""
-    proc, v = _run(
-        prologue,
-        stub_dir,
-        tmp_path,
-        {
-            "DEDICATED_RAY_HEAD": "1",
-            "SLURM_HET_SIZE": "2",
-            "SLURM_JOB_NODELIST_HET_GROUP_0": "head01",
-            "SLURM_JOB_NODELIST_HET_GROUP_1": "node[01-08]",
-            "SLURM_JOB_NODELIST": "head01,node[01-08]",
-            "SLURM_JOB_NUM_NODES": "9",
-            "STUB_HEAD_PARTITION": "cpu",
-            "STUB_WORKER_PARTITION": "batch",
-        },
-    )
+    proc, v = _run(prologue, stub_dir, tmp_path, HET_ENV)
     assert proc.returncode == 0, proc.stderr
 
     assert v["HET_HEAD"] == "1"
@@ -244,6 +260,98 @@ def test_dedicated_head_stays_first_regardless_of_hostname(
     assert v["nodes_array"] == "zzz01 node01 node02 node03 node04"
 
 
+def _ray_start_invocation(head_cmd: str) -> str:
+    """The generated `ray start --head ...` command, excluding surrounding comments.
+
+    Anchored to the start of a line: a nearby comment also mentions the command.
+    """
+    _, sep, after = head_cmd.partition("\nray start --head")
+    assert sep, "generated head script has no `ray start --head` invocation"
+    return after.split("EOFINNER", 1)[0]
+
+
+def test_dedicated_head_ray_start_advertises_no_gpus(prologue, stub_dir, tmp_path):
+    """The head's generated `ray start` zeroes GPUs and drops worker_units.
+
+    This asserts on the generated script rather than the shell variables: the
+    resources JSON is escaped through two nested heredocs and would break
+    silently.
+    """
+    proc, _ = _run(
+        prologue, stub_dir, tmp_path, HET_ENV, capture='printf "%s" "$head_cmd"'
+    )
+    assert proc.returncode == 0, proc.stderr
+    invocation = _ray_start_invocation(proc.stdout)
+    assert "--num-gpus=0" in invocation
+    # worker_units would put the head back into ray.sub's own readiness gate.
+    assert "worker_units" not in invocation
+    assert '{\\"slurm_managed_ray_cluster\\": 1, \\"ray_head\\": 1}' in proc.stdout
+
+
+def test_flat_head_ray_start_is_unchanged(prologue, stub_dir, tmp_path):
+    """Without a dedicated head, `ray start` must not gain a --num-gpus flag."""
+    proc, _ = _run(
+        prologue, stub_dir, tmp_path, FLAT_ENV, capture='printf "%s" "$head_cmd"'
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--num-gpus" not in _ray_start_invocation(proc.stdout)
+
+
+def test_gcs_thread_pools_follow_the_head_not_the_workers(prologue, stub_dir, tmp_path):
+    """The GCS runs on the head, so its pools must be sized from CPUS_PER_HEAD.
+
+    The stub gives the head 32 cores and the workers 224; sizing these from the
+    worker count would oversubscribe the head sevenfold.
+    """
+    proc, got = _run(
+        prologue,
+        stub_dir,
+        tmp_path,
+        HET_ENV,
+        capture=(
+            'printf "server=%s\\nreply=%s\\nclient=%s\\nrpcs=%s\\n"'
+            ' "$RAY_gcs_server_rpc_server_thread_num" "$RAY_num_server_call_thread"'
+            ' "$RAY_gcs_server_rpc_client_thread_num"'
+            ' "$RAY_gcs_max_active_rpcs_per_handler"'
+        ),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert got == {
+        "server": "32",
+        "reply": "16",
+        "client": "32",
+        "rpcs": "6400",
+    }
+
+
+def test_het_job_without_opt_in_warns_but_proceeds(prologue, stub_dir, tmp_path):
+    """A het job without the flag scopes Ray to component 0 and says so.
+
+    This is how tools/external_genrm runs ray.sub (component 0 is the whole Ray
+    cluster, component 1 a side service), so it must keep working -- but it also
+    silently strands nodes when unintended, hence the warning.
+    """
+    proc, v = _run(
+        prologue,
+        stub_dir,
+        tmp_path,
+        {
+            "SLURM_HET_SIZE": "2",
+            "SLURM_JOB_NODELIST_HET_GROUP_0": "node[01-04]",
+            "SLURM_JOB_NODELIST_HET_GROUP_1": "genrm[01-02]",
+            "SLURM_JOB_NODELIST": "node[01-04]",
+            "SLURM_JOB_NUM_NODES": "4",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert v["HET_HEAD"] == "0"
+    # Component 0 only, exactly as the flat path would see it.
+    assert v["NUM_CLUSTER_NODES"] == "4"
+    assert v["NUM_ACTORS"] == "32"
+    assert "DEDICATED_RAY_HEAD" in proc.stderr
+    assert "component 0 only" in proc.stderr
+
+
 @pytest.mark.parametrize(
     "env,expected",
     [
@@ -255,6 +363,18 @@ def test_dedicated_head_stays_first_regardless_of_hostname(
             },
             "requires a heterogeneous job",
             id="not_a_het_job",
+        ),
+        pytest.param(
+            {
+                "DEDICATED_RAY_HEAD": "1",
+                "SLURM_HET_SIZE": "3",
+                "SLURM_JOB_NODELIST_HET_GROUP_0": "head01",
+                "SLURM_JOB_NODELIST_HET_GROUP_1": "node[01-04]",
+                "SLURM_JOB_NODELIST": "head01,node[01-04]",
+                "SLURM_JOB_NUM_NODES": "5",
+            },
+            "exactly two components",
+            id="three_components_would_be_ignored",
         ),
         pytest.param(
             {
