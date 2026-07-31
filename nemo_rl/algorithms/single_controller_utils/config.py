@@ -136,6 +136,46 @@ class FleetHealthConfig(BaseModel, extra="allow"):
         return self
 
 
+# HTTP statuses NeMo-Gym retries internally (nemo_gym/openai_utils.py). For the
+# rate-limit subset it raises its own retry ceiling on each attempt, so answering with
+# one of these is an unbounded loop rather than a bounded one.
+_GYM_RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 520})
+
+
+class PolicyRouterConfig(BaseModel, extra="allow"):
+    """NeMo-RL-owned HTTP router placed in front of the vLLM fleet for NeMo-Gym.
+
+    Gym selects a policy endpoint by static round-robin over a list fixed at process
+    start and never fails over. Handing it a single NeMo-RL-owned URL moves that decision
+    to where fleet health already lives, without changing Gym.
+    """
+
+    # When true, NeMo-Gym receives the router's URL instead of the raw backend URLs.
+    enabled: bool = False
+    # Range the router reserves its fixed port from. Deliberately distinct from Gym
+    # (5000-5999) and vLLM (7000-8999). The port is fixed for the life of the run so the
+    # URL Gym holds never changes.
+    port_range_low: PositiveInt = 6000
+    port_range_high: PositiveInt = 6099
+    # Router -> backend deadline. This is the timeout Gym's own client never sets.
+    backend_timeout_s: PositiveFloat = 600.0
+    # Status returned when no shard is eligible.
+    no_healthy_backend_status: PositiveInt = 409
+
+    @model_validator(mode="after")
+    def _check_status_is_not_retried_by_gym(self) -> "PolicyRouterConfig":
+        if self.no_healthy_backend_status in _GYM_RETRY_STATUSES:
+            raise ValueError(
+                "async_rl.policy_router.no_healthy_backend_status="
+                f"{self.no_healthy_backend_status} is a status NeMo-Gym retries "
+                f"internally ({sorted(_GYM_RETRY_STATUSES)}). For the rate-limit codes "
+                "Gym raises its own retry ceiling on each attempt, so returning one "
+                "would make it retry forever -- exactly the hang the router exists to "
+                "prevent. Use a 4xx outside that set, e.g. 409."
+            )
+        return self
+
+
 class WatchdogConfig(BaseModel, extra="allow"):
     """Last-resort detection for stalls that no other layer catches."""
 
@@ -179,6 +219,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
     # Generation-fleet liveness tracking and shard eligibility.
     fleet_health: FleetHealthConfig = Field(default_factory=FleetHealthConfig)
+    # NeMo-Gym-facing router in front of the generation fleet.
+    policy_router: PolicyRouterConfig = Field(default_factory=PolicyRouterConfig)
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.

@@ -124,6 +124,9 @@ class SingleControllerActor:
         self._rollout_manager = actor_args.rollout_manager
         self._env_handles = actor_args.env_handles
         self._fleet_monitor = actor_args.fleet_monitor
+        self._policy_router = actor_args.policy_router
+        # Forces the first reconcile: the router starts believing every backend serves.
+        self._pushed_membership_epoch: int = -1
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -630,6 +633,7 @@ class SingleControllerActor:
 
             # Probe before publishing so the metrics describe this tick, not the last.
             await self._probe_generation_fleet()
+            await self._push_router_membership()
 
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
@@ -691,6 +695,29 @@ class SingleControllerActor:
                 )
             else:
                 self._fleet_monitor.record_probe(shard_idx, ok=True)
+
+    async def _push_router_membership(self) -> None:
+        """Tell the NeMo-Gym router which backends are currently serving.
+
+        Pushed as the full set rather than a delta, so a dropped or reordered update --
+        or a restarted router, which comes up believing every backend serves -- converges
+        on the next tick without sequence numbers or replay.
+
+        Re-pushed whenever the membership epoch has moved. The epoch tracks the serving
+        set, not per-shard state, so a shard merely going SUSPECT does not churn the
+        router.
+        """
+        if self._policy_router is None or self._fleet_monitor is None:
+            return
+        epoch = self._fleet_monitor.membership_epoch
+        if epoch == self._pushed_membership_epoch:
+            return
+        await self._ray_get(
+            self._policy_router.set_serving_backends.remote(
+                self._fleet_monitor.serving_base_urls()
+            )
+        )
+        self._pushed_membership_epoch = epoch
 
     async def _check_env_health(self) -> None:
         """Ask each environment actor that exposes a health check whether it is whole.

@@ -82,8 +82,10 @@ def _make_controller(
     ctrl._train_steps = train_steps
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
-    # These tests cover stall detection, not fleet health.
+    # These tests cover stall detection, not fleet health or gym routing.
     ctrl._fleet_monitor = None
+    ctrl._policy_router = None
+    ctrl._pushed_membership_epoch = -1
     return ctrl
 
 
