@@ -1167,6 +1167,7 @@ class DPOLossFn(PreferenceLossFn):
             "num_valid_samples": num_valid_samples.item(),
         }
 
+
 class MPOLossConfig(BaseModel, extra="allow"):
     """Mixed Preference Optimization loss configuration."""
 
@@ -1383,6 +1384,8 @@ class MPOLossFn(PreferenceLossFn):
             "bco_reward_sum": bco_reward_sum.item(),
             "bco_reward_count": bco_reward_count.item(),
         }
+
+
 class DistillationLossConfig(BaseModel, extra="allow"):
     kl_type: str = "mixed"
     mixed_kl_weight: float = 0.5

@@ -92,8 +92,7 @@ def test_vlm_preference_processor_adds_nemotron_omni_media_metadata():
 
     assert processor.saw_explicit_image_placeholder
     assert all(
-        "add_special_tokens" not in kwargs
-        for kwargs in processor.chat_template_kwargs
+        "add_special_tokens" not in kwargs for kwargs in processor.chat_template_kwargs
     )
     assert result["idx"] == 7
     assert result["length_chosen"] == 3
