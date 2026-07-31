@@ -47,3 +47,16 @@ code_snapshots*/
 
 # Claude Code review memory (local only)
 .claude/review-memory/
+
+# Local Claude Code / MCP state
+.claude/
+!.claude/review-memory/
+.mcp.json
+
+# Local test + scratch artifacts
+tests/unit/unit_results.json
+tests/unit/unit_results/
+classifier.model
+known_elements.txt
+output.txt
+perm*.txt
