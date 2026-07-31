@@ -11,6 +11,13 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    # Required headroom for the actor train step at long packed sequences (e.g.
+    # 7B math @ 18432 tokens): the actor forward materializes full LM-head
+    # logits (~11GB fp32 over a 152k vocab) on top of unrecomputed activations;
+    # without these, the first policy-training step OOMs in the grad all-reduce
+    # (NCCL "Cuda failure 2 'out of memory'"). Memory-shape only — same math.
+    activation_checkpointing: true
+    defer_fp32_logits: true
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   scheduler: null
