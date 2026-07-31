@@ -187,7 +187,7 @@ def get_microbatch_iterator(
     pad_factor = 1
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
-    pad_packed_seq_for_hybridep = _uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
+    pad_packed_seq_for_hybridep = False
 
     _, seq_dim_size = get_and_validate_seqlen(data)
 
@@ -199,6 +199,9 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
+        pad_packed_seq_for_hybridep = _uses_hybridep_flex_dispatcher(
+            cfg["megatron_cfg"]
+        )
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
