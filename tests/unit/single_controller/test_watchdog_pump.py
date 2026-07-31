@@ -89,6 +89,8 @@ def _make_controller(
     # These tests cover stall detection, not fleet health or gym routing.
     ctrl._fleet_monitor = None
     ctrl._policy_router = None
+    # No fleet health, so nothing ever reaches DEAD and there is nothing to restart.
+    ctrl._engine_supervisor = None
     ctrl._pushed_membership_epoch = -1
     return ctrl
 
@@ -241,6 +243,7 @@ class TestGenerationFleetProbe:
             stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
         ctrl._fleet_monitor = monitor
+        ctrl._engine_supervisor = None
         ctrl._gen = SimpleNamespace(
             worker_group=SimpleNamespace(
                 get_dp_leader_worker_idx=lambda shard: shard,
