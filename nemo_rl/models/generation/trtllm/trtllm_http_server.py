@@ -139,7 +139,7 @@ def create_app(
         )
 
         try:
-            conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
+            conversation, mm_coroutine, *_ = parse_chat_messages_coroutines(
                 messages, model_config
             )
             mm_data, mm_embeddings = await mm_coroutine
