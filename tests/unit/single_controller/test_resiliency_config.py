@@ -25,6 +25,8 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
+    FleetHealthConfig,
+    PolicyRouterConfig,
     RolloutFailureConfig,
     WatchdogConfig,
 )
@@ -118,6 +120,50 @@ class TestWatchdogValidation:
     def test_unknown_action_is_rejected(self):
         with pytest.raises(ValidationError):
             WatchdogConfig(stall_action="explode")
+
+
+class TestPolicyRouterValidation:
+    def test_the_default_status_is_outside_gyms_retry_set(self):
+        assert PolicyRouterConfig().no_healthy_backend_status == 409
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 520])
+    def test_a_status_gym_retries_is_rejected(self, status):
+        """Returning one of these would make Gym retry forever.
+
+        Gym retries 429/500/502/503/504/520, and for the rate-limit subset it raises its
+        own retry ceiling on each attempt. Answering "no healthy backend" with one of
+        them recreates the unbounded hang the router exists to prevent, so it is refused
+        at config load rather than discovered in production.
+        """
+        with pytest.raises(ValidationError, match="NeMo-Gym retries internally"):
+            PolicyRouterConfig(no_healthy_backend_status=status)
+
+    @pytest.mark.parametrize("status", [400, 404, 409, 418, 422])
+    def test_other_client_errors_are_allowed(self, status):
+        assert (
+            PolicyRouterConfig(
+                no_healthy_backend_status=status
+            ).no_healthy_backend_status
+            == status
+        )
+
+    def test_it_is_off_by_default(self):
+        assert AsyncRLConfig().policy_router.enabled is False
+
+
+class TestFleetHealthValidation:
+    def test_it_is_off_by_default(self):
+        assert AsyncRLConfig().fleet_health.enabled is False
+
+    def test_a_probe_timeout_that_outlasts_the_interval_is_rejected(self):
+        """Otherwise probes overlap and a slow fleet reads as a dead one."""
+        with pytest.raises(ValidationError, match="probe_timeout_s"):
+            FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
+
+    def test_unimplemented_recovery_modes_are_rejected(self):
+        """They need the communicator rebuild; accepting them would do nothing."""
+        with pytest.raises(ValidationError):
+            FleetHealthConfig(on_dead_shard="degrade_and_restore")
 
 
 class TestWatchdogVersusRolloutTimeout:
