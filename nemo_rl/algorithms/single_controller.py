@@ -66,6 +66,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -142,6 +143,14 @@ class SingleControllerActor:
         # None means the feature is off, which is also the default for both.
         self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
         self._policy_router = getattr(actor_args, "policy_router", None)
+        # Only with fleet health: without a monitor nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        self._engine_supervisor = (
+            EngineSupervisor(generation=self._gen, monitor=self._fleet_monitor)
+            if self._fleet_monitor is not None
+            and master_config.async_rl.fleet_health.restart_dead_shards
+            else None
+        )
         # Forces the first reconcile: the router starts believing every backend serves.
         self._pushed_membership_epoch: int = -1
         # Rebind so writer and sampler share one buffer instance even
@@ -670,6 +679,8 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._fleet_monitor is not None:
                 metrics.update(self._fleet_monitor.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.metrics())
             self._logger.log_metrics(metrics, step=self._train_steps)
 
             if watchdog_cfg.gym_subprocess_check:
@@ -713,6 +724,12 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
             # Pushed here rather than on the watchdog's clock so a membership change
             # reaches the router at detection speed. Epoch-gated, so an unchanged
             # serving set costs nothing.

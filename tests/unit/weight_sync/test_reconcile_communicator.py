@@ -141,6 +141,10 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     generation.set_refit_membership = lambda membership: setattr(
         generation, "_refit_membership", membership
     )
+    # A rebuild redistributes refit metadata, because a restarted engine has none and
+    # update_weights_from_collective asserts on it.
+    refit_info_pushes = []
+    generation.prepare_refit_info = lambda info: refit_info_pushes.append(info)
     generation.rebuild_collective = (
         lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
@@ -148,6 +152,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     )
     policy_calls = []
     policy = SimpleNamespace(
+        prepare_refit_info=lambda: {"model.weight": object()},
         init_collective=lambda ip, port, world_size, *, train_world_size: (
             policy_calls.append(
                 {
@@ -158,7 +163,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
                 }
             )
             or ["train-future"]
-        )
+        ),
     )
     ports = iter(range(7001, 7100))
     train_cluster = SimpleNamespace(
