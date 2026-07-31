@@ -411,6 +411,9 @@ def setup(
             "generation.val_temperature/val_top_p/val_top_k differing from the "
             "train sampling params is only supported for vLLM NeMo-Gym rollouts."
         )
+    assert grpo_config["val_num_generations_per_prompt"] >= 1, (
+        "grpo.val_num_generations_per_prompt must be >= 1"
+    )
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -3643,12 +3646,10 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
+        # >= 1 is validated in setup().
         val_num_generations_per_prompt = master_config.grpo[
             "val_num_generations_per_prompt"
         ]
-        assert val_num_generations_per_prompt >= 1, (
-            "grpo.val_num_generations_per_prompt must be >= 1"
-        )
 
         total_rewards = []
         total_lengths = []
