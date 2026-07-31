@@ -25,6 +25,8 @@ focusing on:
 
 from unittest.mock import MagicMock, patch
 
+import logging
+
 import pytest
 import ray
 import torch
@@ -1462,6 +1464,50 @@ def test_hybridep_padding_mask_uses_cp_local_layout_for_cp2():
         torch.tensor([11, 21, 22, 23], dtype=padded_input_ids_cp_sharded.dtype),
     )
     assert bool(torch.all(padded_input_ids_cp_sharded[cp_padding_mask] == 0))
+
+
+@pytest.mark.mcore
+def test_hybridep_padding_logs_local_overhead(monkeypatch, caplog):
+    """HybridEP padding diagnostics report the local token-storage overhead."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.megatron import data as megatron_data
+
+    input_ids = torch.tensor([[11, 12, 13]])
+    cu_seqlens_padded = torch.tensor([0, 3], dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=3,
+        max_seqlen_kv=3,
+        qkv_format="thd",
+        total_tokens=3,
+    )
+    monkeypatch.setattr(megatron_data, "_HYBRIDEP_PACKING_LOG_CALLS", 0)
+    monkeypatch.setenv("NEMO_RL_HYBRIDEP_LOG_PACKING", "1")
+    monkeypatch.setenv("NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE", "0")
+
+    with caplog.at_level(logging.WARNING, logger=megatron_data.__name__):
+        padded_input_ids, padded_cp_shard, _, _ = (
+            megatron_data._pad_packed_seq_for_hybridep(
+                input_ids=input_ids,
+                input_ids_cp_sharded=input_ids,
+                packed_seq_params=packed_seq_params,
+                cu_seqlens_padded=cu_seqlens_padded,
+                pad_packed_seq_to_multiple_of=4,
+                cp_rank=0,
+                cp_size=1,
+            )
+        )
+
+    assert padded_input_ids.shape == (1, 4)
+    assert padded_cp_shard.shape == (1, 4)
+    assert "local_tokens=3 target_tokens=4 added_tokens=1" in caplog.text
+    assert "overhead_pct=33.3333" in caplog.text
+    assert "group_overhead_pct=33.3333" in caplog.text
+    assert "reduce_group=False" in caplog.text
 
 
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"
