@@ -200,6 +200,17 @@ def test_gsm8k_subset_selects_hf_config(monkeypatch):
     assert dataset.dataset[0]["messages"][1]["content"] == "4"
 
 
+def test_gsm8k_subset_none_falls_back_to_main(monkeypatch):
+    """`subset: null` is the documented config default, and openai/gsm8k has no
+    implicit default config, so None must resolve to "main"."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    load_response_dataset({"dataset_name": "gsm8k", "subset": None, "split": "train"})
+
+    assert captured["name"] == "main"
+
+
 def test_gsm8k_subset_defaults_to_main(monkeypatch):
     """Unset ``subset`` keeps the previous behavior (the "main" config)."""
     captured = {}

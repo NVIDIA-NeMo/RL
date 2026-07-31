@@ -29,7 +29,8 @@ class GSM8KDataset(RawDataset):
     """Simple wrapper around the GSM8K dataset.
 
     Args:
-        subset: Hugging Face config name, default is "main". ``openai/gsm8k``
+        subset: Hugging Face config name, default is "main" (``None`` also
+            selects "main", since the dataset has no implicit default config). ``openai/gsm8k``
             also ships a ``"socratic"`` config, whose answers interleave
             Socratic sub-questions with the reasoning steps.
         split: Split name for the dataset, default is "train"
@@ -38,7 +39,7 @@ class GSM8KDataset(RawDataset):
 
     def __init__(
         self,
-        subset: str = "main",
+        subset: str | None = "main",
         split: str = "train",
         extract_answer: bool = True,
         **kwargs,
@@ -47,7 +48,7 @@ class GSM8KDataset(RawDataset):
         self.extract_answer = extract_answer
 
         # load from huggingface
-        self.dataset = load_dataset("openai/gsm8k", subset)[split]
+        self.dataset = load_dataset("openai/gsm8k", subset or "main")[split]
 
         # format the dataset
         self.dataset = self.dataset.map(
