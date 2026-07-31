@@ -23,9 +23,8 @@ focusing on:
 - Sequence dimension validation
 """
 
-from unittest.mock import MagicMock, patch
-
 import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
