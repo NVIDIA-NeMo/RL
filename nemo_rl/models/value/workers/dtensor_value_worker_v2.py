@@ -20,10 +20,10 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
-from nemo_automodel.components.distributed.cp_utils import (
+from nemo_automodel.components.distributed.context_parallel.utils import (
     create_context_parallel_ctx,
 )
-from nemo_automodel.components.distributed.cp_utils import (
+from nemo_automodel.components.distributed.context_parallel.utils import (
     get_train_context as get_train_context_automodel,
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
