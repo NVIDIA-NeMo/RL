@@ -21,10 +21,10 @@ from typing import Any, Generator, Iterable, Optional
 import ray
 import torch
 from nemo_automodel.components._peft.lora import LinearLoRA
-from nemo_automodel.components.distributed.cp_utils import (
+from nemo_automodel.components.distributed.context_parallel.utils import (
     create_context_parallel_ctx,
 )
-from nemo_automodel.components.distributed.cp_utils import (
+from nemo_automodel.components.distributed.context_parallel.utils import (
     get_train_context as get_train_context_automodel,
 )
 from nemo_automodel.components.distributed.tensor_utils import (
