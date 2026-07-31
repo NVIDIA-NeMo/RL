@@ -65,6 +65,10 @@ run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recov
 # rebuilds its per-PP-stage bulk groups and regenerates the refit plan. Only this path
 # has to keep a plan and a communicator agreeing about the fleet size.
 run_test env REFIT_TRANSPORT=nccl_reshard uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+# Restart and re-admission, which is a strictly stronger claim than surviving on a
+# smaller fleet: the engine is recreated and returns to the serving set. This is the only
+# coverage RayWorkerGroup.recreate_worker has -- it cannot be reached without GPUs.
+run_test env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what

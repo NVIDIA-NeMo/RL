@@ -254,3 +254,60 @@ def test_a_retired_shard_is_never_restarted(state):
 
     assert gen.restarted == []
     assert monitor.state_of(0) is state
+
+
+class TestPromotionIsWiredUp:
+    """The step that turns a restart into recovered throughput.
+
+    Nothing except a completed refit moves a shard out of STALE, and the supervisor
+    deliberately does not do it -- the refit has to have actually happened. So the
+    controller must promote, and these run through the controller rather than calling
+    report_refit by hand, which is what let this stay unwired: every earlier test in this
+    file promoted manually and passed against a controller that never did.
+    """
+
+    @staticmethod
+    def _controller(monitor, trainer_version=5):
+        from nemo_rl.algorithms.single_controller import SingleControllerActor
+
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._fleet_monitor = monitor
+        ctrl._trainer_version = trainer_version
+        return ctrl
+
+    def test_a_restarted_shard_is_returned_to_service_after_a_refit(self):
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 1)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+        asyncio.run(_tick_and_settle(supervisor))
+        assert monitor.state_of(1) is ShardState.STALE
+
+        self._controller(monitor)._promote_refit_shards()
+
+        assert monitor.state_of(1) is ShardState.HEALTHY
+        assert 1 in monitor.serving_shards()
+
+    def test_the_promoted_shard_carries_the_current_weight_version(self):
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+        asyncio.run(_tick_and_settle(supervisor))
+
+        self._controller(monitor, trainer_version=11)._promote_refit_shards()
+
+        assert monitor.snapshot()[0].weight_version == 11
+
+    def test_a_suspect_shard_is_not_promoted_by_a_refit(self):
+        """It took part in the refit, but it is failing probes for its own reasons and
+        promoting it would reset the count that is meant to condemn it."""
+        monitor = _monitor()
+        monitor.record_probe(2, ok=False, error="timeout")
+        assert monitor.state_of(2) is ShardState.SUSPECT
+
+        self._controller(monitor)._promote_refit_shards()
+
+        assert monitor.state_of(2) is ShardState.SUSPECT
+
+    def test_promotion_is_inert_without_fleet_health(self):
+        ctrl = self._controller(None)
+        ctrl._promote_refit_shards()  # must not raise

@@ -64,6 +64,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
+from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -736,6 +737,28 @@ class SingleControllerActor:
         )
         self._pushed_membership_epoch = epoch
 
+    def _promote_refit_shards(self) -> None:
+        """Return replacements to the serving set now that they hold current weights.
+
+        The last step of re-admission, and the one that makes a restart worth doing. A
+        restarted shard is STALE: in the communicator, so the refit reaches it, but out of
+        the serving set, so it takes no traffic while its weights are from disk. Nothing
+        else moves it out of STALE, so without this the engine comes back, receives
+        weights, and then sits idle for the rest of the run -- the fleet rejoins on paper
+        and never recovers its throughput.
+
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
+        it is failing probes for its own reasons and promoting it here would reset the
+        failure count that is supposed to condemn it.
+        """
+        if self._fleet_monitor is None:
+            return
+        for health in self._fleet_monitor.snapshot():
+            if health.state is ShardState.STALE:
+                self._fleet_monitor.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+
     async def _reconcile_refit_membership(self) -> None:
         """Ask the weight transport to match the live fleet before the refit runs.
 
@@ -821,6 +844,7 @@ class SingleControllerActor:
             self._weight_synchronizer.sync_weights,
             kv_scales=kv_scales,
         )
+        self._promote_refit_shards()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
