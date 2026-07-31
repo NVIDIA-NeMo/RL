@@ -2332,6 +2332,13 @@ def ppo_train(
                                 for k, v in train_results["moe_metrics"].items()
                             }
                         )
+                    if "mtp_metrics" in train_results:
+                        metrics.update(
+                            {
+                                f"mtp/{k}": v
+                                for k, v in train_results["mtp_metrics"].items()
+                            }
+                        )
 
                 # Extract critic metrics from value training results
                 if value_results is not None:
@@ -3517,6 +3524,13 @@ def async_ppo_train(
                             {
                                 f"moe/{k}": v
                                 for k, v in train_results["moe_metrics"].items()
+                            }
+                        )
+                    if "mtp_metrics" in train_results:
+                        metrics.update(
+                            {
+                                f"mtp/{k}": v
+                                for k, v in train_results["mtp_metrics"].items()
                             }
                         )
                     metrics.update(train_results["all_mb_metrics"])
