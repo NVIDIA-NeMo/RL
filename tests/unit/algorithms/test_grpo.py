@@ -48,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -1116,6 +1117,21 @@ class StubAsyncTrajectoryCollector:
         return self._remote_method("resume_after_refit")
 
     @property
+    def get_status(self):
+        """Return a healthy collector status with no reserved targets."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "running": True,
+                "data_exhausted": False,
+                "errored": False,
+                "inflight_workers": 0,
+                "generating_targets": [],
+            }
+        )
+        return mock
+
+    @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
         mock = MagicMock()
@@ -1820,6 +1836,54 @@ def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
 
     master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
     assert should_use_nemo_gym(master_config) is True
+
+
+@pytest.mark.parametrize(
+    (
+        "lookahead_complete",
+        "generating_targets",
+        "current_step_ready",
+        "step",
+        "max_num_steps",
+        "expected",
+        "expected_queries",
+    ),
+    [
+        pytest.param(True, [], True, 3, 10, True, 1, id="complete"),
+        pytest.param(False, [4], True, 3, 10, True, 1, id="reserved-only"),
+        pytest.param(False, [], True, 3, 10, False, 1, id="neither"),
+        pytest.param(False, [5, 6], True, 3, 10, False, 1, id="other-target-reserved"),
+        pytest.param(False, [], True, 9, 10, True, 0, id="last-step"),
+        pytest.param(False, [], False, 3, 10, False, 0, id="current-not-ready"),
+    ],
+)
+def test_startup_pipeline_ready(
+    lookahead_complete,
+    generating_targets,
+    current_step_ready,
+    step,
+    max_num_steps,
+    expected,
+    expected_queries,
+):
+    """Startup needs a complete or claimed lookahead except at the last step."""
+    replay_buffer = MagicMock()
+    replay_buffer.has_complete_batch.remote.return_value = lookahead_complete
+    collector_status = {"generating_targets": generating_targets}
+
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        result = _startup_pipeline_ready(
+            replay_buffer,
+            collector_status,
+            current_step_ready=current_step_ready,
+            step=step,
+            num_prompts_per_step=8,
+            max_trajectory_age_steps=1,
+            max_num_steps=max_num_steps,
+        )
+
+    assert result is expected
+    assert replay_buffer.has_complete_batch.remote.call_count == expected_queries
 
 
 @contextmanager
