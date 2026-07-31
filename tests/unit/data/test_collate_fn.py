@@ -212,8 +212,11 @@ def test_preference_collate_fn_preserves_media_in_mixed_batches():
         pixel_values = train_data["pixel_values"]
         assert isinstance(pixel_values, PackedTensor)
         assert len(pixel_values) == 4
-        assert tuple(
-            index
-            for index, tensor in enumerate(pixel_values.tensors)
-            if tensor is None
-        ) == expected_missing_rows
+        assert (
+            tuple(
+                index
+                for index, tensor in enumerate(pixel_values.tensors)
+                if tensor is None
+            )
+            == expected_missing_rows
+        )
