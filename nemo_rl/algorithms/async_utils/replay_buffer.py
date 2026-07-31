@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import gc
 import statistics
 import threading as _threading
 import uuid
@@ -22,17 +21,13 @@ from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 import ray
-import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
-from nemo_rl.experience.interfaces import (
-    NEMO_GYM_TASK_INDEX_KEY,
-    NEXT_NEMO_GYM_TASK_INDEX_KEY,
-    PromptGroupRecord,
-)
+from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.row_dump import maybe_dump_train_rows
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
@@ -346,44 +341,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "max_size": self.max_size,
             }
 
-    def save_to_path(self, path: str) -> int:
-        """Serialize inside the actor without materializing the buffer on the driver."""
-        state = self.state_dict()
-        torch.save(state, path)
-        num_trajectories = len(state["trajectories"])
-        del state
-        gc.collect()
-        return num_trajectories
-
-    def load_from_path(
-        self,
-        path: str,
-        num_prompts_per_step: int | None = None,
-        current_training_step: int | None = None,
-        max_age_steps: int | None = None,
-    ) -> dict[str, int]:
-        """Restore inside the actor and return only compact coordination metadata."""
-        state = torch.load(path, weights_only=False)
-        saved_task_indices = [
-            int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
-            for trajectory in state.get("trajectories", [])
-            if trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
-        ]
-        next_task_index = max(saved_task_indices, default=-1) + 1
-        num_trajectories = len(state["trajectories"])
-        self.load_state_dict(
-            state,
-            num_prompts_per_step=num_prompts_per_step,
-            current_training_step=current_training_step,
-            max_age_steps=max_age_steps,
-        )
-        del state
-        gc.collect()
-        return {
-            "num_trajectories": num_trajectories,
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: next_task_index,
-        }
-
     def load_state_dict(
         self,
         state: dict[str, Any],
@@ -694,11 +651,16 @@ class TQReplayBuffer:
         partition_id: str,
         *,
         pad_value_dict: Mapping[str, int],
+        staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
+        # Token-capture mode only (docs/design-docs/tq-gym-gate-authoritative.md):
+        # the staging partition whose per-call delta rows `remove` must clear
+        # alongside the canonical rows. None on the legacy path.
+        self._staging_partition_id = staging_partition_id
         self._require_routed_experts = require_routed_experts
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
@@ -707,6 +669,9 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        # Parallel to the lists above; populated only in token-capture mode.
+        self._rollout_ids_list: list[Optional[list[str]]] = []
+        self._staging_keys_list: list[Optional[list[str]]] = []
 
     def reserve(
         self,
@@ -714,6 +679,7 @@ class TQReplayBuffer:
         weight_version: int,
         target_step: Optional[int] = None,
         group_id: Optional[str] = None,
+        rollout_ids: Optional[list[str]] = None,
     ) -> str:
         """Append an unready slot tagged with weight_version.
 
@@ -721,6 +687,9 @@ class TQReplayBuffer:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
+            rollout_ids: Token-capture mode: the gate-registered rollout ids
+                this slot dispatched, recorded so cleanup can name what it
+                owns even before a receipt exists.
 
         Returns:
             group_id used by the matching commit.
@@ -733,6 +702,10 @@ class TQReplayBuffer:
         self.target_step_list.append(target_step)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
+        self._rollout_ids_list.append(
+            list(rollout_ids) if rollout_ids is not None else None
+        )
+        self._staging_keys_list.append(None)
         return group_id
 
     async def commit(
@@ -758,12 +731,12 @@ class TQReplayBuffer:
             ValueError: group_id has no live slot (removed or never reserved).
             RuntimeError: router replay is enabled but the payload has no routes.
         """
-        # Precondition: reserve() must have registered this group_id. Raise
-        # before any side effects so a stray commit doesn't leak orphan DP rows.
+        # Check the slot is still live BEFORE writing: a slot evicted while
+        # its rollout was in flight must not orphan rows into the partition.
         if group_id not in self._group_ids:
             raise ValueError(
-                f"commit called with unknown group_id={group_id!r}; "
-                f"reserve() must precede commit() (or the slot was already removed)"
+                f"TQReplayBuffer.commit: group {group_id} has no live slot "
+                "(evicted or never reserved); nothing written"
             )
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
@@ -776,6 +749,13 @@ class TQReplayBuffer:
                 "not produce that field. Check vLLM routed-expert capture and "
                 "the async message-log flattening path."
             )
+        maybe_dump_train_rows(
+            source="legacy_commit",
+            group_id=group_id,
+            sample_ids=list(sample_ids),
+            train_batch=train_batch,
+            weight_version=start_weight_version,
+        )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
         try:
             await self._call_dp(
@@ -797,7 +777,15 @@ class TQReplayBuffer:
                 tags=[dict(t) for t in tags],
             )
 
-            idx = self._group_ids.index(group_id)
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                # Evicted during the awaited write: un-write the rows so the
+                # partition holds nothing the buffer no longer tracks.
+                raise ValueError(
+                    f"TQReplayBuffer.commit: group {group_id} was evicted "
+                    "during the write; rows cleared"
+                ) from None
             self.meta_list[idx] = meta
             self.end_weight_list[idx] = end_weight_version
             self.ready_list[idx] = True
@@ -839,8 +827,87 @@ class TQReplayBuffer:
             raise ValueError(f"unknown group_id={group_id!r}") from error
         return await self.remove([idx], remove_in_dp=remove_in_dp)
 
+    async def commit_finalized(
+        self,
+        group_id: str,
+        meta: KVBatchMeta,
+        group_min_wv: int,
+        group_max_wv: int,
+        *,
+        staging_keys: Optional[list[str]] = None,
+    ) -> KVBatchMeta:
+        """Mark a slot ready from finalizer output (token-capture mode).
+
+        Unlike :meth:`commit`, the canonical rows are already in TQ — the
+        finalizer tensorized and put them — so this only fills the slot.
+        The slot's effective version is the group's OLDEST call version
+        (``group_min_wv``): staleness accounting stays conservative when a
+        rollout straddles a refit.
+
+        Args:
+            group_id: group_id returned by the matching reserve call.
+            meta: KVBatchMeta the finalizer built over its published rows.
+            group_min_wv: Oldest weight version any call in the group used.
+            group_max_wv: Newest weight version any call in the group used.
+            staging_keys: The group's staged delta keys, recorded so
+                :meth:`remove` can clear the staging partition too.
+
+        Raises:
+            ValueError: group_id has no live slot (removed or never reserved).
+        """
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError:
+            raise ValueError(
+                f"TQReplayBuffer.commit_finalized: group {group_id} has no "
+                "live slot (evicted or never reserved)"
+            ) from None
+        self.meta_list[idx] = meta
+        self.start_weight_list[idx] = group_min_wv
+        self.end_weight_list[idx] = group_max_wv
+        self.ready_list[idx] = True
+        self._staging_keys_list[idx] = (
+            list(staging_keys) if staging_keys is not None else None
+        )
+        return meta
+
+    def abort(self, group_id: str) -> bool:
+        """Drop an unready slot whose dispatch failed or was cancelled.
+
+        Token-capture mode; called from the failed dispatch path.
+        No DataPlane rows are cleared: an unready slot published no canonical
+        rows, and its staged deltas (keys unknown before a receipt) are swept
+        by the staging TTL backstop.
+
+        Returns:
+            True when a slot was dropped; False when the group_id has no
+            live slot (already committed+consumed or never reserved).
+        """
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError:
+            return False
+        if self.ready_list[idx]:
+            return False
+        self._delete_slot(idx)
+        return True
+
+    def _delete_slot(self, idx: int) -> None:
+        del self.meta_list[idx]
+        del self.start_weight_list[idx]
+        del self.end_weight_list[idx]
+        del self.target_step_list[idx]
+        del self.ready_list[idx]
+        del self._group_ids[idx]
+        del self._rollout_ids_list[idx]
+        del self._staging_keys_list[idx]
+
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         """Drop entries at the given indices and optionally clear them from DataPlane.
+
+        In token-capture mode (``staging_partition_id`` set), clearing a
+        group also clears its recorded staged delta rows, so eviction leaves
+        neither canonical nor staging bytes behind.
 
         Args:
             idxs: Entry indices to drop. Must be within [0, size).
@@ -860,16 +927,15 @@ class TQReplayBuffer:
             )
 
         dropped_sample_ids: list[str] = []
+        dropped_staging_keys: list[str] = []
         for i in drop_idxs:
             meta = self.meta_list[i]
             if meta is not None:
                 dropped_sample_ids.extend(meta.sample_ids)
-            del self.meta_list[i]
-            del self.start_weight_list[i]
-            del self.end_weight_list[i]
-            del self.target_step_list[i]
-            del self.ready_list[i]
-            del self._group_ids[i]
+            staging_keys = self._staging_keys_list[i]
+            if staging_keys:
+                dropped_staging_keys.extend(staging_keys)
+            self._delete_slot(i)
 
         if remove_in_dp:
             await self._call_dp(
@@ -877,6 +943,12 @@ class TQReplayBuffer:
                 sample_ids=dropped_sample_ids,
                 partition_id=self._partition_id,
             )
+            if dropped_staging_keys and self._staging_partition_id is not None:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=dropped_staging_keys,
+                    partition_id=self._staging_partition_id,
+                )
 
         return len(drop_idxs)
 
