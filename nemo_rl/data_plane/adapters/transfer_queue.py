@@ -27,8 +27,9 @@ import os
 import socket
 import subprocess
 import time
+import warnings
 from importlib import resources
-from typing import Any
+from typing import Any, cast
 
 import torch
 import transfer_queue as tq
@@ -171,27 +172,28 @@ def _patch_tq_actor_runtime_env() -> None:
         cls.options = patched  # type: ignore[method-assign]
         return True
 
-    patched_any = False
+    unpatched_classes: list[str] = []
     try:
         from transfer_queue.storage.simple_storage import SimpleStorageUnit
 
-        patched_any |= _install(SimpleStorageUnit)
+        if not _install(SimpleStorageUnit):
+            unpatched_classes.append("SimpleStorageUnit")
     except ImportError:
-        pass
+        unpatched_classes.append("SimpleStorageUnit")
     try:
         from transfer_queue.controller import TransferQueueController
 
-        patched_any |= _install(TransferQueueController)
+        if not _install(TransferQueueController):
+            unpatched_classes.append("TransferQueueController")
     except ImportError:
-        pass
+        unpatched_classes.append("TransferQueueController")
 
-    if not patched_any:
+    if unpatched_classes:
         # Soft-fail: TQ may have moved its actor classes. The driver will
         # still work; multi-node TQ may need the per-node `uv sync` workaround.
-        import warnings
-
         warnings.warn(
-            "Could not patch TQ actor classes for runtime_env injection. "
+            "Could not patch every TQ actor class for runtime_env injection: "
+            f"unpatched={unpatched_classes}. "
             "Multi-node TQ may fail with ModuleNotFoundError: 'transfer_queue' "
             "on worker nodes. Workaround: run `uv sync` inside each node's "
             "container before the driver runs.",
@@ -429,15 +431,15 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
 def _from_wire(
     td: TensorDict, promoted_1d_fields: set[str] | None = None
 ) -> TensorDict:
-    """Normalize Mooncake reads and invert :func:`_promote_1d_leaves`.
+    """Normalize TQ reads and invert :func:`_promote_1d_leaves` when needed.
 
-    TQ v0.1.9 reconstructs every non-scalar field as a nested tensor before
-    attempting a dense representation, including fields whose rows all have
-    the same shape. Densify those uniform nested tensors first so regular
-    batched inputs retain their dense representation. Truly ragged fields
-    remain nested. Finally, squeeze only singleton dimensions known to have
-    been introduced by :func:`_promote_1d_leaves`. ``None`` retains the old
-    shape-only behavior for checkpoints written before shape tags existed.
+    Both TQ v0.1.9 storage managers reconstruct every non-scalar field as a
+    nested tensor, including fields whose rows all have the same shape.
+    Densify those uniform nested tensors first so regular batched inputs retain
+    their dense representation. Truly ragged fields remain nested. Finally,
+    squeeze only singleton dimensions known to have been introduced by
+    :func:`_promote_1d_leaves`. ``None`` retains the old shape-only behavior
+    for checkpoints written before shape tags existed.
     """
     # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
     # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
@@ -687,11 +689,15 @@ class TQDataPlaneClient(DataPlaneClient):
             # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
             # itself, so the call here was redundant for tensors and
             # destructive for non-tensors.
-            wire_fields = fields.detach()  # type: ignore[bad-assignment,missing-argument]
+            detached_fields = cast(
+                TensorDict,
+                fields.detach(),  # type: ignore[missing-argument]
+            )
             if self._promote_1d:
-                wire_tags = _add_wire_shape_tags(wire_tags, wire_fields)
-                wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
-            field_names = list(wire_fields.keys())
+                wire_tags = _add_wire_shape_tags(wire_tags, detached_fields)
+                detached_fields = _promote_1d_leaves(detached_fields)
+            wire_fields = detached_fields
+            field_names = [str(key) for key in detached_fields.keys()]
 
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
@@ -718,11 +724,12 @@ class TQDataPlaneClient(DataPlaneClient):
         if not sample_ids:
             return TensorDict({}, batch_size=(0,))
         if not self._promote_1d:
-            return tq.kv_batch_get(
+            td = tq.kv_batch_get(
                 keys=list(sample_ids),
                 partition_id=partition_id,
                 select_fields=select_fields,
             )
+            return _from_wire(td, promoted_1d_fields=set())
 
         # Inline TQ's public kv_batch_get flow so the adapter can also inspect
         # the durable per-row shape markers carried by BatchMeta.custom_meta.
