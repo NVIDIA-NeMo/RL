@@ -378,8 +378,9 @@ override-dependencies = [
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
   "langchain-core>=0.3.80", # Address CVE-2025-65106
-  # Keep the NumPy floor compatible with megatron-core's onnx → ml-dtypes
-  # dependency while composing the data-plane stack with mcore/automodel.
+  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap (resolves to
+  # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
+  # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
   "numpy>=2.1.0",
   # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
   # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
