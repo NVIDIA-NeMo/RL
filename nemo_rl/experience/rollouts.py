@@ -1558,6 +1558,21 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     return list(DEFAULT_THINKING_TAGS)
 
 
+def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
+    """Read ``env.should_mask_flagged_samples``; absent means True.
+
+    True (the default): env-driven ``mask_sample`` flags are carried in the
+    rollout batch and flagged samples are dropped from the loss.
+
+    Set false when the flags are too coarse to honor: for example, Gym flags
+    rollouts that hit max iterations even when they solve the task, and those
+    are samples worth training on. It also keeps batch composition
+    deterministic for controlled benchmark runs — how many samples get
+    flagged varies run to run.
+    """
+    return env_config.get("should_mask_flagged_samples") is not False
+
+
 def _get_reward_penalty_config_value(
     reward_penalty_config: dict[str, Any] | BaseModel | None,
     key: str,
@@ -1997,6 +2012,7 @@ async def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
@@ -2023,6 +2039,8 @@ async def run_async_nemo_gym_rollout(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
@@ -2148,6 +2166,7 @@ async def run_async_nemo_gym_rollout(
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
+                        mask_env_flagged_samples=mask_env_flagged_samples,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2184,6 +2203,7 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2206,6 +2226,8 @@ def run_nemo_gym_rollout_sync(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2235,6 +2257,7 @@ def run_nemo_gym_rollout_sync(
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
             thinking_tags=thinking_tags,
+            mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
         ):
             pass
@@ -2257,6 +2280,7 @@ def _postprocess_single_nemo_gym_group(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
@@ -2437,11 +2461,12 @@ def _postprocess_single_nemo_gym_group(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
-            # Agent/env-driven mask flag — True means this sample should be masked
-            # from the GRPO gradient (kept for advantage computation).
-            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
+    # Env/agent mask flag: flagged samples are dropped from the loss but still
+    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    if mask_env_flagged_samples:
+        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(

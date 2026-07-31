@@ -49,6 +49,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollouts import should_mask_flagged_samples
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
@@ -441,6 +442,7 @@ def setup_single_controller(
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
+        mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         tq_buffer=tq_buffer,
     )
 
