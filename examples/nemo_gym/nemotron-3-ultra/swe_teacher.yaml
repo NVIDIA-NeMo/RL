@@ -76,6 +76,7 @@ grpo:
   advantage_clip_low: -100
   advantage_clip_high: 100
   val_period: 10000
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
