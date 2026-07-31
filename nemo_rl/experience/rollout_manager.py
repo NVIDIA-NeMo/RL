@@ -405,6 +405,7 @@ class AsyncNemoGymRolloutImpl:
         max_seq_len: int,
         max_rollout_turns: int,
         generation_config: GenerationConfig,
+        mask_env_flagged_samples: bool = True,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -413,6 +414,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
+        self._mask_env_flagged_samples = mask_env_flagged_samples
 
         self._validate_init_params()
 
@@ -553,6 +555,13 @@ class AsyncNemoGymRolloutImpl:
             sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
         )
 
+        # Same gate as the batched path: when masking is off, drop the env
+        # mask flag so later batch building never sees it.
+        if not self._mask_env_flagged_samples:
+            (result["full_result"].get("instance_config") or {}).pop(
+                "mask_sample", None
+            )
+
         return Completion(
             message_log=result["message_log"],
             env_extras=result["full_result"],
@@ -651,6 +660,7 @@ class RolloutManager:
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
+        mask_env_flagged_samples: bool = True,
         tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -676,6 +686,8 @@ class RolloutManager:
             max_rollout_turns=max_rollout_turns,
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
+            # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
+            mask_env_flagged_samples=mask_env_flagged_samples,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
