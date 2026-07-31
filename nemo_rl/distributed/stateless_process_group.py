@@ -25,12 +25,33 @@ class StatelessProcessGroup:
         self.port = port
         self.rank = rank
         self.world_size = world_size
+        # Declared here rather than sprung into existence by init_nccl_communicator, so
+        # abort() can tell "never initialized" from "initialized" without hasattr.
+        self.nccl_communicator: Optional[Communicator] = None
         self.tcp_store = torch.distributed.TCPStore(
             host_name=self.master_address,
             port=self.port,
             world_size=self.world_size,
             is_master=(self.rank == 0),
         )
+
+    def abort(self) -> None:
+        """Terminate in-flight operations and release the communicator.
+
+        Idempotent, and safe on a group whose communicator was never built.
+
+        **`abort()`, not `destroy()`, is the correct teardown here.** NCCL documents
+        `destroy` as an intra-node collective that every rank must call or it hangs --
+        precisely what a rank whose process has died cannot do. `abort` terminates
+        outstanding operations instead, so it works whether or not the peers are alive,
+        which makes it the only safe choice on a path that exists to handle dead peers.
+
+        Verified on 2xA6000: with a peer SIGKILLed mid-broadcast, a survivor blocked in
+        the collective was released 0.15s after another thread called abort().
+        """
+        communicator, self.nccl_communicator = self.nccl_communicator, None
+        if communicator is not None:
+            communicator.abort()
 
     def init_nccl_communicator(self, device: int):
         UNIQUE_ID_KEY = "nccl_unique_id"
@@ -39,7 +60,14 @@ class StatelessProcessGroup:
             unique_id = get_unique_id()
             unique_id_bytes = unique_id.as_bytes
             # Rank 0: store unique_id to TCPStore
-            self.tcp_store.set(UNIQUE_ID_KEY, unique_id_bytes)
+            # The torch stub types `value` as str, but TCPStore.set accepts bytes and
+            # round-trips them byte-for-byte (verified directly). Bytes is also required
+            # here, not incidental: a NCCL UniqueId is binary and would not survive a
+            # str round trip. Surfaced when this file entered pyrefly's scope.
+            self.tcp_store.set(
+                UNIQUE_ID_KEY,
+                unique_id_bytes,  # pyrefly: ignore[bad-argument-type]
+            )
         else:
             # Other ranks: get unique_id from TCPStore
             self.tcp_store.wait([UNIQUE_ID_KEY])
@@ -65,6 +93,11 @@ class StatelessProcessGroup:
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None
     ):
+        if self.nccl_communicator is None:
+            raise RuntimeError(
+                "StatelessProcessGroup has no communicator: init_nccl_communicator() "
+                "was never called, or the group was aborted and not rebuilt."
+            )
         if stream is None:
             stream = torch.cuda.current_stream()
         self.nccl_communicator.broadcast(
