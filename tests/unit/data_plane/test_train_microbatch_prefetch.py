@@ -441,7 +441,7 @@ def test_stage_leader_turns_unexpected_iterator_errors_into_failures(
     message: str,
 ) -> None:
     class BrokenIterator:
-        def __next__(self):
+        def take(self, *, start_next: bool):
             raise error
 
     prefetcher = object.__new__(prefetch_module.TrainMicrobatchPrefetcher)
