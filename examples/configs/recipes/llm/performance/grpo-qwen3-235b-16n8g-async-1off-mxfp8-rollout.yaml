@@ -7,6 +7,13 @@ policy:
       resources:
         num_nodes: 8
         gpus_per_node: 8
+    vllm_cfg:
+      quantization_ignored_layer_kws:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - ".mlp.gate"
 logger:
   log_dir: logs/grpo-qwen3-235b-16n8g-async-1off-mxfp8-rollout
   wandb:

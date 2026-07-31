@@ -12,6 +12,7 @@ policy:
         - k_proj
         - v_proj
         - o_proj
+        - ".mlp.gate"
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
 logger:

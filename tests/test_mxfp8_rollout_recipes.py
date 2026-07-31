@@ -196,3 +196,21 @@ def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
         assert "max_num_steps" not in grpo_config
         assert "val_batch_size" not in grpo_config
         assert "max_val_samples" not in grpo_config
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "grpo-qwen3-30ba3b-4n8g-async-1off-mxfp8-rollout",
+        "grpo-qwen3-235b-16n8g-async-1off-mxfp8-rollout",
+    ),
+)
+def test_b200_async_mxfp8_recipes_keep_router_gate_in_bf16(case_name: str) -> None:
+    config = _load_resolved_yaml(PERF_CONFIG_DIR / f"{case_name}.yaml")
+    ignored = config["policy"]["generation"]["vllm_cfg"][
+        "quantization_ignored_layer_kws"
+    ]
+
+    assert ignored == ["q_proj", "k_proj", "v_proj", "o_proj", ".mlp.gate"]
+    assert "gate" not in ignored
+    assert "gate_proj" not in ignored
