@@ -36,13 +36,14 @@ run on separate GPU clusters, so the phase transitions (offload / restore) are
 owned by the orchestrator, not here.
 """
 
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
 
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import RefitMembershipChanged, WeightSynchronizer
 
 
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
@@ -206,6 +207,32 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             inference_world_size,
         )
         self._generation.prepare_nccl_reshard_refit_info(nccl_reshard_refit_info)
+
+    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+        """Refuse the refit when either communicator family has lost a rank.
+
+        This transport is harder to recover than the plain broadcast, and the difference
+        is worth stating rather than discovering. Two families must be reconciled: the
+        shared ``model_update_group``, and the per-PP-stage bulk groups whose
+        ``sub_world_size`` is itself a function of the inference world size.
+
+        More importantly the bulk path is a mesh-to-mesh redistribute, not a broadcast:
+        ``prepare_nccl_reshard_refit_info`` derives each parameter's destination
+        placements from ``gen_world_size``, so every gen rank receives its own slice
+        rather than the same bytes. Dropping a rank therefore does not merely reduce the
+        number of receivers -- it orphans the slices that rank owned, and the survivors
+        would come back holding weights that were never written. Resizing the
+        communicators without regenerating the plan would corrupt the refit silently,
+        which is worse than stopping.
+        """
+        if not absent_shards:
+            return False
+        raise RefitMembershipChanged(
+            f"generation shards {sorted(absent_shards)} are not in the collective. The "
+            "nccl_reshard transport cannot drop a rank without regenerating the refit "
+            "plan, whose destination placements are derived from gen_world_size; "
+            "resizing alone would leave survivors holding unwritten weights."
+        )
 
     def shutdown(self) -> None:
         # The NCCL process groups' lifecycle is managed by Ray actor teardown;
