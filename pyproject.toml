@@ -54,6 +54,7 @@ dependencies = [
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
   # Floor raised to 5.5.0 for Gemma 4 support.
+  # Ceiling raised to <5.13.0 for Automodel r0.6.0, which pins transformers==5.12.1.
   "transformers>=5.5.0,<5.13.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
@@ -131,7 +132,8 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers==5.5.0",
+  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
+  "transformers>=5.12.1,<5.13.0",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "mistral-common>=1.11.0",
   "mamba-ssm",
@@ -447,6 +449,10 @@ constraint-dependencies = [
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
   "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
+  # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
+  # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
+  # in sync with 3rdparty/Automodel-workspace/Automodel/pyproject.toml.
+  "megatron-fsdp @ git+https://github.com/yuhezhang-ai/Megatron-LM.git@455389c480af6b3acdca74c7830c68b3274eb083#subdirectory=megatron/core/distributed/fsdp/src",
   # megatron-energon pulls s3fs; without a floor uv picks the 2020-era s3fs 0.4.2
   # (which needs only plain botocore) instead of a modern aiobotocore-based release.
   "s3fs>=2024.6.0",
