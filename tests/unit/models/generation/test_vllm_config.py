@@ -90,6 +90,12 @@ def test_refit_prequantize_accepts_mxfp8() -> None:
     validate_vllm_quantization_config(generation_config)
 
 
+def test_refit_prequantize_validation_allows_omitted_vllm_cfg() -> None:
+    generation_config = cast(VllmConfig, {"quant_cfg": None})
+
+    validate_vllm_quantization_config(generation_config)
+
+
 def test_configure_generation_config_validates_refit_prequantize() -> None:
     generation_config = cast(
         GenerationConfig,

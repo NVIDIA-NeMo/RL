@@ -160,7 +160,9 @@ class VllmConfig(GenerationConfig):
 
 def validate_vllm_quantization_config(config: VllmConfig) -> None:
     """Reject quantization options that would otherwise be silently ignored."""
-    vllm_cfg = config["vllm_cfg"]
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
     refit_prequantize = vllm_cfg.get("refit_prequantize")
     if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
         raise ValueError(
