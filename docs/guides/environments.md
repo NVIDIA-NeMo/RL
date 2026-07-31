@@ -21,32 +21,6 @@ env_config = {
 
 math_env = MathEnvironment.remote(env_config)
 ```
-### Multi-reward support
-To enable GDPO support, the math environment need to return each reward separately as: 
-```python
-rewards = torch.tensor(results).T.cpu()  ## Shape Batch_size, Number of rewards
-
-return EnvironmentReturn(
-    observations=observations,
-    metadata=metadata,
-    next_stop_strings=next_stop_strings,
-    rewards=rewards,
-    terminateds=done,
-    answers=extracted_answers,
-)
-```
-Therefore, the return batch of `run_multi_turn_rollout` in rollouts.py would have extra entries to store each reward separately as: 
-
-```python
-# Add total rewards to the final batch
-current_batch["total_reward"] = total_rewards
-current_batch["truncated"] = sample_truncated
-# Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
-if multi_rewards is not None:
-    for name, reward_tensor in multi_rewards.items():
-        current_batch[name] = reward_tensor
-```
-
 ### Multi-reward support (GDPO)
 
 Environments can expose a **single reward** (standard GRPO) or **multiple named reward components** (for GDPO).

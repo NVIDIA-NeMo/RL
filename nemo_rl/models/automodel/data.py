@@ -290,14 +290,24 @@ def process_microbatch(
         # differ from T_s) stay full; the loss slices them contiguously by
         # student CP rank because the IPC consumer ships contiguous teacher
         # slices (see FullLogitsPostProcessor un-interleave in train.py).
-        if "alignment_student_chunk_id" in mb:
-            for student_seq_field in (
-                "token_mask",
-                "alignment_student_chunk_id",
-                "alignment_student_exact_partition_mask",
-            ):
-                if student_seq_field in mb:
-                    cp_buffers.append(mb[student_seq_field])
+        # There is one set of student-seq alignment fields per teacher:
+        # single-teacher uses the unprefixed ``alignment_student_*`` keys,
+        # multi-teacher uses ``alignment_{i}_student_*`` (the suffix match
+        # captures both and excludes teacher-seq ``*_teacher_*`` fields).
+        student_seq_alignment_fields = [
+            k
+            for k in mb
+            if k.startswith("alignment_")
+            and (
+                k.endswith("_student_chunk_id")
+                or k.endswith("_student_exact_partition_mask")
+            )
+        ]
+        if student_seq_alignment_fields:
+            if "token_mask" in mb:
+                cp_buffers.append(mb["token_mask"])
+            for student_seq_field in student_seq_alignment_fields:
+                cp_buffers.append(mb[student_seq_field])
 
     return ProcessedInputs(
         input_ids=input_ids,

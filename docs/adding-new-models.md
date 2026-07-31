@@ -153,44 +153,72 @@ uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.
 # [Qwen/Qwen2.5-1.5B] ALL GOOD!
 ```
 
-## [3.check_hf_model_embeddings_untrained.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/3.check_hf_model_embeddings_untrained.py)
+## [3.check_and_reinit_hf_model_embeddings_untrained.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py)
 
-Detects untrained or improperly initialized Hugging Face model embeddings by scanning for near-zero rows and rows with near-identical values in both input and output embeddings. The script also reports whether word embeddings are tied and summarizes basic statistics.
+Detects near-zero embedding rows in a HuggingFace checkpoint and optionally reinitializes them. Near-zero embeddings arise when weight decay drives unused tokens toward zero during pretraining; if those tokens appear during fine-tuning they produce large loss signals and gradient spikes. Use `--stats-only` to inspect without modifying, or `--output`/`--in-place` to write a patched checkpoint where near-zero rows are resampled from N(0, σ) estimated from healthy rows.
 
 ```sh
-# Example run
-uv run --extra mcore tools/model_diagnostics/3.check_hf_model_embeddings_untrained.py --model nvidia/Nemotron-H-8B-Base-8K
+# Inspect only (no writes)
+uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py --input nvidia/Nemotron-H-8B-Base-8K --stats-only
 
-# ....
+# ...
+#Tied word embeddings: False
+#
+#=== backbone.embeddings.weight ===
+#  Shape  : (131072, 4096)
+#  Dtype  : torch.bfloat16
+#  Norm   : min=0.0000e+00  mean=6.3280e-01  max=9.8994e-01
+#  Stats  : mean_abs=0.007878  max_abs=0.196289  std_range=[0.000000, 0.015468]
+#  Near-zero rows (norm < 1.00e-06): 1041/131072 (0.8%)
+#  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,...,114755
+#  Tokens :
+#    ID      0: '<unk>'  norm=0.0000e+00  values=[1.18e-37,-1.18e-37,...,-1.18e-37,-1.18e-37]
+#    ...
+#    ... and 1011 more
+#  Identical rows (std < 1.00e-08): 1041/131072 (0.8%)
+#  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,...,114755
+#  Tokens :
+#    ID      0: '<unk>'  std=1.1756e-37  values=[1.18e-37,-1.18e-37,...,-1.18e-37,-1.18e-37]
+#    ...
+#    ... and 1011 more
+#
+#=== lm_head.weight ===
+#  Shape  : (131072, 4096)
+#  Dtype  : torch.bfloat16
+#  Norm   : min=2.6149e-01  mean=5.4801e-01  max=1.3579e+00
+#  Stats  : mean_abs=0.006785  max_abs=0.200195  std_range=[0.004086, 0.021219]
+#  Near-zero rows (norm < 1.00e-06): 0/131072 (0.0%)
+#  Identical rows (std < 1.00e-08): 0/131072 (0.0%)
+#
 #================================================================================
 #EMBEDDING SUMMARIES
 #================================================================================
 #
-#--- Input Embeddings Summary ---
-#Shape: torch.Size([131072, 4096]), Dtype: torch.bfloat16
-#Near-zero embeddings (abs < 1.00e-10): 1039/131072 (0.8%)
-#  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,81772,81819,82312,82500,82725,82737,82977,84020,84121,84521,84794,85015,86409,87411,89412,90320,91368,94485,96385,104097,108262,112147,112327,112497,114755
-#Identical embeddings (std < 1.00e-08): 1041/131072 (0.8%)
+#--- Input Embeddings Summary (backbone.embeddings.weight) ---
+#Shape: (131072, 4096), Dtype: torch.bfloat16
+#Near-zero (norm < 1.00e-06): 1041/131072 (0.8%)
 #  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,81772,81819,82312,82500,82725,82737,82977,83855,84020,84121,84521,84794,85015,86409,87411,89412,90320,91368,94485,96385,101707,104097,108262,112147,112327,112497,114755
-#Statistics: mean_abs=0.007874, max_abs=0.196289, std_range=[0.000000, 0.015442]
-#⚠️  POTENTIAL ISSUES: 1039 near-zero embeddings, 1041 identical embeddings
+#Identical (std < 1.00e-08): 1041/131072 (0.8%)
+#  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,81772,81819,82312,82500,82725,82737,82977,83855,84020,84121,84521,84794,85015,86409,87411,89412,90320,91368,94485,96385,101707,104097,108262,112147,112327,112497,114755
+#Statistics: mean_abs=0.007878  max_abs=0.196289  std_range=[0.000000, 0.015468]
+#WARNING - POTENTIAL ISSUES: 1041 near-zero embeddings, 1041 identical embeddings
 #
-#--- Output Embeddings Summary (Tied: False) ---
-#Shape: torch.Size([131072, 4096]), Dtype: torch.bfloat16
-#Near-zero embeddings (abs < 1.00e-10): 0/131072 (0.0%)
-#Identical embeddings (std < 1.00e-08): 0/131072 (0.0%)
-#Statistics: mean_abs=0.006775, max_abs=0.200195, std_range=[0.004089, 0.021240]
-#✅ No obvious untrained patterns detected
+#--- Output Embeddings (Tied: False) Summary (lm_head.weight) ---
+#Shape: (131072, 4096), Dtype: torch.bfloat16
+#Near-zero (norm < 1.00e-06): 0/131072 (0.0%)
+#Identical (std < 1.00e-08): 0/131072 (0.0%)
+#Statistics: mean_abs=0.006785  max_abs=0.200195  std_range=[0.004086, 0.021219]
+#OK - No obvious untrained patterns detected
 #
 #=== Final Summary ===
-#Model: nvidia/Nemotron-H-8B-Base-8K
+#Checkpoint: /path/to/huggingface/hub/models--nvidia--Nemotron-H-8B-Base-8K/snapshots/...
 #Analysis complete.
 ```
 
 - Thresholds can be adjusted via flags:
-  - `--near-zero-threshold` (default: `1e-10`)
-  - `--identical-threshold` (default: `1e-8`)
-- If any near-zero or identical rows are reported, the model may have issues of numerical instability (e.g., inf grad norms) during post-training if any of these problematic tokens are encountered. We have observed this happening when special tokens are reserved in the tokenizer and embedding, but none are encountered during pre-training. It may help to initialize these embeddings similar to how they were initialize during pre-training.
+  - `--threshold` (default: `1e-6`) — L2-norm below which a row is considered near-zero
+  - `--identical-threshold` (default: `1e-8`) — std-dev below which a row is considered identical/constant
+- If near-zero or identical rows are reported, the model may have numerical instability (e.g., inf grad norms) during post-training when those tokens are encountered. This commonly happens when special tokens are reserved in the tokenizer but never seen during pretraining. Use `--output <dir>` or `--in-place` to reinitialize the affected rows before fine-tuning.
 
 ## [4.vllm_precision_compilation_test.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/4.vllm_precision_compilation_test.py)
 

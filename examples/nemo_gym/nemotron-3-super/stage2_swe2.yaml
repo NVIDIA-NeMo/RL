@@ -22,6 +22,7 @@ grpo:
   advantage_clip_low: -100
   advantage_clip_high: 100
   val_period: 100
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: true
@@ -113,7 +114,7 @@ policy:
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 8
+    context_parallel_size: 16
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
@@ -131,6 +132,7 @@ policy:
     defer_fp32_logits: True
     moe_per_layer_logging: True
     gradient_accumulation_fusion: False
+    use_fused_weighted_squared_relu: false
 
     mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
@@ -206,8 +208,8 @@ policy:
   scheduler: null
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -223,7 +225,7 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.75
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False
@@ -245,6 +247,7 @@ policy:
           enable_thinking: true
 
     vllm_kwargs:
+      max_num_batched_tokens: 8480
       mamba_ssm_cache_dtype: "float32"
       mamba_cache_mode: align
       compilation_config:
@@ -276,6 +279,8 @@ sif_dir: "/path/to/sif"
 env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
+  # false: ignore env mask_sample flags so the loss trains on every sample.
+  should_mask_flagged_samples: true
   nemo_gym:
     uv_venv_dir: "${oc.env:PERSISTENT_CACHE}/gym_venvs"  # overridden by super_launch.sh to $GYM_VENV_DIR
     skip_venv_if_present: true
@@ -287,8 +292,8 @@ env:
     thinking_tags:
       - "<think>"
       - "</think>"
-    port_range_low: 15001
-    port_range_high: 20000
+    port_range_low: 5000
+    port_range_high: 5999
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
@@ -332,6 +337,7 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

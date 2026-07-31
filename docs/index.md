@@ -41,7 +41,7 @@ Explore the current features and upcoming enhancements in NeMo RL, including dis
 :link: about/tips-and-tricks
 :link-type: doc
 
-Troubleshooting common issues including missing submodules, Ray dashboard access, and debugging techniques.
+Troubleshooting common issues including missing submodules and memory fragmentation.
 :::
 
 ::::
@@ -73,10 +73,10 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
-:link: about/clusters
+:link: cluster
 :link-type: doc
 
-Configure and deploy NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
 ::::
@@ -100,6 +100,13 @@ Reproduce DeepscaleR results with NeMo RL using GRPO on mathematical reasoning t
 Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
+:link: guides/nemotron-3-ultra
+:link-type: doc
+
+Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
+:::
+
 :::{grid-item-card} {octicon}`stack` Environments
 :link: guides/environments
 :link-type: doc
@@ -119,6 +126,13 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 :link-type: doc
 
 Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
+:::
+
+:::{grid-item-card} {octicon}`device-camera-video` Audio-Visual Intent GRPO
+:link: guides/grpo-audio-visual
+:link-type: doc
+
+Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio-visual setup.
 :::
 
 :::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
@@ -156,6 +170,20 @@ Extend a model's context window with YaRN RoPE scaling on the Megatron backend f
 Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
 :::
 
+:::{grid-item-card} {octicon}`arrow-both` Weight Refit
+:link: guides/refit
+:link-type: doc
+
+Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
+:::
+
+:::{grid-item-card} {octicon}`sync` Checkpoint-Engine Refit
+:link: guides/checkpoint-engine-refit
+:link-type: doc
+
+Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
+:::
+
 ::::
 
 ## Advanced Topics
@@ -189,8 +217,7 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link-type: doc
 
 Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
-Includes NVFP4 W4A16 real rollout.
-W4A8 rollout uses fake quantization.
+Includes NVFP4 W4A4 and W4A16 real rollout.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -216,9 +243,12 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 ::::
 
+## Full Documentation Index
+
+The complete table of contents below lists all pages, including guide, development, and design-doc pages that are not shown in the cards above.
+
 ```{toctree}
 :caption: About
-:hidden:
 
 about/overview
 about/performance-summary
@@ -237,7 +267,6 @@ about/tips-and-tricks
 
 ```{toctree}
 :caption: Environment Start
-:hidden:
 
 local-workstation.md
 cluster.md
@@ -246,18 +275,17 @@ cluster.md
 
 ```{toctree}
 :caption: E2E Examples
-:hidden:
 
 guides/sft-openmathinstruct2.md
 ```
 
 ```{toctree}
 :caption: Guides
-:hidden:
 
 guides/nemotron-3-nano.md
 guides/nemotron-3-nano-omni.md
 guides/nemotron-3-super.md
+guides/nemotron-3-ultra.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
@@ -271,16 +299,22 @@ guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
+guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
 guides/deepseek.md
+guides/models/index.md
+guides/models/qwen/index.md
+guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
+guides/refit.md
+guides/checkpoint-engine-refit.md
 guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
@@ -289,14 +323,12 @@ guides/ft-launcher-guide.md
 
 ```{toctree}
 :caption: Containers
-:hidden:
 
 docker.md
 ```
 
 ```{toctree}
 :caption: Development
-:hidden:
 
 ci-cd.md
 testing.md
@@ -309,7 +341,6 @@ guides/use-custom-vllm.md
 
 ```{toctree}
 :caption: Design Docs
-:hidden:
 
 design-docs/design-and-philosophy.md
 design-docs/padding.md
@@ -318,6 +349,8 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/sparse-delta-refit.md
+design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
@@ -325,11 +358,12 @@ design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
+design-docs/modelopt-real-quant-architecture.md
+design-docs/nccl-reshard-refit.md
 ```
 
 ```{toctree}
 :caption: API Reference
-:hidden:
 
 apidocs/index
 ```

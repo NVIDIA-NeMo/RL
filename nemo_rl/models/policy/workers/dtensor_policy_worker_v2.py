@@ -72,12 +72,19 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.checkpoint_engine import (
+    DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.timer import Timer
 
 
 def dtensor_params_generator(
@@ -196,7 +203,11 @@ def get_train_context(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerV2Impl(
-    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+    TQWorkerMixin,
+    DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
 ):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -230,6 +241,14 @@ class DTensorPolicyWorkerV2Impl(
         """Initialize the DTensorPolicyWorkerV2."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
+
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin to this worker's GPU-local CPUs/memory before model load; FSDP's
+        # D2H paths (weight refit, optimizer/checkpoint offload) benefit.
+        # ray.get_gpu_ids()[0] is the physical GPU index that keys the affinity
+        # file, and reading it does not initialize CUDA.
+        bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
 
         # Store configuration
         self.cfg = config
@@ -280,6 +299,7 @@ class DTensorPolicyWorkerV2Impl(
         )
         # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()
+        self.timer = Timer(context={"worker": "dtensor_policy_v2", "rank": self.rank})
         self.device_mesh = distributed_context.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
@@ -289,6 +309,7 @@ class DTensorPolicyWorkerV2Impl(
         self.dp_size = distributed_context.dp_size
         self.tp_size = distributed_context.tp_size
         self.cp_size = distributed_context.cp_size
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
         self._init_checkpoint_manager(
@@ -388,6 +409,7 @@ class DTensorPolicyWorkerV2Impl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -535,6 +557,7 @@ class DTensorPolicyWorkerV2Impl(
                     grad_norm = torch.tensor(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
+                    warn_if_inf_grad_norm(grad_norm)
 
                     # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
@@ -560,6 +583,7 @@ class DTensorPolicyWorkerV2Impl(
                 dtype=self.dtype,
             )
 
+            self.timer.stop("train")
             return metrics
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
@@ -578,6 +602,7 @@ class DTensorPolicyWorkerV2Impl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -654,6 +679,7 @@ class DTensorPolicyWorkerV2Impl(
             all_log_probs_padded.append(lp)
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
 
+        self.timer.stop("get_logprobs")
         return return_data
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
@@ -1147,6 +1173,11 @@ class DTensorPolicyWorkerV2Impl(
             buffer_size_bytes=buffer_size_bytes,
             worker_state=self._ipc_worker_state,
         )
+
+    def _checkpoint_engine_params(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        return dtensor_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(

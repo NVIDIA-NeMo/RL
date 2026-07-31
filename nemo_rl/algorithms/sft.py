@@ -14,7 +14,7 @@
 import os
 import warnings
 from dataclasses import dataclass, fields
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -60,6 +60,21 @@ def _initial_sft_save_state() -> SFTSaveState:
     return SFTSaveState(
         epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
+
+
+def _get_sft_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> SFTSaveState:
+    if loaded_state is None:
+        return _initial_sft_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(SFTSaveState)}
+    state_values = vars(_initial_sft_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return SFTSaveState(**state_values)
 
 
 class SFTConfig(BaseModel, extra="allow"):
@@ -136,17 +151,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known SFTSaveState fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        # Backcompat: checkpoints saved before total_valid_tokens was added.
-        loaded_state.setdefault("total_valid_tokens", 0)
-        known_fields = {f.name for f in fields(SFTSaveState)}
-        sft_save_state = SFTSaveState(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        sft_save_state = _initial_sft_save_state()
+    sft_save_state = _get_sft_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -227,8 +232,8 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     loss_fn = NLLLossFn(
-        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
     )
     print("  ✓ Model initialized")
 
@@ -422,6 +427,8 @@ def sft_train(
 
     policy.prepare_for_training()
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while (
         current_epoch < max_num_epochs and total_steps < master_config.sft.max_num_steps
     ):
@@ -524,6 +531,10 @@ def sft_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
@@ -591,7 +602,10 @@ def sft_train(
                             train_dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
@@ -644,9 +658,11 @@ def sft_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= master_config.sft.max_num_steps:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -655,3 +671,10 @@ def sft_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()

@@ -23,6 +23,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
     RayVirtualCluster,
     get_reordered_bundle,
 )
@@ -163,7 +165,6 @@ class SGLangGeneration(GenerationInterface):
         """
         if port_cursors is None:
             port_cursors = {}
-
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
         pg = self.pg
         reordered_bundle_indices = self.pg_reordered_bundle_indices
@@ -249,13 +250,23 @@ class SGLangGeneration(GenerationInterface):
         if len(local_all_engines) == 0:
             return [], port_cursors
 
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        # SGLang engine server/NCCL/dist_init ports come from the reserved
+        # generation band (3000-4999 by default), below the ephemeral floor;
+        # see the port layout in virtual_cluster.py.
+        gen_port_low = self.sglang_cfg.get("port_range_low")
+        if gen_port_low is None:
+            gen_port_low = DEFAULT_GENERATION_PORT_RANGE_LOW
+        gen_port_high = self.sglang_cfg.get("port_range_high")
+        if gen_port_high is None:
+            gen_port_high = DEFAULT_GENERATION_PORT_RANGE_HIGH
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             gpus_per_node=self.num_gpus_per_node,
             sglang_cfg=self.sglang_cfg,
             local_all_engines=local_all_engines,
             rank_offset=self.rank_offset,
-            base_port=base_port,
+            port_range_low=gen_port_low,
+            port_range_high=gen_port_high,
+            node_port_cursor=port_cursors,
         )
 
         init_handles = [

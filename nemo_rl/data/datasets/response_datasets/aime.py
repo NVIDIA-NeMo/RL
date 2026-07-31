@@ -28,13 +28,14 @@ class AIMEDataset(RawDataset):
 
     Args:
         variant: Which AIME edition to load: "2024" (default), "2025", or "2026".
-        repeat: Number of times to repeat the dataset, default is 16.
+        repeat: Number of times to repeat the dataset, default is 1. Training
+            recipes that need repeated validation should set this explicitly.
     """
 
     def __init__(
         self,
         variant: AIMEVariant = "2024",
-        repeat: int = 16,
+        repeat: int = 1,
         **kwargs,
     ) -> None:
         self.task_name = f"AIME{variant}"

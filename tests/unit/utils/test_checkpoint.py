@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import threading
+import time
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -20,6 +23,7 @@ import pytest
 import torch
 import yaml
 
+import nemo_rl.utils.checkpoint as checkpoint_module
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 
@@ -35,6 +39,7 @@ def checkpoint_config(checkpoint_dir):
         "checkpoint_dir": checkpoint_dir,
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": 3,
         "save_optimizer": True,
     }
@@ -242,6 +247,39 @@ def test_get_best_checkpoint_path(checkpoint_manager, checkpoint_dir):
         assert metadata["loss"] == min(losses)
 
 
+def test_get_best_checkpoint_path_bias_recent_if_equal(
+    checkpoint_manager, checkpoint_dir, monkeypatch
+):
+    # Checkpoints that tie for the best (lowest) metric value at different steps.
+    # The most recent tied checkpoint should be returned, matching the tie-breaking
+    # used by remove_old_checkpoints (which keeps the more recent one on ties).
+    steps = [1, 5, 10]
+    losses = [0.2, 0.5, 0.2]  # steps 1 and 10 tie for the best (lowest) loss
+
+    for step, loss in zip(steps, losses):
+        training_info = {"loss": loss}
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Force the checkpoint history into the adversarial (older-first) order so the
+    # test fails deterministically without the recency tie-break, regardless of the
+    # underlying filesystem's glob ordering.
+    import nemo_rl.utils.checkpoint as checkpoint_mod
+
+    orig_glob = checkpoint_mod.glob.glob
+    monkeypatch.setattr(
+        checkpoint_mod.glob,
+        "glob",
+        lambda pattern: sorted(
+            orig_glob(pattern), key=lambda p: int(Path(p).name.split("_")[1])
+        ),
+    )
+
+    best_path = checkpoint_manager.get_best_checkpoint_path()
+    # Among the tied-best checkpoints (steps 1 and 10), the most recent (step 10) wins.
+    assert Path(best_path).name == "step_10"
+
+
 def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
     # Create multiple checkpoints
     steps = [1, 2, 3]
@@ -297,6 +335,7 @@ def test_checkpoint_without_keep_top_k(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,
         "save_optimizer": True,
     }
@@ -364,7 +403,34 @@ def test_save_optimizer_flag_initialization(checkpoint_config):
     assert manager.save_optimizer is False
 
 
-def test_get_resume_paths_missing_optimizer(checkpoint_manager, checkpoint_dir):
+@pytest.mark.parametrize("model_component", ["policy", "value"])
+@pytest.mark.parametrize("common_state_marker", ["common.pt", "metadata.json"])
+def test_get_resume_paths_detects_megatron_optimizer(
+    checkpoint_dir, monkeypatch, model_component, common_state_marker
+):
+    checkpoint_path = checkpoint_dir / "step_1"
+    iteration_dir = checkpoint_path / model_component / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / common_state_marker).touch()
+    load_common_state = MagicMock(return_value={"optimizer": {}})
+    monkeypatch.setattr(
+        checkpoint_module, "_load_megatron_common_state_dict", load_common_state
+    )
+
+    weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path,
+        model_component=model_component,
+    )
+
+    assert weights_path == checkpoint_path / model_component / "weights"
+    assert optimizer_path == checkpoint_path / model_component / "optimizer"
+    load_common_state.assert_called_once_with(iteration_dir)
+
+
+@pytest.mark.parametrize("model_component", ["policy", "value"])
+def test_get_resume_paths_missing_optimizer(
+    checkpoint_manager, checkpoint_dir, model_component
+):
     # Create a checkpoint
     step = 1
     training_info = {"loss": 0.5}
@@ -373,14 +439,118 @@ def test_get_resume_paths_missing_optimizer(checkpoint_manager, checkpoint_dir):
 
     # Create checkpoint structure with weights but no optimizer (simulates save_optimizer=False)
     checkpoint_path = checkpoint_dir / f"step_{step}"
-    (checkpoint_path / "policy" / "weights").mkdir(parents=True)
+    expected_weights_path = checkpoint_path / model_component / "weights"
+    expected_weights_path.mkdir(parents=True)
 
     # Get resume paths
-    weights_path, optimizer_path = checkpoint_manager.get_resume_paths(checkpoint_path)
+    with pytest.warns(UserWarning, match="Optimizer state not found"):
+        weights_path, optimizer_path = checkpoint_manager.get_resume_paths(
+            checkpoint_path,
+            model_component=model_component,
+        )
 
     # Verify weights path is returned but optimizer path is None
-    assert weights_path is not None
+    assert weights_path == expected_weights_path
     assert optimizer_path is None
+
+
+@pytest.mark.parametrize("model_component", ["policy", "value"])
+def test_get_resume_paths_separate_optimizer(checkpoint_dir, model_component):
+    """DTensor checkpoints use a physical optimizer directory."""
+    checkpoint_path = checkpoint_dir / "step_1"
+    expected_weights_path = checkpoint_path / model_component / "weights"
+    expected_optimizer_path = checkpoint_path / model_component / "optimizer"
+    expected_weights_path.mkdir(parents=True)
+    expected_optimizer_path.mkdir()
+
+    weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path,
+        model_component=model_component,
+    )
+
+    assert weights_path == expected_weights_path
+    assert optimizer_path == expected_optimizer_path
+
+
+def test_get_resume_paths_defaults_to_policy(checkpoint_dir):
+    """Existing one-argument callers continue to resolve the policy subtree."""
+    checkpoint_path = checkpoint_dir / "step_1"
+    expected_weights_path = checkpoint_path / "policy" / "weights"
+    expected_optimizer_path = checkpoint_path / "policy" / "optimizer"
+    expected_weights_path.mkdir(parents=True)
+    expected_optimizer_path.mkdir()
+
+    weights_path, optimizer_path = CheckpointManager.get_resume_paths(checkpoint_path)
+
+    assert weights_path == expected_weights_path
+    assert optimizer_path == expected_optimizer_path
+
+
+def test_get_resume_paths_warns_when_megatron_optimizer_missing(
+    checkpoint_dir, monkeypatch
+):
+    checkpoint_path = checkpoint_dir / "step_1"
+    iteration_dir = checkpoint_path / "policy" / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "metadata.json").touch()
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(return_value={"args": {}}),
+    )
+
+    with pytest.warns(UserWarning, match="Optimizer state not found"):
+        weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+            checkpoint_path
+        )
+
+    assert weights_path == checkpoint_path / "policy" / "weights"
+    assert optimizer_path is None
+
+
+def test_get_resume_paths_prefers_dtensor_optimizer(checkpoint_dir, monkeypatch):
+    checkpoint_path = checkpoint_dir / "step_1"
+    optimizer_path = checkpoint_path / "policy" / "optimizer"
+    optimizer_path.mkdir(parents=True)
+    iteration_dir = checkpoint_path / "policy" / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "metadata.json").touch()
+    load_common_state = MagicMock(side_effect=AssertionError("must not be called"))
+    monkeypatch.setattr(
+        checkpoint_module, "_load_megatron_common_state_dict", load_common_state
+    )
+
+    weights_path, returned_optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path
+    )
+
+    assert weights_path == checkpoint_path / "policy" / "weights"
+    assert returned_optimizer_path == optimizer_path
+    load_common_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        RuntimeError("Megatron-Core is required"),
+        OSError("checkpoint is unreadable"),
+    ],
+)
+def test_get_resume_paths_propagates_megatron_load_failure(
+    checkpoint_dir, monkeypatch, load_error
+):
+    checkpoint_path = checkpoint_dir / "step_1"
+    iteration_dir = checkpoint_path / "policy" / "weights" / "iter_0000000"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "metadata.json").touch()
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(side_effect=load_error),
+    )
+
+    with pytest.raises(type(load_error), match=str(load_error)):
+        CheckpointManager.get_resume_paths(checkpoint_path)
 
 
 def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_dir):
@@ -397,6 +567,7 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,  # Keep all checkpoints
         "save_optimizer": True,
     }
@@ -441,6 +612,7 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,  # Keep all checkpoints
         "save_optimizer": True,
     }
@@ -483,6 +655,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "accuracy",
         "higher_is_better": True,
+        "save_period": 1,
         "keep_top_k": None,  # Keep all
         "save_optimizer": True,
     }
@@ -504,3 +677,651 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     with open(Path(best_path) / "training_info.json", "r") as f:
         metadata = json.load(f)
         assert metadata["accuracy"] == 0.9  # step 2
+
+
+@pytest.fixture
+def async_checkpoint_config(checkpoint_dir):
+    return {
+        "enabled": True,
+        "checkpoint_dir": checkpoint_dir,
+        "metric_name": None,
+        "higher_is_better": False,
+        "save_period": 1,
+        "keep_top_k": None,
+        "save_optimizer": True,
+    }
+
+
+@pytest.fixture
+def async_manager(async_checkpoint_config):
+    mgr = CheckpointManager(async_checkpoint_config)
+    yield mgr
+    mgr.shutdown()
+
+
+class TestBeginFinalization:
+    """Tests for CheckpointManager.begin_finalization()."""
+
+    def test_basic_rename(self, async_manager, checkpoint_dir):
+        """begin_finalization with no wait_fn renames immediately."""
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=None)
+        async_manager.finalize_pending()
+
+        assert not Path(tmp).exists()
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_wait_fn_called_before_rename(self, async_manager, checkpoint_dir):
+        """wait_fn is called and completes before the rename happens."""
+        call_order = []
+
+        def mock_wait():
+            call_order.append("wait_start")
+            time.sleep(0.05)
+            call_order.append("wait_end")
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=mock_wait)
+        async_manager.finalize_pending()
+
+        assert call_order == ["wait_start", "wait_end"]
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_begin_blocks_if_previous_pending(self, async_manager, checkpoint_dir):
+        """Second begin_finalization blocks until first completes."""
+        barrier = threading.Event()
+
+        def slow_wait():
+            barrier.wait(timeout=5)
+
+        tmp1 = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp1, wait_fn=slow_wait)
+
+        tmp2 = async_manager.init_tmp_checkpoint(2, {"loss": 0.2})
+        barrier.set()
+        async_manager.begin_finalization(tmp2, wait_fn=None)
+        async_manager.finalize_pending()
+
+        assert (checkpoint_dir / "step_1").exists()
+        assert (checkpoint_dir / "step_2").exists()
+
+    def test_sync_finalize_still_works(self, async_manager, checkpoint_dir):
+        """Original synchronous finalize_checkpoint API still works."""
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.finalize_checkpoint(tmp)
+
+        assert (checkpoint_dir / "step_1").exists()
+        assert not Path(tmp).exists()
+
+
+class TestFinalizePending:
+    """Tests for CheckpointManager.finalize_pending()."""
+
+    def test_noop_when_nothing_pending(self, async_manager):
+        """finalize_pending is a safe no-op when no finalization is active."""
+        async_manager.finalize_pending()
+
+    def test_idempotent_double_call(self, async_manager, checkpoint_dir):
+        """Calling finalize_pending twice is harmless."""
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=None)
+        async_manager.finalize_pending()
+        async_manager.finalize_pending()
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_propagates_error_from_wait_fn(self, async_manager):
+        """Exceptions in wait_fn are re-raised from finalize_pending."""
+
+        def failing_wait():
+            raise ValueError("Simulated async write failure")
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=failing_wait)
+
+        with pytest.raises(
+            RuntimeError, match="Background checkpoint finalization failed"
+        ):
+            async_manager.finalize_pending()
+
+    def test_error_cleared_after_raise(self, async_manager, checkpoint_dir):
+        """After an error is raised, manager is in clean state for next save."""
+
+        def failing_wait():
+            raise ValueError("boom")
+
+        tmp1 = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp1, wait_fn=failing_wait)
+
+        with pytest.raises(RuntimeError):
+            async_manager.finalize_pending()
+
+        tmp2 = async_manager.init_tmp_checkpoint(2, {"loss": 0.2})
+        async_manager.begin_finalization(tmp2, wait_fn=None)
+        async_manager.finalize_pending()
+        assert (checkpoint_dir / "step_2").exists()
+
+
+class TestShutdown:
+    """Tests for CheckpointManager.shutdown()."""
+
+    def test_waits_for_rename_and_deletion(self, checkpoint_dir):
+        """shutdown() blocks until both rename and deletion complete."""
+        config = {
+            "enabled": True,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": None,
+            "higher_is_better": False,
+            "save_period": 1,
+            "keep_top_k": 1,
+            "save_optimizer": True,
+        }
+        manager = CheckpointManager(config)
+
+        for step in [1, 2, 3]:
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.begin_finalization(tmp, wait_fn=None)
+
+        manager.shutdown()
+
+        remaining = sorted(checkpoint_dir.glob("step_*"))
+        assert len(remaining) == 1
+        assert remaining[0].name == "step_3"
+
+    def test_noop_when_nothing_pending(self, async_manager):
+        """shutdown is safe to call with no pending work."""
+        async_manager.shutdown()
+
+    def test_double_shutdown(self, async_manager, checkpoint_dir):
+        """Calling shutdown twice is harmless."""
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=None)
+        async_manager.shutdown()
+        async_manager.shutdown()
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_usable_after_shutdown(self, async_manager, checkpoint_dir):
+        """Manager can be used for new saves after shutdown."""
+        tmp1 = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp1, wait_fn=None)
+        async_manager.shutdown()
+
+        tmp2 = async_manager.init_tmp_checkpoint(2, {"loss": 0.2})
+        async_manager.begin_finalization(tmp2, wait_fn=None)
+        async_manager.finalize_pending()
+        assert (checkpoint_dir / "step_2").exists()
+
+
+class TestHasPendingFinalization:
+    """Tests for CheckpointManager.has_pending_finalization property."""
+
+    def test_false_initially(self, async_manager):
+        assert not async_manager.has_pending_finalization
+
+    def test_true_while_active(self, async_manager):
+        barrier = threading.Event()
+
+        def slow_wait():
+            barrier.wait(timeout=5)
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=slow_wait)
+
+        assert async_manager.has_pending_finalization
+
+        barrier.set()
+        async_manager.finalize_pending()
+
+    def test_false_after_finalize(self, async_manager, checkpoint_dir):
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=None)
+        async_manager.finalize_pending()
+
+        assert not async_manager.has_pending_finalization
+
+    def test_false_after_error(self, async_manager):
+        """has_pending_finalization is False after a failed finalization."""
+
+        def failing_wait():
+            raise ValueError("boom")
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=failing_wait)
+
+        with pytest.raises(RuntimeError):
+            async_manager.finalize_pending()
+
+        assert not async_manager.has_pending_finalization
+
+
+class TestDeletionSerialization:
+    """Tests for old-checkpoint deletion via the background ThreadPoolExecutor."""
+
+    def test_keep_top_k_with_async_finalization(self, checkpoint_dir):
+        """Old checkpoints are deleted without blocking the main thread."""
+        config = {
+            "enabled": True,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": None,
+            "higher_is_better": False,
+            "save_period": 1,
+            "keep_top_k": 2,
+            "save_optimizer": True,
+        }
+        manager = CheckpointManager(config)
+
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.begin_finalization(tmp, wait_fn=None)
+
+        manager.shutdown()
+
+        remaining = sorted(
+            checkpoint_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1])
+        )
+        assert len(remaining) == 2
+        assert remaining[0].name == "step_4"
+        assert remaining[1].name == "step_5"
+
+    def test_deletion_does_not_block_next_save(self, checkpoint_dir):
+        """Deletion runs asynchronously, so the next begin_finalization returns quickly."""
+        config = {
+            "enabled": True,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": None,
+            "higher_is_better": False,
+            "save_period": 1,
+            "keep_top_k": 1,
+            "save_optimizer": True,
+        }
+        manager = CheckpointManager(config)
+
+        tmp1 = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        manager.begin_finalization(tmp1, wait_fn=None)
+        manager.finalize_pending()
+
+        tmp2 = manager.init_tmp_checkpoint(2, {"loss": 0.2})
+        manager.begin_finalization(tmp2, wait_fn=None)
+        manager.finalize_pending()
+
+        manager.shutdown()
+        remaining = sorted(checkpoint_dir.glob("step_*"))
+        assert len(remaining) == 1
+        assert remaining[0].name == "step_2"
+
+
+class TestDeleteFailureVisibility:
+    """Old-checkpoint deletion failures must be surfaced, not silently swallowed."""
+
+    def test_warn_on_delete_failure_emits_warning(self):
+        import warnings
+
+        fut: Future = Future()
+        fut.set_exception(RuntimeError("rmtree boom"))
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            CheckpointManager._warn_on_delete_failure(fut)
+
+        assert any("prune old checkpoints" in str(w.message) for w in caught)
+        assert any("rmtree boom" in str(w.message) for w in caught)
+
+    def test_warn_on_delete_failure_silent_on_success(self):
+        import warnings
+
+        fut: Future = Future()
+        fut.set_result(None)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            CheckpointManager._warn_on_delete_failure(fut)
+
+        assert len(caught) == 0
+
+    def test_failing_prune_does_not_break_finalization(
+        self, async_checkpoint_config, checkpoint_dir, monkeypatch
+    ):
+        """A raising remove_old_checkpoints does not corrupt the finalized rename."""
+        manager = CheckpointManager(async_checkpoint_config)
+
+        def boom():
+            raise RuntimeError("simulated prune failure")
+
+        monkeypatch.setattr(manager, "remove_old_checkpoints", boom)
+
+        tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        manager.begin_finalization(tmp, wait_fn=None)
+        # Rename must still succeed even though the background prune raises.
+        manager.finalize_pending()
+        manager.shutdown()
+
+        assert (checkpoint_dir / "step_1").exists()
+        assert not Path(tmp).exists()
+
+
+class TestContextManager:
+    """Tests for CheckpointManager as a context manager.
+
+    The owner of the checkpointer uses ``with checkpointer:`` to guarantee that
+    background async-finalization threads are flushed when leaving the block,
+    including on early return or exception.
+    """
+
+    def test_flushes_pending_on_normal_exit(
+        self, async_checkpoint_config, checkpoint_dir
+    ):
+        """A pending begin_finalization is flushed when the with-block exits."""
+        with CheckpointManager(async_checkpoint_config) as manager:
+            tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+            manager.begin_finalization(tmp, wait_fn=None)
+            # Not yet flushed inside the block.
+            assert manager.has_pending_finalization
+
+        assert (checkpoint_dir / "step_1").exists()
+        assert not Path(tmp).exists()
+
+    def test_flushes_pending_on_exception_without_masking(
+        self, async_checkpoint_config, checkpoint_dir
+    ):
+        """On exception, the checkpoint is still flushed and the error propagates."""
+        manager = CheckpointManager(async_checkpoint_config)
+        with pytest.raises(ValueError, match="training blew up"):
+            with manager:
+                tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+                manager.begin_finalization(tmp, wait_fn=None)
+                raise ValueError("training blew up")
+
+        # The successful checkpoint's rename completed despite the exception.
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_exit_does_not_mask_training_exception_on_finalize_error(
+        self, async_checkpoint_config
+    ):
+        """If flushing fails while an exception propagates, the original is kept."""
+        manager = CheckpointManager(async_checkpoint_config)
+
+        def failing_wait():
+            raise ValueError("async write failed")
+
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="training blew up"):
+                with manager:
+                    tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+                    manager.begin_finalization(tmp, wait_fn=failing_wait)
+                    raise ValueError("training blew up")
+
+        # The finalization failure is surfaced as a warning, not raised.
+        assert any("finalization failed" in str(w.message).lower() for w in caught)
+
+    def test_exit_propagates_finalize_error_on_normal_exit(
+        self, async_checkpoint_config
+    ):
+        """On a clean exit, a finalization failure is raised (not silently dropped)."""
+        manager = CheckpointManager(async_checkpoint_config)
+
+        def failing_wait():
+            raise ValueError("async write failed")
+
+        with pytest.raises(
+            RuntimeError, match="Background checkpoint finalization failed"
+        ):
+            with manager:
+                tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+                manager.begin_finalization(tmp, wait_fn=failing_wait)
+
+
+class TestRenameCheckpointSwap:
+    """Tests for _rename_checkpoint when the target step dir already exists."""
+
+    def test_swaps_when_target_exists(self, checkpoint_manager, checkpoint_dir):
+        """A pre-existing step_N is atomically replaced by the new tmp_step_N."""
+        # First finalized checkpoint at step 1.
+        tmp1 = checkpoint_manager.init_tmp_checkpoint(1, {"loss": 0.5})
+        checkpoint_manager.finalize_checkpoint(tmp1)
+        step_dir = checkpoint_dir / "step_1"
+        assert step_dir.exists()
+        # Marker file to prove the directory contents were replaced, not merged.
+        (step_dir / "stale_marker").write_text("old")
+
+        # Re-initialize step 1 (e.g. resuming) and finalize again.
+        tmp2 = checkpoint_manager.init_tmp_checkpoint(1, {"loss": 0.2})
+        checkpoint_manager.finalize_checkpoint(tmp2)
+
+        assert step_dir.exists()
+        assert not Path(tmp2).exists()
+        # The old contents were removed by the swap (no leftover old_step_1).
+        assert not (checkpoint_dir / "old_step_1").exists()
+        assert not (step_dir / "stale_marker").exists()
+        with open(step_dir / "training_info.json") as f:
+            assert json.load(f)["loss"] == 0.2
+
+
+# ---------------------------------------------------------------------------
+# Fault tolerance (ft_keep_latest_k / ft_save_period) retention tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTKeepLatestK:
+    """Tests for the ft_keep_latest_k / periodic union retention policy.
+
+    A checkpoint survives if ANY retention rule keeps it:
+    - periodic (save_period-aligned) checkpoints — all when keep_top_k is None,
+      else only the top-k best among them,
+    - ft_keep_latest_k most recent checkpoints (recency only),
+    - the latest checkpoint (when exclude_latest=True).
+    When both keep_top_k and ft_keep_latest_k are None, nothing is deleted.
+    """
+
+    def _make_manager(
+        self,
+        checkpoint_dir,
+        keep_top_k=None,
+        ft_keep_latest_k=None,
+        metric_name=None,
+        higher_is_better=False,
+        save_period=1,
+    ):
+        config = {
+            "enabled": True,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": metric_name,
+            "higher_is_better": higher_is_better,
+            "save_period": save_period,
+            "keep_top_k": keep_top_k,
+            "ft_keep_latest_k": ft_keep_latest_k,
+            "save_optimizer": True,
+        }
+        return CheckpointManager(config)
+
+    @staticmethod
+    def _remaining_steps(checkpoint_dir):
+        return sorted(int(p.name.split("_")[1]) for p in checkpoint_dir.glob("step_*"))
+
+    def test_both_none_keeps_everything(self, checkpoint_dir):
+        """When both policies are None, no checkpoints are deleted."""
+        manager = self._make_manager(checkpoint_dir)
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [1, 2, 3, 4, 5]
+
+    def test_ft_keep_1_only(self, checkpoint_dir):
+        """ft_keep_latest_k=1 with no periodic checkpoints keeps only the most recent."""
+        # save_period=100 so no steps in range are periodic — isolates ft behavior
+        manager = self._make_manager(
+            checkpoint_dir, ft_keep_latest_k=1, save_period=100
+        )
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [5]
+
+    def test_ft_keep_2_only(self, checkpoint_dir):
+        """ft_keep_latest_k=2 with no periodic checkpoints keeps the two most recent."""
+        manager = self._make_manager(
+            checkpoint_dir, ft_keep_latest_k=2, save_period=100
+        )
+        for step in range(1, 8):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [6, 7]
+
+    def test_keep_top_k_only(self, checkpoint_dir):
+        """keep_top_k=2 alone keeps the 2 most recent (no metric, save_period=1)."""
+        manager = self._make_manager(checkpoint_dir, keep_top_k=2)
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [4, 5]
+
+    def test_union_of_both_policies(self, checkpoint_dir):
+        """A checkpoint survives if either policy retains it (here they overlap)."""
+        manager = self._make_manager(checkpoint_dir, keep_top_k=1, ft_keep_latest_k=1)
+        for step in range(1, 10):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [9]
+
+    def test_union_with_metric_picks_different_sets(self, checkpoint_dir):
+        """Metric-based top-k and recency-based ft pick different checkpoints; union kept."""
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=1,
+            ft_keep_latest_k=1,
+            metric_name="reward",
+            higher_is_better=True,
+        )
+        data = [
+            (1, {"reward": 0.5}),
+            (2, {"reward": 0.9}),  # best by metric
+            (3, {"reward": 0.3}),
+            (4, {"reward": 0.1}),
+            (5, {"reward": 0.2}),
+            (6, {"reward": 0.4}),  # most recent
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # keep_top_k=1 by metric -> step 2; ft_keep_latest_k=1 / exclude_latest -> step 6
+        assert self._remaining_steps(checkpoint_dir) == [2, 6]
+
+    def test_union_with_overlap(self, checkpoint_dir):
+        """Overlapping protections are not double-counted."""
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=2,
+            ft_keep_latest_k=2,
+            metric_name="reward",
+            higher_is_better=True,
+        )
+        data = [
+            (1, {"reward": 0.1}),
+            (2, {"reward": 0.2}),
+            (3, {"reward": 0.3}),
+            (4, {"reward": 0.9}),  # top-2 by metric
+            (5, {"reward": 0.8}),  # top-2 by metric AND latest-2
+            (6, {"reward": 0.4}),  # latest-2 AND most recent
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # top-2 by metric -> {4, 5}; latest-2 -> {5, 6}; union -> {4, 5, 6}
+        assert self._remaining_steps(checkpoint_dir) == [4, 5, 6]
+
+    def test_periodic_retention_all_when_no_keep_top_k(self, checkpoint_dir):
+        """With keep_top_k=None, every save_period-aligned checkpoint is retained."""
+        # save_period=2, ft_keep_latest_k=1: periodic {2,4,6} plus latest {6}.
+        manager = self._make_manager(checkpoint_dir, ft_keep_latest_k=1, save_period=2)
+        for step in range(1, 7):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [2, 4, 6]
+
+    def test_periodic_retention_limited_by_keep_top_k(self, checkpoint_dir):
+        """keep_top_k caps how many periodic checkpoints survive; ft adds recency."""
+        # save_period=2 -> periodic {2,4,6,8}; keep_top_k=1 (no metric) -> newest periodic {8};
+        # ft_keep_latest_k=1 -> {8}; latest -> {8}. Non-periodic never retained here.
+        manager = self._make_manager(
+            checkpoint_dir, keep_top_k=1, ft_keep_latest_k=1, save_period=2
+        )
+        for step in range(1, 9):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [8]
+
+    def test_metric_topk_over_periodic_plus_ft(self, checkpoint_dir):
+        """Top-k by metric (over periodic checkpoints) is retained alongside ft.
+
+        Combines a periodic save_period, metric-based keep_top_k, and
+        ft_keep_latest_k for crash recovery. The best periodic checkpoint by
+        metric must survive even when it is not the most recent, in addition to
+        the ft recency checkpoint.
+        """
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=1,
+            ft_keep_latest_k=1,
+            metric_name="reward",
+            higher_is_better=True,
+            save_period=2,
+        )
+        # save_period=2 -> periodic {2, 4, 6, 8}. Step 4 is the best periodic by
+        # metric; the odd (non-periodic) steps have higher-looking values but are
+        # not eligible for metric top-k (only ft recency could keep them).
+        data = [
+            (1, {"reward": 0.95}),  # non-periodic, high metric -> NOT metric-eligible
+            (2, {"reward": 0.5}),
+            (3, {"reward": 0.99}),  # non-periodic, highest metric -> NOT eligible
+            (4, {"reward": 0.9}),  # best PERIODIC by metric
+            (5, {"reward": 0.2}),
+            (6, {"reward": 0.3}),
+            (7, {"reward": 0.25}),
+            (8, {"reward": 0.4}),  # most recent (periodic)
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # keep_top_k=1 by metric over periodic {2,4,6,8} -> step 4 (reward 0.9).
+        # ft_keep_latest_k=1 / exclude_latest -> step 8.
+        # The high-metric non-periodic steps (1, 3) are correctly NOT retained.
+        assert self._remaining_steps(checkpoint_dir) == [4, 8]
+
+    def test_metric_topk_with_ft_keeps_best_and_recent_disjoint(self, checkpoint_dir):
+        """save_period=1 (all periodic): top-k best by metric plus ft recency.
+
+        Ensures the best-by-metric checkpoints and the most-recent (ft) ones are
+        both retained when they are disjoint sets.
+        """
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=2,
+            ft_keep_latest_k=2,
+            metric_name="reward",
+            higher_is_better=True,
+        )
+        data = [
+            (1, {"reward": 0.9}),  # top-2 by metric
+            (2, {"reward": 0.8}),  # top-2 by metric
+            (3, {"reward": 0.1}),
+            (4, {"reward": 0.2}),
+            (5, {"reward": 0.3}),  # latest-2
+            (6, {"reward": 0.4}),  # latest-2 / most recent
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
+        assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]

@@ -20,12 +20,16 @@ policy:
     tensor_model_parallel_size: 2
     expert_model_parallel_size: 8
     sequence_parallel: true
+    moe_router_dtype: fp32
   sequence_packing:
     enabled: false
   generation:
     backend: megatron
     mcore_generation_config:
       transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: "vllm"
+      moe_router_num_groups: null
+      moe_router_group_topk: null
       activation_checkpointing: false
       tensor_model_parallel_size: 2
       expert_model_parallel_size: 8

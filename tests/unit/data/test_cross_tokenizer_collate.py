@@ -15,6 +15,9 @@
 
 These tests pin the collator's *contract* (output keys, shapes, padding,
 truncation) without needing real HF tokenizers or pre-captured artifacts.
+The collator is multi-teacher: it takes per-teacher lists and emits
+teacher-indexed keys (``teacher_{i}_*`` / ``alignment_{i}_*``). These tests
+exercise the single-cross-tokenizer-teacher case (index 0).
 """
 
 from __future__ import annotations
@@ -111,24 +114,25 @@ def _fake_aligner(b: int, t_s: int, t_t: int, max_pairs: int = 2) -> MagicMock:
     return aligner
 
 
-# Expected keys consumed by xtoken_off_policy_distillation.py:459-476 — drift
-# detector. Adding/removing keys here in lockstep with the trainer's
-# train_data packer catches silent breakage.
+# Expected keys consumed by xtoken_off_policy_distillation.py's per-teacher
+# train_data packer — drift detector. Adding/removing keys here in lockstep
+# with the trainer catches silent breakage. Teacher-indexed (single cross-
+# tokenizer teacher at index 0).
 _EXPECTED_COLLATOR_KEYS = {
     "input_ids",
     "input_lengths",
     "token_mask",
     "sample_mask",
-    "teacher_input_ids",
-    "teacher_input_lengths",
-    "teacher_token_mask",
-    "alignment_pair_valid",
-    "alignment_pair_is_correct",
-    "alignment_student_exact_partition_mask",
-    "alignment_teacher_exact_partition_mask",
-    "alignment_student_chunk_id",
-    "alignment_teacher_chunk_id",
-    "alignment_num_chunks",
+    "teacher_0_input_ids",
+    "teacher_0_input_lengths",
+    "teacher_0_token_mask",
+    "alignment_0_pair_valid",
+    "alignment_0_pair_is_correct",
+    "alignment_0_student_exact_partition_mask",
+    "alignment_0_teacher_exact_partition_mask",
+    "alignment_0_student_chunk_id",
+    "alignment_0_teacher_chunk_id",
+    "alignment_0_num_chunks",
     "idx",
 }
 
@@ -145,10 +149,10 @@ class TestCollatorOutputKeys:
         aligner = _fake_aligner(b=2, t_s=8, t_t=8)
         collator = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=8,
-            ctx_length_teacher=8,
+            ctx_length_teachers=[8],
         )
         out = collator([_datum("hello", 0), _datum("world", 1)])
         assert _EXPECTED_COLLATOR_KEYS.issubset(set(out.keys()))
@@ -161,21 +165,21 @@ class TestCollatorShapes:
         aligner = _fake_aligner(b=2, t_s=8, t_t=16, max_pairs=3)
         collator = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=8,
-            ctx_length_teacher=16,
+            ctx_length_teachers=[16],
         )
         out = collator([_datum("ab", 0), _datum("cd", 1)])
         assert out["input_ids"].shape == (2, 8)
         assert out["token_mask"].shape == (2, 8)
-        assert out["teacher_input_ids"].shape == (2, 16)
-        assert out["teacher_token_mask"].shape == (2, 16)
+        assert out["teacher_0_input_ids"].shape == (2, 16)
+        assert out["teacher_0_token_mask"].shape == (2, 16)
         # alignment payload shapes come from the aligner mock.
-        assert out["alignment_pair_valid"].shape == (2, 3)
-        assert out["alignment_student_chunk_id"].shape == (2, 8)
-        assert out["alignment_teacher_chunk_id"].shape == (2, 16)
-        assert out["alignment_num_chunks"].shape == (2,)
+        assert out["alignment_0_pair_valid"].shape == (2, 3)
+        assert out["alignment_0_student_chunk_id"].shape == (2, 8)
+        assert out["alignment_0_teacher_chunk_id"].shape == (2, 16)
+        assert out["alignment_0_num_chunks"].shape == (2,)
 
     def test_input_lengths_match_attention_mask_sum(self):
         student_tok = FakeTokenizer(vocab_size=32, prefix="s")
@@ -183,15 +187,15 @@ class TestCollatorShapes:
         aligner = _fake_aligner(b=1, t_s=8, t_t=8)
         collator = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=8,
-            ctx_length_teacher=8,
+            ctx_length_teachers=[8],
         )
         out = collator([_datum("abc", 0)])  # 3 chars → 3 real tokens
         assert int(out["input_lengths"][0]) == 3
         assert int(out["token_mask"][0].sum()) == 3
-        assert int(out["teacher_input_lengths"][0]) == 3
+        assert int(out["teacher_0_input_lengths"][0]) == 3
 
 
 class TestCollatorTruncation:
@@ -202,10 +206,10 @@ class TestCollatorTruncation:
         aligner = _fake_aligner(b=1, t_s=ctx, t_t=ctx)
         collator = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=ctx,
-            ctx_length_teacher=ctx,
+            ctx_length_teachers=[ctx],
         )
         # 10 chars; ctx=4 → sample is kept, trailing 6 chars dropped.
         out = collator([_datum("abcdefghij", 0)])
@@ -224,18 +228,18 @@ class TestCollatorSequenceDivisibility:
         aligner = _fake_aligner(b=1, t_s=16, t_t=12)
         collator = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=10,
-            ctx_length_teacher=10,
+            ctx_length_teachers=[10],
             make_seq_div_by_student=8,
-            make_seq_div_by_teacher=4,
+            make_seq_div_by_teachers=[4],
         )
         out = collator([_datum("hi", 0)])
         assert out["input_ids"].shape == (1, 16)
         assert out["token_mask"].shape == (1, 16)
-        assert out["teacher_input_ids"].shape == (1, 12)
-        assert out["teacher_token_mask"].shape == (1, 12)
+        assert out["teacher_0_input_ids"].shape == (1, 12)
+        assert out["teacher_0_token_mask"].shape == (1, 12)
         # Padded slots have token_mask=0.
         assert int(out["token_mask"][0].sum()) == 2  # only "hi" -> 2 real toks
 
@@ -250,10 +254,10 @@ class TestCollatorPadTokenFallback:
         aligner = _fake_aligner(b=1, t_s=4, t_t=4)
         _ = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=4,
-            ctx_length_teacher=4,
+            ctx_length_teachers=[4],
         )
         # Setting `pad_token` to the eos string is enough; HF tokenizers
         # update pad_token_id from that assignment. Our fake doesn't have
@@ -268,10 +272,10 @@ class TestCollatorReadsMessageLog:
         aligner = _fake_aligner(b=1, t_s=8, t_t=8)
         collator = CrossTokenizerCollator(
             student_tokenizer=student_tok,
-            teacher_tokenizer=teacher_tok,
-            aligner=aligner,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
             ctx_length_student=8,
-            ctx_length_teacher=8,
+            ctx_length_teachers=[8],
         )
         out = collator(
             [

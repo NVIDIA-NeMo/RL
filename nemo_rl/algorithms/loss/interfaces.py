@@ -25,6 +25,30 @@ class LossType(enum.Enum):
     SEQUENCE_LEVEL = "sequence_level"
 
 
+class MetricNormalizer(enum.Enum):
+    """Global denominator a loss-returned metric was normalized by.
+
+    Losses reduce most metrics with ``masked_mean(...,
+    global_normalization_factor=...)`` where the factor is the global valid
+    *token* count, the global valid *sequence* count, or absent entirely (raw
+    counts, per-microbatch means, extrema). Split-API trainers run each
+    microbatch with placeholder ``global_valid_*=1`` (collecting raw sums) and
+    rescale once per optimizer step — to do that they must know, per metric,
+    which denominator applies.
+
+    Losses advertise the mapping via a ``metric_normalizations:
+    dict[str, MetricNormalizer]`` instance attribute, built in ``__init__``
+    from the same flags that pick the denominators, so it lives next to the
+    metric definitions instead of in a consumer-side table. Metrics absent
+    from the mapping fall back to the gradient normalization (the
+    ``loss_type`` denominator) on the consumer side.
+    """
+
+    TOKENS = "tokens"  # divided by global_valid_toks
+    SEQUENCES = "sequences"  # divided by global_valid_seqs
+    NONE = "none"  # not normalized: raw counts, local means, min/max
+
+
 class LossInputType(enum.Enum):
     LOGIT = "logit"
     LOGPROB = "logprob"
@@ -38,6 +62,12 @@ class LossFunction(Protocol):
 
     Loss functions compute a scalar loss value and associated metrics from
     model logprobs and other data contained in a BatchedDataDict.
+
+    Losses may additionally expose a ``metric_normalizations:
+    dict[str, MetricNormalizer]`` attribute advertising the global denominator
+    each returned metric was normalized by (see ``MetricNormalizer``). It is
+    optional: consumers fall back to the ``loss_type`` denominator for
+    metrics (or losses) that do not advertise.
     """
 
     loss_type: LossType
@@ -68,7 +98,7 @@ class LossFunction(Protocol):
                 - For LossInputType.LOGPROB: next_token_logprobs (torch.Tensor)
                 - For LossInputType.LOGIT: logits (torch.Tensor)
                 - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
-                - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits, teacher_full_logits (torch.Tensor)
+                - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits (torch.Tensor), teacher_full_logits_by_idx (dict[int, torch.Tensor])
                 - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)
 
         Returns:

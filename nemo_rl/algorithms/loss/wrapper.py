@@ -103,8 +103,8 @@ class SequencePackingLossWrapper:
             )
             # prepare data for loss function
             if (
-                hasattr(self.loss_fn, "use_linear_ce_fusion")
-                and self.loss_fn.use_linear_ce_fusion
+                hasattr(self.loss_fn, "use_fused_linear_logprobs")
+                and self.loss_fn.use_fused_linear_logprobs
             ):
                 # Linear CE fusion returns precomputed token logprobs where shape
                 # can be shorter by 1 token than padded sequence metadata.

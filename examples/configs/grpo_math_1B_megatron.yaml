@@ -114,6 +114,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
 

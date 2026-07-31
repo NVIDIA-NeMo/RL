@@ -14,6 +14,9 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 8
       gpu_memory_utilization: 0.4
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
 logger:
   log_dir: logs/grpo-qwen3-235b-16n4g
   wandb:
@@ -21,3 +24,4 @@ logger:
 cluster:
   gpus_per_node: 4
   num_nodes: 16
+  segment_size: 16

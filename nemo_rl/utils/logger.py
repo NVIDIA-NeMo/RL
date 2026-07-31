@@ -51,6 +51,9 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
     entity: NotRequired[str]
+    # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
+    # very large, so the recommended default is false.
+    log_nemo_gym_full_result_tables: NotRequired[bool]
 
 
 class SwanlabConfig(TypedDict):
@@ -88,6 +91,13 @@ class LoggerConfig(TypedDict):
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
+
+
+def should_log_nemo_gym_full_result_tables(
+    *, wandb_enabled: bool, wandb_config: WandbConfig
+) -> bool:
+    """Return whether complete NeMo Gym results should become W&B Tables."""
+    return wandb_enabled and bool(wandb_config.get("log_nemo_gym_full_result_tables"))
 
 
 class LoggerInterface(ABC):
@@ -206,7 +216,10 @@ class WandbLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
-        self.run = wandb.init(**cfg, dir=log_dir)
+        # NeMo RL logging controls are not valid wandb.init keyword arguments.
+        wandb_init_config = dict(cfg)
+        wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
+        self.run = wandb.init(**wandb_init_config, dir=log_dir)
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -392,6 +405,16 @@ class WandbLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def finish(self) -> None:
+        """Flush queued metrics and close the wandb service.
+
+        Required when the run lives inside a Ray actor: Ray tears the worker
+        down before wandb's atexit hook can drain the IPC queue to the service.
+        """
+        if self.run is not None:
+            self.run.finish()
+            self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to wandb.
@@ -1038,6 +1061,13 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_hyperparams(params)
 
+    def finish(self) -> None:
+        """Flush and close backends that need explicit teardown (e.g. wandb)."""
+        for logger in self.loggers:
+            finish = getattr(logger, "finish", None)
+            if callable(finish):
+                finish()
+
     def log_batched_dict_as_jsonl(
         self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
     ) -> None:
@@ -1616,3 +1646,43 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir
+
+
+def log_container_init_timing() -> None:
+    """Log pre-Python container timing from environment variables.
+
+    Reads epoch timestamps set by the launch script (ray.sub) and prints
+    the Container Init breakdown.  Missing variables are silently skipped
+    so this is safe to call in any environment.
+    """
+    now = time.time()
+    slurm_start = os.environ.get("SLURM_JOB_START_TIME")
+    job_start = os.environ.get("NRL_JOB_START_EPOCH")
+    ray_ready = os.environ.get("NRL_RAY_READY_EPOCH")
+
+    if not job_start:
+        logging.warning(
+            "Cannot detect container startup time: NRL_JOB_START_EPOCH not set. "
+            "Ensure the launch script exports this variable for init timing."
+        )
+        return
+
+    job_start_f = float(job_start)
+    total = now - job_start_f
+
+    print("\n" + "=" * 60)
+    print(" " * 14 + "CONTAINER INIT TIMING")
+
+    if slurm_start:
+        prologue = job_start_f - float(slurm_start)
+        print(f"  slurm_prologue: {prologue:.1f}s")
+        total = now - float(slurm_start)
+
+    if ray_ready:
+        ray_ready_f = float(ray_ready)
+        cluster = ray_ready_f - job_start_f
+        driver_startup = now - ray_ready_f
+        print(f"  cluster_startup (orchestrator+container+ray): {cluster:.1f}s")
+        print(f"  driver_startup (launch+python+imports): {driver_startup:.1f}s")
+    print(f"  total: {total:.1f}s")
+    print("=" * 60 + "\n", flush=True)

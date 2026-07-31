@@ -72,6 +72,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
     policy.generation.colocated.resources.gpus_per_node=1 \
+    policy.generation.mcore_generation_config.refit_backend=nccl \
     grpo.num_prompts_per_step=4 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=10 \
