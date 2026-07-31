@@ -29,6 +29,7 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": None,
+        "router_gate_bf16": True,
     },
     "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout": {
         "nodes": 4,
@@ -36,6 +37,7 @@ MXFP8_CASES = {
         "segment_size": 2,
         "async_engine": True,
         "moe_backend": None,
+        "router_gate_bf16": True,
     },
     "grpo-qwen3-32b-4n4g-mxfp8-rollout": {
         "nodes": 4,
@@ -43,6 +45,7 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": None,
+        "router_gate_bf16": False,
     },
     "grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout": {
         "nodes": 8,
@@ -50,6 +53,7 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": True,
         "moe_backend": None,
+        "router_gate_bf16": False,
     },
     "grpo-qwen3-235b-16n4g-mxfp8-rollout": {
         "nodes": 16,
@@ -58,6 +62,7 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "router_gate_bf16": True,
     },
     "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout": {
         "nodes": 32,
@@ -66,6 +71,7 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "router_gate_bf16": True,
     },
 }
 
@@ -124,12 +130,15 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert vllm_cfg["is_mx"] is True
     assert vllm_cfg["refit_prequantize"] is True
     assert config["policy"]["megatron_cfg"]["enabled"] is True
-    assert vllm_cfg["quantization_ignored_layer_kws"] == [
+    expected_ignored = [
         "q_proj",
         "k_proj",
         "v_proj",
         "o_proj",
     ]
+    if expected["router_gate_bf16"]:
+        expected_ignored.append(".mlp.gate")
+    assert vllm_cfg["quantization_ignored_layer_kws"] == expected_ignored
     assert cluster["num_nodes"] == expected["nodes"]
     assert cluster["gpus_per_node"] == expected["gpus_per_node"]
     assert cluster["segment_size"] == expected["segment_size"]
@@ -212,5 +221,9 @@ def test_b200_async_mxfp8_recipes_keep_router_gate_in_bf16(case_name: str) -> No
     ]
 
     assert ignored == ["q_proj", "k_proj", "v_proj", "o_proj", ".mlp.gate"]
-    assert "gate" not in ignored
-    assert "gate_proj" not in ignored
+    router_name = "model.layers.0.mlp.gate"
+    expert_name = "model.layers.0.mlp.experts.0.gate_proj"
+    fused_expert_name = "model.layers.0.mlp.experts.gate_up_proj"
+    assert any(keyword in router_name for keyword in ignored)
+    assert not any(keyword in expert_name for keyword in ignored)
+    assert not any(keyword in fused_expert_name for keyword in ignored)

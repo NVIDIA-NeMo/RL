@@ -46,6 +46,7 @@ policy:
         - k_proj
         - v_proj
         - o_proj
+        - ".mlp.gate"
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
   wandb_enabled: true
