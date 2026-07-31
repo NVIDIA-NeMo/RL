@@ -22,6 +22,7 @@ No Ray, no GPU, no transfer_queue required.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data_plane.codec import pack_per_token_field, to_nested_by_length
@@ -150,6 +151,51 @@ def test_wire_shape_tags_roundtrip_promoted_field_names() -> None:
     )
 
 
+def test_wire_shape_tags_legacy_rows_have_no_promotion_provenance() -> None:
+    """Rows written before wire-shape tags use the legacy decode path."""
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _promoted_1d_fields_from_tags,
+    )
+
+    assert _promoted_1d_fields_from_tags([], ["reward"]) is None
+
+
+def test_wire_shape_tags_reject_mixed_codec_versions() -> None:
+    """A batch cannot safely mix tagged and legacy rows."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _WIRE_SHAPE_VERSION_TAG,
+        _add_wire_shape_tags,
+        _promoted_1d_fields_from_tags,
+    )
+
+    fields = TensorDict({"input_ids": torch.arange(4).reshape(2, 2)}, batch_size=[2])
+    wire_tags = _add_wire_shape_tags([{}, {}], fields)
+    wire_tags[1].pop(_WIRE_SHAPE_VERSION_TAG)
+
+    with pytest.raises(RuntimeError, match="wire-shape version"):
+        _promoted_1d_fields_from_tags(wire_tags, ["input_ids"])
+
+
+def test_wire_shape_tags_reject_partial_promotion_marker() -> None:
+    """All rows must agree that a field was promoted from one dimension."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _PROMOTED_1D_TAG_PREFIX,
+        _add_wire_shape_tags,
+        _promoted_1d_fields_from_tags,
+    )
+
+    fields = TensorDict({"reward": torch.arange(2)}, batch_size=[2])
+    wire_tags = _add_wire_shape_tags([{}, {}], fields)
+    wire_tags[1].pop(f"{_PROMOTED_1D_TAG_PREFIX}reward")
+
+    with pytest.raises(RuntimeError, match="promotion marker"):
+        _promoted_1d_fields_from_tags(wire_tags, ["reward"])
+
+
 def test_get_samples_uses_persisted_shape_tags(monkeypatch) -> None:
     """The Mooncake adapter restores ranks using TQ's durable row metadata."""
     from tensordict import TensorDict
@@ -210,6 +256,37 @@ def test_get_samples_uses_persisted_shape_tags(monkeypatch) -> None:
     assert restored["input_ids"].shape == (n, 1)
     assert torch.equal(restored["reward"], original["reward"])
     assert torch.equal(restored["input_ids"], original["input_ids"])
+
+
+def test_get_samples_densifies_uniform_rows_without_1d_promotion(monkeypatch) -> None:
+    """The simple backend normalizes uniform nested rows without squeezing."""
+    from tensordict import TensorDict
+
+    import nemo_rl.data_plane.adapters.transfer_queue as tq_adapter
+
+    rows = [torch.tensor([1, 2]), torch.tensor([3, 4])]
+    wire_data = TensorDict(
+        {"input_ids": torch.nested.as_nested_tensor(rows, layout=torch.jagged)},
+        batch_size=[len(rows)],
+    )
+
+    def fake_kv_batch_get(
+        *, keys: list[str], partition_id: str, select_fields: list[str]
+    ) -> TensorDict:
+        assert keys == ["a", "b"]
+        assert partition_id == "train"
+        assert select_fields == ["input_ids"]
+        return wire_data
+
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get, raising=False)
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._promote_1d = False
+
+    restored = client.get_samples(["a", "b"], "train", ["input_ids"])
+
+    assert not restored["input_ids"].is_nested
+    assert restored["input_ids"].shape == (2, 2)
+    assert torch.equal(restored["input_ids"], torch.stack(rows))
 
 
 def test_from_wire_preserves_ragged_nested_rows() -> None:
