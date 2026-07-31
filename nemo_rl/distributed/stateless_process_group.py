@@ -28,11 +28,15 @@ class StatelessProcessGroup:
         # Declared here rather than sprung into existence by init_nccl_communicator, so
         # abort() can tell "never initialized" from "initialized" without hasattr.
         self.nccl_communicator: Optional[Communicator] = None
-        self.tcp_store = torch.distributed.TCPStore(
-            host_name=self.master_address,
-            port=self.port,
-            world_size=self.world_size,
-            is_master=(self.rank == 0),
+        # Optional because abort() releases it: a run that recovers repeatedly would
+        # otherwise hold a bound store per recovery for the life of the worker.
+        self.tcp_store: Optional[torch.distributed.TCPStore] = (
+            torch.distributed.TCPStore(
+                host_name=self.master_address,
+                port=self.port,
+                world_size=self.world_size,
+                is_master=(self.rank == 0),
+            )
         )
 
     def abort(self) -> None:
@@ -48,13 +52,24 @@ class StatelessProcessGroup:
 
         Verified on 2xA6000: with a peer SIGKILLed mid-broadcast, a survivor blocked in
         the collective was released 0.15s after another thread called abort().
+
+        The rendezvous store is dropped too. Each rebuild gets a fresh port, so holding
+        the old one costs nothing functionally, but a run that recovers repeatedly would
+        otherwise accumulate a bound TCPStore per recovery for the life of the worker.
         """
         communicator, self.nccl_communicator = self.nccl_communicator, None
+        self.tcp_store = None
         if communicator is not None:
             communicator.abort()
 
     def init_nccl_communicator(self, device: int):
         UNIQUE_ID_KEY = "nccl_unique_id"
+
+        if self.tcp_store is None:
+            raise RuntimeError(
+                "StatelessProcessGroup has no rendezvous store: the group was aborted. "
+                "Construct a new one rather than re-initializing this."
+            )
 
         if self.rank == 0:
             unique_id = get_unique_id()

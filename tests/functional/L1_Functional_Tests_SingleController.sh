@@ -52,6 +52,15 @@ run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chao
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
     ++async_rl.policy_router.enabled=true \
     ++async_rl.fleet_health.enabled=true
+# Full mode only: kills a generation shard and asserts the run carries on. Needs >= 3
+# GPUs so that losing a shard still leaves a fleet, and self-skips below that rather
+# than passing vacuously.
+#
+# Deliberately alongside the chaos test above, not instead of it: that one asserts a
+# bounded FAILURE on a fleet with nothing to fall back to, this one asserts SURVIVAL when
+# a shard remains. Opposite behaviours, and a regression in either is invisible to the
+# other.
+run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what

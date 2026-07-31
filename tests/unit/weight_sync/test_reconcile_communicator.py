@@ -35,6 +35,7 @@ from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
 from nemo_rl.weight_sync.interfaces import RefitMembershipChanged
+from nemo_rl.weight_sync.membership import NoSurvivingShards
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
 )
@@ -54,7 +55,8 @@ def _reshard() -> NcclReshardWeightSynchronizer:
 
 @pytest.fixture(params=["collective", "nccl_reshard"])
 def synchronizer(request):
-    """Both NCCL transports; both must refuse a refit into a broken world."""
+    """Both NCCL transports. They diverge once a shard is gone -- collective rebuilds,
+    reshard still refuses -- but the no-op path must be identical for both."""
     return _collective() if request.param == "collective" else _reshard()
 
 
@@ -69,13 +71,13 @@ class TestNothingAbsent:
 
 
 class TestAbsentRanks:
-    def test_a_missing_shard_raises_instead_of_hanging(self, synchronizer):
+    def test_a_missing_shard_still_stops_the_reshard_transport(self):
         with pytest.raises(RefitMembershipChanged, match=r"\[2\]"):
-            synchronizer.reconcile_communicator([2])
+            _reshard().reconcile_communicator([2])
 
-    def test_the_message_names_every_absent_shard(self, synchronizer):
+    def test_the_message_names_every_absent_shard(self):
         with pytest.raises(RefitMembershipChanged, match=r"\[1, 3\]"):
-            synchronizer.reconcile_communicator([3, 1])
+            _reshard().reconcile_communicator([3, 1])
 
     def test_the_reshard_message_explains_the_extra_constraint(self):
         """Resizing a reshard world without regenerating the plan corrupts weights.
@@ -86,6 +88,148 @@ class TestAbsentRanks:
         """
         with pytest.raises(RefitMembershipChanged, match="gen_world_size"):
             _reshard().reconcile_communicator([0])
+
+
+class _FakeWorker:
+    """One Ray actor handle. Records the init_collective it was asked to run."""
+
+    def __init__(self, idx: int, *, dead: bool = False) -> None:
+        self.idx = idx
+        self.dead = dead
+        self.calls: list[dict] = []
+
+    class _Method:
+        def __init__(self, worker: "_FakeWorker") -> None:
+            self._worker = worker
+
+        def remote(self, **kwargs):
+            if self._worker.dead:
+                raise AssertionError(
+                    f"worker {self._worker.idx} is gone; dispatching to it is the hang "
+                    "this rebuild exists to avoid"
+                )
+            self._worker.calls.append(kwargs)
+            return f"future-{self._worker.idx}"
+
+    def __getattr__(self, name):
+        if name.startswith("init_collective"):
+            return _FakeWorker._Method(self)
+        raise AttributeError(name)
+
+
+def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8):
+    """A CollectiveWeightSynchronizer over fake Ray handles."""
+    workers = []
+    for shard in range(dp_size):
+        for _ in range(workers_per_shard):
+            workers.append(_FakeWorker(len(workers), dead=shard in set(dead_shards)))
+    generation = SimpleNamespace(
+        cfg={"vllm_cfg": {"async_engine": True}},
+        worker_group=SimpleNamespace(workers=workers, dp_size=dp_size),
+    )
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    generation.rebuild_collective = (
+        lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
+            generation, membership, ip, port
+        )
+    )
+    policy_calls = []
+    policy = SimpleNamespace(
+        init_collective=lambda ip, port, world_size, *, train_world_size: (
+            policy_calls.append(
+                {
+                    "ip": ip,
+                    "port": port,
+                    "world_size": world_size,
+                    "train_world_size": train_world_size,
+                }
+            )
+            or ["train-future"]
+        )
+    )
+    ports = iter(range(7001, 7100))
+    train_cluster = SimpleNamespace(
+        world_size=lambda: train_world_size,
+        get_master_address_and_port=lambda: ("10.0.0.1", next(ports)),
+    )
+    sync = CollectiveWeightSynchronizer(
+        policy=policy,
+        generation=generation,
+        train_cluster=train_cluster,
+        inference_cluster=None,
+    )
+    return sync, workers, policy_calls
+
+
+class TestRebuildDispatch:
+    """Where a wrong answer is silent rather than loud."""
+
+    def test_the_dead_shard_is_never_dispatched_to(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(2,))
+
+        assert sync.reconcile_communicator([2]) is True
+        # _FakeWorker raises if touched, so reaching here is the assertion; confirm the
+        # survivors really were called.
+        assert [w.idx for w in workers if w.calls] == [0, 1, 3]
+
+    def test_survivors_get_compacted_prefixes(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(1,))
+
+        sync.reconcile_communicator([1])
+
+        prefixes = {w.idx: w.calls[0]["rank_prefix"] for w in workers if w.calls}
+        assert prefixes == {0: 0, 2: 1, 3: 2}, "survivors must be contiguous, not holed"
+
+    def test_world_size_shrinks_by_the_lost_shard(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, policy_calls = _rebuildable(
+            dp_size=4, workers_per_shard=2, dead_shards=(0,), train_world_size=8
+        )
+
+        sync.reconcile_communicator([0])
+
+        assert policy_calls[0]["world_size"] == 8 + 6
+        assert all(c["world_size"] == 8 + 6 for w in workers for c in w.calls)
+
+    def test_both_sides_rendezvous_on_the_same_address(self, monkeypatch):
+        """A mismatch here hangs in the TCPStore instead of erroring."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, policy_calls = _rebuildable(dead_shards=(3,))
+
+        sync.reconcile_communicator([3])
+
+        gen_ports = {c["port"] for w in workers for c in w.calls}
+        assert gen_ports == {policy_calls[0]["port"]}
+
+    def test_each_rebuild_takes_a_fresh_port(self, monkeypatch):
+        """The previous world's store may still be bound."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, policy_calls = _rebuildable(dead_shards=(3,))
+
+        sync.reconcile_communicator([3])
+        sync.reconcile_communicator([3])
+
+        assert policy_calls[0]["port"] != policy_calls[1]["port"]
+
+    def test_trainers_are_all_kept(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, policy_calls = _rebuildable(dead_shards=(1,), train_world_size=64)
+
+        sync.reconcile_communicator([1])
+
+        assert policy_calls[0]["train_world_size"] == 64
+
+    def test_losing_every_shard_refuses_rather_than_building_an_empty_world(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dp_size=2, dead_shards=(0, 1))
+
+        with pytest.raises(NoSurvivingShards):
+            sync.reconcile_communicator([0, 1])
 
 
 class TestOtherTransportsAreUnaffected:
@@ -216,10 +360,27 @@ class TestControllerCallSite:
         assert calls == [[1]]
 
     def test_a_refusal_propagates_rather_than_being_swallowed(self):
-        """If this were swallowed the job would proceed into the hang it prevents."""
+        """If this were swallowed the job would proceed into the hang it prevents.
+
+        Uses the reshard transport because it is the one that still refuses; the plain
+        collective now rebuilds instead.
+        """
         monitor = _monitor()
         _condemn(monitor, 0)
-        ctrl = self._controller(monitor, _collective())
+        ctrl = self._controller(monitor, _reshard())
 
         with pytest.raises(RefitMembershipChanged):
             asyncio.run(ctrl._reconcile_refit_membership())
+
+    def test_a_rebuild_is_driven_all_the_way_from_the_controller(self, monkeypatch):
+        """End to end through the hook: monitor -> absent set -> rebuilt communicator."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        monitor = _monitor(shard_count=4)
+        _condemn(monitor, 2)
+        sync, workers, policy_calls = _rebuildable(dead_shards=(2,))
+        ctrl = self._controller(monitor, sync)
+
+        asyncio.run(ctrl._reconcile_refit_membership())
+
+        assert [w.idx for w in workers if w.calls] == [0, 1, 3]
+        assert policy_calls[0]["world_size"] == 8 + 3
