@@ -2653,14 +2653,10 @@ def test_periodic_validation_starts_at_configured_step(
 ):
     """All three trainers preserve cadence while honoring the validation lower bound."""
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo.update(
-        {
-            "max_num_steps": 5,
-            "val_period": 2,
-            "val_start_at": 3,
-            "val_at_end": val_at_end,
-        }
-    )
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.val_start_at = 3
+    master_config.grpo.val_at_end = val_at_end
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
@@ -2715,7 +2711,7 @@ def test_periodic_validation_starts_at_configured_step(
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             mock_grpo_components["checkpointer"],
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
