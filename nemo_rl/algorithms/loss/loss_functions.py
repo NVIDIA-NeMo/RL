@@ -92,6 +92,8 @@ class DraftCrossEntropyLossFn(LossFunction):
                 False,
             )
         else:
+            # teacher_logits is already detached at the call site (utils.py);
+            # match DistributedCrossEntropy semantics.
             teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
             student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
             per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
@@ -1102,10 +1104,10 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
-class DistillationLossConfig(TypedDict):
-    kl_type: str
-    mixed_kl_weight: float
-    zero_outside_topk: bool
+class DistillationLossConfig(BaseModel, extra="allow"):
+    kl_type: str = "mixed"
+    mixed_kl_weight: float = 0.5
+    zero_outside_topk: bool = False
 
 
 class DistillationLossDataDict(TypedDict):
@@ -1124,9 +1126,9 @@ class DistillationLossFn(LossFunction):
     input_type = LossInputType.DISTILLATION
 
     def __init__(self, cfg: DistillationLossConfig):
-        self.kl_type = cfg["kl_type"]
-        self.mixed_kl_weight = cfg["mixed_kl_weight"]
-        self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.kl_type = cfg.kl_type
+        self.mixed_kl_weight = cfg.mixed_kl_weight
+        self.zero_outside_topk = cfg.zero_outside_topk
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"

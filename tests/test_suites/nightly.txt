@@ -32,8 +32,9 @@ tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron.sh
 tests/test_suites/llm/grpo-qwen3.5-9b-1n8g-megatron.sh
 
 # Functional Qwen3.5-35B run (text-only task)
-# Disabled due to known flaky vLLM hang with Qwen3.5 (see disabled.txt): https://github.com/vllm-project/vllm/issues/36237
-# tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
+# Re-enabled with the vLLM 0.25.1 bump: the AutoModel variant no longer hits the
+# hang from https://github.com/vllm-project/vllm/issues/36237.
+tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.sh
 
 # Functional VLM run
@@ -49,9 +50,10 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.sh
 
 # Functional Qwen3.5-35B VLM GRPO run
-# Disable this due to known vLLM crash issue with Qwen3.5: https://github.com/vllm-project/vllm/issues/36237
-# tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
-# tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
+# The AutoModel variant is re-enabled with the vLLM 0.25.1 bump (no longer hits
+# https://github.com/vllm-project/vllm/issues/36237). The Megatron variant still
+# hangs in sample_tokens and stays disabled -- see disabled.txt.
+tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
 
 # Removing this until this issue is resolved: https://github.com/huggingface/transformers/issues/41190
 # tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh

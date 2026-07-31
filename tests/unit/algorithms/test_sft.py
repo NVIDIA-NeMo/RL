@@ -22,9 +22,33 @@ from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.sft import (
     MasterConfig,
     SFTConfig,
+    _get_sft_save_state,
     _initial_sft_save_state,
     sft_train,
 )
+
+
+def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_sft_save_state({}) == _initial_sft_save_state()
+
+    loaded_state = {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "val:loss": 0.25,
+    }
+
+    save_state = _get_sft_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
 
 
 @pytest.fixture
