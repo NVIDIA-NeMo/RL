@@ -71,49 +71,66 @@ def _locked_file_patch(file_path: str):
 
 def _patch_vllm_init_workers_ray(
     py_executable: str, extra_env_vars: list[str] | None
-) -> None:
-    """Patch the vLLM ray_distributed_executor.py file.
+) -> bool:
+    """Patch vLLM's Ray executor env propagation and worker runtime_env.
 
-    1. Pass custom runtime_env in _init_workers_ray call.
+    1. Pass custom runtime_env in _init_workers_ray call (file patch).
         - This allows passing custom py_executable to worker initialization.
-    2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
-        - This is a workaround to fix async vllm in some scenarios.
-        - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+    2. Forward extra env vars to the Ray workers via vLLM's additive
+       VLLM_RAY_EXTRA_ENV_VARS_TO_COPY hook (vLLM >= 0.25). NCCL_*, HF_*, and
+       HUGGING_FACE_* vars are already copied by vLLM's default prefix list
+       (this includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
+       https://github.com/NVIDIA-NeMo/RL/pull/898).
+
+    .. note::
+        Step 1 patches the **v1 Ray executor**, which vLLM 0.25 no longer
+        selects by default: ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND`` flipped from
+        ``"0"`` (0.20) to ``"1"`` (0.25), so ``Executor.get_class`` returns
+        ``RayExecutorV2`` for ray-backed engines. ``RayExecutorV2`` has no
+        ``_init_workers_ray`` at all -- it creates workers inline, and its
+        ``_build_runtime_env`` never sets ``py_executable``.
+
+        The patch is kept because it is still load-bearing when
+        ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`` selects the v1 executor. Under
+        the 0.25 default it is inert, and workers get the right interpreter
+        from Ray's per-field ``runtime_env`` inheritance instead: the parent
+        NeMo-RL actor sets ``py_executable``, and a child created with a
+        ``runtime_env`` that omits it inherits the parent's value.
+
+        So a ``True`` return means "the anchor is in place", not "this is what
+        put the workers on the right interpreter". The caller logs
+        accordingly.
+
+    Returns:
+        Whether the v1 runtime_env source patch is in place. The env-var merge
+        in step 2 cannot fail, but step 1 is anchored on a call-site string; if
+        that moves upstream the py_executable injection silently stops
+        happening, so the caller must not report success unconditionally.
     """
     file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
 
-    old_lines = [
-        "self._init_workers_ray(placement_group)",
-        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
-    ]
-    additional_env_vars = [
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-        "NCCL_CUMEM_ENABLE",
-        "NCCL_NVLS_ENABLE",
-        "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
-        *(extra_env_vars or []),
-    ]
-    additional_env_str = ", ".join(f'"{env_var}"' for env_var in additional_env_vars)
+    old_line = "self._init_workers_ray(placement_group)"
+    new_line = (
+        "self._init_workers_ray(placement_group, "
+        f'runtime_env={{"py_executable": "{py_executable}"}})'
+    )
 
-    new_lines = [
-        (
-            "self._init_workers_ray(placement_group, "
-            f'runtime_env={{"py_executable": "{py_executable}"}})'
-        ),
-        f"ADDITIONAL_ENV_VARS = {{{additional_env_str}}}",
-    ]
-
+    applied = False
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        need_replace = False
-        for old_line, new_line in zip(old_lines, new_lines):
-            if new_line in content or old_line not in content:
-                continue
-            content = content.replace(old_line, new_line)
-            need_replace = True
+        if new_line in content:
+            applied = True  # already patched by another worker on this node
+        elif old_line in content:
+            write_back(content.replace(old_line, new_line))
+            applied = True
 
-        if need_replace:
-            write_back(content)
+    env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
+    existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+    merged = {
+        var.strip() for var in (*existing.split(","), *env_vars_to_copy) if var.strip()
+    }
+    os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
+
+    return applied
 
 
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
@@ -167,119 +184,325 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
     logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
 
-def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
-    """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
+def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
+    """Guard vLLM's NamespaceTool import for openai < 2.25.
 
-    The HuggingFace tokenizer's Rust backend does not support concurrent
-    access. When multiple async requests call _preprocess_chat concurrently,
-    each one constructs a new Hermes2ProToolParser which calls
-    tokenizer.encode() and tokenizer.decode() in __init__, causing
-    "RuntimeError: Already borrowed".
-
-    A lock alone is insufficient because the tool parser's encode() can
-    race with render_chat_async() in another concurrent request - two
-    different codepaths sharing the same tokenizer instance.
-
-    This patch caches the encode/decode results so only the first
-    instantiation (protected by a lock) touches the tokenizer. All
-    subsequent instantiations read from cache without any tokenizer
-    access.
-
-    Related:
-    - https://github.com/vllm-project/vllm/pull/30264
-    - https://github.com/huggingface/tokenizers/issues/537
-    - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
+    vLLM 0.25 imports ``openai.types.responses.NamespaceTool`` (added in
+    openai 2.25.0) at the top of ``tool_parsers/utils.py``, but nemo-gym pins
+    ``openai<=2.7.2`` and its child server venvs must match the parent's
+    openai version exactly. NamespaceTool is only used in isinstance checks
+    for Responses-API namespace tools, which cannot be constructed by an
+    openai client that predates the feature, so a never-matching stub is a
+    faithful fallback.
     """
-    file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+    try:
+        file_to_patch = _get_vllm_file("tool_parsers/utils.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate tool_parsers/utils.py for openai compat patch."
+        )
+        return
 
-    old_import = "import json\nfrom collections.abc import Sequence"
-    new_import = "import json\nimport threading\nfrom collections.abc import Sequence"
-
-    old_class_line = "class Hermes2ProToolParser(ToolParser):"
-    new_class_line = (
-        "class Hermes2ProToolParser(ToolParser):\n"
-        "    _tokenizer_lock = threading.Lock()\n"
-        "    _tokenizer_cache = {}"
+    old_snippet = (
+        "from openai.types.responses import (\n"
+        "    FunctionTool,\n"
+        "    NamespaceTool,\n"
+        "    ToolChoiceFunction,\n"
+        ")\n"
     )
 
-    old_init_snippet = (
-        "        self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
-        "            self.tool_call_start_token, add_special_tokens=False\n"
-        "        )\n"
-        "        self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
-        "            self.tool_call_end_token, add_special_tokens=False\n"
-        "        )\n"
+    new_snippet = (
+        "from openai.types.responses import (\n"
+        "    FunctionTool,\n"
+        "    ToolChoiceFunction,\n"
+        ")\n"
         "\n"
-        "        self.tool_call_start_token_array = [\n"
-        "            self.model_tokenizer.decode([token_id])\n"
-        "            for token_id in self.tool_call_start_token_ids\n"
-        "        ]\n"
+        "try:\n"
+        "    from openai.types.responses import NamespaceTool\n"
+        "except ImportError:  # openai < 2.25.0 predates namespace tools\n"
         "\n"
-        "        self.tool_call_end_token_array = [\n"
-        "            self.model_tokenizer.decode([token_id])\n"
-        "            for token_id in self.tool_call_end_token_ids\n"
-        "        ]"
-    )
-
-    new_init_snippet = (
-        "        _tid = id(self.model_tokenizer)\n"
-        "        if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
-        "            _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
-        "            self.tool_call_start_token_ids = _cached['start_ids']\n"
-        "            self.tool_call_end_token_ids = _cached['end_ids']\n"
-        "            self.tool_call_start_token_array = _cached['start_array']\n"
-        "            self.tool_call_end_token_array = _cached['end_array']\n"
-        "        else:\n"
-        "            with Hermes2ProToolParser._tokenizer_lock:\n"
-        "                if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
-        "                    _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
-        "                    self.tool_call_start_token_ids = _cached['start_ids']\n"
-        "                    self.tool_call_end_token_ids = _cached['end_ids']\n"
-        "                    self.tool_call_start_token_array = _cached['start_array']\n"
-        "                    self.tool_call_end_token_array = _cached['end_array']\n"
-        "                else:\n"
-        "                    self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
-        "                        self.tool_call_start_token, add_special_tokens=False\n"
-        "                    )\n"
-        "                    self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
-        "                        self.tool_call_end_token, add_special_tokens=False\n"
-        "                    )\n"
-        "                    self.tool_call_start_token_array = [\n"
-        "                        self.model_tokenizer.decode([token_id])\n"
-        "                        for token_id in self.tool_call_start_token_ids\n"
-        "                    ]\n"
-        "                    self.tool_call_end_token_array = [\n"
-        "                        self.model_tokenizer.decode([token_id])\n"
-        "                        for token_id in self.tool_call_end_token_ids\n"
-        "                    ]\n"
-        "                    Hermes2ProToolParser._tokenizer_cache[_tid] = {\n"
-        "                        'start_ids': self.tool_call_start_token_ids,\n"
-        "                        'end_ids': self.tool_call_end_token_ids,\n"
-        "                        'start_array': self.tool_call_start_token_array,\n"
-        "                        'end_array': self.tool_call_end_token_array,\n"
-        "                    }"
+        "    class NamespaceTool:  # type: ignore[no-redef]\n"
+        '        """Stub: openai<2.25 clients cannot construct namespace tools."""\n'
+        "\n"
     )
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if "_tokenizer_cache" in content:
-            logger.info("Hermes tool parser thread-safety patch already applied.")
+        if "except ImportError:  # openai < 2.25.0 predates namespace tools" in content:
+            logger.info("vLLM NamespaceTool openai compat patch already applied.")
             return
 
-        if old_init_snippet not in content:
+        if old_snippet not in content:
             logger.warning(
-                "Could not apply hermes tool parser thread-safety patch: "
-                "expected code snippet not found in %s. "
+                "Could not apply NamespaceTool openai compat patch: "
+                "expected import block not found in %s. "
                 "The vLLM version may have changed.",
                 file_to_patch,
             )
             return
 
-        content = content.replace(old_import, new_import, 1)
-        content = content.replace(old_class_line, new_class_line, 1)
-        content = content.replace(old_init_snippet, new_init_snippet, 1)
+        content = content.replace(old_snippet, new_snippet, 1)
         write_back(content)
 
-    logger.info("Successfully patched hermes tool parser for thread-safety.")
+    logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
+
+
+def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
+    """Keep RayExecutorV2's TCPStore port out of the MessageQueue's scan range.
+
+    vLLM 0.25's ``RayExecutorV2._init_executor`` picks the torch.distributed
+    TCPStore port with a bind-probe (Step 3) but only binds it much later, in
+    the rank-0 worker's ``init_process_group``. In between, Step 4 builds the
+    broadcast ``MessageQueue``; when the engine spans nodes that queue needs a
+    real TCP socket, so it calls ``get_open_port()`` and *binds and holds* the
+    result (``shm_broadcast.py``: ``remote_subscribe_port = get_open_port()``
+    then ``remote_socket.bind(...)``). Both searches start at ``VLLM_PORT``, so
+    the queue deterministically takes the very port the probe just released and
+    engine startup dies with ``EADDRINUSE`` (DeepSeek-V3 generation TP=32,
+    observed on port 7000). Engines that fit on one node use a shm/ipc socket
+    instead and never allocate a TCP port here, which is why only node-spanning
+    engines are affected.
+
+    Offsetting the TCPStore search past the queue's scan range removes the
+    collision while keeping both ports inside the engine's 100-port window, and
+    therefore below the OS ephemeral floor. That band is deliberate: leaving
+    ``VLLM_PORT`` unset would send vLLM to kernel-assigned ephemeral ports and
+    reintroduce the TOCTOU contention this layout exists to prevent (#2380,
+    #3103).
+
+    The offset must be applied *before* the ``local_dp_rank is None`` test, not
+    inside it. vLLM's own disjoint-window branch below reads as if it only
+    applies to DP engines, but ``ParallelConfig.__post_init__`` takes the
+    "offline SPMD" path for every engine NeMo-RL builds and assigns
+    ``data_parallel_rank_local = envs.VLLM_DP_RANK_LOCAL`` (0 by default) and
+    ``data_parallel_master_port = envs.VLLM_DP_MASTER_PORT`` (0 by default). So
+    a plain non-DP engine arrives here with ``local_dp_rank=0``, not ``None``:
+    the ``None`` branch is dead, and the DP branch searches from
+    ``0 + 100 + 0 * 32 = 100``, fails all 32 attempts on the privileged range,
+    and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
+    That is exactly the port the MessageQueue takes. See RL-1104.
+
+    Returns without raising when the snippet is missing, but logs at warning
+    level so a silent no-op is visible in worker logs.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/executor/ray_executor_v2.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate ray_executor_v2.py; TCPStore port patch NOT applied. "
+            "Engines spanning nodes may fail with EADDRINUSE at startup."
+        )
+        return
+
+    marker = "start_port=envs.VLLM_PORT + 32"
+    old_snippet = (
+        "        if local_dp_rank is None:\n            return get_open_port()\n"
+    )
+    new_snippet = (
+        "        if envs.VLLM_PORT is not None:\n"
+        "            # NeMo-RL: this port and the broadcast MessageQueue's remote\n"
+        "            # socket are both allocated from VLLM_PORT, but the queue\n"
+        "            # binds and holds its port before this one is bound in the\n"
+        "            # rank-0 worker, so a shared search collides. Search a window\n"
+        "            # past the queue's, still inside the engine's reserved\n"
+        "            # 100-port band.\n"
+        "            #\n"
+        "            # This has to run *before* the local_dp_rank test below:\n"
+        "            # ParallelConfig leaves a non-DP engine with\n"
+        "            # data_parallel_rank_local=0 (not None) and\n"
+        "            # data_parallel_master_port=0, so that branch searches from\n"
+        "            # port 100, fails on the privileged range, and falls back to\n"
+        "            # get_open_port() -- straight back to VLLM_PORT.\n"
+        "            try:\n"
+        "                return _get_open_port(\n"
+        "                    start_port=envs.VLLM_PORT + 32, max_attempts=32\n"
+        "                )\n"
+        "            except RuntimeError:\n"
+        "                pass\n"
+        "        if local_dp_rank is None:\n"
+        "            return get_open_port()\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply RayExecutorV2 TCPStore port patch: expected "
+                "snippet not found in %s. The vLLM version may have changed. "
+                "Engines spanning nodes may fail with EADDRINUSE at startup.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    # Read back so a patch that silently failed to land is not reported as
+    # applied; this is the failure mode that previously went unnoticed.
+    try:
+        with open(file_to_patch) as handle:
+            applied = marker in handle.read()
+    except OSError as error:
+        logger.warning("Could not verify TCPStore port patch: %s", error)
+        return
+
+    if applied:
+        logger.info("Successfully patched vLLM RayExecutorV2 TCPStore port selection.")
+    else:
+        logger.warning(
+            "RayExecutorV2 TCPStore port patch did not persist to %s. Engines "
+            "spanning nodes may fail with EADDRINUSE at startup.",
+            file_to_patch,
+        )
+
+
+def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
+    """Make MessageQueue's remote socket survive losing a port race.
+
+    ``MessageQueue.__init__`` picks the port for its remote (TCP) socket with
+    ``remote_subscribe_port = get_open_port()``, which *probes a port and
+    releases it*, and only binds it with ZMQ several statements later
+    (``shm_broadcast.py``: ``self.remote_socket.bind(socket_addr)``). The
+    window between the probe and the bind is a TOCTOU race.
+
+    On vLLM 0.25 that race is lost reliably, not occasionally. Every
+    ``RayWorkerProc`` on a **non-driver** node takes ``n_local_reader=0``
+    (``ray_executor_v2.py::_init_message_queues``), so every one of them needs
+    a real TCP port, and they all scan from the same ``VLLM_PORT`` -- 7000 for
+    a node-spanning engine. ``_init_message_queues`` runs immediately after
+    ``init_device()``, whose process-group setup is a collective barrier, so
+    all workers on the node arrive at the probe within microseconds of each
+    other, all see the same port free, and all but one die with::
+
+        zmq.error.ZMQError: Address already in use (addr='tcp://10.65.1.9:7000')
+
+    Workers on the driver node take ``n_local_reader=1`` and use an ``ipc://``
+    socket instead, which is why only node-spanning engines are affected --
+    and why no nightly test catches it (none runs an engine whose
+    ``tensor_parallel_size * pipeline_parallel_size`` exceeds
+    ``cluster.gpus_per_node``). See RL-1111.
+
+    Fix the race at the bind rather than the probe: retry, advancing past the
+    port that was lost. This is safe and terminating because a port a peer
+    already holds with ZMQ *is* visible to the next ``_get_open_port`` probe
+    (a plain ``bind(("", port))`` on it fails with ``EADDRINUSE``), so each
+    retry makes forward progress.
+
+    Deliberately keeps the search anchored at ``VLLM_PORT`` instead of letting
+    vLLM fall back to ``bind(("", 0))``: kernel-assigned ephemeral ports are
+    exactly the TOCTOU contention the reserved sub-ephemeral band exists to
+    prevent (#2380, #3103).
+
+    Patching the bind (rather than handing each worker a private start port)
+    also covers every other ``MessageQueue`` with a remote reader -- notably
+    the executor's own ``rpc_broadcast_mq`` -- instead of the one call site
+    that happens to be failing today.
+
+    Returns without raising when the snippet is missing, but logs at warning
+    level so a silent no-op is visible in worker logs.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "distributed/device_communicators/shm_broadcast.py"
+        )
+    except RuntimeError:
+        logger.warning(
+            "Could not locate shm_broadcast.py; MessageQueue bind-retry patch "
+            "NOT applied. Engines spanning nodes may fail with EADDRINUSE at "
+            "startup."
+        )
+        return
+
+    marker = "_nrl_bind_attempts"
+    old_snippet = (
+        '            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
+        "            self.remote_socket.bind(socket_addr)\n"
+    )
+    new_snippet = (
+        "            # NeMo-RL: get_open_port() above probed this port and then\n"
+        "            # released it; ZMQ only binds it for real here. Every worker\n"
+        "            # on a non-driver node builds its response queue at the same\n"
+        "            # instant (init_device()'s collective releases them together)\n"
+        "            # scanning from the same VLLM_PORT, so they all probe the same\n"
+        "            # free port and all but one die with EADDRINUSE. Retry around\n"
+        "            # the bind instead of trusting the probe: a port a peer already\n"
+        "            # holds IS visible to the next probe, so advancing past the\n"
+        "            # loser terminates. Ports stay in the reserved VLLM_PORT band\n"
+        "            # rather than falling back to kernel-ephemeral ones, which is\n"
+        "            # the contention that band exists to avoid (#2380, #3103).\n"
+        "            _nrl_bind_attempts = 64\n"
+        "            for _nrl_bind_attempt in range(_nrl_bind_attempts):\n"
+        '                socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
+        "                try:\n"
+        "                    self.remote_socket.bind(socket_addr)\n"
+        "                    break\n"
+        "                except zmq.ZMQError:\n"
+        "                    if _nrl_bind_attempt == _nrl_bind_attempts - 1:\n"
+        "                        raise\n"
+        "                    from vllm.utils.network_utils import _get_open_port\n"
+        "\n"
+        "                    logger.info(\n"
+        '                        "Port %s was taken between probe and bind; '
+        'retrying.",\n'
+        "                        remote_subscribe_port,\n"
+        "                    )\n"
+        "                    remote_subscribe_port = (\n"
+        "                        _get_open_port(start_port=remote_subscribe_port + 1)\n"
+        "                        if envs.VLLM_PORT is not None\n"
+        "                        else get_open_port()\n"
+        "                    )\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM MessageQueue bind-retry patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply MessageQueue bind-retry patch: expected "
+                "snippet not found in %s. The vLLM version may have changed. "
+                "Engines spanning nodes may fail with EADDRINUSE at startup.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    # Read back so a patch that silently failed to land is not reported as
+    # applied; this is the failure mode that previously went unnoticed.
+    try:
+        with open(file_to_patch) as handle:
+            applied = marker in handle.read()
+    except OSError as error:
+        logger.warning("Could not verify MessageQueue bind-retry patch: %s", error)
+        return
+
+    if applied:
+        logger.info("Successfully patched vLLM MessageQueue remote socket bind.")
+    else:
+        logger.warning(
+            "MessageQueue bind-retry patch did not persist to %s. Engines "
+            "spanning nodes may fail with EADDRINUSE at startup.",
+            file_to_patch,
+        )
+
+
+def ensure_vllm_source_compat() -> None:
+    """Apply interpreter-independent vLLM source-compat patches.
+
+    Safe to call from any process that imports vLLM directly (e.g. the
+    tools/model_diagnostics scripts, which construct ``vllm.LLM`` without
+    going through a NeMo-RL generation worker). Must be called BEFORE the
+    first ``import vllm`` submodule that pulls in ``vllm.tool_parsers``.
+    Worker processes get this via ``_apply_vllm_patches`` at init.
+    """
+    from vllm.logger import init_logger
+
+    _patch_vllm_tool_parser_namespace_tool(init_logger("vllm_patch"))
 
 
 def _apply_vllm_patches(
@@ -288,12 +511,48 @@ def _apply_vllm_patches(
     extra_env_vars: list[str] | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
+    import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
 
-    _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
-    patch_logger.info("Successfully patched vllm _init_workers_ray.")
+    # Whether the v1 patch matters at all depends on which executor vLLM will
+    # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
+    # _init_workers_ray; the patch is only load-bearing when it is set to "0".
+    # Reporting the same way in both cases either cries wolf or hides a real
+    # break, so branch on it.
+    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
+
+    if applied and uses_v1_executor:
+        patch_logger.info(
+            "Successfully patched vllm v1 _init_workers_ray; Ray workers will "
+            "launch under %s.",
+            py_executable,
+        )
+    elif applied:
+        patch_logger.info(
+            "Patched vllm v1 _init_workers_ray, but VLLM_USE_RAY_V2_EXECUTOR_"
+            "BACKEND selects RayExecutorV2, which has no such method. The "
+            "patch is inert here; workers inherit py_executable from this "
+            "actor's runtime_env instead."
+        )
+    elif uses_v1_executor:
+        patch_logger.error(
+            "vllm v1 _init_workers_ray patch did NOT apply: the "
+            "'self._init_workers_ray(placement_group)' anchor was not found, "
+            "and VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor "
+            "that depends on it. Ray workers will launch under the wrong "
+            "interpreter. Either the anchor moved upstream, or unset "
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2."
+        )
+    else:
+        patch_logger.info(
+            "vllm v1 _init_workers_ray anchor not found, which is harmless "
+            "here: RayExecutorV2 is selected and does not use it."
+        )
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
-    _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
+    _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
+    _patch_vllm_shm_broadcast_bind_retry(patch_logger)
