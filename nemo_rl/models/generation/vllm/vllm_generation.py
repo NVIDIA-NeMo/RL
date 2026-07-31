@@ -48,6 +48,7 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.membership import RefitMembership
 
 logger = logging.getLogger(__name__)
 
@@ -630,6 +631,48 @@ class VllmGeneration(GenerationInterface):
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
+    def rebuild_collective(
+        self, membership: "RefitMembership", ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Re-init the collective over the surviving shards only.
+
+        Deliberately not ``init_collective`` with a filter.
+        ``run_all_workers_multiple_data`` walks every worker in the group, so it would
+        dispatch to the shard we are rebuilding *because* it is gone -- and calling into
+        a dead Ray actor is the hang this is meant to end. Here the surviving DP leaders
+        are addressed directly.
+
+        Only leaders are called: each one ``collective_rpc``s into its own TP/PP workers,
+        so one Ray call per shard reaches every rank in it.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_collective"
+        )
+        workers = self.worker_group.workers
+        futures: list[ray.ObjectRef] = []
+        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+            leader_idx = shard_idx * membership.workers_per_shard
+            if leader_idx >= len(workers):
+                raise RuntimeError(
+                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
+                    f"{len(workers)} workers"
+                )
+            futures.append(
+                getattr(workers[leader_idx], method_name).remote(
+                    rank_prefix=rank_prefix,
+                    ip=ip,
+                    port=port,
+                    world_size=membership.world_size,
+                    train_world_size=membership.train_world_size,
+                )
+            )
         return futures
 
     def generate(
