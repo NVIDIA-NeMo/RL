@@ -114,11 +114,12 @@ class TrtllmGeneration(GenerationInterface):
         )
 
         self.colocated_enabled = bool(self.cfg["colocated"]["enabled"])
+        self.async_engine = bool(self.cfg["trtllm_cfg"].get("async_engine", False))
         # The synchronous TRT-LLM engine path is no longer supported: only the
         # async worker wires up colocated sleep/wakeup, IPC-ZMQ refit, and
         # per-sample streaming. Fail loudly at setup rather than silently
         # running a half-supported path.
-        assert self.cfg["trtllm_cfg"].get("async_engine", False), (
+        assert self.async_engine, (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
             "synchronous engine path (async_engine=false) is no longer supported."
         )
