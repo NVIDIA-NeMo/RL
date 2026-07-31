@@ -368,19 +368,11 @@ def setup(
     policy_config = master_config.policy
     value_config = master_config.value
 
-    # Privileged (answer-conditioned) critic is currently wired for synchronous PPO
-    # only; fail loudly rather than silently falling back to a blind critic on the
-    # async path (which does not build the answer-augmented value batch).
+    # Privileged (answer-conditioned) critic — supported in BOTH the sync (ppo_train)
+    # and async (async_ppo_train) loops; both build the answer-augmented value batch
+    # at train time from message_log + extra_env_info.
     _privileged_critic = value_config.get("privileged_critic")
     if _privileged_critic is not None and _privileged_critic.get("enabled"):
-        assert not (
-            "async_ppo" in master_config.ppo
-            and master_config.ppo["async_ppo"].get("enabled")
-        ), (
-            "value.privileged_critic is supported only for synchronous PPO for now "
-            "(the async_ppo value stage does not build the answer-augmented batch). "
-            "Disable async_ppo or value.privileged_critic.enabled."
-        )
         # The critic scores [prompt + answer + response], which is longer than the
         # policy's [prompt + response] by up to max_answer_tokens (+ grader-note
         # template overhead). Give the VALUE model that much headroom so every
@@ -3178,10 +3170,41 @@ def async_ppo_train(
                 # end below). Load value only.
                 print("▶ Computing values...")
                 with timer.time("value_inference"):
+                    # Privileged (answer-conditioned) critic — same driver-side pattern
+                    # as the sync loop: score [prompt(+gold), response] and remap the
+                    # response-position values back into the policy layout. The buffered
+                    # trajectories carry message_log + extra_env_info, so the augmented
+                    # batch is built at train time exactly as in sync.
+                    privileged_critic_cfg = master_config.value.get("privileged_critic")
+                    if privileged_critic_cfg is not None and not privileged_critic_cfg.get(
+                        "enabled"
+                    ):
+                        privileged_critic_cfg = None
+                    critic_batch = None
+
                     value_model.prepare_for_inference()
-                    train_data["values"] = value_model.get_values(train_data)[
-                        "values"
-                    ].squeeze(-1)
+                    if privileged_critic_cfg is not None:
+                        critic_batch = build_privileged_value_inputs(
+                            repeated_batch,
+                            tokenizer,
+                            privileged_critic_cfg,
+                            make_seq_len_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                        vals_aug = value_model.get_values(critic_batch)["values"].squeeze(
+                            -1
+                        )
+                        critic_batch["values"] = vals_aug
+                        train_data["values"] = remap_by_response_mask(
+                            vals_aug,
+                            critic_batch["token_mask"],
+                            train_data["token_mask"],
+                        )
+                    else:
+                        train_data["values"] = value_model.get_values(train_data)[
+                            "values"
+                        ].squeeze(-1)
                     value_model.finish_inference()
 
                 # ---- 4. Policy / reference logprobs (policy on GPU, then off) ----
@@ -3260,6 +3283,15 @@ def async_ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                        # Privileged critic trains on the answer-augmented sequence:
+                        # scatter the (policy-layout) GAE returns onto the augmented
+                        # response positions. Same response tokens => exact mapping.
+                        if critic_batch is not None:
+                            critic_batch["returns"] = remap_by_response_mask(
+                                returns,
+                                train_data["token_mask"],
+                                critic_batch["token_mask"],
+                            )
 
                 # ---- 7. ppo_epochs inner loop (critic, then actor) ----
                 # Each epoch: value on GPU -> train -> off. Then, once past critic
@@ -3276,8 +3308,16 @@ def async_ppo_train(
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
                     with timer.time("value_training"):
+                        # Privileged critic: train on the answer-augmented batch
+                        # (returns already scattered onto its response positions above;
+                        # values=aug old-values for the optional value clip).
+                        if critic_batch is not None:
+                            critic_batch["sample_mask"] = train_data["sample_mask"]
+                            value_train_batch = critic_batch
+                        else:
+                            value_train_batch = train_data
                         value_results = value_model.train(
-                            train_data,
+                            value_train_batch,
                             value_loss_fn,
                             timer=timer,
                         )
