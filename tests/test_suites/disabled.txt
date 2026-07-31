@@ -1,9 +1,7 @@
 # Tests that are temporarily disabled
-# Disable this due to known vLLM crash issue with Qwen3.5: https://github.com/vllm-project/vllm/issues/36237
-tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
+# Still hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of
+# https://github.com/vllm-project/vllm/issues/36237, which the bump does fix.
+# Not specific to this vLLM version: the enabled
+# grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2 run hangs the same way on main,
+# so this is the pre-existing Qwen3.5 + Megatron + EP hang.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
-# Flaky hang (passes on rerun); same vLLM issue, unresolved as of vLLM 0.20. Re-enable after next vLLM bump.
-tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
-
-# Disable this due to know vLLM bug with Qwen3.5: https://github.com/vllm-project/vllm/issues/37856
-tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh

@@ -184,6 +184,14 @@ class BaseVllmGenerationWorker:
                 # The engine spans several nodes. Each engine's rank-0 process is
                 # on a different node, so every such engine can use node-local
                 # slot 0 without colliding.
+                #
+                # These engines are also the ones exposed to the vLLM 0.25
+                # TCPStore/MessageQueue collision within a single engine's window
+                # (see _patch_vllm_ray_executor_v2_tcpstore_port in patches.py).
+                # That is fixed by offsetting the TCPStore search, deliberately
+                # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
+                # kernel-ephemeral ports, which is the TOCTOU contention this port
+                # layout exists to avoid (#2380, #3103).
                 engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node

@@ -170,7 +170,29 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
         for path in patched_paths
     )
+    assert any(
+        "ModelOptMxFp8FusedMoE.apply_monolithic" in path for path in patched_paths
+    )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
+
+def test_get_module_from_param_name_resolves_vllm_025_routed_experts(
+    fp8_module: types.ModuleType,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    fp8 = fp8_module
+    routed_experts = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(routed_experts)
+    runner = MoERunner.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = routed_experts
+    model = types.SimpleNamespace(packed_modules_mapping={}, experts=runner)
+
+    assert (
+        fp8._get_module_from_param_name(model, "experts.w13_weight") is routed_experts
+    )
 
 
 def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
@@ -293,6 +315,8 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
     fp8_module: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
     fp8 = fp8_module
     captured: dict[str, Any] = {}
 
@@ -342,10 +366,13 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
     )
     layer.moe_config = types.SimpleNamespace(intermediate_size_per_partition=3)
     quant_method = types.SimpleNamespace(
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
+        experts_cls=types.SimpleNamespace(is_monolithic=lambda: True),
+        weight_block_size=[1, 32],
         moe=types.SimpleNamespace(
             is_act_and_mul=False,
             intermediate_size_per_partition=3,
-        )
+        ),
     )
     original_w13 = layer.w13_weight.detach().clone()
     original_w2 = layer.w2_weight.detach().clone()
@@ -368,9 +395,168 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
     assert layer.mxfp8_padded_hidden_size == 512
     assert layer.mxfp8_unpadded_intermediate_size_per_partition == 3
     assert layer.mxfp8_padded_intermediate_size_per_partition == 128
+    assert layer.intermediate_size_per_partition == 128
     assert layer.moe_config.intermediate_size_per_partition == 128
     assert quant_method.moe.intermediate_size_per_partition == 128
     assert layer.w13_weight_for_apply.shape == (2, 128, 512)
     assert layer.w2_weight_for_apply.shape == (2, 512, 128)
     assert layer.w13_scale_for_apply.shape == (2, 128, 16)
     assert layer.w2_scale_for_apply.shape == (2, 512, 4)
+    assert layer.weight_block_size == [1, 32]
+
+
+def test_process_mxfp8_moe_rejects_non_trtllm_backend_before_mutation(
+    fp8_module: types.ModuleType,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    fp8 = fp8_module
+    quant_method = types.SimpleNamespace(
+        mxfp8_backend=Fp8MoeBackend.DEEPGEMM,
+        experts_cls=types.SimpleNamespace(is_monolithic=lambda: True),
+    )
+    layer = types.SimpleNamespace(marker=object())
+
+    with pytest.raises(
+        NotImplementedError,
+        match="requires the monolithic FlashInfer TRTLLM backend",
+    ):
+        fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    assert not hasattr(layer, "weight_block_size")
+
+
+def test_apply_monolithic_mxfp8_moe_uses_vllm_025_moe_config(
+    fp8_module: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+    from vllm.utils import flashinfer as vllm_flashinfer
+
+    fp8 = fp8_module
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda tensor, **_kwargs: (
+            tensor.to(torch.float8_e4m3fn),
+            torch.ones(
+                tensor.shape[0],
+                tensor.shape[1] // 32,
+                dtype=torch.uint8,
+            ),
+        ),
+    )
+
+    def fake_moe(**kwargs: Any) -> torch.Tensor:
+        captured.update(kwargs)
+        return torch.zeros_like(kwargs["hidden_states"], dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "flashinfer_trtllm_fp8_block_scale_moe",
+        fake_moe,
+    )
+
+    parallel_config = types.SimpleNamespace(enable_eplb=False, ep_rank=3)
+    moe_config = types.SimpleNamespace(
+        activation=MoEActivation.RELU2_NO_MUL,
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel_config,
+        num_experts=32,
+        experts_per_token=2,
+        intermediate_size_per_partition=128,
+        num_local_experts=4,
+    )
+    quant_method = types.SimpleNamespace(
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
+        moe=moe_config,
+    )
+    layer = types.SimpleNamespace(
+        num_expert_group=0,
+        topk_group=0,
+        routed_scaling_factor=1.0,
+        e_score_correction_bias=None,
+        w13_weight=torch.empty(4, 128, 512, dtype=torch.float8_e4m3fn),
+        w13_weight_scale=torch.ones(4, 128, 16, dtype=torch.uint8),
+        w2_weight=torch.empty(4, 512, 128, dtype=torch.float8_e4m3fn),
+        w2_weight_scale=torch.ones(4, 512, 4, dtype=torch.uint8),
+        mxfp8_padded_hidden_size=512,
+    )
+    x = torch.ones(2, 64, dtype=torch.bfloat16)
+    router_logits = torch.zeros(2, 32, dtype=torch.bfloat16)
+
+    output = fp8.apply_monolithic_mxfp8_moe(
+        quant_method,
+        layer,
+        x,
+        router_logits,
+    )
+
+    assert captured["num_experts"] == 32
+    assert captured["top_k"] == 2
+    assert captured["intermediate_size"] == 128
+    assert captured["local_expert_offset"] == 12
+    assert captured["local_num_experts"] == 4
+    assert captured["routing_method_type"] == RoutingMethodType.Renormalize
+    assert captured["hidden_states"].shape == (2, 512)
+    assert output.shape == x.shape
+
+
+def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
+    """Refit runs this every step; rebinding .data each time fragments memory.
+
+    Regression guard for the CuMemAllocator wake-up OOM (~75 steps into the
+    fp8-rollouts nightlies): the 0.25 port rebound weight/weight_scale_inv to
+    fresh allocations on every call, where 0.20 copied in place. Nothing in the
+    suite pinned that, so a refactor back to .data rebinding would have
+    produced no test failure -- just a slow OOM in a nightly days later.
+    """
+    import torch
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    layer = types.SimpleNamespace(
+        weight=torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False),
+        weight_scale_inv=torch.nn.Parameter(torch.zeros(1, 1), requires_grad=False),
+    )
+    # Same shape/dtype back, but a *fresh* tensor each call -- exactly what the
+    # real helper returns once the processed layout is stable.
+    monkeypatch.setattr(
+        fp8_utils,
+        "process_fp8_weight_block_strategy",
+        lambda w, s: (torch.ones_like(w), torch.ones_like(s)),
+    )
+    monkeypatch.setattr(fp8, "maybe_post_process_fp8_weight_block", lambda _layer: None)
+
+    method = types.SimpleNamespace(
+        block_quant=True,
+        quant_config=types.SimpleNamespace(
+            is_checkpoint_fp8_serialized=True, activation_scheme="dynamic"
+        ),
+    )
+
+    weight_ptr = layer.weight.data.data_ptr()
+    scale_ptr = layer.weight_scale_inv.data.data_ptr()
+    weight_param, scale_param = layer.weight, layer.weight_scale_inv
+
+    for _ in range(3):  # initial load + two refits
+        fp8.process_weights_after_loading(method, layer)
+
+    assert layer.weight.data.data_ptr() == weight_ptr, (
+        "weight storage was rebound instead of copied in place; on a real refit "
+        "this leaks a fresh allocation every step until wake_up OOMs"
+    )
+    assert layer.weight_scale_inv.data.data_ptr() == scale_ptr, (
+        "weight_scale_inv storage was rebound instead of copied in place"
+    )
+    # Parameter identity (and therefore weight_loader) must also survive.
+    assert layer.weight is weight_param
+    assert layer.weight_scale_inv is scale_param
+    # The processed values must actually land.
+    assert torch.equal(layer.weight.data, torch.ones(4, 4))
