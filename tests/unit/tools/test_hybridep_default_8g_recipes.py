@@ -46,6 +46,20 @@ X86_HYBRIDEP_ENVIRONMENT = {
     "USE_MNNVL": "0",
 }
 X86_HYBRIDEP_ENVIRONMENT_KEYS = set(X86_HYBRIDEP_ENVIRONMENT)
+GB200_HYBRIDEP_RECIPES = {
+    "grpo-deepseek-v3-32n4g.yaml": "16",
+    "grpo-deepseek-v3-64n4g.yaml": "32",
+    "grpo-deepseek-v3-64n4g-async-1off.yaml": "16",
+    "grpo-qwen3-235b-16n4g.yaml": "16",
+    "grpo-qwen3-235b-32n4g.yaml": "16",
+    "grpo-qwen3-235b-32n4g-async-1off.yaml": "16",
+}
+GB200_HYBRIDEP_ENVIRONMENT_KEYS = {
+    "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
+    "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API",
+    "NVLINK_DOMAIN_SIZE",
+    "USE_MNNVL",
+}
 
 DENSE_8G_RECIPES = (
     "grpo-llama3.1-8b-instruct-2n8g.yaml",
@@ -55,11 +69,11 @@ DENSE_8G_RECIPES = (
     "grpo-qwen3-32b-8n8g-async-1off.yaml",
 )
 
-FOUR_GPU_RECIPES = (
-    "grpo-deepseek-v3-32n4g.yaml",
-    "grpo-deepseek-v3-64n4g-async-1off.yaml",
-    "grpo-qwen3-235b-16n4g.yaml",
-    "grpo-qwen3-235b-32n4g-async-1off.yaml",
+FOUR_GPU_NON_HYBRIDEP_RECIPES = (
+    "grpo-nemotron3-super-120BA12B-32n4g.yaml",
+    "grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml",
+    "grpo-qwen3-30ba3b-4n4g.yaml",
+    "grpo-qwen3-30ba3b-4n4g-async-1off.yaml",
 )
 
 
@@ -141,13 +155,50 @@ def test_dense_8g_recipes_do_not_select_hybridep(recipe_name: str) -> None:
     assert not X86_HYBRIDEP_ENVIRONMENT_KEYS.intersection(_environment(megatron_cfg))
 
 
-@pytest.mark.parametrize("recipe_name", FOUR_GPU_RECIPES)
-def test_4g_descendants_use_hybridep_without_x86_environment(
-    recipe_name: str,
+@pytest.mark.parametrize("recipe_name, expected_ranks", GB200_HYBRIDEP_RECIPES.items())
+def test_gb200_4g_recipes_set_hybridep_topology(
+    recipe_name: str, expected_ranks: str
 ) -> None:
     megatron_cfg = _megatron_config(_resolve_recipe(recipe_name))
 
     assert megatron_cfg["moe_token_dispatcher_type"] == "flex"
     assert megatron_cfg["moe_flex_dispatcher_backend"] == "hybridep"
     assert megatron_cfg["moe_hybridep_num_sms"] == 32
-    assert not X86_HYBRIDEP_ENVIRONMENT_KEYS.intersection(_environment(megatron_cfg))
+    expected = {
+        "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN": expected_ranks,
+        "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API": "128",
+        "NVLINK_DOMAIN_SIZE": "72",
+        "USE_MNNVL": "1",
+    }
+    assert expected.items() <= _environment(megatron_cfg).items()
+    assert str(megatron_cfg["expert_model_parallel_size"]) == expected_ranks
+
+
+def test_gb200_qwen3_235b_16n4g_preserves_parent_environment() -> None:
+    megatron_cfg = _megatron_config(_resolve_recipe("grpo-qwen3-235b-16n4g.yaml"))
+
+    assert "PYTORCH_CUDA_ALLOC_CONF" in _environment(megatron_cfg)
+
+
+def test_gb200_deepseek_v3_32n4g_preserves_unrelated_parent_environment() -> None:
+    parent_environment = _environment(
+        _megatron_config(_resolve_recipe("grpo-deepseek-v3-32n8g.yaml"))
+    )
+    child_environment = _environment(
+        _megatron_config(_resolve_recipe("grpo-deepseek-v3-32n4g.yaml"))
+    )
+
+    unrelated_parent_environment_keys = (
+        set(parent_environment) - GB200_HYBRIDEP_ENVIRONMENT_KEYS
+    )
+    assert unrelated_parent_environment_keys <= set(child_environment)
+
+
+@pytest.mark.parametrize("recipe_name", FOUR_GPU_NON_HYBRIDEP_RECIPES)
+def test_4g_non_hybridep_recipes_do_not_set_hybridep_topology(
+    recipe_name: str,
+) -> None:
+    megatron_cfg = _megatron_config(_resolve_recipe(recipe_name))
+
+    assert megatron_cfg.get("moe_flex_dispatcher_backend") != "hybridep"
+    assert not GB200_HYBRIDEP_ENVIRONMENT_KEYS.intersection(_environment(megatron_cfg))
