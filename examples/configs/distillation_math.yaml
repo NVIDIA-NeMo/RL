@@ -205,8 +205,6 @@ policy: &POLICY_BASE
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
-            refit_batched_moe_shuffle: true # Batch MoE layout transforms across experts during refit.
-            refit_cache_loader_routes: false # Replay stable vLLM loader routes across refits.
             kv_cache_dtype: "auto"
             tensor_parallel_size: 1
             pipeline_parallel_size: 1

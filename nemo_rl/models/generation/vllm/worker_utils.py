@@ -15,7 +15,6 @@
 from collections.abc import Mapping
 from typing import Any
 
-
 _REFIT_CACHE_LOADER_ROUTES_KEY = "nemo_rl_refit_cache_loader_routes"
 
 
@@ -24,9 +23,9 @@ def configure_refit_runtime(
 ) -> None:
     """Forward NeMo-RL refit options through vLLM's worker config."""
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
-    additional_config[_REFIT_CACHE_LOADER_ROUTES_KEY] = vllm_cfg[
-        "refit_cache_loader_routes"
-    ]
+    additional_config[_REFIT_CACHE_LOADER_ROUTES_KEY] = vllm_cfg.get(
+        "refit_cache_loader_routes", False
+    )
     vllm_kwargs["additional_config"] = additional_config
 
 

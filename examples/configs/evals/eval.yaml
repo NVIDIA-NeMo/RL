@@ -19,8 +19,6 @@ generation:
   vllm_cfg:
     async_engine: false
     precision: "bfloat16"
-    refit_batched_moe_shuffle: true
-    refit_cache_loader_routes: false
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1

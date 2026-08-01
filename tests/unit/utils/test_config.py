@@ -20,14 +20,6 @@ from omegaconf import OmegaConf
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-NEMO_GYM_VLLM_CONFIG_PATHS = [
-    config_path.relative_to(REPO_ROOT)
-    for config_path in sorted((REPO_ROOT / "examples/nemo_gym").rglob("*.yaml"))
-    if OmegaConf.select(
-        OmegaConf.load(config_path), "policy.generation.vllm_cfg"
-    )
-    is not None
-]
 ULTRA_CONFIG_PATHS = [
     "examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml",
     "examples/nemo_gym/nemotron-3-ultra/student_rlvr2.yaml",
@@ -238,18 +230,6 @@ def test_add_resolver():
     config = OmegaConf.create({"value": "${add:2,3}"})
 
     assert config.value == 5
-
-
-@pytest.mark.parametrize("config_path", NEMO_GYM_VLLM_CONFIG_PATHS)
-def test_nemo_gym_vllm_configs_define_refit_defaults(config_path):
-    """Ensure standalone NeMo-Gym vLLM configs set required refit defaults."""
-    config = OmegaConf.load(REPO_ROOT / config_path)
-    vllm_config = config.policy.generation.vllm_cfg
-
-    assert "refit_batched_moe_shuffle" in vllm_config
-    assert vllm_config.refit_batched_moe_shuffle is True
-    assert "refit_cache_loader_routes" in vllm_config
-    assert vllm_config.refit_cache_loader_routes is False
 
 
 @pytest.mark.parametrize("config_path", ULTRA_CONFIG_PATHS)

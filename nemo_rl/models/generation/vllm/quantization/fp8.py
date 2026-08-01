@@ -114,9 +114,7 @@ def install_fp8_config(config: dict[str, Any] | None) -> None:
     global_fp8_config = FP8Config(**config)
 
 
-def _patch_ray_executor_v2_worker(
-    ray_executor_v2: Any, fp8_config: FP8Config
-) -> None:
+def _patch_ray_executor_v2_worker(ray_executor_v2: Any, fp8_config: FP8Config) -> None:
     """Install FP8 patches inside RayExecutorV2 workers before model loading."""
     original_ray_worker_proc = ray_executor_v2.RayWorkerProc
     if getattr(original_ray_worker_proc, "_nrl_fp8_patched", False):
@@ -284,7 +282,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
-        "refit_batched_moe_shuffle": vllm_cfg["refit_batched_moe_shuffle"],
+        "refit_batched_moe_shuffle": vllm_cfg.get("refit_batched_moe_shuffle", True),
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -563,9 +561,7 @@ def load_weights(weights, model_runner):
     load_weights_maybe_cached(
         model,
         weights_quantized,
-        cache_loader_routes=refit_cache_loader_routes_enabled(
-            model_runner.vllm_config
-        ),
+        cache_loader_routes=refit_cache_loader_routes_enabled(model_runner.vllm_config),
     )
 
 

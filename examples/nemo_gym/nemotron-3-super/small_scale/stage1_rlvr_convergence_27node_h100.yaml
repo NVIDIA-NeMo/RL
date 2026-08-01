@@ -7,8 +7,6 @@ policy:
       resources:
         num_nodes: 12
     vllm_cfg:
-      refit_batched_moe_shuffle: true
-      refit_cache_loader_routes: false
       max_num_seqs: 16
       gpu_memory_utilization: 0.70
 

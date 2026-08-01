@@ -52,8 +52,6 @@ policy:
 
   generation:
     vllm_cfg:
-      refit_batched_moe_shuffle: true
-      refit_cache_loader_routes: false
       tensor_parallel_size: 4
       # This is a very low GPU mem utilization. We GPU OOM in two places:
       # Refit after train, refit before validation.

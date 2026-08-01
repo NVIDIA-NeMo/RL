@@ -95,8 +95,6 @@ policy:
     port_range_high: 4999
     max_new_tokens: ${policy.max_total_sequence_length}
     vllm_cfg:
-      refit_batched_moe_shuffle: true
-      refit_cache_loader_routes: false
       enable_prefix_caching: true
       tensor_parallel_size: 2
       gpu_memory_utilization: 0.8

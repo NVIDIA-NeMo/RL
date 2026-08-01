@@ -244,8 +244,6 @@ policy:
         - deepseek-r1-reasoning
         - qwen3-coder-tool
     vllm_cfg:
-      refit_batched_moe_shuffle: true
-      refit_cache_loader_routes: false
       # NB: can re-enable prefix cache on vllm >= 0.11.2.
       # enable_prefix_caching: false
       async_engine: true

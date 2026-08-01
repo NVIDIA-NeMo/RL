@@ -28,13 +28,13 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.worker_utils import (
+    refit_cache_loader_routes_enabled,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
-)
-from nemo_rl.models.generation.vllm.worker_utils import (
-    refit_cache_loader_routes_enabled,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
@@ -320,6 +320,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
         if params is None:

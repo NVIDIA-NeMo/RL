@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cloudpickle
 import types
 from typing import Any
 
+import cloudpickle
 import pytest
 import torch
 
@@ -90,6 +90,29 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert fp8.global_fp8_config.refit_batched_moe_shuffle is False
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
+
+
+def test_init_fp8_defaults_to_batched_moe_shuffle(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert fp8.global_fp8_config.refit_batched_moe_shuffle is True
 
 
 def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(

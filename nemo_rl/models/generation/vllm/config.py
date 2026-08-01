@@ -42,9 +42,9 @@ class VllmSpecificArgs(TypedDict):
     # Megatron policy backend.
     refit_prequantize: NotRequired[bool]
     # Batch MoE weight-layout transforms across experts during MXFP8 refit.
-    refit_batched_moe_shuffle: bool
+    refit_batched_moe_shuffle: NotRequired[bool]
     # Cache and replay stable vLLM weight-loader routes across refits.
-    refit_cache_loader_routes: bool
+    refit_cache_loader_routes: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
