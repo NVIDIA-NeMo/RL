@@ -228,6 +228,27 @@ def test_context_parallel_batch_padding():
     assert data["input_ids"].shape == (2, 6)
 
 
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_context_parallel_batch_padding_noop(cp_size):
+    from nemo_rl.models.value.workers.dtensor_value_worker_v2 import (
+        pad_batch_for_context_parallel,
+    )
+
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(8).reshape(2, 4),
+            "attention_mask": torch.ones(2, 4),
+        }
+    )
+
+    padded, original_seq_len = pad_batch_for_context_parallel(
+        data, cp_size=cp_size, pad_token_id=99
+    )
+
+    assert padded is data
+    assert original_seq_len == 4
+
+
 def _create_value_test_config(
     model_name: str,
     tp: int = 1,
