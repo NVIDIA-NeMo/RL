@@ -489,6 +489,7 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._data_plane_checkpoint_lock = asyncio.Lock()
     ctrl._master_config = SimpleNamespace(
         grpo={
             "num_prompts_per_step": 2,
