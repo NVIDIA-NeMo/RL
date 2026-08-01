@@ -86,9 +86,13 @@ def test_rollout_pump_stamps_target_steps(
             self._buffer = buffer
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del prompt
+            del prompt, inflight_registry
             self._buffer.reserve(target_step=target_step)
 
     buffer = _RecordingBuffer()
@@ -124,6 +128,55 @@ def test_rollout_pump_stamps_target_steps(
     assert ctrl._rollout_exhausted.is_set()
 
 
+def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
+    async def _main() -> None:
+        fresh = asyncio.create_task(asyncio.Event().wait())
+        stale = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
+
+        aborted = await ctrl._abort_stale_inflight()
+
+        assert aborted == 1
+        assert stale.cancelled()
+        assert not fresh.cancelled()
+
+        fresh.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fresh
+
+    asyncio.run(_main())
+
+
+def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
+    async def _main() -> None:
+        async def _boom() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("cleanup boom")
+
+        task = asyncio.create_task(_boom())
+        await asyncio.sleep(0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"g": (task, 0)}
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await ctrl._abort_stale_inflight()
+        assert exc_info.value.subgroup(RuntimeError) is not None
+
+    asyncio.run(_main())
+
+
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
     class _FailingRolloutManager:
         def __init__(self) -> None:
@@ -132,9 +185,13 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             self.sibling_cancelled = False
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del target_step
+            del target_step, inflight_registry
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -199,9 +256,13 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
 def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> None:
     class _NeverCalledRolloutManager:
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del prompt, target_step
+            del prompt, target_step, inflight_registry
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
