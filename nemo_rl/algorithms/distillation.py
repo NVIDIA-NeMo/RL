@@ -724,6 +724,7 @@ def distillation_train(
     val_at_start = master_config.distillation.val_at_start
     val_at_end = master_config.distillation.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     max_epochs = (
         master_config.distillation.max_num_epochs
     )  # max number of epochs to train for
@@ -736,7 +737,10 @@ def distillation_train(
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
-                student_policy, student_generation, colocated_inference
+                student_policy,
+                student_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -797,6 +801,7 @@ def distillation_train(
                             student_policy,
                             student_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                         )
                         POLICY_GENERATION_STALE = False
@@ -939,7 +944,10 @@ def distillation_train(
                 ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
+                            student_policy,
+                            student_generation,
+                            colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                         )
                         POLICY_GENERATION_STALE = False
                     else:

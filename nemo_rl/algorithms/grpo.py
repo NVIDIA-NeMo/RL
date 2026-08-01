@@ -3929,6 +3929,7 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -4081,6 +4082,7 @@ def async_grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
@@ -4608,6 +4610,7 @@ def async_grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -4641,6 +4644,7 @@ def async_grpo_train(
                                 policy,
                                 policy_generation,
                                 colocated_inference,
+                                _refit_buffer_size_gb=refit_buffer_size_gb,
                             )
                             POLICY_GENERATION_STALE = False
                         else:

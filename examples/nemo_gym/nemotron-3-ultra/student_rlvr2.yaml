@@ -305,6 +305,8 @@ policy:
     # Same memory as EP=1 but uses all-to-all for expert routing.
     # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
     vllm_cfg:
+      refit_batched_moe_shuffle: true
+      refit_cache_loader_routes: false
       async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

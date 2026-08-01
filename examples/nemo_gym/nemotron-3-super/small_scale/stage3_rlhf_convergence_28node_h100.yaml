@@ -7,6 +7,8 @@ policy:
       resources:
         num_nodes: 8            # 8 TP8 H100 gen replicas for the 2048-trajectory step
     vllm_cfg:
+      refit_batched_moe_shuffle: true
+      refit_cache_loader_routes: false
       max_num_seqs: 16
       gpu_memory_utilization: 0.75
 
