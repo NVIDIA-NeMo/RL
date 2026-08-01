@@ -197,6 +197,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
+    ctrl._inflight_by_group_id = {}
 
     asyncio.run(ctrl._sync_weights())
 
@@ -222,6 +223,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
+    ctrl._inflight_by_group_id = {}
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),

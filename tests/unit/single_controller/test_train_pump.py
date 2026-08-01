@@ -367,6 +367,8 @@ def test_train_pump_drives_mcore_training_step(
         for metrics in train_metrics:
             assert math.isfinite(metrics["reward"])
             assert math.isfinite(metrics["advantages/mean"])
+            assert metrics["evicted_stale_prompt_groups"] == 0
+            assert metrics["aborted_stale_inflight_groups"] == 0
 
     finally:
         trainer.shutdown()
