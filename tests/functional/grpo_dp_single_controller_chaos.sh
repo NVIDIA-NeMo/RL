@@ -72,6 +72,11 @@ VICTIM_STATE=${VICTIM_STATE:-idle}
 # How long to wait for the worker to be observed in that state. Generous because `serving`
 # is a narrow window -- generate_async was only ~2% of samples, against ~34% for idle.
 VICTIM_WAIT_S=${VICTIM_WAIT_S:-300}
+# GPUs this test pins itself to, independent of how many the host has. One shard of
+# generation and one trainer: killing the shard leaves the fleet empty, which is the
+# scenario -- a bounded failure with nothing to fall back to. Defined once because the
+# pre-flight check below has to agree with it.
+GPUS=2
 
 rm -rf "$EXP_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
@@ -85,7 +90,7 @@ uv run "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=8 \
     policy.train_micro_batch_size=1 \
-    cluster.gpus_per_node=2 \
+    cluster.gpus_per_node=$GPUS \
     grpo.max_num_steps=50 \
     logger.tensorboard_enabled=true \
     logger.log_dir="$LOG_DIR" \
@@ -122,12 +127,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Same reasoning in reverse: refuse to start on a dirty machine rather than
-# misreport a leftover allocation as a failure of the code under test.
+# Same reasoning in reverse: refuse to start on a dirty machine rather than misreport a
+# leftover allocation as a failure of the code under test.
+#
+# Counts how many GPUs are free and requires enough of them, rather than requiring that
+# EVERY GPU on the host is free. The latter is an OR that gets likelier to trip the bigger
+# the machine: this test pins itself to $GPUS GPUs, so on an 8-GPU CI runner one unrelated
+# process on one GPU would abort it with six sitting idle -- a false failure that says
+# nothing about the code. It still catches the case it was written for, a previous test in
+# the lane leaking a VLLM::EngineCore, because that drops the free count below $GPUS.
 if command -v nvidia-smi >/dev/null 2>&1; then
-    USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)
-    if [[ ${USED:-0} -gt 1024 ]]; then
-        echo "[chaos] FAIL: ${USED}MiB already in use on a GPU; clean up before running"
+    FREE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+           | awk -v lim=1024 '$1 <= lim' | wc -l)
+    if (( FREE < GPUS )); then
+        echo "[chaos] FAIL: need $GPUS free GPUs, found $FREE; clean up before running"
+        nvidia-smi --query-gpu=index,memory.used --format=csv
         nvidia-smi --query-compute-apps=pid,used_memory --format=csv
         exit 1
     fi
