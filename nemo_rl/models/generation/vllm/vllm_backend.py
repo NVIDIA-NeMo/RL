@@ -33,6 +33,9 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.models.generation.vllm.worker_utils import (
+    refit_cache_loader_routes_enabled,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -317,8 +320,6 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
-    _refit_cache_loader_routes: bool = False
-
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
         if params is None:
@@ -332,7 +333,9 @@ class VllmInternalWorkerExtension:
         load_weights_maybe_cached(
             self.model_runner.model,
             policy_weights,
-            cache_loader_routes=self._refit_cache_loader_routes,
+            cache_loader_routes=refit_cache_loader_routes_enabled(
+                self.model_runner.vllm_config
+            ),
         )
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
@@ -474,10 +477,6 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         fp8.install_fp8_config(serialized_fp8_config)
-        self._refit_cache_loader_routes = bool(
-            fp8.global_fp8_config
-            and fp8.global_fp8_config.refit_cache_loader_routes
-        )
         if not (
             fp8.global_fp8_config is not None
             and fp8.global_fp8_config.is_mx
@@ -893,7 +892,9 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, buffer_size_bytes: Optional[int] = None
+    ) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -902,11 +903,17 @@ class VllmInternalWorkerExtension:
 
         try:
             with self._weight_update_lifecycle("collective") as finalize:
+                consumer_kwargs = (
+                    {}
+                    if buffer_size_bytes is None
+                    else {"buffer_size_bytes": buffer_size_bytes}
+                )
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=self._load_weights,
+                    **consumer_kwargs,
                 )
                 finalize()
 

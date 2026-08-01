@@ -272,8 +272,11 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         call_order.append("load")
         assert weights == [("model.weight", "weight-value")]
 
-    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+    def packed_broadcast_consumer(
+        iterator, group, src, post_unpack_func, *, buffer_size_bytes
+    ):
         call_order.append("broadcast")
+        assert buffer_size_bytes == 1024
         assert list(iterator) == [("model.weight", expected_state_info)]
         assert group is ext.model_update_group
         assert src == 0
@@ -290,7 +293,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         lambda: call_order.append("empty_cache"),
     )
 
-    assert ext.update_weights_from_collective() is True
+    assert ext.update_weights_from_collective(buffer_size_bytes=1024) is True
 
     expected_process_calls = [(ext.model_runner.model, ext.model_config, ext.device)]
     expected_call_order = [
@@ -366,6 +369,21 @@ def test_sync_weight_updates_check_every_internal_worker(
 
 
 @pytest.mark.vllm
+def test_sync_collective_update_forwards_buffer_size():
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=[True]))
+
+    assert worker.update_weights_from_collective(buffer_size_bytes=1024) is True
+    worker.llm.collective_rpc.assert_called_once_with(
+        "update_weights_from_collective",
+        kwargs={"buffer_size_bytes": 1024},
+    )
+
+
+@pytest.mark.vllm
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "method_name",
@@ -387,6 +405,27 @@ async def test_async_weight_updates_check_every_internal_worker(
     worker.llm = SimpleNamespace(collective_rpc=AsyncMock(return_value=worker_results))
 
     assert await getattr(worker, method_name)() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_collective_update_forwards_buffer_size():
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(collective_rpc=AsyncMock(return_value=[True]))
+
+    assert (
+        await worker.update_weights_from_collective_async(buffer_size_bytes=1024)
+        is True
+    )
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "update_weights_from_collective",
+        kwargs={"buffer_size_bytes": 1024},
+    )
 
 
 @pytest.mark.vllm

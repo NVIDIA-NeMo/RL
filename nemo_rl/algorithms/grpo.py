@@ -2262,10 +2262,15 @@ def refit_policy_generation(
     with timer_context:
         # update weights
         update_success = False
+        configured_buffer_size_bytes = (
+            None
+            if _refit_buffer_size_gb is None
+            else int(_refit_buffer_size_gb * 1024**3)
+        )
         if colocated_inference:
             # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
+            if configured_buffer_size_bytes is not None:
+                buffer_size_bytes = configured_buffer_size_bytes
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
@@ -2306,11 +2311,20 @@ def refit_policy_generation(
                 )
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
-            else:
+                futures_inference = policy_generation.update_weights_from_collective()
+            elif configured_buffer_size_bytes is None:
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales
                 )
-            futures_inference = policy_generation.update_weights_from_collective()
+                futures_inference = policy_generation.update_weights_from_collective()
+            else:
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales,
+                    buffer_size_bytes=configured_buffer_size_bytes,
+                )
+                futures_inference = policy_generation.update_weights_from_collective(
+                    buffer_size_bytes=configured_buffer_size_bytes
+                )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)

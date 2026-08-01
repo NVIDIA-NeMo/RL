@@ -121,6 +121,7 @@ class NcclExtension(WorkerExtension):
         *,
         drain: bool = True,
         recompute_kv: bool = False,
+        buffer_size_bytes: int | None = None,
     ) -> bool:
         """Receive weights via NCCL broadcast and update model parameters.
 
@@ -163,11 +164,17 @@ class NcclExtension(WorkerExtension):
                         module, "_weights_removed", False
                     ):
                         module.pre_reload_weights()
+                consumer_kwargs = (
+                    {}
+                    if buffer_size_bytes is None
+                    else {"buffer_size_bytes": buffer_size_bytes}
+                )
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=load_model_weight_func,
+                    **consumer_kwargs,
                 )
                 _call_model_loader_hook_if_available(
                     model_engine.model_loader, "finalize_update_weights"

@@ -69,6 +69,8 @@ basic_vllm_test_config: VllmConfig = {
     "stop_strings": None,
     "vllm_cfg": {
         "precision": "bfloat16",
+        "refit_batched_moe_shuffle": True,
+        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,

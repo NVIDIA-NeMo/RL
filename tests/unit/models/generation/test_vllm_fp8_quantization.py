@@ -88,7 +88,6 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
     assert fp8.global_fp8_config.refit_batched_moe_shuffle is False
-    assert fp8.global_fp8_config.refit_cache_loader_routes is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
@@ -298,7 +297,7 @@ def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
     monkeypatch.setattr(
         vllm_backend,
         "load_weights_maybe_cached",
-        lambda model, weights: loaded.extend(weights),
+        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
     )
     model = object()
 
@@ -308,7 +307,10 @@ def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
             ("model.prequantized.weight", prequantized),
             ("model.receiver.weight", receiver_quantized),
         ],
-        types.SimpleNamespace(model=model),
+        types.SimpleNamespace(
+            model=model,
+            vllm_config=types.SimpleNamespace(additional_config={}),
+        ),
     )
 
     assert loaded[0][0] == "model.native"

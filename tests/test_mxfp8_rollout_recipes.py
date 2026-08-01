@@ -155,6 +155,21 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "config_path",
+    sorted(PERF_CONFIG_DIR.glob("*mxfp8-rollout.yaml")),
+    ids=lambda path: path.stem,
+)
+def test_all_mxfp8_rollout_recipes_enable_refit_optimizations(
+    config_path: Path,
+) -> None:
+    config = _load_resolved_yaml(config_path)
+    vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
+
+    assert vllm_cfg["refit_batched_moe_shuffle"] is True
+    assert vllm_cfg["refit_cache_loader_routes"] is True
+
+
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:
     suite_text = GB200_SUITE.read_text(encoding="utf-8")
 

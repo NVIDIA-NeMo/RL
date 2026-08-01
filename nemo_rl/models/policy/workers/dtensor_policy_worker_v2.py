@@ -1189,7 +1189,9 @@ class DTensorPolicyWorkerV2Impl(
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        buffer_size_bytes: Optional[int] = None,
     ) -> None:
         """Broadcast the weights for collective communication."""
         if kv_scales is not None:
@@ -1213,6 +1215,7 @@ class DTensorPolicyWorkerV2Impl(
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
+            buffer_size_bytes=buffer_size_bytes,
         )
 
         # Manually move model to cpu for cpu offload case

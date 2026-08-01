@@ -62,6 +62,8 @@ def _make_vllm_config(tokenizer, *, async_engine=False, is_eval=True):
         "quant_cfg": _QUANT_CFG,
         "vllm_cfg": {
             "precision": "bfloat16",
+            "refit_batched_moe_shuffle": True,
+            "refit_cache_loader_routes": False,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "expert_parallel_size": 1,

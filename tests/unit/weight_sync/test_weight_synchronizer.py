@@ -613,8 +613,10 @@ class TestFactory:
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
+            refit_buffer_size_gb=1.5,
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+        assert sync._buffer_size_bytes == int(1.5 * 1024**3)
 
     def test_non_colocated_sglang_raises(self):
         policy = _mock_policy()

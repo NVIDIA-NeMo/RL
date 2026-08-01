@@ -1354,7 +1354,9 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, buffer_size_bytes: Optional[int] = None
+    ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1366,9 +1368,15 @@ class VllmAsyncGenerationWorkerImpl(
                     "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
                 )
 
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
-            )
+            if buffer_size_bytes is None:
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_from_collective", args=tuple()
+                )
+            else:
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_from_collective",
+                    kwargs={"buffer_size_bytes": buffer_size_bytes},
+                )
 
             if asyncio.iscoroutine(result_or_coro):
                 worker_results = await result_or_coro

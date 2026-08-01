@@ -33,6 +33,9 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
+from nemo_rl.models.generation.vllm.worker_utils import (
+    refit_cache_loader_routes_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -63,7 +66,6 @@ class FP8Config:
     # *_scale_from_checkpoint entries), so load_weights skips re-quantization.
     refit_prequantize: bool = False
     refit_batched_moe_shuffle: bool = True
-    refit_cache_loader_routes: bool = False
 
 
 @dataclass()
@@ -283,7 +285,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
         "refit_batched_moe_shuffle": vllm_cfg["refit_batched_moe_shuffle"],
-        "refit_cache_loader_routes": vllm_cfg["refit_cache_loader_routes"],
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -562,7 +563,9 @@ def load_weights(weights, model_runner):
     load_weights_maybe_cached(
         model,
         weights_quantized,
-        cache_loader_routes=global_fp8_config.refit_cache_loader_routes,
+        cache_loader_routes=refit_cache_loader_routes_enabled(
+            model_runner.vllm_config
+        ),
     )
 
 
