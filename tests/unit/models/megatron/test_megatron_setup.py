@@ -3642,3 +3642,92 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+@pytest.mark.mcore
+class TestForceSyncModelFromOptimizerFp32:
+    """Regression tests for the first forward after a full optimizer resume."""
+
+    @staticmethod
+    def _make_distrib_opt(hdo_cls, model_values=(0.0, 0.0), master_values=(3.0, 4.0)):
+        model_param = torch.tensor(model_values)
+        fp32_master = torch.tensor(master_values)
+
+        class _HDO(hdo_cls):
+            def __init__(self):
+                self.param_to_fp32_param = {model_param: fp32_master}
+
+        model_chunk = MagicMock()
+        distrib_opt = SimpleNamespace(
+            optimizer=_HDO(),
+            model_chunks=[model_chunk],
+        )
+        return SimpleNamespace(
+            distrib_opt=distrib_opt,
+            model_param=model_param,
+            fp32_master=fp32_master,
+            model_chunk=model_chunk,
+        )
+
+    def test_restores_compute_params_and_forces_dp_sync(self, monkeypatch):
+        """Loaded FP32 masters must reach BF16 shards before the first forward."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        setup_mod._force_sync_model_from_optimizer_fp32(fake.distrib_opt)
+
+        torch.testing.assert_close(fake.model_param, fake.fp32_master)
+        fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+
+    def test_handles_chained_optimizers(self, monkeypatch):
+        """Every distributed optimizer in a chain is restored and synchronized."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        a = self._make_distrib_opt(
+            _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(1.0, 2.0)
+        )
+        b = self._make_distrib_opt(
+            _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(5.0, 6.0)
+        )
+        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+
+        setup_mod._force_sync_model_from_optimizer_fp32(chained)
+
+        for fake in (a, b):
+            torch.testing.assert_close(fake.model_param, fake.fp32_master)
+            fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+
+    def test_noop_for_non_hybrid_optimizer(self, monkeypatch):
+        """Other optimizer implementations must remain untouched."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        model_param = torch.zeros(2)
+        model_chunk = MagicMock()
+        plain_opt = SimpleNamespace(
+            optimizer=object(),
+            model_chunks=[model_chunk],
+        )
+
+        setup_mod._force_sync_model_from_optimizer_fp32(plain_opt)
+
+        torch.testing.assert_close(model_param, torch.zeros(2))
+        model_chunk.start_param_sync.assert_not_called()
