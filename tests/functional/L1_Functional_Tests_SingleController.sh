@@ -36,6 +36,12 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
+# Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
+# and attributably instead of wedging. This is the ONLY end-to-end check of the
+# containment behaviour -- without it, a regression that restores the silent wedge is
+# caught by nothing, because a wedged job produces no exception and no failing assertion
+# anywhere else.
+run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -8,8 +8,12 @@
 # spun, with no exception raised anywhere. The pass condition here is therefore not
 # "training succeeds"; it is "the job stops, quickly, with an attributable error".
 #
-# Not part of any CI lane: it needs GPUs and is inherently timing-sensitive. Run it
-# by hand when changing the rollout failure paths.
+# Registered in the SingleController L1 lane (full mode). It was originally kept out as
+# "timing-sensitive", but that no longer justifies exclusion: the death deadline is now
+# 600s against an observed 222s, the victim selection is asserted rather than assumed, and
+# the recovery tests in the same lane kill processes the same way. Leaving it out meant
+# the containment behaviour had no end-to-end coverage at all -- and a wedge is precisely
+# the failure that no other test can detect, because it raises nothing.
 #
 # Usage: bash tests/functional/grpo_dp_single_controller_chaos.sh
 
