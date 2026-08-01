@@ -38,6 +38,12 @@ policy:
         weight_transfer_mode: ipc
       sglang_router_config:
         use_external_router: false
+      # Fault tolerance (RolloutHealthMonitor). Off by default; when enabled,
+      # a daemon thread health-checks each engine and restarts hung/dead actors.
+      use_fault_tolerance: false
+      rollout_health_check_interval: 60
+      rollout_health_check_timeout: 60
+      rollout_health_check_first_wait: 60
     colocated:
       enabled: true
 

@@ -135,6 +135,11 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         # Validating read: a misspelled scheme must raise, not fall back to BF16.
         target_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
 
+        # Restart engines that died since the last refit, so the topology read
+        # below reflects the survivors. No-op when nothing died.
+        if self._generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
+            self._generation.recover_updatable_engines()
+
         (
             rollout_engines,
             rollout_engine_lock,
