@@ -42,6 +42,16 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # caught by nothing, because a wedged job produces no exception and no failing assertion
 # anywhere else.
 run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+# Full mode only: the same Gym run, but with NeMo-Gym pointed at the NeMo-RL-owned router.
+# Without this the router has no functional coverage at all -- the default Gym run above
+# leaves it disabled, so a regression in the proxy would ship silently.
+#
+# gen_kl_error is the assertion that earns its keep here: it compares vLLM's logprobs
+# against the trainer's recomputation, so a proxy that corrupts or truncates a response
+# blows it up. A run that merely completes would not prove the payload survived the hop.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
+    ++async_rl.policy_router.enabled=true \
+    ++async_rl.fleet_health.enabled=true
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
