@@ -36,19 +36,42 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 # headroom, and CI is slower than this workstation -- a deadline that tight turns into a
 # flaky "wedge" report.
 DEATH_DEADLINE_S=${DEATH_DEADLINE_S:-600}
-# Pattern matching the Ray worker process that serves generation.
+# Which generation worker to kill, and in which state.
 #
-# Matches BOTH the `ray::`-titled form and the venv-path form, because both occur: Ray
-# retitles its workers via setproctitle, and a worker observed mid-run had the venv path
-# in /proc/<pid>/cmdline while the one killed in a later run showed `ray::`.
+# Ray retitles a worker with setproctitle for the exact duration of a call, so a single
+# actor cycles through several titles. Observed over one run (378 samples):
 #
-# This was widened after a run where the old `ray::.*[Gg]eneration` pattern selected a
-# process that was NOT the serving generation worker: the kill landed, the worker kept
-# serving, training continued to step 3/50, and the test was on course to report a wedge
-# that never happened -- a false failure of the very behaviour it exists to prove. The
-# assertions below matter more than the pattern: they make a mis-targeted kill visible
-# instead of letting it masquerade as a hang.
-WORKER_PATTERN=${WORKER_PATTERN:-'ray::.*[Gg]enerationWorker|ray_venvs/.*[Gg]enerationWorker/bin/python'}
+#   /opt/ray_venvs/...VllmAsyncGenerationWorker/bin/python   a CHILD process, not the actor
+#   bash -c exec /opt/ray_venvs/...GenerationWorker...       the launcher shell
+#   ray::VllmAsyncGenerationWorker                           the actor, between calls
+#   ray::vllm_policy-0-0:VllmAsyncGenerationWorker.__init__  the actor, constructing
+#   ray::VllmAsyncGenerationWorker.generate_async            the actor, serving a rollout
+#   ray::VllmAsyncGenerationWorker.init_collective_async     the actor, setting up refit
+#   ray::VllmAsyncGenerationWorker.shutdown                  the actor, tearing down
+#
+# A loose `[Gg]enerationWorker` substring matches every one of those -- three distinct
+# processes across five states -- and `head -1` then picked whichever had the lowest pid.
+# So the test silently chose a different scenario from run to run. It never failed, because
+# every scenario does end in a bounded attributable failure, which is all it asserted; the
+# difference only showed up as wildly different wall-clock times across branches (7s vs
+# 222s). A `*GenerationWorker*` check on the victim does not help either: the launcher
+# shell and the venv child both satisfy it.
+#
+# So select the ACTOR structurally (`ray::` prefix, optional `name:` infix) and pin the
+# state:
+#   idle    -- title has no method suffix. Nothing is in flight, so the loss must be
+#              *detected*: by a health probe, or by the stall detector. This exercises the
+#              resiliency machinery, so it is the default.
+#   serving -- title is `.generate_async`. An in-flight rollout RPC dies with the worker
+#              and the failure surfaces immediately, without detection doing any work.
+#
+# Deliberately not "any method suffix": killing during __init__, init_collective_async or
+# shutdown are three further distinct scenarios, and lumping them in would reintroduce
+# exactly the ambiguity this replaces.
+VICTIM_STATE=${VICTIM_STATE:-idle}
+# How long to wait for the worker to be observed in that state. Generous because `serving`
+# is a narrow window -- generate_async was only ~2% of samples, against ~34% for idle.
+VICTIM_WAIT_S=${VICTIM_WAIT_S:-300}
 
 rm -rf "$EXP_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
@@ -118,22 +141,46 @@ for _ in $(seq 1 120); do
 done
 grep -q "train step 1/" "$RUN_LOG" || { echo "[chaos] FAIL: never reached a train step"; tail -40 "$RUN_LOG"; exit 1; }
 
-VICTIM=$(pgrep -f "$WORKER_PATTERN" | head -1)
-if [[ -z "${VICTIM:-}" ]]; then
-    echo "[chaos] FAIL: no process matched '$WORKER_PATTERN'"
-    ps -eo pid,args --no-headers | grep -iE "generation|EngineCore" | grep -v grep | head -20
+# A Ray generation ACTOR, optionally with a `<actor-name>:` infix, and with the method
+# suffix that says what it is doing. Anchored at both ends so the venv child process and
+# the launcher shell -- which both contain the class name -- cannot match.
+ACTOR_RE='^ray::([A-Za-z0-9_.:-]+:)?[A-Za-z_]*GenerationWorker'
+case "$VICTIM_STATE" in
+    idle)    STATE_RE="${ACTOR_RE}\$" ;;
+    serving) STATE_RE="${ACTOR_RE}\.generate_async\$" ;;
+    *) echo "[chaos] FAIL: VICTIM_STATE must be 'idle' or 'serving', got '$VICTIM_STATE'"; exit 1 ;;
+esac
+
+# Poll faster than a generate_async call lasts, or the narrow `serving` window is missed.
+echo "[chaos] waiting up to ${VICTIM_WAIT_S}s for a generation worker in state '$VICTIM_STATE'..."
+VICTIM=""
+for _ in $(seq 1 $((VICTIM_WAIT_S * 5))); do
+    kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before the kill"; tail -40 "$RUN_LOG"; exit 1; }
+    while read -r pid title; do
+        if [[ "$title" =~ $STATE_RE ]]; then VICTIM=$pid; VICTIM_CMD=$title; break; fi
+    done < <(ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//')
+    [[ -n "$VICTIM" ]] && break
+    sleep 0.2
+done
+if [[ -z "$VICTIM" ]]; then
+    echo "[chaos] FAIL: no generation actor reached state '$VICTIM_STATE' in ${VICTIM_WAIT_S}s"
+    echo "[chaos] actors seen now:"
+    ps -eo pid=,args= | sed -E 's/^ *//' | grep -E "$ACTOR_RE" | head -10
     exit 1
 fi
-# Print what is actually being killed. The whole test is meaningless if the victim is not
-# a generation worker, and a mis-targeted kill otherwise looks exactly like a pass of the
-# "job keeps running" kind -- i.e. it is reported as a wedge.
-VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | cut -c1-120)
-echo "[chaos] killing generation worker pid=$VICTIM"
-echo "[chaos]   cmdline: $VICTIM_CMD"
-case "$VICTIM_CMD" in
-    *[Gg]enerationWorker*) ;;
-    *) echo "[chaos] FAIL: victim does not look like a generation worker"; exit 1 ;;
-esac
+
+# Re-read the title immediately before killing. Ray can retitle the actor between the scan
+# and the kill; the window is sub-millisecond, but a state change here would silently turn
+# this back into the coin flip the whole exercise removes, so check rather than assume.
+NOW_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
+if [[ ! "$NOW_CMD" =~ $STATE_RE ]]; then
+    echo "[chaos] FAIL: pid $VICTIM left state '$VICTIM_STATE' before the kill"
+    echo "[chaos]   was: $VICTIM_CMD"
+    echo "[chaos]   now: $NOW_CMD"
+    exit 1
+fi
+echo "[chaos] killing generation worker pid=$VICTIM in state '$VICTIM_STATE'"
+echo "[chaos]   cmdline: $NOW_CMD"
 kill -9 "$VICTIM"
 KILLED_AT=$(date +%s)
 sleep 2
