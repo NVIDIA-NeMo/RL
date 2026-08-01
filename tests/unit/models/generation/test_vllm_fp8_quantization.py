@@ -88,6 +88,61 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    events = []
+    config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=2,
+        is_mx=True,
+    )
+
+    class FakeRayWorkerProc:
+        def initialize_worker(
+            self,
+            local_rank,
+            env_vars,
+            driver_env_vars=None,
+            assigned_physical_gpu_ids=None,
+        ):
+            events.append(
+                (
+                    "model_load",
+                    local_rank,
+                    env_vars,
+                    driver_env_vars,
+                    assigned_physical_gpu_ids,
+                )
+            )
+
+    def fake_apply_fp8_patches(_self, fp8_config):
+        events.append(("fp8_patches", fp8_config))
+        fp8.fp8_patches_applied = True
+
+    monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
+    fp8._patch_ray_executor_v2_worker(FakeRayWorkerProc, config)
+
+    FakeRayWorkerProc().initialize_worker(
+        1,
+        {"WORKER_ENV": "1"},
+        {"DRIVER_ENV": "1"},
+        assigned_physical_gpu_ids=[2, 3],
+    )
+
+    assert events == [
+        ("fp8_patches", config),
+        (
+            "model_load",
+            1,
+            {"WORKER_ENV": "1"},
+            {"DRIVER_ENV": "1"},
+            [2, 3],
+        ),
+    ]
+
+
 @pytest.mark.parametrize(
     ("field", "error"),
     [

@@ -110,7 +110,44 @@ def install_fp8_config(config: dict[str, Any] | None) -> None:
     global_fp8_config = FP8Config(**config)
 
 
+def _patch_ray_executor_v2_worker(
+    ray_worker_proc_cls: type[Any], fp8_config: FP8Config
+) -> None:
+    """Install FP8 patches inside RayExecutorV2 workers before model loading."""
+    original_initialize_worker = ray_worker_proc_cls.initialize_worker
+    if getattr(original_initialize_worker, "_nrl_fp8_patched", False):
+        return
+
+    def initialize_worker_with_fp8_patches(
+        self: Any,
+        local_rank: int,
+        env_vars: dict[str, str],
+        driver_env_vars: dict[str, str] | None = None,
+        assigned_physical_gpu_ids: list[int] | None = None,
+    ) -> Any:
+        global fp8_patches_applied
+        if not fp8_patches_applied:
+            apply_fp8_patches(None, fp8_config)
+        return original_initialize_worker(
+            self,
+            local_rank,
+            env_vars,
+            driver_env_vars,
+            assigned_physical_gpu_ids,
+        )
+
+    setattr(initialize_worker_with_fp8_patches, "_nrl_fp8_patched", True)
+    ray_worker_proc_cls.initialize_worker = initialize_worker_with_fp8_patches
+
+
 def monkey_patch_vllm_ray_executor(fp8_config):
+    try:
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+    except ImportError:
+        pass
+    else:
+        _patch_ray_executor_v2_worker(RayWorkerProc, fp8_config)
+
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
