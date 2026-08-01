@@ -431,9 +431,14 @@ env:
       - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
       - resources_servers/format_verification/configs/freeform_formatting.yaml
       - resources_servers/format_verification/configs/citation_format.yaml
-      - resources_servers/rdkit_chemistry/configs/rdkit_chemistry.yaml
+      - resources_servers/litmus_agent/configs/litmus_agent.yaml
       - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
       - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
+
+    # The RLVR2 blend still uses the superseded rdkit_chemistry agent
+    # name. Keep that data reference while running the replacement Litmus agent.
+    rdkit_chemistry_agent:
+      _inherit_from: litmus_agent_agent
 
     policy_model:
       responses_api_models:

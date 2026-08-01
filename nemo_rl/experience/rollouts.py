@@ -50,6 +50,7 @@ from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
@@ -142,6 +143,50 @@ def _dummy_routed_experts_for_tokens(
         .expand(int(token_ids.shape[0]), template.shape[1], topk)
         .clone()
     )
+
+
+def backfill_missing_routed_experts(
+    message_logs: Sequence[list[dict]],
+) -> None:
+    """Give every tokenized message a ``routed_experts`` row, in place.
+
+    Routes are attached only where generation ran, so a trajectory whose first
+    turn raised (or a turn whose routes vLLM could not return) leaves messages
+    without the field while its siblings have it. Flattening then either stacks
+    ragged ranks or silently concatenates a short column, so fill the gaps with
+    the all--1 missing-route sentinel: Megatron routes those tokens with its own
+    router, which is the honest answer for tokens no capture covered.
+
+    No-op when the batch carries no routes at all — that is the router-replay-off
+    case, and on the TQ paths the producer-side guard must still see the field
+    missing so it can report a capture failure.
+    """
+    template = None
+    for message_log in message_logs:
+        template = _find_routed_experts_template(message_log)
+        if template is not None:
+            break
+    if template is None:
+        return
+    if template.dim() != 3:
+        raise ValueError(
+            "routed_experts messages must have shape [tokens, layers, topk], "
+            f"got {tuple(template.shape)}"
+        )
+
+    for message_log in message_logs:
+        for msg in message_log:
+            token_ids = msg.get("token_ids")
+            if not isinstance(token_ids, torch.Tensor):
+                continue
+            if isinstance(msg.get("routed_experts"), torch.Tensor):
+                continue
+            msg["routed_experts"] = torch.full(
+                (int(token_ids.shape[0]), template.shape[1], template.shape[2]),
+                ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                dtype=template.dtype,
+                device=template.device,
+            )
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):

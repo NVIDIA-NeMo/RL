@@ -34,6 +34,12 @@ An example recipe is available at:
 examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
 ```
 
+The native async TransferQueue path uses the SingleController entrypoint with:
+
+```text
+examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
+```
+
 ## Validation
 
 Router Replay validation covers two end-to-end questions:
@@ -43,13 +49,14 @@ Router Replay validation covers two end-to-end questions:
 2. whether matched R3-on runs reduce train-vs-rollout mismatch relative to
    matched R3-off controls.
 
-### Trace Debugging
+### Validation and Trace Debugging
 
 Router Replay can emit JSONL traces for a small number of training steps. This
 is intended for correctness debugging, not long training runs.
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
+| `NRL_ROUTER_REPLAY_VALIDATE` | `0` | Validate replay tensors before Megatron installs them, rejecting partially missing routes, duplicate top-k expert IDs, and out-of-range expert IDs. |
 | `NRL_R3_TRACE` | `0` | Master switch for R3 JSONL trace emission. |
 | `NRL_R3_TRACE_STEPS` | `1` | Number of training steps to trace. |
 | `NRL_R3_TRACE_SAMPLES` | `2` | Number of samples with full tensor previews. |
@@ -110,7 +117,11 @@ all returned vLLM routes are still replayed exactly.
 The fallback is intentionally route-local: it does not disable Router Replay for
 the whole batch or sample.
 
-When fallback is used, NeMo RL logs
-`r3/routed_experts_fallback_token_route_fraction`. This metric should normally
-be zero or near-zero. A nonzero value means some token routes used Megatron's
-normal router instead of replay.
+When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warning
+to the run log naming the affected sample count and missing token-route count.
+Fallback should normally be absent or rare; frequent warnings mean a meaningful
+share of token routes used Megatron's normal router instead of replay.
+
+The generation backend also computes
+`r3/routed_experts_fallback_token_route_fraction`, but no training loop currently
+forwards it to the metric logger, so do not rely on it in dashboards or gates.
