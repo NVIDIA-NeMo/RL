@@ -16,6 +16,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,6 +36,258 @@ from nemo_rl.utils.timer import Timer
 
 class FakeWeightSynchronizer:
     pass
+
+
+class FakeCheckpointDataPlane:
+    def __init__(self) -> None:
+        self.saves: list[dict[str, Any]] = []
+        self.loads: list[dict[str, Any]] = []
+        self.metadata: dict[str, Any] = {}
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.saves.append(kwargs)
+        self.metadata = dict(kwargs["metadata"])
+
+    def load_checkpoint(self, **kwargs: Any) -> dict[str, Any]:
+        self.loads.append(kwargs)
+        return dict(self.metadata)
+
+
+def _checkpoint_controller(
+    dp_client: Any | None = None,
+) -> tuple[Any, Any]:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    if dp_client is None:
+        dp_client = FakeCheckpointDataPlane()
+    ctrl._dp_client = dp_client
+    ctrl._data_plane_checkpoint_lock = asyncio.Lock()
+    ctrl._run_started = False
+    ctrl._train_steps = 4
+    ctrl._trainer_version = 5
+    ctrl._current_epoch = 2
+    ctrl._partition_id = "rollout-data"
+    return ctrl, dp_client
+
+
+def test_data_plane_checkpoint_hooks_forward_through_client(tmp_path) -> None:
+    ctrl, dp_client = _checkpoint_controller()
+    checkpoint_dir = str(tmp_path / "step-4")
+
+    asyncio.run(
+        ctrl.save_data_plane_checkpoint(
+            checkpoint_dir,
+            metadata={"run_id": "test-run"},
+        )
+    )
+    restored_metadata = asyncio.run(
+        ctrl.load_data_plane_checkpoint(checkpoint_dir)
+    )
+
+    assert dp_client.saves == [
+        {
+            "checkpoint_dir": checkpoint_dir,
+            "metadata": {
+                "run_id": "test-run",
+                "data_plane_checkpoint_schema_version": 1,
+                "single_controller_train_steps": 4,
+                "single_controller_trainer_version": 5,
+                "single_controller_epoch": 2,
+            },
+        }
+    ]
+    assert dp_client.loads == [{"checkpoint_dir": checkpoint_dir}]
+    assert restored_metadata == dp_client.saves[0]["metadata"]
+
+
+def test_data_plane_checkpoint_restore_rejected_after_run_starts(tmp_path) -> None:
+    ctrl, dp_client = _checkpoint_controller()
+    ctrl._run_started = True
+
+    with pytest.raises(RuntimeError, match="before SingleControllerActor.run"):
+        asyncio.run(
+            ctrl.load_data_plane_checkpoint(
+                str(tmp_path / "step-4"),
+            )
+        )
+    assert dp_client.loads == []
+
+
+def test_run_waits_for_inflight_data_plane_restore(tmp_path) -> None:
+    class BlockingCheckpointDataPlane:
+        def __init__(self) -> None:
+            self.load_started = asyncio.Event()
+            self.allow_load = asyncio.Event()
+
+        async def load_checkpoint(self, checkpoint_dir) -> dict[str, Any]:
+            self.load_started.set()
+            await self.allow_load.wait()
+            return {}
+
+    async def exercise() -> None:
+        dp_client = BlockingCheckpointDataPlane()
+        ctrl, _ = _checkpoint_controller(dp_client)
+        sync_started = asyncio.Event()
+        block_sync = asyncio.Event()
+
+        async def blocking_sync_weights() -> None:
+            sync_started.set()
+            await block_sync.wait()
+
+        ctrl._sync_weights = blocking_sync_weights
+
+        load_task = asyncio.create_task(
+            ctrl.load_data_plane_checkpoint(str(tmp_path / "step-4"))
+        )
+        await dp_client.load_started.wait()
+
+        run_task = asyncio.create_task(ctrl.run())
+        await asyncio.sleep(0)
+        assert not ctrl._run_started
+
+        dp_client.allow_load.set()
+        await load_task
+        await sync_started.wait()
+        assert ctrl._run_started
+
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+    asyncio.run(exercise())
+
+
+def test_data_plane_checkpoint_saves_serialize_and_snapshot_inside_lock(
+    tmp_path,
+) -> None:
+    class BlockingCheckpointDataPlane:
+        def __init__(self) -> None:
+            self.save_started = asyncio.Event()
+            self.allow_first_save = asyncio.Event()
+            self.active_saves = 0
+            self.max_active_saves = 0
+            self.saves: list[dict[str, Any]] = []
+
+        async def save_checkpoint(self, **kwargs: Any) -> None:
+            self.active_saves += 1
+            self.max_active_saves = max(
+                self.max_active_saves, self.active_saves
+            )
+            self.saves.append(kwargs)
+            if len(self.saves) == 1:
+                self.save_started.set()
+                await self.allow_first_save.wait()
+            self.active_saves -= 1
+
+    async def exercise() -> None:
+        dp_client = BlockingCheckpointDataPlane()
+        ctrl, _ = _checkpoint_controller(dp_client)
+        first = asyncio.create_task(
+            ctrl.save_data_plane_checkpoint(str(tmp_path / "first"))
+        )
+        await dp_client.save_started.wait()
+
+        second = asyncio.create_task(
+            ctrl.save_data_plane_checkpoint(str(tmp_path / "second"))
+        )
+        await asyncio.sleep(0)
+        ctrl._train_steps = 9
+        ctrl._trainer_version = 10
+        assert len(dp_client.saves) == 1
+
+        dp_client.allow_first_save.set()
+        await asyncio.gather(first, second)
+
+        assert dp_client.max_active_saves == 1
+        assert dp_client.saves[0]["metadata"][
+            "single_controller_train_steps"
+        ] == 4
+        assert dp_client.saves[1]["metadata"][
+            "single_controller_train_steps"
+        ] == 9
+        assert dp_client.saves[1]["metadata"][
+            "single_controller_trainer_version"
+        ] == 10
+
+    asyncio.run(exercise())
+
+
+def test_data_plane_clear_waits_for_checkpoint_save(tmp_path) -> None:
+    class BlockingCheckpointDataPlane:
+        def __init__(self) -> None:
+            self.save_started = asyncio.Event()
+            self.allow_save = asyncio.Event()
+            self.clears: list[dict[str, Any]] = []
+
+        async def save_checkpoint(self, **kwargs: Any) -> None:
+            self.save_started.set()
+            await self.allow_save.wait()
+
+        def clear_samples(self, **kwargs: Any) -> None:
+            self.clears.append(kwargs)
+
+    async def exercise() -> None:
+        dp_client = BlockingCheckpointDataPlane()
+        ctrl, _ = _checkpoint_controller(dp_client)
+        save = asyncio.create_task(
+            ctrl.save_data_plane_checkpoint(str(tmp_path / "checkpoint"))
+        )
+        await dp_client.save_started.wait()
+
+        clear = asyncio.create_task(
+            ctrl._clear_data_plane_samples(["sample-1"])
+        )
+        await asyncio.sleep(0)
+        assert dp_client.clears == []
+
+        dp_client.allow_save.set()
+        await asyncio.gather(save, clear)
+        assert dp_client.clears == [
+            {
+                "sample_ids": ["sample-1"],
+                "partition_id": "rollout-data",
+            }
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_data_plane_checkpoint_save_failure_is_reported(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingCheckpointDataPlane:
+        def save_checkpoint(self, **kwargs: Any) -> None:
+            raise OSError("storage unavailable")
+
+    ctrl, _ = _checkpoint_controller(FailingCheckpointDataPlane())
+    checkpoint_dir = str(tmp_path / "failed")
+
+    with pytest.raises(OSError, match="storage unavailable"):
+        asyncio.run(ctrl.save_data_plane_checkpoint(checkpoint_dir))
+
+    output = capsys.readouterr().out
+    assert "data-plane checkpoint save failed" in output
+    assert checkpoint_dir in output
+
+
+def test_data_plane_checkpoint_load_failure_is_reported(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingCheckpointDataPlane:
+        def load_checkpoint(self, **kwargs: Any) -> dict[str, Any]:
+            raise FileNotFoundError("checkpoint missing")
+
+    ctrl, _ = _checkpoint_controller(FailingCheckpointDataPlane())
+    checkpoint_dir = str(tmp_path / "missing")
+
+    with pytest.raises(FileNotFoundError, match="checkpoint missing"):
+        asyncio.run(ctrl.load_data_plane_checkpoint(checkpoint_dir))
+
+    output = capsys.readouterr().out
+    assert "data-plane checkpoint load failed" in output
+    assert checkpoint_dir in output
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:

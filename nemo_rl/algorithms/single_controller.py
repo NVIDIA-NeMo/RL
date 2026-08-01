@@ -143,6 +143,15 @@ class SingleControllerActor:
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
+        # Serializes explicit data-plane save/load requests. TQ requires load
+        # before any data operations and does not support overlapping saves.
+        self._data_plane_checkpoint_lock: asyncio.Lock = asyncio.Lock()
+        self._run_started: bool = False
+        if self._buffer is not None:
+            self._buffer.set_data_plane_checkpoint_lock(
+                self._data_plane_checkpoint_lock
+            )
+
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
@@ -187,6 +196,16 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
+        # Establish a total order with pre-run restore. If restore already
+        # holds the lock, run waits for it to finish. If run wins, it marks the
+        # controller started before a later restore can acquire the lock.
+        async with self._data_plane_checkpoint_lock:
+            if self._run_started:
+                raise RuntimeError(
+                    "SingleControllerActor.run() may only be called once"
+                )
+            self._run_started = True
+
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
@@ -212,6 +231,99 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
         }
+
+    async def save_data_plane_checkpoint(
+        self,
+        checkpoint_dir: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Save TQ state through the data-plane abstraction.
+
+        This is an explicit PoC hook, not yet the coordinated NeMo-RL
+        model/controller checkpoint trigger. The current local data-plane call
+        blocks this actor while TQ saves, so the train pump cannot clear rows
+        concurrently; independent producers may continue to put rows.
+
+        The saved controller counters are diagnostic compatibility metadata.
+        Loading this checkpoint does not apply them to the controller.
+        """
+        async with self._data_plane_checkpoint_lock:
+            checkpoint_metadata = dict(metadata or {})
+            checkpoint_metadata.update(
+                {
+                    "data_plane_checkpoint_schema_version": 1,
+                    "single_controller_train_steps": self._train_steps,
+                    "single_controller_trainer_version": self._trainer_version,
+                    "single_controller_epoch": self._current_epoch,
+                }
+            )
+            started = time.monotonic()
+            print(
+                f"data-plane checkpoint save started: {checkpoint_dir}",
+                flush=True,
+            )
+            try:
+                await self._call_dp(
+                    "save_checkpoint",
+                    checkpoint_dir=checkpoint_dir,
+                    metadata=checkpoint_metadata,
+                )
+            except Exception as error:
+                print(
+                    "data-plane checkpoint save failed: "
+                    f"{checkpoint_dir} ({type(error).__name__}: {error})",
+                    flush=True,
+                )
+                raise
+            print(
+                "data-plane checkpoint save completed: "
+                f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
+                flush=True,
+            )
+
+    async def load_data_plane_checkpoint(
+        self, checkpoint_dir: str
+    ) -> dict[str, Any]:
+        """Restore TQ state before :meth:`run` and return save-time metadata.
+
+        This does not restore controller counters, policy/optimizer state,
+        dataloader position, or the process-local replay-buffer index.
+        """
+        async with self._data_plane_checkpoint_lock:
+            if self._run_started:
+                raise RuntimeError(
+                    "Data-plane checkpoint restore must run before "
+                    "SingleControllerActor.run()"
+                )
+            started = time.monotonic()
+            print(
+                f"data-plane checkpoint load started: {checkpoint_dir}",
+                flush=True,
+            )
+            try:
+                metadata = await self._call_dp(
+                    "load_checkpoint",
+                    checkpoint_dir=checkpoint_dir,
+                )
+                if not isinstance(metadata, dict):
+                    raise TypeError(
+                        "DataPlaneClient.load_checkpoint() must return a metadata "
+                        f"dictionary, got {type(metadata).__name__}"
+                    )
+            except Exception as error:
+                print(
+                    "data-plane checkpoint load failed: "
+                    f"{checkpoint_dir} ({type(error).__name__}: {error})",
+                    flush=True,
+                )
+                raise
+            print(
+                "data-plane checkpoint load completed: "
+                f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
+                flush=True,
+            )
+            return dict(metadata)
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
@@ -240,6 +352,27 @@ class SingleControllerActor:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    async def _evict_stale_groups(self) -> int:
+        """Evict stale groups through the sampler.
+
+        Data-plane row clears are serialized against checkpoints inside
+        ``TQReplayBuffer._clear_samples``. Do not acquire the checkpoint lock
+        here: ``asyncio.Lock`` is not reentrant, and the downstream clear
+        acquires the same lock.
+        """
+        return await self._sampler.evict(
+            current_train_weight=self._trainer_version,
+        )
+
+    async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
+        """Clear consumed rows without overlapping a data-plane checkpoint."""
+        async with self._data_plane_checkpoint_lock:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+            )
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -375,9 +508,8 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
-                        evicted = await self._sampler.evict(
-                            current_train_weight=self._trainer_version,
-                        )
+                        # TQ snapshots permit concurrent puts but not clears.
+                        evicted = await self._evict_stale_groups()
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -497,10 +629,8 @@ class SingleControllerActor:
                         min_sample_version = curr_min_sample_version
 
                     # Remove consumed sample_ids from the buffer
-                    await self._call_dp(
-                        "clear_samples",
-                        sample_ids=list(train_meta.sample_ids),
-                        partition_id=self._partition_id,
+                    await self._clear_data_plane_samples(
+                        list(train_meta.sample_ids)
                     )
 
                     groups_dispatched += num_groups

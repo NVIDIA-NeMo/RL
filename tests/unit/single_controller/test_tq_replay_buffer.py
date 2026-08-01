@@ -132,10 +132,16 @@ def _make_record() -> PromptGroupRecord:
     )
 
 
-def _make_buffer(dp: FakeDataPlaneClient) -> TQReplayBuffer:
-    return TQReplayBuffer(
+def _make_buffer(
+    dp: FakeDataPlaneClient,
+    *,
+    checkpoint_lock: asyncio.Lock | None = None,
+) -> TQReplayBuffer:
+    buf = TQReplayBuffer(
         dp, partition_id="rollout_data", pad_value_dict={"token_ids": 0}
     )
+    buf.set_data_plane_checkpoint_lock(checkpoint_lock or asyncio.Lock())
+    return buf
 
 
 def _add_group(
@@ -285,6 +291,45 @@ class TestTQReplayBufferReserveCommit:
 
 
 class TestTQReplayBufferRemove:
+    def test_dp_clear_fails_without_bound_checkpoint_lock(self):
+        dp = FakeDataPlaneClient()
+        buf = TQReplayBuffer(
+            dp,
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+        )
+
+        with pytest.raises(RuntimeError, match="must be bound"):
+            _run(buf._clear_samples(sample_ids=["sample-1"]))
+
+        assert dp.clear_calls == []
+
+    def test_dp_clear_waits_for_bound_checkpoint_lock(self):
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            checkpoint_lock = asyncio.Lock()
+            buf = _make_buffer(dp, checkpoint_lock=checkpoint_lock)
+            group_id = buf.reserve(weight_version=0)
+            await buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+
+            await checkpoint_lock.acquire()
+            remove_task = asyncio.create_task(
+                buf.remove([0], remove_in_dp=True)
+            )
+            await asyncio.sleep(0)
+            assert dp.clear_calls == []
+
+            checkpoint_lock.release()
+            await remove_task
+            assert dp.clear_calls == [dp.put_calls[0]["sample_ids"]]
+
+        asyncio.run(exercise())
+
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)

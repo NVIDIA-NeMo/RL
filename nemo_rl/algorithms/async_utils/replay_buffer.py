@@ -659,6 +659,13 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        self._data_plane_checkpoint_lock: Optional[asyncio.Lock] = None
+
+    def set_data_plane_checkpoint_lock(self, lock: asyncio.Lock) -> None:
+        """Serialize destructive DP operations with controller checkpoints."""
+        if self._data_plane_checkpoint_lock is not None:
+            raise RuntimeError("data-plane checkpoint lock is already configured")
+        self._data_plane_checkpoint_lock = lock
 
     def reserve(
         self,
@@ -749,10 +756,8 @@ class TQReplayBuffer:
             # put_samples may have written rows before raising. Roll back by the
             # deterministic IDs known here; the caller removes the reserved slot.
             try:
-                await self._call_dp(
-                    "clear_samples",
+                await self._clear_samples(
                     sample_ids=list(sample_ids),
-                    partition_id=self._partition_id,
                 )
             except BaseException as rollback_error:
                 if isinstance(commit_error, asyncio.CancelledError):
@@ -815,10 +820,8 @@ class TQReplayBuffer:
             del self._group_ids[i]
 
         if remove_in_dp:
-            await self._call_dp(
-                "clear_samples",
+            await self._clear_samples(
                 sample_ids=dropped_sample_ids,
-                partition_id=self._partition_id,
             )
 
         return len(drop_idxs)
@@ -840,3 +843,17 @@ class TQReplayBuffer:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    async def _clear_samples(self, *, sample_ids: list[str]) -> None:
+        """Clear DP rows without overlapping a bound controller checkpoint."""
+        if self._data_plane_checkpoint_lock is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint lock before clearing samples"
+            )
+        async with self._data_plane_checkpoint_lock:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+            )
