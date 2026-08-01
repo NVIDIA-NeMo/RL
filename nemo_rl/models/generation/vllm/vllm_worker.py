@@ -184,6 +184,14 @@ class BaseVllmGenerationWorker:
                 # The engine spans several nodes. Each engine's rank-0 process is
                 # on a different node, so every such engine can use node-local
                 # slot 0 without colliding.
+                #
+                # These engines are also the ones exposed to the vLLM 0.25
+                # TCPStore/MessageQueue collision within a single engine's window
+                # (see _patch_vllm_ray_executor_v2_tcpstore_port in patches.py).
+                # That is fixed by offsetting the TCPStore search, deliberately
+                # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
+                # kernel-ephemeral ports, which is the TOCTOU contention this port
+                # layout exists to avoid (#2380, #3103).
                 engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
@@ -645,6 +653,22 @@ class BaseVllmGenerationWorker:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
     @staticmethod
+    def _spec_decode_max_tokens(
+        base_max_tokens: int,
+        input_len: int,
+        max_model_len: int,
+        spec_lookahead: int,
+    ) -> int:
+        """Clamp max_tokens so speculative decoding never reads past max_model_len.
+
+        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
+        at least `spec_lookahead + 1` tokens before the boundary.
+        """
+        return max(
+            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
+        )
+
+    @staticmethod
     def _patch_vllm_nsight_config() -> None:
         """Override vLLM's nsight config for internal TP workers to use deferred capture.
 
@@ -806,6 +830,26 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             greedy=greedy,
             stop_strings=stop_strings,
         )
+
+        # vLLM 0.20 eagle3 spec decode hits a CUDA illegal memory access when a
+        # request's total length reaches max_model_len (the drafter looks ahead
+        # past the boundary). Clamp per-request max_tokens so speculative
+        # requests stop short of the boundary by the drafter lookahead.
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+        spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+        if spec_lookahead > 0:
+            max_model_len = self.cfg["vllm_cfg"]["max_model_len"]
+            base_max_tokens = sampling_params.max_tokens
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=self._spec_decode_max_tokens(
+                        base_max_tokens, int(input_len), max_model_len, spec_lookahead
+                    ),
+                )
+                for input_len in data["input_lengths"].tolist()
+            ]
 
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])

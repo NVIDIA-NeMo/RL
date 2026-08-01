@@ -443,6 +443,7 @@ def grpo_train_sync(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
@@ -990,9 +991,11 @@ def grpo_train_sync(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and (total_steps + 1) >= val_start_at
+                    and (total_steps + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(

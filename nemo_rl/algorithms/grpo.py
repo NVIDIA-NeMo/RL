@@ -86,10 +86,12 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    backfill_missing_routed_experts,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -253,6 +255,8 @@ class GRPOConfig(TypedDict):
     advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
+    # First training step eligible for periodic validation; -1 disables the delay.
+    val_start_at: int
     val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
@@ -1737,12 +1741,16 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    Router-replay routes get the same treatment via
+    :func:`backfill_missing_routed_experts`, so every per-token field is defined
+    for every tokenized message before the batch is flattened.
 
     Args:
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
+    backfill_missing_routed_experts(message_logs)
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2617,6 +2625,7 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
@@ -2800,6 +2809,9 @@ def grpo_train(
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                            mask_env_flagged_samples=should_mask_flagged_samples(
+                                master_config.env
+                            ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2940,6 +2952,10 @@ def grpo_train(
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
+
+                    # Must precede prompt extraction: it reuses the same message
+                    # dicts, so this also protects the prompt flatten below.
+                    backfill_missing_routed_experts(repeated_batch["message_log"])
 
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
@@ -3175,9 +3191,11 @@ def grpo_train(
                     )
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and (total_steps + 1) >= val_start_at
+                    and (total_steps + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_metrics = refit_policy_generation(
@@ -3246,6 +3264,10 @@ def grpo_train(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
+                if "draft_grad_norm" in train_results:
+                    metrics["draft_grad_norm"] = train_results[
+                        "draft_grad_norm"
+                    ].numpy()
                 if master_config.grpo["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
@@ -3645,6 +3667,9 @@ def validate(
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                    mask_env_flagged_samples=should_mask_flagged_samples(
+                        master_config.env
+                    ),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -3844,9 +3869,12 @@ def async_grpo_train(
         master_config.data_plane or {}
     ).get("enabled", False):
         raise NotImplementedError(
-            "policy.router_replay.enabled=true with async GRPO is currently "
-            "supported only when data_plane.enabled=false. Async + TQ support "
-            "has not been merged yet."
+            "policy.router_replay.enabled=true with async GRPO on this "
+            "entrypoint is supported only when data_plane.enabled=false. For "
+            "async + TransferQueue, use the SingleController entrypoint: "
+            "examples/run_grpo_single_controller.py with e.g. "
+            "examples/configs/recipes/llm/"
+            "grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml"
         )
 
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
@@ -3881,6 +3909,7 @@ def async_grpo_train(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
@@ -4336,6 +4365,10 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
+                    # Must precede prompt extraction: it reuses the same message
+                    # dicts, so this also protects the prompt flatten below.
+                    backfill_missing_routed_experts(repeated_batch["message_log"])
+
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
                     initial_prompt_message_logs = extract_initial_prompt_messages(
@@ -4578,9 +4611,11 @@ def async_grpo_train(
                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and (step + 1) >= val_start_at
+                    and (step + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     with timer.time("idle/validation"):
                         # Pause trajectory collection during validation to reduce memory pressure
                         trajectory_collector.pause.remote()
@@ -4655,6 +4690,10 @@ def async_grpo_train(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
+                if "draft_grad_norm" in train_results:
+                    metrics["draft_grad_norm"] = train_results[
+                        "draft_grad_norm"
+                    ].numpy()
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():

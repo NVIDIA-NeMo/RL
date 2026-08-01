@@ -22,10 +22,34 @@ from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.algorithms.rm import (
     MasterConfig,
     RMConfig,
+    _get_rm_save_state,
     _initial_rm_save_state,
     rm_train,
     setup,
 )
+
+
+def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_rm_save_state({}) == _initial_rm_save_state()
+
+    loaded_state = {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _get_rm_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
 
 
 @pytest.fixture

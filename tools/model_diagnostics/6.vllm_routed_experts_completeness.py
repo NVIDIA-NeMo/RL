@@ -62,6 +62,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+
+    # Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+    ensure_vllm_source_compat()
+
     from vllm import LLM, SamplingParams
 
     llm_kwargs = {

@@ -16,6 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -57,6 +58,21 @@ def _initial_rm_save_state() -> RMSaveState:
     return RMSaveState(
         epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
+
+
+def _get_rm_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> RMSaveState:
+    if loaded_state is None:
+        return _initial_rm_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(RMSaveState)}
+    state_values = vars(_initial_rm_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return RMSaveState(**state_values)
 
 
 class RMConfig(BaseModel, extra="allow"):
@@ -156,17 +172,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known RMSaveState fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        # Backcompat: checkpoints saved before total_valid_tokens was added.
-        loaded_state.setdefault("total_valid_tokens", 0)
-        known_fields = {f.name for f in fields(RMSaveState)}
-        rm_save_state = RMSaveState(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        rm_save_state = _initial_rm_save_state()
+    rm_save_state = _get_rm_save_state(loaded_state)
 
     # ==========================
     #           Data
