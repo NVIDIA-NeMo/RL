@@ -1,0 +1,28 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+policy:
+  megatron_cfg:
+    # Multi-Token Prediction, mirroring the validated text-only Super recipe
+    # (grpo-nemotron3-super-120BA12B-16n8g-megatron.yaml).
+    #
+    # The checkpoint ships a single physical MTP layer
+    # (num_nextn_predict_layers: 1, mtp_hybrid_override_pattern: "*E"), so five
+    # prediction steps are only possible by reusing that layer -- hence
+    # mtp_use_repeated_layer. Setting mtp_num_layers > 1 without it would look
+    # for MTP blocks the checkpoint does not contain.
+    #
+    # detach_heads keeps MTP gradients from flowing back into the backbone, so
+    # the main next-token objective is unchanged by the auxiliary heads.
+    mtp_num_layers: 5
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.3
+logger:
+  log_dir: logs/nemotron-super-omni-async-gym-mtp
+  wandb:
+    name: nemotron-super-omni-async-gym-mtp
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-async-gym-mtp
+# Repeated from the base recipe rather than inherited: super_launch.sh reads
+# cluster.num_nodes out of this file with awk and does not resolve `defaults:`.
+cluster:
+  num_nodes: 16
