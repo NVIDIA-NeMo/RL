@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import cloudpickle
 import types
 from typing import Any
 
@@ -107,14 +108,12 @@ def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
             driver_env_vars=None,
             assigned_physical_gpu_ids=None,
         ):
-            events.append(
-                (
-                    "model_load",
-                    local_rank,
-                    env_vars,
-                    driver_env_vars,
-                    assigned_physical_gpu_ids,
-                )
+            assert fp8.fp8_patches_applied
+            return (
+                local_rank,
+                env_vars,
+                driver_env_vars,
+                assigned_physical_gpu_ids,
             )
 
     def fake_apply_fp8_patches(_self, fp8_config):
@@ -122,25 +121,26 @@ def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
         fp8.fp8_patches_applied = True
 
     monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
-    fp8._patch_ray_executor_v2_worker(FakeRayWorkerProc, config)
+    ray_executor_v2 = types.SimpleNamespace(RayWorkerProc=FakeRayWorkerProc)
+    fp8._patch_ray_executor_v2_worker(ray_executor_v2, config)
+    patched_worker_cls = cloudpickle.loads(
+        cloudpickle.dumps(ray_executor_v2.RayWorkerProc)
+    )
 
-    FakeRayWorkerProc().initialize_worker(
+    result = patched_worker_cls().initialize_worker(
         1,
         {"WORKER_ENV": "1"},
         {"DRIVER_ENV": "1"},
         assigned_physical_gpu_ids=[2, 3],
     )
 
-    assert events == [
-        ("fp8_patches", config),
-        (
-            "model_load",
-            1,
-            {"WORKER_ENV": "1"},
-            {"DRIVER_ENV": "1"},
-            [2, 3],
-        ),
-    ]
+    assert events == [("fp8_patches", config)]
+    assert result == (
+        1,
+        {"WORKER_ENV": "1"},
+        {"DRIVER_ENV": "1"},
+        [2, 3],
+    )
 
 
 @pytest.mark.parametrize(
