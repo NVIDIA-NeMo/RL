@@ -27,9 +27,24 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 # How long to wait for the job to die after the kill. The point of the test is that
 # this is bounded at all: pre-P0 the job would still be sitting here at any deadline.
-DEATH_DEADLINE_S=${DEATH_DEADLINE_S:-300}
+# 600s, not 300s: an observed run took 222s to die (5 re-dispatch attempts with capped
+# exponential backoff, which is the designed containment behaviour). 300s left only 26%
+# headroom, and CI is slower than this workstation -- a deadline that tight turns into a
+# flaky "wedge" report.
+DEATH_DEADLINE_S=${DEATH_DEADLINE_S:-600}
 # Pattern matching the Ray worker process that serves generation.
-WORKER_PATTERN=${WORKER_PATTERN:-'ray::.*[Gg]eneration'}
+#
+# Matches BOTH the `ray::`-titled form and the venv-path form, because both occur: Ray
+# retitles its workers via setproctitle, and a worker observed mid-run had the venv path
+# in /proc/<pid>/cmdline while the one killed in a later run showed `ray::`.
+#
+# This was widened after a run where the old `ray::.*[Gg]eneration` pattern selected a
+# process that was NOT the serving generation worker: the kill landed, the worker kept
+# serving, training continued to step 3/50, and the test was on course to report a wedge
+# that never happened -- a false failure of the very behaviour it exists to prove. The
+# assertions below matter more than the pattern: they make a mis-targeted kill visible
+# instead of letting it masquerade as a hang.
+WORKER_PATTERN=${WORKER_PATTERN:-'ray::.*[Gg]enerationWorker|ray_venvs/.*[Gg]enerationWorker/bin/python'}
 
 rm -rf "$EXP_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
@@ -102,12 +117,26 @@ grep -q "train step 1/" "$RUN_LOG" || { echo "[chaos] FAIL: never reached a trai
 VICTIM=$(pgrep -f "$WORKER_PATTERN" | head -1)
 if [[ -z "${VICTIM:-}" ]]; then
     echo "[chaos] FAIL: no process matched '$WORKER_PATTERN'"
-    ps -eo pid,args --no-headers | grep "ray::" | grep -v grep | head -20
+    ps -eo pid,args --no-headers | grep -iE "generation|EngineCore" | grep -v grep | head -20
     exit 1
 fi
+# Print what is actually being killed. The whole test is meaningless if the victim is not
+# a generation worker, and a mis-targeted kill otherwise looks exactly like a pass of the
+# "job keeps running" kind -- i.e. it is reported as a wedge.
+VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | cut -c1-120)
 echo "[chaos] killing generation worker pid=$VICTIM"
+echo "[chaos]   cmdline: $VICTIM_CMD"
+case "$VICTIM_CMD" in
+    *[Gg]enerationWorker*) ;;
+    *) echo "[chaos] FAIL: victim does not look like a generation worker"; exit 1 ;;
+esac
 kill -9 "$VICTIM"
 KILLED_AT=$(date +%s)
+sleep 2
+if kill -0 "$VICTIM" 2>/dev/null; then
+    echo "[chaos] FAIL: victim $VICTIM survived SIGKILL; nothing was actually killed"
+    exit 1
+fi
 
 echo "[chaos] waiting up to ${DEATH_DEADLINE_S}s for the job to stop..."
 DIED=0
