@@ -259,7 +259,7 @@ class AsyncRolloutImpl:
         max_seq_len: int,
         max_rollout_turns: int,
         policy_generation: GenerationInterface,
-        timeouts: RolloutTimeouts,
+        timeouts: RolloutTimeouts = RolloutTimeouts(),
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
