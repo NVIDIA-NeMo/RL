@@ -60,6 +60,7 @@ grpo:
   advantage_clip_low: -20
   advantage_clip_high: 20
   val_period: 10000000
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
@@ -104,7 +105,6 @@ grpo:
 
   dynamic_sampling_oversample_ratio: 1.0
   seq_logprob_error_threshold: 2
-  skip_reference_policy_logprobs_calculation: true
 
 # =============================================================================
 # Loss Function
@@ -598,8 +598,8 @@ env:
 
     # External GenRM. The launcher adds base_url after the load balancer is
     # healthy and keeps the served model name fixed at "model". The local vLLM
-    # settings remain as schema-compatible documentation but are not launched
-    # when base_url is present.
+    # settings support the Gym-native TP=4, DP=16 deployment but are not
+    # launched when base_url is present.
     genrm_model:
       responses_api_models:
         genrm_model:
