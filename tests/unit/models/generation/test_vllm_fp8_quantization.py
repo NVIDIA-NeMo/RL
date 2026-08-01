@@ -93,7 +93,7 @@ def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
     fp8_module, monkeypatch
 ):
     fp8 = fp8_module
-    events = []
+    monkeypatch.setattr(fp8, "_test_applied_configs", [], raising=False)
     config = fp8.FP8Config(
         use_fp8_weights=True,
         model_parallel_size=2,
@@ -117,7 +117,7 @@ def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
             )
 
     def fake_apply_fp8_patches(_self, fp8_config):
-        events.append(("fp8_patches", fp8_config))
+        fp8._test_applied_configs.append(fp8_config)
         fp8.fp8_patches_applied = True
 
     monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
@@ -134,7 +134,7 @@ def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
         assigned_physical_gpu_ids=[2, 3],
     )
 
-    assert events == [("fp8_patches", config)]
+    assert fp8._test_applied_configs == [config]
     assert result == (
         1,
         {"WORKER_ENV": "1"},
