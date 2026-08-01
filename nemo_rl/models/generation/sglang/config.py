@@ -75,6 +75,12 @@ class SglangSpecificArgs(TypedDict):
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
 
+    # Fault tolerance (RolloutHealthMonitor). When True, a daemon thread health-checks
+    # each engine and restarts hung/dead actors; the three fields below are then required.
+    use_fault_tolerance: bool
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
