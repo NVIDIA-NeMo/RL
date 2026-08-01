@@ -24,6 +24,7 @@ import pytest
 
 from nemo_rl.weight_sync.membership import (
     NoSurvivingShards,
+    desired_membership,
     plan_refit_membership,
 )
 
@@ -139,3 +140,42 @@ class TestRejected:
     def test_a_non_positive_dp_size_is_refused(self, dp_size):
         with pytest.raises(ValueError, match="dp_size"):
             _plan([0], dp_size=dp_size, total_gen_workers=4)
+
+
+class TestDesiredMembership:
+    """The absent-set view of the same plan.
+
+    Exists so that "who should be in the communicator" has one answer whether a shard is
+    leaving or rejoining. The re-admission bug this guards against was real: keyed off
+    "is anything absent", an empty absent set reads as "nothing to do", and a restarted
+    shard stays excluded from the refit forever while looking perfectly healthy.
+    """
+
+    def _desired(self, absent, **kw):
+        return desired_membership(
+            absent_shards=absent,
+            dp_size=4,
+            total_gen_workers=4,
+            train_world_size=8,
+            **kw,
+        )
+
+    def test_no_absent_shards_is_the_whole_fleet(self):
+        """Not a no-op signal -- a concrete full-fleet plan, which is what re-admission compares against."""
+        assert self._desired([]).shard_prefixes == {0: 0, 1: 1, 2: 2, 3: 3}
+
+    def test_it_agrees_with_the_survivor_view(self):
+        assert self._desired([1]) == _plan([0, 2, 3])
+
+    def test_a_rejoining_shard_changes_the_plan_back(self):
+        """The whole point: absent -> present must be visible as a different membership."""
+        while_absent = self._desired([2])
+        after_rejoin = self._desired([])
+
+        assert while_absent != after_rejoin
+        assert 2 not in while_absent.shard_prefixes
+        assert 2 in after_rejoin.shard_prefixes
+
+    def test_losing_everyone_is_refused(self):
+        with pytest.raises(NoSurvivingShards):
+            self._desired([0, 1, 2, 3])
