@@ -39,7 +39,30 @@ cd "$PROJECT_ROOT"
 
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --list-gpus | wc -l)}
 GEN_GPUS=${GEN_GPUS:-2}          # two shards at tp=1, so one can die and one remains
-TRAIN_GPUS=$((NUM_GPUS - GEN_GPUS))
+
+# Training ranks, rounded DOWN to a power of two.
+#
+# Megatron asserts global_batch_size % (micro_batch_size * data_parallel_size) == 0
+# (num_microbatches_calculator.py). This config inherits train_global_batch_size=512 and
+# train_micro_batch_size=4 from grpo_math_1B.yaml, and tp=pp=cp=1, so dp is just the
+# training GPU count. Taking every remaining GPU therefore breaks on common host sizes:
+#
+#   3 GPUs -> dp=1   512 %  4 = 0   ok
+#   4 GPUs -> dp=2   512 %  8 = 0   ok
+#   5 GPUs -> dp=3   512 % 12 = 8   assertion failure
+#   8 GPUs -> dp=6   512 % 24 = 8   assertion failure
+#  16 GPUs -> dp=14  512 % 56 = 8   assertion failure
+#
+# 8 is the usual CI runner size, so this test would have died in Megatron setup on exactly
+# the machines where it is the only place the >= 3 GPU scenario can run at all -- and with
+# an assertion that says nothing about shard recovery.
+#
+# 512 and 4 are both powers of two, so any power-of-two dp divides. Rounding down leaves
+# some GPUs idle on hosts that are not GEN_GPUS + 2^k, which is the right trade for a test
+# whose point is surviving a shard loss, not throughput.
+TRAIN_GPUS=1
+while (( TRAIN_GPUS * 2 <= NUM_GPUS - GEN_GPUS )); do TRAIN_GPUS=$((TRAIN_GPUS * 2)); done
+USED_GPUS=$((GEN_GPUS + TRAIN_GPUS))
 
 if (( NUM_GPUS < 3 )); then
     echo "[recovery] SKIP: needs >= 3 GPUs (2 generation shards + >= 1 trainer), found $NUM_GPUS."
@@ -63,7 +86,7 @@ COMPLETION_DEADLINE_S=${COMPLETION_DEADLINE_S:-1800}
 # communicator agreeing about the fleet.
 REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
 
-echo "[recovery] $NUM_GPUS GPUs -> $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
+echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
 uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     --config "$PROJECT_ROOT"/examples/configs/grpo_math_1B_megatron_single_controller.yaml \
@@ -73,7 +96,7 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
     policy.generation.refit_transport="$REFIT_TRANSPORT" \
-    cluster.gpus_per_node="$NUM_GPUS" \
+    cluster.gpus_per_node="$USED_GPUS" \
     grpo.max_num_steps="$MAX_STEPS" \
     grpo.val_period=-1 \
     grpo.val_at_start=false \
@@ -110,16 +133,38 @@ done
 grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" || {
     echo "[recovery] FAIL: never reached step $KILL_AFTER_STEP"; tail -60 "$RUN_LOG"; exit 1; }
 
-# Kill exactly one generation shard. Sorting by pid keeps the choice deterministic.
-mapfile -t GEN_PIDS < <(pgrep -f "VllmAsyncGenerationWorker" | sort -n)
-if (( ${#GEN_PIDS[@]} < 2 )); then
-    echo "[recovery] FAIL: expected >= 2 generation workers, found ${#GEN_PIDS[@]}"
+# Kill exactly one generation shard.
+#
+# Match the Ray ACTOR structurally rather than by substring. `pgrep -f
+# VllmAsyncGenerationWorker` also matches the per-worker venv python child and the bash
+# launcher that execs it, so it returns roughly three entries per shard; the lowest pid is
+# then just as likely to be a child as an actor. That matters more here than in the chaos
+# test: this one asserts the run COMPLETES, so killing a non-actor leaves both shards alive,
+# the run finishes exactly as it would have anyway, and the test reports a pass having
+# never exercised recovery at all.
+#
+# The `<name>:` infix and `.method` suffix are both optional because Ray retitles a worker
+# for the duration of each call -- either form is the actor, and unlike the chaos test the
+# state it is in does not change what is being asserted here.
+ACTOR_RE='^ray::([A-Za-z0-9_.:-]+:)?[A-Za-z_]*GenerationWorker(\.[A-Za-z_]+)?$'
+mapfile -t GEN_PIDS < <(ps -eo pid=,args= | sed -E 's/^ *//' | awk -v re="$ACTOR_RE" \
+    '{ pid=$1; $1=""; sub(/^ /,""); if ($0 ~ re) print pid }' | sort -n)
+if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
+    echo "[recovery] FAIL: expected exactly $GEN_GPUS generation actors, found ${#GEN_PIDS[@]}"
+    echo "[recovery] this is a harness problem, not a recovery failure -- killing the wrong"
+    echo "[recovery] process would let the run complete and report a false pass."
     ps -eo pid,args --no-headers | grep "ray::" | grep -v grep | head -20
     exit 1
 fi
 VICTIM=${GEN_PIDS[0]}
-echo "[recovery] killing generation shard pid=$VICTIM (of ${#GEN_PIDS[@]})"
+VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
+echo "[recovery] killing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
 kill -9 "$VICTIM"
+sleep 2
+if kill -0 "$VICTIM" 2>/dev/null; then
+    echo "[recovery] FAIL: victim $VICTIM survived SIGKILL; nothing was actually killed"
+    exit 1
+fi
 KILLED_AT=$(date +%s)
 
 echo "[recovery] waiting up to ${COMPLETION_DEADLINE_S}s for the run to finish..."
