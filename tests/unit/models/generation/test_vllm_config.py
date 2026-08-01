@@ -90,6 +90,26 @@ def test_refit_prequantize_accepts_mxfp8() -> None:
     validate_vllm_quantization_config(generation_config)
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["refit_batched_moe_shuffle", "refit_cache_loader_routes"],
+)
+def test_refit_optimization_flags_must_be_boolean(field: str) -> None:
+    generation_config = cast(
+        VllmConfig,
+        {
+            "vllm_cfg": {
+                "precision": "fp8",
+                "is_mx": True,
+                field: "true",
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match=rf"{field} must be a boolean"):
+        validate_vllm_quantization_config(generation_config)
+
+
 def test_refit_prequantize_validation_allows_omitted_vllm_cfg() -> None:
     generation_config = cast(VllmConfig, {"quant_cfg": None})
 

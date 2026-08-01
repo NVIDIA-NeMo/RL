@@ -218,18 +218,19 @@ def _record_loader_calls(
 
 
 def load_weights_maybe_cached(
-    model: Any, weights: list[tuple[str, torch.Tensor]]
+    model: Any,
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    cache_loader_routes: bool,
 ) -> set[str]:
-    """model.load_weights with optional loader replay caching.
+    """Load weights, optionally replaying cached loader routes.
 
-    Opt-in via NRL_REFIT_CACHED_LOADERS=1 since model load_weights
-    implementations vary; the default is a plain model.load_weights call.
     Cached parameter identities are re-validated against named_parameters()
     on every call, so a process_weights_after_loading pass that replaces
     parameter objects drops the cache instead of loading into orphans.
     Returns the set of loaded weight names, mirroring model.load_weights.
     """
-    if os.getenv("NRL_REFIT_CACHED_LOADERS") != "1":
+    if not cache_loader_routes:
         return model.load_weights(weights=weights)
 
     cache = getattr(model, "_nrl_refit_loader_cache", None)
@@ -316,6 +317,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _refit_cache_loader_routes: bool = False
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -327,9 +329,11 @@ class VllmInternalWorkerExtension:
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
-        # Refit optimization: replay cached weight-loader routing when
-        # NRL_REFIT_CACHED_LOADERS=1 (identity-validated), else plain load.
-        load_weights_maybe_cached(self.model_runner.model, policy_weights)
+        load_weights_maybe_cached(
+            self.model_runner.model,
+            policy_weights,
+            cache_loader_routes=self._refit_cache_loader_routes,
+        )
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
@@ -470,6 +474,10 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         fp8.install_fp8_config(serialized_fp8_config)
+        self._refit_cache_loader_routes = bool(
+            fp8.global_fp8_config
+            and fp8.global_fp8_config.refit_cache_loader_routes
+        )
         if not (
             fp8.global_fp8_config is not None
             and fp8.global_fp8_config.is_mx

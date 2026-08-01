@@ -200,7 +200,6 @@ def test_refit_loader_cache_records_replays_and_falls_back(monkeypatch):
                     loaded.add(name)
             return loaded
 
-    monkeypatch.setenv("NRL_REFIT_CACHED_LOADERS", "1")
     model = Model()
     first_expert = torch.tensor([1.0])
     first_default = torch.tensor([2.0])
@@ -210,10 +209,12 @@ def test_refit_loader_cache_records_replays_and_falls_back(monkeypatch):
     assert load_weights_maybe_cached(
         model,
         [("expert", first_expert), ("default", first_default)],
+        cache_loader_routes=True,
     ) == {"expert", "default"}
     assert load_weights_maybe_cached(
         model,
         [("expert", second_expert), ("default", second_default)],
+        cache_loader_routes=True,
     ) == {"expert", "default"}
 
     cache = model._nrl_refit_loader_cache
@@ -274,18 +275,21 @@ def test_refit_loader_cache_invalidates_replaced_parameter(monkeypatch):
                 self.local.weight_loader(self.local, weight)
             return {name for name, _weight in weights}
 
-    monkeypatch.setenv("NRL_REFIT_CACHED_LOADERS", "1")
     model = Model()
     first = torch.tensor([1.0])
     second = torch.tensor([2.0])
 
-    assert load_weights_maybe_cached(model, [("expert", first)]) == {"expert"}
+    assert load_weights_maybe_cached(
+        model, [("expert", first)], cache_loader_routes=True
+    ) == {"expert"}
     cache = model._nrl_refit_loader_cache
     old_local = model.local
     model.local = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
     model.local.weight_loader = make_loader("replacement")
 
-    assert load_weights_maybe_cached(model, [("expert", second)]) == {"expert"}
+    assert load_weights_maybe_cached(
+        model, [("expert", second)], cache_loader_routes=True
+    ) == {"expert"}
 
     assert model.load_calls == [["expert"], ["expert"]]
     assert events == ["remote", "local", "remote", "replacement"]

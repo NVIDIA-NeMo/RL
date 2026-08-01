@@ -66,6 +66,8 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
             "kv_cache_dtype": "auto",
             "async_engine": False,
             "is_mx": True,
+            "refit_batched_moe_shuffle": False,
+            "refit_cache_loader_routes": True,
             "use_deep_gemm": True,
         },
         "dummy-model",
@@ -85,6 +87,8 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
+    assert fp8.global_fp8_config.refit_batched_moe_shuffle is False
+    assert fp8.global_fp8_config.refit_cache_loader_routes is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
@@ -167,6 +171,8 @@ def test_init_fp8_rejects_non_pow2_mxfp8_scales(fp8_module, monkeypatch, field, 
                 "kv_cache_dtype": "auto",
                 "async_engine": False,
                 "is_mx": True,
+                "refit_batched_moe_shuffle": True,
+                "refit_cache_loader_routes": False,
                 field: False,
             },
             "dummy-model",
@@ -423,7 +429,7 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", fake_batched_shuffle)
     monkeypatch.setattr(fp8_oracle, "make_fp8_moe_quant_config", fake_make_quant_config)
     monkeypatch.setattr(fp8_oracle, "make_fp8_moe_kernel", fake_make_kernel)
-    monkeypatch.delenv("NRL_MXFP8_BATCHED_SHUFFLE", raising=False)
+    fp8.global_fp8_config = fp8.FP8Config(refit_batched_moe_shuffle=True)
 
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(

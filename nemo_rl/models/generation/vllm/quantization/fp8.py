@@ -62,6 +62,8 @@ class FP8Config:
     # Weights arrive from the trainer already MXFP8-quantized (E4M3 data plus
     # *_scale_from_checkpoint entries), so load_weights skips re-quantization.
     refit_prequantize: bool = False
+    refit_batched_moe_shuffle: bool = True
+    refit_cache_loader_routes: bool = False
 
 
 @dataclass()
@@ -280,6 +282,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
+        "refit_batched_moe_shuffle": vllm_cfg["refit_batched_moe_shuffle"],
+        "refit_cache_loader_routes": vllm_cfg["refit_cache_loader_routes"],
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -555,7 +559,11 @@ def load_weights(weights, model_runner):
     # module top would cycle through the nemo_rl generation package init.
     from nemo_rl.models.generation.vllm.vllm_backend import load_weights_maybe_cached
 
-    load_weights_maybe_cached(model, weights_quantized)
+    load_weights_maybe_cached(
+        model,
+        weights_quantized,
+        cache_loader_routes=global_fp8_config.refit_cache_loader_routes,
+    )
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -1353,8 +1361,8 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         w13_weight = swap_w13_to_w31(w13_weight)
         w13_scale = swap_w13_to_w31(w13_scale)
 
-    # NRL_MXFP8_BATCHED_SHUFFLE=0 is the kill switch back to the per-expert path.
-    use_batched_shuffle = os.getenv("NRL_MXFP8_BATCHED_SHUFFLE", "1") != "0"
+    assert global_fp8_config is not None
+    use_batched_shuffle = global_fp8_config.refit_batched_moe_shuffle
     if use_batched_shuffle:
         (
             w13_weight_shuffled,

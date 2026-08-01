@@ -41,6 +41,10 @@ class VllmSpecificArgs(TypedDict):
     # the vLLM worker then skips its per-refit re-quantization. Requires the
     # Megatron policy backend.
     refit_prequantize: NotRequired[bool]
+    # Batch MoE weight-layout transforms across experts during MXFP8 refit.
+    refit_batched_moe_shuffle: bool
+    # Cache and replay stable vLLM weight-loader routes across refits.
+    refit_cache_loader_routes: bool
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
@@ -175,6 +179,10 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize requires "
             "precision='fp8' and is_mx=true."
         )
+    for field in ("refit_batched_moe_shuffle", "refit_cache_loader_routes"):
+        value = vllm_cfg.get(field)
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"policy.generation.vllm_cfg.{field} must be a boolean.")
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
