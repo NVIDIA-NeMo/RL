@@ -535,7 +535,6 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     generation = policy.get("generation", {}) or {}
     megatron_cfg = policy.get("megatron_cfg", {}) or {}
     dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
-    policy_precision = policy.get("precision")
     vllm_cfg = generation.get("vllm_cfg", {}) or {}
     vllm_kwargs = generation.get("vllm_kwargs", {}) or {}
 
@@ -553,13 +552,6 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     if backend != "vllm":
         violations.append(
             f"policy.generation.backend must be 'vllm' (got {backend!r})."
-        )
-
-    if policy_precision != "bfloat16":
-        violations.append(
-            "policy.precision must be 'bfloat16' for nccl_reshard_refit "
-            f"(got {policy_precision!r}); the refit byte-copies training storage "
-            "into the generation model."
         )
 
     if vllm_kwargs.get("enable_eplb"):
