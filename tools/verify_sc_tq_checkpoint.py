@@ -201,16 +201,22 @@ def _load(checkpoint_dir: Path, num_storage_units: int) -> None:
         if metadata["single_controller_trainer_version"] != 3:
             raise AssertionError("SingleController recovery metadata was not saved")
 
+        expected_remaining_ids = set(SAMPLE_IDS) - consumed_ids
+        if dp_client.check_consumption_status(PARTITION_ID, [TASK_NAME]):
+            raise AssertionError(
+                "Restored consumer cursor marked every row consumed before "
+                "the expected remaining rows were claimed"
+            )
         remaining = dp_client.claim_meta(
             partition_id=PARTITION_ID,
             task_name=TASK_NAME,
             required_fields=FIELDS,
-            batch_size=len(SAMPLE_IDS),
+            batch_size=len(expected_remaining_ids),
             timeout_s=30.0,
         )
         if consumed_ids.intersection(remaining.sample_ids):
             raise AssertionError("A previously consumed row was claimed after restore")
-        if set(remaining.sample_ids).union(consumed_ids) != set(SAMPLE_IDS):
+        if set(remaining.sample_ids) != expected_remaining_ids:
             raise AssertionError("Restored consumption state lost or added rows")
         if not dp_client.check_consumption_status(PARTITION_ID, [TASK_NAME]):
             raise AssertionError("Restored consumer cursor did not reach completion")
