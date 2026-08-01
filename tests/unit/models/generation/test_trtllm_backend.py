@@ -4,14 +4,15 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from nemo_rl.models.generation.trtllm.trtllm_backend import (
-    NcclExtension,
-    WorkerExtension,
-)
+import pytest
+
+pytestmark = pytest.mark.trtllm
 
 
 def test_collective_refit_always_resets_prefix_cache():
-    extension = NcclExtension.__new__(NcclExtension)
+    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
+
+    extension = backend.NcclExtension.__new__(backend.NcclExtension)
     model = MagicMock()
     model.modules.return_value = []
     model_loader = MagicMock()
@@ -45,7 +46,9 @@ def test_collective_refit_always_resets_prefix_cache():
 
 
 def test_refit_finalization_falls_back_for_older_trtllm():
-    extension = NcclExtension.__new__(NcclExtension)
+    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
+
+    extension = backend.NcclExtension.__new__(backend.NcclExtension)
     module = MagicMock()
     module._weights_removed = False
     model = MagicMock()
@@ -55,7 +58,7 @@ def test_refit_finalization_falls_back_for_older_trtllm():
         model_engine=SimpleNamespace(model=model, model_loader=model_loader)
     )
 
-    with patch.object(WorkerExtension, "finalize_weight_update", None):
+    with patch.object(backend.WorkerExtension, "finalize_weight_update", None):
         extension._finalize_weight_update()
 
     model_loader.finalize_update_weights.assert_called_once_with()
