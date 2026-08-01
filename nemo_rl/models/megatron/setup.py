@@ -225,6 +225,64 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
         )
 
 
+def _force_sync_model_from_optimizer_fp32(optimizer):
+    """Restore BF16 compute weights from loaded HybridDeviceOptimizer masters.
+
+    On a full checkpoint resume, ``HybridDeviceOptimizer.load_state_dict`` restores
+    its FP32 master parameters, but the BF16 parameter shards used by the first
+    forward can still contain the pre-load values. The first optimizer step copies
+    the masters back and masks the problem from subsequent steps, producing a
+    one-step loss/reward discontinuity exactly at the resume boundary.
+
+    Copy each loaded FP32 working parameter back to its BF16 shard and then force a
+    synchronous DP parameter all-gather before any reference-policy or training
+    forward. This is the inverse of ``_force_sync_optimizer_fp32_from_model`` and
+    is only called for a genuine optimizer-state resume.
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _sync_distrib_opt(distrib_opt):
+        try:
+            from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+                HybridDeviceOptimizer,
+            )
+        except ImportError:
+            return False
+        if not isinstance(
+            getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer
+        ):
+            return False
+
+        hdo = distrib_opt.optimizer
+        param_to_fp32_param = getattr(hdo, "param_to_fp32_param", None)
+        if not param_to_fp32_param:
+            return False
+
+        # HybridDeviceOptimizer's post-load hook has already populated these
+        # FP32 working parameters from the checkpoint's master_param entries.
+        for model_param, fp32_param in param_to_fp32_param.items():
+            model_param.data.copy_(fp32_param.data)
+
+        # The copied parameters are local distributed-optimizer shards. Rebuild
+        # full BF16 compute parameters before the first forward after resume.
+        for model_chunk in getattr(distrib_opt, "model_chunks", []):
+            model_chunk.start_param_sync(force_sync=True)
+        return True
+
+    applied = False
+    if hasattr(optimizer, "chained_optimizers"):
+        for sub_opt in optimizer.chained_optimizers:
+            applied |= _sync_distrib_opt(sub_opt)
+    else:
+        applied = _sync_distrib_opt(optimizer)
+
+    if applied and rank == 0:
+        print(
+            "WORKAROUND: force-synced BF16 model params from loaded optimizer "
+            "FP32 masters (HybridDeviceOptimizer)"
+        )
+
+
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
@@ -2099,8 +2157,11 @@ def setup_model_and_optimizer(
         # through BF16 and lose precision, so we must skip the sync there.
         # state.cfg is megatron_cfg (set above), so this reads the value the
         # bridge may have just mutated during load_checkpoint.
-        if optimizer is not None and megatron_cfg.checkpoint.finetune:
-            _force_sync_optimizer_fp32_from_model(optimizer, model)
+        if optimizer is not None:
+            if megatron_cfg.checkpoint.finetune:
+                _force_sync_optimizer_fp32_from_model(optimizer, model)
+            elif resume_checkpoint_exists:
+                _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)
