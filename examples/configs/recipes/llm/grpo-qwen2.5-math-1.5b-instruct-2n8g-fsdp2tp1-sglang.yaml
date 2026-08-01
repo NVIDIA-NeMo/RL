@@ -46,6 +46,7 @@ policy:
       sglang_router_config:
         use_external_router: false
         use_distributed_post: true
+      use_fault_tolerance: false
 
 data:
   max_input_seq_length: 512
