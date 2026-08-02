@@ -31,7 +31,9 @@ dependencies = [
   "torch>=2.11.0",
   "torchvision",
   "nvidia-modelopt>=0.37.0",
-  "nvidia-nccl-cu13>=2.28.9,<=2.29.7",
+  # Ceiling raised from upstream's <=2.29.7 (which tracks what NGC rel-26-04 ships,
+  # not a tested incompatibility) so it matches the nvidia-nccl-cu13==2.30.4 override.
+  "nvidia-nccl-cu13>=2.28.9,<=2.30.4",
   "nvidia-cuda-nvrtc",
   "nvidia-cutlass-dsl[cu13]==4.5.0",
   "nvidia-ml-py>=13",

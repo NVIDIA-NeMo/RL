@@ -144,10 +144,15 @@ def _batch_fused_modelopt_moe_weights(
 ) -> list[tuple[str, torch.Tensor]]:
     """Map fused ModelOpt payloads to vLLM per-projection checkpoint names.
 
-    Large expert weights and block scales stay batched so vLLM can
+    ``w2`` weights and block scales stay batched so vLLM can
     tensor-parallel-shard the full ``[E, ...]`` tensor at once.  Its scalar
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
+
+    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
+    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
+    fused-3D branch mis-transposes packed NVFP4. See the comment at the
+    emission site below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -178,16 +183,24 @@ def _batch_fused_modelopt_moe_weights(
                     f"Expected fused gate/up tensor with an even projection "
                     f"dimension for {name}, got {tuple(tensor.shape)}"
                 )
+            # Emit per-expert 2-D shards rather than batched 3-D tensors:
+            # gated models (e.g. Qwen3-MoE) route batched tensors through
+            # vLLM 0.25's RoutedExperts.load_weights fused branch, whose
+            # orientation heuristic compares the last dim against the
+            # unpacked hidden size and mis-transposes packed NVFP4 weights
+            # (K/2 uint8) and block scales (K/16). Per-expert 2-D loads take
+            # the same weight_loader path as the initial disk load.
             gate, up = tensor.chunk(2, dim=1)
             batched.extend(
                 (
-                    f"{prefix}.experts.0.{projection}.{target_suffix}",
-                    shard,
+                    f"{prefix}.experts.{expert_id}.{projection}.{target_suffix}",
+                    expert_weight,
                 )
                 for projection, shard in (
                     ("gate_proj", gate),
                     ("up_proj", up),
                 )
+                for expert_id, expert_weight in enumerate(shard.unbind(0))
             )
             continue
 
@@ -566,6 +579,36 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in patched_quantizer_buffers:
                 del buf.weight_loader
 
+    @contextmanager
+    def _attach_input_quantizer_amax_loaders(self, model):
+        """Eagerly attach weight_loaders to input_quantizer amax buffers.
+
+        vLLM >= 0.25 loads refit weights through per-module
+        ``load_weights`` (e.g. ``LinearBase.load_weights``), which resolves
+        targets via ``getattr`` and calls ``param.weight_loader(param,
+        loaded_weight, shard_id)`` directly — it never iterates
+        ``model.named_parameters()``, so the lazy attach in
+        ``_patch_named_parameters_to_include_buffers`` no longer fires and
+        quantizer amax buffers arrive without a loader (AttributeError:
+        'Tensor' object has no attribute 'weight_loader').
+        """
+
+        def input_amax_loader(param, loaded_weight, *args, **kwargs):
+            param.copy_(torch.max(param, loaded_weight))
+
+        attached = []
+        for name, buf in model.named_buffers():
+            if "input_quantizer" not in name:
+                continue
+            if not hasattr(buf, "weight_loader"):
+                buf.weight_loader = input_amax_loader
+                attached.append(buf)
+        try:
+            yield
+        finally:
+            for buf in attached:
+                del buf.weight_loader
+
     def _load_weights(self, weights):
         """Load pre-folded weights and input_quantizer amax buffers.
 
@@ -620,6 +663,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 contexts.enter_context(
                     self._patch_named_parameters_to_include_buffers(child)
                 )
+            contexts.enter_context(
+                self._attach_input_quantizer_amax_loaders(self.model_runner.model)
+            )
             return super()._load_weights(weights)
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
