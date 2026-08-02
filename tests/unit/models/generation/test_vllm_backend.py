@@ -127,7 +127,9 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     call_order = []
     model = object()
     model_config = object()
-    vllm_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+    )
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
@@ -139,6 +141,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda config: False)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     @contextlib.contextmanager
     def set_current_vllm_config(config):
@@ -167,11 +170,13 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         ),
     )
 
-    with ext._weight_update_lifecycle("collective") as finalize:
-        call_order.append("load")
-        finalize()
+    for _ in range(2):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            call_order.append("load")
+            finalize()
+        assert ext._nrl_layerwise_reload_active is False
 
-    assert call_order == [
+    expected_cycle = [
         "config_enter",
         ("initialize", model),
         "load",
@@ -180,6 +185,68 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         "config_exit",
         "kv",
     ]
+    assert call_order == expected_cycle * 2
+
+
+@pytest.mark.vllm
+def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = SimpleNamespace(load_weights=MagicMock())
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    ext._nrl_layerwise_reload_active = True
+    weight = torch.ones(2)
+    detach = MagicMock()
+    monkeypatch.setattr(vllm_backend, "_detach_pending_layerwise_weights", detach)
+
+    ext._load_full_hf_weights([("model.weight", weight)])
+
+    model.load_weights.assert_called_once_with(weights=[("model.weight", weight)])
+    detach.assert_called_once_with(model, {weight.untyped_storage().data_ptr()})
+
+
+@pytest.mark.vllm
+def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    model = object()
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda config: True)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: pytest.fail("FP8 must not use the unquantized reload lifecycle"),
+    )
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+
+    process.assert_called_once_with(model, model_config, ext.device)
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
 
 
 @pytest.mark.vllm

@@ -71,6 +71,25 @@ class IPCWeightManifestError(RuntimeError):
     """An IPC transfer did not match the prepared state-dict manifest."""
 
 
+def _detach_pending_layerwise_weights(
+    model: torch.nn.Module, source_storage_ptrs: set[int]
+) -> None:
+    """Detach deferred reload weights from a reusable transport buffer."""
+    if not source_storage_ptrs:
+        return
+
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    for module in model.modules():
+        info = get_layerwise_info(module)
+        for _, arguments in info.loaded_weights:
+            loaded_weight = arguments.arguments.get("loaded_weight")
+            if not isinstance(loaded_weight, torch.Tensor):
+                continue
+            if loaded_weight.untyped_storage().data_ptr() in source_storage_ptrs:
+                arguments.arguments["loaded_weight"] = loaded_weight.clone()
+
+
 class _IPCWeightManifest:
     """Validate an IPC stream against its prepared state-dict manifest."""
 
@@ -184,6 +203,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _nrl_layerwise_reload_active: bool = False
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -195,7 +215,19 @@ class VllmInternalWorkerExtension:
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
-        self.model_runner.model.load_weights(weights=policy_weights)
+        if not self._nrl_layerwise_reload_active:
+            self.model_runner.model.load_weights(weights=policy_weights)
+            return
+
+        source_storage_ptrs = {
+            tensor.untyped_storage().data_ptr() for _, tensor in policy_weights
+        }
+        try:
+            self.model_runner.model.load_weights(weights=policy_weights)
+        finally:
+            _detach_pending_layerwise_weights(
+                self.model_runner.model, source_storage_ptrs
+            )
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
@@ -605,12 +637,49 @@ class VllmInternalWorkerExtension:
             )
         return self._sparse_delta_applier
 
+    def _uses_unquantized_flashinfer_trtllm(self) -> bool:
+        vllm_config = self.model_runner.vllm_config
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        if getattr(kernel_config, "moe_backend", None) != "flashinfer_trtllm":
+            return False
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return not fp8.is_fp8_model(vllm_config)
+
     @contextmanager
     def _weight_update_lifecycle(
         self, transport: WeightUpdateTransport
     ) -> Iterator[WeightUpdateFinalizer]:
         """Provide setup/finalization around a transport-owned weight update."""
         del transport
+        if self._uses_unquantized_flashinfer_trtllm():
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+
+            model = self.model_runner.model
+
+            def finalize() -> None:
+                with torch.device(self.device):
+                    finalize_layerwise_reload(model, self.model_config)
+                    self._maybe_process_mtp_drafter_after_loading()
+                torch.accelerator.synchronize()
+
+            try:
+                with set_current_vllm_config(self.model_runner.vllm_config):
+                    with torch.device(self.device):
+                        initialize_layerwise_reload(model)
+                    self._nrl_layerwise_reload_active = True
+                    yield finalize
+            finally:
+                self._nrl_layerwise_reload_active = False
+
+            self._maybe_process_fp8_kv_cache()
+            return
+
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
@@ -630,7 +699,7 @@ class VllmInternalWorkerExtension:
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
-        return False
+        return self._uses_unquantized_flashinfer_trtllm()
 
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence work consuming one IPC data batch before its acknowledgment."""
