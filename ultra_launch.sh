@@ -677,8 +677,10 @@ export SETUP_COMMAND
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
+${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
 ${GENRM_RUNTIME_SETUP}\
 ${VLLM_ENV_SOURCE}\
+${NRL_DRIVER_PYTHONPATH:+PYTHONPATH=${NRL_DRIVER_PYTHONPATH} }\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \
