@@ -257,18 +257,19 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_modelopt_extension_does_not_use_unquantized_reload(monkeypatch):
-    from nemo_rl.modelopt.models.generation import vllm_quant_backend
+def test_extension_capability_can_disable_unquantized_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
-    ext = vllm_quant_backend.VllmQuantInternalWorkerExtension.__new__(
-        vllm_quant_backend.VllmQuantInternalWorkerExtension
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
         )
     )
+    ext._supports_unquantized_flashinfer_trtllm_refit = lambda: False
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
 
     assert ext._uses_unquantized_flashinfer_trtllm() is False
