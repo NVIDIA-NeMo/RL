@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import json
 import os
 import socket
 import subprocess
 import time
 import warnings
 from importlib import resources
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -482,6 +484,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
+        self._backend = cfg["backend"]
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
@@ -718,6 +721,39 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Save TQ controller metadata and storage data."""
+        if self._backend == "mooncake_cpu":
+            raise NotImplementedError(
+                "TQ checkpointing is not supported for the mooncake_cpu "
+                "backend: MooncakeStorageManager cannot persist its in-memory "
+                "rows, so TQ would silently create a metadata-only checkpoint."
+            )
+        _connect_existing()
+        tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore TQ state after initialization and before data operations."""
+        if self._backend == "mooncake_cpu":
+            raise NotImplementedError(
+                "TQ checkpoint restore is not supported for the mooncake_cpu "
+                "backend because its in-memory rows cannot be restored."
+            )
+        _connect_existing()
+        tq.load_checkpoint(checkpoint_dir)
+        metadata_path = Path(checkpoint_dir) / "metadata.json"
+        with metadata_path.open() as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        user_metadata = checkpoint_metadata.get("user_metadata", {})
+        if not isinstance(user_metadata, dict):
+            raise ValueError("TQ checkpoint user_metadata must be a dictionary")
+        return dict(user_metadata)
 
     def close(self) -> None:
         if self._closed:

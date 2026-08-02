@@ -672,6 +672,13 @@ class TQReplayBuffer:
         # Parallel to the lists above; populated only in token-capture mode.
         self._rollout_ids_list: list[Optional[list[str]]] = []
         self._staging_keys_list: list[Optional[list[str]]] = []
+        self._data_plane_checkpoint_lock: Optional[asyncio.Lock] = None
+
+    def set_data_plane_checkpoint_lock(self, lock: asyncio.Lock) -> None:
+        """Serialize replay-buffer-owned clears with SC checkpoints."""
+        if self._data_plane_checkpoint_lock is not None:
+            raise RuntimeError("data-plane checkpoint lock is already configured")
+        self._data_plane_checkpoint_lock = lock
 
     def reserve(
         self,
@@ -793,10 +800,8 @@ class TQReplayBuffer:
             # put_samples may have written rows before raising. Roll back by the
             # deterministic IDs known here; the caller removes the reserved slot.
             try:
-                await self._call_dp(
-                    "clear_samples",
+                await self._clear_samples(
                     sample_ids=list(sample_ids),
-                    partition_id=self._partition_id,
                 )
             except BaseException as rollback_error:
                 if isinstance(commit_error, asyncio.CancelledError):
@@ -1216,3 +1221,17 @@ class TQReplayBuffer:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    async def _clear_samples(self, *, sample_ids: list[str]) -> None:
+        """Clear rows without overlapping a bound data-plane checkpoint."""
+        if self._data_plane_checkpoint_lock is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint lock before clearing samples"
+            )
+        async with self._data_plane_checkpoint_lock:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+            )

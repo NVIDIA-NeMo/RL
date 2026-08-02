@@ -22,6 +22,9 @@ the data-plane extra still passes.
 
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 import torch
@@ -80,6 +83,76 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
         {"keys": [schema_keys[0]], "partition_id": "obj-backend"},
         {"keys": [schema_keys[1]], "partition_id": "obj-backend"},
     ]
+
+
+def test_checkpoint_lifecycle_forwards_to_tq(monkeypatch, tmp_path) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    connect_calls = []
+    save_calls = []
+    load_calls = []
+    monkeypatch.setattr(
+        tq_adapter,
+        "_connect_existing",
+        lambda: connect_calls.append(None),
+    )
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "save_checkpoint",
+        lambda checkpoint_dir, *, metadata=None: save_calls.append(
+            (checkpoint_dir, metadata)
+        ),
+    )
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "load_checkpoint",
+        lambda checkpoint_dir: load_calls.append(checkpoint_dir),
+    )
+
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._backend = "simple"
+    checkpoint_dir = tmp_path / "step-7"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps({"storage_saved": True, "user_metadata": {"step": 7}})
+    )
+    client.save_checkpoint(checkpoint_dir, metadata={"step": 7})
+    metadata = client.load_checkpoint(checkpoint_dir)
+
+    assert connect_calls == [None, None]
+    assert save_calls == [(checkpoint_dir, {"step": 7})]
+    assert load_calls == [checkpoint_dir]
+    assert metadata == {"step": 7}
+
+
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_mooncake_checkpoint_lifecycle_fails_loudly(
+    monkeypatch,
+    tmp_path,
+    operation: str,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    connect = MagicMock()
+    save = MagicMock()
+    load = MagicMock()
+    monkeypatch.setattr(tq_adapter, "_connect_existing", connect)
+    monkeypatch.setattr(tq_adapter.tq, "save_checkpoint", save)
+    monkeypatch.setattr(tq_adapter.tq, "load_checkpoint", load)
+
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._backend = "mooncake_cpu"
+    checkpoint_dir = tmp_path / "step-7"
+
+    with pytest.raises(NotImplementedError, match="mooncake_cpu"):
+        if operation == "save":
+            client.save_checkpoint(checkpoint_dir)
+        else:
+            client.load_checkpoint(checkpoint_dir)
+
+    connect.assert_not_called()
+    save.assert_not_called()
+    load.assert_not_called()
 
 
 # ``tq_client`` (simple) and ``tq_client_backends`` (parametrized over
