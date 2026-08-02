@@ -77,7 +77,7 @@ def get_nemo_gym_uv_cache_dir() -> str | None:
     try:
         return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
     except FileNotFoundError as e:
-        raise RuntimeError(
+        raise FileNotFoundError(
             "uv is not available in the container, cannot determine NeMo Gym uv cache directory"
         ) from e
 
