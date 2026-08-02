@@ -1,21 +1,26 @@
 defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
 policy:
   megatron_cfg:
-    # Multi-Token Prediction, mirroring the validated text-only Super recipe
-    # (grpo-nemotron3-super-120BA12B-16n8g-megatron.yaml).
+    # Multi-Token Prediction, matching the reference Super Omni recipe that
+    # runs MTP at context_parallel_size=2.
     #
-    # The checkpoint ships a single physical MTP layer
-    # (num_nextn_predict_layers: 1, mtp_hybrid_override_pattern: "*E"), so five
-    # prediction steps are only possible by reusing that layer -- hence
-    # mtp_use_repeated_layer. Setting mtp_num_layers > 1 without it would look
-    # for MTP blocks the checkpoint does not contain.
+    # The checkpoint ships one physical MTP layer (num_nextn_predict_layers: 1,
+    # mtp_hybrid_override_pattern: "*E"), so mtp_num_layers: 1 with
+    # use_repeated_layer: false maps directly onto it. Asking for more layers
+    # would require repeating that single layer.
     #
     # detach_heads keeps MTP gradients from flowing back into the backbone, so
-    # the main next-token objective is unchanged by the auxiliary heads.
-    mtp_num_layers: 5
-    mtp_use_repeated_layer: true
+    # the main next-token objective is unchanged by the auxiliary head.
+    mtp_num_layers: 1
+    mtp_use_repeated_layer: false
     mtp_detach_heads: true
-    mtp_loss_scaling_factor: 0.3
+    # 0.0 keeps the MTP head present and refit into vLLM (so speculative
+    # decoding can use it) without adding its loss to the training objective.
+    # This matches the reference Super Omni CP=2 recipe. Raising it turns MTP
+    # training on -- note that the pinned Megatron-LM has no separate MTP
+    # gradient clipping (nothing in clip_grads.py or optimizer_config.py
+    # references MTP), which is the known cause of exploding grad_norm.
+    mtp_loss_scaling_factor: 0.0
 logger:
   log_dir: logs/nemotron-super-omni-async-gym-mtp
   wandb:
