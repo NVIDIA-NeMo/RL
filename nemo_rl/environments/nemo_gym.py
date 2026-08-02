@@ -587,6 +587,11 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
                 f"NeMo Gym verify result {idx} declares reward_components but "
                 "is missing the scalar reward field required for validation."
             )
+        if "reward" not in result:
+            raise ValueError(
+                f"NeMo Gym verify result {idx} declares reward_components but "
+                "is missing the scalar reward field required for validation."
+            )
         scalar_reward = float(result["reward"])
         component_sum = sum(components.values())
         if not math.isclose(scalar_reward, component_sum, rel_tol=1e-5, abs_tol=1e-6):
