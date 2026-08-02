@@ -79,6 +79,9 @@ if TYPE_CHECKING:
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
+DATA_PLANE_CHECKPOINT_DIR = "data_plane"
+DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 1
+
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
@@ -183,6 +186,16 @@ class SingleControllerActor:
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
+        # TQ snapshots permit concurrent puts but not destructive clears. All
+        # clears currently owned by async SC use this lock, including rollback
+        # and eviction through TQReplayBuffer. A future staging/finalizer path
+        # must join the same barrier before native restore can be authoritative.
+        self._data_plane_checkpoint_lock: asyncio.Lock = asyncio.Lock()
+        if self._buffer is not None:
+            self._buffer.set_data_plane_checkpoint_lock(
+                self._data_plane_checkpoint_lock
+            )
+
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
@@ -537,6 +550,61 @@ class SingleControllerActor:
                 errors.append(cleanup_error)
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
+    async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
+        """Clear consumed rows without overlapping a data-plane checkpoint."""
+        async with self._data_plane_checkpoint_lock:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+            )
+
+    async def _save_data_plane_checkpoint(self, checkpoint_path: str) -> None:
+        """Save a shadow TQ snapshot inside an SC checkpoint bundle."""
+        checkpoint_dir = os.path.join(
+            checkpoint_path,
+            DATA_PLANE_CHECKPOINT_DIR,
+        )
+        metadata = {
+            "data_plane_checkpoint_schema_version": (
+                DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+            ),
+            "single_controller_train_steps": self._train_steps,
+            "single_controller_trainer_version": self._trainer_version,
+            "single_controller_epoch": self._current_epoch,
+            "partition_id": self._partition_id,
+            "mode": "shadow",
+        }
+        started = time.monotonic()
+        print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
+        try:
+            method = getattr(self._dp_client, "save_checkpoint")
+            remote = getattr(method, "remote", None)
+            if remote is not None:
+                await self._ray_get(
+                    remote(checkpoint_dir=checkpoint_dir, metadata=metadata)
+                )
+            else:
+                result = await asyncio.to_thread(
+                    method,
+                    checkpoint_dir=checkpoint_dir,
+                    metadata=metadata,
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception as error:
+            print(
+                "data-plane checkpoint save failed: "
+                f"{checkpoint_dir} ({type(error).__name__}: {error})",
+                flush=True,
+            )
+            raise
+        print(
+            "data-plane checkpoint save completed: "
+            f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
+            flush=True,
+        )
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -1054,14 +1122,28 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
-        buffer_state = await self._buffer.state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts
-        )
-        await asyncio.to_thread(
-            torch.save,
-            buffer_state,
-            os.path.join(checkpoint_path, "replay_buffer.pt"),
-        )
+        buffer_state: Optional[dict[str, Any]] = None
+        if self._master_config.data_plane.get("checkpointing_enabled"):
+            # Capture the legacy replay payload and the native TQ snapshot
+            # under one clear barrier. Generation puts may continue, so TQ can
+            # contain a superset of the groups named by replay_buffer.pt.
+            async with self._data_plane_checkpoint_lock:
+                if self._sampler.supports_buffer_checkpoint:
+                    buffer_state = await self._buffer.state_dict(
+                        saved_capacity=self._async_cfg.max_buffered_rollouts
+                    )
+                await self._save_data_plane_checkpoint(checkpoint_path)
+        elif self._sampler.supports_buffer_checkpoint:
+            buffer_state = await self._buffer.state_dict(
+                saved_capacity=self._async_cfg.max_buffered_rollouts
+            )
+
+        if buffer_state is not None:
+            await asyncio.to_thread(
+                torch.save,
+                buffer_state,
+                os.path.join(checkpoint_path, "replay_buffer.pt"),
+            )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(

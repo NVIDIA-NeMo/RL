@@ -224,6 +224,17 @@ class TestSetup:
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_single_controller(mc, MagicMock())
 
+    def test_rejects_mooncake_data_plane_checkpointing(self):
+        mc = _make_master_config()
+        mc.data_plane.update(
+            {
+                "backend": "mooncake_cpu",
+                "checkpointing_enabled": True,
+            }
+        )
+        with pytest.raises(NotImplementedError, match="backend='simple'"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_multiple_dataloader_not_supported(self):
         mc = _make_master_config(use_multiple_dataloader=True)
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):

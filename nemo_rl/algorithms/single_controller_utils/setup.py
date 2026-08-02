@@ -402,6 +402,12 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    if dp_config.get("checkpointing_enabled") and dp_config["backend"] != "simple":
+        raise NotImplementedError(
+            "SingleController data-plane checkpointing currently requires "
+            "data_plane.backend='simple'; Mooncake storage cannot be restored "
+            "by TQ v0.1.9."
+        )
 
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"

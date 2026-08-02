@@ -131,6 +131,42 @@ def test_close_propagates(wrapped_client):
     client.close()
 
 
+def test_checkpoint_lifecycle_is_forwarded_and_recorded(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "data-plane"
+    source_events: list[dict] = []
+    source = MetricsDataPlaneClient(
+        NoOpDataPlaneClient(),
+        on_event=source_events.append,
+    )
+    source.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+    source.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([1])}, batch_size=[1]),
+    )
+    source.save_checkpoint(checkpoint_dir, metadata={"step": 3})
+
+    restore_events: list[dict] = []
+    restored = MetricsDataPlaneClient(
+        NoOpDataPlaneClient(),
+        on_event=restore_events.append,
+    )
+    metadata = restored.load_checkpoint(checkpoint_dir)
+
+    assert metadata == {"step": 3}
+    assert [event["op"] for event in source_events][-1] == "save_checkpoint"
+    assert source_events[-1]["status"] == "ok"
+    assert [event["op"] for event in restore_events] == ["load_checkpoint"]
+    assert restore_events[-1]["status"] == "ok"
+    source.close()
+    restored.close()
+
+
 def test_factory_wraps_when_observability_enabled():
     """Programmatic wrap path; factory.py uses the same MetricsDataPlaneClient."""
     inner = NoOpDataPlaneClient()
