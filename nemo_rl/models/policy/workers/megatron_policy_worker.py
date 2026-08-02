@@ -572,13 +572,10 @@ class MegatronPolicyWorkerImpl(
                     "A model cannot both own sequence packing and consume caller-packed "
                     "full THD inputs."
                 )
-            model_config = self._get_model_config()
-            mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-            if mtp_num_layers is not None and mtp_num_layers > 0:
-                raise NotImplementedError(
-                    "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
-                    "Disable MTP for the Nano image/text path."
-                )
+            # MTP is supported here: the caller packs the MTP loss mask onto the
+            # same full THD row as input_ids and leaves it unsharded, so the
+            # model's own post-embedding CP slice applies to both alike. See the
+            # mtp_loss_mask branch in nemo_rl.models.megatron.data.
             if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
                 raise NotImplementedError(
                     "Nemotron Omni caller-packed THD inputs do not support "
