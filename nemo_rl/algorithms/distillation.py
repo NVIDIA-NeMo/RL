@@ -544,7 +544,7 @@ def setup(
                     nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
                 nemo_gym_cfg = NemoGymConfig(
                     model_name=generation_config["model_name"],
-                    base_urls=deferred_vllm.dp_openai_server_base_urls,
+                    base_urls=deferred_vllm.openai_server_base_urls(),
                     invalid_tool_call_patterns=invalid_tool_call_patterns,
                     thinking_tags=thinking_tags,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),

@@ -102,6 +102,7 @@ class VllmGeneration(GenerationInterface):
         """
         # Store config
         self.cfg = config
+        self.router_url = self.cfg["vllm_cfg"].get("router_url")
         self._defer_model_load = defer_model_load
         self.weight_synchronizer: WeightSynchronizer | None = None
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -274,6 +275,13 @@ class VllmGeneration(GenerationInterface):
             self.device_uuids = self._report_device_id()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
+
+    def openai_server_base_urls(self) -> list[str | None]:
+        """Return the endpoint used by HTTP-based rollout environments."""
+        if self.router_url:
+            base_url = self.router_url.rstrip("/")
+            return [base_url if base_url.endswith("/v1") else f"{base_url}/v1"]
+        return self.dp_openai_server_base_urls
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster

@@ -1211,7 +1211,7 @@ def setup(
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
                 return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
+                    deferred_vllm.openai_server_base_urls(),
                     generation_config["model_name"],
                 )
 
