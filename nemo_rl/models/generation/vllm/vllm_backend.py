@@ -638,7 +638,10 @@ class VllmInternalWorkerExtension:
         return self._sparse_delta_applier
 
     def _uses_unquantized_flashinfer_trtllm(self) -> bool:
-        vllm_config = self.model_runner.vllm_config
+        model_runner = getattr(self, "model_runner", None)
+        vllm_config = getattr(model_runner, "vllm_config", None)
+        if vllm_config is None:
+            return False
         kernel_config = getattr(vllm_config, "kernel_config", None)
         if getattr(kernel_config, "moe_backend", None) != "flashinfer_trtllm":
             return False
