@@ -215,7 +215,7 @@ class VllmInternalWorkerExtension:
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
-        if not self._nrl_layerwise_reload_active:
+        if not getattr(self, "_nrl_layerwise_reload_active", False):
             self.model_runner.model.load_weights(weights=policy_weights)
             return
 
