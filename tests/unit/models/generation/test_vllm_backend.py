@@ -138,7 +138,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     ext.model_config = model_config
     ext.device = torch.device("cpu")
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
-    ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
+    ext._maybe_process_fp8_kv_cache = MagicMock()
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda config: False)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
@@ -183,9 +183,9 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         ("finalize", model, model_config),
         "mtp",
         "config_exit",
-        "kv",
     ]
     assert call_order == expected_cycle * 2
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -247,6 +247,46 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
     ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+
+
+@pytest.mark.vllm
+def test_modelopt_extension_does_not_use_unquantized_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+        )
+    )
+    ext._is_real_quant_model = lambda: False
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
+def test_unquantized_reload_rejects_cotrained_mtp(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+        )
+    )
+    ext._mtp_drafter_refit_enabled = lambda: True
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    with pytest.raises(RuntimeError, match="co-trained MTP drafter"):
+        with ext._weight_update_lifecycle("collective"):
+            pass
 
 
 @pytest.mark.vllm

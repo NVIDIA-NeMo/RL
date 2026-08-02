@@ -638,6 +638,8 @@ class VllmInternalWorkerExtension:
         return self._sparse_delta_applier
 
     def _uses_unquantized_flashinfer_trtllm(self) -> bool:
+        if callable(getattr(self, "_is_real_quant_model", None)):
+            return False
         model_runner = getattr(self, "model_runner", None)
         vllm_config = getattr(model_runner, "vllm_config", None)
         if vllm_config is None:
@@ -657,6 +659,11 @@ class VllmInternalWorkerExtension:
         """Provide setup/finalization around a transport-owned weight update."""
         del transport
         if self._uses_unquantized_flashinfer_trtllm():
+            if self._mtp_drafter_refit_enabled():
+                raise RuntimeError(
+                    "Unquantized FlashInfer TRTLLM refit does not yet support "
+                    "a co-trained MTP drafter"
+                )
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload import (
                 finalize_layerwise_reload,
@@ -680,7 +687,6 @@ class VllmInternalWorkerExtension:
             finally:
                 self._nrl_layerwise_reload_active = False
 
-            self._maybe_process_fp8_kv_cache()
             return
 
         from vllm.config import set_current_vllm_config
