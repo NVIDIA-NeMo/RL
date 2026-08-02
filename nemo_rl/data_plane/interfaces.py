@@ -60,10 +60,11 @@ class DataPlaneConfig(TypedDict):
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
 
-    ``checkpointing_enabled`` opts algorithms into saving native TQ state
-    inside their checkpoint bundle. It is optional during rollout because
-    existing configs predate data-plane checkpointing; exemplar configs carry
-    the recommended default explicitly.
+    ``checkpointing_enabled`` opts SingleController into saving required
+    shadow TQ state inside its checkpoint bundle. Other algorithm entrypoints
+    do not consume this field. It is optional because existing configs predate
+    data-plane checkpointing; exemplar configs carry the recommended default
+    explicitly.
     """
 
     enabled: bool
@@ -474,7 +475,9 @@ class DataPlaneClient(ABC):
         """Restore a complete data-plane checkpoint.
 
         The data-plane implementation must already be initialized, but no data
-        operations may have run before restore.
+        operations may have run before restore. Implementations must reject a
+        load after operations through the same client; callers must also ensure
+        that no other client has modified shared data-plane state.
 
         Args:
             checkpoint_dir: Directory previously written by
