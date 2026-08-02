@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Verify TQ data-plane save/load across a fresh process restart.
+"""Verify TQ data-plane save/load across a fresh process and parent rename.
 
 The save phase writes sample tensors, tags, and partial consumer progress to
-TQ before checkpointing it. The load phase starts a fresh TQ instance, restores
-the checkpoint before any partition operations, and verifies both the tensors
-and the consumer cursor.
+TQ under ``tmp_<bundle>/data_plane``, then renames the parent bundle to its
+final path just like ``CheckpointManager``. The load phase starts a fresh TQ
+instance, restores from ``<bundle>/data_plane`` before any partition operations,
+and verifies both the tensors and the consumer cursor.
 
 Example:
     uv run --no-sync python tools/verify_tq_data_plane_checkpoint.py \
@@ -27,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +44,7 @@ TASK_NAME = "train"
 SAMPLE_IDS = [f"prompt-0:generation-{index}" for index in range(4)]
 SEQ_LEN = 16
 FIELDS = ["token_ids", "token_mask", "generation_logprobs"]
+DATA_PLANE_DIR = "data_plane"
 
 
 def _data_plane_config(num_storage_units: int) -> DataPlaneConfig:
@@ -161,6 +164,28 @@ def _load(checkpoint_dir: Path, num_storage_units: int) -> None:
         dp_client.close()
 
 
+def _save_and_finalize_bundle(
+    bundle_dir: Path,
+    num_storage_units: int,
+) -> None:
+    """Save below a temporary parent, then rename it to ``bundle_dir``."""
+    staging_dir = bundle_dir.with_name(f"tmp_{bundle_dir.name}")
+    if bundle_dir.exists():
+        raise FileExistsError(f"Final checkpoint bundle already exists: {bundle_dir}")
+    if staging_dir.exists():
+        raise FileExistsError(
+            f"Staging checkpoint bundle already exists: {staging_dir}"
+        )
+
+    try:
+        _save(staging_dir / DATA_PLANE_DIR, num_storage_units)
+        staging_dir.rename(bundle_dir)
+    except Exception:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        raise
+
+
 def _run_child(
     phase: str,
     checkpoint_dir: Path,
@@ -189,21 +214,29 @@ def main() -> None:
         default="round-trip",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        required=True,
+        help="Final SC-like checkpoint bundle directory.",
+    )
     parser.add_argument("--num-storage-units", type=int, default=4)
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
     if args.phase == "save":
-        _save(checkpoint_dir, args.num_storage_units)
+        _save_and_finalize_bundle(checkpoint_dir, args.num_storage_units)
         return
     if args.phase == "load":
-        _load(checkpoint_dir, args.num_storage_units)
+        _load(checkpoint_dir / DATA_PLANE_DIR, args.num_storage_units)
         return
 
     _run_child("save", checkpoint_dir, args.num_storage_units)
     _run_child("load", checkpoint_dir, args.num_storage_units)
-    print("PASS: TQ data-plane checkpoint survived a fresh process", flush=True)
+    print(
+        "PASS: TQ checkpoint survived a parent rename and fresh process",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
