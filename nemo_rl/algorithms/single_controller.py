@@ -188,8 +188,11 @@ class SingleControllerActor:
         # ── asyncio state ──────────────────────────────────────────────────
         # TQ snapshots permit concurrent puts but not destructive clears. All
         # clears currently owned by async SC use this lock, including rollback
-        # and eviction through TQReplayBuffer. A future staging/finalizer path
-        # must join the same barrier before native restore can be authoritative.
+        # and eviction through TQReplayBuffer. Clear-dependent eviction waits
+        # during a save; _buffer_capacity bounds new rollout groups and
+        # eventually stalls dispatch instead of allowing unbounded TQ growth.
+        # A future staging/finalizer path must join the same barrier before
+        # native restore can be authoritative.
         self._data_plane_checkpoint_lock: asyncio.Lock = asyncio.Lock()
         if self._buffer is not None:
             self._buffer.set_data_plane_checkpoint_lock(
@@ -343,13 +346,33 @@ class SingleControllerActor:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
         return await obj_ref
 
-    async def _call_dp(self, method_name: str, **kwargs) -> Any:
-        """Call a DataPlaneClient method or a Ray actor exposing that method."""
+    async def _call_dp(
+        self,
+        method_name: str,
+        *,
+        offload_sync: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Call a local DataPlaneClient or a Ray actor exposing its methods.
+
+        Args:
+            method_name: DataPlaneClient method to invoke.
+            offload_sync: Run a synchronous local implementation in a worker
+                thread. Use for blocking filesystem or RPC operations; Ray
+                methods are already asynchronous and ignore this setting.
+            **kwargs: Keyword arguments forwarded to the data-plane method.
+
+        Returns:
+            The method result after awaiting Ray or coroutine results.
+        """
         method = getattr(self._dp_client, method_name)
         remote = getattr(method, "remote", None)
         if remote is not None:
             return await self._ray_get(remote(**kwargs))
-        result = method(**kwargs)
+        if offload_sync:
+            result = await asyncio.to_thread(method, **kwargs)
+        else:
+            result = method(**kwargs)
         if asyncio.iscoroutine(result):
             return await result
         return result
@@ -561,7 +584,13 @@ class SingleControllerActor:
             )
 
     async def _save_data_plane_checkpoint(self, checkpoint_path: str) -> None:
-        """Save a shadow TQ snapshot inside an SC checkpoint bundle."""
+        """Save a required shadow TQ snapshot inside an SC checkpoint bundle.
+
+        Although native TQ restore is not wired into SC yet, opting into this
+        shadow snapshot is intentionally fail-closed: any failure propagates so
+        a finalized bundle never silently omits the advertised data-plane
+        component.
+        """
         checkpoint_dir = os.path.join(
             checkpoint_path,
             DATA_PLANE_CHECKPOINT_DIR,
@@ -579,20 +608,12 @@ class SingleControllerActor:
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
-            method = getattr(self._dp_client, "save_checkpoint")
-            remote = getattr(method, "remote", None)
-            if remote is not None:
-                await self._ray_get(
-                    remote(checkpoint_dir=checkpoint_dir, metadata=metadata)
-                )
-            else:
-                result = await asyncio.to_thread(
-                    method,
-                    checkpoint_dir=checkpoint_dir,
-                    metadata=metadata,
-                )
-                if asyncio.iscoroutine(result):
-                    await result
+            await self._call_dp(
+                "save_checkpoint",
+                offload_sync=True,
+                checkpoint_dir=checkpoint_dir,
+                metadata=metadata,
+            )
         except Exception as error:
             print(
                 "data-plane checkpoint save failed: "
