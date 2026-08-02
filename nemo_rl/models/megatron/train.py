@@ -133,6 +133,15 @@ def model_forward(
             **multimodal_data,
         )
 
+    # A model that slices context parallelism itself returns (output,
+    # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the
+    # caller can see the mask in the model's own CP-local token order. The MTP
+    # loss is computed inside the model against that mask, so only the logits
+    # are needed here. Without this the tuple reaches the loss wrapper, which
+    # calls .narrow() on it. See modeling_nemotron_omni.py return_sliced_loss_mask.
+    if isinstance(output_tensor, tuple):
+        output_tensor = output_tensor[0]
+
     return output_tensor
 
 
