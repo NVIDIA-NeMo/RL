@@ -213,11 +213,48 @@ class _ExhaustingSampler(_FakeSampler):
 
 
 class _FakeDPClient:
-    def __init__(self) -> None:
+    def __init__(self, *, save_error: Optional[Exception] = None) -> None:
         self.clear_calls: list[tuple[list[str], str]] = []
+        self.save_calls: list[dict[str, Any]] = []
+        self.save_error = save_error
 
     def clear_samples(self, sample_ids: list[str], partition_id: str) -> None:
         self.clear_calls.append((list(sample_ids), partition_id))
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str,
+        *,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.save_calls.append(
+            {
+                "checkpoint_dir": checkpoint_dir,
+                "metadata": dict(metadata or {}),
+            }
+        )
+        if self.save_error is not None:
+            raise self.save_error
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
+            json.dump({"user_metadata": metadata or {}}, f)
+
+
+class _BlockingDPClient(_FakeDPClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.save_started = threading.Event()
+        self.release_save = threading.Event()
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str,
+        *,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.save_started.set()
+        assert self.release_save.wait(timeout=30.0), "test never released TQ save"
+        super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
 class _FakeWeightSynchronizer:
@@ -251,6 +288,10 @@ class _FakeTQBuffer:
         self.load_return = load_return
         self.state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
+        self.checkpoint_lock: Optional[asyncio.Lock] = None
+
+    def set_data_plane_checkpoint_lock(self, lock: asyncio.Lock) -> None:
+        self.checkpoint_lock = lock
 
     async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
         self.state_dict_calls.append(saved_capacity)
@@ -313,6 +354,7 @@ def _actor_master_config(
     ft_save_period: Optional[int] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
+    data_plane_checkpoint: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -355,7 +397,12 @@ def _actor_master_config(
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
         },
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "checkpointing_enabled": data_plane_checkpoint,
+        },
         async_rl=AsyncRLConfig(
             sampler=sampler_cfg,
             min_groups_for_streaming_train=1,
@@ -371,6 +418,7 @@ def _make_actor_args(
     save_state: Optional[GRPOSaveState] = None,
     dataloader: Optional[_FakeDataloader] = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
+    dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
@@ -379,7 +427,7 @@ def _make_actor_args(
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
         inference_cluster=None,  # type: ignore[arg-type]
-        dp_client=_FakeDPClient(),
+        dp_client=dp_client if dp_client is not None else _FakeDPClient(),
         dataloader=dataloader if dataloader is not None else _FakeDataloader(),
         weight_synchronizer=_FakeWeightSynchronizer(),  # type: ignore[arg-type]
         advantage_estimator=None,
@@ -697,6 +745,88 @@ class TestSaveTrigger:
 
         # step_2 from ft_save_period, step_3 from last-step.
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
+
+
+class TestDataPlaneShadowCheckpoint:
+    def test_saves_tq_state_and_keeps_legacy_replay_payload(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            data_plane_checkpoint=True,
+        )
+        dp_client = _FakeDPClient()
+        buffer = _FakeTQBuffer(state={"legacy_payload": "kept"})
+
+        _run_train_pump(
+            mc,
+            _make_actor_args(dp_client=dp_client, tq_buffer=buffer),
+        )
+
+        assert len(dp_client.save_calls) == 1
+        save_call = dp_client.save_calls[0]
+        assert save_call["checkpoint_dir"] == str(
+            tmp_path / "checkpoints" / "tmp_step_1" / "data_plane"
+        )
+        assert save_call["metadata"] == {
+            "data_plane_checkpoint_schema_version": 1,
+            "single_controller_train_steps": 1,
+            "single_controller_trainer_version": 1,
+            "single_controller_epoch": 0,
+            "partition_id": _PARTITION_ID,
+            "mode": "shadow",
+        }
+        step_dir = tmp_path / "checkpoints" / "step_1"
+        assert (step_dir / "data_plane" / "metadata.json").is_file()
+        assert torch.load(step_dir / "replay_buffer.pt", weights_only=False) == {
+            "legacy_payload": "kept"
+        }
+        assert buffer.state_dict_calls == [4]
+
+    def test_tq_save_failure_aborts_checkpoint(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            data_plane_checkpoint=True,
+        )
+        dp_client = _FakeDPClient(save_error=RuntimeError("injected TQ failure"))
+
+        with pytest.raises(RuntimeError, match="injected TQ failure"):
+            _run_train_pump(mc, _make_actor_args(dp_client=dp_client))
+
+        assert not (tmp_path / "checkpoints" / "step_1").exists()
+
+    def test_consumed_clear_waits_for_tq_save(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            data_plane_checkpoint=True,
+        )
+        dp_client = _BlockingDPClient()
+
+        async def _main() -> None:
+            actor = _ACTOR_CLS(mc, _make_actor_args(dp_client=dp_client))
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            save_task = asyncio.create_task(actor._save_checkpoint({"loss": 1.0}))
+            started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
+            assert started
+
+            clear_task = asyncio.create_task(
+                actor._clear_data_plane_samples(["sample-0"])
+            )
+            await asyncio.sleep(0)
+            assert dp_client.clear_calls == []
+
+            dp_client.release_save.set()
+            await save_task
+            await clear_task
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+        assert dp_client.clear_calls == [(["sample-0"], _PARTITION_ID)]
 
 
 # ── async-save finalization ──────────────────────────────────────────────────
