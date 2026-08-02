@@ -100,6 +100,7 @@ logger:
 
 data_plane:
   enabled: true
+  checkpointing_enabled: true
 
 cluster:
   gpus_per_node: 2
