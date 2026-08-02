@@ -192,20 +192,27 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = SimpleNamespace(load_weights=MagicMock())
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
+    source = torch.ones(4)
+    unrelated = torch.full((2,), 7.0)
+    source_args = SimpleNamespace(arguments={"loaded_weight": source[:2]})
+    unrelated_args = SimpleNamespace(arguments={"loaded_weight": unrelated})
+    model = SimpleNamespace(modules=lambda: [object()])
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.layerwise.get_layerwise_info",
+        lambda _module: SimpleNamespace(
+            loaded_weights=[("source", source_args), ("other", unrelated_args)]
+        ),
     )
-    ext.model_runner = SimpleNamespace(model=model)
-    ext._nrl_layerwise_reload_active = True
-    weight = torch.ones(2)
-    detach = MagicMock()
-    monkeypatch.setattr(vllm_backend, "_detach_pending_layerwise_weights", detach)
 
-    ext._load_full_hf_weights([("model.weight", weight)])
+    vllm_backend._detach_pending_layerwise_weights(
+        model, {source.untyped_storage().data_ptr()}
+    )
 
-    model.load_weights.assert_called_once_with(weights=[("model.weight", weight)])
-    detach.assert_called_once_with(model, {weight.untyped_storage().data_ptr()})
+    detached = source_args.arguments["loaded_weight"]
+    assert detached.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert unrelated_args.arguments["loaded_weight"] is unrelated
+    source.zero_()
+    torch.testing.assert_close(detached, torch.ones(2))
 
 
 @pytest.mark.vllm
@@ -251,6 +258,25 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
 @pytest.mark.vllm
 def test_modelopt_extension_does_not_use_unquantized_reload(monkeypatch):
+    from nemo_rl.modelopt.models.generation import vllm_quant_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_quant_backend.VllmQuantInternalWorkerExtension.__new__(
+        vllm_quant_backend.VllmQuantInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+        )
+    )
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("moe_backend", ["auto", "triton", None])
+def test_other_moe_backends_keep_existing_refit_lifecycle(monkeypatch, moe_backend):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -259,17 +285,16 @@ def test_modelopt_extension_does_not_use_unquantized_reload(monkeypatch):
     )
     ext.model_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+            kernel_config=SimpleNamespace(moe_backend=moe_backend)
         )
     )
-    ext._is_real_quant_model = lambda: False
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
 
     assert ext._uses_unquantized_flashinfer_trtllm() is False
 
 
 @pytest.mark.vllm
-def test_unquantized_reload_rejects_cotrained_mtp(monkeypatch):
+def test_unquantized_reload_rejects_cotrained_mtp_during_prepare(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -285,6 +310,44 @@ def test_unquantized_reload_rejects_cotrained_mtp(monkeypatch):
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
 
     with pytest.raises(RuntimeError, match="co-trained MTP drafter"):
+        ext.prepare_refit_info({"model.weight": object()})
+
+    assert not hasattr(ext, "state_dict_info")
+
+
+@pytest.mark.vllm
+def test_failed_unquantized_reload_marks_worker_unusable(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=object(),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+        ),
+    )
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._mtp_drafter_refit_enabled = lambda: False
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: None,
+    )
+
+    failure = RuntimeError("load failed")
+    with pytest.raises(RuntimeError, match="load failed"):
+        with ext._weight_update_lifecycle("collective"):
+            raise failure
+
+    assert ext._nrl_layerwise_reload_failure is failure
+    with pytest.raises(RuntimeError, match="worker is unusable"):
         with ext._weight_update_lifecycle("collective"):
             pass
 
