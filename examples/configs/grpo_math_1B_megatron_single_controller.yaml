@@ -58,6 +58,7 @@ logger:
 
 data_plane:
   enabled: true
+  # Required shadow snapshot: a save failure aborts checkpoint finalization.
   checkpointing_enabled: true
 
 cluster:
