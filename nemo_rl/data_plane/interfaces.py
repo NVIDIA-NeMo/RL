@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
@@ -58,6 +59,11 @@ class DataPlaneConfig(TypedDict):
     ``backend == "mooncake_cpu"``; the simple backend ignores them.
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
+
+    ``checkpointing_enabled`` opts algorithms into saving native TQ state
+    inside their checkpoint bundle. It is optional during rollout because
+    existing configs predate data-plane checkpointing; exemplar configs carry
+    the recommended default explicitly.
     """
 
     enabled: bool
@@ -68,6 +74,7 @@ class DataPlaneConfig(TypedDict):
     claim_meta_poll_interval_s: float
     global_segment_size: int
     local_buffer_size: int
+    checkpointing_enabled: NotRequired[bool]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
@@ -259,7 +266,8 @@ class DataPlaneClient(ABC):
     B. *Direct-by-key* — used by stages that already know the exact uids
        (e.g. driver-side fan-out to DP ranks):
        :meth:`put_samples`, :meth:`get_samples`, :meth:`clear_samples`.
-    C. *Lifecycle* — :meth:`close`.
+    C. *Lifecycle* — :meth:`save_checkpoint`, :meth:`load_checkpoint`, and
+       :meth:`close`.
 
     Stage-completion signal: there is intentionally no ``mark_consumed``.
     The authoritative signal in TransferQueue is *field production* —
@@ -441,6 +449,42 @@ class DataPlaneClient(ABC):
         """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    @abstractmethod
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist the complete data-plane state to ``checkpoint_dir``.
+
+        The checkpoint must include both data and the implementation's
+        scheduling/consumption metadata. Callers must serialize checkpoint
+        saves and prevent destructive operations such as clears until this
+        method returns.
+
+        Args:
+            checkpoint_dir: New durable directory for this checkpoint.
+            metadata: Optional JSON-compatible recovery metadata.
+        """
+
+    @abstractmethod
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore a complete data-plane checkpoint.
+
+        The data-plane implementation must already be initialized, but no data
+        operations may have run before restore.
+
+        Args:
+            checkpoint_dir: Directory previously written by
+                :meth:`save_checkpoint`.
+
+        Returns:
+            User metadata supplied to :meth:`save_checkpoint`. The caller may
+            validate this metadata, but restoring data-plane state does not
+            restore the surrounding controller or trainer state.
+        """
 
     @abstractmethod
     def close(self) -> None:

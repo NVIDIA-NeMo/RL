@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Literal, TypedDict
 
@@ -336,6 +337,28 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=n_keys,
         )
         self._record_clear(partition_id, sample_ids_list)
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._run(
+            "save_checkpoint",
+            "",
+            lambda: self._inner.save_checkpoint(
+                checkpoint_dir,
+                metadata=metadata,
+            ),
+        )
+
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        return self._run(
+            "load_checkpoint",
+            "",
+            lambda: self._inner.load_checkpoint(checkpoint_dir),
+        )
 
     def close(self) -> None:
         self._run(

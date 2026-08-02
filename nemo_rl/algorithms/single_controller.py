@@ -74,6 +74,9 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
+DATA_PLANE_CHECKPOINT_DIR = "data_plane"
+DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 1
+
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
@@ -169,6 +172,16 @@ class SingleControllerActor:
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
+        # TQ snapshots permit concurrent puts but not destructive clears. All
+        # clears currently owned by async SC use this lock, including rollback
+        # and eviction through TQReplayBuffer. A future staging/finalizer path
+        # must join the same barrier before native restore can be authoritative.
+        self._data_plane_checkpoint_lock: asyncio.Lock = asyncio.Lock()
+        if self._buffer is not None:
+            self._buffer.set_data_plane_checkpoint_lock(
+                self._data_plane_checkpoint_lock
+            )
+
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
@@ -296,9 +309,7 @@ class SingleControllerActor:
             buffer_state,
             max_groups=self._async_cfg.max_buffered_rollouts,
             expected_partition_id=self._partition_id,
-            expected_group_size=self._master_config.grpo[
-                "num_generations_per_prompt"
-            ],
+            expected_group_size=self._master_config.grpo["num_generations_per_prompt"],
         )
         # Each buffered group holds one _buffer_capacity permit; the load
         # truncation guarantees restored <= capacity, so this never blocks.
@@ -320,6 +331,61 @@ class SingleControllerActor:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
+        """Clear consumed rows without overlapping a data-plane checkpoint."""
+        async with self._data_plane_checkpoint_lock:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+            )
+
+    async def _save_data_plane_checkpoint(self, checkpoint_path: str) -> None:
+        """Save a shadow TQ snapshot inside an SC checkpoint bundle."""
+        checkpoint_dir = os.path.join(
+            checkpoint_path,
+            DATA_PLANE_CHECKPOINT_DIR,
+        )
+        metadata = {
+            "data_plane_checkpoint_schema_version": (
+                DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+            ),
+            "single_controller_train_steps": self._train_steps,
+            "single_controller_trainer_version": self._trainer_version,
+            "single_controller_epoch": self._current_epoch,
+            "partition_id": self._partition_id,
+            "mode": "shadow",
+        }
+        started = time.monotonic()
+        print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
+        try:
+            method = getattr(self._dp_client, "save_checkpoint")
+            remote = getattr(method, "remote", None)
+            if remote is not None:
+                await self._ray_get(
+                    remote(checkpoint_dir=checkpoint_dir, metadata=metadata)
+                )
+            else:
+                result = await asyncio.to_thread(
+                    method,
+                    checkpoint_dir=checkpoint_dir,
+                    metadata=metadata,
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception as error:
+            print(
+                "data-plane checkpoint save failed: "
+                f"{checkpoint_dir} ({type(error).__name__}: {error})",
+                flush=True,
+            )
+            raise
+        print(
+            "data-plane checkpoint save completed: "
+            f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
+            flush=True,
+        )
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -577,11 +643,7 @@ class SingleControllerActor:
                         min_sample_version = curr_min_sample_version
 
                     # Remove consumed sample_ids from the buffer
-                    await self._call_dp(
-                        "clear_samples",
-                        sample_ids=list(train_meta.sample_ids),
-                        partition_id=self._partition_id,
-                    )
+                    await self._clear_data_plane_samples(list(train_meta.sample_ids))
 
                     groups_dispatched += num_groups
 
@@ -606,9 +668,7 @@ class SingleControllerActor:
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 self._consumed_samples += grpo_cfg["num_prompts_per_step"]
-                self._total_valid_tokens += step_metrics.get(
-                    "global_valid_toks", 0
-                )
+                self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
                 is_last_step = self._train_steps >= grpo_cfg["max_num_steps"]
@@ -706,9 +766,9 @@ class SingleControllerActor:
 
         full_metric_name = self._master_config.checkpointing["metric_name"]
         if full_metric_name is not None:
-            assert full_metric_name.startswith(
-                "train:"
-            ) or full_metric_name.startswith("val:"), (
+            assert full_metric_name.startswith("train:") or full_metric_name.startswith(
+                "val:"
+            ), (
                 f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
                 f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
                 f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
@@ -725,9 +785,7 @@ class SingleControllerActor:
                 if full_metric_name in save_state:
                     del save_state[full_metric_name]
             elif metric_name not in metrics_source:
-                raise ValueError(
-                    f"Metric {metric_name} not found in {prefix} metrics"
-                )
+                raise ValueError(f"Metric {metric_name} not found in {prefix} metrics")
             else:
                 save_state[full_metric_name] = metrics_source[metric_name]
 
@@ -758,10 +816,23 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
-        if self._sampler.supports_buffer_checkpoint:
+        buffer_state: Optional[dict[str, Any]] = None
+        if self._master_config.data_plane.get("checkpointing_enabled"):
+            # Capture the legacy replay payload and the native TQ snapshot
+            # under one clear barrier. Generation puts may continue, so TQ can
+            # contain a superset of the groups named by replay_buffer.pt.
+            async with self._data_plane_checkpoint_lock:
+                if self._sampler.supports_buffer_checkpoint:
+                    buffer_state = await self._buffer.state_dict(
+                        saved_capacity=self._async_cfg.max_buffered_rollouts
+                    )
+                await self._save_data_plane_checkpoint(checkpoint_path)
+        elif self._sampler.supports_buffer_checkpoint:
             buffer_state = await self._buffer.state_dict(
                 saved_capacity=self._async_cfg.max_buffered_rollouts
             )
+
+        if buffer_state is not None:
             await asyncio.to_thread(
                 torch.save,
                 buffer_state,
