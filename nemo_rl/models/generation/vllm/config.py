@@ -43,7 +43,7 @@ class VllmSpecificArgs(TypedDict):
     use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
-    # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
+    # It exposes /tokenize, /v1/chat/completions, and /v1/completions.
     expose_http_server: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
@@ -62,6 +62,10 @@ class VllmSpecificArgs(TypedDict):
     env_vars: NotRequired[dict[str, str]]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
+    # Optional external vLLM Router origin (or origin/v1). Ray still owns
+    # worker lifecycle/refit; rollout requests use this endpoint when set.
+    router_url: NotRequired[str]
+    router_request_id_header: NotRequired[str]
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):

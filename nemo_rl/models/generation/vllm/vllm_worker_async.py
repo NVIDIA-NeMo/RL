@@ -357,6 +357,13 @@ class VllmAsyncGenerationWorkerImpl(
             ChatCompletionRequest,
             ChatCompletionResponse,
         )
+        from vllm.entrypoints.openai.completion.protocol import (
+            CompletionRequest,
+            CompletionResponse,
+        )
+        from vllm.entrypoints.openai.completion.serving import (
+            OpenAIServingCompletion,
+        )
         from vllm.entrypoints.openai.chat_completion.serving import (
             OpenAIServingChat,
         )
@@ -662,8 +669,40 @@ class VllmAsyncGenerationWorkerImpl(
             )
         )
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
+        openai_serving_completion = OpenAIServingCompletion(
+            engine_client=engine_client,
+            models=openai_serving_models,
+            online_renderer=engine_client.renderer,
+            request_logger=serving_chat_kwargs["request_logger"],
+            return_tokens_as_token_ids=True,
+            enable_prompt_tokens_details=True,
+        )
 
         generation_config = self.cfg
+
+        @app.post("/v1/completions")
+        async def create_completion(
+            request: CompletionRequest, raw_request: Request
+        ):
+            # This endpoint is for native NeMo-RL router transport.  It keeps
+            # the prompt pre-tokenized and returns token IDs/logprobs instead
+            # of forcing a text round-trip through a chat template.
+            assert request.top_k in (None, -1), (
+                f"Top k must be unset, empty, or -1; got {request.top_k}"
+            )
+            request.top_k = -1
+            assert request.temperature == generation_config["temperature"]
+            assert request.top_p == generation_config["top_p"]
+            generator = await openai_serving_completion.create_completion(
+                request, raw_request
+            )
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.error.code
+                )
+            if isinstance(generator, CompletionResponse):
+                return JSONResponse(content=generator.model_dump())
+            return StreamingResponse(content=generator, media_type="text/event-stream")
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")

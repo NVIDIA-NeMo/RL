@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import asyncio
+import base64
+import io
 import logging
 import os
+import uuid
 import warnings
 from collections import defaultdict
 from typing import (
@@ -102,6 +105,10 @@ class VllmGeneration(GenerationInterface):
         """
         # Store config
         self.cfg = config
+        self.router_url = self.cfg["vllm_cfg"].get("router_url")
+        self.router_request_id_header = self.cfg["vllm_cfg"].get(
+            "router_request_id_header", "x-request-id"
+        )
         self._defer_model_load = defer_model_load
         self.weight_synchronizer: WeightSynchronizer | None = None
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -274,6 +281,17 @@ class VllmGeneration(GenerationInterface):
             self.device_uuids = self._report_device_id()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
+
+    def openai_server_base_urls(self) -> list[str | None]:
+        """Return the endpoint used by HTTP-based rollout environments."""
+        if self.router_url:
+            return [self._router_base_url()]
+        return self.dp_openai_server_base_urls
+
+    def _router_base_url(self) -> str:
+        """Return the router's OpenAI-compatible ``/v1`` base URL."""
+        base_url = self.router_url.rstrip("/")
+        return base_url if base_url.endswith("/v1") else f"{base_url}/v1"
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -754,6 +772,10 @@ class VllmGeneration(GenerationInterface):
             f"outside this method."
         )
 
+        if self.router_url:
+            yield await self._generate_one_via_router(data, greedy=greedy)
+            return
+
         # Determine the leader worker for the current data parallel shard
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
             self.current_generate_dp_shard_idx
@@ -804,6 +826,118 @@ class VllmGeneration(GenerationInterface):
         original_idx, result_batch = sample_result
         result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
         yield (original_idx, result_batch)
+
+    async def _generate_one_via_router(
+        self, data: BatchedDataDict[GenerationDatumSpec], *, greedy: bool
+    ) -> tuple[int, BatchedDataDict[GenerationOutputSpec]]:
+        """Generate one token-id prompt through an external vLLM Router."""
+        import aiohttp
+
+        input_ids = data["input_ids"][0]
+        input_length = int(data["input_lengths"][0].item())
+        prompt_token_ids = input_ids[:input_length].detach().cpu().tolist()
+        stop_strings = data.get("stop_strings", [None])[0]
+        remaining = self.cfg["vllm_cfg"]["max_model_len"] - input_length
+        max_tokens = max(0, min(self.cfg["max_new_tokens"], remaining))
+        if max_tokens == 0:
+            return 0, BatchedDataDict(
+                {
+                    "output_ids": input_ids[:input_length].unsqueeze(0),
+                    "logprobs": torch.zeros(
+                        (1, input_length), dtype=torch.float32, device=input_ids.device
+                    ),
+                    "generation_lengths": torch.zeros(1, dtype=torch.long),
+                    "unpadded_sequence_lengths": torch.tensor(
+                        [input_length], dtype=torch.long
+                    ),
+                    "truncated": torch.zeros(1, dtype=torch.bool),
+                }
+            )
+
+        request_id = data.get("router_request_id") or str(uuid.uuid4())
+        headers = {
+            self.router_request_id_header: str(request_id),
+            "content-type": "application/json",
+        }
+        body = {
+            "model": self.cfg["model_name"],
+            "prompt": prompt_token_ids,
+            "max_tokens": max_tokens,
+            "temperature": 0.0 if greedy else self.cfg["temperature"],
+            "top_p": self.cfg["top_p"],
+            "top_k": 1 if greedy else (self.cfg["top_k"] or -1),
+            "stop": stop_strings,
+            "stop_token_ids": self.cfg["stop_token_ids"],
+            "include_stop_str_in_output": True,
+            "ignore_eos": self.cfg.get("ignore_eos", False),
+            "logprobs": 0,
+            "return_token_ids": True,
+            "request_id": str(request_id),
+        }
+        timeout = aiohttp.ClientTimeout(
+            total=float(os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900"))
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{self._router_base_url()}/completions",
+                json=body,
+                headers=headers,
+            ) as response:
+                payload = await response.json()
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"vLLM Router generation failed ({response.status}): {payload}"
+                    )
+
+        choice = payload["choices"][0]
+        returned_prompt = choice.get("prompt_token_ids")
+        if returned_prompt is not None and returned_prompt != prompt_token_ids:
+            raise RuntimeError(
+                "Router backend changed the prompt token IDs; refusing an "
+                "off-policy native rollout."
+            )
+        generated_token_ids = choice.get("token_ids")
+        if generated_token_ids is None:
+            raise RuntimeError(
+                "Router completion response did not include token_ids; "
+                "set return_token_ids on every backend."
+            )
+        generated_token_ids = [int(token_id) for token_id in generated_token_ids]
+        output_ids = torch.tensor(
+            [prompt_token_ids + generated_token_ids],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        token_logprobs = (choice.get("logprobs") or {}).get("token_logprobs") or []
+        logprobs = torch.zeros(
+            output_ids.shape, dtype=torch.float32, device=input_ids.device
+        )
+        for idx, value in enumerate(token_logprobs[: len(generated_token_ids)]):
+            if value is not None:
+                logprobs[0, input_length + idx] = float(value)
+        result = BatchedDataDict(
+            {
+                "output_ids": output_ids,
+                "logprobs": logprobs,
+                "generation_lengths": torch.tensor(
+                    [len(generated_token_ids)], dtype=torch.long
+                ),
+                "unpadded_sequence_lengths": torch.tensor(
+                    [output_ids.shape[1]], dtype=torch.long
+                ),
+                "truncated": torch.tensor(
+                    [choice.get("finish_reason") == "length"], dtype=torch.bool
+                ),
+            }
+        )
+        routed_experts_b64 = choice.get("routed_experts")
+        if routed_experts_b64:
+            with io.BytesIO(base64.b64decode(routed_experts_b64)) as buffer:
+                routed = torch.from_numpy(np.load(buffer, allow_pickle=False)).to(
+                    device=input_ids.device
+                )
+            result["routed_experts"] = routed.unsqueeze(0)
+        return 0, result
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
