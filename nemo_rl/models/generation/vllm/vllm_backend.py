@@ -352,6 +352,7 @@ class VllmInternalWorkerExtension:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
         """
+        self._validate_weight_update_compatibility()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def prepare_sparse_delta_refit_info(
@@ -637,8 +638,11 @@ class VllmInternalWorkerExtension:
             )
         return self._sparse_delta_applier
 
+    def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
+        return True
+
     def _uses_unquantized_flashinfer_trtllm(self) -> bool:
-        if callable(getattr(self, "_is_real_quant_model", None)):
+        if not self._supports_unquantized_flashinfer_trtllm_refit():
             return False
         model_runner = getattr(self, "model_runner", None)
         vllm_config = getattr(model_runner, "vllm_config", None)
@@ -652,6 +656,16 @@ class VllmInternalWorkerExtension:
 
         return not fp8.is_fp8_model(vllm_config)
 
+    def _validate_weight_update_compatibility(self) -> None:
+        if (
+            self._uses_unquantized_flashinfer_trtllm()
+            and self._mtp_drafter_refit_enabled()
+        ):
+            raise RuntimeError(
+                "Unquantized FlashInfer TRTLLM refit does not yet support "
+                "a co-trained MTP drafter"
+            )
+
     @contextmanager
     def _weight_update_lifecycle(
         self, transport: WeightUpdateTransport
@@ -659,11 +673,12 @@ class VllmInternalWorkerExtension:
         """Provide setup/finalization around a transport-owned weight update."""
         del transport
         if self._uses_unquantized_flashinfer_trtllm():
-            if self._mtp_drafter_refit_enabled():
+            self._validate_weight_update_compatibility()
+            previous_failure = getattr(self, "_nrl_layerwise_reload_failure", None)
+            if previous_failure is not None:
                 raise RuntimeError(
-                    "Unquantized FlashInfer TRTLLM refit does not yet support "
-                    "a co-trained MTP drafter"
-                )
+                    "The vLLM worker is unusable after a failed native layerwise refit"
+                ) from previous_failure
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload import (
                 finalize_layerwise_reload,
@@ -684,6 +699,9 @@ class VllmInternalWorkerExtension:
                         initialize_layerwise_reload(model)
                     self._nrl_layerwise_reload_active = True
                     yield finalize
+            except Exception as error:
+                self._nrl_layerwise_reload_failure = error
+                raise
             finally:
                 self._nrl_layerwise_reload_active = False
 
