@@ -675,7 +675,12 @@ class TQReplayBuffer:
         self._data_plane_checkpoint_lock: Optional[asyncio.Lock] = None
 
     def set_data_plane_checkpoint_lock(self, lock: asyncio.Lock) -> None:
-        """Serialize replay-buffer-owned clears with SC checkpoints."""
+        """Bind the controller's shared checkpoint/clear barrier exactly once.
+
+        A private fallback lock would not coordinate with controller-owned
+        saves and clears, so destructive operations fail loudly until the SC
+        actor supplies its lock.
+        """
         if self._data_plane_checkpoint_lock is not None:
             raise RuntimeError("data-plane checkpoint lock is already configured")
         self._data_plane_checkpoint_lock = lock
