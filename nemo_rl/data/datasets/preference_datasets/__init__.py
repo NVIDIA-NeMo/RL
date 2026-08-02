@@ -52,6 +52,10 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
         raise ValueError(
             "PreferenceDatasetConfig must contain a 'dataset_name' key."
         )
+    if "dataset_name" not in data_config:
+        raise ValueError(
+            "PreferenceDatasetConfig must contain a 'dataset_name' key."
+        )
     dataset_name = data_config["dataset_name"]
 
     # load dataset
