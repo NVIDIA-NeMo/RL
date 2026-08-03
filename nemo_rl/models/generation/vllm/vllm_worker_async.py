@@ -682,6 +682,14 @@ class VllmAsyncGenerationWorkerImpl(
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
+            # Merge recipe-level chat_template_kwargs into the request. Client-
+            # provided keys win so a caller can still override per request.
+            if default_chat_template_kwargs:
+                request.chat_template_kwargs = {
+                    **default_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
+                }
+
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
@@ -748,6 +756,17 @@ class VllmAsyncGenerationWorkerImpl(
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            # Chat-mode tokenize also renders the chat template — inject the
+            # same default kwargs so /tokenize and /v1/chat/completions produce
+            # identical prompt tokens under multi-turn.
+            if default_chat_template_kwargs and hasattr(
+                request, "chat_template_kwargs"
+            ):
+                request.chat_template_kwargs = {
+                    **default_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
+                }
+
             generator = await openai_serving_tokenization.create_tokenize(
                 request, raw_request
             )

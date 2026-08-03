@@ -1,0 +1,22 @@
+# Async variant of grpo_nemotron_omni_30ba3b_gymv_smoke.yaml.
+#
+# Extends the sync smoke recipe and flips only the async_grpo block on:
+# 1-step trajectory age (mirrors the LLM `-async-1off` recipes under
+# examples/configs/recipes/llm/performance/).
+#
+# Run with:
+#   uv run --locked --extra mcore --extra vllm \
+#     examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke_async_1off.yaml
+
+defaults: grpo_nemotron_omni_30ba3b_gymv_smoke.yaml
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+
+logger:
+  log_dir: "logs/grpo-nemotron-omni-30ba3b-gymv-smoke-async"
+  wandb:
+    name: "grpo-nemotron-omni-30ba3b-gymv-smoke-async"

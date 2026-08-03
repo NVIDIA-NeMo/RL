@@ -1,0 +1,309 @@
+# Qwen2.5-VL-3B smoke test for the multimodal + multi-turn NeMo-Gym integration.
+#
+# Modeled after nemo-rl-games-bandit's frozenlake_size4.yaml chain (see
+# examples/configs/frozenlake_difficulty_ablations/frozenlake_size4.yaml) but
+# retargeted to this branch's live gym-v drop under
+# `3rdparty/Gym-workspace/Gym/environments/gym_v/` — which bundles both the
+# gym_v resources server and the gymv_agent responses-API agent.
+#
+# Shape (single node, 8 GPUs, non-colocated):
+#   - vLLM generation: 4 GPUs (TP=4)
+#   - Megatron policy: 4 GPUs (TP=4)
+#
+# Data: the bundled `environments/gym_v/data/example.jsonl` (8 rows across
+# FrozenLake, GameOfLife, and a few other env families). Used for both train
+# and validation so the smoke run exercises the multi-turn rollout + full
+# validation path without needing an external manifest.
+#
+# Run with:
+#   uv run --locked --extra mcore --extra vllm \
+#     examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_qwen25vl_gymv_smoke.yaml
+
+grpo:
+  num_prompts_per_step: 1                # smallest: exercises the loop, minimal cost
+  num_generations_per_prompt: 4          # gbs = 1 * 4 = 4 rollouts/step
+  num_val_generations_per_prompt: 1
+  # Multi-turn: cap at 4 turns so per-rollout images stay < limit_mm_per_prompt
+  # and the smoke run finishes quickly even on a slow VLM.
+  max_rollout_turns: 4
+  max_num_epochs: 1
+  max_num_steps: 5                       # smoke: 5 optimizer steps
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 5
+  val_at_start: true                     # validate the eval path before training
+  val_at_end: false
+  overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
+  max_val_samples: null                  # inferred from val dataset length
+  val_batch_size: null                   # inferred from val dataset length
+  seed: 42
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  async_grpo:
+    enabled: false                       # sync GRPO for the smoke run
+    max_trajectory_age_steps: 1
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
+  use_importance_sampling_correction: false
+  token_level_loss: true
+
+checkpointing:
+  enabled: false                         # smoke test — no checkpoints
+  checkpoint_dir: "results/grpo-qwen25vl-gymv-smoke"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1
+  save_period: 5
+  checkpoint_must_save_by: null
+  save_optimizer: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-VL-3B-Instruct"
+  is_vlm: true                           # required by run_multimodal_grpo_nemo_gym.py
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  # gbs must equal num_prompts_per_step * num_generations_per_prompt.
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 8
+  # Room for a 4-turn multi-image rollout with Qwen2.5-VL's per-image token cost.
+  max_total_sequence_length: 8192
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: false                       # using megatron backend for the policy
+
+  megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    # 4-GPU policy world → TP=4, DP=1, PP=1.
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false             # off for a dense small VLM smoke
+    # Qwen2.5-VL-3B is dense, but freeze the MoE knobs anyway so nothing
+    # unexpected fires. Router/expert paths are unused for this model.
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    apply_rope_fusion: true
+    # VLM: keep bias_activation_fusion off (see nano-v3 recipe rationale;
+    # avoids fused-kernel edge cases with the vision-tower path).
+    bias_activation_fusion: false
+    defer_fp32_logits: false
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-7
+      min_lr: 5.0e-7
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      # Smoke test only ever runs 5 steps; keep warmup at 0 so the
+      # OptimizerParamScheduler invariant `lr_warmup_iters < lr_decay_iters`
+      # never trips (mirrors the trajectory-collection recipe).
+      lr_warmup_iters: 0
+      lr_warmup_init: 5.0e-8
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    # Off for the smoke run — the multimodal packing path has extra invariants
+    # (imgs_sizes / mm_token_type_ids alignment) that we want to keep out of
+    # the first-cut integration signal. Turn on once the base loop is green.
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null
+  scheduler: null
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 1024                 # per-turn cap; total ≤ max_total_sequence_length
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true                 # required by NeMo-Gym setup asserts
+      precision: ${policy.precision}
+      tensor_parallel_size: 4            # 4 vLLM GPUs on the single node
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.55       # leave headroom for the mcore side of the split
+      max_model_len: ${policy.max_total_sequence_length}
+      # enforce_eager off keeps CUDA-graph compile-time impact bounded for the
+      # smoke run; flip to true if the run OOMs during graph capture.
+      enforce_eager: true
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      kv_cache_dtype: "auto"
+      expose_http_server: true           # required by NeMo-Gym setup asserts
+      # VLMs need the tokenizer initialized before generation
+      # (run_multimodal_grpo_nemo_gym.py asserts this).
+      skip_tokenizer_init: false
+    vllm_kwargs:
+      # Cap images per prompt at max_rollout_turns + 1 (initial obs) — each
+      # multi-turn step appends one board image.
+      limit_mm_per_prompt: {"image": 8}
+      # Disable vLLM's multimodal processor cache; observed hangs / mm-cache
+      # desyncs with it enabled on VLM RL runs. Must sit in vllm_kwargs, not
+      # vllm_cfg (see vlm_grpo_3B.yaml).
+      mm_processor_cache_gb: 0
+    colocated:
+      enabled: false                     # non-colocated split
+      resources:
+        gpus_per_node: 4                 # 4 GPUs dedicated to vLLM
+        num_nodes: 1
+
+data:
+  # NeMo-Gym builds the real per-turn prompt server-side, so
+  # max_input_seq_length is not consumed by the NemoGymDataset processor.
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+
+  train:
+    # Sourced from nemo-rl-games-bandit's frozenlake_size4.yaml — the
+    # size=4 (num_holes=3) FrozenLake ablation train manifest.
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/frozenlake_ablations/size_4/train_manifest.jsonl
+  validation:
+    # Paired eval manifest for the size=4 FrozenLake ablation. Note: rows are
+    # `Games/FrozenLake-singleturn-v0` with horizon_cap=1 (single-turn eval),
+    # while train rows are the multi-turn `Games/FrozenLake-v0`.
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/frozenlake_ablations/size_4/eval_manifest.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:                              # forwarded to NeMo-Gym as initial_global_config_dict
+    # Match ray.sub's port layout: Gym below the 9000 ephemeral floor,
+    # non-overlapping with NeMo-RL (3000-4999) or vLLM (7000-8999).
+    port_range_low: 5000
+    port_range_high: 5999
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false      # smoke test does real training
+    config_paths:
+      # for_training variant — required by NeMo-Gym
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      # gym_v drop: this single file wires both the gym_v resources server
+      # and the gymv_agent responses-API agent (see
+      # 3rdparty/Gym-workspace/Gym/environments/gym_v/config.yaml).
+      - environments/gym_v/config.yaml
+    # Agent-side smoke knobs. Cap agent turns at the same value as
+    # grpo.max_rollout_turns so both sides agree on the horizon.
+    # Outer group name matches the manifest's agent_ref.name = "gym_v_agent"
+    # (see 3rdparty/Gym-workspace/Gym/environments/gym_v/config.yaml).
+    gym_v_agent:
+      responses_api_agents:
+        gymv_agent:
+          max_steps: 4
+          done_if_no_boxed_answer: true  # short-circuit on malformed output for smoke signal
+
+logger:
+  log_dir: "logs/grpo-qwen25vl-gymv-smoke"
+  num_val_samples_to_print: 0
+  wandb_enabled: false                   # smoke test — no external logging
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+  wandb:
+    project: "grpo-qwen25vl-gymv"
+    name: "grpo-qwen25vl-gymv-smoke"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-qwen25vl-gymv"
+    run_name: "grpo-qwen25vl-gymv-smoke"
+  gpu_monitoring:
+    collection_interval: 30
+    flush_interval: 30
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

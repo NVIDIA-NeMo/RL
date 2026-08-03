@@ -171,17 +171,17 @@ mcore = [
   # sudo dpkg -i cuda-keyring_1.1-1_all.deb
   # sudo apt-get update
   # sudo apt-get install cudnn-cuda-13
-
-  # megatron-bridge is installed straight from the submodule's own pyproject.toml, so its
-  # dependencies (transformers, transformer-engine, megatron-core[dev,mlm] -> nvidia-modelopt,
-  # onnxscript, flash-linear-attention, ...) flow transitively and pick up upstream changes on
-  # every submodule bump + `uv lock`. Do not mirror them here. transformer-engine's exact
-  # version is still pinned globally via [tool.uv] override-dependencies.
-  # [te]/[ssm] activate megatron-bridge's transformer-engine and mamba-ssm/causal-conv1d extras.
-  # megatron-core is intentionally NOT listed: it flows from megatron-bridge's own
-  # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
-  # pyproject changes propagate on bump without any mirror here.
-  "megatron-bridge[te,ssm]",
+  # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
+  # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
+  # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "megatron-core",
+  "megatron-bridge",
+  "megatron-energon[av-decode]~=7.0",
+  # Must match Megatron-Bridge main's transformers requirement (still includes GLM 5.1 support).
+  "transformers>=5.8.1,<5.9.0",
+  "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+  "onnxscript",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
