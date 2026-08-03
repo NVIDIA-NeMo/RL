@@ -29,6 +29,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
+    get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
@@ -44,6 +45,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    cp_sharder: Optional[Any] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -59,6 +61,9 @@ def prepare_loss_input(
         chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
             computation (policy.logprob_chunk_size); avoids materializing
             full-size float32 logits during training.
+        cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
+            sequence layout (V2 automodel worker with cp_size > 1); ``logits``
+            are then this rank's CP-local shard while ``data`` stays canonical.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -91,6 +96,7 @@ def prepare_loss_input(
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
                 chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -115,6 +121,7 @@ def prepare_loss_input(
                     sampling_params=None,  # no filtering
                     # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
                     chunk_size=None,
+                    cp_sharder=cp_sharder,
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -131,6 +138,7 @@ def prepare_loss_input(
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
             )
         )
 
@@ -158,6 +166,7 @@ def prepare_loss_input(
             projection_matrix_paths=loss_fn.projection_matrix_paths,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            cp_sharder=cp_sharder,
         )
         loss_input = {
             "logits": logits,
@@ -167,6 +176,41 @@ def prepare_loss_input(
             "tp_group": tp_group,
             "cp_group": cp_group,
         }
+        if cp_sharder is not None:
+            next_token_logprobs = get_cp_sharded_next_token_logprobs(
+                logits,
+                data["input_ids"],
+                cp_sharder,
+                chunk_size=chunk_size,
+            )
+            full_logprobs = torch.cat(
+                [next_token_logprobs, torch.zeros_like(next_token_logprobs[:, :1])],
+                dim=1,
+            )
+            cp_size = (
+                torch.distributed.get_world_size(context_parallel_group)
+                if context_parallel_group is not None
+                else 1
+            )
+            cp_rank = (
+                torch.distributed.get_rank(context_parallel_group)
+                if context_parallel_group is not None
+                else 0
+            )
+            local_seq_len = full_logprobs.shape[1] // cp_size
+            seq_start = cp_rank * local_seq_len
+            next_token_mask = (
+                data["token_mask"].to(full_logprobs.device).roll(shifts=-1, dims=1)
+            )
+            next_token_mask[:, -1] = 0
+            loss_input.update(
+                student_next_token_logprobs=full_logprobs.narrow(
+                    1, seq_start, local_seq_len
+                ).contiguous(),
+                student_next_token_mask=next_token_mask.narrow(
+                    1, seq_start, local_seq_len
+                ).contiguous(),
+            )
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 
