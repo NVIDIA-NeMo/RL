@@ -33,6 +33,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.backend=megatron \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
+    policy.generation.mcore_generation_config.refit_backend=nccl \
     policy.generation.mcore_generation_config.async_engine=true \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \

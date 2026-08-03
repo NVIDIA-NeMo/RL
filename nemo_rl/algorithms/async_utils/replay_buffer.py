@@ -24,8 +24,10 @@ import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -648,10 +650,12 @@ class TQReplayBuffer:
         partition_id: str,
         *,
         pad_value_dict: Mapping[str, int],
+        require_routed_experts: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
+        self._require_routed_experts = require_routed_experts
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -708,6 +712,7 @@ class TQReplayBuffer:
 
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
+            RuntimeError: router replay is enabled but the payload has no routes.
         """
         # Precondition: reserve() must have registered this group_id. Raise
         # before any side effects so a stray commit doesn't leak orphan DP rows.
@@ -720,6 +725,14 @@ class TQReplayBuffer:
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
         )
+        if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the SingleController rollout payload, but payload packing did "
+                "not produce that field. Check vLLM routed-expert capture and "
+                "the async message-log flattening path."
+            )
+        trace_rollout_payload(keys=sample_ids, data=train_batch)
         try:
             await self._call_dp(
                 "put_samples",
