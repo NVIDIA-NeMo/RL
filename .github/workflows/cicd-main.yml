@@ -177,7 +177,7 @@ jobs:
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
   org-member-pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d241fcfa92900f804cd425c7abc11855e5532064 # v0.80.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
     with:
       default_runner_prefix: ${{ vars.DEFAULT_H100_RUNNER }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_H100_RUNNER }}
