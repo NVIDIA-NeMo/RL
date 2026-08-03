@@ -147,6 +147,9 @@ class _SyncDPAdapter:
             )
         )
 
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        return ray.get(self._handle.list_sample_ids.remote(partition_id))
+
     @staticmethod
     def _padded(td: TensorDict) -> TensorDict:
         out: dict[str, torch.Tensor] = {}

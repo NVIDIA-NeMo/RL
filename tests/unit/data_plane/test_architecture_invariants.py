@@ -78,6 +78,7 @@ def test_sync_trainer_rejects_message_level_advantage_penalties():
         "get_data",
         "put_samples",
         "get_samples",
+        "list_sample_ids",
         "clear_samples",
         "check_consumption_status",
         "save_checkpoint",

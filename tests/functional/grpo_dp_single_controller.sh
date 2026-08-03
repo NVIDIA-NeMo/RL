@@ -22,7 +22,7 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_single_controller.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
@@ -47,11 +47,13 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $@ \
     2>&1 | tee $RUN_LOG
 
-uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
+    uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/gen_kl_error"]) < 0.002' \
-    'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
-    'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'max(data["train/gen_kl_error"]) < 0.002' \
+        'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
+        'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
+        'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
+        'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+fi

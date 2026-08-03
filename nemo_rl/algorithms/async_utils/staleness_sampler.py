@@ -44,6 +44,7 @@ import importlib
 from typing import (
     Annotated,
     Callable,
+    ClassVar,
     Literal,
     Optional,
     Protocol,
@@ -455,6 +456,7 @@ class InOrderSampler(_GatedSampler):
 
 
 class WindowedSamplerConfig(BaseModel, extra="allow"):
+    supports_buffer_checkpoint: ClassVar[bool] = True
     name: Literal["windowed"] = "windowed"
     # Max weight-version gap a selected group may have from the trainer.
     max_staleness_versions: NonNegativeInt = 1
@@ -463,18 +465,22 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
 
 
 class WeightFifoSamplerConfig(BaseModel, extra="allow"):
+    supports_buffer_checkpoint: ClassVar[bool] = False
     name: Literal["weight_fifo"] = "weight_fifo"
     # Lookahead + selectable weight window, in trainer versions.
     max_staleness_versions: NonNegativeInt = 1
 
 
 class InOrderSamplerConfig(BaseModel, extra="allow"):
+    supports_buffer_checkpoint: ClassVar[bool] = False
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
     max_lookahead_versions: NonNegativeInt = 1
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
+    # A custom implementation's capability is known only after construction.
+    supports_buffer_checkpoint: ClassVar[Optional[bool]] = None
     name: Literal["custom"] = "custom"
     # "module:ClassName" of a PromptGroupSampler defined outside this repo.
     # Extra keys are forwarded to the constructor (after ``buffer``).
@@ -531,26 +537,27 @@ def create_sampler(
             signature — a custom class that doesn't accept the kwarg fails
             loudly the first time a run actually resumes with it.
     """
+    sampler: PromptGroupSampler
     if isinstance(cfg, WindowedSamplerConfig):
-        return WindowedSampler(
+        sampler = WindowedSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
             resume_from_step=resume_from_step,
         )
-    if isinstance(cfg, WeightFifoSamplerConfig):
-        return WeightFifoSampler(
+    elif isinstance(cfg, WeightFifoSamplerConfig):
+        sampler = WeightFifoSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             resume_from_step=resume_from_step,
         )
-    if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(
+    elif isinstance(cfg, InOrderSamplerConfig):
+        sampler = InOrderSampler(
             buffer,
             max_lookahead_versions=cfg.max_lookahead_versions,
             resume_from_step=resume_from_step,
         )
-    if isinstance(cfg, CustomSamplerConfig):
+    elif isinstance(cfg, CustomSamplerConfig):
         module_name, sep, class_name = cfg.target.partition(":")
         if not sep:
             raise ValueError(
@@ -567,5 +574,17 @@ def create_sampler(
                 f"interface (needs admit/select/evict, is_on_policy, "
                 f"supports_buffer_checkpoint, required_buffer_capacity)"
             )
-        return sampler
-    raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    else:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+
+    expected_capability = cfg.supports_buffer_checkpoint
+    if (
+        expected_capability is not None
+        and sampler.supports_buffer_checkpoint != expected_capability
+    ):
+        raise RuntimeError(
+            f"{type(cfg).__name__}.supports_buffer_checkpoint="
+            f"{expected_capability} disagrees with {type(sampler).__name__}."
+            f"supports_buffer_checkpoint={sampler.supports_buffer_checkpoint}"
+        )
+    return sampler

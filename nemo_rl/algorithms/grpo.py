@@ -301,6 +301,7 @@ class GRPOSaveState(TypedDict):
     current_epoch: int
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
+    trainer_version: NotRequired[int]
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
