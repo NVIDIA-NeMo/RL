@@ -61,9 +61,7 @@ def test_sync_call_can_be_offloaded() -> None:
 
 
 def test_local_coroutine_result_is_awaited() -> None:
-    result = asyncio.run(
-        call_data_plane(_LocalClient(), "async_value", value=7)
-    )
+    result = asyncio.run(call_data_plane(_LocalClient(), "async_value", value=7))
 
     assert result == 7
 

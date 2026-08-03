@@ -323,6 +323,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=len(sample_ids),
         )
 
+    def list_sample_ids(self, partition_id):
+        return self._run(
+            "list_sample_ids",
+            partition_id,
+            lambda: self._inner.list_sample_ids(partition_id),
+        )
+
     def clear_samples(self, sample_ids, partition_id):
         sample_ids_list = (
             sample_ids

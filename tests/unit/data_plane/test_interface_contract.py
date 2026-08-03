@@ -65,8 +65,10 @@ def test_register_put_get_clear(client: DataPlaneClient):
 
     out = client.get_samples(sample_ids=keys, partition_id="p", select_fields=["x"])
     assert torch.equal(out["x"], torch.arange(4))
+    assert client.list_sample_ids("p") == keys
 
     client.clear_samples(sample_ids=None, partition_id="p")
+    assert client.list_sample_ids("p") == []
     with pytest.raises(KeyError):
         client.get_samples(sample_ids=keys, partition_id="p", select_fields=["x"])
 

@@ -223,6 +223,11 @@ class NoOpDataPlaneClient(DataPlaneClient):
         stacked = {f: _stack_or_nest(out[f]) for f in select_fields}
         return TensorDict(stacked, batch_size=(len(sample_ids),))
 
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List stored sample IDs without reading their tensor payloads."""
+        rec = self._partitions.get(partition_id)
+        return sorted(rec.rows) if rec is not None else []
+
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         rec = self._partitions.get(partition_id)
         if rec is None:
