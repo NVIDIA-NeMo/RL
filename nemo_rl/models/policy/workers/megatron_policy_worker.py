@@ -100,7 +100,10 @@ from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
     connect_colocate_topology,
     connect_rollout_engines_from_distributed,
+    find_exported_hf_shape_mismatches,
     get_runtime_env_for_policy_worker,
+    raise_on_exported_hf_shape_mismatches,
+    read_safetensors_shapes,
     reset_rollout_engines_from_distributed,
     send_hf_buckets_via_ipc_actor_impl,
 )
@@ -1798,7 +1801,62 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
+        self._validate_refit_export_shapes(refit_param_info_hf)
         return refit_param_info_hf
+
+    def _validate_refit_export_shapes(
+        self, refit_param_info_hf: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Fail refit setup when an exported tensor's shape is wrong.
+
+        AutoBridge restores full HF tensors from the sharded Megatron model, so
+        a parallelism-dependent bug there surfaces only as a shape the
+        generation backend cannot load. Catching it here names the parameter
+        and fails before any weights are pushed to a rollout engine; catching
+        it at transfer time leaves the engines partially updated.
+
+        Runs on rank 0 only. Every rank exports identical full tensors, so one
+        rank is sufficient, and the driver surfaces the raise when it gathers
+        ``prepare_refit_info``.
+
+        Args:
+            refit_param_info_hf: Mapping from HF tensor name to
+                ``(shape, dtype)`` for everything this refit will transmit.
+
+        Raises:
+            ValueError: If any exported tensor disagrees with the checkpoint.
+        """
+        if self.rank != 0:
+            return
+
+        state = getattr(self.megatron_bridge.hf_pretrained, "state", None)
+        source = getattr(state, "source", None)
+        checkpoint_dir = getattr(source, "path", None)
+        if checkpoint_dir is None:
+            # Config-only bridges (no materialized checkpoint) have nothing to
+            # compare against. Say so: a silent skip is indistinguishable from a
+            # clean pass, which makes the check untrustworthy exactly when it
+            # matters.
+            print(
+                "NRL_REFIT_EXPORT_SHAPE_CHECK skipped=1 "
+                "reason=no_materialized_checkpoint",
+                flush=True,
+            )
+            return
+
+        reference_shapes = read_safetensors_shapes(str(checkpoint_dir))
+        mismatches = find_exported_hf_shape_mismatches(
+            exported=refit_param_info_hf,
+            reference=reference_shapes,
+        )
+        compared = sum(1 for name in refit_param_info_hf if name in reference_shapes)
+        print(
+            f"NRL_REFIT_EXPORT_SHAPE_CHECK compared={compared} "
+            f"exported={len(refit_param_info_hf)} "
+            f"reference={len(reference_shapes)} mismatches={len(mismatches)}",
+            flush=True,
+        )
+        raise_on_exported_hf_shape_mismatches(mismatches)
 
     def _collect_mtp_metrics(
         self,

@@ -613,6 +613,106 @@ def connect_colocate_topology(
     worker_state.setdefault("weight_version", 0)
 
 
+def read_safetensors_shapes(checkpoint_dir: str) -> Dict[str, tuple[int, ...]]:
+    """Map every tensor name in a safetensors checkpoint to its shape.
+
+    Only the safetensors headers are read; no tensor data is materialized, so
+    this stays cheap even for a sharded multi-hundred-gigabyte checkpoint.
+
+    Args:
+        checkpoint_dir: Directory holding one or more ``*.safetensors`` files.
+
+    Returns:
+        Mapping from tensor name to its shape in the checkpoint.
+
+    Raises:
+        FileNotFoundError: If the directory holds no ``*.safetensors`` file.
+    """
+    from glob import glob
+
+    from safetensors import safe_open
+
+    shard_paths = sorted(glob(os.path.join(str(checkpoint_dir), "*.safetensors")))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No .safetensors files found in {checkpoint_dir}; cannot read "
+            "reference tensor shapes."
+        )
+
+    shapes: Dict[str, tuple[int, ...]] = {}
+    for shard_path in shard_paths:
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            for name in shard.keys():
+                shapes[name] = tuple(shard.get_slice(name).get_shape())
+    return shapes
+
+
+def find_exported_hf_shape_mismatches(
+    *,
+    exported: "Dict[str, tuple[Any, Any]]",
+    reference: "Dict[str, tuple[int, ...]]",
+) -> list[tuple[str, tuple[int, ...], tuple[int, ...]]]:
+    """Find exported HF tensors whose shape disagrees with the checkpoint.
+
+    Names absent from ``reference`` are skipped on purpose: a refit
+    legitimately emits tensors the source checkpoint does not carry, such as
+    FP8 KV/Q scales, MXFP8 ``weight_scale_inv`` companions, and draft-model
+    weights.
+
+    Args:
+        exported: Mapping from HF tensor name to ``(shape, dtype)``, as built
+            by a policy worker's ``prepare_refit_info``.
+        reference: Mapping from HF tensor name to the checkpoint shape.
+
+    Returns:
+        Sorted ``(name, exported_shape, reference_shape)`` triples, empty when
+        every shared name agrees.
+    """
+    mismatches = []
+    for name, (shape, _dtype) in exported.items():
+        expected = reference.get(name)
+        if expected is None:
+            continue
+        actual = tuple(shape)
+        if actual != tuple(expected):
+            mismatches.append((name, actual, tuple(expected)))
+    return sorted(mismatches)
+
+
+def raise_on_exported_hf_shape_mismatches(
+    mismatches: list[tuple[str, tuple[int, ...], tuple[int, ...]]],
+    *,
+    max_reported: int = 10,
+) -> None:
+    """Turn shape mismatches into a named, actionable error.
+
+    Without this the first mismatched tensor is only rejected much later by
+    the generation backend, which reports the offending dimensions but not the
+    parameter name.
+
+    Args:
+        mismatches: Triples produced by :func:`find_exported_hf_shape_mismatches`.
+        max_reported: Number of mismatches to name before summarizing the rest.
+
+    Raises:
+        ValueError: If ``mismatches`` is non-empty.
+    """
+    if not mismatches:
+        return
+
+    detail = "; ".join(
+        f"{name}: exported {actual} != checkpoint {expected}"
+        for name, actual, expected in mismatches[:max_reported]
+    )
+    remaining = len(mismatches) - max_reported
+    suffix = f" (+{remaining} more)" if remaining > 0 else ""
+    raise ValueError(
+        f"{len(mismatches)} exported HF tensor(s) do not match the source "
+        f"checkpoint shape, so the generation backend will reject them at "
+        f"refit time. {detail}{suffix}"
+    )
+
+
 def _check_weight_sync_results(results: list) -> None:
     from collections.abc import Mapping
 

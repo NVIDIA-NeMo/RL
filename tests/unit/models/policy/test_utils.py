@@ -14,6 +14,7 @@
 
 import multiprocessing
 import os
+import re
 import sys
 import time
 import traceback
@@ -29,8 +30,11 @@ from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
+    find_exported_hf_shape_mismatches,
     get_megatron_checkpoint_dir,
     invalidate_sglang_kv_cache_for_refit,
+    raise_on_exported_hf_shape_mismatches,
+    read_safetensors_shapes,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
@@ -595,3 +599,81 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+class TestExportedHfShapeValidation:
+    """Guardrail for the refit export path.
+
+    A parallelism-dependent bug in the Megatron->HF restoration shows up only
+    as a tensor the generation backend cannot load, and the backend reports the
+    offending dimensions without the parameter name.
+    """
+
+    EXPERT = "model.layers.0.mlp.experts.0.gate_proj.weight"
+
+    def test_matching_shapes_report_no_mismatch(self):
+        exported = {
+            self.EXPERT: (torch.Size([768, 2048]), torch.bfloat16),
+            "model.embed_tokens.weight": (torch.Size([151936, 2048]), torch.bfloat16),
+        }
+        reference = {
+            self.EXPERT: (768, 2048),
+            "model.embed_tokens.weight": (151936, 2048),
+        }
+        assert (
+            find_exported_hf_shape_mismatches(exported=exported, reference=reference)
+            == []
+        )
+
+    def test_mismatched_expert_shape_is_reported(self):
+        exported = {self.EXPERT: (torch.Size([768, 64]), torch.bfloat16)}
+        reference = {self.EXPERT: (768, 2048)}
+
+        mismatches = find_exported_hf_shape_mismatches(
+            exported=exported, reference=reference
+        )
+        assert mismatches == [(self.EXPERT, (768, 64), (768, 2048))]
+
+    def test_names_absent_from_checkpoint_are_skipped(self):
+        # KV/Q scales and MXFP8 scale companions are emitted by refit but are
+        # not present in the source checkpoint.
+        exported = {
+            "model.layers.0.self_attn.k_scale": (torch.Size([1]), torch.float32),
+            f"{self.EXPERT}_scale_inv": (torch.Size([6, 2048]), torch.float32),
+        }
+        assert find_exported_hf_shape_mismatches(exported=exported, reference={}) == []
+
+    def test_raise_names_the_parameter(self):
+        mismatches = [(self.EXPERT, (768, 64), (768, 2048))]
+        with pytest.raises(ValueError, match=re.escape(self.EXPERT)) as excinfo:
+            raise_on_exported_hf_shape_mismatches(mismatches)
+        assert "(768, 64)" in str(excinfo.value)
+        assert "(768, 2048)" in str(excinfo.value)
+
+    def test_raise_is_a_noop_when_shapes_agree(self):
+        raise_on_exported_hf_shape_mismatches([])
+
+    def test_raise_summarizes_beyond_the_report_limit(self):
+        mismatches = [
+            (f"model.layers.{i}.mlp.experts.0.gate_proj.weight", (768, 64), (768, 2048))
+            for i in range(5)
+        ]
+        with pytest.raises(ValueError, match=r"\+3 more"):
+            raise_on_exported_hf_shape_mismatches(mismatches, max_reported=2)
+
+    def test_read_safetensors_shapes_reads_headers(self, tmp_path):
+        safetensors_torch = pytest.importorskip("safetensors.torch")
+        safetensors_torch.save_file(
+            {
+                self.EXPERT: torch.zeros(768, 2048, dtype=torch.bfloat16),
+                "model.norm.weight": torch.zeros(2048, dtype=torch.bfloat16),
+            },
+            str(tmp_path / "model-00001-of-00001.safetensors"),
+        )
+
+        shapes = read_safetensors_shapes(str(tmp_path))
+        assert shapes == {self.EXPERT: (768, 2048), "model.norm.weight": (2048,)}
+
+    def test_read_safetensors_shapes_requires_a_shard(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="No .safetensors files"):
+            read_safetensors_shapes(str(tmp_path))
