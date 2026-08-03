@@ -1,0 +1,41 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.yaml
+policy:
+  megatron_cfg:
+    # Train the MTP head rather than merely carrying it. The MTP-only recipe
+    # uses 0.0, which keeps the head present for speculative decoding without
+    # adding its loss to the objective.
+    #
+    # WARNING: the pinned Megatron-LM has no separate MTP gradient clipping --
+    # neither clip_grads.py nor optimizer_config.py references MTP -- so MTP
+    # gradients are clipped jointly with the backbone. That is the known cause
+    # of exploding grad_norm on Super with MTP. Watch train/grad_norm.
+    mtp_loss_scaling_factor: 0.1
+  generation:
+    vllm_kwargs:
+      # FULL cudagraph replay reproduced CUDA illegal-instruction crashes with
+      # SuperV3 MTP + bad_words upstream; PIECEWISE keeps cudagraph
+      # acceleration while avoiding the captured full-forward replay path.
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+#
+# Speculative decoding is NOT configured here. Drive it with
+# ENABLE_MTP_INFERENCE=1, which is the in-tree recipe in super_launch.sh:
+# it sets speculative_config.{method,num_speculative_tokens} plus the
+# Mamba-specific settings this model needs -- mamba_cache_mode=align for
+# rolling back SSM state on rejected draft tokens, chunked prefill, and a
+# reduced max_num_batched_tokens. Keeping it in one place avoids two
+# sources of truth, and that recipe is written against this container's
+# vLLM (the reference tree's block sets speculative_config.attention_backend,
+# a field this vLLM's SpeculativeConfig rejects).
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-async-gym-mtp-specdec
+  save_period: 5
+logger:
+  log_dir: logs/nemotron-super-omni-async-gym-mtp-specdec
+  wandb_enabled: true
+  wandb:
+    name: nemotron-super-omni-async-gym-mtp-specdec
+# Repeated from the base recipe rather than inherited: super_launch.sh reads
+# cluster.num_nodes out of this file with awk and does not resolve `defaults:`.
+cluster:
+  num_nodes: 16
