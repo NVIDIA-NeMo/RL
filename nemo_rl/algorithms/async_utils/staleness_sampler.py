@@ -44,6 +44,7 @@ import importlib
 from typing import (
     Annotated,
     Callable,
+    ClassVar,
     Literal,
     Optional,
     Protocol,
@@ -107,6 +108,11 @@ class PromptGroupSampler(Protocol):
     @property
     def is_on_policy(self) -> bool:
         """True when the policy admits zero staleness (sync mode)."""
+        ...
+
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        """Whether completed buffered groups can be restored safely."""
         ...
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
@@ -196,6 +202,10 @@ class BaseSampler(abc.ABC):
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
 
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        return False
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
 
@@ -265,6 +275,11 @@ class WindowedSampler(BaseSampler):
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
+
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        # Ungated restored groups are ordinary in-window candidates.
+        return True
 
     def should_abort_inflight(
         self,
@@ -443,6 +458,7 @@ class InOrderSampler(_GatedSampler):
 
 
 class WindowedSamplerConfig(BaseModel, extra="allow"):
+    supports_buffer_checkpoint: ClassVar[bool] = True
     name: Literal["windowed"] = "windowed"
     # Max weight-version gap a selected group may have from the trainer.
     max_staleness_versions: NonNegativeInt = 1
@@ -451,18 +467,22 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
 
 
 class WeightFifoSamplerConfig(BaseModel, extra="allow"):
+    supports_buffer_checkpoint: ClassVar[bool] = False
     name: Literal["weight_fifo"] = "weight_fifo"
     # Lookahead + selectable weight window, in trainer versions.
     max_staleness_versions: NonNegativeInt = 1
 
 
 class InOrderSamplerConfig(BaseModel, extra="allow"):
+    supports_buffer_checkpoint: ClassVar[bool] = False
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
     max_lookahead_versions: NonNegativeInt = 1
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
+    # A custom implementation's capability is known only after construction.
+    supports_buffer_checkpoint: ClassVar[Optional[bool]] = None
     name: Literal["custom"] = "custom"
     # "module:ClassName" of a PromptGroupSampler defined outside this repo.
     # Extra keys are forwarded to the constructor (after ``buffer``).
@@ -505,20 +525,30 @@ def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
 ) -> PromptGroupSampler:
-    """Build a sampler from its config (or import one by FQN)."""
+    """Build a sampler from its config (or import one by FQN).
+
+    Args:
+        buffer: Shared TQReplayBuffer holding the candidate slots.
+        cfg: Discriminated sampler config selecting the policy.
+    """
+    sampler: PromptGroupSampler
     if isinstance(cfg, WindowedSamplerConfig):
-        return WindowedSampler(
+        sampler = WindowedSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
         )
-    if isinstance(cfg, WeightFifoSamplerConfig):
-        return WeightFifoSampler(
-            buffer, max_staleness_versions=cfg.max_staleness_versions
+    elif isinstance(cfg, WeightFifoSamplerConfig):
+        sampler = WeightFifoSampler(
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
         )
-    if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
-    if isinstance(cfg, CustomSamplerConfig):
+    elif isinstance(cfg, InOrderSamplerConfig):
+        sampler = InOrderSampler(
+            buffer,
+            max_lookahead_versions=cfg.max_lookahead_versions,
+        )
+    elif isinstance(cfg, CustomSamplerConfig):
         module_name, sep, class_name = cfg.target.partition(":")
         if not sep:
             raise ValueError(
@@ -532,5 +562,17 @@ def create_sampler(
                 f"interface (needs admit/select/evict/should_abort_inflight, "
                 f"set_dispatch_index, is_on_policy, required_buffer_capacity)"
             )
-        return sampler
-    raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    else:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+
+    expected_capability = cfg.supports_buffer_checkpoint
+    if (
+        expected_capability is not None
+        and sampler.supports_buffer_checkpoint != expected_capability
+    ):
+        raise RuntimeError(
+            f"{type(cfg).__name__}.supports_buffer_checkpoint="
+            f"{expected_capability} disagrees with {type(sampler).__name__}."
+            f"supports_buffer_checkpoint={sampler.supports_buffer_checkpoint}"
+        )
+    return sampler

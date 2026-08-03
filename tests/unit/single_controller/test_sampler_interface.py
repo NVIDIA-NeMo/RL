@@ -27,10 +27,12 @@ import asyncio
 import pytest
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     InOrderSampler,
     InOrderSamplerConfig,
     PromptGroupSampler,
     WeightFifoSampler,
+    WeightFifoSamplerConfig,
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
@@ -151,6 +153,24 @@ class TestInOrderEvictMatchesSelect:
 
 
 class TestFactory:
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            (WindowedSamplerConfig(), True),
+            (WeightFifoSamplerConfig(), False),
+            (InOrderSamplerConfig(), False),
+            (
+                CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
+                None,
+            ),
+        ],
+    )
+    def test_config_declares_checkpoint_capability_without_serializing_it(
+        self, config, expected
+    ):
+        assert config.supports_buffer_checkpoint is expected
+        assert "supports_buffer_checkpoint" not in config.model_dump()
+
     def test_windowed_config_builds_windowed(self):
         s = create_sampler(
             FakeBuffer(), WindowedSamplerConfig(max_staleness_versions=3)
@@ -164,24 +184,25 @@ class TestFactory:
         assert s.max_lookahead_versions == 2
 
     def test_weight_fifo_config_builds_weight_fifo(self):
-        from nemo_rl.algorithms.async_utils.staleness_sampler import (
-            WeightFifoSamplerConfig,
-        )
-
         s = create_sampler(
             FakeBuffer(), WeightFifoSamplerConfig(max_staleness_versions=4)
         )
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
 
+    def test_factory_rejects_config_implementation_capability_drift(self, monkeypatch):
+        monkeypatch.setattr(
+            WindowedSampler,
+            "supports_buffer_checkpoint",
+            property(lambda _self: False),
+        )
+        with pytest.raises(RuntimeError, match="disagrees with"):
+            create_sampler(FakeBuffer(), WindowedSamplerConfig())
+
 
 class TestCustomFqnSampler:
     def test_custom_target_loads_out_of_repo_sampler(self):
         # A user sampler defined anywhere importable; here, this test module.
-        from nemo_rl.algorithms.async_utils.staleness_sampler import (
-            CustomSamplerConfig,
-        )
-
         s = create_sampler(
             FakeBuffer(),
             CustomSamplerConfig(

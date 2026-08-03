@@ -89,6 +89,22 @@ def test_register_and_clear_recorded(wrapped_client):
     assert ops.count("clear") == 1
 
 
+def test_list_sample_ids_is_forwarded_and_recorded(wrapped_client):
+    client, events = wrapped_client
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["r"]
+    )
+    client.put_samples(
+        sample_ids=["b", "a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
+    )
+
+    assert client.list_sample_ids("p") == ["a", "b"]
+    assert events[-1]["op"] == "list_sample_ids"
+    assert events[-1]["status"] == "ok"
+
+
 def test_error_status_recorded_and_reraised(wrapped_client):
     """Decorator does NOT swallow errors — re-raise after recording."""
     client, events = wrapped_client
