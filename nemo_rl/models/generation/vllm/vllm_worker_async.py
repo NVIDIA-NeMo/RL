@@ -353,6 +353,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -639,6 +640,15 @@ class VllmAsyncGenerationWorkerImpl(
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        # The embedded server is constructed directly instead of through
+        # vLLM's CLI, where chat-template file paths are normally loaded.
+        # OnlineRenderer expects literal Jinja content; passing a path renders
+        # the path itself and drops multimodal placeholders such as <image>.
+        configured_chat_template = serving_chat_kwargs.get("chat_template")
+        if configured_chat_template is not None:
+            serving_chat_kwargs["chat_template"] = load_chat_template(
+                configured_chat_template
+            )
         online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
