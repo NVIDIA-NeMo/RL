@@ -384,6 +384,10 @@ if (( NUM_RAY_GPU_NODES <= 0 )); then
   exit 1
 fi
 NUM_ACTORS=$((GPUS_PER_NODE * NUM_RAY_GPU_NODES))
+if (( DEDICATED_RAY_HEAD == 1 )); then
+  echo "[INFO] DEDICATED_RAY_HEAD=1: $NUM_RAY_GPU_NODES of $SLURM_JOB_NUM_NODES allocated nodes are GPU compute nodes."
+  echo "[INFO] Size your driver COMMAND to $NUM_RAY_GPU_NODES nodes (cluster.num_nodes, plus env.nemo_gym.num_gpu_nodes when set); ray.sub cannot validate this for you."
+fi
 
 # Track backgrounded srun client PIDs for head and workers
 declare -A SRUN_PIDS
@@ -556,12 +560,22 @@ fi
 # IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
 # with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
 # nemo_rl/distributed/virtual_cluster.py.
-RAY_RESOURCES='{\"worker_units\": '"$GPUS_PER_NODE"', \"slurm_managed_ray_cluster\": 1'
-if [[ -n "\$CLUSTER_UUID" ]]; then
-  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
-fi
-if [[ -n "\$TOPO_RANK" ]]; then
-  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+# NRL_DEDICATED_RAY_HEAD=1 is exported only by the head under DEDICATED_RAY_HEAD=1.
+# That node runs the control plane and driver only, so it advertises no compute
+# resources: without worker_units and the topology keys, neither a GPU actor nor a
+# topology-constrained placement group can select it. Any new node-level key belongs
+# in the else branch unless the dedicated head should carry it too.
+RAY_RESOURCES='{\"slurm_managed_ray_cluster\": 1'
+if [[ "\${NRL_DEDICATED_RAY_HEAD:-0}" == "1" ]]; then
+  RAY_RESOURCES+=', \"ray_head\": 1'
+else
+  RAY_RESOURCES+=', \"worker_units\": '"$GPUS_PER_NODE"
+  if [[ -n "\$CLUSTER_UUID" ]]; then
+    RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
+  fi
+  if [[ -n "\$TOPO_RANK" ]]; then
+    RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+  fi
 fi
 RAY_RESOURCES+='}'
 export RAY_RESOURCES
@@ -678,16 +692,17 @@ ray-status-sidecar &
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
+# Keeps model, generation, teacher, and Gym GPU actors off the Ray head. The
+# resource JSON itself is built by topology_probe.sh so head and workers keep a
+# single construction site.
+export NRL_DEDICATED_RAY_HEAD=$DEDICATED_RAY_HEAD
+
 source $LOG_DIR/topology_probe.sh
 
-# Keep model, generation, teacher, and Gym GPU actors off the Ray head. Omitting
-# worker_units and topology resources also prevents topology-constrained
-# placement groups from selecting it as a compute node.
 HEAD_RAY_RESOURCE_ARGS=""
 if [[ "$DEDICATED_RAY_HEAD" == "1" ]]; then
-  RAY_RESOURCES='{\"slurm_managed_ray_cluster\": 1, \"ray_head\": 1}'
   HEAD_RAY_RESOURCE_ARGS="--num-gpus=0"
-  echo "[INFO] Dedicated Ray head enabled: advertising zero GPUs"
+  echo "[INFO] Dedicated Ray head enabled: advertising zero GPUs and no worker_units"
 fi
 
 # Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
