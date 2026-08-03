@@ -14,7 +14,9 @@
 
 import os
 import tempfile
+from collections.abc import Iterator
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,8 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.test_utils import SimpleLossFn
+
+pytestmark = pytest.mark.mcore
 
 _MODELOPT_AVAILABLE = False
 try:
@@ -69,6 +73,10 @@ requires_weight_folding = pytest.mark.skipif(
 _VOCAB_SIZE = 32000
 _BATCH_SIZE = 8
 _NUM_GPUS = 2
+_NVFP4_A16_RECIPE = (
+    Path(__file__).resolve().parents[4]
+    / "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml"
+).as_posix()
 
 
 class _FakeModelOptBridge:
@@ -85,11 +93,12 @@ def _make_real_quant_worker():
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     worker.cfg = {
-        "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
+        "quant_cfg": _NVFP4_A16_RECIPE,
         "generation": {
             "backend": "vllm",
-            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
+            "quant_cfg": _NVFP4_A16_RECIPE,
             "real_quant": True,
+            "real_quant_export_cpu_offload": True,
             "real_quant_ignore": ["lm_head"],
             "vllm_cfg": {"kv_cache_dtype": "auto"},
         },
@@ -271,6 +280,68 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     assert kwargs["show_progress"] is False
     assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
     assert kwargs["ignore_patterns"] == ["lm_head"]
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
+
+    list(worker._iter_real_quant_refit_params())
+
+    _, kwargs = worker.megatron_bridge.calls[0]
+    assert kwargs["cpu"] is False
+
+
+@pytest.mark.parametrize("quant_mode", ["w4a16_nvfp4", "nvfp4"])
+@requires_quant
+@requires_weight_folding
+def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
+    quant_mode: str,
+) -> None:
+    # Megatron Bridge is an optional dependency needed only by this CUDA test.
+    from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
+    from megatron.bridge.models.conversion.modelopt_utils import (
+        QuantMeta,
+        get_modelopt_quant_exporter,
+    )
+
+    qformat, export_weight = get_modelopt_quant_exporter(quant_mode)
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    source = torch.randn(
+        (32, 32),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    meta = QuantMeta(
+        qformat=qformat,
+        block_size=16,
+        weight_amax=source.abs().max(),
+        input_amax=torch.tensor(2.0, device="cuda"),
+    )
+
+    def export_hook(
+        name: str,
+        tensor: torch.Tensor,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        yield from export_weight(name, tensor, meta)
+
+    weight = HFWeightTuple("model.layers.0.mlp.down_proj.weight", source)
+    cpu_export = list(weight.iter_finalized(cpu=True, export_hook=export_hook))
+    gpu_export = list(weight.iter_finalized(cpu=False, export_hook=export_hook))
+
+    assert [name for name, _ in cpu_export] == [name for name, _ in gpu_export]
+    assert len(cpu_export) == (4 if quant_mode == "nvfp4" else 3)
+    for (_, cpu_tensor), (_, gpu_tensor) in zip(cpu_export, gpu_export, strict=True):
+        assert cpu_tensor.device.type == "cpu"
+        assert gpu_tensor.device.type == "cuda"
+        assert cpu_tensor.shape == gpu_tensor.shape
+        assert cpu_tensor.dtype == gpu_tensor.dtype
+        assert torch.equal(
+            cpu_tensor.contiguous().reshape(-1).view(torch.uint8),
+            gpu_tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu(),
+        )
 
 
 @requires_weight_folding

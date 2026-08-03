@@ -28,6 +28,13 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 
+def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
+    policy = Policy.__new__(Policy)
+
+    assert policy.shutdown()
+    assert capsys.readouterr().out == ""
+
+
 def create_mock_cluster(world_size: int):
     """Create a mock cluster with the specified world size."""
     cluster = MagicMock()

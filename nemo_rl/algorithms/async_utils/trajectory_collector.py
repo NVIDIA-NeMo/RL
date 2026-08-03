@@ -511,6 +511,12 @@ class AsyncTrajectoryCollector:
             is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
                 "async_engine", False
             )
+        elif backend == "trtllm":
+            assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
+                "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+                "synchronous engine path (async_engine=false) is no longer supported."
+            )
+            is_async_engine = True
         else:
             is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
@@ -541,24 +547,27 @@ class AsyncTrajectoryCollector:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
 
-        # Invalidate&recompute vLLM caches after the in-flight weight updates if
+        # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
+        # Not invalidating KV cache can result in compounding policy KL errors across steps.
         async_cfg = self.master_config.grpo.get("async_grpo", {})
-        if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
-            "recompute_kv_cache_after_weight_updates", False
-        ):
+        if async_cfg.get("recompute_kv_cache_after_weight_updates", False):
             try:
-                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
+                print(
+                    "🔄 Invalidating generation backend KV caches after weight update"
+                )
                 invalidated = self.policy_generation.invalidate_kv_cache()
                 if invalidated:
-                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    print(
+                        "✅ Invalidated generation backend KV caches after weight update"
+                    )
                 else:
                     print(
-                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
+                        "⚠️ KV cache invalidation not supported or only partially applied by the generation backend"
                     )
             except Exception as e:
-                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+                print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
 
         self._refit_pause_cleared.set()
 
@@ -743,6 +752,7 @@ class AsyncTrajectoryCollector:
             from nemo_rl.experience.rollouts import (
                 get_nemo_gym_thinking_tags,
                 run_async_nemo_gym_rollout,
+                should_mask_flagged_samples,
             )
 
             # NeMo-Gym owns stop criteria. Configuration fills the policy EOS token
@@ -768,6 +778,9 @@ class AsyncTrajectoryCollector:
                 greedy=False,
                 reward_penalty_config=self.master_config.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
+                mask_env_flagged_samples=should_mask_flagged_samples(
+                    self.master_config.env
+                ),
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:

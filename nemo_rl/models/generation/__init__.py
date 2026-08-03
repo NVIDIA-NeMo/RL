@@ -17,6 +17,7 @@ from typing import cast
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.trtllm import TrtllmConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
@@ -45,6 +46,23 @@ def configure_generation_config(
     # vllm setting
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        if config.get("real_quant"):
+            export_cpu_offload = config.get("real_quant_export_cpu_offload")
+            if not isinstance(export_cpu_offload, bool):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload must be a boolean"
+                )
+            colocated = config.get("colocated")
+            if not export_cpu_offload and (
+                colocated is None
+                or not colocated["enabled"]
+                or config.get("refit_transport") is not None
+            ):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload=false requires "
+                    "colocated CUDA-IPC refit with no explicit refit_transport"
+                )
+
         # set load_format
         config["vllm_cfg"]["load_format"] = (
             "auto"
@@ -81,5 +99,8 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
+
+    elif config["backend"] == "trtllm":
+        config = cast(TrtllmConfig, config)
 
     return config
