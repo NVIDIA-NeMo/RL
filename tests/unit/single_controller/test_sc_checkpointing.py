@@ -215,10 +215,12 @@ class _ExhaustingSampler(_FakeSampler):
 class _FakeDPClient:
     def __init__(self, *, save_error: Optional[Exception] = None) -> None:
         self.clear_calls: list[tuple[list[str], str]] = []
+        self.clear_thread_ids: list[int] = []
         self.save_calls: list[dict[str, Any]] = []
         self.save_error = save_error
 
     def clear_samples(self, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_thread_ids.append(threading.get_ident())
         self.clear_calls.append((list(sample_ids), partition_id))
 
     def save_checkpoint(
@@ -827,6 +829,21 @@ class TestDataPlaneShadowCheckpoint:
 
         asyncio.run(_main())
         assert dp_client.clear_calls == [(["sample-0"], _PARTITION_ID)]
+
+    def test_consumed_clear_does_not_block_actor_event_loop(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=1, save_period=1)
+        dp_client = _FakeDPClient()
+
+        async def _main() -> int:
+            actor = _ACTOR_CLS(mc, _make_actor_args(dp_client=dp_client))
+            event_loop_thread_id = threading.get_ident()
+            await actor._clear_data_plane_samples(["sample-0"])
+            actor._checkpointer.shutdown()
+            return event_loop_thread_id
+
+        event_loop_thread_id = asyncio.run(_main())
+        assert dp_client.clear_thread_ids
+        assert dp_client.clear_thread_ids[0] != event_loop_thread_id
 
 
 # ── async-save finalization ──────────────────────────────────────────────────
