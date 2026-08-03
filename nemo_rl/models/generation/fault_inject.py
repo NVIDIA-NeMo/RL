@@ -231,6 +231,11 @@ class FaultInjector:
         - ``"time"``: plain sleep(delay_s), same as K8s behaviour.
         - ``"during_generation"``: block until VllmGeneration._generating is
           set (generate() is in progress), then sleep delay_s within that window.
+          NOTE: This only works with synchronous (non-async) GRPO. With async
+          GRPO, generate() is called from the AsyncTrajectoryCollector Ray actor
+          (a separate process), so the main process's VllmGeneration._generating
+          event is never set and this trigger will block indefinitely. Use
+          ``"time"`` instead when async_grpo.enabled is true.
         - ``"during_refit"``: block until VllmGeneration._refitting is set
           (update_weights_from_collective() is in progress), then sleep delay_s.
         """
@@ -301,15 +306,27 @@ class FaultInjector:
     def _wait_for_steady_state(
         self, timeout_s: float = 600.0, poll_every_s: float = 5.0
     ) -> bool:
-        """Block until no joining shards remain and refit gate is open."""
+        """Block until the fleet is fully recovered and the refit gate is open.
+
+        Three conditions must all hold:
+        1. No shards in "joining" state (recovery actor has finished init).
+        2. refit_ready gate is open (all live shards acked last refit).
+        3. len(ready) >= target_shard_count — guards against spawns that are
+           still in flight before the new shard appears in the table.  Without
+           this check the injector can fire a second kill while the first
+           replacement actor is still being scheduled by Ray.
+        """
         deadline = time.monotonic() + timeout_s
         last_logged = 0.0
         while time.monotonic() < deadline:
             try:
                 shards = self._router.get_shards_list()
                 ready, _ = self._router.refit_ready_state()
+                target = getattr(self._router, "_target_shard_count", 0)
                 joining = [s for s in shards if s.get("status") == "joining"]
-                if not joining and ready:
+                ready_shards = [s for s in shards if s.get("status") == "ready"]
+                fleet_full = target == 0 or len(ready_shards) >= target
+                if not joining and ready and fleet_full:
                     print(
                         f"[fault-inject] steady state: {len(shards)} shards, "
                         f"all ready, refit_ready=True",
@@ -321,6 +338,7 @@ class FaultInjector:
                     print(
                         f"[fault-inject] waiting for steady state: "
                         f"joining={[s['shard_id'] for s in joining]}, "
+                        f"ready={len(ready_shards)}/{target}, "
                         f"refit_ready={ready}",
                         flush=True,
                     )

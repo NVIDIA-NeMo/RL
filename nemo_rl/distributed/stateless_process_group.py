@@ -17,7 +17,7 @@ from datetime import timedelta
 from typing import Optional
 
 import torch
-from nccl import bindings as _nccl_bindings
+from nccl.bindings import nccl as _nccl_bindings
 from nccl.core.communicator import Communicator, NCCLConfig
 from nccl.core.utils import UniqueId, get_unique_id
 
@@ -80,24 +80,27 @@ class StatelessProcessGroup:
         with torch.cuda.device(device):
             _t = _time.monotonic()
             # Non-blocking init: poll async state to completion rather than blocking in C.
-            # We use the raw binding because the high-level Communicator constructor
-            # introspects the comm immediately, which fails on an in-progress pointer.
-            cfg = NCCLConfig(blocking=False)
-            comm_ptr = _nccl_bindings.comm_init_rank_scalable(
+            # We create a null Communicator first and pass its _comm_box.address so the
+            # C binding can fill in the pointer.  The high-level constructor would
+            # introspect the comm immediately, which fails on an in-progress pointer.
+            cfg = NCCLConfig()
+            cfg.blocking = False
+            comm = Communicator()  # null comm; _comm_box.ptr == 0
+            _nccl_bindings.comm_init_rank_scalable(
+                comm._comm_box.address,
                 int(self.world_size),
                 int(self.rank),
                 1,
-                unique_id.ptr,
-                cfg.ptr,
+                bytearray(bytes(unique_id)),
+                cfg._lowpp.ptr,
             )
             self._poll_raw_async(
-                comm_ptr,
+                comm._comm,
                 phase="bootstrap",
                 timeout=_NCCL_BOOTSTRAP_TIMEOUT,
             )
-            # Bootstrap complete — now safe to wrap with the high-level
-            # class and let it introspect the comm.
-            self.nccl_communicator = Communicator(comm_ptr)
+            # Bootstrap complete — comm is fully initialized.
+            self.nccl_communicator = comm
             _t_comm_init = _time.monotonic() - _t
 
             _t = _time.monotonic()

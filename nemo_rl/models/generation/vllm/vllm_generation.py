@@ -629,7 +629,10 @@ class VllmGeneration(GenerationInterface):
             "_get_raw_spec_counters",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        worker_metrics = ray.get(futures)
+        try:
+            worker_metrics = ray.get(futures)
+        except Exception:  # noqa: BLE001 — dead worker (e.g. ray-kill); return empty
+            return {}
 
         # Aggregate across workers
         return aggregate_spec_decode_counters(worker_metrics)

@@ -4800,7 +4800,42 @@ def async_grpo_train(
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        # Pass the latest worker state so the AC's stale
+                        # VllmGeneration copy learns about any recovery shards
+                        # added since it was last synced (fault tolerance).
+                        # Only include leaders of READY shards — joining shards
+                        # haven't been refitted yet so their weights are stale;
+                        # dispatching to them would cause a large generation KL
+                        # error until they receive their first weight broadcast.
+                        _worker_sync_state = None
+                        if (
+                            not colocated_inference
+                            and policy_generation is not None
+                            and hasattr(policy_generation, "worker_group")
+                        ):
+                            _wg = policy_generation.worker_group
+                            _router = getattr(policy_generation, "_router", None)
+                            if _router is not None:
+                                _ready_leaders: set[int] = set()
+                                for _entry in _router._shards.values():
+                                    if _entry.status == "ready":
+                                        for _idx in _entry.worker_indices:
+                                            if _idx in _wg.dp_leader_worker_indices:
+                                                _ready_leaders.add(_idx)
+                                _dp_leaders_for_ac = [
+                                    _idx for _idx in _wg.dp_leader_worker_indices
+                                    if _idx in _ready_leaders
+                                ]
+                            else:
+                                _dp_leaders_for_ac = list(_wg.dp_leader_worker_indices)
+                            _worker_sync_state = (
+                                list(_wg.workers),
+                                _dp_leaders_for_ac,
+                                set(_wg._dead_indices),
+                            )
+                        trajectory_collector.resume_after_refit.remote(
+                            worker_sync_state=_worker_sync_state
+                        )
 
                     timer.stop("idle/refit_bubble")
 

@@ -861,25 +861,32 @@ class RayWorkerGroup:
                 "dp_shard_idx": dp_shard_idx,
             }
         )
-        if is_leader:
-            # If there are dead slots, update the sharding layout so that
-            # get_worker_coords(new_worker_idx) returns valid coordinates
-            # instead of raising ValueError.  Inheriting the dead worker's
-            # slot gives the replacement the same DP/TP/PP coords as the
-            # shard it replaces, without any index compaction.
-            if self._dead_indices and hasattr(
-                self.sharding_annotations, "replace_worker_id"
-            ):
-                # Pick the lowest dead leader index (the TP followers are not
-                # in dp_leader_worker_indices; we only care about leaders here).
-                dead_leaders = sorted(
-                    idx for idx in self._dead_indices
-                    if idx not in self.dp_leader_worker_indices
+        # If there are dead slots, update the sharding layout so that
+        # get_worker_coords(new_worker_idx) returns valid coordinates
+        # instead of raising ValueError.  Inheriting the dead worker's slot
+        # gives the replacement the same DP/TP/PP coords as the shard it
+        # replaces, without any index compaction.
+        #
+        # With TP>1 each shard has (leader + N followers). dead_slots is the
+        # sorted list of all dead worker indices NOT currently in
+        # dp_leader_worker_indices (i.e. the original leader once removed, plus
+        # all followers).  local_rank indexes into that list so each new worker
+        # inherits the coords of the dead worker it replaces positionally:
+        #   local_rank=0 (leader) → dead_slots[0] (was the dead shard leader)
+        #   local_rank=1          → dead_slots[1] (was TP follower rank 1)
+        #   etc.
+        if self._dead_indices and hasattr(
+            self.sharding_annotations, "replace_worker_id"
+        ):
+            dead_slots = sorted(
+                idx for idx in self._dead_indices
+                if idx not in self.dp_leader_worker_indices
+            )
+            if local_rank < len(dead_slots):
+                self.sharding_annotations.replace_worker_id(
+                    dead_slots[local_rank], new_worker_idx
                 )
-                if dead_leaders:
-                    self.sharding_annotations.replace_worker_id(
-                        dead_leaders[0], new_worker_idx
-                    )
+        if is_leader:
             self.dp_leader_worker_indices.append(new_worker_idx)
         return new_worker_idx
 
