@@ -1771,6 +1771,34 @@ class VllmGeneration(GenerationInterface):
         """Clear logger metrics for performance reporting."""
         self.clear_vllm_logger_metrics()
 
+    def get_shard_health_metrics(self) -> dict[str, Any]:
+        """Return per-status shard counts from the router for wandb logging.
+
+        Returns a dict with keys:
+          ``shard_health/ready``, ``shard_health/joining``,
+          ``shard_health/cordoned``, ``shard_health/draining``,
+          ``shard_health/alive`` (ready + joining),
+          ``shard_health/target``
+        or an empty dict when there is no router (colocated mode).
+        """
+        if self._router is None:
+            return {}
+        try:
+            shards = self._router.get_shards_list()
+            counts: dict[str, int] = {"ready": 0, "joining": 0}
+            for s in shards:
+                status = s.get("status", "unknown")
+                if status in counts:
+                    counts[status] += 1
+            return {
+                "shard_health/ready": counts["ready"],
+                "shard_health/joining": counts["joining"],
+                "shard_health/alive": counts["ready"] + counts["joining"],
+                "shard_health/target": getattr(self._router, "_target_shard_count", 0),
+            }
+        except Exception:  # noqa: BLE001
+            return {}
+
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting."""
         return self.get_vllm_logger_metrics()

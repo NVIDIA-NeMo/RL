@@ -4976,6 +4976,10 @@ def async_grpo_train(
                 if hasattr(policy_generation, "get_step_metrics"):
                     metrics.update(policy_generation.get_step_metrics())
 
+                # Generation worker shard health (fault-tolerance visibility).
+                if hasattr(policy_generation, "get_shard_health_metrics"):
+                    metrics.update(policy_generation.get_shard_health_metrics())
+
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
                 timeout.mark_iteration()
