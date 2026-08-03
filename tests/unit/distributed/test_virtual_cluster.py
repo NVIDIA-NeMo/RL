@@ -475,6 +475,7 @@ class TestVllmPortAssignment:
             (8, (0, list(range(16))), 0),  # 16-GPU engine across 2 nodes
             (8, (0, list(range(16, 32))), 0),  # second such engine
             (8, (0, list(range(32, 48))), 0),  # third such engine
+            (8, (0, list(range(32))), 0),  # DeepSeek-V3 generation TP=32
             # 4 GPUs per node, for example GB200 NVL72.
             (4, (0, [3]), 3),  # 3 % 4
             (4, (0, [0, 1, 2, 3]), 0),  # 4-GPU engine
@@ -501,6 +502,47 @@ class TestVllmPortAssignment:
             DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices",
+        [
+            (8, (0, list(range(16)))),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(32)))),  # DeepSeek-V3 generation TP=32, 4 nodes
+            (4, (0, list(range(8, 16)))),  # 8-GPU engine across 2 GB200 nodes
+        ],
+    )
+    def test_node_spanning_engines_keep_a_port_below_the_ephemeral_floor(
+        self, num_gpus_per_node, bundle_indices
+    ):
+        """Engines that span nodes must still get a port in the reserved band.
+
+        Leaving VLLM_PORT unset would send vLLM to kernel-assigned ephemeral
+        ports, reintroducing the TOCTOU contention the port layout exists to
+        avoid. The vLLM 0.25 TCPStore/MessageQueue collision within one engine's
+        window is handled by offsetting the TCPStore search instead (see
+        _patch_vllm_ray_executor_v2_tcpstore_port).
+        """
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        # Lowest observed ephemeral floor on some GB200 nodes.
+        EPHEMERAL_FLOOR = 9000
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        assert "VLLM_PORT" in env_vars
+        port = int(env_vars["VLLM_PORT"])
+        assert DEFAULT_VLLM_PORT_RANGE_LOW <= port < EPHEMERAL_FLOOR
+        # The TCPStore search is offset by 32 within the engine's window, so the
+        # whole window must stay below the ephemeral floor.
+        assert port + DEFAULT_VLLM_PORTS_PER_ENGINE <= EPHEMERAL_FLOOR
 
     def test_no_vllm_port_without_bundle_indices(self):
         from nemo_rl.models.generation.vllm.vllm_worker import (

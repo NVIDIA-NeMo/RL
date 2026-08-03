@@ -50,6 +50,7 @@ from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
@@ -142,6 +143,50 @@ def _dummy_routed_experts_for_tokens(
         .expand(int(token_ids.shape[0]), template.shape[1], topk)
         .clone()
     )
+
+
+def backfill_missing_routed_experts(
+    message_logs: Sequence[list[dict]],
+) -> None:
+    """Give every tokenized message a ``routed_experts`` row, in place.
+
+    Routes are attached only where generation ran, so a trajectory whose first
+    turn raised (or a turn whose routes vLLM could not return) leaves messages
+    without the field while its siblings have it. Flattening then either stacks
+    ragged ranks or silently concatenates a short column, so fill the gaps with
+    the all--1 missing-route sentinel: Megatron routes those tokens with its own
+    router, which is the honest answer for tokens no capture covered.
+
+    No-op when the batch carries no routes at all — that is the router-replay-off
+    case, and on the TQ paths the producer-side guard must still see the field
+    missing so it can report a capture failure.
+    """
+    template = None
+    for message_log in message_logs:
+        template = _find_routed_experts_template(message_log)
+        if template is not None:
+            break
+    if template is None:
+        return
+    if template.dim() != 3:
+        raise ValueError(
+            "routed_experts messages must have shape [tokens, layers, topk], "
+            f"got {tuple(template.shape)}"
+        )
+
+    for message_log in message_logs:
+        for msg in message_log:
+            token_ids = msg.get("token_ids")
+            if not isinstance(token_ids, torch.Tensor):
+                continue
+            if isinstance(msg.get("routed_experts"), torch.Tensor):
+                continue
+            msg["routed_experts"] = torch.full(
+                (int(token_ids.shape[0]), template.shape[1], template.shape[2]),
+                ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                dtype=template.dtype,
+                device=template.device,
+            )
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):
@@ -1558,6 +1603,21 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     return list(DEFAULT_THINKING_TAGS)
 
 
+def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
+    """Read ``env.should_mask_flagged_samples``; absent means True.
+
+    True (the default): env-driven ``mask_sample`` flags are carried in the
+    rollout batch and flagged samples are dropped from the loss.
+
+    Set false when the flags are too coarse to honor: for example, Gym flags
+    rollouts that hit max iterations even when they solve the task, and those
+    are samples worth training on. It also keeps batch composition
+    deterministic for controlled benchmark runs — how many samples get
+    flagged varies run to run.
+    """
+    return env_config.get("should_mask_flagged_samples") is not False
+
+
 def _get_reward_penalty_config_value(
     reward_penalty_config: dict[str, Any] | BaseModel | None,
     key: str,
@@ -1997,6 +2057,7 @@ async def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
@@ -2023,6 +2084,8 @@ async def run_async_nemo_gym_rollout(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
@@ -2148,6 +2211,7 @@ async def run_async_nemo_gym_rollout(
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
+                        mask_env_flagged_samples=mask_env_flagged_samples,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2184,6 +2248,7 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2206,6 +2271,8 @@ def run_nemo_gym_rollout_sync(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2235,6 +2302,7 @@ def run_nemo_gym_rollout_sync(
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
             thinking_tags=thinking_tags,
+            mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
         ):
             pass
@@ -2257,6 +2325,7 @@ def _postprocess_single_nemo_gym_group(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
@@ -2437,11 +2506,12 @@ def _postprocess_single_nemo_gym_group(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
-            # Agent/env-driven mask flag — True means this sample should be masked
-            # from the GRPO gradient (kept for advantage computation).
-            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
+    # Env/agent mask flag: flagged samples are dropped from the loss but still
+    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    if mask_env_flagged_samples:
+        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
