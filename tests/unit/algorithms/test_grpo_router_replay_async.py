@@ -19,6 +19,8 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+    GRPOConfig,
     MasterConfig,
     _build_async_grpo_train_data,
     _initial_grpo_save_state,
@@ -60,6 +62,11 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
                 },
             },
             "loss_fn": SimpleNamespace(use_importance_sampling_correction=True),
+            "grpo": GRPOConfig.model_construct(
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_generation_failures=0,
+                )
+            ),
             "data_plane": data_plane,
         }
     )

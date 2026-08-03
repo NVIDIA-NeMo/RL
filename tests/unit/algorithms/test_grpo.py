@@ -290,6 +290,7 @@ def mock_grpo_components():
                 async_grpo=AsyncGRPOConfig.model_construct(
                     enabled=False,
                     max_trajectory_age_steps=1,
+                    max_generation_failures=0,
                 ),
                 seq_logprob_error_threshold=None,
                 adv_estimator=AdvEstimatorConfig.model_construct(
@@ -406,6 +407,7 @@ def test_grpo_config_nested_defaults_are_populated():
     assert isinstance(first.reward_shaping, RewardShapingConfig)
     assert isinstance(first.reward_scaling, RewardScalingConfig)
     assert first.async_grpo.enabled is False
+    assert first.async_grpo.max_generation_failures == 0
     assert first.adv_estimator.use_leave_one_out_baseline is True
     assert first.adv_estimator.normalize_rewards is True
     assert first.adv_estimator.minus_baseline is True
@@ -881,10 +883,16 @@ class StubReplayBuffer:
 
 
 class StubAsyncTrajectoryCollector:
-    """Non-Ray stub of AsyncTrajectoryCollector for unit testing
+    """Non-Ray stub of AsyncTrajectoryCollector for unit testing.
 
-    Each method is a property that returns a MagicMock with a 'remote' attribute.
+    Actor methods expose MagicMocks with a ``remote`` attribute.
     """
+
+    def __init__(self, health_side_effect=None):
+        self.check_health = MagicMock()
+        self.check_health.remote = MagicMock(
+            return_value=None, side_effect=health_side_effect
+        )
 
     @property
     def start_collection(self):
@@ -973,7 +981,10 @@ class StubAsyncTrajectoryCollector:
 
 
 def mock_async_grpo_infrastructure(
-    mock_batch, mock_rollout_metrics, seq_logprob_error_result=None
+    mock_batch,
+    mock_rollout_metrics,
+    seq_logprob_error_result=None,
+    collector_health_side_effect=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -990,7 +1001,9 @@ def mock_async_grpo_infrastructure(
         mock_batch=mock_batch,
         mock_rollout_metrics=mock_rollout_metrics,
     )
-    stub_collector = StubAsyncTrajectoryCollector()
+    stub_collector = StubAsyncTrajectoryCollector(
+        health_side_effect=collector_health_side_effect
+    )
 
     # Patch venv creation
     stack.enter_context(
@@ -1163,6 +1176,49 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
+    """A fatal collector health result aborts the trainer and still cleans up."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            mock_rollout_metrics,
+            collector_health_side_effect=[
+                None,
+                RuntimeError("collector health failed"),
+            ],
+        ),
+        pytest.raises(RuntimeError, match="collector health failed"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    mock_grpo_components["checkpointer"].shutdown.assert_called_once()
+    mock_grpo_components["policy"].shutdown.assert_called_once()
 
 
 @pytest.mark.parametrize(

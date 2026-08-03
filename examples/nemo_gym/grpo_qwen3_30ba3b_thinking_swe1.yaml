@@ -30,6 +30,7 @@ grpo:
     stop_properly_penalty_coef: null
   async_grpo:
     enabled: true
+    max_generation_failures: 3
     in_flight_weight_updates: true
 loss_fn:
   kl_input_clamp_value: null
