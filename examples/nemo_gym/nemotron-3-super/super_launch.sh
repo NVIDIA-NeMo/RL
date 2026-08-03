@@ -77,6 +77,11 @@ export WANDB_MODE
 ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
+# Pinned cudagraph capture sizes conflict with the variable batch shapes that
+# speculative decoding produces, so they are removed when MTP is on. Hydra's
+# delete fails outright if the key is absent, and only the text-only Super
+# stage configs define it -- set this to 0 for a recipe that does not.
+MTP_DROP_CUDAGRAPH_CAPTURE_SIZES="${MTP_DROP_CUDAGRAPH_CAPTURE_SIZES:-1}"
 MTP_EXTRA_ARGS=""
 if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
     MTP_EXTRA_ARGS="\
@@ -84,9 +89,12 @@ if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
 ++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
 ++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
 ++policy.generation.vllm_kwargs.mamba_cache_mode=align \
-~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes \
 ++policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS} \
 ++policy.generation.vllm_kwargs.speculative_config.method=mtp"
+    if [[ "${MTP_DROP_CUDAGRAPH_CAPTURE_SIZES}" == "1" ]]; then
+        MTP_EXTRA_ARGS="${MTP_EXTRA_ARGS} \
+~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes"
+    fi
     echo "MTP speculative decoding ENABLED (num_speculative_tokens=${NUM_SPECULATIVE_TOKENS})"
 fi
 
