@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -77,18 +78,19 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         )
 
 
-def test_logs_concrete_weight_synchronizer(
+def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
+    logger = MagicMock()
+    monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": 8},
         grpo={
             "num_prompts_per_step": 2,
             "num_generations_per_prompt": 4,
         },
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=1,
             max_buffered_rollouts=4,
@@ -116,6 +118,7 @@ def test_logs_concrete_weight_synchronizer(
         actor_args=actor_args,
     )
 
+    logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output

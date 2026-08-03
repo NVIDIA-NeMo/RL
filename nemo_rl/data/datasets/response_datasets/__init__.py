@@ -123,7 +123,8 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
         )
 
     # Every dataset class accepts **kwargs, so unsupported config keys are
-    # otherwise swallowed silently (e.g. `subset` on GSM8KDataset).
+    # otherwise swallowed silently (e.g. `split_validation_size` on a dataset
+    # that never calls `split_train_validation`).
     warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
 
     dataset = dataset_class(
