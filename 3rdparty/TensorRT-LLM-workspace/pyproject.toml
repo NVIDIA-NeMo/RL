@@ -123,4 +123,4 @@ backend-path = ["."]
 # be reused across ref and uv-version changes. When bumping `ref`, also re-sync
 # [project].dependencies against the new requirements.txt.
 url = "https://github.com/hchings/TensorRT-LLM.git"
-ref = "a57b321622c4b516b827e91db5acb93fe27d6b21"   # pragma: allowlist secret
+ref = "a57b321622c4b516b827e91db5acb93fe27d6b21"    # pragma: allowlist secret
