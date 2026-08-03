@@ -1092,9 +1092,7 @@ class DTensorPolicyWorkerImpl(
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
-                vlm_kwargs = filter_multimodal_kwargs_for_model(
-                    self.model, vlm_kwargs
-                )
+                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
@@ -1539,9 +1537,7 @@ class DTensorPolicyWorkerImpl(
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
-                vlm_kwargs = filter_multimodal_kwargs_for_model(
-                    self.model, vlm_kwargs
-                )
+                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
                 batch_size, seq_len = input_ids.shape
 
                 # Store original shapes for unpacking later

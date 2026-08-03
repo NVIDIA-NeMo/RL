@@ -480,9 +480,7 @@ class TestProcessMicrobatch:
 
         assert torch.equal(full_tokens, mbridge_batch["input_ids"])
         assert torch.equal(cu_seqlens, mbridge_batch["cu_seqlens_q"])
-        assert torch.equal(
-            cu_seqlens_padded, mbridge_batch["cu_seqlens_q_padded"]
-        )
+        assert torch.equal(cu_seqlens_padded, mbridge_batch["cu_seqlens_q_padded"])
 
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):

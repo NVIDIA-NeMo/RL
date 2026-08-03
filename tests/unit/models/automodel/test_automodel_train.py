@@ -210,9 +210,9 @@ class TestModelForward:
 
         model_forward(model, processed_inputs_multimodal)
 
-        assert model.pixel_values is processed_inputs_multimodal.vlm_kwargs[
-            "pixel_values"
-        ]
+        assert (
+            model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
+        )
 
     def test_forward_preserves_multimodal_metadata_for_kwargs_model(
         self, processed_inputs_multimodal

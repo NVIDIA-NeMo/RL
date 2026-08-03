@@ -327,9 +327,7 @@ class VllmAsyncGenerationWorkerImpl(
         if self.llm is not None:
             # AsyncLLM.collective_rpc is a coroutine, so initialization must
             # happen in the async post-init path rather than shared _load_model.
-            await self.llm.collective_rpc(
-                "_initialize_nemotron_omni_radio_layerscale"
-            )
+            await self.llm.collective_rpc("_initialize_nemotron_omni_radio_layerscale")
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:

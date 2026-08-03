@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 
-
 _NEMOTRON_OMNI_ARCHITECTURES = {
     "NemotronH_Nano_Omni_Reasoning_V3",
     "NemotronH_Super_Omni_Reasoning_V3",
@@ -24,9 +23,7 @@ _NEMOTRON_OMNI_ARCHITECTURES = {
 
 
 def _is_nemotron_omni(model_runner: Any) -> bool:
-    architectures = set(
-        model_runner.vllm_config.model_config.architectures or []
-    )
+    architectures = set(model_runner.vllm_config.model_config.architectures or [])
     return not architectures.isdisjoint(_NEMOTRON_OMNI_ARCHITECTURES)
 
 

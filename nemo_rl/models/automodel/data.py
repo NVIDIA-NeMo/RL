@@ -42,9 +42,7 @@ def _accepted_forward_kwargs(
     except (AttributeError, TypeError, ValueError):
         return None
 
-    if any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
-    ):
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
         return None
     return frozenset(
         parameter.name for parameter in parameters if parameter.name != "self"
@@ -59,9 +57,7 @@ def filter_multimodal_kwargs_for_model(
     if accepted_kwargs is None:
         return multimodal_kwargs
     return {
-        key: value
-        for key, value in multimodal_kwargs.items()
-        if key in accepted_kwargs
+        key: value for key, value in multimodal_kwargs.items() if key in accepted_kwargs
     }
 
 

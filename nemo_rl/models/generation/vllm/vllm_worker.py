@@ -777,9 +777,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             # weights, while stock vLLM still allocates ls1/ls2 parameters.
             # Initialize them before colocated level-1 sleep releases CUDA
             # storage. Non-Omni worker extensions return without changing state.
-            self.llm.collective_rpc(
-                "_initialize_nemotron_omni_radio_layerscale"
-            )
+            self.llm.collective_rpc("_initialize_nemotron_omni_radio_layerscale")
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:
@@ -849,19 +847,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         # requests stop short of the boundary by the drafter lookahead.
         spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
         spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
-        if spec_lookahead > 0:
-            max_model_len = self.cfg["vllm_cfg"]["max_model_len"]
-            base_max_tokens = sampling_params.max_tokens
-            sampling_params = [
-                self._build_sampling_params(
-                    greedy=greedy,
-                    stop_strings=stop_strings,
-                    max_new_tokens=self._spec_decode_max_tokens(
-                        base_max_tokens, int(input_len), max_model_len, spec_lookahead
-                    ),
-                )
-                for input_len in data["input_lengths"].tolist()
-            ]
 
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
@@ -872,7 +857,20 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        if self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"):
+        if spec_lookahead > 0:
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            base_max_tokens = int(self.cfg["max_new_tokens"])
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=self._spec_decode_max_tokens(
+                        base_max_tokens, int(input_len), max_model_len, spec_lookahead
+                    ),
+                )
+                for input_len in input_lengths.tolist()
+            ]
+        elif self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"):
             max_model_len = int(self.llm.llm_engine.model_config.max_model_len)
             sampling_params = [
                 self._build_sampling_params(
