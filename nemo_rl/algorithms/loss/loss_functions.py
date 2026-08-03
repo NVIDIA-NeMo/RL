@@ -1620,6 +1620,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1633,9 +1635,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the raw ``logits`` is kept for the CE term.
+        the Automodel CP path also supplies its sequence-local CE inputs.
         """
-        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+        ce_loss = self._compute_ce(
+            logits,
+            data,
+            global_valid_toks,
+            student_next_token_logprobs=student_next_token_logprobs,
+            student_next_token_mask=student_next_token_mask,
+        )
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
@@ -2649,8 +2657,24 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
+        *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers)."""
+        if student_next_token_logprobs is not None:
+            assert student_next_token_mask is not None
+            label_mask = student_next_token_mask.to(
+                student_next_token_logprobs.dtype
+            ) * to_local_if_dtensor(data["sample_mask"]).to(
+                student_next_token_logprobs.device
+            ).unsqueeze(-1)
+            return masked_mean(
+                -student_next_token_logprobs,
+                label_mask,
+                global_normalization_factor=global_valid_toks,
+            )
+
         per_token_ce = student_next_token_ce(
             logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
         )
