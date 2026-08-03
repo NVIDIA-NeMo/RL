@@ -128,6 +128,23 @@ def test_checkpoint_lifecycle_forwards_to_tq(monkeypatch, tmp_path) -> None:
     assert client._data_operations_started
 
 
+def test_list_sample_ids_uses_tq_partition_listing(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    list_call = MagicMock(
+        return_value={"rollout_data": {"sample-b": {}, "sample-a": {}}}
+    )
+    monkeypatch.setattr(tq_adapter.tq, "kv_list", list_call)
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._data_operations_started = False
+
+    sample_ids = client.list_sample_ids("rollout_data")
+
+    assert sample_ids == ["sample-a", "sample-b"]
+    assert client._data_operations_started
+    list_call.assert_called_once_with(partition_id="rollout_data")
+
+
 def test_checkpoint_load_rejects_client_after_data_operation(
     monkeypatch,
     tmp_path,
