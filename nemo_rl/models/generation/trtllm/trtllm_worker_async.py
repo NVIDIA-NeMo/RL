@@ -116,7 +116,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         # Populated by a background asyncio task started in post_init_async
         # when trtllm_cfg.enable_trtllm_metrics_logger is set.
         self._trtllm_metrics_enabled = bool(
-            self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger", False)
+            self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger")
         )
         self._trtllm_metrics_lock = threading.Lock()
         self._stats_task: Optional[asyncio.Task] = None
@@ -385,7 +385,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         this iteration)."""
         assert self.llm is not None
         interval = float(
-            self.cfg["trtllm_cfg"].get("trtllm_metrics_logger_interval", 5.0)
+            self.cfg["trtllm_cfg"]["trtllm_metrics_logger_interval"]
         )
         _err_logged = 0
         while True:
