@@ -61,6 +61,7 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
     get_ray_cluster_topology,
@@ -562,11 +563,32 @@ def setup(
                 )
             )
             if node_resource_constraints is not None:
-                vllm_cfg = cast(VllmConfig, generation_config)["vllm_cfg"]
-                gpus_per_instance = (
-                    vllm_cfg["tensor_parallel_size"]
-                    * vllm_cfg["pipeline_parallel_size"]
-                )
+                training_node_ids = set(topology) - set(remaining_node_ids)
+                nodes_missing_topo_rank = [
+                    nid
+                    for nid in training_node_ids
+                    if topology[nid][1] == TOPO_RANK_UNKNOWN
+                ]
+                if nodes_missing_topo_rank:
+                    print(
+                        f"  ⚠ {len(nodes_missing_topo_rank)} selected training nodes have NVLink domain "
+                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
+                        flush=True,
+                    )
+
+                if generation_config["backend"] == "vllm":
+                    vllm_cfg = generation_config.get("vllm_cfg", {})
+                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                        "pipeline_parallel_size", 1
+                    )
+                elif generation_config["backend"] == "trtllm":
+                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
+                    gpus_per_instance = trtllm_cfg[
+                        "tensor_parallel_size"
+                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                else:
+                    sglang_cfg = generation_config.get("sglang_cfg", {})
+                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node
