@@ -20,6 +20,10 @@ export SUPER_OMNI_MODE=true
 # MTP off on both paths: the recipe sets megatron_cfg.mtp_num_layers=0 for
 # training and refit, and this keeps vLLM speculative decoding off too.
 export ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
+# The Omni recipes do not pin cudagraph_capture_sizes (only the text-only Super
+# stage configs do), so there is nothing for the MTP path's Hydra delete to
+# remove and attempting it aborts config composition.
+export MTP_DROP_CUDAGRAPH_CAPTURE_SIZES="${MTP_DROP_CUDAGRAPH_CAPTURE_SIZES:-0}"
 
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/smahdavi/images/nemo-rl-20260625.sqsh}"
 export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
