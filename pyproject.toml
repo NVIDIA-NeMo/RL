@@ -457,8 +457,8 @@ constraint-dependencies = [
   # NOTE: dropped the `prometheus-fastapi-instrumentator>=8.0.2` floor. It fixed
   # a crash on fastapi>=0.137, but tensorrt-llm now pins fastapi<=0.121.3, and
   # >=8.0.2 requires starlette>=1.0.0 which conflicts with fastapi's starlette<0.51.
-  "av>=17.1.0",                               # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
-  "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
+  "av>=17.1.0",                    # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
+  "opencv-python-headless>=5.0.0", # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
 # Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
