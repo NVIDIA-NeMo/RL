@@ -77,7 +77,15 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
-    TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+    # The `trtllm` extra is built into the image (Dockerfile.trtllm: uv sync
+    # --extra trtllm); at runtime we point directly at that baked venv's python
+    # via NEMO_RL_PY_EXECUTABLES_TRTLLM (a python binary path, NOT a `uv run`
+    # string) so the worker skips uv venv creation. trtllm_worker_async.py takes
+    # os.path.dirname(PY_EXECUTABLES.TRTLLM), which requires a real binary path.
+    TRTLLM = os.environ.get(
+        "NEMO_RL_PY_EXECUTABLES_TRTLLM",
+        f"uv run --locked --extra trtllm --directory {git_root}",
+    )
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200

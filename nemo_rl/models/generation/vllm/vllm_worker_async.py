@@ -56,6 +56,51 @@ from nemo_rl.models.generation.openai_server_utils import (
 
 LOGGER = logging.getLogger(__name__)
 
+_NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
+_NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
+_NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY = "_validation_generation"
+
+
+def _pop_nemo_rl_request_type(request: Any) -> Optional[str]:
+    """Remove and return NeMo-RL-only metadata before template rendering."""
+    chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+    assert isinstance(chat_template_kwargs, dict), (
+        "Chat completion request chat_template_kwargs must be a dict."
+    )
+    chat_template_kwargs = dict(chat_template_kwargs)
+    request_type = chat_template_kwargs.pop(_NEMO_RL_REQUEST_TYPE_METADATA_KEY, None)
+    if request_type is not None:
+        request.chat_template_kwargs = chat_template_kwargs
+    return request_type
+
+
+def _is_validation_request(request: Any, generation_config: dict[str, Any]) -> bool:
+    """Identify validation requests while keeping training checks strict."""
+    request_type = _pop_nemo_rl_request_type(request)
+    if request_type is not None:
+        assert request_type == _NEMO_RL_VALIDATION_REQUEST_TYPE, (
+            f"Unsupported NeMo RL request type: {request_type!r}."
+        )
+        return True
+
+    validation_generation = generation_config.get(
+        _NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY
+    )
+    if validation_generation is None:
+        return False
+
+    if (
+        validation_generation["temperature"] == generation_config["temperature"]
+        and validation_generation["top_p"] == generation_config["top_p"]
+    ):
+        return False
+
+    request_top_p = 1.0 if request.top_p is None else request.top_p
+    return (
+        request.temperature == validation_generation["temperature"]
+        and request_top_p == validation_generation["top_p"]
+    )
+
 
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
@@ -419,6 +464,11 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return super().model_post_init(context)
 
+        # Bind the worker instance for use inside the serving mixins below:
+        # their methods run with `self` = the vLLM serving/render object, which
+        # has no `cfg` attribute.
+        worker_self = self
+
         class NeMoRLOpenAIServingMixin:
             @staticmethod
             def _set_max_tokens(request, max_tokens: int) -> None:
@@ -466,7 +516,12 @@ class VllmAsyncGenerationWorkerImpl(
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                    content = message.get("content")
+                    if content is not None and not isinstance(content, (list, str)):
+                        try:
+                            message["content"] = list(content)
+                        except TypeError:
+                            message["content"] = []
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -514,6 +569,27 @@ class VllmAsyncGenerationWorkerImpl(
                             res[1][0]["prompt_token_ids"],
                         )
                     return res
+
+                # vLLM normalizes reasoning and tool-call message content during
+                # preprocessing.  Reuse that representation for the isolated
+                # prefix render, while removing NeMo-RL's token bookkeeping.
+                excluded_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for message in messages:
+                    if isinstance(message, dict):
+                        messages_for_replace_prefix_tokens.append(
+                            {
+                                key: deepcopy(value)
+                                for key, value in message.items()
+                                if key not in excluded_fields
+                            }
+                        )
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(message))
 
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
@@ -583,8 +659,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
-        # belongs on the renderer subclass.
-        worker_self = self
+        # belongs on the renderer subclass (worker_self is bound above).
 
         class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
@@ -677,10 +752,20 @@ class VllmAsyncGenerationWorkerImpl(
             )
             request.top_k = -1
 
-            # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # Training requests must match the NeMo RL policy config exactly —
+            # a mismatch means off-policy inference and destroys training stability.
+            # Validation requests are metric-only and may use validation_generation params.
+            if not _is_validation_request(request, generation_config):
+                expected_temperature = generation_config["temperature"]
+                expected_top_p = generation_config["top_p"]
+                assert request.temperature == expected_temperature, (
+                    f"policy request temperature mismatch: got {request.temperature}, "
+                    f"expected {expected_temperature}."
+                )
+                assert request.top_p == expected_top_p, (
+                    f"policy request top_p mismatch: got {request.top_p}, "
+                    f"expected {expected_top_p}."
+                )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -1331,17 +1416,18 @@ class VllmAsyncGenerationWorkerImpl(
             worker_results = cast(list[bool], worker_results)
 
             if not worker_results or not all(worker_results):
-                print(
-                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                # Weight-update failures must abort the step: silently continuing
+                # would train against stale generation weights (off-policy drift).
+                raise RuntimeError(
+                    f"Worker failed to update weights. Results: {worker_results}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
@@ -1367,17 +1453,18 @@ class VllmAsyncGenerationWorkerImpl(
             worker_results = cast(list[bool], worker_results)
 
             if not worker_results or not all(worker_results):
-                print(
-                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                # Weight-update failures must abort the step: silently continuing
+                # would train against stale generation weights (off-policy drift).
+                raise RuntimeError(
+                    f"Worker failed to update weights. Results: {worker_results}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def init_nccl_reshard_comm_group_async(
         self,
