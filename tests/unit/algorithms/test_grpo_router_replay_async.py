@@ -109,10 +109,10 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
         assert "routed_experts" not in train_data
 
 
-def test_async_grpo_r3_rejects_data_plane_until_async_tq_exists():
+def test_async_grpo_r3_data_plane_directs_to_single_controller():
     master_config = _make_async_master_config(data_plane={"enabled": True})
 
-    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+    with pytest.raises(NotImplementedError, match="SingleController entrypoint"):
         async_grpo_train(
             MagicMock(),
             MagicMock(),

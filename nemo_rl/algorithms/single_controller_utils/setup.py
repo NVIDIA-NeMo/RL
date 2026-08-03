@@ -432,6 +432,7 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        require_routed_experts=router_replay_enabled(policy_config),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
