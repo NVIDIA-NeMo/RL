@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# File-backed registry helpers for the in-allocation GenRM pool.
+# File-backed registry helpers for an in-allocation external Gym vLLM pool.
 
 set -euo pipefail
 
-GENRM_SERVING_DIR="${GENRM_SERVING_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-GENRM_GROUP_ID="${GENRM_GROUP_ID:-default}"
-REGISTRY_FILE="${GENRM_SERVING_DIR}/.registry_${GENRM_GROUP_ID}"
+EXTERNAL_VLLM_STATE_DIR="${EXTERNAL_VLLM_STATE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+EXTERNAL_VLLM_GROUP_ID="${EXTERNAL_VLLM_GROUP_ID:-default}"
+REGISTRY_FILE="${EXTERNAL_VLLM_STATE_DIR}/.registry_${EXTERNAL_VLLM_GROUP_ID}"
 REGISTRY_LOCK="${REGISTRY_FILE}.lock"
 
 _ensure_registry() {

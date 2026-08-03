@@ -13,17 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Restart the lightweight GenRM load balancer after an unexpected exit.
+# Restart an external Gym vLLM load balancer after an unexpected exit.
 
 set -uo pipefail
 
 PYTHON="${PYTHON:-python3}"
-LB_SCRIPT="$(dirname "$0")/genrm_lb.py"
+LB_SCRIPT="$(dirname "$0")/vllm_pool_lb.py"
 PORT="${1:?port required}"
 REGISTRY_DIR="${2:?registry directory required}"
 GROUP_ID="${3:?group ID required}"
 
-trap 'kill %1 2>/dev/null; exit 0' TERM INT
+lb_pid=""
+shutdown() {
+  trap - TERM INT
+  if [[ -n "${lb_pid}" ]] && kill -0 "${lb_pid}" 2>/dev/null; then
+    kill "${lb_pid}" 2>/dev/null || true
+    wait "${lb_pid}" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap shutdown TERM INT
 
 fast_failures=0
 while true; do
@@ -32,8 +41,11 @@ while true; do
   "${PYTHON}" "${LB_SCRIPT}" \
     --port "${PORT}" \
     --registry-dir "${REGISTRY_DIR}" \
-    --group-id "${GROUP_ID}"
+    --group-id "${GROUP_ID}" &
+  lb_pid=$!
+  wait "${lb_pid}"
   status=$?
+  lb_pid=""
   elapsed=$(( $(date +%s) - started_at ))
   echo "$(date) [WATCHDOG] Load balancer exited (${status}) after ${elapsed}s"
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run the native vLLM CLI with its Python propagated to Ray workers."""
+"""Run an external Gym vLLM CLI with its Python propagated to Ray workers."""
 
 from __future__ import annotations
 

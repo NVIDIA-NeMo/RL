@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lightweight async reverse proxy for GenRM vLLM backends.
+"""Lightweight async reverse proxy for an external Gym vLLM backend pool.
 
 Reads the backend registry file and forwards OpenAI-compatible requests
 to healthy backends using least-outstanding-requests routing.
@@ -25,7 +25,7 @@ Supports:
   - Single URL for Gym integration
 
 Usage:
-    python genrm_lb.py --port 8080 --registry-dir /path/to/genrm_serving --group-id default
+    python vllm_pool_lb.py --port 8080 --registry-dir /path/to/state --group-id default
 
 The load balancer exposes:
     http://<host>:8080/v1/...   →  proxied to backends
@@ -64,7 +64,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("genrm_lb")
+log = logging.getLogger("vllm_pool_lb")
 
 
 # HTTP statuses that indicate the upstream backend is sick (crashed EngineCore,
@@ -366,7 +366,8 @@ class LoadBalancer:
                 resp_headers = {
                     k: v
                     for k, v in upstream_resp.headers.items()
-                    if k.lower() not in ("transfer-encoding", "content-encoding")
+                    if k.lower()
+                    not in ("transfer-encoding", "content-encoding", "content-length")
                 }
                 if upstream_resp.status in RETRYABLE_UPSTREAM_STATUSES:
                     raise UpstreamRetryableStatus(
@@ -464,7 +465,7 @@ class LoadBalancer:
             except UpstreamRetryableStatus as e:
                 log.warning(
                     "[proxy %s %s] attempt %d/%d: backend %s returned %d, "
-                    "quarantining and failing over. Body: %s",
+                    "failing over without changing backend health. Body: %s",
                     request.method,
                     request.path_qs,
                     attempt,
@@ -473,7 +474,6 @@ class LoadBalancer:
                     e.status,
                     e.body[:500],
                 )
-                backend.healthy = False
                 last_upstream_5xx = e
             except Exception as e:
                 log.warning(
@@ -523,7 +523,9 @@ class LoadBalancer:
         )
 
     def make_app(self) -> web.Application:
-        app = web.Application()
+        # Judge payloads can include many long candidate responses. Let each
+        # upstream model enforce its own request/model-length limits.
+        app = web.Application(client_max_size=0)
         app.router.add_get("/health", self.handle_health)
         # Catch-all: proxy everything else
         app.router.add_route("*", "/{path:.*}", self.handle_proxy)
@@ -543,18 +545,18 @@ class LoadBalancer:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GenRM Load Balancer")
+    parser = argparse.ArgumentParser(description="External vLLM Pool Load Balancer")
     parser.add_argument("--port", type=int, default=8080, help="LB listen port")
     parser.add_argument(
         "--registry-dir",
         default=os.environ.get(
-            "GENRM_SERVING_DIR", os.path.dirname(os.path.abspath(__file__))
+            "EXTERNAL_VLLM_STATE_DIR", os.path.dirname(os.path.abspath(__file__))
         ),
         help="Directory containing the registry file",
     )
     parser.add_argument(
         "--group-id",
-        default=os.environ.get("GENRM_GROUP_ID", "default"),
+        default=os.environ.get("EXTERNAL_VLLM_GROUP_ID", "default"),
         help="Server group ID",
     )
     parser.add_argument(
@@ -570,7 +572,9 @@ def main() -> None:
     app = lb.make_app()
 
     log.info(
-        "Starting GenRM Load Balancer on port %d (group=%s)", args.port, args.group_id
+        "Starting external vLLM load balancer on port %d (group=%s)",
+        args.port,
+        args.group_id,
     )
     log.info("Registry: %s", pool.registry_file)
 
