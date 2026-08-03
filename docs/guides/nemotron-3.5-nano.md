@@ -4,24 +4,24 @@ This guide describes the reference NeMo RL recipes for post-training Nemotron
 3.5 Nano on four-GPU GB200 nodes:
 
 - SWE reinforcement learning with executable software-engineering environments.
-- RLVR with an external GenRM pool and in-cluster general-purpose and safety
-  judges.
+- RLVR with external GenRM and general-purpose judge pools plus an in-cluster
+  safety judge.
 
 The recipes and shared launcher are under
 `examples/nemo_gym/nemotron-3.5-nano/`.
 
 ## Reference topology
 
-| Recipe | Training | Policy generation | Gym judges | External GenRM | Total |
-|---|---:|---:|---:|---:|---:|
-| SWE | 16 nodes | 32 nodes | 0 nodes | 0 nodes | 48 nodes |
-| RLVR | 32 nodes | 32 nodes | 6 nodes | 16 nodes | 86 nodes |
+| Recipe | Training | Policy generation | Gym judges | External GenRM | External NL2Bash | Total |
+|---|---:|---:|---:|---:|---:|---:|
+| SWE | 16 nodes | 32 nodes | 0 nodes | 0 nodes | 0 nodes | 48 nodes |
+| RLVR | 32 nodes | 32 nodes | 2 nodes | 16 nodes | 4 nodes | 86 nodes |
 
-The RLVR launcher reserves 16 nodes outside the NeMo RL Ray cluster and starts
-eight independent TP=8, DP=1 GenRM servers. A lightweight load balancer routes
-Gym requests across the healthy servers. Training starts only after the complete
-GenRM pool and load balancer are healthy. The six Gym nodes host the TP=4,
-DP=4 general-purpose judge and TP=4, DP=2 safety judge.
+The RLVR launcher reserves 20 nodes outside the NeMo RL Ray cluster. It starts
+eight independent TP=8, DP=1 GenRM servers on 16 nodes and four independent
+TP=4, DP=1 NL2Bash judge servers on four nodes. Each pool has a lightweight
+load balancer. Training starts only after both complete pools and load
+balancers are healthy. The two Gym nodes host the TP=4, DP=2 safety judge.
 
 Both reference profiles assume four GPUs per node. Override the node counts,
 `GPUS_PER_NODE`, and `SEGMENT_SIZE` only after confirming that all model
@@ -47,10 +47,10 @@ Prepare:
 On enroot-based clusters, `CONTAINER` and `SANDBOX_CONTAINER` may be `.sqsh`
 paths. `EXTRA_MOUNTS` is a comma-separated list of `host:container` mappings.
 
-The inline external-GenRM launcher currently expects `BASE_LOG_DIR`,
-`GENRM_TOOLS_DIR_HOST`, and absolute local GenRM model/plugin paths to be under
-`/lustre`, which is mounted into its service containers. A Hugging Face model ID
-may be used for `GENRM_MODEL` instead of an absolute path.
+The inline external-service launcher currently expects `BASE_LOG_DIR`,
+`EXTERNAL_VLLM_TOOLS_DIR_HOST`, and absolute local GenRM, NL2Bash, or plugin
+paths to be under `/lustre`, which is mounted into its service containers. A
+Hugging Face model ID may be used instead of an absolute model path.
 
 ## Prepare the inputs
 
@@ -85,9 +85,12 @@ The RLVR profile requires:
 - `NL2BASH_JUDGE_MODEL`: general-purpose judge checkpoint or model ID.
 - `SAFETY_JUDGE_MODEL`: safety judge checkpoint or model ID.
 
-The reference external GenRM deployment uses expert parallelism and serves the
-OpenAI-compatible model name `model`. The launcher injects the load balancer URL
-and model name into Gym after all backends become healthy.
+The reference external deployments use expert parallelism and serve the
+OpenAI-compatible model name `model`. The launcher injects both load-balancer
+URLs and model names into Gym after all backends become healthy.
+The model-specific vLLM arguments are intentionally defined in
+`nano35_launch.sh`; `tools/external_gym_vllm/run_in_allocation.sh` only implements
+the generic lifecycle for the named external pools.
 
 ## Launch script
 
@@ -114,7 +117,7 @@ Useful optional variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `RESULTS_DIR` | `results/$EXP_NAME` | Checkpoints and per-submission logs. |
-| `BASE_LOG_DIR` | `$RESULTS_DIR/ray_logs` | Ray and external GenRM logs. |
+| `BASE_LOG_DIR` | `$RESULTS_DIR/ray_logs` | Ray and external-judge logs. |
 | `EXTRA_MOUNTS` | empty | Additional container mounts. |
 | `WALLTIME` | `4:00:00` | Slurm time limit. |
 | `SLURM_QOS`, `SLURM_RESERVATION`, `EXCLUDE_NODES` | empty | Optional Slurm controls. |
@@ -171,8 +174,9 @@ bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh rlvr
 ```
 
 The reference RLVR configuration uses TP=4, CP=4, EP=16, GBS=8192, 512
-prompts per step, and 16 generations per prompt. The inline GenRM defaults are
-eight TP=8 replicas on 16 four-GPU nodes.
+prompts per step, and 16 generations per prompt. The external defaults are
+eight TP=8 GenRM replicas on 16 four-GPU nodes and four TP=4 NL2Bash replicas
+on four more nodes.
 
 ## Inspect a launch
 
