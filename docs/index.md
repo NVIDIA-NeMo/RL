@@ -299,6 +299,7 @@ guides/sft-openmathinstruct2.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
+guides/nemotron-omni-mpo.md
 guides/dapo.md
 guides/lora.md
 guides/cispo.md
