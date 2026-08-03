@@ -55,6 +55,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
+    _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
@@ -445,6 +446,8 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    stop_at_validation_threshold = master_config.grpo["stop_at_validation_threshold"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
@@ -525,6 +528,17 @@ def grpo_train_sync(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        stop_message = _validation_early_stop_message(
+            val_metrics,
+            stop_at_validation_threshold,
+            stop_at_validation_metric,
+            initial=True,
+        )
+        if stop_message is not None:
+            print(stop_message, flush=True)
+            # Flush pending checkpoint finalization, like the other early returns.
+            checkpointer.shutdown()
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -991,6 +1005,7 @@ def grpo_train_sync(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
+                early_stop_message: Optional[str] = None
                 if (
                     val_period > 0
                     and (total_steps + 1) >= val_start_at
@@ -1025,6 +1040,14 @@ def grpo_train_sync(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    early_stop_message = _validation_early_stop_message(
+                        val_metrics,
+                        stop_at_validation_threshold,
+                        stop_at_validation_metric,
+                    )
+                    if early_stop_message is not None:
+                        # Exit at the end of this step, after checkpointing.
+                        print(early_stop_message, flush=True)
 
                 # advantages and token_mask are in scope from the
                 # advantage / masking blocks above. No need to re-fetch.
@@ -1106,6 +1129,8 @@ def grpo_train_sync(
 
                 should_save_by_step = (
                     is_last_step
+                    # Early stop saves the final state like a last step.
+                    or early_stop_message is not None
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                     or (
@@ -1347,6 +1372,10 @@ def grpo_train_sync(
             timer.reset()
             current_step += 1
             total_steps += 1
+            if early_stop_message is not None:
+                checkpointer.shutdown()
+                memory_tracker.snapshot_start_of_stage("", dir())
+                return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())

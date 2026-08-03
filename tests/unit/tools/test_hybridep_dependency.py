@@ -16,14 +16,17 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-HYBRIDEP_COMMIT = "f725d29699f5bda9ba789456bb9579af69844685"  # pragma: allowlist secret
+HYBRIDEP_COMMIT = "17cfb817bccec3a9c247013360cc550c2bac441e"  # pragma: allowlist secret
+PREVIOUS_HYBRIDEP_COMMIT = (
+    "f725d29699f5bda9ba789456bb9579af69844685"  # pragma: allowlist secret
+)
 PREVIOUS_X86_COMMIT = (
     "29d31c095796f3c8ece47ee9cdcc167051bbeed9"  # pragma: allowlist secret
 )
 PREVIOUS_ARM_COMMIT = (
     "a48493600c4886c1b297aaa78db0e1ebc2d8dd6c"  # pragma: allowlist secret
 )
-HYBRIDEP_VERSION = "1.2.1+f725d29"
+HYBRIDEP_VERSION = "1.2.1+17cfb81"
 
 
 def _project_root() -> Path:
@@ -92,5 +95,6 @@ def test_lock_uses_same_hybridep_commit_for_x86_and_arm() -> None:
     assert f"#{HYBRIDEP_COMMIT}" in package["source"]["git"]
     assert "resolution-markers" not in package
     lock_text = lock_path.read_text()
+    assert PREVIOUS_HYBRIDEP_COMMIT not in lock_text
     assert PREVIOUS_X86_COMMIT not in lock_text
     assert PREVIOUS_ARM_COMMIT not in lock_text

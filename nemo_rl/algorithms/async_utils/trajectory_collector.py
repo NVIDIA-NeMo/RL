@@ -752,6 +752,7 @@ class AsyncTrajectoryCollector:
             from nemo_rl.experience.rollouts import (
                 get_nemo_gym_thinking_tags,
                 run_async_nemo_gym_rollout,
+                should_mask_flagged_samples,
             )
 
             # NeMo-Gym owns stop criteria. Configuration fills the policy EOS token
@@ -777,6 +778,9 @@ class AsyncTrajectoryCollector:
                 greedy=False,
                 reward_penalty_config=self.master_config.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
+                mask_env_flagged_samples=should_mask_flagged_samples(
+                    self.master_config.env
+                ),
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
