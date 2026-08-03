@@ -63,6 +63,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -577,8 +578,10 @@ class SingleControllerActor:
     async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
         """Clear consumed rows without overlapping a data-plane checkpoint."""
         async with self._data_plane_checkpoint_lock:
-            await self._call_dp(
+            await call_data_plane(
+                self._dp_client,
                 "clear_samples",
+                offload_sync=True,
                 sample_ids=sample_ids,
                 partition_id=self._partition_id,
             )
@@ -608,7 +611,8 @@ class SingleControllerActor:
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
-            await self._call_dp(
+            await call_data_plane(
+                self._dp_client,
                 "save_checkpoint",
                 offload_sync=True,
                 checkpoint_dir=checkpoint_dir,
@@ -1264,7 +1268,8 @@ class SingleControllerActor:
             return meta
         adv_cfg = self._advantage_cfg
 
-        data = await self._call_dp(
+        data = await call_data_plane(
+            self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
@@ -1317,7 +1322,8 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
-        await self._call_dp(
+        await call_data_plane(
+            self._dp_client,
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,

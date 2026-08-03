@@ -24,6 +24,7 @@ import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG, ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
@@ -770,7 +771,8 @@ class TQReplayBuffer:
         )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
         try:
-            await self._call_dp(
+            await call_data_plane(
+                self._dp_client,
                 "put_samples",
                 sample_ids=sample_ids,
                 partition_id=self._partition_id,
@@ -1042,7 +1044,8 @@ class TQReplayBuffer:
 
         groups: list[dict[str, Any]] = []
         for meta, start_weight, end_weight, target_step, group_id in snapshot:
-            fields_data = await self._call_dp(
+            fields_data = await call_data_plane(
+                self._dp_client,
                 "get_samples",
                 sample_ids=meta.sample_ids,
                 partition_id=self._partition_id,
@@ -1185,7 +1188,8 @@ class TQReplayBuffer:
 
         for group in groups:
             meta = group["meta"]
-            await self._call_dp(
+            await call_data_plane(
+                self._dp_client,
                 "put_samples",
                 sample_ids=list(meta.sample_ids),
                 partition_id=self._partition_id,
@@ -1216,17 +1220,6 @@ class TQReplayBuffer:
     def __len__(self) -> int:
         return len(self.meta_list)
 
-    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
-        """Call a DataPlaneClient method, awaiting Ray remotes if needed."""
-        method = getattr(self._dp_client, method_name)
-        remote = getattr(method, "remote", None)
-        if remote is not None:
-            return await remote(**kwargs)
-        result = method(**kwargs)
-        if asyncio.iscoroutine(result):
-            return await result
-        return result
-
     async def _clear_samples(self, *, sample_ids: list[str]) -> None:
         """Clear rows without overlapping a bound data-plane checkpoint."""
         if self._data_plane_checkpoint_lock is None:
@@ -1235,8 +1228,10 @@ class TQReplayBuffer:
                 "checkpoint lock before clearing samples"
             )
         async with self._data_plane_checkpoint_lock:
-            await self._call_dp(
+            await call_data_plane(
+                self._dp_client,
                 "clear_samples",
+                offload_sync=True,
                 sample_ids=sample_ids,
                 partition_id=self._partition_id,
             )
