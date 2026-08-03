@@ -62,6 +62,44 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
+def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_bf16_to_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+
+    with pytest.raises(ValueError, match="is_mx=True for BF16-to-MXFP8 refit"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="does not support blockwise-FP8 storage"):
+        check_nccl_reshard_refit_support(config)
+
+
 @pytest.mark.parametrize(
     ("generation_update", "expected_violation"),
     [

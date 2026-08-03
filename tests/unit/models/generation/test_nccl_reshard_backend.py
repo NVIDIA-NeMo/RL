@@ -313,3 +313,101 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
     egctx.buf.fill_(5.0)
     eg.post(egctx)
     assert torch.equal(w13[:, 0:Pl, :], torch.full_like(w13[:, 0:Pl, :], 5.0))
+
+
+def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
+    H, E, Pl = 32, 2, 64
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.experts.gate_proj.weight",
+                    "global_shape": [E, Pl, H],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                },
+                {
+                    "name": "model.layers.0.mlp.experts.down_proj.weight",
+                    "global_shape": [E, H, Pl],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                },
+            ]
+        },
+    }
+    w13 = torch.empty(E, 2 * Pl, H, dtype=torch.float8_e4m3fn)
+    w13_scale = torch.empty(E, 2 * Pl, H // 32, dtype=torch.uint8)
+    w2 = torch.empty(E, H, Pl, dtype=torch.float8_e4m3fn)
+    w2_scale = torch.empty(E, H, Pl // 32, dtype=torch.uint8)
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.w13_weight": w13,
+            "model.layers.0.mlp.experts.w13_weight_scale_from_checkpoint": w13_scale,
+            "model.layers.0.mlp.experts.w2_weight": w2,
+            "model.layers.0.mlp.experts.w2_weight_scale_from_checkpoint": w2_scale,
+        }
+    )
+
+    def fake_quantize(weight):
+        return (
+            torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
+            torch.full(
+                (*weight.shape[:-1], weight.shape[-1] // 32), 7, dtype=torch.uint8
+            ),
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.quantize_mxfp8_weight",
+        fake_quantize,
+    )
+
+    pmap = ext.build_hf_to_local_param_map(refit_info)
+
+    gate = pmap.get("model.layers.0.mlp.experts.gate_proj.weight")
+    assert gate is not None and gate.pre is not None and gate.post is not None
+    gate_ctx = gate.pre(gate.base)
+    assert gate_ctx.buf.dtype == torch.bfloat16
+    assert gate_ctx.buf.shape == w13[:, :Pl, :].shape
+    gate.post(gate_ctx)
+    assert torch.all(w13[:, :Pl, :].float() == 3)
+    assert torch.all(w13_scale[:, :Pl, :] == 7)
+
+    down = pmap.get("model.layers.0.mlp.experts.down_proj.weight")
+    assert down is not None and down.pre is not None and down.post is not None
+    down_ctx = down.pre(down.base)
+    assert down_ctx.buf.dtype == torch.bfloat16
+    assert down_ctx.buf.shape == w2.shape
+    down.post(down_ctx)
+    assert torch.all(w2.float() == 3)
+    assert torch.all(w2_scale == 7)
+
+
+def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
+    H, E, P = 32, 2, 64
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.experts.down_proj.weight",
+                    "global_shape": [E, H, P],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                }
+            ]
+        },
+    }
+    w2 = torch.empty(E, H, P, dtype=torch.float8_e4m3fn)
+    invalid_scale = torch.empty(E, H, 1, dtype=torch.uint8)
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.w2_weight": w2,
+            "model.layers.0.mlp.experts.w2_weight_scale_from_checkpoint": invalid_scale,
+        }
+    )
+
+    with pytest.raises(ValueError, match="has shape"):
+        ext.build_hf_to_local_param_map(refit_info)

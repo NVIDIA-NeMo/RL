@@ -441,6 +441,17 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a checkpoint-layout weight and sanitize zero E8M0 scales."""
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+
+    value, scale = mxfp8_e4m3_quantize(weight)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return value, scale
+
+
 def load_weights(weights, model_runner):
     global global_fp8_config
     weights_quantized = []
@@ -452,11 +463,7 @@ def load_weights(weights, model_runner):
             continue
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:
-            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-                mxfp8_e4m3_quantize,
-            )
-
-            param_lp, param_scale = mxfp8_e4m3_quantize(v)
+            param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),
