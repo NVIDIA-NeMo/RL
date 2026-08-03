@@ -326,6 +326,9 @@ policy:
       reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
 
     vllm_kwargs:
+      # Match the higher-throughput backend used by the earlier successful
+      # policy-serving runs. This must remain compatible with repeated refits.
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       max_num_seqs: 64
       mamba_ssm_cache_dtype: "float32"
@@ -485,7 +488,6 @@ env:
           return_token_id_information: false
           uses_reasoning_parser: false
           debug: true
-          ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
             VLLM_USE_DEEP_GEMM: "0"
