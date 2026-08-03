@@ -22,8 +22,8 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,

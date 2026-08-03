@@ -28,8 +28,8 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
