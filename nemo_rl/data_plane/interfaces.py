@@ -60,11 +60,12 @@ class DataPlaneConfig(TypedDict):
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
 
-    ``checkpointing_enabled`` opts SingleController into saving required
-    shadow TQ state inside its checkpoint bundle. Other algorithm entrypoints
-    do not consume this field. It is optional because existing configs predate
-    data-plane checkpointing; exemplar configs carry the recommended default
-    explicitly.
+    ``checkpointing_enabled`` opts SingleController into saving required TQ
+    state inside its checkpoint bundle. Samplers that support replay-buffer
+    recovery pair the native snapshot with a metadata-only local index; other
+    samplers save it in shadow mode. Other algorithm entrypoints do not consume
+    this field. It is optional because existing configs predate data-plane
+    checkpointing; exemplar configs carry the recommended default explicitly.
     """
 
     enabled: bool
@@ -418,6 +419,22 @@ class DataPlaneClient(ABC):
 
         Returns:
             ``TensorDict`` keyed by field name, batched along ``sample_ids``.
+        """
+
+    @abstractmethod
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List the sample IDs currently stored in a partition.
+
+        This metadata-only operation is intended for recovery validation and
+        reconciliation. It must not fetch tensor payloads or advance consumer
+        cursors.
+
+        Args:
+            partition_id: Partition whose stored keys should be listed.
+
+        Returns:
+            Stable, sorted sample IDs. An unknown or empty partition returns
+            an empty list.
         """
 
     @abstractmethod
