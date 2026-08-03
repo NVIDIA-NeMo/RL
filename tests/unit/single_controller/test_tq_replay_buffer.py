@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import threading
 from typing import Any
 
 import pytest
@@ -72,6 +73,7 @@ class FakeDataPlaneClient:
         self._rows: dict[str, dict[str, Any]] = {}
         self.put_calls: list[dict[str, Any]] = []
         self.clear_calls: list[list[str]] = []
+        self.clear_thread_ids: list[int] = []
         self.get_calls: list[dict[str, Any]] = []
 
     def put_samples(
@@ -103,6 +105,7 @@ class FakeDataPlaneClient:
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         assert partition_id == self._partition_id
+        self.clear_thread_ids.append(threading.get_ident())
         ids = list(sample_ids) if sample_ids is not None else list(self._rows)
         self.clear_calls.append(list(ids))
         for sid in ids:
@@ -393,6 +396,18 @@ class TestTQReplayBufferRemove:
             assert dp.clear_calls == [dp.put_calls[0]["sample_ids"]]
 
         asyncio.run(exercise())
+
+    def test_dp_clear_does_not_block_actor_event_loop(self):
+        async def exercise() -> tuple[FakeDataPlaneClient, int]:
+            dp = FakeDataPlaneClient()
+            buf = _make_buffer(dp)
+            event_loop_thread_id = threading.get_ident()
+            await buf._clear_samples(sample_ids=["sample-1"])
+            return dp, event_loop_thread_id
+
+        dp, event_loop_thread_id = asyncio.run(exercise())
+        assert dp.clear_thread_ids
+        assert dp.clear_thread_ids[0] != event_loop_thread_id
 
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()

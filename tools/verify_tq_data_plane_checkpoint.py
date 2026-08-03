@@ -177,6 +177,9 @@ def _save_and_finalize_bundle(
             f"Staging checkpoint bundle already exists: {staging_dir}"
         )
 
+    # CheckpointManager creates tmp_step_N before component writers run.
+    # Mirror that precondition instead of relying on TQ to create the parent.
+    staging_dir.mkdir(parents=True)
     try:
         _save(staging_dir / DATA_PLANE_DIR, num_storage_units)
         staging_dir.rename(bundle_dir)
