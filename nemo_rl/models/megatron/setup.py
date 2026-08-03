@@ -292,8 +292,20 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def setup_distributed(config: Optional[PolicyConfig] = None) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
+    # SGLang's scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0 and the
+    # trainer has to agree with it. This has to happen before the
+    # init_process_group below, not in validate_and_set_config, which runs
+    # after the default process group already picked a transport.
+    if (
+        config is not None
+        and "generation" in config
+        and config["generation"] is not None
+        and config["generation"].get("backend") == "sglang"
+    ):
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
@@ -313,11 +325,13 @@ def validate_and_set_config(
 ):
     # Handle generation configuration
     is_generation_colocated = None
+    rollout_backend = None
     sampling_params = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        rollout_backend = generation_cfg.get("backend")
         # set sampling params
         sampling_params = TrainingSamplingParams(
             top_k=generation_cfg["top_k"],
@@ -327,7 +341,8 @@ def validate_and_set_config(
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    if not is_generation_colocated:
+    # SGLang keeps the 0 that setup_distributed set before NCCL init.
+    if not is_generation_colocated and rollout_backend != "sglang":
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
     # Setup data types
