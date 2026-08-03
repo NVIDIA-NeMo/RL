@@ -33,13 +33,13 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # The length of the buffer to penalize responses that exceed the maximum response length threshold.
     # Responses of length greater than overlong_buffer_length + max_response_length will
     # receive the maximum penalty.
-    overlong_buffer_length: int = 128
+    overlong_buffer_length: int | None = None
 
     # The penalty for responses that exceed the maximum response length threshold.
-    overlong_buffer_penalty: float = 1.0
+    overlong_buffer_penalty: float | None = None
 
     # The maximum response length threshold. Responses exceeding this length will be penalized.
-    max_response_length: int = 512
+    max_response_length: int | None = None
 
     # Stop properly penalty: scale factor for rewards of truncated responses (0-1).
     # When set to 0, truncated responses get zero reward.
@@ -114,10 +114,19 @@ def apply_reward_shaping(
 
         return batch
 
-    # Get the overlong_buffer_length, overlong_buffer_penalty and max_response_length
+    # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     overlong_buffer_length = cfg.overlong_buffer_length
     overlong_buffer_penalty = cfg.overlong_buffer_penalty
     max_response_length = cfg.max_response_length
+    if (
+        overlong_buffer_length is None
+        or overlong_buffer_penalty is None
+        or max_response_length is None
+    ):
+        raise ValueError(
+            "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."
+        )
+
     assert overlong_buffer_penalty >= 0, f"{overlong_buffer_penalty=} must be >=0"
     # Calculate the expected response length
     expected_response_length = max_response_length - overlong_buffer_length

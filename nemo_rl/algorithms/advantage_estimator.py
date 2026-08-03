@@ -46,8 +46,8 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
 
     name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
-    normalize_rewards: bool | None = None
-    use_leave_one_out_baseline: bool = False
+    normalize_rewards: bool = True
+    use_leave_one_out_baseline: bool = True
     # GDPO specific: optional per-component weights w_n for the aggregation.
     reward_weights: list[float] | None = None
     # Reinforce++ specific

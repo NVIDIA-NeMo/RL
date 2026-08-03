@@ -401,8 +401,8 @@ def test_grpo_config_nested_defaults_are_populated():
     assert isinstance(first.reward_shaping, RewardShapingConfig)
     assert isinstance(first.reward_scaling, RewardScalingConfig)
     assert first.async_grpo.enabled is False
-    assert first.adv_estimator.use_leave_one_out_baseline is False
-    assert first.adv_estimator.normalize_rewards is None
+    assert first.adv_estimator.use_leave_one_out_baseline is True
+    assert first.adv_estimator.normalize_rewards is True
     assert first.adv_estimator.minus_baseline is True
     assert first.async_grpo is not second.async_grpo
     assert first.adv_estimator is not second.adv_estimator
@@ -2784,15 +2784,11 @@ def _enter_stop_test_mocks(
 def test_training_stops_at_validation_threshold(mock_grpo_components, train_func):
     """All three trainers stop early once the stop metric reaches the threshold."""
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo.update(
-        {
-            "max_num_steps": 5,
-            "val_period": 2,
-            "stop_at_validation_metric": "accuracy",
-            "stop_at_validation_threshold": 0.5,
-            "val_at_end": False,
-        }
-    )
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_metric = "accuracy"
+    master_config.grpo.stop_at_validation_threshold = 0.5
+    master_config.grpo.val_at_end = False
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
@@ -2823,7 +2819,7 @@ def test_training_stops_at_validation_threshold(mock_grpo_components, train_func
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             mock_grpo_components["checkpointer"],
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
@@ -2836,16 +2832,12 @@ def test_training_stops_at_validation_threshold(mock_grpo_components, train_func
 def test_training_stops_at_initial_validation(mock_grpo_components, train_func):
     """A val_at_start result meeting the threshold stops before any training."""
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo.update(
-        {
-            "max_num_steps": 5,
-            "val_period": 2,
-            "val_at_start": True,
-            "stop_at_validation_metric": "accuracy",
-            "stop_at_validation_threshold": 0.5,
-            "val_at_end": False,
-        }
-    )
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.val_at_start = True
+    master_config.grpo.stop_at_validation_metric = "accuracy"
+    master_config.grpo.stop_at_validation_threshold = 0.5
+    master_config.grpo.val_at_end = False
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
@@ -2876,7 +2868,7 @@ def test_training_stops_at_initial_validation(mock_grpo_components, train_func):
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             mock_grpo_components["checkpointer"],
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
@@ -2889,15 +2881,11 @@ def test_training_stops_at_initial_validation(mock_grpo_components, train_func):
 def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp_path):
     """The early-stop step is checkpointed before training exits."""
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo.update(
-        {
-            "max_num_steps": 5,
-            "val_period": 2,
-            "stop_at_validation_metric": "accuracy",
-            "stop_at_validation_threshold": 0.5,
-            "val_at_end": False,
-        }
-    )
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_metric = "accuracy"
+    master_config.grpo.stop_at_validation_threshold = 0.5
+    master_config.grpo.val_at_end = False
     master_config.checkpointing["enabled"] = True
     # save_period alone can never fire, so only the early stop saves.
     master_config.checkpointing["save_period"] = 1000
@@ -2938,7 +2926,7 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             checkpointer,
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
@@ -2955,15 +2943,11 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
 def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
     """grpo.stop_at_validation_metric=pass_k stops on pass_k, not accuracy."""
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo.update(
-        {
-            "max_num_steps": 5,
-            "val_period": 2,
-            "stop_at_validation_threshold": 0.69,
-            "stop_at_validation_metric": "pass_k",
-            "val_at_end": False,
-        }
-    )
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_threshold = 0.69
+    master_config.grpo.stop_at_validation_metric = "pass_k"
+    master_config.grpo.val_at_end = False
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
@@ -3001,7 +2985,7 @@ def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             mock_grpo_components["checkpointer"],
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
@@ -3012,15 +2996,11 @@ def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
 def test_stop_metric_missing_from_validation_fails_loudly(mock_grpo_components):
     """A stop metric that validation does not report raises, not skips."""
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo.update(
-        {
-            "max_num_steps": 5,
-            "val_period": 2,
-            "stop_at_validation_threshold": 0.69,
-            "stop_at_validation_metric": "pass_k",
-            "val_at_end": False,
-        }
-    )
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_threshold = 0.69
+    master_config.grpo.stop_at_validation_metric = "pass_k"
+    master_config.grpo.val_at_end = False
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
@@ -3058,7 +3038,7 @@ def test_stop_metric_missing_from_validation_fails_loudly(mock_grpo_components):
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             mock_grpo_components["checkpointer"],
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 

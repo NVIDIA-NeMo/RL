@@ -260,13 +260,41 @@ def test_reward_shaping_disabled_does_not_save_unshaped_reward():
     assert "unshaped_total_reward" not in result_batch
 
 
-def test_reward_shaping_defaults_match_grpo_exemplar():
+def test_reward_shaping_optional_defaults_are_none():
     config = RewardShapingConfig()
 
-    assert config.overlong_buffer_length == 128
-    assert config.overlong_buffer_penalty == 1.0
-    assert config.max_response_length == 512
+    assert config.overlong_buffer_length is None
+    assert config.overlong_buffer_penalty is None
+    assert config.max_response_length is None
     assert config.stop_properly_penalty_coef is None
+
+
+def test_reward_shaping_missing_config_values():
+    """Test that missing required DAPO config values raise ValueError."""
+    batch = create_mock_batch_with_responses(
+        num_samples=1, response_lengths=[20], initial_rewards=[1.0]
+    )
+
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_penalty=0.1,
+        max_response_length=25,
+    )
+
+    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
+        apply_reward_shaping(batch, config)
+
+    config.overlong_buffer_length = 5
+    config.overlong_buffer_penalty = None
+
+    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
+        apply_reward_shaping(batch, config)
+
+    config.overlong_buffer_penalty = 0.1
+    config.max_response_length = None
+
+    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
+        apply_reward_shaping(batch, config)
 
 
 def test_reward_shaping_missing_assistant_response():
@@ -325,7 +353,7 @@ def test_reward_shaping_mismatched_lengths():
         apply_reward_shaping(batch, config)
 
 
-def test_stop_properly_penalty():
+def test_stop_properly_penalty(capsys):
     """Test stop_properly_penalty_coef scales rewards for truncated samples."""
     batch = create_mock_batch_with_responses(
         num_samples=4,
@@ -337,6 +365,7 @@ def test_stop_properly_penalty():
     config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
     result_batch = apply_reward_shaping(batch, config)
 
+    assert "[WARN]" not in capsys.readouterr().out
     # Non-truncated unchanged, truncated scaled by 0.5
     expected_rewards = torch.tensor([1.0, 0.4, 0.6, 0.2])
     assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
