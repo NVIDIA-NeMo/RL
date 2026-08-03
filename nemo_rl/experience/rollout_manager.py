@@ -22,7 +22,6 @@ from typing import Any, Optional
 import ray.exceptions
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
@@ -67,6 +66,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
 from nemo_rl.utils.timer import Timer
+from wandb.data_types import Table
 
 TokenizerType = PreTrainedTokenizerBase
 

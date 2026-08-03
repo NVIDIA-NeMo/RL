@@ -27,6 +27,8 @@ from nemo_rl.algorithms.dpo import (
     DPOSaveState,
     DPOValMetrics,
     dpo_train,
+)
+from nemo_rl.algorithms.dpo import (
     setup as setup_preference_training,
 )
 from nemo_rl.algorithms.loss import MPOLossConfig, MPOLossFn
