@@ -22,6 +22,9 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.r3_trace import (
     trace_router_replay_action,
@@ -29,7 +32,7 @@ from nemo_rl.utils.r3_trace import (
 )
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
-_MISSING_ROUTE_SENTINEL = -1
+_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
 
 

@@ -1,0 +1,23 @@
+# Routed-expert NVFP4 W4A16 recipe for QARL.
+#
+# This is the weight-only counterpart of ``nvfp4_experts.yaml``:
+# routed-expert weights use block-16 E2M1 NVFP4, while activations and every
+# non-routed-expert path stay in their native dtype.
+
+metadata:
+  recipe_type: ptq
+  description: Routed-expert NVFP4 W4A16.
+
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*.experts.*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1

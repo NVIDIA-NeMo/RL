@@ -16,12 +16,16 @@
 
 The two formats share torch_dist sharded weights. They differ only in metadata:
 
-  bridge:  iter_*/run_config.yaml + common.pt (no ``args``)
+  bridge:  iter_*/run_config.yaml + common state (no ``args``)
   MLM:     iter_*/common.pt with ``args`` (no run_config.yaml)
 
 The conversion is lossless for our purposes: copy/symlink everything, drop
 ``run_config.yaml``, and inject an ``argparse.Namespace`` into ``common.pt``
 populated with the TP/PP fields bridge's MLM-load path consults.
+
+Bridge checkpoints may store common state either in the legacy ``common.pt``
+file or, with current MCore, inside the torch_dist checkpoint. MCore's public
+loader handles both layouts.
 
 This script exists to support functional testing of the
 ``pretrained_checkpoint.format=megatron_lm`` code path without requiring an
@@ -34,6 +38,7 @@ from typing import Any
 
 import torch
 import yaml
+from megatron.core import dist_checkpointing
 
 
 def bridge_to_mlm(bridge_iter_dir: str, mlm_iter_dir: str) -> None:
@@ -59,11 +64,7 @@ def bridge_to_mlm(bridge_iter_dir: str, mlm_iter_dir: str) -> None:
     model_cfg: dict[str, Any] = run_config.get("model", {}) or {}
     ckpt_cfg: dict[str, Any] = run_config.get("checkpoint", {}) or {}
 
-    common = torch.load(
-        os.path.join(bridge_iter_dir, "common.pt"),
-        map_location="cpu",
-        weights_only=False,
-    )
+    common = dist_checkpointing.load_common_state_dict(str(bridge_iter_dir))
     # Bridge's _extract_megatron_lm_args_from_state_dict reads these via
     # getattr-with-defaults; only TP/PP must be accurate, the rest are flags
     # that don't affect a pretrained_checkpoint load.

@@ -116,6 +116,7 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
     # dying during the last buffer's broadcast leaves its NCCL error enqueued
     # on the stream; the error escapes silently and the caller returns True
     # (success) for a partially-failed broadcast causing weight corruption.
+    # Uses synchronize_or_abort when available for fast peer-death detection.
     for s in streams:
         _sync_stream(s)
 
@@ -234,3 +235,11 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                         )
                     )
                 break
+
+    # Join all recv/unpack/load side streams before returning. Without this,
+    # generation can start reading model weights while the final unpack/load
+    # copies are still in flight on the side streams, producing garbage
+    # logprobs (vLLM >= 0.25's PyNcclCommunicator enqueues on the current
+    # stream without blocking).
+    for s in streams:
+        s.synchronize()

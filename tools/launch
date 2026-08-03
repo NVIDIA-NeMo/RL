@@ -123,6 +123,7 @@ for SCRIPT in $SCRIPTS; do
     # Reset optional per-script config vars so a value from a previous script in
     # the loop does not leak into a script that omits it.
     SEGMENT_SIZE=""
+    JOB_REAPER_COMMENT=""
     eval "$config"
 
     # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
@@ -182,6 +183,11 @@ for SCRIPT in $SCRIPTS; do
             GRES_ARG=""
         fi
 
+        COMMENT_ARG=""
+        if [[ -n "${JOB_REAPER_COMMENT:-}" ]]; then
+            COMMENT_ARG="--comment='${JOB_REAPER_COMMENT}' "
+        fi
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -201,7 +207,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
+    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF

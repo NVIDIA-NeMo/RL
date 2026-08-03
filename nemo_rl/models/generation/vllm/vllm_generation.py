@@ -45,6 +45,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ class VllmGeneration(GenerationInterface):
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
+        self.weight_synchronizer: WeightSynchronizer | None = None
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -1489,8 +1491,13 @@ class VllmGeneration(GenerationInterface):
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
         try:
+            if self.weight_synchronizer is not None:
+                self.weight_synchronizer.shutdown()
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
+        except ray.exceptions.RayActorError:
+            # Workers already dead (e.g., shut down via another handle to the same actors).
+            return True
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
@@ -1604,6 +1611,76 @@ class VllmGeneration(GenerationInterface):
             return self._raw_update_weights_from_collective()
         finally:
             self._refitting.clear()
+
+    def init_nccl_reshard_comm_group(
+        self,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize the nccl_reshard bulk-path comm group(s) on all gen workers.
+
+        One group per PP stage (non-PP = ``pp_size`` 1).
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_nccl_reshard_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_nccl_reshard_comm_group"
+        )
+
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={
+                "pp_ips": pp_ips,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "train_ranks_per_stage": train_ranks_per_stage,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        # co-works with lm_policy; wait for all futures to complete outside
+        return futures
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
+        method_name = (
+            "prepare_nccl_reshard_refit_info_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "prepare_nccl_reshard_refit_info"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            refit_info=refit_info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "nccl_reshard_refit_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "nccl_reshard_refit"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return futures
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
