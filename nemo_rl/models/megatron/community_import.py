@@ -23,6 +23,24 @@ from megatron.core.transformer import ModuleSpec
 from nemo_rl.models.policy import MegatronConfig
 
 
+def iter_vlm_config_overrides(megatron_config: MegatronConfig):
+    """Yield explicitly configured Nemotron Omni provider overrides.
+
+    Only keys present in the recipe are yielded, so omitting one keeps the
+    provider's own default rather than silently forcing False.
+    """
+    keys = (
+        "radio_force_cpe_eval_mode",
+        "freeze_vision_model",
+        "freeze_vision_projection",
+        "freeze_sound_encoder",
+        "freeze_sound_projection",
+    )
+    for key in keys:
+        if key in megatron_config:
+            yield key, megatron_config[key]
+
+
 def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     if isinstance(dtype, torch.dtype):
         return dtype
@@ -110,6 +128,11 @@ def import_model_from_hf_name(
     )
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
+
+    if megatron_config is not None:
+        for key, value in iter_vlm_config_overrides(megatron_config):
+            if hasattr(model_provider, key):
+                setattr(model_provider, key, value)
 
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
