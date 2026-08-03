@@ -380,7 +380,6 @@ def validate_and_prepare_config(
             "Context parallel is not supported for sequence packing. "
             "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
         )
-
     if sequence_parallel_enabled and tp_size == 1:
         print(
             "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. "
