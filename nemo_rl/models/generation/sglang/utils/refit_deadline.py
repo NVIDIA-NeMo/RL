@@ -62,6 +62,35 @@ class SGLangRefitDeadline:
         """Return the remaining budget in the form torch collectives expect."""
         return timedelta(seconds=self.remaining(stage))
 
+    def _get_as_completed(self, refs: list, *, stage: str) -> list:
+        """Resolve refs one at a time, in completion order.
+
+        Args:
+            refs: Ray refs to resolve. Must not contain duplicates.
+            stage: Description of the awaited work, used in error messages.
+
+        Returns:
+            Results ordered to match ``refs``, not completion order.
+
+        Raises:
+            ray.exceptions.GetTimeoutError: If the refit budget expires while
+                refs are still pending.
+        """
+        results: dict[Any, Any] = {}
+        pending = list(refs)
+        while pending:
+            ready, pending = ray.wait(
+                pending, num_returns=1, timeout=self.remaining(stage)
+            )
+            if not ready:
+                raise ray.exceptions.GetTimeoutError(
+                    f"{len(pending)} ref(s) still pending while {stage}"
+                )
+            for ref in ready:
+                # Raises here if this worker failed, without waiting on peers.
+                results[ref] = ray.get(ref)
+        return [results[ref] for ref in refs]
+
     def ray_get(
         self,
         refs: Any,
@@ -71,11 +100,21 @@ class SGLangRefitDeadline:
     ) -> Any:
         """Wait for Ray refs without resetting the refit timeout.
 
+        A list of refs resolves as its members complete rather than in one
+        blocking call, so a single failing worker raises immediately instead of
+        staying hidden until every peer also finishes. That distinction is
+        load-bearing during the weight transfer: non-zero trainer ranks sit in
+        Megatron collectives that a failed rank 0 will never join, so waiting
+        on them replaces the real error with the actor deaths that follow their
+        NCCL watchdog timeout.
+
         When cancellation is requested, queued or cooperative actor work is
         cancelled best-effort. Callers still need transport-specific cleanup
         for operations that may already have entered C++ or HTTP code.
         """
         try:
+            if isinstance(refs, (list, tuple)):
+                return self._get_as_completed(list(refs), stage=stage)
             return ray.get(refs, timeout=self.remaining(stage))
         except ray.exceptions.GetTimeoutError as exc:
             if cancel_on_error:

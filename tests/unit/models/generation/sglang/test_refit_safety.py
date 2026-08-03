@@ -129,6 +129,88 @@ def test_refit_deadline_uses_one_decreasing_monotonic_budget(monkeypatch):
         deadline.remaining("final stage")
 
 
+class _StubRef:
+    """Stand-in for an ObjectRef: hashable, resolves to a value or an error."""
+
+    def __init__(self, name, *, error=None, value=None):
+        self.name = name
+        self.error = error
+        self.value = value
+
+
+def _install_stub_ray(monkeypatch, *, completion_order):
+    """Patch ``refit_deadline.ray`` so refs complete in a chosen order.
+
+    Returns the list of refs handed to ``ray.get``, so a test can assert that
+    a failing ref short-circuits the wait instead of resolving every peer.
+    """
+    resolved = []
+    pending_order = list(completion_order)
+
+    def fake_wait(refs, *, num_returns, timeout):
+        for ref in pending_order:
+            if ref in refs:
+                remaining = [candidate for candidate in refs if candidate is not ref]
+                return [ref], remaining
+        return [], list(refs)
+
+    def fake_get(ref, timeout=None):
+        resolved.append(ref)
+        if ref.error is not None:
+            raise ref.error
+        return ref.value
+
+    monkeypatch.setattr(
+        refit_deadline,
+        "ray",
+        SimpleNamespace(
+            wait=fake_wait,
+            get=fake_get,
+            cancel=lambda *_args, **_kwargs: None,
+            exceptions=SimpleNamespace(GetTimeoutError=RuntimeError),
+        ),
+    )
+    return resolved
+
+
+def test_ray_get_raises_on_first_failure_without_waiting_for_peers(monkeypatch):
+    """Rank 0's error must not wait on peers stuck in Megatron collectives."""
+    rank0 = _StubRef("rank0", error=ValueError("engine rejected the bucket"))
+    peers = [_StubRef(f"rank{i}", value=None) for i in range(1, 4)]
+    resolved = _install_stub_ray(monkeypatch, completion_order=[rank0, *peers])
+
+    deadline = SGLangRefitDeadline(60.0)
+
+    with pytest.raises(ValueError, match="engine rejected the bucket"):
+        deadline.ray_get([rank0, *peers], stage="waiting for SGLang weight transfer")
+
+    assert resolved == [rank0]
+
+
+def test_ray_get_returns_results_in_caller_order(monkeypatch):
+    refs = [_StubRef(f"rank{i}", value=i) for i in range(4)]
+    # Completion order is deliberately not the caller's order.
+    _install_stub_ray(
+        monkeypatch, completion_order=[refs[2], refs[0], refs[3], refs[1]]
+    )
+
+    deadline = SGLangRefitDeadline(60.0)
+
+    assert deadline.ray_get(refs, stage="waiting for engine receives") == [0, 1, 2, 3]
+
+
+def test_ray_get_times_out_when_a_ref_never_completes(monkeypatch):
+    stuck = _StubRef("stuck", value=None)
+    done = _StubRef("done", value=None)
+    # ``stuck`` is absent from the completion order, so wait never yields it.
+    _install_stub_ray(monkeypatch, completion_order=[done])
+
+    deadline = SGLangRefitDeadline(60.0)
+
+    with pytest.raises(SGLangRefitTimeoutError, match="draining"):
+        deadline.ray_get([done, stuck], stage="draining")
+
+
 def test_startup_deadline_uses_one_decreasing_monotonic_budget(monkeypatch):
     clock = iter([10.0, 12.0, 15.5, 20.0])
     monkeypatch.setattr(startup_deadline.time, "monotonic", lambda: next(clock))
