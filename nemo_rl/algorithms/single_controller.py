@@ -124,6 +124,7 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
+        self._logger.log_hyperparams(master_config.model_dump())
         self._timer = Timer()
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
