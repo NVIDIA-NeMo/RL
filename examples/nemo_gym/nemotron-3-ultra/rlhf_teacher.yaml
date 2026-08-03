@@ -62,6 +62,10 @@ grpo:
   val_at_end: false
   overlong_filtering: false
   max_val_samples: null
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
 
