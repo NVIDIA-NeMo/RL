@@ -610,3 +610,12 @@ def test_prepare_refit_info_leaves_non_nemotron_model_unchanged():
     vision_model = ext.model_runner.model.vision_model
     assert torch.equal(vision_model.ls1, torch.full_like(vision_model.ls1, 0.001))
     assert torch.equal(vision_model.ls2, torch.full_like(vision_model.ls2, -0.001))
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_leaves_model_without_architectures_unchanged():
+    ext = _make_extension_with_radio("SomeOtherArchitecture")
+    del ext.model_runner.vllm_config.model_config.architectures
+
+    ext.prepare_refit_info({})
+    assert ext._initialize_nemotron_omni_radio_layerscale() == 0

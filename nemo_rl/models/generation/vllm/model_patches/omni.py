@@ -23,7 +23,8 @@ _NEMOTRON_OMNI_ARCHITECTURES = {
 
 
 def _is_nemotron_omni(model_runner: Any) -> bool:
-    architectures = set(model_runner.vllm_config.model_config.architectures or [])
+    model_config = model_runner.vllm_config.model_config
+    architectures = set(getattr(model_config, "architectures", None) or [])
     return not architectures.isdisjoint(_NEMOTRON_OMNI_ARCHITECTURES)
 
 
