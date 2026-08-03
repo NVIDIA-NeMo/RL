@@ -541,7 +541,7 @@ class TQDataPlaneClient(DataPlaneClient):
         if self._data_operations_started:
             raise RuntimeError(
                 "load_checkpoint requires a clean TQ client before any "
-                "register, claim, get, put, clear, or consumption operation"
+                "register, claim, get, list, put, clear, or consumption operation"
             )
 
     # ── (A) task-mediated ───────────────────────────────────────────────
@@ -773,6 +773,12 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_tags = list(tq_meta.custom_meta) if tq_meta.custom_meta else []
         promoted_1d_fields = _promoted_1d_fields_from_tags(wire_tags, tensor_fields)
         return _from_wire(td, promoted_1d_fields)
+
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List TQ keys in ``partition_id`` without fetching tensor payloads."""
+        self._mark_data_operation_started()
+        listing = tq.kv_list(partition_id=partition_id)
+        return sorted(listing.get(partition_id, {}).keys())
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None
