@@ -220,7 +220,10 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
+from nemo_rl.models.megatron.community_import import (
+    import_model_from_hf_name,
+    iter_vlm_config_overrides,
+)
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
@@ -646,6 +649,14 @@ def setup_model_config(
     # Optional layernorm epsilon
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
+
+    # Provider objects loaded from checkpoint metadata otherwise retain the
+    # serialized defaults. Apply explicit recipe controls before model
+    # construction so RADIO positional encoding and frozen towers are stable
+    # and consistent between logprob and training passes.
+    for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
+        if hasattr(model_cfg, vlm_key):
+            setattr(model_cfg, vlm_key, vlm_value)
 
     # Validate chunking configuration
     _validate_chunking_config(config)
@@ -1410,9 +1421,8 @@ def setup_model_and_optimizer(
                 # `.llava_model.language_model`; unwrap that layer first so the
                 # generic `.language_model.decoder.layers` walk below finds the
                 # MoE router.
-                if (
-                    getattr(model_module, "llava_model", None) is not None
-                    and hasattr(model_module.llava_model, "language_model")
+                if getattr(model_module, "llava_model", None) is not None and hasattr(
+                    model_module.llava_model, "language_model"
                 ):
                     model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):
