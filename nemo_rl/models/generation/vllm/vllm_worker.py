@@ -901,7 +901,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                         spec_lookahead=spec_lookahead,
                     )
                 )
-
             sampling_params = [
                 self._build_sampling_params(
                     greedy=greedy,
