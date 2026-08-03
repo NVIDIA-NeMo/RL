@@ -160,8 +160,27 @@ def main() -> None:
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
+        # Mirror run_grpo_nemo_gym.py. When the trainer owns the MTP layer its
+        # weights reach vLLM through refit, and configure_generation_config uses
+        # trains_mtp to record that. Leaving it at the default routes the worker
+        # into load_mtp_weights_from_disk instead, which is the path for a
+        # frozen drafter and which expects the MTP layer to be indexed
+        # positionally after the backbone rather than in Nemotron's mtp.*
+        # namespace -- so MTP speculative decoding failed with
+        # "No MTP layer weights for layers [<num_hidden_layers>] found".
+        has_refit_draft_weights = (
+            "draft" in config.policy and config.policy["draft"]["enabled"]
+        )
+        trains_mtp = (
+            "megatron_cfg" in config.policy
+            and config.policy["megatron_cfg"]["enabled"]
+            and bool(config.policy["megatron_cfg"].get("mtp_num_layers"))
+        )
         config.policy["generation"] = configure_generation_config(
-            config.policy["generation"], tokenizer
+            config.policy["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+            trains_mtp=trains_mtp,
         )
         if "vllm_cfg" in config.policy["generation"]:
             assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
