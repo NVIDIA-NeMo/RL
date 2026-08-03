@@ -236,6 +236,7 @@ def test_get_tp_shard_dim(name, expected):
         ("model.layers.0.mlp.down_proj.weight", True),
         ("model.layers.0.mlp.experts.3.gate_proj.weight", True),
         ("model.language_model.layers.7.mlp.experts.3.up_proj.weight", True),
+        ("model.layers.0.mlp.experts.3.up_proj.weight_scale_inv", False),
         # shared experts are FFN-named but fuse differently -> misc
         ("model.layers.0.mlp.shared_expert.gate_proj.weight", False),
         ("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", False),

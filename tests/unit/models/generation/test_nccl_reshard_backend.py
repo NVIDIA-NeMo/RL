@@ -384,6 +384,34 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     assert torch.all(w2_scale == 7)
 
 
+def test_build_hf_to_local_param_map_keeps_matching_blockwise_fp8_storage():
+    H, E, P = 32, 2, 64
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.experts.down_proj.weight",
+                    "global_shape": [E, H, P],
+                    "dtype": "torch.float8_e4m3fn",
+                    "grouped_expert_proj": "down_proj",
+                }
+            ]
+        },
+    }
+    w2 = torch.empty(E, H, P, dtype=torch.float8_e4m3fn)
+    ext = _make_ext({"model.layers.0.mlp.experts.w2_weight": w2})
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(
+        "model.layers.0.mlp.experts.down_proj.weight"
+    )
+
+    assert spec is not None
+    assert spec.base.data_ptr() == w2.data_ptr()
+    assert spec.pre is None and spec.post is None
+
+
 def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
     H, E, P = 32, 2, 64
     refit_info = {
