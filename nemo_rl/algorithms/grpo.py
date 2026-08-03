@@ -3978,6 +3978,22 @@ def async_grpo_train(
 
     # Training state
     step = grpo_save_state["current_step"]
+    steps_per_epoch = len(dataloader)
+    master_config.grpo["max_num_steps"] = min(
+        master_config.grpo["max_num_steps"],
+        master_config.grpo["max_num_epochs"] * steps_per_epoch,
+    )
+    max_num_steps = master_config.grpo["max_num_steps"]
+    if step >= max_num_steps:
+        print(
+            "Async GRPO training is already complete: "
+            f"current step {step} reached the effective limit of "
+            f"{max_num_steps} steps.",
+            flush=True,
+        )
+        checkpointer.shutdown()
+        return
+
     POLICY_GENERATION_STALE = _initial_policy_generation_stale(policy_generation, step)
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state["consumed_samples"]
@@ -4107,6 +4123,14 @@ def async_grpo_train(
         },
     }
 
+    # Async checkpoints created before collector epoch tracking do not carry
+    # current_epoch. New checkpoints persist the collector's own completed-epoch
+    # count because generation may prefetch ahead of the trainer.
+    if "current_epoch" in grpo_save_state:
+        collector_start_epoch = grpo_save_state["current_epoch"]
+    else:
+        collector_start_epoch = step // steps_per_epoch
+
     # Initialize trajectory collector with synchronized collection
     trajectory_collector = AsyncTrajectoryCollector.options(
         runtime_env=_tc_runtime_env
@@ -4117,6 +4141,7 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        start_epoch=collector_start_epoch,
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
@@ -4299,7 +4324,7 @@ def async_grpo_train(
                 f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
                 f"The dataset ran out of data before training could start. "
                 f"Collector status: {collector_status}. "
-                f"Increase data.train.max_num_epochs or use a larger dataset."
+                f"Increase grpo.max_num_epochs or use a larger dataset."
             )
 
         wait_iterations += 1
@@ -4312,12 +4337,10 @@ def async_grpo_train(
 
     # Main training loop
     try:
-        while step < master_config.grpo["max_num_steps"]:
+        while step < max_num_steps:
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
-            print(
-                f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
-            )
+            print(f"\n{'=' * 25} Step {step + 1}/{max_num_steps} {'=' * 25}")
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
@@ -4408,7 +4431,7 @@ def async_grpo_train(
                                 f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
                                 f"The dataset ran out of data before training could complete. "
                                 f"Collector status: {collector_status}. "
-                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                                f"Increase grpo.max_num_epochs or use a larger dataset."
                             )
 
                         with timer.time("idle/buffer_starvation"):
@@ -4715,7 +4738,7 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config.grpo["max_num_steps"]
+                is_last_step = step + 1 == max_num_steps
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (
@@ -4865,6 +4888,7 @@ def async_grpo_train(
                     should_save_by_step or should_save_by_timeout
                 ):
                     grpo_save_state["current_step"] = step + 1
+                    grpo_save_state["total_steps"] = step + 1
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
@@ -4906,6 +4930,16 @@ def async_grpo_train(
                         # starting a new one. No-op with sync save / nothing pending.
                         checkpointer.finalize_pending()
 
+                        # Snapshot the collector's epoch counter with the
+                        # stateful dataloader. The collector can prefetch ahead
+                        # of the training step, so trainer-derived epoch math is
+                        # not a valid resume position.
+                        (
+                            actual_dataloader_state,
+                            collector_epoch,
+                        ) = ray.get(trajectory_collector.get_dataloader_state.remote())
+                        grpo_save_state["current_epoch"] = collector_epoch
+
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             step + 1, grpo_save_state, master_config
@@ -4923,10 +4957,6 @@ def async_grpo_train(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
-                        )
-                        # Get dataloader state from trajectory collector
-                        actual_dataloader_state = ray.get(
-                            trajectory_collector.get_dataloader_state.remote()
                         )
                         torch.save(
                             actual_dataloader_state,
@@ -5106,10 +5136,10 @@ def async_grpo_train(
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if step >= master_config.grpo["max_num_steps"]:
+            if step >= max_num_steps:
                 checkpointer.shutdown()
                 print(
-                    "Max number of steps has been reached, stopping training early",
+                    "Effective max number of steps has been reached, stopping training",
                     flush=True,
                 )
                 return
