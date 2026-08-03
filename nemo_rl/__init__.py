@@ -281,11 +281,16 @@ _patch_nsight_file()
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
 def patch_transformers_module_dir(env_vars: dict[str, str]):
-    hf_home = os.environ.get("HF_HOME", None)
-    if hf_home is None:
-        return env_vars
+    # Prefer the explicit cache. A per-run HF_MODULES_CACHE keeps concurrent
+    # runs from racing on generated module names, and deriving the directory
+    # from HF_HOME instead would silently point at a different tree.
+    module_dir = os.environ.get("HF_MODULES_CACHE")
+    if module_dir is None:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home is None:
+            return env_vars
+        module_dir = os.path.join(hf_home, "modules")
 
-    module_dir = os.path.join(hf_home, "modules")
     if not os.path.isdir(module_dir):
         return env_vars
 
@@ -293,6 +298,14 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
         env_vars["PYTHONPATH"] = module_dir
     else:
         env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
+
+    # Updating PYTHONPATH only affects interpreters started after this process.
+    # Ray actors may import NeMo RL before unpickling trust_remote_code objects,
+    # so make the dynamic module package importable in the current interpreter.
+    if env_vars is os.environ:
+        while module_dir in sys.path:
+            sys.path.remove(module_dir)
+        sys.path.insert(0, module_dir)
 
     return env_vars
 
