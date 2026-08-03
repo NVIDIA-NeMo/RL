@@ -57,6 +57,7 @@ class FP8Config:
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
+    refit_batched_moe_shuffle: bool = True
 
 
 @dataclass()
@@ -219,6 +220,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
+        if "refit_batched_moe_shuffle" in vllm_cfg:
+            fp8_config_kwargs["refit_batched_moe_shuffle"] = vllm_cfg[
+                "refit_batched_moe_shuffle"
+            ]
         if vllm_cfg.get("pow2_weight_scaling_factors") is False:
             raise ValueError("only pow2 weight scaling factors are supported for MXFP8")
         if vllm_cfg.get("pow2_activation_scaling_factors") is False:
@@ -903,29 +908,188 @@ def process_weights_after_loading_moe(self, layer) -> None:
         )
 
 
-def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
-    """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
+_mxfp8_shuffle_scratch_buffers: dict[
+    tuple[str, tuple[int, ...], torch.device], torch.Tensor
+] = {}
+
+
+def _mxfp8_scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:
+    key = (tag, tuple(shape), device)
+    buffer = _mxfp8_shuffle_scratch_buffers.get(key)
+    if buffer is None:
+        buffer = torch.empty(shape, dtype=torch.uint8, device=device)
+        _mxfp8_shuffle_scratch_buffers[key] = buffer
+    return buffer
+
+
+def _mxfp8_moe_row_permutations(
+    layer,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    is_gated: bool,
+    epilogue_tile_m: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return row permutations equivalent to the FlashInfer shuffle calls."""
+    perm_w13 = getattr(layer, "_mxfp8_shuffle_perm_w13", None)
+    perm_w2 = getattr(layer, "_mxfp8_shuffle_perm_w2", None)
+    if perm_w13 is None or perm_w2 is None:
+        from flashinfer.fused_moe.core import (
+            get_reorder_rows_for_gated_act_gemm_row_indices,
+        )
+        from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+        perm_w13 = get_shuffle_matrix_a_row_indices(w13_weight[0], epilogue_tile_m)
+        if is_gated:
+            reorder = get_reorder_rows_for_gated_act_gemm_row_indices(w13_weight[0])
+            perm_w13 = reorder[perm_w13]
+        perm_w2 = get_shuffle_matrix_a_row_indices(w2_weight[0], epilogue_tile_m)
+        layer._mxfp8_shuffle_perm_w13 = perm_w13
+        layer._mxfp8_shuffle_perm_w2 = perm_w2
+    device = w13_weight.device
+    return perm_w13.to(device), perm_w2.to(device)
+
+
+def _shuffle_mxfp8_moe_batched(
+    layer,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    is_gated: bool,
+    epilogue_tile_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shuffle stacked expert values and scales with four batched gathers."""
+    from flashinfer import block_scale_interleave
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_SCALE_DTYPE,
+        MXFP8_VALUE_DTYPE,
+    )
+
+    perm_w13, perm_w2 = _mxfp8_moe_row_permutations(
+        layer, w13_weight, w2_weight, is_gated, epilogue_tile_m
+    )
+    num_experts = w13_weight.shape[0]
+    w13_u8 = w13_weight.view(torch.uint8)
+    w2_u8 = w2_weight.view(torch.uint8)
+    w13_shuffled = torch.index_select(
+        w13_u8,
+        1,
+        perm_w13,
+        out=_mxfp8_scratch("w13", w13_u8.shape, w13_u8.device),
+    )
+    w2_shuffled = torch.index_select(
+        w2_u8,
+        1,
+        perm_w2,
+        out=_mxfp8_scratch("w2", w2_u8.shape, w2_u8.device),
+    )
+
+    w13_scale_u8 = pad_flashinfer_scale_k(w13_scale.view(torch.uint8))
+    w2_scale_u8 = pad_flashinfer_scale_k(w2_scale.view(torch.uint8))
+    assert w13_scale_u8.shape[1] % 128 == 0
+    assert w2_scale_u8.shape[1] % 128 == 0
+    w13_scale_gathered = torch.index_select(
+        w13_scale_u8,
+        1,
+        perm_w13,
+        out=_mxfp8_scratch("w13_scale", w13_scale_u8.shape, w13_scale_u8.device),
+    )
+    w2_scale_gathered = torch.index_select(
+        w2_scale_u8,
+        1,
+        perm_w2,
+        out=_mxfp8_scratch("w2_scale", w2_scale_u8.shape, w2_scale_u8.device),
+    )
+    w13_scale_shuffled = (
+        block_scale_interleave(w13_scale_gathered)
+        .view(MXFP8_SCALE_DTYPE)
+        .view(num_experts, -1)
+    )
+    w2_scale_shuffled = (
+        block_scale_interleave(w2_scale_gathered)
+        .view(MXFP8_SCALE_DTYPE)
+        .view(num_experts, -1)
+    )
+    return (
+        w13_shuffled.view(MXFP8_VALUE_DTYPE),
+        w2_shuffled.view(MXFP8_VALUE_DTYPE),
+        w13_scale_shuffled,
+        w2_scale_shuffled,
+    )
+
+
+def _shuffle_mxfp8_moe_per_expert(
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    is_gated: bool,
+    epilogue_tile_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the original per-expert FlashInfer shuffle as a reference path."""
     from flashinfer import (
         reorder_rows_for_gated_act_gemm,
         shuffle_matrix_a,
         shuffle_matrix_sf_a,
     )
-    from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
-    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-        swap_w13_to_w31,
-    )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         MXFP8_SCALE_DTYPE,
         MXFP8_VALUE_DTYPE,
+    )
+
+    num_experts = w13_weight.shape[0]
+    w13_rows = w13_weight.shape[1]
+    w2_rows = w2_weight.shape[1]
+    w13_weight_shuffled = []
+    w2_weight_shuffled = []
+    w13_scale_shuffled = []
+    w2_scale_shuffled = []
+    for i in range(num_experts):
+        w13_i = w13_weight[i].reshape(w13_rows, -1)
+        w13_sf_i = w13_scale[i].reshape(w13_rows, -1)
+        if is_gated:
+            # Reorder rows for gated activation layout expected by TRTLLM.
+            w13_i = reorder_rows_for_gated_act_gemm(w13_i.clone())
+            w13_sf_i = reorder_rows_for_gated_act_gemm(w13_sf_i.clone())
+
+        w13_shuffled_i = shuffle_matrix_a(w13_i.view(torch.uint8), epilogue_tile_m)
+        w2_shuffled_i = shuffle_matrix_a(
+            w2_weight[i].view(torch.uint8), epilogue_tile_m
+        )
+        w13_weight_shuffled.append(w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
+        w2_weight_shuffled.append(w2_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
+        w13_sf_shuffled_i = shuffle_matrix_sf_a(
+            pad_flashinfer_scale_k(w13_sf_i.view(torch.uint8).reshape(w13_rows, -1)),
+            epilogue_tile_m,
+        )
+        w2_sf_shuffled_i = shuffle_matrix_sf_a(
+            pad_flashinfer_scale_k(w2_scale[i].view(torch.uint8).reshape(w2_rows, -1)),
+            epilogue_tile_m,
+        )
+        w13_scale_shuffled.append(
+            w13_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
+        )
+        w2_scale_shuffled.append(w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE))
+
+    return (
+        torch.stack(w13_weight_shuffled).contiguous(),
+        torch.stack(w2_weight_shuffled).contiguous(),
+        torch.stack(w13_scale_shuffled).contiguous(),
+        torch.stack(w2_scale_shuffled).contiguous(),
+    )
+
+
+def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
+    """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
+    from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        swap_w13_to_w31,
     )
     from vllm.model_executor.parameter import ModelWeightParameter
     from vllm.model_executor.utils import set_weight_attrs
 
     epilogue_tile_m = 128
-    num_experts = layer.w13_weight.shape[0]
     is_gated = self.moe.is_act_and_mul
-    intermediate_size_factor = 2 if is_gated else 1
-
     w13_weight = layer.w13_weight.data
     if not hasattr(layer, "w13_weight_scale_from_checkpoint"):
         w13_scale = layer.w13_weight_scale.data
@@ -942,47 +1106,32 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     else:
         w2_scale = layer.w2_weight_scale_from_checkpoint.data
 
-    w13_weight_shuffled = []
-    w2_weight_shuffled = []
-    w13_scale_shuffled = []
-    w2_scale_shuffled = []
-    for i in range(num_experts):
-        w13_i = w13_weight[i].reshape(
-            intermediate_size_factor * layer.intermediate_size_per_partition, -1
-        )
-        w13_sf_i = w13_scale[i].reshape(
-            intermediate_size_factor * layer.intermediate_size_per_partition, -1
-        )
-        if is_gated:
-            # Reorder rows for gated activation layout expected by TRTLLM.
-            w13_i = reorder_rows_for_gated_act_gemm(w13_i.clone())
-            w13_sf_i = reorder_rows_for_gated_act_gemm(w13_sf_i.clone())
-
-        w13_shuffled_i = shuffle_matrix_a(w13_i.view(torch.uint8), epilogue_tile_m)
-        w2_shuffled_i = shuffle_matrix_a(
-            w2_weight[i].view(torch.uint8), epilogue_tile_m
-        )
-        w13_weight_shuffled.append(w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
-        w2_weight_shuffled.append(w2_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
-        w13_sf_shuffled_i = shuffle_matrix_sf_a(
-            pad_flashinfer_scale_k(
-                w13_sf_i.view(torch.uint8).reshape(
-                    intermediate_size_factor * layer.intermediate_size_per_partition,
-                    -1,
-                )
-            ),
+    assert global_fp8_config is not None
+    if global_fp8_config.refit_batched_moe_shuffle:
+        shuffled = _shuffle_mxfp8_moe_batched(
+            layer,
+            w13_weight,
+            w2_weight,
+            w13_scale,
+            w2_scale,
+            is_gated,
             epilogue_tile_m,
         )
-        w2_sf_shuffled_i = shuffle_matrix_sf_a(
-            pad_flashinfer_scale_k(
-                w2_scale[i].view(torch.uint8).reshape(layer.hidden_size, -1)
-            ),
+    else:
+        shuffled = _shuffle_mxfp8_moe_per_expert(
+            w13_weight,
+            w2_weight,
+            w13_scale,
+            w2_scale,
+            is_gated,
             epilogue_tile_m,
         )
-        w13_scale_shuffled.append(
-            w13_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
-        )
-        w2_scale_shuffled.append(w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE))
+    (
+        w13_weight_shuffled,
+        w2_weight_shuffled,
+        w13_scale_shuffled,
+        w2_scale_shuffled,
+    ) = shuffled
 
     if not hasattr(layer, "w13_weight_scale_from_checkpoint"):
         layer.w13_weight_scale_from_checkpoint = ModelWeightParameter(
@@ -1018,16 +1167,16 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
         )
         layer.w13_weight_scale = torch.nn.Parameter(
-            torch.stack(w13_scale_shuffled).contiguous(), requires_grad=False
+            w13_scale_shuffled, requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            torch.stack(w2_scale_shuffled).contiguous(), requires_grad=False
+            w2_scale_shuffled, requires_grad=False
         )
     else:
-        layer.w13_weight_scale.copy_(torch.stack(w13_scale_shuffled).contiguous())
-        layer.w2_weight_scale.copy_(torch.stack(w2_scale_shuffled).contiguous())
-    layer.w13_weight.copy_(torch.stack(w13_weight_shuffled).contiguous())
-    layer.w2_weight.copy_(torch.stack(w2_weight_shuffled).contiguous())
+        layer.w13_weight_scale.copy_(w13_scale_shuffled)
+        layer.w2_weight_scale.copy_(w2_scale_shuffled)
+    layer.w13_weight.copy_(w13_weight_shuffled)
+    layer.w2_weight.copy_(w2_weight_shuffled)
 
 
 def process_weights_after_loading_kv(self, layer) -> None:
