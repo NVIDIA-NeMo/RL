@@ -33,6 +33,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
@@ -390,7 +391,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
                     self.cfg.get("routed_experts_dtype", "int16")
                 ]
-                routed_experts = torch.as_tensor(
+                routed_experts = decode_routed_experts(
                     routed_experts_raw, dtype=routed_experts_dtype
                 )
                 if routed_experts.dim() != 3:
@@ -613,26 +614,31 @@ def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
     base_urls: list[Optional[str]],
     model_name: str,
+    *,
     enable_router_replay: bool,
+    routed_experts_dtype: str,
+    use_fastokens: bool,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
-    When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
-    scheduled with soft NodeAffinity to the current Ray node so its colocated
-    GPU resources land where the caller expects.
+    When env_configs["nemo_gym"]["num_gpu_nodes"] > 0, the actor is scheduled
+    with soft NodeAffinity to the current Ray node so its colocated GPU
+    resources land where the caller expects.
 
     Args:
-        env_configs: The ``master_config.env`` mapping; ``env_configs["nemo_gym"]``
-            supplies the Gym global config plus NeMo-RL detection knobs
-            (``invalid_tool_call_patterns``, ``thinking_tags``, ``num_gpu_nodes``).
-        base_urls: Per-DP-rank OpenAI-compatible server base URLs from the
-            generation backend.
+        env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
+            the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
+            thinking_tags, num_gpu_nodes).
+        base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
-        enable_router_replay: Sets ``require_routed_experts`` on the
-            ``NemoGymConfig``.
+        enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
+        routed_experts_dtype: Dtype name for R3 routed_experts tensors ("int8"/"int16"/"int32"),
+            resolved by the caller from the model's expert count.
+        use_fastokens: Forwarded from policy.tokenizer.use_fastokens so the rollout actor
+            patches its tokenizer consistently with the driver.
 
     Returns:
-        The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
+        The spun-up NemoGym Ray actor handle (_spinup already awaited).
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
@@ -656,6 +662,8 @@ def spinup_nemo_gym_actor(
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         require_routed_experts=enable_router_replay,
+        routed_experts_dtype=routed_experts_dtype,
+        use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
     )
 

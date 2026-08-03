@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -35,8 +35,10 @@ from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -45,6 +47,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -260,10 +263,13 @@ def mock_grpo_components():
                 "num_generations_per_prompt": 1,
                 "max_rollout_turns": 1,
                 "val_period": 100,
+                "val_start_at": -1,
                 "val_batch_size": 1,
                 "val_at_start": False,
                 "val_at_end": False,
                 "max_val_samples": 10,
+                "stop_at_validation_metric": None,
+                "stop_at_validation_threshold": None,
                 "seed": 42,
                 "advantage_normalization": "global",
                 "use_leave_one_out_baseline": False,
@@ -997,6 +1003,93 @@ def mock_async_grpo_infrastructure(
     return stack
 
 
+def mock_sync_grpo_infrastructure(policy):
+    """Context manager that mocks the TQ/data-plane infrastructure of grpo_train_sync.
+
+    Mirrors ``mock_async_grpo_infrastructure``: the Ray rollout actor and the
+    TQ round-trips are stubbed so the driver loop runs for real, with small
+    real tensors standing in for the per-sample slices the driver computes
+    against. ``validate_sync`` is intentionally left unpatched so tests can
+    install their own capturing mock.
+    """
+    stack = ExitStack()
+
+    # Slice returned by the stubbed rollout actor; baseline/std are computed
+    # for real on the driver from these fields.
+    driver_carry = BatchedDataDict(
+        {
+            "total_reward": torch.tensor([1.0]),
+            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "truncated": torch.tensor([False]),
+            "length": torch.tensor([3]),
+        }
+    )
+    meta = MagicMock()
+    meta.fields = ["input_ids"]
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    rollout_actor = MagicMock()
+    rollout_actor.rollout_to_tq.remote.return_value = (
+        meta,
+        driver_carry,
+        rollout_metrics,
+        {},
+    )
+    rollout_actor_cls = MagicMock()
+    rollout_actor_cls.options.return_value.remote.return_value = rollout_actor
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.SyncRolloutActor", rollout_actor_cls)
+    )
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.make_actor_runtime_env", return_value={})
+    )
+    # The only ray.get on the driver path receives the stub actor's plain tuple.
+    stack.enter_context(patch("ray.get", side_effect=lambda ref: ref))
+
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.refit_policy_generation", return_value=None)
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo_sync._compute_seq_logprob_error_metrics",
+            return_value=(torch.ones(1), _mock_seq_logprob_error_result()),
+        )
+    )
+    adv_estimator = MagicMock()
+    adv_estimator.compute_advantage.return_value = torch.zeros(1, 4)
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo_sync._create_advantage_estimator",
+            return_value=adv_estimator,
+        )
+    )
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.print_performance_metrics", return_value={})
+    )
+
+    # TQ-mediated policy methods: per-token slices read back from the data
+    # plane, and train results in the same shape as ``policy.train``.
+    dp_bank = {
+        "generation_logprobs": torch.zeros(1, 4),
+        "token_mask": torch.ones(1, 4),
+        "prev_logprobs": torch.zeros(1, 4),
+        "reference_policy_logprobs": torch.zeros(1, 4),
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+    }
+    policy.read_from_dataplane.side_effect = lambda meta, select_fields, **kw: (
+        BatchedDataDict({k: dp_bank[k].clone() for k in select_fields})
+    )
+    policy.train_from_meta.return_value = policy.train.return_value
+    policy.tq_partition_id = 0
+
+    return stack
+
+
 @pytest.mark.parametrize(
     ("generation_config", "expected"),
     [
@@ -1717,6 +1810,62 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
+    mock_grpo_components,
+):
+    """Reject teacher placement groups wider than a physical cluster node."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.grpo import setup
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.cluster["num_nodes"] = 3
+    master_config.cluster["gpus_per_node"] = 4
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "default_teacher": "/checkpoints/default_teacher"
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "num_nodes": 1,
+                },
+            },
+        }
+    )
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.opd_module.reserve_teacher_clusters"
+        ) as mock_reserve_teacher_clusters,
+        pytest.raises(
+            AssertionError,
+            match=(
+                "OPD teacher 'default_teacher' requests gpus_per_node=8 > "
+                "cluster.gpus_per_node=4"
+            ),
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+    mock_reserve_teacher_clusters.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -2440,6 +2589,412 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         "policy.get_logprobs was called even though force_on_policy_ratio=True. "
         "This indicates a regression of PR #2177."
     )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+@pytest.mark.parametrize(
+    ("val_at_end", "expected_validation_steps"),
+    [(False, [4]), (True, [4, 5])],
+)
+def test_periodic_validation_starts_at_configured_step(
+    mock_grpo_components, train_func, val_at_end, expected_validation_steps
+):
+    """All three trainers preserve cadence while honoring the validation lower bound."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "val_start_at": 3,
+            "val_at_end": val_at_end,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = "nemo_rl.algorithms.grpo.validate"
+        if train_func is grpo_train_sync:
+            master_config.data_plane = {"enabled": True}
+            stack.enter_context(
+                mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+            )
+            validate_target = "nemo_rl.algorithms.grpo_sync.validate_sync"
+        elif train_func is async_grpo_train:
+            master_config.policy["generation"]["colocated"]["enabled"] = False
+            stack.enter_context(
+                mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=_mock_seq_logprob_error_result(),
+                )
+            )
+
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == (
+        expected_validation_steps
+    )
+
+
+def _enter_stop_test_mocks(
+    stack,
+    train_func,
+    master_config,
+    mock_grpo_components,
+    mock_batch,
+    mock_rollout_metrics,
+):
+    """Enter per-trainer infrastructure mocks; returns the validate patch target."""
+    if train_func is grpo_train_sync:
+        master_config.data_plane = {"enabled": True}
+        stack.enter_context(
+            mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+        )
+        return "nemo_rl.algorithms.grpo_sync.validate_sync"
+    if train_func is async_grpo_train:
+        master_config.policy["generation"]["colocated"]["enabled"] = False
+        stack.enter_context(
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+        )
+        return "nemo_rl.algorithms.grpo.validate"
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        )
+    )
+    return "nemo_rl.algorithms.grpo.validate"
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_training_stops_at_validation_threshold(mock_grpo_components, train_func):
+    """All three trainers stop early once the stop metric reaches the threshold."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "stop_at_validation_metric": "accuracy",
+            "stop_at_validation_threshold": 0.5,
+            "val_at_end": False,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.75}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    # Validation fires at step 2 with accuracy above the threshold, so
+    # training stops before the step-4 validation ever runs.
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_training_stops_at_initial_validation(mock_grpo_components, train_func):
+    """A val_at_start result meeting the threshold stops before any training."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "val_at_start": True,
+            "stop_at_validation_metric": "accuracy",
+            "stop_at_validation_threshold": 0.5,
+            "val_at_end": False,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.75}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    # The initial validation already meets the threshold, so training exits
+    # before the periodic step-2/step-4 validations ever run.
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [0]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp_path):
+    """The early-stop step is checkpointed before training exits."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "stop_at_validation_metric": "accuracy",
+            "stop_at_validation_threshold": 0.5,
+            "val_at_end": False,
+        }
+    )
+    master_config.checkpointing["enabled"] = True
+    # save_period alone can never fire, so only the early stop saves.
+    master_config.checkpointing["save_period"] = 1000
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        stack.enter_context(patch("nemo_rl.algorithms.grpo_sync.torch.save"))
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.75}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    # Training stopped after the step-2 validation...
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+    # ...but only after checkpointing that step with its validation metrics.
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
+    assert checkpointer.init_tmp_checkpoint.call_args.args[1]["val_reward"] == 0.75
+    mock_grpo_components["policy"].save_checkpoint.assert_called_once()
+    assert checkpointer.shutdown.called
+
+
+def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
+    """grpo.stop_at_validation_metric=pass_k stops on pass_k, not accuracy."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "stop_at_validation_threshold": 0.69,
+            "stop_at_validation_metric": "pass_k",
+            "val_at_end": False,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.validate",
+            # accuracy stays below the threshold; only pass_k crosses it.
+            return_value=({"accuracy": 0.63, "pass_k": 0.74}, {}),
+        ) as mock_validate,
+    ):
+        grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    # pass_k (0.74) crosses 0.69 at the first validation (step 2).
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+
+
+def test_stop_metric_missing_from_validation_fails_loudly(mock_grpo_components):
+    """A stop metric that validation does not report raises, not skips."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "stop_at_validation_threshold": 0.69,
+            "stop_at_validation_metric": "pass_k",
+            "val_at_end": False,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.validate",
+            return_value=({"accuracy": 0.99}, {}),
+        ),
+        pytest.raises(AssertionError, match="stop_at_validation_metric"),
+    ):
+        grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
@@ -3629,3 +4184,58 @@ class TestAggregateRolloutMetrics:
         assert result["total_turns"] == 45
         assert result["accuracy"] == pytest.approx(0.8)
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
+
+
+def _cfg(
+    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+):
+    return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=force,
+            use_kl_in_reward=kl_reward,
+            reference_policy_kl_penalty=kl_penalty,
+        ),
+        grpo={
+            "seq_logprob_error_threshold": threshold,
+            "skip_reference_policy_logprobs_calculation": skip_ref,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "kw, expected",
+    [
+        ({}, (False, None)),
+        ({"force": True}, (True, None)),
+        ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        ({"skip_ref": True}, (False, True)),
+    ],
+    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+)
+def test_resolve_logprob_skip_flags(kw, expected):
+    if kw.get("force") and kw.get("threshold") is not None:
+        with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
+            assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    else:
+        assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():
+    with pytest.raises(AssertionError, match="use_kl_in_reward"):
+        _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True))
+
+
+def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
+    # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
+    # prev_logprobs can't corrupt the advantage.
+    _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))
+
+
+@pytest.mark.parametrize(
+    "skip_prev_logprobs, expect_prev",
+    [(False, True), (True, False)],
+    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+)
+def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
+    fields = _train_fields_for_step(skip_prev_logprobs)
+    assert ("prev_logprobs" in fields) is expect_prev

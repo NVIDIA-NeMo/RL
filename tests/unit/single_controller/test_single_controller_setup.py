@@ -70,6 +70,7 @@ def _make_master_config(
         policy={
             "train_global_batch_size": num_prompts_per_step * 2,
             "max_total_sequence_length": 32,
+            "tokenizer": {"use_fastokens": False},
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
                 "backend": backend,
@@ -281,6 +282,15 @@ class TestSetup:
         assert actor_args.tq_buffer._dp_client is actor_args.dp_client
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
+        assert actor_args.tq_buffer._require_routed_experts is False
+
+    def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
+        mc = _make_master_config(colocated=True)
+        mc.policy["router_replay"] = {"enabled": True}
+
+        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._require_routed_experts is True
 
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""
@@ -421,6 +431,8 @@ class TestSetup:
             ].return_value.dp_openai_server_base_urls,
             model_name="test-model",
             enable_router_replay=False,
+            routed_experts_dtype="int16",
+            use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 

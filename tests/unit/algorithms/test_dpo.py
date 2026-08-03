@@ -22,6 +22,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.dpo import (
     DPOConfig,
     MasterConfig,
+    _get_dpo_save_state,
     _initial_dpo_save_state,
     add_ref_logprobs_to_data,
     dpo_train,
@@ -29,6 +30,29 @@ from nemo_rl.algorithms.dpo import (
 from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+
+
+def test_get_dpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_dpo_save_state({}) == _initial_dpo_save_state()
+
+    loaded_state = {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _get_dpo_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
 
 
 class MockPolicy:

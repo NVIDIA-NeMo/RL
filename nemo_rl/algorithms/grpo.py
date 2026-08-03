@@ -24,7 +24,6 @@ import numpy as np
 import ray
 import torch
 from pydantic import BaseModel, Field, model_validator
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -80,22 +79,19 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import (
-    NemoGym,
-    NemoGymConfig,
-    get_nemo_gym_uv_cache_dir,
-    get_nemo_gym_venv_dir,
-)
+from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    backfill_missing_routed_experts,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -186,7 +182,7 @@ class AsyncGRPOConfig(TypedDict):
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: NotRequired[bool]
-    # Recomputes the KV cache after the in-flight weight updates.
+    # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
@@ -259,12 +255,21 @@ class GRPOConfig(TypedDict):
     advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
+    # First training step eligible for periodic validation; -1 disables the delay.
+    val_start_at: int
     val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
+    # Early stop: end training once this validation metric (e.g. accuracy,
+    # always reported, or pass_k with grouped validation) reaches
+    # stop_at_validation_threshold; null disables early stopping.
+    stop_at_validation_metric: str | None
+    # Threshold for the early stop; required when stop_at_validation_metric
+    # is set.
+    stop_at_validation_threshold: float | None
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -435,6 +440,13 @@ def setup(
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
         )
 
+    # Validate the early-stop pairing
+    if grpo_config["stop_at_validation_metric"] is not None:
+        assert grpo_config["stop_at_validation_threshold"] is not None, (
+            "grpo.stop_at_validation_threshold must be set when "
+            "grpo.stop_at_validation_metric is set"
+        )
+
     # Validate number of prompts per step
     if data_config["use_multiple_dataloader"]:
         assert num_prompts_per_step % dataloader_batch_size == 0, (
@@ -578,6 +590,8 @@ def setup(
             "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
 
+    _validate_use_kl_in_reward_compat(master_config)
+
     # ==========================
     #          Cluster
     # ==========================
@@ -594,67 +608,24 @@ def setup(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
-    if enable_nemo_gym:
-        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
-        ray_runtime_ctx = ray.get_runtime_context()
-        ray_cur_node_id = ray_runtime_ctx.get_node_id()
-    else:
-        nemo_gym_num_nodes = 0
-        ray_cur_node_id = None
 
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo Gym actor against the given generation server URLs."""
         t0 = time.perf_counter()
-        nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
-        if nemo_gym_py_exec.startswith("uv"):
-            nemo_gym_py_exec = create_local_venv_on_each_node(
-                nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
-            )
-        nemo_gym_dict = dict(env_configs["nemo_gym"])
-        # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
-        # (where the detector reads them), not part of Gym's global config.
-        invalid_tool_call_patterns = nemo_gym_dict.pop(
-            "invalid_tool_call_patterns", None
+        enable_router_replay = router_replay_enabled(policy_config)
+        routed_experts_dtype = (
+            resolve_routed_experts_dtype_name_for_model(model_name)
+            if enable_router_replay
+            else "int16"
         )
-        thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-        # Pass prebuilt cache + venv dirs through the global config so the gym reuses
-        # image-baked venvs instead of rebuilding them.
-        uv_cache_dir = get_nemo_gym_uv_cache_dir()
-        if uv_cache_dir is not None:
-            nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
-        uv_venv_dir = get_nemo_gym_venv_dir()
-        if uv_venv_dir is not None:
-            nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
-        nemo_gym_cfg = NemoGymConfig(
-            model_name=model_name,
+        actor = spinup_nemo_gym_actor(
+            env_configs=env_configs,
             base_urls=base_urls,
-            invalid_tool_call_patterns=invalid_tool_call_patterns,
-            thinking_tags=thinking_tags,
-            require_routed_experts=router_replay_enabled(policy_config),
-            routed_experts_dtype=(
-                resolve_routed_experts_dtype_name_for_model(model_name)
-                if router_replay_enabled(policy_config)
-                else "int16"
-            ),
+            model_name=model_name,
+            enable_router_replay=enable_router_replay,
+            routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-            initial_global_config_dict=nemo_gym_dict,
         )
-        nemo_gym_opts = {}
-        if nemo_gym_num_nodes:
-            nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-                node_id=ray_cur_node_id,
-                soft=True,
-            )
-        nemo_gym_opts["runtime_env"] = {
-            "py_executable": nemo_gym_py_exec,
-            "env_vars": {
-                **os.environ,
-                "VIRTUAL_ENV": nemo_gym_py_exec,
-                "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-            },
-        }
-        actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-        ray.get(actor._spinup.remote())
         return actor, time.perf_counter() - t0
 
     total_nodes = cluster_config["num_nodes"]
@@ -693,6 +664,11 @@ def setup(
         opd_cfg = opd_module._opd_cfg(master_config)
         teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
         for tcfg in teacher_configs:
+            assert tcfg.gpus_per_node <= cluster_config["gpus_per_node"], (
+                f"OPD teacher '{tcfg.alias}' requests gpus_per_node={tcfg.gpus_per_node} > "
+                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}; "
+                "each teacher placement group must fit on one node."
+            )
             opd_teacher_nodes += tcfg.num_nodes
         policy_nodes -= opd_teacher_nodes
         assert policy_nodes > 0, (
@@ -949,6 +925,21 @@ def setup(
             flush=True,
         )
 
+    # Reserve topology-aware teacher placement groups before NeMo Gym starts
+    # opportunistically placing its GPU-backed services. Worker creation and
+    # model loading remain deferred until the policy is ready to avoid racing
+    # Megatron-Bridge checkpoint conversion.
+    teacher_clusters: dict[str, RayVirtualCluster] = {}
+    teacher_reservation_time = 0.0
+    if enable_opd_teachers:
+        t0 = time.perf_counter()
+        teacher_clusters = opd_module.reserve_teacher_clusters(
+            master_config,
+            segment_size=segment_size,
+            teacher_segment_topology=teacher_segment_topology,
+        )
+        teacher_reservation_time = time.perf_counter() - t0
+
     # ==========================
     #   Training and Inference
     # ==========================
@@ -964,6 +955,10 @@ def setup(
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
+    if teacher_reservation_time:
+        worker_init_timing_metrics["teacher_reservation_time_s"] = (
+            teacher_reservation_time
+        )
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
@@ -1169,7 +1164,9 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None:
+        elif refit_transport is not None and refit_transport != "nccl_reshard":
+            # nccl_reshard is handled below via nccl_reshard_refit_enabled,
+            # not via checkpoint-engine.
             checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
             assert checkpoint_engine_config is not None
 
@@ -1339,6 +1336,16 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    nccl_reshard_refit_enabled = (
+        generation_config.get("refit_transport") == "nccl_reshard"
+    )
+    if nccl_reshard_refit_enabled:
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            check_nccl_reshard_refit_support,
+        )
+
+        check_nccl_reshard_refit_support(master_config)
+
     if generation_config.get("refit_transport") is not None and backend != "vllm":
         raise NotImplementedError(
             "Non-default refit transports are only supported for the vLLM "
@@ -1382,6 +1389,16 @@ def setup(
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
+        elif nccl_reshard_refit_enabled:
+            policy_generation.weight_synchronizer = create_weight_synchronizer(
+                policy=policy,
+                generation=policy_generation,
+                generation_backend=backend,
+                colocated=False,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
+            policy_generation.weight_synchronizer.init_communicator()
         else:
             futures_train = policy.init_collective(
                 ip, port, world_size, train_world_size=train_world_size
@@ -1431,9 +1448,10 @@ def setup(
             flush=True,
         )
     else:
-        state_dict_info = policy.prepare_refit_info()
-        if policy_generation is not None:
-            policy_generation.prepare_refit_info(state_dict_info)
+        if not (nccl_reshard_refit_enabled and not colocated_inference):
+            state_dict_info = policy.prepare_refit_info()
+            if policy_generation is not None:
+                policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -1448,11 +1466,18 @@ def setup(
                 master_config,
                 policy_config,
                 tokenizer,
-                segment_size=segment_size,
-                teacher_segment_topology=teacher_segment_topology,
+                teacher_clusters=teacher_clusters,
             )
         )
-        worker_init_timing_metrics["teacher_init_time_s"] = time.perf_counter() - t0
+        teacher_model_init_time = time.perf_counter() - t0
+        worker_init_timing_metrics["teacher_model_init_time_s"] = (
+            teacher_model_init_time
+        )
+        # Preserve the existing metric's end-to-end meaning while exposing the
+        # newly separated reservation and model-initialization phases.
+        worker_init_timing_metrics["teacher_init_time_s"] = (
+            teacher_reservation_time + teacher_model_init_time
+        )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1730,12 +1755,16 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    Router-replay routes get the same treatment via
+    :func:`backfill_missing_routed_experts`, so every per-token field is defined
+    for every tokenized message before the batch is flattened.
 
     Args:
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
+    backfill_missing_routed_experts(message_logs)
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2359,6 +2388,65 @@ def _log_mixed_rewards_and_advantages_information(
     metrics["advantages/mean"] = advantages.float().mean().item()
 
 
+def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
+    """Zero-valued seq-level metrics used when the prev_logprobs forward is skipped."""
+    return {
+        "max_seq_mult_prob_error": 0.0,
+        "mean_seq_mult_prob_error": 0.0,
+        "min_seq_mult_prob_error": 0.0,
+        "max_seq_mult_prob_error_after_mask": 0.0,
+        "mean_seq_mult_prob_error_after_mask": 0.0,
+        "min_seq_mult_prob_error_after_mask": 0.0,
+        "num_masked_seqs_by_logprob_error": 0,
+        "masked_correct_pct": 0.0,
+    }
+
+
+def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
+    """Reject ``use_kl_in_reward`` when the KL term would read zero placeholder logprobs.
+
+    ``force_on_policy_ratio`` (without ``seq_logprob_error_threshold``) skips
+    the prev_logprobs forward and passes a zero placeholder to the advantage
+    estimator; ``use_kl_in_reward`` then applies
+    ``kl_coef * calculate_kl(zeros, ref)`` which corrupts the advantage.
+    ``kl_coef=0`` (``reference_policy_kl_penalty=0``) zeros the term regardless,
+    so that case is allowed.
+    """
+    loss_config = master_config.loss_fn
+    if loss_config.use_kl_in_reward and loss_config.reference_policy_kl_penalty != 0:
+        assert not opd_module._skip_prev_logprobs(master_config), (
+            "loss_fn.use_kl_in_reward with nonzero loss_fn.reference_policy_kl_penalty "
+            "requires real prev_logprobs, but force_on_policy_ratio (without "
+            "grpo.seq_logprob_error_threshold) zeros them — KL would be computed "
+            "against a zero placeholder."
+        )
+
+
+def _resolve_logprob_skip_flags(
+    master_config: MasterConfig,
+) -> tuple[bool, bool | None]:
+    """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
+
+    Skip prev_logprobs when force_on_policy_ratio=True unless
+    seq_logprob_error_threshold is set (which requires prev_logprobs).
+    Skip reference_policy_logprobs when
+    ``grpo.skip_reference_policy_logprobs_calculation`` is set.
+    """
+    # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
+    if (
+        master_config.loss_fn.force_on_policy_ratio
+        and master_config.grpo.get("seq_logprob_error_threshold") is not None
+    ):
+        warnings.warn(
+            "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
+            "Computing prev_logprobs anyway for seq-level error masking."
+        )
+    return (
+        opd_module._skip_prev_logprobs(master_config),
+        master_config.grpo.get("skip_reference_policy_logprobs_calculation"),
+    )
+
+
 def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
@@ -2494,6 +2582,40 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _validation_stop_value(val_metrics: dict[str, Any], stop_metric: str) -> float:
+    """Value of the early-stop metric chosen by grpo.stop_at_validation_metric."""
+    assert stop_metric in val_metrics, (
+        f"grpo.stop_at_validation_metric={stop_metric!r} is not a reported "
+        f"validation metric; available: {sorted(val_metrics)}"
+    )
+    return val_metrics[stop_metric]
+
+
+def _validation_early_stop_message(
+    val_metrics: dict[str, Any],
+    stop_threshold: float | None,
+    stop_metric: str | None,
+    *,
+    initial: bool = False,
+) -> Optional[str]:
+    """Stop message when the early-stop threshold is reached, else None."""
+    if stop_metric is None:
+        return None
+    # setup() guards this pairing at startup; keep the invariant visible here.
+    assert stop_threshold is not None, (
+        "grpo.stop_at_validation_threshold must be set when "
+        "grpo.stop_at_validation_metric is set"
+    )
+    value = _validation_stop_value(val_metrics, stop_metric)
+    if value < stop_threshold:
+        return None
+    prefix = "Initial validation" if initial else "Validation"
+    return (
+        f"{prefix} {stop_metric} reached the early-stop threshold "
+        f"({value:.4f} >= {stop_threshold}); stopping training"
+    )
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2551,8 +2673,11 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+    stop_at_validation_threshold = master_config.grpo["stop_at_validation_threshold"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2585,6 +2710,17 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        stop_message = _validation_early_stop_message(
+            val_metrics,
+            stop_at_validation_threshold,
+            stop_at_validation_metric,
+            initial=True,
+        )
+        if stop_message is not None:
+            print(stop_message, flush=True)
+            # Flush pending checkpoint finalization, like the other early returns.
+            checkpointer.shutdown()
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -2734,6 +2870,9 @@ def grpo_train(
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                            mask_env_flagged_samples=should_mask_flagged_samples(
+                                master_config.env
+                            ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2875,6 +3014,10 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
+                    # Must precede prompt extraction: it reuses the same message
+                    # dicts, so this also protects the prompt flatten below.
+                    backfill_missing_routed_experts(repeated_batch["message_log"])
+
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
                     initial_prompt_message_logs = extract_initial_prompt_messages(
@@ -2952,23 +3095,11 @@ def grpo_train(
                     metrics_logging_data["content"] = flat_messages["content"]
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                # Skip prev_logprobs computation when force_on_policy_ratio=True
-                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
                 seq_logprob_error_threshold = master_config.grpo.get(
                     "seq_logprob_error_threshold", None
-                )
-                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
-                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
-                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
-                    warnings.warn(
-                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
-                        "Computing prev_logprobs anyway for seq-level error masking."
-                    )
-
-                # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
-                skip_reference_logprobs = master_config.grpo.get(
-                    "skip_reference_policy_logprobs_calculation"
                 )
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
@@ -3034,16 +3165,7 @@ def grpo_train(
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = {
-                        "max_seq_mult_prob_error": 0.0,
-                        "mean_seq_mult_prob_error": 0.0,
-                        "min_seq_mult_prob_error": 0.0,
-                        "max_seq_mult_prob_error_after_mask": 0.0,
-                        "mean_seq_mult_prob_error_after_mask": 0.0,
-                        "min_seq_mult_prob_error_after_mask": 0.0,
-                        "num_masked_seqs_by_logprob_error": 0,
-                        "masked_correct_pct": 0.0,
-                    }
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
@@ -3129,10 +3251,13 @@ def grpo_train(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
+                early_stop_message: Optional[str] = None
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and (total_steps + 1) >= val_start_at
+                    and (total_steps + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_metrics = refit_policy_generation(
@@ -3163,6 +3288,14 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    early_stop_message = _validation_early_stop_message(
+                        val_metrics,
+                        stop_at_validation_threshold,
+                        stop_at_validation_metric,
+                    )
+                    if early_stop_message is not None:
+                        # Exit at the end of this step, after checkpointing.
+                        print(early_stop_message, flush=True)
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3201,6 +3334,10 @@ def grpo_train(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
+                if "draft_grad_norm" in train_results:
+                    metrics["draft_grad_norm"] = train_results[
+                        "draft_grad_norm"
+                    ].numpy()
                 if master_config.grpo["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
@@ -3248,6 +3385,8 @@ def grpo_train(
                 # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
+                    # Early stop saves the final state like a last step.
+                    or early_stop_message is not None
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                     or (
@@ -3520,6 +3659,10 @@ def grpo_train(
             timer.reset()
             current_step += 1
             total_steps += 1
+            if early_stop_message is not None:
+                checkpointer.shutdown()
+                memory_tracker.snapshot_start_of_stage("", dir())
+                return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
@@ -3600,6 +3743,9 @@ def validate(
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                    mask_env_flagged_samples=should_mask_flagged_samples(
+                        master_config.env
+                    ),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -3799,9 +3945,12 @@ def async_grpo_train(
         master_config.data_plane or {}
     ).get("enabled", False):
         raise NotImplementedError(
-            "policy.router_replay.enabled=true with async GRPO is currently "
-            "supported only when data_plane.enabled=false. Async + TQ support "
-            "has not been merged yet."
+            "policy.router_replay.enabled=true with async GRPO on this "
+            "entrypoint is supported only when data_plane.enabled=false. For "
+            "async + TransferQueue, use the SingleController entrypoint: "
+            "examples/run_grpo_single_controller.py with e.g. "
+            "examples/configs/recipes/llm/"
+            "grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml"
         )
 
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
@@ -3836,10 +3985,12 @@ def async_grpo_train(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-
+    stop_at_validation_threshold = master_config.grpo["stop_at_validation_threshold"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -3856,7 +4007,7 @@ def async_grpo_train(
     # Ensure the buffer has at least one step worth of prompt-groups before training
     min_trajectories_needed = num_prompts_per_step
 
-    print("📊 Buffer requirements calculation:")
+    print("📊 Buffer requirements calculation:", flush=True)
     print(f"   - num_prompts_per_step: {num_prompts_per_step}")
     print(f"   - num_generations_per_prompt: {samples_per_prompt_group}")
     print(f"   - samples_per_prompt_group: {samples_per_prompt_group}")
@@ -3984,12 +4135,16 @@ def async_grpo_train(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
-    print("⏳ Preparing policy generation for training...")
+    print("⏳ Preparing policy generation for training...", flush=True)
     if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...")
+        print("🔄 Refitting policy generation with actual model weights...", flush=True)
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            print("✅ Policy generation refit completed successfully")
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+            )
+            print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
@@ -4017,6 +4172,7 @@ def async_grpo_train(
         # Pause trajectory collection during initial validation
         trajectory_collector.pause.remote()
 
+        initial_val_metrics: Optional[dict[str, Any]] = None
         try:
             val_metrics, validation_timings = validate(
                 policy_generation,
@@ -4027,6 +4183,7 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
+            initial_val_metrics = val_metrics
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
@@ -4040,6 +4197,32 @@ def async_grpo_train(
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
+
+        stop_message = (
+            _validation_early_stop_message(
+                initial_val_metrics,
+                stop_at_validation_threshold,
+                stop_at_validation_metric,
+                initial=True,
+            )
+            if initial_val_metrics is not None
+            else None
+        )
+        if stop_message is not None:
+            print(stop_message, flush=True)
+            # Flush pending checkpoint finalization and stop rollout
+            # generation; the remaining actors are reaped when the driver
+            # exits right after this return.
+            checkpointer.shutdown()
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
+            return
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -4131,6 +4314,7 @@ def async_grpo_train(
     try:
         while step < master_config.grpo["max_num_steps"]:
             refit_metrics: dict[str, float] = {}
+            early_stop_message: Optional[str] = None
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
             )
@@ -4288,6 +4472,10 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
+                    # Must precede prompt extraction: it reuses the same message
+                    # dicts, so this also protects the prompt flatten below.
+                    backfill_missing_routed_experts(repeated_batch["message_log"])
+
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
                     initial_prompt_message_logs = extract_initial_prompt_messages(
@@ -4357,24 +4545,11 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
-                # Skip prev_logprobs computation when force_on_policy_ratio=True
-                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
                 seq_logprob_error_threshold = master_config.grpo.get(
                     "seq_logprob_error_threshold", None
-                )
-                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
-
-                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
-                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
-                    warnings.warn(
-                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
-                        "Computing prev_logprobs anyway for seq-level error masking."
-                    )
-
-                # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
-                skip_reference_logprobs = master_config.grpo.get(
-                    "skip_reference_policy_logprobs_calculation"
                 )
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
@@ -4412,16 +4587,7 @@ def async_grpo_train(
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = {
-                        "max_seq_mult_prob_error": 0.0,
-                        "mean_seq_mult_prob_error": 0.0,
-                        "min_seq_mult_prob_error": 0.0,
-                        "max_seq_mult_prob_error_after_mask": 0.0,
-                        "mean_seq_mult_prob_error_after_mask": 0.0,
-                        "min_seq_mult_prob_error_after_mask": 0.0,
-                        "num_masked_seqs_by_logprob_error": 0,
-                        "masked_correct_pct": 0.0,
-                    }
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
@@ -4552,16 +4718,20 @@ def async_grpo_train(
                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and (step + 1) >= val_start_at
+                    and (step + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     with timer.time("idle/validation"):
                         # Pause trajectory collection during validation to reduce memory pressure
                         trajectory_collector.pause.remote()
 
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
-                                policy, policy_generation, colocated_inference
+                                policy,
+                                policy_generation,
+                                colocated_inference,
                             )
                             POLICY_GENERATION_STALE = False
                         else:
@@ -4580,6 +4750,14 @@ def async_grpo_train(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        early_stop_message = _validation_early_stop_message(
+                            val_metrics,
+                            stop_at_validation_threshold,
+                            stop_at_validation_metric,
+                        )
+                        if early_stop_message is not None:
+                            # Exit at the end of this step, after checkpointing.
+                            print(early_stop_message, flush=True)
 
                         # Explicit GPU memory cleanup after validation in async mode
                         import gc
@@ -4587,8 +4765,9 @@ def async_grpo_train(
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                        # Resume trajectory collection after validation
-                        trajectory_collector.resume.remote()
+                        if early_stop_message is None:
+                            # Resume trajectory collection after validation
+                            trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4627,6 +4806,10 @@ def async_grpo_train(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
+                if "draft_grad_norm" in train_results:
+                    metrics["draft_grad_norm"] = train_results[
+                        "draft_grad_norm"
+                    ].numpy()
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
@@ -4670,6 +4853,8 @@ def async_grpo_train(
                 # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
+                    # Early stop saves the final state like a last step.
+                    or early_stop_message is not None
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
@@ -4914,6 +5099,9 @@ def async_grpo_train(
 
             timer.reset()
             step += 1
+            if early_stop_message is not None:
+                checkpointer.shutdown()
+                return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
