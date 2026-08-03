@@ -3,11 +3,20 @@ grpo:
   max_num_steps: 450
   val_batch_size: 128
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated
 policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    scheduler:
+      lr_warmup_iters: 50
+  dtensor_cfg:
+    enabled: false
   dynamic_batching:
     enabled: true
   sequence_packing:
@@ -16,6 +25,11 @@ policy:
   generation:
     backend: sglang
     max_new_tokens: 512
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
     sglang_cfg:
       model_path: ${policy.model_name}
       dtype: ${policy.precision}
@@ -38,18 +52,19 @@ policy:
         pause_generation_mode: retract
         num_gpus: 8
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
-        weight_transfer_mode: ipc
+        weight_transfer_mode: broadcast
       sglang_router_config:
         use_external_router: false
         use_distributed_post: true
 data:
   max_input_seq_length: 512
 logger:
-  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+    name: grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated
 cluster:
   gpus_per_node: 8
+  num_nodes: 2
