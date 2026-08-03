@@ -1305,7 +1305,10 @@ class VllmAsyncGenerationWorkerImpl(
 
         Tears down the cross-cluster NCCL comm via collective_rpc into the
         VllmInternalWorkerExtension running inside the engine process.
+        Non-model-owner (TP follower placeholder) actors skip this silently.
         """
+        if self.llm is None:
+            return
         await self.llm.collective_rpc("reset_collective", args=tuple())
 
     async def warmup_nccl_library_async(self) -> None:
@@ -1314,11 +1317,16 @@ class VllmAsyncGenerationWorkerImpl(
         Delegates to the VllmInternalWorkerExtension method inside the engine
         process via collective_rpc, which pre-warms NCCL's per-process lazy
         init before the first real cross-cluster collective.
+        Non-model-owner (TP follower placeholder) actors skip this silently.
         """
+        if self.llm is None:
+            return
         await self.llm.collective_rpc("warmup_nccl_library", args=tuple())
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
+        if self.llm is None:
+            return
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def update_weights_via_ipc_zmq_async(

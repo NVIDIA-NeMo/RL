@@ -144,6 +144,10 @@ class NamedSharding:
         """
         return all(coords.get(ax, 0) == 0 for ax in axes)
 
+    def contains_worker_id(self, worker_id: int) -> bool:
+        """Return True if ``worker_id`` is present in the sharding layout."""
+        return bool(np.where(self._layout == worker_id)[0].size)
+
     def replace_worker_id(self, old_id: int, new_id: int) -> bool:
         """Replace ``old_id`` with ``new_id`` in the layout in-place.
 

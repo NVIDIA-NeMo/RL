@@ -1035,11 +1035,20 @@ class VllmGeneration(GenerationInterface):
         names: list[str] = []
         bis: list[Optional[tuple[int, list[int]]]] = []
 
+        # Bundle indices that the dead shard occupied — the replacement must
+        # use the same ones so vLLM's RayExecutorV2 places its TP sub-workers
+        # on the correct placement-group bundles.  For dp-0 (bundles [0..N-1])
+        # list(range(N)) would be accidentally correct, but for any other shard
+        # (e.g. dp-1 on bundles [4..7]) we need the actual dead indices.
+        actual_bundles = (
+            dead_bundle_indices[1]
+            if dead_bundle_indices is not None
+            else list(range(model_parallel_size))
+        )
+
         for local_rank in range(model_parallel_size):
             bi: Optional[tuple[int, list[int]]] = (
-                (dp_shard_idx, list(range(model_parallel_size)))
-                if local_rank == 0
-                else None
+                (dp_shard_idx, actual_bundles) if local_rank == 0 else None
             )
             # Map local_rank to the correct PG bundle index from the dead shard.
             if dead_bundle_indices is not None and local_rank < len(dead_bundle_indices[1]):

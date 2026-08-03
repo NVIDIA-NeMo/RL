@@ -752,8 +752,18 @@ class RayWorkerGroup:
         new_worker_idx = len(self._workers)
         if dp_shard_idx is None:
             dp_shard_idx = len(self.dp_leader_worker_indices)
-        if bundle_indices is None:
+        # Only apply the default bundle_indices for TP rank-0 leaders.
+        # Followers (local_rank > 0) must receive bundle_indices=None so that
+        # configure_worker leaves init_kwargs["bundle_indices"] unset, which
+        # keeps is_model_owner=False and prevents them from trying to
+        # initialise a full vLLM engine (which would fail because
+        # VLLM_RAY_BUNDLE_INDICES would be "[0]" but tensor_parallel_size > 1).
+        if bundle_indices is None and local_rank == 0:
             bundle_indices = (new_worker_idx, [0])
+
+        # NODE_RANK must be an integer even for followers that have no
+        # bundle_indices; fall back to new_worker_idx.
+        node_rank = bundle_indices[0] if bundle_indices is not None else new_worker_idx
 
         worker_env_vars = deepcopy(self._env_vars)
         for k, v in os.environ.items():
@@ -766,7 +776,7 @@ class RayWorkerGroup:
                 "WORLD_SIZE": str(new_worker_idx + 1),
                 "MASTER_ADDR": self.master_address,
                 "MASTER_PORT": str(self.master_port),
-                "NODE_RANK": str(bundle_indices[0]),
+                "NODE_RANK": str(node_rank),
             }
         )
         for k in (
@@ -878,13 +888,32 @@ class RayWorkerGroup:
         if self._dead_indices and hasattr(
             self.sharding_annotations, "replace_worker_id"
         ):
-            dead_slots = sorted(
+            # Candidate dead slots: dead workers not currently in
+            # dp_leader_worker_indices.  Across multiple recovery cycles the
+            # layout entries for slots from EARLIER cycles have already been
+            # overwritten (e.g. slot 0 → 16 after cycle-1 recovery), so
+            # _dead_indices contains stale entries no longer present in the
+            # layout.  Filter to the subset still in the layout.
+            #
+            # append_spawned_worker is called once per TP rank in ascending
+            # local_rank order (0, 1, 2, ...) within a single recovery.  Each
+            # call consumes the FIRST remaining slot (dead_slots[0]) because
+            # the prior call already removed the previous first entry by
+            # replacing it.  Using local_rank as the index is wrong: after
+            # local_rank=0 removes slot 0 the filtered list shrinks, so
+            # local_rank=1 would pick index 1 of the shorter list (wrong TP
+            # coords) and local_rank=2 would go out of bounds entirely.
+            all_dead = sorted(
                 idx for idx in self._dead_indices
                 if idx not in self.dp_leader_worker_indices
             )
-            if local_rank < len(dead_slots):
+            dead_slots = [
+                slot for slot in all_dead
+                if self.sharding_annotations.contains_worker_id(slot)
+            ]
+            if dead_slots:
                 self.sharding_annotations.replace_worker_id(
-                    dead_slots[local_rank], new_worker_idx
+                    dead_slots[0], new_worker_idx
                 )
         if is_leader:
             self.dp_leader_worker_indices.append(new_worker_idx)
