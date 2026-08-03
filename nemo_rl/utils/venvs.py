@@ -47,13 +47,17 @@ def _tier_editable_paths_for_venv(venv_name: str) -> list[str]:
     paths: list[str] = []
     for env_key, tier, _skip_package in _TIER_EDITABLE_ENV_VARS:
         if tier in venv_name.lower():
-            paths += [p.strip() for p in os.environ.get(env_key, "").split(",") if p.strip()]
+            paths += [
+                p.strip() for p in os.environ.get(env_key, "").split(",") if p.strip()
+            ]
     return paths
 
 
 def _tier_skip_package_for_venv(venv_name: str) -> str | None:
-    """Return the pinned distribution to exclude from `uv sync` (the editable
-    replaces it) for this venv's active tier editable, or None."""
+    """Return the pinned distribution to exclude from `uv sync`, or None.
+
+    The editable replaces it for this venv's active tier editable.
+    """
     for env_key, tier, skip_package in _TIER_EDITABLE_ENV_VARS:
         if tier in venv_name.lower() and os.environ.get(env_key, "").strip():
             return skip_package
