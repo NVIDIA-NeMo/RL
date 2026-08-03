@@ -15,6 +15,7 @@
 import types
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.vllm
 
@@ -63,6 +64,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
             "kv_cache_dtype": "auto",
             "async_engine": False,
             "is_mx": True,
+            "refit_batched_moe_shuffle": False,
             "use_deep_gemm": True,
         },
         "dummy-model",
@@ -76,8 +78,86 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
+    assert fp8.global_fp8_config.refit_batched_moe_shuffle is False
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
+
+
+def test_init_fp8_defaults_to_batched_moe_shuffle(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert fp8.global_fp8_config.refit_batched_moe_shuffle is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("is_gated", "intermediate_size", "hidden_size"),
+    [
+        (True, 128, 256),
+        (True, 192, 128),
+        (False, 128, 256),
+    ],
+)
+def test_batched_moe_shuffle_matches_per_expert(
+    fp8_module, is_gated, intermediate_size, hidden_size
+):
+    pytest.importorskip("flashinfer")
+    fp8 = fp8_module
+    torch.manual_seed(0)
+    num_experts = 4
+    w13_rows = (2 if is_gated else 1) * intermediate_size
+
+    def rand_bytes(*shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+
+    w13_weight = rand_bytes(num_experts, w13_rows, hidden_size).view(
+        torch.float8_e4m3fn
+    )
+    w2_weight = rand_bytes(num_experts, hidden_size, intermediate_size).view(
+        torch.float8_e4m3fn
+    )
+    w13_scale = rand_bytes(num_experts, w13_rows, hidden_size // 32)
+    w2_scale = rand_bytes(num_experts, hidden_size, intermediate_size // 32)
+
+    batched = fp8._shuffle_mxfp8_moe_batched(
+        types.SimpleNamespace(),
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        is_gated,
+        128,
+    )
+    reference = fp8._shuffle_mxfp8_moe_per_expert(
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        is_gated,
+        128,
+    )
+
+    for actual, expected in zip(batched, reference):
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize(
