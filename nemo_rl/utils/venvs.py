@@ -47,13 +47,17 @@ def _tier_editable_paths_for_venv(venv_name: str) -> list[str]:
     paths: list[str] = []
     for env_key, tier, _skip_package in _TIER_EDITABLE_ENV_VARS:
         if tier in venv_name.lower():
-            paths += [p.strip() for p in os.environ.get(env_key, "").split(",") if p.strip()]
+            paths += [
+                p.strip() for p in os.environ.get(env_key, "").split(",") if p.strip()
+            ]
     return paths
 
 
 def _tier_skip_package_for_venv(venv_name: str) -> str | None:
-    """Return the pinned distribution to exclude from `uv sync` (the editable
-    replaces it) for this venv's active tier editable, or None."""
+    """Return the pinned distribution to exclude from `uv sync`, or None.
+
+    The editable replaces it for this venv's active tier editable.
+    """
     for env_key, tier, skip_package in _TIER_EDITABLE_ENV_VARS:
         if tier in venv_name.lower() and os.environ.get(env_key, "").strip():
             return skip_package
@@ -76,8 +80,7 @@ def _cudnn_link(target: str, linkname: str) -> None:
 
 
 def _cudnn_minor_suffix(cudnn_lib_dir: str) -> str:
-    """Return the '.MINOR.PATCH' suffix the loader appends to libcudnn*.so.9
-    (e.g. '.20.0' for cuDNN 9.20.0), or '' if it can't be determined.
+    """Return the '.MINOR.PATCH' suffix appended to libcudnn*.so.9, or '' if undetermined.
 
     Derived from the installed nvidia-cudnn wheel's dist-info version: pure
     filesystem, so no GPU, no dlopen, and no system-wide cuDNN are needed (the
@@ -107,9 +110,9 @@ def _cudnn_minor_suffix(cudnn_lib_dir: str) -> str:
 
 
 def _fix_cudnn_symlinks(venv_path: str) -> None:
-    """Reconcile cuDNN after a freshly-built editable venv so it doesn't hit
-    CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED / _VERSION_MISMATCH in conv ops.
+    """Reconcile cuDNN after a freshly-built editable venv.
 
+    Prevents CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED / _VERSION_MISMATCH in conv ops.
     pip's nvidia-cudnn wheels ship only the major soname (libcudnn_*.so.9), but
     TE / the cuDNN frontend dlopen the full minor-versioned name
     (libcudnn_*.so.9.X.Y). (1) add those versioned symlinks for the SUBLIBRARIES
@@ -251,7 +254,11 @@ def create_local_venv(
     # CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED / _VERSION_MISMATCH at runtime. Baked
     # images get this at build time via docker/mlperf/Dockerfile.cudnn-fix.
     # Set NRL_SKIP_CUDNN_FIX=1 to skip (e.g. containers whose cuDNN is already OK).
-    _skip_cudnn = os.environ.get("NRL_SKIP_CUDNN_FIX", "").lower() in ("1", "true", "yes")
+    _skip_cudnn = os.environ.get("NRL_SKIP_CUDNN_FIX", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     if tier_editable_paths and not _skip_cudnn:
         _fix_cudnn_symlinks(venv_path)
 
