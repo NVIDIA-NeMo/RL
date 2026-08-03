@@ -173,6 +173,12 @@ class SglangSpecificArgs(TypedDict):
     allow_auto_truncate: NotRequired[bool]
     # Attention backend to use (e.g. "fa3", "triton", "flashinfer", "trtllm_mha"); None = auto.
     attention_backend: NotRequired[str | None]
+    # MoE runner backend ("auto", "triton", "flashinfer_trtllm", ...). SGLang's own
+    # default is "auto"; not nullable, so do not set this to null. On sm100 "auto"
+    # resolves to "flashinfer_trtllm" for bf16 MoE models, which rewrites expert weights
+    # into a block layout that SGLang's weight-update path does not undo, so a refit
+    # fails with a tensor-shape mismatch. Set "triton" to refit MoE models.
+    moe_runner_backend: NotRequired[str]
     # Enable multimodal serving for the model (no-op if model is text-only).
     enable_multimodal: NotRequired[bool]
     # Sampling kernel backend (e.g. "flashinfer", "pytorch"); None = auto.

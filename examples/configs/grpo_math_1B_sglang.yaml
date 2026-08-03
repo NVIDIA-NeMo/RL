@@ -21,6 +21,11 @@ policy:
       random_seed: 42
       max_running_requests: null
       mem_fraction_static: 0.6
+      # SGLang's own default. Irrelevant for this dense model, but on sm100 "auto"
+      # resolves to "flashinfer_trtllm" for bf16 MoE models, which rewrites expert
+      # weights into a block layout its weight-update path never undoes -- a refit
+      # then fails with a tensor-shape mismatch. Set "triton" to refit an MoE model.
+      moe_runner_backend: auto
       skip_server_warmup: true
       # Piecewise CUDA graph currently crashes with "illegal memory access"
       # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.

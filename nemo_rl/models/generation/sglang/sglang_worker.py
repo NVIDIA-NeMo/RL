@@ -754,6 +754,7 @@ class SGLangGenerationWorker:
             "disable_cuda_graph_padding",
             "cuda_graph_max_bs",
             "cuda_graph_bs",
+            "moe_runner_backend",
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]
