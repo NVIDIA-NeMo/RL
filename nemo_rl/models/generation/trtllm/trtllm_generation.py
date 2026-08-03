@@ -446,7 +446,7 @@ class TrtllmGeneration(GenerationInterface):
         """
         if not self.async_engine:
             return {}
-        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger", False):
+        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return {}
         if not self.worker_group or not self.worker_group.workers:
             return {}
@@ -486,7 +486,7 @@ class TrtllmGeneration(GenerationInterface):
     def clear_logger_metrics(self) -> None:
         if not self.async_engine:
             return
-        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger", False):
+        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return
         if not self.worker_group or not self.worker_group.workers:
             return

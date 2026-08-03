@@ -17,6 +17,8 @@ policy:
       # diverge from grpo.async_grpo (single source of truth).
       in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
       recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      enable_trtllm_metrics_logger: false # Set to true to enable TRT-LLM per-iteration IFB/kv-cache telemetry (async_engine only); turn off for better performance
+      trtllm_metrics_logger_interval: 5.0 # Interval in seconds to collect TRT-LLM logger metrics
     trtllm_kwargs:
       batch_wait_timeout_iters: 32
       batch_wait_max_tokens_ratio: 0.5

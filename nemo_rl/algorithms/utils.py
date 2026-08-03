@@ -930,10 +930,10 @@ def resolve_generation_metrics_logger(
         return vllm_cfg["vllm_metrics_logger_interval"]
 
     trtllm_cfg = generation_cfg.get("trtllm_cfg", {}) or {}
-    if trtllm_cfg.get("enable_trtllm_metrics_logger", False) and trtllm_cfg.get(
+    if trtllm_cfg.get("enable_trtllm_metrics_logger") and trtllm_cfg.get(
         "async_engine", False
     ):
-        return trtllm_cfg.get("trtllm_metrics_logger_interval", 5.0)
+        return trtllm_cfg["trtllm_metrics_logger_interval"]
 
     return None
 
