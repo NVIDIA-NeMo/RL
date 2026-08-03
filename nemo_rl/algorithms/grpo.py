@@ -256,7 +256,7 @@ class GRPOConfig(BaseModel, extra="allow"):
     stop_at_validation_threshold: float | None = None
     skip_reference_policy_logprobs_calculation: bool = False
     seed: int = 42
-    async_grpo: Optional[AsyncGRPOConfig] = None
+    async_grpo: AsyncGRPOConfig = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -267,8 +267,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
-    reward_shaping: RewardShapingConfig = RewardShapingConfig()
-    reward_scaling: RewardScalingConfig = RewardScalingConfig()
+    reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
+    reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
@@ -281,7 +281,7 @@ class GRPOConfig(BaseModel, extra="allow"):
     # overwrites the computed advantage for those tokens; absent/None disables the penalty.
     malformed_thinking_advantage: float | None = None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
-    adv_estimator: Optional[AdvEstimatorConfig] = None
+    adv_estimator: AdvEstimatorConfig = Field(default_factory=AdvEstimatorConfig)
 
 
 @dataclass
@@ -305,7 +305,7 @@ def _initial_grpo_save_state() -> GRPOSaveState:
     )
 
 
-def _load_grpo_save_state(
+def _get_grpo_save_state(
     loaded_state: Optional[dict[str, Any]],
 ) -> GRPOSaveState:
     if loaded_state is None:
@@ -413,7 +413,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    grpo_save_state = _load_grpo_save_state(loaded_state)
+    grpo_save_state = _get_grpo_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -963,10 +963,7 @@ def setup(
         # When the user opts into recompute-after-refit on the megatron side,
         # override mcore's kv_cache_management_mode to "recompute" directly.
         async_grpo_config = grpo_config.async_grpo
-        if (
-            async_grpo_config is not None
-            and async_grpo_config.recompute_kv_cache_after_weight_updates
-        ):
+        if async_grpo_config.recompute_kv_cache_after_weight_updates:
             mcore_cfg = policy_config["generation"]["mcore_generation_config"]
             prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
             if prior_mode != "recompute":
@@ -2150,18 +2147,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
     grpo_config = master_config.grpo
     loss_config = master_config.loss_fn
 
-    # Provide backward-compatible defaults when adv_estimator is not in config.
-    # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
-    # which older configs still use.
-    if grpo_config.adv_estimator is not None:
-        adv_estimator_config = grpo_config.adv_estimator
-    else:
-        adv_estimator_config = AdvEstimatorConfig(
-            name="grpo",
-            normalize_rewards=grpo_config.normalize_rewards,
-            use_leave_one_out_baseline=grpo_config.use_leave_one_out_baseline,
-            minus_baseline=True,
-        )
+    adv_estimator_config = grpo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
     if adv_estimator_name == "gdpo":
@@ -2654,9 +2640,9 @@ def grpo_train(
     consumed_samples = (
         grpo_save_state.consumed_samples
     )  # total samples consumed across all epochs
-    total_valid_tokens = getattr(
-        grpo_save_state, "total_valid_tokens", 0
-    )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
+    total_valid_tokens = (
+        grpo_save_state.total_valid_tokens
+    )  # total valid tokens processed across all epochs
     val_at_start = master_config.grpo.val_at_start
     val_at_end = master_config.grpo.val_at_end
     val_period = master_config.grpo.val_period
@@ -3937,10 +3923,7 @@ def async_grpo_train(
             "grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml"
         )
 
-    if (
-        master_config.grpo.async_grpo is not None
-        and master_config.grpo.async_grpo.max_trajectory_age_steps > 1
-    ):
+    if master_config.grpo.async_grpo.max_trajectory_age_steps > 1:
         if not master_config.grpo.async_grpo.in_flight_weight_updates:
             print(
                 "⚠️ WARNING: In-flight weight updates must be enabled for async GRPO with max_trajectory_age_steps > 1. "
@@ -3968,9 +3951,7 @@ def async_grpo_train(
     POLICY_GENERATION_STALE = _initial_policy_generation_stale(policy_generation, step)
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state.consumed_samples
-    total_valid_tokens = getattr(
-        grpo_save_state, "total_valid_tokens", 0
-    )  # Default to 0 for backward compatibility with older checkpoints
+    total_valid_tokens = grpo_save_state.total_valid_tokens
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     val_at_start = master_config.grpo.val_at_start

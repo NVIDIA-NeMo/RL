@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, TypeVar
+from typing import TypeVar
 
 import torch
 from pydantic import BaseModel
@@ -33,18 +33,18 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # The length of the buffer to penalize responses that exceed the maximum response length threshold.
     # Responses of length greater than overlong_buffer_length + max_response_length will
     # receive the maximum penalty.
-    overlong_buffer_length: Optional[int] = None
+    overlong_buffer_length: int = 128
 
     # The penalty for responses that exceed the maximum response length threshold.
-    overlong_buffer_penalty: Optional[float] = None
+    overlong_buffer_penalty: float = 1.0
 
     # The maximum response length threshold. Responses exceeding this length will be penalized.
-    max_response_length: Optional[int] = None
+    max_response_length: int = 512
 
     # Stop properly penalty: scale factor for rewards of truncated responses (0-1).
     # When set to 0, truncated responses get zero reward.
     # When set to 1, no penalty is applied (default behavior).
-    stop_properly_penalty_coef: Optional[float] = None
+    stop_properly_penalty_coef: float | None = None
 
 
 def apply_reward_shaping(
@@ -113,16 +113,6 @@ def apply_reward_shaping(
             )
 
         return batch
-
-    # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
-    if (
-        cfg.overlong_buffer_length is None
-        or cfg.overlong_buffer_penalty is None
-        or cfg.max_response_length is None
-    ):
-        raise ValueError(
-            "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."
-        )
 
     # Get the overlong_buffer_length, overlong_buffer_penalty and max_response_length
     overlong_buffer_length = cfg.overlong_buffer_length

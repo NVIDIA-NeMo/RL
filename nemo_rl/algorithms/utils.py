@@ -740,11 +740,11 @@ def print_performance_metrics(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
-    grpo_config = getattr(master_config, "grpo", None)
-    async_grpo_config = getattr(grpo_config, "async_grpo", None)
     if (
-        async_grpo_config is not None and async_grpo_config.enabled
-    ) and not colocated_inference:
+        "exposed_generation" in timing_metrics
+        and master_config.grpo.async_grpo.enabled
+        and not colocated_inference
+    ):
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -765,6 +765,7 @@ def print_performance_metrics(
         )
 
     # Detect which algorithm config key is being used
+    grpo_config = getattr(master_config, "grpo", None)
     algo_config = grpo_config or getattr(master_config, "ppo", None) or {}
     if isinstance(algo_config, dict):
         num_prompts_per_step = algo_config.get("num_prompts_per_step", 1)

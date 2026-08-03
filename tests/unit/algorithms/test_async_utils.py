@@ -1346,7 +1346,6 @@ class TestAsyncTrajectoryCollector:
         """Test resume after refit invalidates cache without in-flight updates."""
         collector = self.create_local_collector()
         async_cfg = collector.master_config.grpo.async_grpo
-        assert async_cfg is not None
         async_cfg.in_flight_weight_updates = False
         async_cfg.recompute_kv_cache_after_weight_updates = True
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
@@ -1359,7 +1358,6 @@ class TestAsyncTrajectoryCollector:
         """Test resume after refit skips cache invalidation when recompute is disabled."""
         collector = self.create_local_collector()
         async_cfg = collector.master_config.grpo.async_grpo
-        assert async_cfg is not None
         async_cfg.in_flight_weight_updates = True
         async_cfg.recompute_kv_cache_after_weight_updates = False
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)

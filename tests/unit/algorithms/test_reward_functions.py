@@ -260,36 +260,13 @@ def test_reward_shaping_disabled_does_not_save_unshaped_reward():
     assert "unshaped_total_reward" not in result_batch
 
 
-def test_reward_shaping_missing_config_values():
-    """Test that missing required config values raise ValueError."""
-    batch = create_mock_batch_with_responses(
-        num_samples=1, response_lengths=[20], initial_rewards=[1.0]
-    )
+def test_reward_shaping_defaults_match_grpo_exemplar():
+    config = RewardShapingConfig()
 
-    # Test missing overlong_buffer_length
-    config = RewardShapingConfig(
-        enabled=True,
-        overlong_buffer_length=None,
-        overlong_buffer_penalty=0.1,
-        max_response_length=25,
-    )
-
-    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
-        apply_reward_shaping(batch, config)
-
-    # Test missing overlong_buffer_penalty
-    config.overlong_buffer_length = 5
-    config.overlong_buffer_penalty = None
-
-    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
-        apply_reward_shaping(batch, config)
-
-    # Test missing max_response_length
-    config.overlong_buffer_penalty = 0.1
-    config.max_response_length = None
-
-    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
-        apply_reward_shaping(batch, config)
+    assert config.overlong_buffer_length == 128
+    assert config.overlong_buffer_penalty == 1.0
+    assert config.max_response_length == 512
+    assert config.stop_properly_penalty_coef is None
 
 
 def test_reward_shaping_missing_assistant_response():

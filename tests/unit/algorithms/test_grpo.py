@@ -38,7 +38,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_message_level_advantage_penalties,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
-    _load_grpo_save_state,
+    _get_grpo_save_state,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -346,8 +346,8 @@ def mock_grpo_components():
     }
 
 
-def test_load_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
-    assert _load_grpo_save_state({}) == _initial_grpo_save_state()
+def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_grpo_save_state({}) == _initial_grpo_save_state()
 
     loaded_state = {
         "consumed_samples": 32,
@@ -357,7 +357,7 @@ def test_load_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "val:accuracy": 0.75,
     }
 
-    save_state = _load_grpo_save_state(loaded_state)
+    save_state = _get_grpo_save_state(loaded_state)
 
     assert vars(save_state) == {
         "consumed_samples": 32,
@@ -379,7 +379,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     save_state.val_reward = 0.8
     setattr(save_state, "val:accuracy", 0.8)
 
-    restored_state = _load_grpo_save_state(vars(save_state))
+    restored_state = _get_grpo_save_state(vars(save_state))
 
     assert restored_state.current_step == 4
     assert restored_state.total_steps == 4
@@ -390,6 +390,24 @@ def test_grpo_save_state_checkpoint_round_trip():
 
 def test_grpo_config_dynamic_sampling_default_matches_exemplar():
     assert GRPOConfig().dynamic_sampling_max_gen_batches == 10
+
+
+def test_grpo_config_nested_defaults_are_populated():
+    first = GRPOConfig()
+    second = GRPOConfig()
+
+    assert isinstance(first.async_grpo, AsyncGRPOConfig)
+    assert isinstance(first.adv_estimator, AdvEstimatorConfig)
+    assert isinstance(first.reward_shaping, RewardShapingConfig)
+    assert isinstance(first.reward_scaling, RewardScalingConfig)
+    assert first.async_grpo.enabled is False
+    assert first.adv_estimator.use_leave_one_out_baseline is False
+    assert first.adv_estimator.normalize_rewards is None
+    assert first.adv_estimator.minus_baseline is True
+    assert first.async_grpo is not second.async_grpo
+    assert first.adv_estimator is not second.adv_estimator
+    assert first.reward_shaping is not second.reward_shaping
+    assert first.reward_scaling is not second.reward_scaling
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:

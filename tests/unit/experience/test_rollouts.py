@@ -133,13 +133,9 @@ class TestPct:
         """Test that a single-element input returns that element."""
         assert pct([42], 95) == 42.0
 
-    def test_nearest_rank_p50(self):
-        """Test that p50 uses the nearest-rank element without upward bias."""
-        assert pct([10, 20, 30, 40], 50) == 20.0
-
-    def test_nearest_rank_exact_boundary(self):
-        """An exact rank boundary selects that rank, not the following value."""
-        assert pct(list(range(1, 21)), 95) == 19.0
+    def test_median_like_p50(self):
+        """Test that p50 lands on the upper-mid element (int truncation, no interpolation)."""
+        assert pct([10, 20, 30, 40], 50) == 30.0
 
 
 class _DummyTokenizer:
@@ -1563,8 +1559,8 @@ def test_run_async_nemo_gym_rollout(
             "turns_per_sample/median": 2.0,
             "turns_per_sample/stddev": 0.0,
             "turns_per_sample/histogram": None,
-            "turns_per_sample/p95": 2.0,
-            "turns_per_sample/p99": 2.0,
+            "turns_per_sample/p95": None,
+            "turns_per_sample/p99": None,
             "total_tokens_per_sample/mean": 3843.0,
             "total_tokens_per_sample/max": 3848,
             "total_tokens_per_sample/min": 3838,

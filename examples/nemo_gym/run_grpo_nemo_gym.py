@@ -259,7 +259,7 @@ The validation set you pass in will directly be used for validation with no addi
             master_config=master_config,
         )
     # Check if async mode is enabled
-    elif config.grpo.async_grpo is not None and config.grpo.async_grpo.enabled:
+    elif config.grpo.async_grpo.enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
         if config.grpo.use_dynamic_sampling:
             raise NotImplementedError(

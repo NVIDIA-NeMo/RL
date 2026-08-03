@@ -518,11 +518,7 @@ class AsyncTrajectoryCollector:
         else:
             is_async_engine = False
         async_grpo_config = self.master_config.grpo.async_grpo
-        in_flight_weight_updates = (
-            async_grpo_config.in_flight_weight_updates
-            if async_grpo_config is not None
-            else False
-        )
+        in_flight_weight_updates = async_grpo_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
             # async engines support in-flight weight updates
@@ -552,7 +548,7 @@ class AsyncTrajectoryCollector:
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
         async_cfg = self.master_config.grpo.async_grpo
-        if async_cfg is not None and async_cfg.recompute_kv_cache_after_weight_updates:
+        if async_cfg.recompute_kv_cache_after_weight_updates:
             try:
                 print(
                     "🔄 Invalidating generation backend KV caches after weight update"
