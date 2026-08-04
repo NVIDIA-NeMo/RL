@@ -10,8 +10,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 export EXP_NAME="${EXP_NAME:-grpo-super-v3-omni-textrl-svg-async}"
-export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/pjin/checkpoints/super-omni-textrl-svg-20260629-step-125-hf}"
-export TRAIN_PATH="${TRAIN_PATH:-/scratch/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/datasets/eagle-next/image_data/rl_data/Super_filtered_samples/random_blend_super_v6_5_gym.jsonl}"
+export MODEL_PATH="${MODEL_PATH:-/path/to/nemotron-super-omni-hf-checkpoint}"
+export TRAIN_PATH="${TRAIN_PATH:-/path/to/super-omni-gym-train.jsonl}"
 export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 export CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml}"
 export ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_multimodal_grpo_nemo_gym.py}"
@@ -25,9 +25,9 @@ export ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
 # remove and attempting it aborts config composition.
 export MTP_DROP_CUDAGRAPH_CAPTURE_SIZES="${MTP_DROP_CUDAGRAPH_CAPTURE_SIZES:-0}"
 
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/smahdavi/images/nemo-rl-20260625.sqsh}"
-export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
-export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/${USER}/cache/nemo-rl-super-omni}"
+export CONTAINER="${CONTAINER:-/path/to/nemo-rl.sqsh}"
+export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/path/to/nemo-skills-sandbox.sqsh}"
+export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/path/to/cache/nemo-rl-super-omni}"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:-/scratch:/scratch,/lustre:/lustre}"
 
 export SLURM_PARTITION="${SLURM_PARTITION:-batch_long,batch}"
