@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inject a *synchronous*, Ray-picklable iteration-stats fetch into TRT-LLM's
-executor worker so the TRT-LLM in-flight-batching metrics logger can read
-per-iteration stats via ``collective_rpc``.
+"""Inject a sync, Ray-picklable iteration-stats fetch into TRT-LLM's worker.
+
+This lets the TRT-LLM in-flight-batching metrics logger read per-iteration
+stats via ``collective_rpc``.
 
 Why this is needed (TRT-LLM 1.3.0rc21, ``_torch`` ``AsyncLLM`` + ``RayExecutor``):
 
@@ -55,7 +56,11 @@ def apply() -> bool:
     try:
         from tensorrt_llm.executor.base_worker import BaseWorker
     except Exception as exc:  # pragma: no cover - TRT-LLM not importable
-        print(f"[ifb_stats_patch] BaseWorker import failed: {exc!r}", file=sys.stderr, flush=True)
+        print(
+            f"[ifb_stats_patch] BaseWorker import failed: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
         return False
 
     if getattr(BaseWorker, "fetch_stats_serialized", None) is not None:
@@ -71,7 +76,11 @@ def apply() -> bool:
         return [self._stats_serializer(s) for s in self.fetch_stats()]
 
     BaseWorker.fetch_stats_serialized = fetch_stats_serialized
-    print("[ifb_stats_patch] BaseWorker.fetch_stats_serialized installed", file=sys.stderr, flush=True)
+    print(
+        "[ifb_stats_patch] BaseWorker.fetch_stats_serialized installed",
+        file=sys.stderr,
+        flush=True,
+    )
     return True
 
 
