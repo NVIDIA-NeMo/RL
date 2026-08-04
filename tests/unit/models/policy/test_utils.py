@@ -56,6 +56,22 @@ def test_resolve_policy_worker_validates_two_sided_kv_skip(monkeypatch):
     )
 
 
+def test_resolve_policy_worker_accepts_rollout_only_recent_window(monkeypatch):
+    monkeypatch.setenv("MODELOPT_KV_CACHE_QUANT_SKIP_LAST_N", "512")
+    monkeypatch.setenv("MODELOPT_KV_CACHE_QUANT_ROLLOUT_ONLY", "1")
+
+    assert resolve_policy_worker_cls("policy.Worker", _kv_skip_policy_config()) == (
+        "policy.Worker"
+    )
+
+
+def test_resolve_policy_worker_rejects_recent_window_on_learner(monkeypatch):
+    monkeypatch.setenv("MODELOPT_KV_CACHE_QUANT_SKIP_LAST_N", "512")
+
+    with pytest.raises(ValueError, match="requires rollout-only"):
+        resolve_policy_worker_cls("policy.Worker", _kv_skip_policy_config())
+
+
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [

@@ -154,7 +154,9 @@ def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32
 
 
 @requires_weight_folding
-def test_kv_boundary_skip_is_reapplied_after_modelopt_restore(monkeypatch, tmp_path):
+def test_modelopt_quantization_configuration_is_deferred_until_after_restore(
+    monkeypatch, tmp_path
+):
     from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
 
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
@@ -177,19 +179,9 @@ def test_kv_boundary_skip_is_reapplied_after_modelopt_restore(monkeypatch, tmp_p
         "load_modelopt_state",
         lambda model, path: calls.append(("load", model, path)),
     )
-    monkeypatch.setattr(
-        megatron_quant_policy_worker,
-        "configure_modelopt_kv_cache_quant_skip",
-        lambda model: calls.append(("configure", model)),
-    )
-
     worker._restore_modelopt_state_pre_load(state, object())
 
-    assert calls == [
-        ("load", chunks, str(tmp_path)),
-        ("configure", chunks[0]),
-        ("configure", chunks[1]),
-    ]
+    assert calls == [("load", chunks, str(tmp_path))]
 
 
 @requires_weight_folding

@@ -43,6 +43,8 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     configure_modelopt_kv_cache_quant_skip,
+    disable_modelopt_learner_kv_quantizers,
+    get_kv_cache_quant_rollout_only,
     resolve_nvfp4_real_quant_mode,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -186,6 +188,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
 
+        unwrapped_model = unwrap_model(self.model)
+        model_chunks = (
+            unwrapped_model
+            if isinstance(unwrapped_model, (list, tuple))
+            else [unwrapped_model]
+        )
+        for model_chunk in model_chunks:
+            self._configure_learner_kv_quantization(model_chunk)
+
         if hasattr(self, "reference_state_dict"):
             for name, item in self.model.state_dict().items():
                 if "_quantizer." in name:
@@ -208,8 +219,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             data=self.cfg.get("quant_calib_data"),
             max_sample_length=self.cfg.get("quant_sequence_length"),
         )
-        configure_modelopt_kv_cache_quant_skip(unwrapped_model)
         return model
+
+    @staticmethod
+    def _configure_learner_kv_quantization(model) -> None:
+        if get_kv_cache_quant_rollout_only():
+            disable_modelopt_learner_kv_quantizers(model)
+        else:
+            configure_modelopt_kv_cache_quant_skip(model)
 
     def _patch_validate_model_paths(self):
         """Patch validate_model_paths to handle quantized checkpoint paths.
@@ -304,13 +321,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if has_modelopt_state(model_path):
             unwrapped_model = unwrap_model(model)
             load_modelopt_state(unwrapped_model, model_path)
-            model_chunks = (
-                unwrapped_model
-                if isinstance(unwrapped_model, (list, tuple))
-                else [unwrapped_model]
-            )
-            for model_chunk in model_chunks:
-                configure_modelopt_kv_cache_quant_skip(model_chunk)
 
     @contextmanager
     def hide_tensor_quantizers(self):
@@ -434,8 +444,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                         with_amax += 1
                         if (module.amax > 0).all():
                             positive_amax += 1
-                        if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
-                            kv_amax[name] = module.amax.detach().cpu().clone()
+                if (
+                    name.endswith(("k_bmm_quantizer", "v_bmm_quantizer"))
+                    and hasattr(module, "amax")
+                    and module.amax is not None
+                ):
+                    kv_amax[name] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,

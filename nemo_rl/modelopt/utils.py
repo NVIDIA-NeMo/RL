@@ -23,6 +23,8 @@ from typing import Any, Iterator, Literal
 
 MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
 MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N = "MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N"
+MODELOPT_KV_CACHE_QUANT_SKIP_LAST_N = "MODELOPT_KV_CACHE_QUANT_SKIP_LAST_N"
+MODELOPT_KV_CACHE_QUANT_ROLLOUT_ONLY = "MODELOPT_KV_CACHE_QUANT_ROLLOUT_ONLY"
 
 _QUANT_IGNORE_NAME_SUFFIXES = (
     ".weight",
@@ -47,31 +49,59 @@ NVFP4RealQuantMode = Literal["w4a4", "w4a16"]
 _NVFP4_REAL_QUANT_MODES = frozenset({"w4a4", "w4a16"})
 
 
-def get_kv_cache_quant_skip_first_n() -> int:
-    """Read and validate the ModelOpt K/V first-token skip configuration."""
-    raw = os.environ.get(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, "0")
+def _get_nonnegative_int_env(name: str) -> int:
+    raw = os.environ.get(name, "0")
     try:
         value = int(raw)
     except ValueError as error:
         raise ValueError(
-            f"{MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N} must be a nonnegative integer; "
-            f"got {raw!r}."
+            f"{name} must be a nonnegative integer; got {raw!r}."
         ) from error
     if value < 0:
-        raise ValueError(
-            f"{MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N} must be nonnegative; got {value}."
-        )
+        raise ValueError(f"{name} must be nonnegative; got {value}.")
     return value
 
 
+def _get_bool_env(name: str) -> bool:
+    raw = os.environ.get(name, "0").lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    if raw in {"0", "false", "no"}:
+        return False
+    raise ValueError(f"{name} must be a boolean; got {raw!r}.")
+
+
+def get_kv_cache_quant_skip_first_n() -> int:
+    """Read and validate the ModelOpt K/V first-token skip configuration."""
+    return _get_nonnegative_int_env(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N)
+
+
+def get_kv_cache_quant_skip_last_n() -> int:
+    """Read and validate the ModelOpt K/V recent-token skip configuration."""
+    return _get_nonnegative_int_env(MODELOPT_KV_CACHE_QUANT_SKIP_LAST_N)
+
+
+def get_kv_cache_quant_rollout_only() -> bool:
+    """Return whether learner K/V QDQ is disabled after calibration."""
+    return _get_bool_env(MODELOPT_KV_CACHE_QUANT_ROLLOUT_ONLY)
+
+
 def validate_kv_cache_quant_skip_config(config: Mapping[str, Any]) -> None:
-    """Require matching simulated-quant learner and rollout paths for K/V skipping."""
-    if get_kv_cache_quant_skip_first_n() == 0:
+    """Validate simulated K/V boundary skipping and rollout-only execution."""
+    first_n = get_kv_cache_quant_skip_first_n()
+    last_n = get_kv_cache_quant_skip_last_n()
+    rollout_only = get_kv_cache_quant_rollout_only()
+    if first_n == 0 and last_n == 0 and not rollout_only:
         return
+    if last_n and not rollout_only:
+        raise ValueError(
+            "K/V last-token skipping requires rollout-only quantization because "
+            "the learner cannot represent a moving recent-context window."
+        )
 
     if config.get("quant_cfg") is None:
         raise ValueError(
-            "K/V first-token skipping requires policy.quant_cfg for the learner."
+            "K/V boundary skipping requires policy.quant_cfg to calibrate rollout amax."
         )
     if not config.get("megatron_cfg", {}).get("enabled", False):
         raise ValueError(
@@ -80,22 +110,23 @@ def validate_kv_cache_quant_skip_config(config: Mapping[str, Any]) -> None:
 
     generation = config.get("generation")
     if not isinstance(generation, Mapping) or generation.get("backend") != "vllm":
-        raise ValueError("K/V first-token skipping requires a vLLM rollout backend.")
+        raise ValueError("K/V boundary skipping requires a vLLM rollout backend.")
     if generation.get("quant_cfg") is None:
         raise ValueError(
-            "K/V first-token skipping requires policy.generation.quant_cfg for the "
+            "K/V boundary skipping requires policy.generation.quant_cfg for the "
             "rollout."
         )
     if generation.get("real_quant"):
         raise ValueError(
-            "K/V first-token skipping supports simulated rollout quantization only."
+            "K/V boundary skipping supports simulated rollout quantization only."
         )
 
 
 def configure_modelopt_kv_cache_quant_skip(model) -> int:
-    """Apply K/V first-token skipping to enabled ModelOpt attention quantizers."""
+    """Apply K/V boundary skipping to enabled ModelOpt attention quantizers."""
     first_n = get_kv_cache_quant_skip_first_n()
-    if first_n == 0:
+    last_n = get_kv_cache_quant_skip_last_n()
+    if first_n == 0 and last_n == 0:
         return 0
 
     configured = 0
@@ -108,11 +139,18 @@ def configure_modelopt_kv_cache_quant_skip(model) -> int:
             or getattr(v_quantizer, "is_enabled", False)
         ):
             continue
-        setter = getattr(module, "set_kv_quant_skip_first_tokens", None)
-        if setter is None:
+        setter = getattr(module, "set_kv_quant_skip_tokens", None)
+        if setter is not None:
+            setter(first_n, last_n)
+        elif (
+            last_n == 0
+            and (setter := getattr(module, "set_kv_quant_skip_first_tokens", None))
+            is not None
+        ):
+            setter(first_n)
+        else:
             unsupported.append(name)
             continue
-        setter(first_n)
         configured += 1
 
     if unsupported:
@@ -125,8 +163,56 @@ def configure_modelopt_kv_cache_quant_skip(model) -> int:
             "K/V boundary skipping was requested, but no enabled K/V quantizers "
             "support it."
         )
-    print(f"MODELOPT_KV_CACHE_QUANT_SKIP_ACTIVE first_n={first_n} modules={configured}")
+    print(
+        "MODELOPT_KV_CACHE_QUANT_SKIP_ACTIVE "
+        f"first_n={first_n} last_n={last_n} modules={configured}"
+    )
     return configured
+
+
+def disable_modelopt_learner_kv_quantizers(model) -> tuple[int, int]:
+    """Disable calibrated learner K/V QDQ while retaining mapped amax buffers."""
+    import torch
+
+    configured_modules = 0
+    disabled_quantizers = 0
+    for _name, module in model.named_modules():
+        quantizers = (
+            getattr(module, "k_bmm_quantizer", None),
+            getattr(module, "v_bmm_quantizer", None),
+        )
+        if not any(
+            getattr(quantizer, "is_enabled", False)
+            or getattr(quantizer, "amax", None) is not None
+            for quantizer in quantizers
+            if quantizer is not None
+        ):
+            continue
+        for quantizer in quantizers:
+            amax = getattr(quantizer, "amax", None)
+            if (
+                amax is None
+                or not bool(torch.isfinite(amax).all().item())
+                or not bool((amax > 0).all().item())
+            ):
+                raise RuntimeError(
+                    "Rollout-only K/V quantization requires finite positive "
+                    "calibrated learner amax values."
+                )
+            quantizer.disable()
+            disabled_quantizers += 1
+        configured_modules += 1
+
+    if configured_modules == 0:
+        raise RuntimeError(
+            "Rollout-only K/V quantization was requested, but no calibrated "
+            "learner K/V quantizers were found."
+        )
+    print(
+        "MODELOPT_KV_CACHE_QUANT_LEARNER_DISABLED "
+        f"modules={configured_modules} quantizers={disabled_quantizers}"
+    )
+    return configured_modules, disabled_quantizers
 
 
 def _iter_quant_ignore_suffix_variants(name: str) -> Iterator[str]:

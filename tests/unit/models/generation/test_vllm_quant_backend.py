@@ -71,6 +71,7 @@ def _make_vllm_config(tokenizer, quant_cfg, *, is_eval=True):
             "async_engine": False,
             "skip_tokenizer_init": False,
             "load_format": "auto",
+            "kv_cache_dtype": "auto",
             "enforce_eager": "False",
         },
         "colocated": {
@@ -119,13 +120,30 @@ def cluster():
 
 
 @requires_quant
-@pytest.mark.parametrize("recipe", ["kv_cache_fp8.yaml", "kv_cache_nvfp4.yaml"])
-def test_vllm_quant_refit(cluster, recipe, monkeypatch):
+@pytest.mark.parametrize(
+    ("recipe", "rollout_only"),
+    [
+        ("kv_cache_fp8.yaml", False),
+        ("kv_cache_nvfp4.yaml", False),
+        pytest.param("kv_cache_nvfp4.yaml", True, id="nvfp4-rollout-only"),
+    ],
+)
+def test_vllm_quant_refit(cluster, recipe, rollout_only, monkeypatch):
     """Calibrated simulated K/V state must match after Megatron-to-vLLM refit."""
     monkeypatch.setenv("ENABLE_BRIDGE_QUANT_MAPPING", "1")
+    if rollout_only:
+        monkeypatch.setenv("MODELOPT_KV_CACHE_QUANT_ROLLOUT_ONLY", "1")
     quant_cfg = str((_QUANT_CFG_DIR / recipe).resolve())
     tokenizer = get_tokenizer({"name": _MODEL_NAME})
     vllm_config = _make_vllm_config(tokenizer, quant_cfg)
+    if rollout_only:
+        vllm_config["vllm_cfg"].update(
+            {
+                "enforce_eager": True,
+                "enable_prefix_caching": False,
+            }
+        )
+        vllm_config["vllm_kwargs"]["attention_backend"] = "FLASH_ATTN"
     megatron_config = _make_megatron_config(vllm_config, quant_cfg)
 
     vllm_policy = None
@@ -147,16 +165,23 @@ def test_vllm_quant_refit(cluster, recipe, monkeypatch):
 
         megatron_policy = Policy(cluster, megatron_config, tokenizer)
 
-        # Megatron quantizers should be calibrated (amax > 0) after init
+        # Megatron K/V amax is calibrated even when learner QDQ is disabled.
         futures = megatron_policy.worker_group.run_all_workers_single_data(
             "get_quantizer_stats"
         )
         policy_stats = ray.get(futures)
         for rank, stats in enumerate(policy_stats):
-            assert stats["enabled"] > 0, f"Megatron rank {rank}: no enabled quantizers"
-            assert stats["positive_amax"] == stats["with_amax"], (
-                f"Megatron rank {rank}: {stats['with_amax'] - stats['positive_amax']} quantizers have non-positive amax"
-            )
+            if rollout_only:
+                assert stats["enabled"] == 0, (
+                    f"Megatron rank {rank}: learner quantizers remained enabled"
+                )
+            else:
+                assert stats["enabled"] > 0, (
+                    f"Megatron rank {rank}: no enabled quantizers"
+                )
+                assert stats["positive_amax"] == stats["with_amax"], (
+                    f"Megatron rank {rank}: {stats['with_amax'] - stats['positive_amax']} quantizers have non-positive amax"
+                )
             assert stats["kv_amax"], f"Megatron rank {rank}: no K/V amax state"
 
         # Refit: transfer pre-folded weights + input_quantizer amax from Megatron to vLLM
@@ -181,9 +206,10 @@ def test_vllm_quant_refit(cluster, recipe, monkeypatch):
         rollout_kv_amax = _kv_amax_by_layer(rollout_stats[0])
         assert rollout_kv_amax.keys() == policy_kv_amax.keys()
         for key, expected in policy_kv_amax.items():
-            torch.testing.assert_close(
-                rollout_kv_amax[key], expected, rtol=1e-2, atol=1e-3
+            tolerances = (
+                {"rtol": 0, "atol": 0} if rollout_only else {"rtol": 1e-2, "atol": 1e-3}
             )
+            torch.testing.assert_close(rollout_kv_amax[key], expected, **tolerances)
     finally:
         if vllm_policy:
             vllm_policy.shutdown()

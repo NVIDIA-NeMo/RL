@@ -123,7 +123,12 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
     import-free of ModelOpt.
     """
-    if os.environ.get("MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N", "0") != "0":
+    kv_quant_envs = (
+        "MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N",
+        "MODELOPT_KV_CACHE_QUANT_SKIP_LAST_N",
+        "MODELOPT_KV_CACHE_QUANT_ROLLOUT_ONLY",
+    )
+    if any(name in os.environ for name in kv_quant_envs):
         from nemo_rl.modelopt.utils import validate_kv_cache_quant_skip_config
 
         validate_kv_cache_quant_skip_config(config)
