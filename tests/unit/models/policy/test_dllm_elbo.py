@@ -7,6 +7,7 @@ from nemo_rl.models.policy.dllm import (
     DllmConfig,
     SdmcElboEstimator,
     get_quadrature,
+    resolve_mask_id,
 )
 
 MASK_ID = 126336
@@ -73,7 +74,7 @@ def test_per_position_contributions_sum_to_scalar_elbo():
     the per-token logprob slot that the rest of the stack already consumes.
     """
     cfg = make_cfg(quadrature="gauss-3")
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     input_ids, completion_mask = make_batch()
 
     torch.manual_seed(7)
@@ -90,7 +91,7 @@ def test_per_position_contributions_sum_to_scalar_elbo():
 
 def test_masking_never_touches_prompt_or_padding():
     cfg = make_cfg(quadrature="gauss-3", mc_samples=2)
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     input_ids, completion_mask = make_batch()
 
     for point in estimator.mask_points(input_ids, completion_mask, seed=0):
@@ -104,7 +105,7 @@ def test_masking_never_touches_prompt_or_padding():
 
 def test_masked_fraction_tracks_quadrature_time():
     cfg = make_cfg(quadrature="gauss-5")
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     input_ids, completion_mask = make_batch(completion_len=100)
     scorable = completion_mask.sum(-1)[0].item()
 
@@ -118,7 +119,7 @@ def test_masked_fraction_tracks_quadrature_time():
 def test_same_seed_gives_identical_masks():
     """old/ref/current ELBOs must share masks or the ratio is pure estimator noise."""
     cfg = make_cfg(quadrature="gauss-2")
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     input_ids, completion_mask = make_batch()
 
     first = [
@@ -141,7 +142,7 @@ def test_same_seed_gives_identical_masks():
 def test_at_least_one_position_masked_at_small_t():
     """A point that masks nothing would be scaled by 1/t into a NaN."""
     cfg = make_cfg(quadrature="gauss-5")
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     # 4 scorable positions and t as low as ~0.046 rounds to zero masked tokens.
     input_ids, completion_mask = make_batch(completion_len=4)
 
@@ -152,17 +153,22 @@ def test_at_least_one_position_masked_at_small_t():
 
 
 def test_num_forwards_matches_points_times_samples():
-    assert SdmcElboEstimator(make_cfg(quadrature="gauss-3")).num_forwards == 3
+    assert SdmcElboEstimator(make_cfg(quadrature="gauss-3"), MASK_ID).num_forwards == 3
     assert (
-        SdmcElboEstimator(make_cfg(quadrature="gauss-3", mc_samples=4)).num_forwards
+        SdmcElboEstimator(
+            make_cfg(quadrature="gauss-3", mc_samples=4), MASK_ID
+        ).num_forwards
         == 12
     )
-    assert SdmcElboEstimator(make_cfg(quadrature="mc", mc_samples=8)).num_forwards == 8
+    assert (
+        SdmcElboEstimator(make_cfg(quadrature="mc", mc_samples=8), MASK_ID).num_forwards
+        == 8
+    )
 
 
 def test_prompt_masking_corrupts_input_but_is_not_scored():
     cfg = make_cfg(quadrature="gauss-1", p_mask_prompt=1.0)
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     input_ids, completion_mask = make_batch()
 
     (point,) = list(estimator.mask_points(input_ids, completion_mask, seed=11))
@@ -196,7 +202,9 @@ def test_every_rule_recovers_a_known_closed_form_elbo(rule, mc_samples):
     a scale error, whatever the rule.
     """
     const = -0.25
-    estimator = SdmcElboEstimator(make_cfg(quadrature=rule, mc_samples=mc_samples))
+    estimator = SdmcElboEstimator(
+        make_cfg(quadrature=rule, mc_samples=mc_samples), MASK_ID
+    )
     input_ids, completion_mask = make_batch(batch=2, completion_len=128)
     scorable = completion_mask.sum(-1).float()
 
@@ -238,8 +246,8 @@ def test_sdmc_has_lower_variance_than_double_monte_carlo():
     base = -torch.rand(input_ids.shape)
 
     budget = 3
-    sdmc = SdmcElboEstimator(make_cfg(quadrature="gauss-3"))
-    double_mc = SdmcElboEstimator(make_cfg(quadrature="mc", mc_samples=budget))
+    sdmc = SdmcElboEstimator(make_cfg(quadrature="gauss-3"), MASK_ID)
+    double_mc = SdmcElboEstimator(make_cfg(quadrature="mc", mc_samples=budget), MASK_ID)
     assert sdmc.num_forwards == double_mc.num_forwards == budget
 
     sdmc_estimates = torch.tensor(
@@ -271,17 +279,41 @@ def test_sdmc_has_lower_variance_than_double_monte_carlo():
 )
 def test_yielded_points_match_the_advertised_forward_budget(rule, mc_samples):
     """num_forwards is what callers size their compute against, so it must be real."""
-    estimator = SdmcElboEstimator(make_cfg(quadrature=rule, mc_samples=mc_samples))
+    estimator = SdmcElboEstimator(
+        make_cfg(quadrature=rule, mc_samples=mc_samples), MASK_ID
+    )
     input_ids, completion_mask = make_batch()
 
     points = list(estimator.mask_points(input_ids, completion_mask, seed=0))
     assert len(points) == estimator.num_forwards
 
 
-def test_mask_id_is_required():
-    """A wrong or missing mask id silently corrupts the likelihood."""
-    with pytest.raises(Exception):
-        DllmConfig(enabled=True)
+class _FakeModelConfig:
+    """Stands in for a Hugging Face config exposing a mask token id."""
+
+    def __init__(self, **attrs):
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+
+def test_mask_id_is_read_from_the_model_when_unset():
+    """LLaDA publishes mask_token_id=126336, so users should not retype it."""
+    cfg = DllmConfig(enabled=True)
+    assert cfg.mask_id is None
+    assert resolve_mask_id(cfg, _FakeModelConfig(mask_token_id=MASK_ID)) == MASK_ID
+
+
+def test_explicit_mask_id_overrides_the_model():
+    """An escape hatch for a model whose config is wrong or absent."""
+    cfg = make_cfg(mask_id=999)
+    assert resolve_mask_id(cfg, _FakeModelConfig(mask_token_id=MASK_ID)) == 999
+
+
+def test_missing_mask_id_everywhere_raises_with_guidance():
+    """Silently guessing a mask id would corrupt the likelihood, not crash."""
+    cfg = DllmConfig(enabled=True)
+    with pytest.raises(ValueError, match="no mask token id is available"):
+        resolve_mask_id(cfg, _FakeModelConfig(vocab_size=126464))
 
 
 def test_defaults_match_the_papers_recommended_setting():
@@ -290,12 +322,12 @@ def test_defaults_match_the_papers_recommended_setting():
     assert cfg.mc_samples == 1
     assert cfg.shift_targets is False
     assert not cfg.enabled
-    assert SdmcElboEstimator(cfg).num_forwards == 2
+    assert SdmcElboEstimator(cfg, MASK_ID).num_forwards == 2
 
 
 def test_estimator_is_dtype_preserving():
     cfg = make_cfg(quadrature="gauss-2")
-    estimator = SdmcElboEstimator(cfg)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
     input_ids, completion_mask = make_batch()
 
     for point in estimator.mask_points(input_ids, completion_mask, seed=2):

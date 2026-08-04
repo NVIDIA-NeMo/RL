@@ -13,6 +13,8 @@
 # limitations under the License.
 """Configuration for masked diffusion language model (dLLM) policies."""
 
+from typing import Any, Optional
+
 from pydantic import BaseModel
 
 
@@ -34,10 +36,14 @@ class DllmConfig(BaseModel, extra="allow"):
     enabled: bool = False
     """Whether the policy is a masked diffusion LM."""
 
-    mask_id: int
-    """Token id of the ``[MASK]`` token. Model-specific and required: 126336 for
-    LLaDA-8B, 156895 for LLaDA2.0. A wrong value silently corrupts the
-    likelihood, so there is deliberately no default."""
+    mask_id: Optional[int] = None
+    """Token id of the ``[MASK]`` token.
+
+    Model-specific, and a wrong value silently corrupts the likelihood rather
+    than failing, so there is no static default. Leave unset to read it from the
+    model's own config (LLaDA publishes ``mask_token_id``); set it explicitly
+    only for a model that does not. :func:`resolve_mask_id` performs that
+    lookup, and raises if neither source supplies one."""
 
     quadrature: str = "gauss-2"
     """Integration rule over the mask ratio t. One of ``gauss-1`` .. ``gauss-5``
@@ -67,3 +73,41 @@ class DllmConfig(BaseModel, extra="allow"):
     cfg_scale: float = 0.0
     """Unsupervised classifier-free guidance scale. 0.0 disables guidance and
     halves the number of forward passes."""
+
+
+# Attributes a masked diffusion model may publish its mask token id under.
+_MASK_ID_ATTRS = ("mask_token_id", "mask_id")
+
+
+def resolve_mask_id(cfg: DllmConfig, model_config: Any) -> int:
+    """Resolves the mask token id from the config, falling back to the model.
+
+    An explicit ``cfg.mask_id`` wins so a model with a mislabeled config can be
+    corrected, but the model's own value is preferred over asking the user to
+    retype a constant they cannot verify.
+
+    Args:
+        cfg: The dLLM policy configuration.
+        model_config: The Hugging Face model config to read ``mask_token_id``
+            from when ``cfg.mask_id`` is unset.
+
+    Returns:
+        The mask token id to substitute at masked positions.
+
+    Raises:
+        ValueError: If neither the config nor the model supplies a mask token id.
+    """
+    if cfg.mask_id is not None:
+        return cfg.mask_id
+
+    for attr in _MASK_ID_ATTRS:
+        value = getattr(model_config, attr, None)
+        if value is not None:
+            return int(value)
+
+    raise ValueError(
+        "policy.dllm.enabled is true but no mask token id is available: "
+        f"policy.dllm.mask_id is unset and the model config exposes none of "
+        f"{_MASK_ID_ATTRS}. Set policy.dllm.mask_id explicitly (126336 for "
+        "LLaDA-8B, 156895 for LLaDA2.0)."
+    )

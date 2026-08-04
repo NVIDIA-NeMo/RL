@@ -145,7 +145,7 @@ class SdmcElboEstimator:
 
     The caller drives the loop::
 
-        estimator = SdmcElboEstimator(cfg)
+        estimator = SdmcElboEstimator(cfg, resolve_mask_id(cfg, model.config))
         elbo_per_position = torch.zeros_like(input_ids, dtype=torch.float32)
         for point in estimator.mask_points(input_ids, completion_mask, seed=seed):
             logprobs = score(point.input_ids)  # one forward, position-aligned
@@ -156,14 +156,19 @@ class SdmcElboEstimator:
     that the rest of the training stack already understands.
     """
 
-    def __init__(self, cfg: DllmConfig):
+    def __init__(self, cfg: DllmConfig, mask_id: int):
         """Initializes the estimator.
 
         Args:
-            cfg: The dLLM policy configuration supplying the mask token, the
-                integration rule, and the number of Monte Carlo mask draws.
+            cfg: The dLLM policy configuration supplying the integration rule
+                and the number of Monte Carlo mask draws.
+            mask_id: The resolved mask token id, from
+                :func:`nemo_rl.models.policy.dllm.config.resolve_mask_id`. Passed
+                separately rather than read off ``cfg`` because ``cfg.mask_id``
+                is optional -- it may still need resolving against the model.
         """
         self.cfg = cfg
+        self.mask_id = mask_id
         self.times, self.weights = get_quadrature(cfg.quadrature)
 
     @property
@@ -223,7 +228,7 @@ class SdmcElboEstimator:
         for time, weight, draws in schedule:
             for _ in range(draws):
                 masked = self._draw_mask(completion_mask, time, generator)
-                noisy = torch.where(masked, self.cfg.mask_id, input_ids)
+                noisy = torch.where(masked, self.mask_id, input_ids)
                 if self.cfg.p_mask_prompt > 0.0:
                     noisy, masked = self._mask_prompt(
                         noisy, masked, completion_mask, input_ids, generator
@@ -294,7 +299,7 @@ class SdmcElboEstimator:
         Prompt positions are corrupted as a regularizer but are never scored, so
         they are added to the model input without entering the returned mask.
         """
-        is_prompt = ~completion_mask & (input_ids != self.cfg.mask_id)
+        is_prompt = ~completion_mask & (input_ids != self.mask_id)
         draw = torch.rand(noisy.shape, generator=generator, device=noisy.device)
         corrupt = is_prompt & (draw < self.cfg.p_mask_prompt)
-        return torch.where(corrupt, self.cfg.mask_id, noisy), masked
+        return torch.where(corrupt, self.mask_id, noisy), masked

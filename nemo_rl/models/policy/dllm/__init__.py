@@ -19,7 +19,7 @@ Implements the sequence-level ELBO likelihood used by GDPO
 estimator from https://arxiv.org/abs/2601.05242.
 """
 
-from nemo_rl.models.policy.dllm.config import DllmConfig
+from nemo_rl.models.policy.dllm.config import DllmConfig, resolve_mask_id
 from nemo_rl.models.policy.dllm.elbo import (
     MaskPoint,
     SdmcElboEstimator,
@@ -29,6 +29,7 @@ from nemo_rl.models.policy.dllm.elbo import (
 __all__ = [
     "DllmConfig",
     "MaskPoint",
+    "resolve_mask_id",
     "SdmcElboEstimator",
     "get_quadrature",
 ]
