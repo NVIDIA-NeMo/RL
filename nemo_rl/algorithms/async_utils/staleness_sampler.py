@@ -100,16 +100,6 @@ class PromptGroupSampler(Protocol):
         """True when the policy admits zero staleness (sync mode)."""
         ...
 
-    @property
-    def supports_buffer_checkpoint(self) -> bool:
-        """True when buffered groups may be checkpointed and restored.
-
-        Gated policies dispatch a fixed quota per trainer step, so groups
-        restored from a checkpoint can never complete an already-consumed
-        quota window — only ungated (over-sampled) policies can consume them.
-        """
-        ...
-
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
@@ -189,10 +179,6 @@ class BaseSampler(abc.ABC):
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
 
-    @property
-    def supports_buffer_checkpoint(self) -> bool:
-        return False
-
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
 
@@ -262,12 +248,6 @@ class WindowedSampler(BaseSampler):
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
-
-    @property
-    def supports_buffer_checkpoint(self) -> bool:
-        # Ungated: restored groups are ordinary in-window candidates, so the
-        # buffer can round-trip through a checkpoint.
-        return True
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         # Over-sampled: dispatch is bounded by buffer capacity, not by version.
@@ -521,8 +501,7 @@ def create_sampler(
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
                 f"interface (needs admit/select/evict, set_dispatch_index, "
-                f"is_on_policy, supports_buffer_checkpoint, "
-                f"required_buffer_capacity)"
+                f"is_on_policy, required_buffer_capacity)"
             )
         return sampler
     raise ValueError(f"unknown sampler config {type(cfg).__name__}")

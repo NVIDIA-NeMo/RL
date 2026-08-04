@@ -25,7 +25,7 @@ Covers:
   - dataloader state: train_dataloader.pt written at save, position
     round-trip through a real StatefulDataLoader, dataset-swap guard,
     setup restore wiring + missing-file corruption check;
-  - replay buffer persistence gated on sampler.supports_buffer_checkpoint;
+  - replay buffer persistence (restore skipped on a sampler_name mismatch);
   - setup_single_controller resume-path wiring (get_resume_paths forwarded
     to the trainer factory, save_state loaded from training_info.json).
 """
@@ -45,10 +45,7 @@ import torch
 import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    InOrderSamplerConfig,
-    WindowedSamplerConfig,
-)
+from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -153,8 +150,7 @@ class _FailingFinalizeTrainer(_FakeTrainer):
 class _FakeSampler:
     """PromptGroupSampler stand-in: always returns a full, fresh batch."""
 
-    def __init__(self, supports_buffer_checkpoint: bool = True) -> None:
-        self._supports_buffer_checkpoint = supports_buffer_checkpoint
+    def __init__(self) -> None:
         self._step = 0
 
     async def admit(self, *, trainer_version_fn) -> Optional[int]:
@@ -185,10 +181,6 @@ class _FakeSampler:
     @property
     def is_on_policy(self) -> bool:
         return False
-
-    @property
-    def supports_buffer_checkpoint(self) -> bool:
-        return self._supports_buffer_checkpoint
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
@@ -292,20 +284,13 @@ def _actor_master_config(
     checkpoint_must_save_by: Optional[str] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
-    buffer_checkpoint: bool = True,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
     All fields are populated (init_tmp_checkpoint dumps the whole config to
     config.yaml); values satisfy validate_single_controller_config.
-    buffer_checkpoint selects the sampler: windowed supports replay-buffer
-    checkpointing, the gated in_order sampler does not.
     """
-    sampler_cfg = (
-        WindowedSamplerConfig(max_staleness_versions=1)
-        if buffer_checkpoint
-        else InOrderSamplerConfig(max_lookahead_versions=1)
-    )
+    sampler_cfg = WindowedSamplerConfig(max_staleness_versions=1)
     return MasterConfig.model_construct(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
@@ -393,9 +378,7 @@ def _run_train_pump(
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args)
-        actor._sampler = _FakeSampler(
-            supports_buffer_checkpoint=(mc.async_rl.sampler.name == "windowed")
-        )
+        actor._sampler = _FakeSampler()
         # In-process runs have no Ray runtime; the pump only reads the GPU
         # count for a throughput metric.
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
@@ -642,28 +625,6 @@ class TestAsyncSaveFinalization:
 
         with pytest.raises(RuntimeError, match="finalization failed"):
             _run_train_pump(mc, _make_actor_args(trainer=trainer), flush=False)
-
-    def test_save_checkpoint_records_val_metrics(self, tmp_path):
-        # Direct _save_checkpoint call: the val_metrics parameter feeds both
-        # val_reward and a val:* metric_name (wired by the future validation
-        # loop; the pump passes None today).
-        mc = _actor_master_config(
-            tmp_path, max_num_steps=2, save_period=2, metric_name="val:accuracy"
-        )
-
-        async def _main():
-            actor = _ACTOR_CLS(mc, _make_actor_args())
-            actor._train_steps = 2
-            await actor._save_checkpoint({"loss": 1.0}, val_metrics={"accuracy": 0.75})
-            actor._checkpointer.shutdown()
-            return actor
-
-        actor = asyncio.run(_main())
-
-        info = _training_info(tmp_path / "checkpoints", 2)
-        assert info["val_reward"] == 0.75
-        assert info["val:accuracy"] == 0.75
-        assert actor._save_state["val_reward"] == 0.75
 
 
 # ── metric_name behavior ─────────────────────────────────────────────────────
@@ -993,8 +954,15 @@ class TestDataloaderState:
 # ── replay buffer persistence ────────────────────────────────────────────────
 
 
+def _matching_save_state() -> dict[str, Any]:
+    """save_state whose sampler_name matches _actor_master_config's sampler."""
+    save_state = _default_grpo_save_state()
+    save_state["sampler_name"] = "windowed"
+    return save_state
+
+
 class TestReplayBufferPersistence:
-    def test_save_writes_replay_buffer_when_sampler_supports_it(self, tmp_path):
+    def test_save_writes_replay_buffer(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
         envelope = {"groups": [], "sentinel": "abc"}
         buffer = _FakeTQBuffer(state=envelope)
@@ -1005,21 +973,10 @@ class TestReplayBufferPersistence:
         buffer_path = ckpt_dir / "step_2" / "replay_buffer.pt"
         assert buffer_path.exists()
         assert torch.load(buffer_path, weights_only=False) == envelope
-        # state_dict is stamped with the capacity at save time.
+        # state_dict is stamped with the capacity at save time; the sampler
+        # identity lands in training_info.json for the restore-side check.
         assert buffer.state_dict_calls == [4]
-
-    def test_no_replay_buffer_with_gated_sampler(self, tmp_path):
-        mc = _actor_master_config(
-            tmp_path, max_num_steps=2, save_period=2, buffer_checkpoint=False
-        )
-        buffer = _FakeTQBuffer()
-
-        _run_train_pump(mc, _make_actor_args(tq_buffer=buffer))
-
-        ckpt_dir = tmp_path / "checkpoints"
-        assert (ckpt_dir / "step_2" / "training_info.json").exists()
-        assert not (ckpt_dir / "step_2" / "replay_buffer.pt").exists()
-        assert buffer.state_dict_calls == []
+        assert _training_info(ckpt_dir, 2)["sampler_name"] == "windowed"
 
     def test_run_restores_replay_buffer_and_permits(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
@@ -1031,7 +988,11 @@ class TestReplayBufferPersistence:
 
         actor, result = _run_actor_run(
             mc,
-            _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+            ),
         )
 
         assert buffer.load_calls == [
@@ -1057,7 +1018,11 @@ class TestReplayBufferPersistence:
 
         actor, result = _run_actor_run(
             mc,
-            _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+            ),
         )
 
         assert len(buffer.load_calls) == 1
@@ -1065,8 +1030,8 @@ class TestReplayBufferPersistence:
         assert result["train_steps"] == 0
 
     def test_run_missing_replay_buffer_file_starts_empty(self, tmp_path, monkeypatch):
-        # Resuming from a checkpoint written by a gated-sampler run: no
-        # replay_buffer.pt.
+        # Resuming from a checkpoint that predates replay-buffer persistence:
+        # no replay_buffer.pt.
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
         mc = _actor_master_config(tmp_path, max_num_steps=0)
@@ -1086,19 +1051,32 @@ class TestReplayBufferPersistence:
         assert actor._buffer_capacity._value == 4  # zero permits consumed
         assert any("No replay buffer checkpoint found" in line for line in printed)
 
-    def test_run_no_restore_with_gated_sampler(self, tmp_path):
-        # File present but the sampler doesn't support buffer checkpointing:
-        # nothing is restored.
+    def test_run_no_restore_on_sampler_mismatch(self, tmp_path, monkeypatch):
+        # File present but the checkpoint's training_info records a different
+        # sampler: warn and skip — the saved stamps may never be selectable
+        # under the current policy.
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
         torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
-        mc = _actor_master_config(tmp_path, max_num_steps=0, buffer_checkpoint=False)
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        save_state = _default_grpo_save_state()
+        save_state["sampler_name"] = "in_order"  # current run uses windowed
         buffer = _FakeTQBuffer(load_return=2)
+        printed: list[str] = []
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        )
 
         actor, _ = _run_actor_run(
             mc,
-            _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=save_state,
+            ),
         )
 
         assert buffer.load_calls == []
         assert actor._buffer_capacity._value == 4
+        assert any("skipping the buffer restore" in line for line in printed)

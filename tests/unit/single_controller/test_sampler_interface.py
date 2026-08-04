@@ -304,23 +304,6 @@ class TestDefaultEvictSkipsUnready:
         assert _run(s.evict(current_train_weight=5)) == 0
 
 
-class TestSupportsBufferCheckpoint:
-    """Only ungated (over-sampled) policies may checkpoint buffered groups."""
-
-    def test_windowed_supports_buffer_checkpoint(self):
-        assert WindowedSampler(
-            FakeBuffer(), max_staleness_versions=1
-        ).supports_buffer_checkpoint
-
-    def test_gated_samplers_do_not(self):
-        assert not WeightFifoSampler(
-            FakeBuffer(), max_staleness_versions=1
-        ).supports_buffer_checkpoint
-        assert not InOrderSampler(
-            FakeBuffer(), max_lookahead_versions=1
-        ).supports_buffer_checkpoint
-
-
 class TestDispatchCursorRestore:
     """Checkpoint resume calls set_dispatch_index(current_step), restoring the
     fresh-start invariant _dispatch_index == trainer_version - 1. Without it,

@@ -255,18 +255,27 @@ class SingleControllerActor:
     async def _maybe_restore_replay_buffer(self) -> None:
         """Restore replay-buffer groups from the previous run's checkpoint.
 
-        No-op unless the sampler supports_buffer_checkpoint (ungated only).
+        Skipped with a warning when the checkpoint was written under a
+        different sampler: restored groups carry the saving sampler's
+        weight/target-step stamps, which another policy may never select.
         """
-        if not (
-            self._sampler.supports_buffer_checkpoint
-            and self._last_checkpoint_path is not None
-        ):
+        if self._last_checkpoint_path is None:
             return
         buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
         if not os.path.exists(buffer_path):
             print(
                 f"⚠️ No replay buffer checkpoint found at {buffer_path}. "
                 "Starting with an empty replay buffer.",
+                flush=True,
+            )
+            return
+        saved_sampler_name = self._save_state.get("sampler_name")
+        current_sampler_name = self._async_cfg.sampler.name
+        if saved_sampler_name != current_sampler_name:
+            print(
+                f"⚠️ Replay buffer checkpoint was saved with sampler "
+                f"{saved_sampler_name!r} but this run uses "
+                f"{current_sampler_name!r}; skipping the buffer restore.",
                 flush=True,
             )
             return
@@ -663,16 +672,11 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
-    async def _save_checkpoint(
-        self,
-        step_metrics: dict[str, Any],
-        val_metrics: Optional[dict[str, Any]] = None,
-    ) -> None:
+    async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
         """Write a full checkpoint for the just-finished train step.
 
         Everything except the (possibly async) policy weight write must be
         on disk before begin_finalization; rollouts keep running throughout.
-        val_metrics stays None until SC grows a validation loop.
         """
         save_state = self._save_state
         save_state["current_step"] = self._train_steps
@@ -680,13 +684,15 @@ class SingleControllerActor:
         save_state["current_epoch"] = self._current_epoch
         save_state["consumed_samples"] = self._consumed_samples
         save_state["total_valid_tokens"] = self._total_valid_tokens
+        # The restore skips the replay buffer when the resuming run uses a
+        # different sampler (its stamps may never be selectable there).
+        save_state["sampler_name"] = self._async_cfg.sampler.name
         # Snapshot before any await so it can't interleave with
         # _rollout_pump iterating this same dataloader.
         dataloader_state = self._dataloader.state_dict()
-        if val_metrics is not None:
-            save_state["val_reward"] = val_metrics["accuracy"]
-        elif "val_reward" in save_state:
-            del save_state["val_reward"]
+        # SC has no validation loop yet; drop the default sentinel instead of
+        # persisting a bogus val_reward.
+        save_state.pop("val_reward", None)
 
         full_metric_name = self._master_config.checkpointing["metric_name"]
         if full_metric_name is not None:
@@ -699,7 +705,7 @@ class SingleControllerActor:
                 f" e.g. 'val_reward --> 'val:accuracy'"
             )
             prefix, metric_name = full_metric_name.split(":", 1)
-            metrics_source = step_metrics if prefix == "train" else val_metrics
+            metrics_source = step_metrics if prefix == "train" else None
             if not metrics_source:
                 warnings.warn(
                     f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
@@ -742,15 +748,14 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
-        if self._sampler.supports_buffer_checkpoint:
-            buffer_state = await self._buffer.state_dict(
-                saved_capacity=self._async_cfg.max_buffered_rollouts
-            )
-            await asyncio.to_thread(
-                torch.save,
-                buffer_state,
-                os.path.join(checkpoint_path, "replay_buffer.pt"),
-            )
+        buffer_state = await self._buffer.state_dict(
+            saved_capacity=self._async_cfg.max_buffered_rollouts
+        )
+        await asyncio.to_thread(
+            torch.save,
+            buffer_state,
+            os.path.join(checkpoint_path, "replay_buffer.pt"),
+        )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
