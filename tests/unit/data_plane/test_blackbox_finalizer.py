@@ -185,11 +185,12 @@ def _fetch_rows(tq_client, sample_ids):
 
 def test_finalize_group_builds_n_rows_with_placeholder(tq_client, partitions):
     group_id = "grp1"
+    canonical_sample_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    rollout_ids = [f"{sample_id}_aattempt-1" for sample_id in canonical_sample_ids]
     receipt, expected = _stage_fixture(
-        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
-    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt["rollout_id"] = rollout_ids[0]
 
     finalizer = _finalizer(tq_client)
     finalized = finalizer.finalize_group(
@@ -198,11 +199,12 @@ def test_finalize_group_builds_n_rows_with_placeholder(tq_client, partitions):
         [receipt, None],  # second rollout lost its receipt -> placeholder
         [1.0, 0.0],
         fallback_weight_version=9,
+        canonical_sample_ids=canonical_sample_ids,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
     assert finalized.fields is not None
-    assert finalized.meta.sample_ids == rollout_ids
+    assert finalized.meta.sample_ids == canonical_sample_ids
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
@@ -228,7 +230,7 @@ def test_finalize_group_builds_n_rows_with_placeholder(tq_client, partitions):
     assert finalized.staging_keys == [receipt["manifest"][0]["staging_key"]]
     assert finalizer._source.fetch(finalized.staging_keys)
     with pytest.raises((KeyError, RuntimeError, ValueError)):
-        _fetch_rows(tq_client, rollout_ids)
+        _fetch_rows(tq_client, canonical_sample_ids)
 
 
 def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):

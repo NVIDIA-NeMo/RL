@@ -45,6 +45,10 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
 )
+from nemo_rl.experience.rollout_recovery import (
+    RolloutAttemptStatus,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -151,6 +155,7 @@ def _make_manager(
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
     mgr._finalizer = None
+    mgr._recovery_ledger = None
     mgr._env_handles = {}
     mgr._weight_version = 0
     mgr._retry_policy = (
@@ -1018,10 +1023,24 @@ class _FakeFinalizer:
         self._dropped = dropped
 
     def finalize_group(
-        self, group_id, rollout_ids, receipts, rewards, *, fallback_weight_version
+        self,
+        group_id,
+        rollout_ids,
+        receipts,
+        rewards,
+        *,
+        fallback_weight_version,
+        canonical_sample_ids=None,
     ):
         self.calls.append(
-            (group_id, rollout_ids, receipts, rewards, fallback_weight_version)
+            (
+                group_id,
+                rollout_ids,
+                receipts,
+                rewards,
+                fallback_weight_version,
+                canonical_sample_ids,
+            )
         )
         return _FakeFinalizedGroup(dropped=self._dropped)
 
@@ -1109,8 +1128,12 @@ def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
     mgr._num_generations_per_prompt = num_generations
     mgr._tq_buffer = buf
     mgr._finalizer = finalizer
+    mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
     mgr._weight_version = 7
+    mgr._retry_policy = RolloutRetryPolicy.single_attempt()
+    mgr._stats = RolloutStats()
+    mgr._skipped_prompts = 0
 
     class _CaptureImpl:
         def __init__(self):
@@ -1128,24 +1151,54 @@ def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
     return mgr
 
 
+def _capture_sample():
+    return {
+        "idx": 42,
+        "message_log": [],
+        "extra_env_info": {},
+        "task_name": "nemo_gym",
+    }
+
+
 class TestGenerateAndFinalizeFlow:
     def test_mints_ids_finalizes_and_commits(self):
         buf = _FakeCaptureBuffer()
         finalizer = _FakeFinalizer()
-        mgr = _make_capture_manager(buf, finalizer)
+        observed_recovery_groups = []
 
-        _run(mgr.generate_and_push({"prompt": "p"}, target_step=5))
+        async def _observe_dispatched_group(_sample):
+            observed_recovery_groups.append(
+                mgr.recovery_ledger.get_group(buf._slots[0])
+            )
 
-        # Rollout ids were minted from the reserved group id and threaded
-        # end to end: reserve -> impl -> finalizer.
+        mgr = _make_capture_manager(buf, finalizer, on_run=_observe_dispatched_group)
+
+        _run(mgr.generate_and_push(_capture_sample(), target_step=5))
+
+        # Canonical IDs are stable logical siblings. Physical gate IDs carry
+        # an attempt suffix and are threaded reserve -> impl -> finalizer.
         (group_id,) = buf._slots
-        expected_ids = [f"{group_id}_g0", f"{group_id}_g1"]
-        assert buf.reserve_rollout_ids == [expected_ids]
-        assert mgr._impl.seen_rollout_ids == expected_ids
-        (fin_group_id, fin_ids, receipts, rewards, fallback_wv) = finalizer.calls[0]
+        logical_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+        (gate_ids,) = buf.reserve_rollout_ids
+        assert gate_ids is not None
+        assert all(
+            gate_id.startswith(f"{logical_id}_a")
+            for gate_id, logical_id in zip(gate_ids, logical_ids)
+        )
+        assert len(set(gate_ids)) == 2
+        assert mgr._impl.seen_rollout_ids == gate_ids
+        (
+            fin_group_id,
+            fin_ids,
+            receipts,
+            rewards,
+            fallback_wv,
+            canonical_ids,
+        ) = finalizer.calls[0]
         assert fin_group_id == group_id
-        assert fin_ids == expected_ids
-        assert [r["rollout_id"] for r in receipts] == expected_ids
+        assert fin_ids == gate_ids
+        assert canonical_ids == logical_ids
+        assert [r["rollout_id"] for r in receipts] == gate_ids
         assert rewards == [0.5, 0.5]
         assert fallback_wv == 7
         # commit_finalized carried the group's min/max call versions.
@@ -1162,12 +1215,21 @@ class TestGenerateAndFinalizeFlow:
         # The legacy commit path was not used and nothing failed at the gate.
         assert buf.commit_calls == []
         assert mgr._env_handles["nemo_gym"].failed == []
+        (recovery_group,) = observed_recovery_groups
+        assert recovery_group.prompt_id == "42"
+        assert recovery_group.target_step == 5
+        assert recovery_group.logical_rollout_ids == logical_ids
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.DISPATCHED
+            for sibling in recovery_group.siblings
+        )
+        assert len(mgr.recovery_ledger) == 0
 
     def test_dropped_group_aborts_slot(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf, _FakeFinalizer(dropped=True))
         with pytest.raises(RuntimeError, match="min_valid_fraction"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push(_capture_sample()))
         assert buf.commit_finalized_calls == []
         assert len(buf.abort_finalized_calls) == 1
         assert len(buf.abort_calls) >= 1
@@ -1180,10 +1242,18 @@ class TestGenerateAndFinalizeFlow:
 
         mgr = _make_capture_manager(buf, _FakeFinalizer(), on_run=_boom)
         with pytest.raises(RuntimeError, match="rollout exploded"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push(_capture_sample()))
         assert buf.commit_finalized_calls == []
-        assert len(buf.abort_calls) == 1
+        assert len(buf.remove_calls) == 1
         (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[0]
-        (group_id,) = [buf.abort_calls[0]]
-        assert failed_ids == [f"{group_id}_g0", f"{group_id}_g1"]
+        (group_id,) = buf.remove_calls
+        assert all(
+            gate_id.startswith(f"{group_id}_g{generation_index}_a")
+            for generation_index, gate_id in enumerate(failed_ids)
+        )
         assert reason == "dispatch_failed"
+        recovery_group = mgr.recovery_ledger.get_group(group_id)
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.ABANDONED
+            for sibling in recovery_group.siblings
+        )

@@ -16,7 +16,6 @@ import asyncio
 import copy
 import enum
 import json
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -41,6 +40,7 @@ from nemo_rl.experience.failures import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
@@ -1156,6 +1156,7 @@ class RolloutManager:
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
         finalizer: Optional[Any] = None,
+        recovery_ledger: Optional[RolloutRecoveryLedger] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1172,6 +1173,10 @@ class RolloutManager:
         if finalizer is not None:
             assert use_nemo_gym, (
                 "token capture (finalizer) is only supported on the NeMo-Gym path"
+            )
+        if recovery_ledger is not None and finalizer is None:
+            raise ValueError(
+                "rollout recovery ledger is only supported with token capture"
             )
 
         if not use_nemo_gym:
@@ -1206,6 +1211,13 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._finalizer = finalizer
+        self._recovery_ledger = (
+            recovery_ledger
+            if recovery_ledger is not None
+            else RolloutRecoveryLedger()
+            if finalizer is not None
+            else None
+        )
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
@@ -1218,6 +1230,11 @@ class RolloutManager:
     def stats(self) -> RolloutStats:
         """Counters describing retry/skip activity so far."""
         return self._stats
+
+    @property
+    def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
+        """Return the controller-local token-capture recovery ledger."""
+        return self._recovery_ledger
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -1290,6 +1307,7 @@ class RolloutManager:
         infra_attempts = 0
         data_attempts = 0
         last_infra_error: Optional[Exception] = None
+        recovery_group_id: Optional[str] = None
 
         # The loop condition is the infrastructure budget, so running out of it exits
         # here rather than raising from inside the handler. The data budget is tracked
@@ -1297,28 +1315,48 @@ class RolloutManager:
         # about the prompt rather than about the fleet.
         while infra_attempts < policy.max_infra_attempts:
             start_version = self._weight_version
-            # Reserved inside the loop so each attempt owns a fresh group_id: rows a
-            # failed attempt may have written cannot then collide with the retry's.
+            # Native retries reserve fresh group IDs. Token-capture retries preserve
+            # the logical group while minting fresh physical sibling attempt IDs.
             rollout_ids: Optional[list[str]] = None
             if self._finalizer is None:
                 group_id = self._tq_buffer.reserve(
                     weight_version=start_version, target_step=target_step
                 )
             else:
-                group_id = str(uuid.uuid4())
-                rollout_ids = [
-                    f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
-                ]
+                assert self._recovery_ledger is not None
+                if recovery_group_id is None:
+                    recovery_group = self._recovery_ledger.reserve_group(
+                        prompt_id=str(input_sample["idx"]),
+                        prompt_payload=input_sample,
+                        expected_generations=self._num_generations_per_prompt,
+                        target_step=target_step,
+                        start_weight_version=start_version,
+                    )
+                    recovery_group_id = recovery_group.group_id
+                else:
+                    recovery_group = self._recovery_ledger.get_group(
+                        recovery_group_id
+                    )
+                    for sibling in recovery_group.siblings:
+                        self._recovery_ledger.retry_sibling(
+                            recovery_group_id,
+                            generation_index=sibling.generation_index,
+                        )
+                    recovery_group = self._recovery_ledger.get_group(
+                        recovery_group_id
+                    )
+                group_id = recovery_group.group_id
+                start_version = recovery_group.start_weight_version
+                rollout_ids = recovery_group.gate_rollout_ids
                 self._tq_buffer.reserve(
                     weight_version=start_version,
                     target_step=target_step,
                     group_id=group_id,
                     rollout_ids=rollout_ids,
                 )
+                self._recovery_ledger.mark_group_dispatched(group_id)
             try:
-                # Registered per ATTEMPT, not per prompt: each retry reserves a fresh
-                # group_id, so the controller's registry must follow the attempt that
-                # actually owns the slot it might abort.
+                # Registered only while this attempt owns an active buffer slot.
                 if inflight_registry is not None:
                     current_task = asyncio.current_task()
                     assert current_task is not None
@@ -1339,8 +1377,13 @@ class RolloutManager:
                             input_sample,
                             group_id=group_id,
                             rollout_ids=rollout_ids,
+                            canonical_sample_ids=(
+                                recovery_group.logical_rollout_ids
+                            ),
                             start_version=start_version,
                         )
+                        self._recovery_ledger.mark_group_finalized(group_id)
+                        self._recovery_ledger.release_finalized_group(group_id)
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(group_id, None)
@@ -1350,6 +1393,8 @@ class RolloutManager:
                 # Cleanup failure must not mask the error that caused it.
                 if rollout_ids is not None:
                     await self._fail_capture_rollouts(group_id, rollout_ids)
+                    assert self._recovery_ledger is not None
+                    self._recovery_ledger.abandon_group(group_id)
                 try:
                     await self._tq_buffer.remove_group(group_id)
                 except Exception as cleanup_exc:
@@ -1387,6 +1432,10 @@ class RolloutManager:
                             "sequence-length configuration is likely wrong"
                         ) from error
                     self._skipped_prompts += 1
+                    if recovery_group_id is not None:
+                        assert self._recovery_ledger is not None
+                        self._recovery_ledger.discard_group(recovery_group_id)
+                        recovery_group_id = None
                     print(
                         f"skipping prompt idx={input_sample['idx']} after "
                         f"{data_attempts} deterministic failure(s) ({reason}: {error})",
@@ -1404,6 +1453,8 @@ class RolloutManager:
                 # Cancellation and other non-Exception exits: clean up, never retry.
                 if rollout_ids is not None:
                     await self._fail_capture_rollouts(group_id, rollout_ids)
+                    assert self._recovery_ledger is not None
+                    self._recovery_ledger.abandon_group(group_id)
                 try:
                     await self._tq_buffer.remove_group(group_id)
                 except Exception as cleanup_exc:
@@ -1437,6 +1488,7 @@ class RolloutManager:
         *,
         group_id: str,
         rollout_ids: list[str],
+        canonical_sample_ids: list[str],
         start_version: int,
     ) -> None:
         """Finalize one already-reserved token-capture rollout attempt."""
@@ -1453,6 +1505,7 @@ class RolloutManager:
             receipts,
             rewards,
             fallback_weight_version=start_version,
+            canonical_sample_ids=canonical_sample_ids,
         )
         record.rollout_metrics.update(finalized.metrics)
         if finalized.dropped:
