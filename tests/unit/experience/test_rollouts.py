@@ -141,12 +141,7 @@ class TestPct:
 class _DummyTokenizer:
     pad_token_id = 0
 
-    def batch_decode(
-        self,
-        generated_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    ):
+    def batch_decode(self, generated_ids, skip_special_tokens=True):
         return ["ok" for _ in generated_ids]
 
 
