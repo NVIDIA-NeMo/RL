@@ -1,84 +1,130 @@
-# Full GLM-5.2 131K stress recipe on 72 H100 nodes. The allocation reserves
-# 64 nodes for TP2/PP8/CP32/EP64 training and 8 nodes for vLLM generation.
-# TP2 * PP8 * CP32 consumes all 512 training GPUs, preserving the DP=1
-# layout of the verified GLM-5.1 131K run. This is important for the
-# fixed-size EP64 all-gather token dispatcher when sequence packing is used.
-defaults: ./grpo-glm5.2-72n8g-megatron-8K-full-onpolicy-h100-cudnn-noncolocated.yaml
+# Full GLM-5.2 131K recipe on 72 H100 nodes: 64 nodes for
+# TP2/PP8/CP32/EP64 training and 8 nodes for non-colocated vLLM generation.
+# Inherit directly from the GRPO exemplar so this recipe is self-contained
+# rather than depending on the GLM-5.2 8K recipe chain.
+defaults: ../../grpo_math_1B.yaml
 
 grpo:
-  # Match the resolved successful GLM-5.1 131K run: one prompt produces
-  # eight generations, which form one global training batch at DP=1.
-  max_num_epochs: 1
   num_prompts_per_step: 1
   num_generations_per_prompt: 8
-
-data:
-  max_input_seq_length: 130560
-  train:
-    # The source GLM-5.1 recipe points at a shorter 30K pipeclean by default;
-    # this dataset exercises the requested 130,560 + 512 = 131,072 tokens.
-    data_path: /lustre/fsw/portfolios/llmservice/users/slikhite/nemo-rl-integration/data/grpo_nemotron_math_30k_160_20steps.jsonl
-
+  max_num_steps: 100
+  val_period: -1
+  reward_shaping:
+    # Match the long-context DAPOMath17K recipes: reserve 2K tokens for the
+    # prompt and allow the response to consume the rest of the 131K window.
+    max_response_length: 129024
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  force_on_policy_ratio: true
 checkpointing:
   checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
-  # Match the verified GLM-5.1 131K cadence. GRPO always saves the last step,
-  # so a 10-step validation writes one resumable full-state checkpoint rather
-  # than the 19 TB required for both step 5 and step 10.
-  save_period: 10
-
 policy:
+  model_name: zai-org/GLM-5.2
+  hf_config_overrides:
+    qk_rope_head_dim: 64
   train_global_batch_size: 8
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  logprob_chunk_size: 2048
   max_total_sequence_length: 131072
-  sequence_packing:
-    enabled: true
-    train_mb_tokens: 131072
-    logprob_mb_tokens: 131072
-  dynamic_batching:
-    train_mb_tokens: 131072
-    logprob_mb_tokens: 131072
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    enabled: false
   megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
     tensor_model_parallel_size: 2
+    expert_model_parallel_size: 64
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 14
     num_layers_in_last_pipeline_stage: 16
     context_parallel_size: 32
-    expert_model_parallel_size: 64
-    activation_checkpointing: true
-    distributed_data_parallel_config:
-      # Keep the memory behavior proven by the successful GLM-5.2 run.
-      # In particular, disabling parameter-gather overlap avoids retaining an
-      # extra gather buffer when the post-step refit exports the MoE experts.
-      grad_reduce_in_fp32: true
-      overlap_grad_reduce: false
-      overlap_param_gather: false
+    cp_comm_type: all_gather
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    moe_token_dispatcher_type: allgather
     optimizer:
-      lr: 5.0e-7
-      min_lr: 5.0e-8
+      lr: 5.0e-07
+      min_lr: 5.0e-08
       weight_decay: 0.0
-      adam_beta2: 0.999
-      # GLM-5.2 allocates its optimizer state on the first update. Keeping that
-      # state on HBM left only 1.18 GiB for a 1.50-GiB EP64 refit gather. These
-      # are the exact optimizer-memory settings of the successful GLM-5.2 job.
-      use_precision_aware_optimizer: true
       optimizer_cpu_offload: true
       optimizer_offload_fraction: 1.0
     scheduler:
-      lr_decay_iters: 1000
       lr_warmup_iters: 2
-      lr_warmup_init: 5.0e-8
+      lr_warmup_init: 5.0e-08
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+    converter_type: GlmMoeDsaForCausalLM
+    dsa_indexer_rope_interleaved: true
+    dsa_indexer_rotate_activation: false
+    dsa_indexer_k_norm_epsilon: 1.0e-06
+    dsa_kernel_backend: cudnn
+    dsa_indexer_loss_coeff: 0.0
+    dsa_indexer_use_sparse_loss: false
+    clear_memory_caches_before_refit: true
+    moe_grouped_gemm: true
+    deallocate_pipeline_outputs: true
+    persist_layer_norm: true
+    bias_dropout_fusion: true
+  dynamic_batching:
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  sequence_packing:
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  optimizer: null
+  scheduler: null
   generation:
+    max_new_tokens: 129024
     vllm_cfg:
+      precision: bfloat16
       tensor_parallel_size: 8
       expert_parallel_size: 64
       gpu_memory_utilization: 0.7
+      enforce_eager: true
     vllm_kwargs:
       max_num_batched_tokens: 4096
       max_num_seqs: 1
-
+      enable_chunked_prefill: true
+      attention_config:
+        backend: FLASHMLA_SPARSE
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+      async_scheduling: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
 logger:
   log_dir: logs/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  wandb_enabled: true
+  tensorboard_enabled: true
   wandb:
+    project: nemo-rl-glm-perf
     name: grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+cluster:
+  gpus_per_node: 8
+  num_nodes: 72
