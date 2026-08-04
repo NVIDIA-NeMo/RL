@@ -349,3 +349,31 @@ def test_packedtensor_as_tensor_with_mixed_none_and_tensors():
     out = pt.as_tensor()
     expected = torch.cat([t1, t3], dim=0)
     assert torch.equal(out, expected)
+
+
+def test_get_multimodal_dict_missing_companion_asserts():
+    """Wire-form parent without its ``__lengths`` companion must fail
+    loud with a wire-contract error (not a bare KeyError deep in the
+    trainer forward)."""
+    data = BatchedDataDict(
+        {
+            "pixel_values": torch.zeros(2, 3, 4, 4),
+            # pixel_values__lengths intentionally omitted
+        }
+    )
+    with pytest.raises(AssertionError, match="missing companion"):
+        data.get_multimodal_dict(as_tensors=False)
+
+
+def test_get_multimodal_dict_empty_batch_skips_wire_field():
+    """Empty batch (0 rows) must not crash ``PackedTensor.__init__``'s
+    non-empty-list assertion — ``from_nested_wire`` returns ``None`` and
+    the read side skips the field."""
+    data = BatchedDataDict(
+        {
+            "pixel_values": torch.zeros(0, 3, 4, 4),
+            PackedTensor.lengths_key("pixel_values"): torch.zeros(0, dtype=torch.int32),
+        }
+    )
+    mm = data.get_multimodal_dict(as_tensors=False)
+    assert "pixel_values" not in mm

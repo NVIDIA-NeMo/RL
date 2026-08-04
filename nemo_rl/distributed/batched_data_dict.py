@@ -30,6 +30,8 @@ import torch
 from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
@@ -73,12 +75,6 @@ class DynamicBatchingArgs(TypedDict):
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
-    # keys that are model specific, but not part of the PackedTensor
-    ADDITIONAL_OPTIONAL_KEY_TENSORS = [
-        "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
-        "mm_token_type_ids",  # specific to qwen2.5-vl (transformers>=5.3): tells model which tokens are text(0)/image(1)/video(2) for 3D RoPE position encoding
-    ]
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -89,15 +85,40 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     def get_multimodal_dict(
         self, as_tensors: bool = False, device: Optional[torch.device] = None
     ) -> dict[str, Any]:
-        """Return a regular dict of tensors or packed multimodal data items."""
-        multimodal_dict = {}
+        """Return the multimodal fields as a dict.
+
+        Four cases per (k, v):
+          * ``PackedTensor`` — legacy in-memory, keep as-is.
+          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — wire form,
+            reassemble via ``PackedTensor.from_nested_wire``.
+          * ``k`` in ``PER_TOKEN_MULTIMODAL_FIELDS`` — plain per-token
+            tensor, keep as-is.
+          * anything else (including ``<key>__lengths`` companions) —
+            not multimodal, skip.
+        """
+        result: dict[str, Any] = {}
         for k, v in self.data.items():
             if isinstance(v, PackedTensor):
-                multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
-            elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
-                multimodal_dict[k] = v
-
-        return multimodal_dict
+                # Legacy in-memory PackedTensor (or per-token field
+                # that a caller happened to wrap; matches pre-refactor
+                # behavior of unwrapping via as_tensor).
+                result[k] = v.as_tensor(device=device) if as_tensors else v
+            elif k in PER_TOKEN_MULTIMODAL_FIELDS:
+                # Plain per-token tensor: emit as-is.
+                result[k] = v
+            elif k in PACKED_MULTIMODAL_FIELDS:
+                # Wire form: parent tensor + companion ``__lengths``
+                # (TQ fetch must include both).
+                lengths_key = PackedTensor.lengths_key(k)
+                assert lengths_key in self.data, (
+                    f"missing companion {lengths_key!r} for {k!r}"
+                )
+                packed = PackedTensor.from_nested_wire(v, self.data[lengths_key])
+                if packed is None:
+                    continue  # empty batch (0 rows); nothing to emit
+                result[k] = packed.as_tensor(device=device) if as_tensors else packed
+            # else: not a multimodal field, silently skip.
+        return result
 
     @classmethod
     def from_batches(

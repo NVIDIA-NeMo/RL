@@ -66,6 +66,32 @@ MEDIA_TAG_PATTERN = re.compile(
 logger = logging.getLogger(__name__)
 
 
+# Multimodal field registries — single source of truth. Add a new
+# modality by extending the right set; every consumer (write path,
+# get_multimodal_dict, logprob include-list) dispatches through these.
+
+# Per-token: rectangular ``[B, S]`` type maps for text/image/video tokens.
+PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
+    {
+        "token_type_ids",  # gemma3: which tokens are image
+        "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+    }
+)
+
+# Packed per-sample: jagged; ``PackedTensor`` in-memory, wire form is
+# ``torch.nested`` parent + ``<key>__lengths`` companion.
+PACKED_MULTIMODAL_FIELDS = frozenset(
+    {
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "second_per_grid_ts",
+        "input_features",
+    }
+)
+
+
 class PackedTensor:
     """Wrapper around a list of torch tensors and a dimension along which to pack the tensors.
 
@@ -196,6 +222,109 @@ class PackedTensor:
         )
         tensors = [p.as_tensor() for p in from_packed_tensors]
         return cls(tensors, from_packed_tensors[0].dim_to_pack)
+
+    # ── Wire encoding (data-plane roundtrip) ─────────────────────────
+    # PackedTensor is a domain wrapper; the wire only handles
+    # ``torch.Tensor`` (incl. ``torch.nested``) and ``np.ndarray[object]``.
+    # ``to_nested_wire`` / ``from_nested_wire`` are the single boundary
+    # between the two representations. ``LENGTHS_SUFFIX`` / ``lengths_key``
+    # keep the companion-field convention in one place so callers don't
+    # repeat magic strings.
+    LENGTHS_SUFFIX = "__lengths"
+
+    @staticmethod
+    def lengths_key(field: str) -> str:
+        return field + PackedTensor.LENGTHS_SUFFIX
+
+    def to_nested_wire(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Encode as ``(nested_tensor, per_sample_lengths)`` for wire transport.
+
+        Returns ``(None, None)`` when every entry is ``None`` so the
+        caller can skip the field entirely.
+
+        Otherwise:
+          * ``nested`` — ``torch.nested`` jagged along dim 0. Real entries
+            keep their shape; ``None`` entries become zero-length
+            placeholders sharing the ref entry's trailing dims / device
+            so ``as_nested_tensor`` doesn't reject the list on device or
+            shape mismatch.
+          * ``lengths`` — ``int32[B]`` of per-sample sizes (0 for a
+            ``None`` entry).
+
+        Only ``dim_to_pack=0`` is supported today; other values would
+        need ``ragged_idx`` on the nested tensor and a matching
+        transpose in :meth:`from_nested_wire`.
+        """
+        if self.dim_to_pack != 0:
+            raise NotImplementedError(
+                f"to_nested_wire only supports dim_to_pack=0, got "
+                f"{self.dim_to_pack}. Non-zero requires ragged_idx "
+                "threading in torch.nested and a matching transpose "
+                "on the read side."
+            )
+        ref = next((t for t in self.tensors if t is not None), None)
+        if ref is None:
+            return None, None
+
+        length_ints = [0 if t is None else t.shape[0] for t in self.tensors]
+        if any(t is None for t in self.tensors):
+            placeholder = torch.zeros(
+                0, *ref.shape[1:], dtype=ref.dtype, device=ref.device
+            )
+            rows = [placeholder if t is None else t for t in self.tensors]
+        else:
+            rows = list(self.tensors)  # type: ignore[arg-type]
+
+        return (
+            torch.nested.as_nested_tensor(rows, layout=torch.jagged),  # type: ignore[arg-type]
+            torch.tensor(length_ints, dtype=torch.int32, device=ref.device),
+        )
+
+    @classmethod
+    def from_nested_wire(
+        cls, padded: torch.Tensor, lengths: torch.Tensor
+    ) -> Optional["PackedTensor"]:
+        """Reconstruct from ``(materialize-padded tensor, lengths)``.
+
+        Returns ``None`` for an empty batch (``padded.shape[0] == 0``);
+        the caller should skip the field entirely rather than trying to
+        instantiate an empty ``PackedTensor``.
+
+        Slices each row to its true length; entries with
+        ``lengths[i] == 0`` become empty tensors and contribute nothing
+        when :meth:`as_tensor` concatenates.
+
+        Mirrors :meth:`to_nested_wire`; both assume ``dim_to_pack=0``.
+        """
+        if padded.shape[0] == 0:
+            return None
+        # ``.tolist()`` once instead of ``.item()`` per row: one host
+        # sync if ``lengths`` is on GPU.
+        lengths_cpu = lengths.tolist()
+        rows = [padded[i, :n] for i, n in enumerate(lengths_cpu)]
+        return cls(rows, dim_to_pack=0)  # type: ignore[arg-type]
+
+
+def encode_multimodal_for_wire(k, v):
+    """Yield ``(wire_key, wire_value)`` pairs. Dispatched by registry membership."""
+    if k in PACKED_MULTIMODAL_FIELDS:
+        assert isinstance(v, PackedTensor), (
+            f"{k!r}: expected PackedTensor, got {type(v).__name__}"
+        )
+        nested, lengths = v.to_nested_wire()
+        if nested is None:
+            return  # all-None batch
+        yield k, nested
+        yield PackedTensor.lengths_key(k), lengths
+    elif k in PER_TOKEN_MULTIMODAL_FIELDS:
+        assert isinstance(v, torch.Tensor), (
+            f"{k!r}: expected Tensor, got {type(v).__name__}"
+        )
+        yield k, v
+    else:
+        raise KeyError(
+            f"unregistered multimodal field {k!r} — add to PACKED_/PER_TOKEN_MULTIMODAL_FIELDS"
+        )
 
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
