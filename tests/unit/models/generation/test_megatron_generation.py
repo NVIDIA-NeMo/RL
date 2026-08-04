@@ -430,10 +430,15 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
 
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
+@pytest.mark.parametrize("skip_weight_load", [False, True])
 def test_megatron_generation_non_colocated_refit(
-    policy_cluster_separate, test_input_data, tokenizer
+    policy_cluster_separate, test_input_data, tokenizer, skip_weight_load
 ):
-    """Non-colocated Megatron generation."""
+    """Non-colocated Megatron generation.
+
+    With skip_weight_load the inference engine builds without loading the
+    checkpoint and must still generate correctly once refit delivers weights.
+    """
     generation_cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1],
         use_gpus=True,
@@ -455,8 +460,22 @@ def test_megatron_generation_non_colocated_refit(
         policy = Policy(
             cluster=policy_cluster_separate, config=config, tokenizer=tokenizer
         )
+
+        # construction guard: skip_weight_load requires a dedicated inference
+        # policy; wrapping an existing (colocated) policy must be rejected.
+        with pytest.raises(AssertionError):
+            MegatronGeneration(
+                config=config,
+                tokenizer=tokenizer,
+                policy=policy,
+                skip_weight_load=True,
+            )
+
         mg = MegatronGeneration(
-            config=config, tokenizer=tokenizer, cluster=generation_cluster
+            config=config,
+            tokenizer=tokenizer,
+            cluster=generation_cluster,
+            skip_weight_load=skip_weight_load,
         )
 
         # init the refit collective on both sides.
