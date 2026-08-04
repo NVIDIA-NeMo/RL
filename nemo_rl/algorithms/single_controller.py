@@ -612,7 +612,7 @@ class SingleControllerActor:
         is what is checked instead.
         """
         watchdog_cfg = self._async_cfg.watchdog
-        max_num_steps = self._master_config.grpo["max_num_steps"]
+        max_num_steps = self._master_config.grpo.max_num_steps
         last_progress = (-1, -1)
         last_progress_at = time.monotonic()
 

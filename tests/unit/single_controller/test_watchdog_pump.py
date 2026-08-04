@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutStats
@@ -65,7 +66,7 @@ def _make_controller(
             gym_subprocess_check=gym_subprocess_check,
         )
     )
-    ctrl._master_config = SimpleNamespace(grpo={"max_num_steps": max_num_steps})
+    ctrl._master_config = SimpleNamespace(grpo=GRPOConfig.model_construct(max_num_steps=max_num_steps))
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
     ctrl._train_steps = train_steps
