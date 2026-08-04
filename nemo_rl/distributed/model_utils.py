@@ -1574,6 +1574,8 @@ def get_logprobs_from_vocab_parallel_logits(
     seq_index: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    *,
+    shift_targets: bool = True,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -1589,6 +1591,9 @@ def get_logprobs_from_vocab_parallel_logits(
             with shape [sequence_length].
         chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        shift_targets (bool, optional): If True (default), position ``i`` scores token ``i+1``
+            -- the autoregressive convention. Set to False for masked diffusion LMs, which score
+            token ``i`` at position ``i`` and keep every sequence position. Defaults to True.
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
@@ -1618,6 +1623,7 @@ def get_logprobs_from_vocab_parallel_logits(
         seq_index=seq_index,
         chunk_size=chunk_size,
         sampling_params=sampling_params,
+        shift_targets=shift_targets,
     )
 
 
