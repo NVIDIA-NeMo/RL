@@ -21,12 +21,15 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, cast
 
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -60,6 +63,11 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -109,17 +117,20 @@ def _maybe_restore_native_data_plane_checkpoint(
 ) -> Optional[dict[str, Any]]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
-    The metadata-only replay sidecar is the format marker. Checkpoints without
-    any replay artifact resume trainer state with an empty replay buffer;
-    legacy tensor-bearing replay files are rejected rather than silently
-    ignored. Rollout tensors are never serialized into a controller-side
-    replay checkpoint.
+    A replay-metadata or rollout-recovery sidecar is the authoritative format
+    marker. Checkpoints without either artifact resume trainer state with an
+    empty replay buffer; legacy tensor-bearing replay files are rejected
+    rather than silently ignored. Rollout tensors are never serialized into a
+    controller-side checkpoint.
     """
     if last_checkpoint_path is None:
         return None
     checkpoint_path = Path(last_checkpoint_path)
     replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
-    if not replay_metadata_path.is_file():
+    rollout_recovery_path = checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME
+    has_replay_metadata = replay_metadata_path.is_file()
+    has_rollout_recovery = rollout_recovery_path.is_file()
+    if not has_replay_metadata and not has_rollout_recovery:
         legacy_replay_path = checkpoint_path / LEGACY_REPLAY_BUFFER_FILENAME
         if legacy_replay_path.is_file():
             raise RuntimeError(
@@ -145,9 +156,7 @@ def _maybe_restore_native_data_plane_checkpoint(
             f"got {type(metadata).__name__}"
         )
     expected_values: dict[str, Any] = {
-        "data_plane_checkpoint_schema_version": (
-            DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-        ),
+        "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
         "single_controller_train_steps": save_state["current_step"],
         "single_controller_trainer_version": save_state.get(
             "trainer_version", save_state["current_step"]
@@ -156,8 +165,15 @@ def _maybe_restore_native_data_plane_checkpoint(
         "partition_id": partition_id,
         "sampler_name": sampler_name,
         "mode": "authoritative",
-        "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     }
+    if has_replay_metadata:
+        expected_values["replay_metadata_schema_version"] = (
+            REPLAY_BUFFER_METADATA_SCHEMA_VERSION
+        )
+    if has_rollout_recovery:
+        expected_values["rollout_recovery_schema_version"] = (
+            ROLLOUT_RECOVERY_SCHEMA_VERSION
+        )
     mismatches = {
         key: {"checkpoint": metadata.get(key), "expected": expected}
         for key, expected in expected_values.items()
@@ -168,23 +184,119 @@ def _maybe_restore_native_data_plane_checkpoint(
             "Native TQ checkpoint metadata does not match the trainer "
             f"checkpoint: {mismatches}"
         )
-    manifest_digest = metadata.get("replay_manifest_digest")
-    if not isinstance(manifest_digest, str) or not manifest_digest:
-        raise ValueError(
-            "Native TQ checkpoint metadata is missing replay_manifest_digest"
+    group_count = 0
+    if has_replay_metadata:
+        manifest_digest = metadata.get("replay_manifest_digest")
+        if not isinstance(manifest_digest, str) or not manifest_digest:
+            raise ValueError(
+                "Native TQ checkpoint metadata is missing replay_manifest_digest"
+            )
+        group_count = metadata.get("replay_group_count")
+        if not isinstance(group_count, int) or group_count < 0:
+            raise ValueError(
+                "Native TQ checkpoint metadata has invalid replay_group_count: "
+                f"{group_count!r}"
+            )
+    elif any(
+        key in metadata
+        for key in (
+            "replay_metadata_schema_version",
+            "replay_manifest_digest",
+            "replay_group_count",
         )
-    group_count = metadata.get("replay_group_count")
-    if not isinstance(group_count, int) or group_count < 0:
-        raise ValueError(
-            "Native TQ checkpoint metadata has invalid replay_group_count: "
-            f"{group_count!r}"
+    ):
+        raise FileNotFoundError(
+            "Native TQ checkpoint advertises replay metadata, but its sidecar "
+            f"is missing at {replay_metadata_path}"
+        )
+
+    if has_rollout_recovery:
+        recovery_digest = metadata.get("rollout_recovery_payload_sha256")
+        if not isinstance(recovery_digest, str) or not recovery_digest:
+            raise ValueError(
+                "Native TQ checkpoint metadata is missing "
+                "rollout_recovery_payload_sha256"
+            )
+        recovery_group_count = metadata.get("rollout_recovery_group_count")
+        if not isinstance(recovery_group_count, int) or recovery_group_count < 0:
+            raise ValueError(
+                "Native TQ checkpoint metadata has invalid "
+                f"rollout_recovery_group_count: {recovery_group_count!r}"
+            )
+    elif any(
+        key in metadata
+        for key in (
+            "rollout_recovery_schema_version",
+            "rollout_recovery_payload_sha256",
+            "rollout_recovery_group_count",
+        )
+    ):
+        raise FileNotFoundError(
+            "Native TQ checkpoint advertises rollout recovery, but its "
+            f"sidecar is missing at {rollout_recovery_path}"
         )
     print(
-        "📦 Native TQ checkpoint restored and validated: "
-        f"groups={group_count}",
+        f"📦 Native TQ checkpoint restored and validated: groups={group_count}",
         flush=True,
     )
     return metadata
+
+
+def _maybe_restore_rollout_recovery_ledger(
+    *,
+    last_checkpoint_path: Optional[str],
+    data_plane_checkpoint_metadata: Optional[dict[str, Any]],
+    token_capture_enabled: bool,
+) -> Optional[RolloutRecoveryLedger]:
+    """Load and bind the rollout-recovery sidecar to the restored TQ cut."""
+    if last_checkpoint_path is None:
+        return None
+    recovery_path = Path(last_checkpoint_path) / ROLLOUT_RECOVERY_STATE_FILENAME
+    if not recovery_path.is_file():
+        return None
+    if not token_capture_enabled:
+        raise RuntimeError(
+            "Checkpoint contains rollout-recovery state, but token capture is disabled"
+        )
+    if data_plane_checkpoint_metadata is None:
+        raise RuntimeError(
+            "Rollout-recovery sidecar requires a matching restored native TQ checkpoint"
+        )
+
+    payload = recovery_path.read_bytes()
+    actual_digest = hashlib.sha256(payload).hexdigest()
+    expected_digest = data_plane_checkpoint_metadata.get(
+        "rollout_recovery_payload_sha256"
+    )
+    if actual_digest != expected_digest:
+        raise ValueError(
+            "Rollout-recovery sidecar digest does not match the native TQ "
+            f"checkpoint metadata: actual={actual_digest!r}, "
+            f"expected={expected_digest!r}"
+        )
+    # weights_only=False: the trusted same-job sidecar may contain DatumSpec
+    # values unsupported by torch's restricted weights-only unpickler.
+    state = torch.load(io.BytesIO(payload), weights_only=False)
+    if not isinstance(state, dict):
+        raise TypeError(
+            "Rollout-recovery sidecar must contain a state dictionary, "
+            f"got {type(state).__name__}"
+        )
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    expected_group_count = data_plane_checkpoint_metadata.get(
+        "rollout_recovery_group_count"
+    )
+    if len(ledger) != expected_group_count:
+        raise ValueError(
+            "Rollout-recovery sidecar group count does not match the native "
+            f"TQ checkpoint metadata: sidecar={len(ledger)}, "
+            f"checkpoint={expected_group_count!r}"
+        )
+    print(
+        f"📦 Restored rollout recovery ledger: groups={len(ledger)}",
+        flush=True,
+    )
+    return ledger
 
 
 def _build_clusters(
@@ -437,6 +549,23 @@ def setup_single_controller(
     # worker hosts Gym's capture core + adapter in-process).
     token_capture_cfg = master_config.token_capture
     if token_capture_cfg.enabled:
+        if master_config.checkpointing["enabled"] and not dp_config.get(
+            "checkpointing_enabled"
+        ):
+            raise ValueError(
+                "SingleController token-capture checkpointing requires "
+                "data_plane.checkpointing_enabled=true so receipts and their "
+                "TQ staging rows share one durable checkpoint cut."
+            )
+        if (
+            master_config.checkpointing["enabled"]
+            and master_config.async_rl.sampler.supports_buffer_checkpoint is not True
+        ):
+            raise NotImplementedError(
+                "Token-capture checkpoint recovery currently requires a "
+                "replay-checkpoint-capable sampler (windowed); restoring the "
+                "dispatch/readiness state of gated samplers is not implemented yet."
+            )
         if not _should_use_nemo_gym(master_config):
             raise ValueError(
                 "token_capture.enabled requires the NeMo-Gym rollout path "
@@ -605,6 +734,11 @@ def setup_single_controller(
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
+    recovery_ledger = _maybe_restore_rollout_recovery_ledger(
+        last_checkpoint_path=last_checkpoint_path,
+        data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        token_capture_enabled=token_capture_cfg.enabled,
+    )
 
     # ==========================
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
@@ -732,6 +866,7 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         tq_buffer=tq_buffer,
         finalizer=finalizer,
+        recovery_ledger=recovery_ledger,
     )
 
     return SingleControllerActorArgs(

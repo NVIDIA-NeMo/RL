@@ -22,7 +22,10 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -84,7 +87,7 @@ class AsyncRolloutImpl:
                 available only on the NeMo-Gym path.
 
         Returns:
-            PromptGroupRecord with num_generations_per_prompt completions.
+            PromptGroupRecord containing each requested generation.
         """
         assert rollout_ids is None, (
             "token capture (rollout_ids) is only supported on the NeMo-Gym path"
@@ -442,6 +445,7 @@ class AsyncNemoGymRolloutImpl:
         input_sample: DatumSpec,
         *,
         rollout_ids: Optional[list[str]] = None,
+        generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -452,6 +456,9 @@ class AsyncNemoGymRolloutImpl:
                 per generation, riding each row's run body as the opaque
                 ``_ng_rollout_id`` key (agents stamp /ng-rollout/<id> from it;
                 zero agent changes).
+            generation_indices: Logical sibling indices represented by
+                ``rollout_ids``. Recovery uses a strict subset so already
+                sealed siblings are not generated again.
             on_completion: Optional async callback invoked as soon as one
                 streamed sibling result has been converted to a completion.
 
@@ -462,12 +469,42 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rollout_inputs = self._build_inputs(input_sample, rollout_ids=rollout_ids)
+        if generation_indices is None:
+            generation_indices = list(range(self._num_generations_per_prompt))
+        if not generation_indices:
+            raise ValueError("generation_indices must not be empty")
+        if len(set(generation_indices)) != len(generation_indices) or any(
+            index < 0 or index >= self._num_generations_per_prompt
+            for index in generation_indices
+        ):
+            raise ValueError(
+                "generation_indices must contain unique logical sibling "
+                "indices within the configured group size"
+            )
+        if rollout_ids is None and generation_indices != list(
+            range(self._num_generations_per_prompt)
+        ):
+            raise ValueError("subset generation requires token-capture rollout IDs")
+
+        rollout_inputs = self._build_inputs(
+            input_sample,
+            rollout_ids=rollout_ids,
+            num_generations=len(generation_indices),
+        )
+
+        async def _map_completion_index(
+            local_index: int, completion: Completion
+        ) -> None:
+            if on_completion is not None:
+                await on_completion(generation_indices[local_index], completion)
+
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs,
             timer,
             timer_prefix,
-            on_completion=on_completion,
+            on_completion=(
+                _map_completion_index if on_completion is not None else None
+            ),
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -497,9 +534,15 @@ class AsyncNemoGymRolloutImpl:
         )
 
     def _build_inputs(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        num_generations: Optional[int] = None,
     ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
+        if num_generations is None:
+            num_generations = self._num_generations_per_prompt
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
 
@@ -520,11 +563,11 @@ class AsyncNemoGymRolloutImpl:
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         if rollout_ids is not None:
-            assert len(rollout_ids) == self._num_generations_per_prompt, (
-                "token-capture rollout ids must be one per generation"
+            assert len(rollout_ids) == num_generations, (
+                "token-capture rollout ids must be one per requested generation"
             )
         rows = []
-        for i in range(self._num_generations_per_prompt):
+        for i in range(num_generations):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             if rollout_ids is not None:
@@ -802,6 +845,7 @@ class RolloutManager:
             if finalizer is not None
             else None
         )
+        self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
@@ -812,6 +856,16 @@ class RolloutManager:
         """Return the controller-local token-capture recovery ledger."""
         return self._recovery_ledger
 
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        """Bind the SC checkpoint barrier to streamed ledger mutations."""
+        if self._data_plane_checkpoint_barrier is not None:
+            raise RuntimeError(
+                "rollout-manager checkpoint barrier is already configured"
+            )
+        self._data_plane_checkpoint_barrier = barrier
+
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
 
@@ -819,6 +873,27 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
+
+    def reserve_prompt_group(
+        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+    ) -> Optional[str]:
+        """Reserve durable lineage before advancing past a dataloader batch.
+
+        The native rollout path returns ``None`` because its completed-only
+        replay recovery does not retain partial generation state.
+        """
+        if self._finalizer is None:
+            return None
+        if self._recovery_ledger is None:
+            raise RuntimeError("token capture requires a rollout recovery ledger")
+        group = self._recovery_ledger.reserve_group(
+            prompt_id=str(input_sample["idx"]),
+            prompt_payload=input_sample,
+            expected_generations=self._num_generations_per_prompt,
+            target_step=target_step,
+            start_weight_version=self._weight_version,
+        )
+        return group.group_id
 
     async def gate_metrics(self) -> Optional[dict[str, int]]:
         """Fetch the capture gate's § 8 counters, or None off the capture path.
@@ -838,22 +913,39 @@ class RolloutManager:
         input_sample: DatumSpec,
         *,
         rollout_ids: Optional[list[str]] = None,
+        generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert on_completion is None, (
                 "completion callback requires token-capture rollout IDs"
             )
+            assert generation_indices is None, (
+                "generation subset requires token-capture rollout IDs"
+            )
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
+        if generation_indices is None:
+            return await self._impl.run_rollout(
+                input_sample,
+                rollout_ids=rollout_ids,
+                on_completion=on_completion,
+            )
+        if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            raise RuntimeError("generation subset requires the NeMo-Gym rollout path")
         return await self._impl.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
+            generation_indices=generation_indices,
             on_completion=on_completion,
         )
 
     async def generate_and_push(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        recovery_group_id: Optional[str] = None,
     ) -> None:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
@@ -865,8 +957,16 @@ class RolloutManager:
             "generate_and_push requires tq_buffer to be set at __init__"
         )
         if self._finalizer is not None:
-            await self._generate_and_finalize(input_sample, target_step=target_step)
+            await self._generate_and_finalize(
+                input_sample,
+                target_step=target_step,
+                recovery_group_id=recovery_group_id,
+            )
             return
+        if recovery_group_id is not None:
+            raise ValueError(
+                "recovery_group_id is only supported for token-capture rollouts"
+            )
         start_version = self._weight_version
         group_id = self._tq_buffer.reserve(
             weight_version=start_version, target_step=target_step
@@ -887,7 +987,11 @@ class RolloutManager:
             raise
 
     async def _generate_and_finalize(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        recovery_group_id: Optional[str] = None,
     ) -> None:
         """Token-capture dispatch: receipts in, canonical rows via the finalizer.
 
@@ -897,14 +1001,25 @@ class RolloutManager:
         the finalizer maps those attempts back to stable canonical rows.
         """
         assert self._recovery_ledger is not None
-        start_version = self._weight_version
-        recovery_group = self._recovery_ledger.reserve_group(
-            prompt_id=str(input_sample["idx"]),
-            prompt_payload=input_sample,
-            expected_generations=self._num_generations_per_prompt,
-            target_step=target_step,
-            start_weight_version=start_version,
-        )
+        if recovery_group_id is None:
+            recovery_group_id = self.reserve_prompt_group(
+                input_sample, target_step=target_step
+            )
+            assert recovery_group_id is not None
+        recovery_group = self._recovery_ledger.get_group(recovery_group_id)
+        if recovery_group.prompt_id != str(input_sample["idx"]):
+            raise ValueError(
+                "pre-reserved recovery group belongs to a different prompt: "
+                f"group={recovery_group.prompt_id!r}, "
+                f"input={str(input_sample['idx'])!r}"
+            )
+        if recovery_group.target_step != target_step:
+            raise ValueError(
+                "pre-reserved recovery group target step does not match its "
+                f"dispatch: group={recovery_group.target_step!r}, "
+                f"dispatch={target_step!r}"
+            )
+        start_version = recovery_group.start_weight_version
         group_id = recovery_group.group_id
         logical_rollout_ids = recovery_group.logical_rollout_ids
         gate_rollout_ids = recovery_group.gate_rollout_ids
@@ -928,13 +1043,22 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its gate rollout ID"
                 )
-            self._recovery_ledger.mark_sibling_sealed(
-                group_id,
-                generation_index=generation_index,
-                gate_rollout_id=gate_rollout_id,
-                receipt=receipt,
-                reward=completion.reward,
-            )
+            if self._data_plane_checkpoint_barrier is None:
+                raise RuntimeError(
+                    "token-capture recovery requires the SC data-plane "
+                    "checkpoint barrier"
+                )
+            # The worker staged every key in the receipt before the gate
+            # returned it. Joining the mutation side here prevents a ledger
+            # snapshot from naming rows omitted by the matching TQ snapshot.
+            async with self._data_plane_checkpoint_barrier.mutation():
+                self._recovery_ledger.mark_sibling_sealed(
+                    group_id,
+                    generation_index=generation_index,
+                    gate_rollout_id=gate_rollout_id,
+                    receipt=receipt,
+                    reward=completion.reward,
+                )
 
         try:
             self._tq_buffer.reserve(
@@ -1018,3 +1142,171 @@ class RolloutManager:
             # controller memory without improving recovery.
             self._recovery_ledger.mark_group_finalized(group_id)
             self._recovery_ledger.release_finalized_group(group_id)
+
+    async def recover_group(self, group_id: str) -> bool:
+        """Redispatch missing siblings and publish one restored prompt group.
+
+        Returns:
+            True when canonical rows were committed. False when finalizer
+            policy deliberately dropped the restored group.
+        """
+        if self._recovery_ledger is None or self._finalizer is None:
+            raise RuntimeError("prompt-group recovery requires token capture")
+        if self._tq_buffer is None:
+            raise RuntimeError("prompt-group recovery requires a TQ replay buffer")
+
+        group = self._recovery_ledger.get_group(group_id)
+        generation_indices = self._recovery_ledger.retryable_generation_indices(
+            group_id
+        )
+        for generation_index in generation_indices:
+            self._recovery_ledger.retry_sibling(
+                group_id, generation_index=generation_index
+            )
+        if generation_indices:
+            self._recovery_ledger.mark_siblings_dispatched(
+                group_id, generation_indices=generation_indices
+            )
+        group = self._recovery_ledger.get_group(group_id)
+        allowed_statuses = {
+            RolloutAttemptStatus.SEALED,
+            RolloutAttemptStatus.DISPATCHED,
+        }
+        if any(
+            sibling.current_attempt.status not in allowed_statuses
+            for sibling in group.siblings
+        ):
+            raise ValueError(
+                f"recovery group {group_id!r} contains attempts that are "
+                "neither reusable nor retryable"
+            )
+
+        async def _record_retried_completion(
+            generation_index: int, completion: Completion
+        ) -> None:
+            env_extras = completion.env_extras
+            if env_extras is None:
+                raise ValueError(
+                    "token-capture completion must contain environment extras"
+                )
+            receipt = env_extras.get("ng_receipt")
+            gate_rollout_id = env_extras.get("ng_rollout_id")
+            if not isinstance(receipt, dict) or not isinstance(gate_rollout_id, str):
+                raise ValueError(
+                    "retried token-capture completion must contain its receipt "
+                    "and gate rollout ID"
+                )
+            if self._data_plane_checkpoint_barrier is None:
+                raise RuntimeError(
+                    "token-capture recovery requires the SC data-plane "
+                    "checkpoint barrier"
+                )
+            async with self._data_plane_checkpoint_barrier.mutation():
+                self._recovery_ledger.mark_sibling_sealed(
+                    group_id,
+                    generation_index=generation_index,
+                    gate_rollout_id=gate_rollout_id,
+                    receipt=receipt,
+                    reward=completion.reward,
+                )
+
+        try:
+            self._tq_buffer.reserve(
+                weight_version=group.start_weight_version,
+                target_step=group.target_step,
+                group_id=group.group_id,
+                rollout_ids=group.gate_rollout_ids,
+            )
+            if generation_indices:
+                retry_rollout_ids = [
+                    group.siblings[generation_index].current_attempt.gate_rollout_id
+                    for generation_index in generation_indices
+                ]
+                await self.run_rollout(
+                    group.prompt_payload,
+                    rollout_ids=retry_rollout_ids,
+                    generation_indices=generation_indices,
+                    on_completion=_record_retried_completion,
+                )
+
+            group = self._recovery_ledger.get_group(group_id)
+            attempts = [sibling.current_attempt for sibling in group.siblings]
+            if any(
+                attempt.status != RolloutAttemptStatus.SEALED for attempt in attempts
+            ):
+                raise RuntimeError(
+                    f"recovery group {group_id!r} did not seal every sibling"
+                )
+            receipts: list[dict[str, Any]] = []
+            rewards: list[float] = []
+            for attempt in attempts:
+                if attempt.receipt is None or attempt.reward is None:
+                    raise RuntimeError(
+                        f"sealed attempt {attempt.gate_rollout_id!r} lost its "
+                        "receipt or reward"
+                    )
+                receipts.append(attempt.receipt)
+                rewards.append(attempt.reward)
+
+            finalized = await asyncio.to_thread(
+                self._finalizer.finalize_group,
+                group.group_id,
+                group.gate_rollout_ids,
+                receipts,
+                rewards,
+                fallback_weight_version=group.start_weight_version,
+                canonical_sample_ids=group.logical_rollout_ids,
+            )
+            if finalized.dropped:
+                await self._tq_buffer.abort_finalized(
+                    group.group_id, staging_keys=finalized.staging_keys
+                )
+                self._recovery_ledger.discard_group(group.group_id)
+                print(
+                    f"rollout recovery dropped group: group={group.group_id}",
+                    flush=True,
+                )
+                return False
+            assert finalized.meta is not None
+            assert finalized.fields is not None
+            await self._tq_buffer.commit_finalized(
+                group.group_id,
+                finalized.meta,
+                finalized.fields,
+                finalized.group_min_wv,
+                finalized.group_max_wv,
+                staging_keys=finalized.staging_keys,
+            )
+        except BaseException:
+            self._tq_buffer.abort(group.group_id)
+            self._recovery_ledger.abandon_group(group.group_id)
+            recovery_group = self._recovery_ledger.get_group(group.group_id)
+            gate_ids_to_fail = [
+                sibling.current_attempt.gate_rollout_id
+                for sibling in recovery_group.siblings
+                if sibling.current_attempt.status
+                not in {
+                    RolloutAttemptStatus.SEALED,
+                    RolloutAttemptStatus.FINALIZED,
+                }
+            ]
+            nemo_gym_env = self._env_handles.get("nemo_gym")
+            if nemo_gym_env is not None and gate_ids_to_fail:
+                try:
+                    await nemo_gym_env.fail_rollouts.remote(
+                        gate_ids_to_fail, reason="recovery_failed"
+                    )
+                except Exception as error:  # noqa: BLE001 — TTL is the backstop
+                    print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
+            raise
+        else:
+            self._recovery_ledger.mark_group_finalized(group.group_id)
+            self._recovery_ledger.release_finalized_group(group.group_id)
+            print(
+                "rollout recovery finalized group: "
+                f"group={group.group_id} reused="
+                f"{group.expected_generations - len(generation_indices)} "
+                f"redispatched={len(generation_indices)}",
+                flush=True,
+            )
+            return True

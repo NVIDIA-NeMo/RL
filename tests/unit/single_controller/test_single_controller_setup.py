@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -37,6 +39,11 @@ from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     SingleControllerActorArgs,
     setup_single_controller,
+)
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    RolloutRecoveryLedger,
 )
 
 
@@ -111,9 +118,7 @@ def _native_tq_metadata(
     *, step: int = 3, trainer_version: Optional[int] = None, epoch: int = 1
 ) -> dict[str, Any]:
     return {
-        "data_plane_checkpoint_schema_version": (
-            DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-        ),
+        "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
         "single_controller_train_steps": step,
         "single_controller_trainer_version": (
             step if trainer_version is None else trainer_version
@@ -126,6 +131,26 @@ def _native_tq_metadata(
         "replay_manifest_digest": "digest-1",
         "replay_group_count": 2,
     }
+
+
+def _write_recovery_sidecar(checkpoint_path) -> tuple[RolloutRecoveryLedger, str]:
+    ledger = RolloutRecoveryLedger()
+    ledger.reserve_group(
+        group_id="recovery-g0",
+        prompt_id="prompt-0",
+        prompt_payload={
+            "idx": 0,
+            "message_log": [{"role": "user", "content": "solve"}],
+            "extra_env_info": {},
+            "task_name": "nemo_gym",
+        },  # type: ignore[arg-type]
+        expected_generations=2,
+        target_step=None,
+        start_weight_version=3,
+    )
+    recovery_path = checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME
+    torch.save(ledger.state_dict(), recovery_path)
+    return ledger, hashlib.sha256(recovery_path.read_bytes()).hexdigest()
 
 
 @pytest.fixture
@@ -276,6 +301,36 @@ class TestSetup:
                 "replay-checkpoint-capable sampler requires "
                 "data_plane.checkpointing_enabled=true"
             ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_rejects_token_capture_checkpointing_without_native_tq(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.token_capture.enabled = True
+        mc.data_plane.update(
+            {
+                "backend": "simple",
+                "checkpointing_enabled": False,
+            }
+        )
+
+        with pytest.raises(ValueError, match="token-capture checkpointing requires"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_rejects_token_capture_recovery_with_gated_sampler(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.token_capture.enabled = True
+        mc.data_plane.update(
+            {
+                "backend": "simple",
+                "checkpointing_enabled": True,
+            }
+        )
+
+        with pytest.raises(
+            NotImplementedError, match="replay-checkpoint-capable sampler"
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -517,6 +572,58 @@ class TestSetup:
 
 
 class TestNativeTQRecoverySetup:
+    def test_restores_rollout_ledger_bound_to_native_tq_metadata(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        expected_ledger, digest = _write_recovery_sidecar(checkpoint_path)
+        metadata = {
+            "data_plane_checkpoint_schema_version": (
+                DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+            ),
+            "single_controller_train_steps": 3,
+            "single_controller_trainer_version": 3,
+            "single_controller_epoch": 1,
+            "partition_id": "rollout_data",
+            "sampler_name": "windowed",
+            "mode": "authoritative",
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": digest,
+            "rollout_recovery_group_count": 1,
+        }
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored_metadata = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            policy,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state={"current_step": 3, "current_epoch": 1},
+            partition_id="rollout_data",
+            sampler_name="windowed",
+        )
+        restored_ledger = sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+            last_checkpoint_path=str(checkpoint_path),
+            data_plane_checkpoint_metadata=restored_metadata,
+            token_capture_enabled=True,
+        )
+
+        assert restored_ledger is not None
+        assert restored_ledger.state_dict() == expected_ledger.state_dict()
+
+    def test_rejects_rollout_ledger_payload_digest_mismatch(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir(parents=True)
+        _write_recovery_sidecar(checkpoint_path)
+
+        with pytest.raises(ValueError, match="sidecar digest does not match"):
+            sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+                last_checkpoint_path=str(checkpoint_path),
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_payload_sha256": "wrong-digest",
+                    "rollout_recovery_group_count": 1,
+                },
+                token_capture_enabled=True,
+            )
+
     def test_setup_loads_tq_before_creating_single_controller_client(
         self, tmp_path, patched_factories
     ):
@@ -541,9 +648,7 @@ class TestNativeTQRecoverySetup:
         checkpointer.get_resume_paths.return_value = (None, None)
         mc = _make_master_config()
 
-        with patch.object(
-            sc_setup_mod, "CheckpointManager", return_value=checkpointer
-        ):
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert events == ["load", "build"]

@@ -33,6 +33,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -68,6 +69,11 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -208,16 +214,21 @@ class _FakeDPClient:
         *,
         save_error: Optional[Exception] = None,
         sample_ids: Optional[list[str]] = None,
+        staging_sample_ids: Optional[list[str]] = None,
     ) -> None:
         self.clear_calls: list[tuple[list[str], str]] = []
         self.clear_thread_ids: list[int] = []
         self.save_calls: list[dict[str, Any]] = []
         self.save_error = save_error
         self.sample_ids = list(sample_ids or [])
+        self.staging_sample_ids = list(staging_sample_ids or [])
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
-        assert partition_id == _PARTITION_ID
-        return sorted(self.sample_ids)
+        if partition_id == _PARTITION_ID:
+            return sorted(self.sample_ids)
+        if partition_id == "rollout_staging":
+            return sorted(self.staging_sample_ids)
+        raise AssertionError(f"unexpected partition_id={partition_id!r}")
 
     def clear_samples(self, sample_ids: list[str], partition_id: str) -> None:
         self.clear_thread_ids.append(threading.get_ident())
@@ -268,12 +279,63 @@ class _FakeWeightSynchronizer:
 
 
 class _FakeRolloutManager:
-    def __init__(self) -> None:
+    def __init__(self, recovery_ledger: Optional[RolloutRecoveryLedger] = None) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self._recovery_ledger = recovery_ledger
+        self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+        self.recovered_group_ids: list[str] = []
+
+    @property
+    def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
+        return self._recovery_ledger
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    async def recover_group(self, group_id: str) -> bool:
+        self.recovered_group_ids.append(group_id)
+        assert self._recovery_ledger is not None
+        self._recovery_ledger.prepare_for_restart()
+        for generation_index in self._recovery_ledger.retryable_generation_indices(
+            group_id
+        ):
+            self._recovery_ledger.retry_sibling(
+                group_id, generation_index=generation_index
+            )
+        group = self._recovery_ledger.get_group(group_id)
+        retry_indices = [
+            sibling.generation_index
+            for sibling in group.siblings
+            if sibling.current_attempt.status.value == "reserved"
+        ]
+        if retry_indices:
+            self._recovery_ledger.mark_siblings_dispatched(
+                group_id, generation_indices=retry_indices
+            )
+            for generation_index in retry_indices:
+                retry_group = self._recovery_ledger.get_group(group_id)
+                attempt = retry_group.siblings[generation_index].current_attempt
+                self._recovery_ledger.mark_sibling_sealed(
+                    group_id,
+                    generation_index=generation_index,
+                    gate_rollout_id=attempt.gate_rollout_id,
+                    receipt={
+                        "rollout_id": attempt.gate_rollout_id,
+                        "manifest": [
+                            {"staging_key": f"retry-stage-{generation_index}"}
+                        ],
+                    },
+                    reward=0.0,
+                )
+        self._recovery_ledger.mark_group_finalized(group_id)
+        self._recovery_ledger.release_finalized_group(group_id)
+        return True
 
 
 class _FakeTQBuffer:
@@ -363,6 +425,7 @@ def _actor_master_config(
     max_num_epochs: int = 1,
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = False,
+    token_capture: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -376,7 +439,7 @@ def _actor_master_config(
         if buffer_checkpoint
         else InOrderSamplerConfig(max_lookahead_versions=1)
     )
-    return MasterConfig.model_construct(
+    config = MasterConfig.model_construct(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
@@ -423,6 +486,8 @@ def _actor_master_config(
             max_buffered_rollouts=4,
         ),
     )
+    config.token_capture.enabled = token_capture
+    return config
 
 
 def _make_actor_args(
@@ -434,6 +499,7 @@ def _make_actor_args(
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
+    rollout_manager: Optional[_FakeRolloutManager] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -446,7 +512,9 @@ def _make_actor_args(
         weight_synchronizer=_FakeWeightSynchronizer(),  # type: ignore[arg-type]
         advantage_estimator=None,
         loss_fn=object(),  # type: ignore[arg-type]
-        rollout_manager=_FakeRolloutManager(),  # type: ignore[arg-type]
+        rollout_manager=(
+            rollout_manager if rollout_manager is not None else _FakeRolloutManager()
+        ),  # type: ignore[arg-type]
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
         save_state=(
@@ -455,6 +523,72 @@ def _make_actor_args(
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
+
+
+def _sealed_recovery_ledger(*, group_id: str = "recovery-g0") -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    group = ledger.reserve_group(
+        group_id=group_id,
+        prompt_id="prompt-0",
+        prompt_payload={
+            "idx": 0,
+            "message_log": [{"role": "user", "content": "solve"}],
+            "extra_env_info": {},
+            "task_name": "nemo_gym",
+        },  # type: ignore[arg-type]
+        expected_generations=2,
+        target_step=None,
+        start_weight_version=0,
+    )
+    ledger.mark_group_dispatched(group.group_id)
+    for sibling in group.siblings:
+        rollout_id = sibling.current_attempt.gate_rollout_id
+        ledger.mark_sibling_sealed(
+            group.group_id,
+            generation_index=sibling.generation_index,
+            gate_rollout_id=rollout_id,
+            receipt={
+                "rollout_id": rollout_id,
+                "manifest": [
+                    {
+                        "staging_key": f"{group.group_id}-stage-{sibling.generation_index}"
+                    }
+                ],
+            },
+            reward=float(sibling.generation_index),
+        )
+    return ledger
+
+
+def _partial_recovery_ledger() -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    group = ledger.reserve_group(
+        group_id="partial-g0",
+        prompt_id="prompt-0",
+        prompt_payload={
+            "idx": 0,
+            "message_log": [{"role": "user", "content": "solve"}],
+            "extra_env_info": {},
+            "task_name": "nemo_gym",
+        },  # type: ignore[arg-type]
+        expected_generations=2,
+        target_step=None,
+        start_weight_version=0,
+    )
+    ledger.mark_group_dispatched(group.group_id)
+    first_rollout_id = group.siblings[0].current_attempt.gate_rollout_id
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=0,
+        gate_rollout_id=first_rollout_id,
+        receipt={
+            "rollout_id": first_rollout_id,
+            "manifest": [{"staging_key": "partial-g0-stage-0"}],
+        },
+        reward=1.0,
+    )
+    ledger.abandon_group(group.group_id)
+    return ledger
 
 
 def _run_train_pump(
@@ -688,6 +822,185 @@ class TestSaveTrigger:
 
 
 class TestDataPlaneCheckpoint:
+    def test_restore_replays_fully_sealed_groups_before_pumps(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+        )
+        ledger = _sealed_recovery_ledger()
+        (group,) = ledger.groups()
+        manager = _FakeRolloutManager(ledger)
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                dp_client=_FakeDPClient(
+                    staging_sample_ids=sorted(ledger.expected_staging_keys())
+                ),
+                rollout_manager=manager,
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_payload_sha256": "digest"
+                },
+            ),
+        )
+
+        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+        actor._checkpointer.shutdown()
+
+        assert manager.recovered_group_ids == [group.group_id]
+        assert len(ledger) == 0
+
+    def test_restore_redispatches_partial_groups_before_pumps(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+        )
+        ledger = _partial_recovery_ledger()
+        manager = _FakeRolloutManager(ledger)
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                dp_client=_FakeDPClient(
+                    staging_sample_ids=sorted(ledger.expected_staging_keys())
+                ),
+                rollout_manager=manager,
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_payload_sha256": "digest"
+                },
+            ),
+        )
+
+        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+        actor._checkpointer.shutdown()
+
+        assert manager.recovered_group_ids == ["partial-g0"]
+        assert len(ledger) == 0
+
+    def test_restore_rejects_missing_staging_rows(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+        )
+        ledger = _sealed_recovery_ledger()
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                dp_client=_FakeDPClient(),
+                rollout_manager=_FakeRolloutManager(ledger),
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_payload_sha256": "digest"
+                },
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="staging rows missing"):
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+        actor._checkpointer.shutdown()
+
+    def test_saves_rollout_recovery_sidecar_bound_to_tq_snapshot(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+        )
+        ledger = _sealed_recovery_ledger()
+        expected_state = ledger.state_dict()
+        staging_keys = sorted(ledger.expected_staging_keys())
+        dp_client = _FakeDPClient(staging_sample_ids=staging_keys)
+        rollout_manager = _FakeRolloutManager(ledger)
+
+        async def _main() -> None:
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=dp_client,
+                    rollout_manager=rollout_manager,
+                ),
+            )
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            await actor._save_checkpoint({"loss": 1.0})
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+
+        step_dir = tmp_path / "checkpoints" / "step_1"
+        recovery_path = step_dir / ROLLOUT_RECOVERY_STATE_FILENAME
+        payload = recovery_path.read_bytes()
+        assert torch.load(recovery_path, weights_only=False) == expected_state
+        metadata = dp_client.save_calls[0]["metadata"]
+        assert metadata["rollout_recovery_schema_version"] == (
+            ROLLOUT_RECOVERY_SCHEMA_VERSION
+        )
+        assert (
+            metadata["rollout_recovery_payload_sha256"]
+            == hashlib.sha256(payload).hexdigest()
+        )
+        assert metadata["rollout_recovery_group_count"] == 1
+        assert metadata["mode"] == "authoritative"
+
+    def test_canonical_replay_wins_over_ledger_during_checkpoint_cut(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+        )
+        ledger = _sealed_recovery_ledger(group_id="g0")
+        sample_ids = ["g0_g0", "g0_g1"]
+        replay_metadata = {
+            "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+            "storage": REPLAY_BUFFER_METADATA_STORAGE,
+            "partition_id": _PARTITION_ID,
+            "saved_capacity": 4,
+            "manifest_digest": "digest-g0",
+            "groups": [
+                {
+                    "meta": KVBatchMeta(
+                        partition_id=_PARTITION_ID,
+                        task_name="train",
+                        sample_ids=sample_ids,
+                        fields=["input_ids"],
+                        sequence_lengths=[16, 16],
+                        tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    ),
+                    "start_weight": 0,
+                    "end_weight": 0,
+                    "target_step": None,
+                    "group_id": "g0",
+                }
+            ],
+        }
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                dp_client=_FakeDPClient(sample_ids=sample_ids),
+                tq_buffer=_FakeTQBuffer(metadata_state=replay_metadata),
+                rollout_manager=_FakeRolloutManager(ledger),
+            ),
+        )
+        actor._train_steps = 1
+        actor._trainer_version = 1
+
+        asyncio.run(actor._save_checkpoint({"loss": 1.0}))
+        actor._checkpointer.shutdown()
+
+        recovery_state = torch.load(
+            tmp_path / "checkpoints" / "step_1" / ROLLOUT_RECOVERY_STATE_FILENAME,
+            weights_only=False,
+        )
+        assert recovery_state["groups"] == []
+
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path
     ):
@@ -754,9 +1067,10 @@ class TestDataPlaneCheckpoint:
         }
         step_dir = tmp_path / "checkpoints" / "step_1"
         assert (step_dir / "data_plane" / "metadata.json").is_file()
-        assert torch.load(
-            step_dir / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False
-        ) == replay_metadata
+        assert (
+            torch.load(step_dir / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False)
+            == replay_metadata
+        )
         assert not (step_dir / "replay_buffer.pt").exists()
         assert buffer.metadata_state_dict_calls == [4]
 
@@ -1312,16 +1626,12 @@ class TestReplayBufferPersistence:
         ckpt_dir = tmp_path / "checkpoints"
         assert (ckpt_dir / "step_2" / "training_info.json").exists()
         assert not (ckpt_dir / "step_2" / "replay_buffer.pt").exists()
-        assert not (
-            ckpt_dir / "step_2" / REPLAY_BUFFER_METADATA_FILENAME
-        ).exists()
+        assert not (ckpt_dir / "step_2" / REPLAY_BUFFER_METADATA_FILENAME).exists()
 
     def test_run_rejects_legacy_replay_file(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
-        torch.save(
-            {"groups": ["legacy"]}, ckpt_dir / LEGACY_REPLAY_BUFFER_FILENAME
-        )
+        torch.save({"groups": ["legacy"]}, ckpt_dir / LEGACY_REPLAY_BUFFER_FILENAME)
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=0,
@@ -1333,9 +1643,7 @@ class TestReplayBufferPersistence:
         with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
             _run_actor_run(
                 mc,
-                _make_actor_args(
-                    tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)
-                ),
+                _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
             )
 
         assert buffer.load_calls == []
@@ -1501,9 +1809,7 @@ class TestReplayBufferPersistence:
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
         torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        mc = _actor_master_config(
-            tmp_path, max_num_steps=0, buffer_checkpoint=False
-        )
+        mc = _actor_master_config(tmp_path, max_num_steps=0, buffer_checkpoint=False)
 
         with pytest.raises(RuntimeError, match="does not support replay-buffer"):
             _run_actor_run(

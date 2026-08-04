@@ -24,7 +24,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
@@ -260,6 +263,68 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
+
+
+def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
+    events: list[str] = []
+
+    class _RecordingRolloutManager:
+        def reserve_prompt_group(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> str:
+            del target_step
+            prompt_id = prompt["idx"]
+            events.append(f"reserve-{prompt_id}")
+            return f"group-{prompt_id}"
+
+        async def generate_and_push(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            recovery_group_id: str | None = None,
+        ) -> None:
+            del target_step
+            events.append(f"dispatch-{prompt['idx']}-{recovery_group_id}")
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo={"max_num_epochs": 1},
+        token_capture=SimpleNamespace(enabled=True),
+    )
+    ctrl._rollout_manager = _RecordingRolloutManager()
+    ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {
+                "idx": [10, 11],
+                "message_log": [
+                    [{"role": "user", "content": "a"}],
+                    [{"role": "user", "content": "b"}],
+                ],
+            }
+        )
+    ]
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert events == [
+        "reserve-10",
+        "reserve-11",
+        "dispatch-10-group-10",
+        "dispatch-11-group-11",
+    ]
 
 
 @pytest.mark.vllm
