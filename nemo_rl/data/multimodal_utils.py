@@ -404,7 +404,18 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
 
 
 def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
-    """Encode a PIL Image as a base64 data URL."""
+    """Encode a PIL Image as a base64 ``data:`` URL.
+
+    Args:
+        image: PIL image to encode.
+        fmt: PIL image format used for serialization (e.g. ``"PNG"``, ``"JPEG"``).
+            The value is also lowercased and embedded in the MIME type of the
+            returned URL.
+
+    Returns:
+        A ``data:image/<fmt>;base64,<payload>`` URL suitable for embedding in
+        an OpenAI Responses ``input_image`` content part.
+    """
     buf = BytesIO()
     image.save(buf, format=fmt)
     encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -412,11 +423,27 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
 
 
 def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Walk examples and replace local image paths with base64 data URLs.
+    """Replace local image paths in NeMo Gym examples with base64 data URLs.
 
-    Operates in-place on each example's responses_create_params.input[].content[]
-    items of type 'input_image'. HTTP(S) and data URLs are preserved; local
-    paths, including file:// URLs, are encoded as data URLs.
+    Walks each example's ``responses_create_params.input[].content[]`` items
+    and rewrites any ``input_image`` part whose ``image_url`` is a local path
+    (or ``file://`` URL) into a base64 ``data:`` URL via
+    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
+    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
+    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
+    without raising.
+
+    The examples are mutated in place; the same list is also returned for
+    convenience so callers can chain the call.
+
+    Args:
+        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
+            expected to contain a ``responses_create_params`` mapping with an
+            ``input`` list of Responses API messages.
+
+    Returns:
+        The same ``nemo_gym_examples`` list, with local image references
+        rewritten to base64 data URLs in place.
     """
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
