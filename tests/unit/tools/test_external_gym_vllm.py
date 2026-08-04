@@ -603,6 +603,21 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert 'env \\\n  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
 
 
+def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
+    script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
+    source = script.read_text()
+
+    assert "RAY_PORT=1200" in source
+    assert "RAY_CLIENT_SERVER_PORT=1201" in source
+    assert "MIN_WORKER_PORT=2000" in source
+    assert "MAX_WORKER_PORT=2999" in source
+    assert "VLLM_ENGINE_PORT=7000" in source
+    assert source.count('--min-worker-port="${MIN_WORKER_PORT}"') == 2
+    assert source.count('--max-worker-port="${MAX_WORKER_PORT}"') == 2
+    assert 'export VLLM_PORT="${VLLM_ENGINE_PORT}"' in source
+    assert '--port "${VLLM_HTTP_PORT}"' in source
+
+
 def test_pool_config_interface_registers_an_arbitrary_third_pool():
     script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
     program = textwrap.dedent(

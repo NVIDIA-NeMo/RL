@@ -345,7 +345,7 @@ pool_value() {
 
 MODEL=$(pool_value MODEL)
 VLLM_PYTHON=$(pool_value VLLM_PYTHON)
-VLLM_PORT=$(pool_value VLLM_PORT)
+VLLM_HTTP_PORT=$(pool_value VLLM_PORT)
 TENSOR_PARALLEL_SIZE=$(pool_value TENSOR_PARALLEL_SIZE)
 SERVED_MODEL_NAME=$(pool_value SERVED_MODEL_NAME)
 DISPLAY_NAME=$(pool_value DISPLAY_NAME)
@@ -353,7 +353,22 @@ DISPLAY_NAME=$(pool_value DISPLAY_NAME)
 [[ -n "${DISPLAY_NAME}" ]] || DISPLAY_NAME="${POOL_PREFIX}"
 
 source "${EXTERNAL_VLLM_TOOLS_DIR}/vllm_backend_registry.sh"
-RAY_PORT=6379
+
+# Match ray.sub's sub-ephemeral port layout. Some GB200 nodes use
+# 9000-65000 for ephemeral ports, so Ray's former 10002-19999 worker range
+# could race vLLM's bind-probe-and-release TCPStore allocation. Every replica
+# owns disjoint nodes, so these fixed ports can be reused across replicas.
+RAY_PORT=1200
+RAY_CLIENT_SERVER_PORT=1201
+NODE_MANAGER_PORT=1301
+OBJECT_MANAGER_PORT=1303
+RUNTIME_ENV_AGENT_PORT=1305
+DASHBOARD_AGENT_GRPC_PORT=1307
+METRICS_EXPORT_PORT=1309
+DASHBOARD_AGENT_LISTEN_PORT=1311
+MIN_WORKER_PORT=2000
+MAX_WORKER_PORT=2999
+VLLM_ENGINE_PORT=7000
 
 cleanup_replica() {
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
@@ -381,6 +396,15 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     --head \
     --node-ip-address="${HEAD_IP}" \
     --port="${RAY_PORT}" \
+    --ray-client-server-port="${RAY_CLIENT_SERVER_PORT}" \
+    --min-worker-port="${MIN_WORKER_PORT}" \
+    --max-worker-port="${MAX_WORKER_PORT}" \
+    --node-manager-port="$((NODE_MANAGER_PORT + 1))" \
+    --object-manager-port="$((OBJECT_MANAGER_PORT + 1))" \
+    --runtime-env-agent-port="$((RUNTIME_ENV_AGENT_PORT + 1))" \
+    --dashboard-agent-grpc-port="$((DASHBOARD_AGENT_GRPC_PORT + 1))" \
+    --dashboard-agent-listen-port="$((DASHBOARD_AGENT_LISTEN_PORT + 1))" \
+    --metrics-export-port="$((METRICS_EXPORT_PORT + 1))" \
     --disable-usage-stats
 
   while IFS= read -r assignment; do
@@ -393,6 +417,11 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     export "${assignment}"
   done <<< "$(pool_value ENV_VARS)"
 
+  # Keep vLLM's TCPStore and MessageQueue ports inside the reserved
+  # 7000-7999 band. serve_vllm_on_ray.py applies the NeMo RL compatibility
+  # patch that offsets the TCPStore search within this per-engine window.
+  export VLLM_PORT="${VLLM_ENGINE_PORT}"
+
   vllm_args=()
   while IFS= read -r argument; do
     [[ -n "${argument}" ]] && vllm_args+=("${argument}")
@@ -402,7 +431,7 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   "${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" serve "${MODEL}" \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
     --distributed-executor-backend ray \
-    --port "${VLLM_PORT}" \
+    --port "${VLLM_HTTP_PORT}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     "${vllm_args[@]}" \
     > "${LOG_FILE}" 2>&1 &
@@ -410,7 +439,7 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
 
   while ! "${VLLM_PYTHON}" -c \
     'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).close()' \
-    "http://${HEAD_IP}:${VLLM_PORT}/health" >/dev/null 2>&1; do
+    "http://${HEAD_IP}:${VLLM_HTTP_PORT}/health" >/dev/null 2>&1; do
     if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
       echo "[${REPLICA_ID}] ERROR: vLLM exited before becoming healthy" >&2
       exit 1
@@ -418,8 +447,8 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     sleep 5
   done
 
-  registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_PORT}"
-  echo "[${REPLICA_ID}] Registered healthy backend ${HEAD_IP}:${VLLM_PORT}"
+  registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_HTTP_PORT}"
+  echo "[${REPLICA_ID}] Registered healthy backend ${HEAD_IP}:${VLLM_HTTP_PORT}"
   wait "${VLLM_PID}"
 else
   for _ in $(seq 1 120); do
@@ -434,7 +463,17 @@ else
   HEAD_IP=$(cat "${HEAD_IP_FILE}")
   joined=0
   for _ in $(seq 1 120); do
-    if ray start --address="${HEAD_IP}:${RAY_PORT}" --disable-usage-stats; then
+    if ray start \
+      --address="${HEAD_IP}:${RAY_PORT}" \
+      --min-worker-port="${MIN_WORKER_PORT}" \
+      --max-worker-port="${MAX_WORKER_PORT}" \
+      --node-manager-port="${NODE_MANAGER_PORT}" \
+      --object-manager-port="${OBJECT_MANAGER_PORT}" \
+      --runtime-env-agent-port="${RUNTIME_ENV_AGENT_PORT}" \
+      --dashboard-agent-grpc-port="${DASHBOARD_AGENT_GRPC_PORT}" \
+      --dashboard-agent-listen-port="${DASHBOARD_AGENT_LISTEN_PORT}" \
+      --metrics-export-port="${METRICS_EXPORT_PORT}" \
+      --disable-usage-stats; then
       joined=1
       break
     fi

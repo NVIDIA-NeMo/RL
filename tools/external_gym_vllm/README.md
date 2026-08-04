@@ -127,6 +127,26 @@ Every TP value must be divisible by `GPUS_PER_NODE`. The wrapper records the
 actual split in `$BASE_LOG_DIR/<job-id>-logs/node-allocation.txt` and writes
 each resolved URL to `<pool-name-lowercase>_url` in the same directory.
 
+### Private-cluster port layout
+
+Each replica uses the same fixed port layout on its disjoint node set. This
+matches `ray.sub` and stays below the `9000` ephemeral-port floor observed on
+GB200 nodes:
+
+| Range | Purpose |
+|---|---|
+| `1200-1201` | Private Ray GCS and client server. |
+| `1301-1312` | Private Ray management services. |
+| `2000-2999` | Private Ray worker gRPC ports. |
+| `7000-7999` | vLLM engine rendezvous, anchored by `VLLM_PORT=7000`. |
+| `8000` by default | Per-pool vLLM HTTP endpoint (`POOL_VLLM_PORT`). |
+
+The old `10002-19999` Ray worker default overlaps the `9000-65000` ephemeral
+range on these nodes. A vLLM TCPStore probe could therefore select a Ray worker
+port and later fail with `EADDRINUSE`. Keeping both Ray and vLLM internal ports
+in disjoint sub-ephemeral bands removes that race; ports above `19999` are not
+reserved for this helper.
+
 ## Filesystem and container requirements
 
 External replicas mount `EXTERNAL_VLLM_SHARED_ROOT` at the same path inside the
