@@ -135,25 +135,28 @@ grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" || {
 
 # Kill exactly one generation shard.
 #
-# Match the Ray ACTOR structurally rather than by substring. `pgrep -f
-# VllmAsyncGenerationWorker` also matches the per-worker venv python child and the bash
-# launcher that execs it, so it returns roughly three entries per shard; the lowest pid is
-# then just as likely to be a child as an actor. That matters more here than in the chaos
-# test: this one asserts the run COMPLETES, so killing a non-actor leaves both shards alive,
-# the run finishes exactly as it would have anyway, and the test reports a pass having
-# never exercised recovery at all.
+# Ask Ray which processes its generation actors are, rather than inferring it from process
+# titles. `pgrep -f VllmAsyncGenerationWorker` matched the venv child and the launcher shell
+# as well as the actor -- three hits per shard -- and anchoring on Ray's `ray::` title fixed
+# that on a workstation but found ZERO actors on a GB200 cluster (job 5861743: "expected
+# exactly 2 generation actors, found 0" at train step 3, with generation working). Titles
+# are a runtime implementation detail; the GCS actor table is the runtime's own record.
 #
-# The `<name>:` infix and `.method` suffix are both optional because Ray retitles a worker
-# for the duration of each call -- either form is the actor, and unlike the chaos test the
-# state it is in does not change what is being asserted here.
-ACTOR_RE='^ray::([A-Za-z0-9_.:-]+:)?[A-Za-z_]*GenerationWorker(\.[A-Za-z_]+)?$'
-mapfile -t GEN_PIDS < <(ps -eo pid=,args= | sed -E 's/^ *//' | awk -v re="$ACTOR_RE" \
-    '{ pid=$1; $1=""; sub(/^ /,""); if ($0 ~ re) print pid }' | sort -n)
+# This matters more here than in the chaos test: this one asserts the run COMPLETES, so
+# killing a non-actor leaves both shards serving, the run finishes exactly as it would have
+# anyway, and the test reports a pass having never exercised recovery.
+mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
+
 if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     echo "[recovery] FAIL: expected exactly $GEN_GPUS generation actors, found ${#GEN_PIDS[@]}"
     echo "[recovery] this is a harness problem, not a recovery failure -- killing the wrong"
     echo "[recovery] process would let the run complete and report a false pass."
-    ps -eo pid,args --no-headers | grep "ray::" | grep -v grep | head -20
+    echo "[recovery] --- what Ray reports ---"
+    uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
+    echo "[recovery] --- every process with 'eneration' in its command line ---"
+    # Unfiltered on purpose. The previous diagnostic grepped for "ray::" and so printed
+    # nothing precisely when the ray:: assumption was the thing that was wrong.
+    ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//' | grep -i "eneration" | grep -v grep | head -20
     exit 1
 fi
 VICTIM=${GEN_PIDS[0]}
