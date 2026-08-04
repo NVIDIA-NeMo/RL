@@ -1660,18 +1660,18 @@ def ppo_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
-            if "global_valid_toks" in metrics:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                    metrics["global_valid_toks"] / total_time / total_num_gpus
-                    if total_time > 0
-                    else 0
-                )
             performance_metrics = print_performance_metrics(
                 train_results if train_results is not None else (value_results or {}),
                 metrics,
                 timing_metrics,
                 master_config,
             )
+            if "global_valid_toks" in metrics:
+                performance_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics["global_valid_toks"] / total_time / total_num_gpus
+                    if total_time > 0
+                    else 0
+                )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(

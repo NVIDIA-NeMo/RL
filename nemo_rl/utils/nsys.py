@@ -59,6 +59,22 @@ class ProfilablePolicy(Protocol):
     def stop_gpu_profiling(self) -> None: ...
 
 
+def _stop_gpu_profiling_best_effort(policy: ProfilablePolicy) -> None:
+    """Stop profiling without letting a profiling failure kill the run.
+
+    ``stop_gpu_profiling`` fans out via ``ray.get``; if nsys already tore the
+    workers down (``capture-range-end=stop-shutdown``) that raises
+    ``ActorDiedError`` and would abort training.
+    """
+    try:
+        policy.stop_gpu_profiling()
+    except Exception as e:
+        rich.print(
+            f"[bold yellow]Failed to stop GPU profiling for {policy} "
+            f"({type(e).__name__}: {e}); continuing.[/bold yellow]"
+        )
+
+
 def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
     assert not (bool(NRL_NSYS_WORKER_PATTERNS) ^ bool(NRL_NSYS_PROFILE_STEP_RANGE)), (
         "Either both NRL_NSYS_WORKER_PATTERNS and NRL_NSYS_PROFILE_STEP_RANGE must be set, or neither. See https://github.com/NVIDIA/NeMo-RL/tree/main/docs/nsys-profiling.md for more details."
@@ -98,7 +114,7 @@ def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
                 rich.print(
                     f"[bold red]Stopping GPU profiling on exit for {policy} for step {step}[/bold red]"
                 )
-                policy.stop_gpu_profiling()
+                _stop_gpu_profiling_best_effort(policy)
 
             atexit.register(stop_profiler_on_exit)
     else:
@@ -106,20 +122,15 @@ def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
             rich.print(
                 f"[bold red]Stopping GPU profiling for {policy} for step {step}[/bold red]"
             )
-            policy.stop_gpu_profiling()
+            _stop_gpu_profiling_best_effort(policy)
             policy.__NRL_PROFILE_STARTED = False
 
 
 def wrap_with_nvtx_name(name: str):
-    """A decorator to wrap a function with an NVTX range with the given name."""
+    """A decorator to wrap a function with an NVTX range with the given name.
 
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            torch.cuda.nvtx.range_push(name)
-            ret = func(*args, **kwargs)
-            torch.cuda.nvtx.range_pop()
-            return ret
-
-        return wrapper
-
-    return decorator
+    ``torch.cuda.nvtx.range`` is a ContextDecorator that pops in a ``finally``,
+    so a raising call cannot leak an unbalanced range and mis-nest every later
+    range in the trace.
+    """
+    return torch.cuda.nvtx.range(name)

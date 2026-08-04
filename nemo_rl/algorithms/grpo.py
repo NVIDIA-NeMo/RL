@@ -3593,11 +3593,11 @@ def grpo_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
+            )
+            performance_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
             )
 
             if refit_metrics:
@@ -5024,11 +5024,11 @@ def async_grpo_train(
                 master_config.cluster["num_nodes"]
                 * master_config.cluster["gpus_per_node"]
             )
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
+            )
+            performance_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
             )
 
             collector_efficiency = ray.get(

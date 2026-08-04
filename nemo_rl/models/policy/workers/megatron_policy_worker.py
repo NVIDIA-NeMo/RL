@@ -2676,6 +2676,7 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1].contiguous(),
         )
 
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -2698,6 +2699,7 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
