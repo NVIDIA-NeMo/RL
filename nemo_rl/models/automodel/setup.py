@@ -312,6 +312,12 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
+    if is_vlm and cp_size_cfg > 1:
+        raise ValueError(
+            "Context parallel is not supported for VLM models on the Automodel "
+            "policy worker. Set policy.dtensor_cfg.context_parallel_size = 1."
+        )
+
     attn_impl = (
         "flash_attention_2"
         if (enable_seq_packing and cp_size_cfg == 1)
@@ -380,6 +386,7 @@ def validate_and_prepare_config(
             "Context parallel is not supported for sequence packing. "
             "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
         )
+
     if sequence_parallel_enabled and tp_size == 1:
         print(
             "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. "
