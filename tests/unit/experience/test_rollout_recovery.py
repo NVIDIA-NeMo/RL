@@ -92,6 +92,34 @@ def test_retry_preserves_logical_id_and_changes_attempt_identity() -> None:
     assert retry.status == RolloutAttemptStatus.RESERVED
 
 
+def test_partial_retry_dispatches_only_missing_sibling() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    for generation_index in (0, 2):
+        attempt = group.siblings[generation_index].current_attempt
+        ledger.mark_sibling_sealed(
+            group.group_id,
+            generation_index=generation_index,
+            gate_rollout_id=attempt.gate_rollout_id,
+            receipt=_receipt(attempt.gate_rollout_id, generation_index),
+            reward=float(generation_index),
+        )
+    ledger.prepare_for_restart()
+
+    assert ledger.retryable_generation_indices(group.group_id) == [1]
+    retry = ledger.retry_sibling(group.group_id, generation_index=1)
+    ledger.mark_siblings_dispatched(group.group_id, generation_indices=[1])
+
+    restored = ledger.get_group(group.group_id)
+    assert restored.siblings[0].current_attempt.status == RolloutAttemptStatus.SEALED
+    assert (
+        restored.siblings[1].current_attempt.status == RolloutAttemptStatus.DISPATCHED
+    )
+    assert restored.siblings[1].current_attempt.gate_rollout_id == retry.gate_rollout_id
+    assert restored.siblings[2].current_attempt.status == RolloutAttemptStatus.SEALED
+
+
 def test_prompt_payload_is_snapshotted_defensively() -> None:
     prompt = _prompt()
     ledger = RolloutRecoveryLedger()
@@ -139,6 +167,39 @@ def test_state_dict_round_trip_preserves_lineage() -> None:
         sibling.current_attempt.status == RolloutAttemptStatus.DISPATCHED
         for sibling in restored_group.siblings[1:]
     )
+
+
+def test_prepare_for_restart_preserves_only_reusable_sealed_attempts() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    gate_rollout_id = group.siblings[1].current_attempt.gate_rollout_id
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=1,
+        gate_rollout_id=gate_rollout_id,
+        receipt=_receipt(gate_rollout_id, 1),
+        reward=1.0,
+    )
+
+    ledger.prepare_for_restart()
+
+    restored_group = ledger.get_group(group.group_id)
+    assert [sibling.current_attempt.status for sibling in restored_group.siblings] == [
+        RolloutAttemptStatus.ABANDONED,
+        RolloutAttemptStatus.SEALED,
+        RolloutAttemptStatus.ABANDONED,
+    ]
+    assert ledger.expected_staging_keys() == {"stage-1"}
+
+
+def test_discard_canonical_groups_reconciles_checkpoint_overlap() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(ledger, group_id="canonical")
+    _reserve(ledger, group_id="unfinished")
+
+    assert ledger.discard_canonical_groups({"canonical", "missing"}) == 1
+    assert [group.group_id for group in ledger.groups()] == ["unfinished"]
 
 
 def test_invalid_state_transition_fails_without_partial_mutation() -> None:
