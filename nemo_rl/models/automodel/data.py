@@ -42,13 +42,18 @@ def _accepted_forward_kwargs(
     except (AttributeError, TypeError, ValueError):
         return None
 
-    if any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
-    ):
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
         return None
     return frozenset(
         parameter.name for parameter in parameters if parameter.name != "self"
     )
+
+
+def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:
+    """Return True if every image in the batch has the same (height, width)."""
+    if imgs_sizes.ndim != 2 or imgs_sizes.shape[0] <= 1:
+        return True
+    return bool((imgs_sizes == imgs_sizes[0]).all())
 
 
 def filter_multimodal_kwargs_for_model(
@@ -58,10 +63,23 @@ def filter_multimodal_kwargs_for_model(
     accepted_kwargs = _accepted_forward_kwargs(type(model))
     if accepted_kwargs is None:
         return multimodal_kwargs
+    # A forward that cannot consume imgs_sizes also cannot crop the per-image
+    # pad_to_max_shape padding, so mixed-resolution batches would feed padded
+    # pixels to the vision encoder and mismatch the placeholder count.
+    imgs_sizes = multimodal_kwargs.get("imgs_sizes")
+    if (
+        imgs_sizes is not None
+        and "imgs_sizes" not in accepted_kwargs
+        and not _all_image_sizes_equal(imgs_sizes)
+    ):
+        raise ValueError(
+            "This AutoModel does not accept `imgs_sizes` and cannot crop padded "
+            "pixel_values, but the batch contains mixed-resolution images. The "
+            "AutoModel backend only supports equal-resolution images/tiles; use "
+            "the Megatron backend for mixed-resolution inputs."
+        )
     return {
-        key: value
-        for key, value in multimodal_kwargs.items()
-        if key in accepted_kwargs
+        key: value for key, value in multimodal_kwargs.items() if key in accepted_kwargs
     }
 
 

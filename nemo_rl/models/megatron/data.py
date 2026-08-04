@@ -403,9 +403,7 @@ def process_microbatch(
                         # TE's default inference excludes the final boundary, so
                         # it misses trailing-only padding for a single sequence.
                         # CP zigzag can move that padding to a rank-local seam.
-                        pad_between_seqs=not torch.equal(
-                            cu_seqlens, cu_seqlens_padded
-                        ),
+                        pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
                         qkv_format="thd",
                         total_tokens=input_ids.shape[1],
                     )

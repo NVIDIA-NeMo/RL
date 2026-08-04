@@ -214,6 +214,66 @@ class TestModelForward:
             model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
         )
 
+    def test_forward_rejects_mixed_resolution_without_imgs_sizes_support(
+        self, processed_inputs_multimodal
+    ):
+        class ExplicitMultimodalModel(torch.nn.Module):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = ExplicitMultimodalModel()
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "imgs_sizes": torch.tensor([[224, 320], [256, 288]]),
+                "num_frames": torch.ones(2, dtype=torch.long),
+            }
+        )
+
+        with pytest.raises(ValueError, match="mixed-resolution"):
+            model_forward(model, processed_inputs_multimodal)
+
+    def test_forward_allows_uniform_resolution_without_imgs_sizes_support(
+        self, processed_inputs_multimodal
+    ):
+        class ExplicitMultimodalModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pixel_values = None
+
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                self.pixel_values = pixel_values
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = ExplicitMultimodalModel()
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "imgs_sizes": torch.tensor([[224, 224], [224, 224]]),
+                "num_frames": torch.ones(2, dtype=torch.long),
+            }
+        )
+
+        # Uniform sizes (the shipped fixed-tile case): no raise, and imgs_sizes
+        # is filtered out for a model that cannot consume it.
+        model_forward(model, processed_inputs_multimodal)
+
+        assert (
+            model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
+        )
+
     def test_forward_preserves_dynamic_resolution_omni_inputs(
         self, processed_inputs_multimodal
     ):
