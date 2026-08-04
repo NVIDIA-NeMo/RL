@@ -1870,8 +1870,6 @@ def get_distillation_topk_logprobs_from_logits(
             "topk=0 is not supported as it would result in empty tensor operations."
         )
 
-    # Ensure float32 for stability
-    student_logits = student_logits.to(torch.float32)
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
@@ -1917,6 +1915,15 @@ def get_distillation_topk_logprobs_from_logits(
     else:
         student_logits = student_logits
         parallel_group = None
+
+    # Only the paths that read the full vocabulary need a [B, S, V] fp32 copy:
+    # zero_outside_topk takes a full-vocab log_softmax, and the TP/CP paths feed
+    # chunked kernels that allocate their fp32 buffers from this tensor. The
+    # remaining path reads K columns, so it upcasts the gathered [B, S, K]
+    # instead -- gather-then-cast is equivalent to cast-then-gather, and avoids
+    # materializing the full-vocab fp32 tensor.
+    if zero_outside_topk or parallel_group is not None or cp_size > 1:
+        student_logits = student_logits.to(torch.float32)
 
     # Process based on the zero_outside_topk setting
     H_all = None
@@ -1998,7 +2005,7 @@ def get_distillation_topk_logprobs_from_logits(
         else:
             student_topk_logits = student_logits.gather(
                 dim=-1, index=teacher_topk_indices
-            )
+            ).to(torch.float32)
 
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1
