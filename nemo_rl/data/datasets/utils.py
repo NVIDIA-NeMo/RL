@@ -209,7 +209,6 @@ def warn_on_unsupported_dataset_config_keys(
     The dataset dispatchers instantiate with ``dataset_class(**data_config)``
     and every built-in dataset accepts ``**kwargs``, so a config key the class
     does not actually support is swallowed without any feedback — e.g.
-    ``subset`` on ``GSM8KDataset`` (which hardcodes the ``main`` config) or
     ``split_validation_size`` on datasets that never call
     ``split_train_validation``. For the keys in
     ``_BEHAVIORAL_DATASET_CONFIG_KEYS``, warn when the resolved class does not

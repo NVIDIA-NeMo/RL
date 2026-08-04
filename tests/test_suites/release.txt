@@ -23,6 +23,10 @@ tests/test_suites/llm/dapo-qwen2.5-7b.v2.sh
 # Qwen3.5-35B DAPO GRPO run
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.sh
 
+# Qwen3.5-397B-A17B GRPO run. Lives here rather than in nightly.txt because one
+# run costs 1024 GPU-hours (32 nodes x 8 GPUs x 4h).
+tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh
+
 # GLM-4.7-Flash GRPO run
 tests/test_suites/llm/grpo-glm47-flash-4n8g-automodel.sh
 

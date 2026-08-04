@@ -107,10 +107,10 @@ class SingleControllerActor:
         self._async_cfg = master_config.async_rl
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.get("seq_logprob_error_threshold") is None
+            and master_config.grpo.seq_logprob_error_threshold is None
         )
         self._reference_logprobs_required = not bool(
-            master_config.grpo.get("skip_reference_policy_logprobs_calculation")
+            master_config.grpo.skip_reference_policy_logprobs_calculation
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
@@ -128,6 +128,7 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
+        self._logger.log_hyperparams(master_config.model_dump())
         self._timer = Timer()
 
         # Also built here, not on the driver: TimeoutChecker must capture
@@ -141,22 +142,20 @@ class SingleControllerActor:
         )
         self._timeout.start_iterations()
 
-        # Loaded (or default) GRPOSaveState; keys SC does not own
-        # (val_reward, ...) pass through to saved checkpoints untouched.
+        # Loaded (or initial) GRPOSaveState from setup; _get_grpo_save_state
+        # already defaulted any fields missing from older checkpoints.
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
-        self._consumed_samples: int = actor_args.save_state["consumed_samples"]
-        self._total_valid_tokens: int = actor_args.save_state.get(
-            "total_valid_tokens", 0
-        )  # Default to 0 for backward compatibility with older checkpoints
+        self._consumed_samples: int = actor_args.save_state.consumed_samples
+        self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
 
-        num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
         self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
-        self._sampler.set_dispatch_index(actor_args.save_state["current_step"])
+        self._sampler.set_dispatch_index(actor_args.save_state.current_step)
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
         validate_sampler_buffer_capacity(
             self._async_cfg,
@@ -187,9 +186,9 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        self._trainer_version: int = actor_args.save_state["current_step"]
-        self._train_steps: int = actor_args.save_state["current_step"]
-        self._current_epoch: int = actor_args.save_state["current_epoch"]
+        self._trainer_version: int = actor_args.save_state.current_step
+        self._train_steps: int = actor_args.save_state.current_step
+        self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
@@ -269,7 +268,7 @@ class SingleControllerActor:
                 flush=True,
             )
             return
-        saved_sampler_name = self._save_state.get("sampler_name")
+        saved_sampler_name = getattr(self._save_state, "sampler_name", None)
         current_sampler_name = self._async_cfg.sampler.name
         if saved_sampler_name != current_sampler_name:
             print(
@@ -289,9 +288,7 @@ class SingleControllerActor:
             buffer_state,
             max_groups=self._async_cfg.max_buffered_rollouts,
             expected_partition_id=self._partition_id,
-            expected_group_size=self._master_config.grpo[
-                "num_generations_per_prompt"
-            ],
+            expected_group_size=self._master_config.grpo.num_generations_per_prompt,
         )
         # Each buffered group holds one _buffer_capacity permit; the load
         # truncation guarantees restored <= capacity, so this never blocks.
@@ -373,7 +370,7 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        max_epochs = self._master_config.grpo["max_num_epochs"]
+        max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
@@ -434,7 +431,7 @@ class SingleControllerActor:
         """
         grpo_cfg = self._master_config.grpo
 
-        while self._train_steps < grpo_cfg["max_num_steps"]:
+        while self._train_steps < grpo_cfg.max_num_steps:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             min_sample_version = None
@@ -442,7 +439,7 @@ class SingleControllerActor:
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
+                while groups_dispatched < grpo_cfg.num_prompts_per_step:
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -461,7 +458,7 @@ class SingleControllerActor:
 
                         # Select a batch
                         max_prompt_groups = (
-                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
+                            grpo_cfg.num_prompts_per_step - groups_dispatched
                         )
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
@@ -488,7 +485,7 @@ class SingleControllerActor:
                                     "rollout exhausted before a complete training "
                                     f"step was assembled: dispatched "
                                     f"{groups_dispatched}/"
-                                    f"{grpo_cfg['num_prompts_per_step']} prompt "
+                                    f"{grpo_cfg.num_prompts_per_step} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
@@ -598,13 +595,13 @@ class SingleControllerActor:
                     await self._sync_weights(calibration_data=calibration_data)
 
                 # Checkpointing (mirrors async_grpo_train's save block).
-                self._consumed_samples += grpo_cfg["num_prompts_per_step"]
+                self._consumed_samples += grpo_cfg.num_prompts_per_step
                 self._total_valid_tokens += step_metrics.get(
                     "global_valid_toks", 0
                 )
                 self._timeout.mark_iteration()
 
-                is_last_step = self._train_steps >= grpo_cfg["max_num_steps"]
+                is_last_step = self._train_steps >= grpo_cfg.max_num_steps
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
                 should_save_by_step = (
@@ -662,7 +659,7 @@ class SingleControllerActor:
             # generated with; lag = training version - oldest sample version.
             lag = version_during_step - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
+                f"train step {self._train_steps}/{grpo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,
@@ -679,20 +676,21 @@ class SingleControllerActor:
         on disk before begin_finalization; rollouts keep running throughout.
         """
         save_state = self._save_state
-        save_state["current_step"] = self._train_steps
-        save_state["total_steps"] = self._train_steps
-        save_state["current_epoch"] = self._current_epoch
-        save_state["consumed_samples"] = self._consumed_samples
-        save_state["total_valid_tokens"] = self._total_valid_tokens
+        save_state.current_step = self._train_steps
+        save_state.total_steps = self._train_steps
+        save_state.current_epoch = self._current_epoch
+        save_state.consumed_samples = self._consumed_samples
+        save_state.total_valid_tokens = self._total_valid_tokens
         # The restore skips the replay buffer when the resuming run uses a
         # different sampler (its stamps may never be selectable there).
-        save_state["sampler_name"] = self._async_cfg.sampler.name
+        save_state.sampler_name = self._async_cfg.sampler.name  # type: ignore[attr-defined]
         # Snapshot before any await so it can't interleave with
         # _rollout_pump iterating this same dataloader.
         dataloader_state = self._dataloader.state_dict()
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
-        save_state.pop("val_reward", None)
+        if hasattr(save_state, "val_reward"):
+            delattr(save_state, "val_reward")
 
         full_metric_name = self._master_config.checkpointing["metric_name"]
         if full_metric_name is not None:
@@ -712,14 +710,14 @@ class SingleControllerActor:
                     "This checkpoint will not be saved as top-k.",
                     stacklevel=2,
                 )
-                if full_metric_name in save_state:
-                    del save_state[full_metric_name]
+                if hasattr(save_state, full_metric_name):
+                    delattr(save_state, full_metric_name)
             elif metric_name not in metrics_source:
                 raise ValueError(
                     f"Metric {metric_name} not found in {prefix} metrics"
                 )
             else:
-                save_state[full_metric_name] = metrics_source[metric_name]
+                setattr(save_state, full_metric_name, metrics_source[metric_name])
 
         # Flush the previous checkpoint's background finalization first;
         # re-raises a failure from it.
@@ -729,7 +727,7 @@ class SingleControllerActor:
         checkpoint_path = await asyncio.to_thread(
             self._checkpointer.init_tmp_checkpoint,
             self._train_steps,
-            save_state,
+            vars(save_state),
             self._master_config,
         )
         # With async_save this returns after D2H staging; disk writes finish

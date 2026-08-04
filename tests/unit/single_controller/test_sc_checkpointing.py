@@ -37,7 +37,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -46,7 +46,12 @@ import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
-from nemo_rl.algorithms.grpo import _default_grpo_save_state
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    GRPOSaveState,
+    _get_grpo_save_state,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
@@ -299,13 +304,13 @@ def _actor_master_config(
         loss_fn=ClippedPGLossConfig(),
         env={},
         data={"shuffle": False, "num_workers": 0},
-        grpo={
-            "max_num_steps": max_num_steps,
-            "max_num_epochs": max_num_epochs,
-            "num_prompts_per_step": num_prompts_per_step,
-            "num_generations_per_prompt": 2,
-            "seed": 42,
-        },
+        grpo=GRPOConfig.model_construct(
+            max_num_steps=max_num_steps,
+            max_num_epochs=max_num_epochs,
+            num_prompts_per_step=num_prompts_per_step,
+            num_generations_per_prompt=2,
+            seed=42,
+        ),
         logger={
             "log_dir": str(tmp_path / "logs"),
             "wandb_enabled": False,
@@ -338,7 +343,7 @@ def _actor_master_config(
 def _make_actor_args(
     *,
     trainer: Optional[_FakeTrainer] = None,
-    save_state: Optional[dict[str, Any]] = None,
+    save_state: Optional[GRPOSaveState] = None,
     dataloader: Optional[_FakeDataloader] = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
     last_checkpoint_path: Optional[str] = None,
@@ -358,7 +363,7 @@ def _make_actor_args(
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
         save_state=(
-            save_state if save_state is not None else _default_grpo_save_state()
+            save_state if save_state is not None else _initial_grpo_save_state()
         ),
         last_checkpoint_path=last_checkpoint_path,
     )
@@ -423,11 +428,11 @@ def _training_info(ckpt_dir: Path, step: int) -> dict[str, Any]:
 
 class TestCounterRestore:
     def test_restore_from_step_n(self, tmp_path):
-        save_state = _default_grpo_save_state()
-        save_state["current_step"] = 7
-        save_state["current_epoch"] = 2
-        save_state["consumed_samples"] = 42
-        save_state["total_valid_tokens"] = 1234
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 7
+        save_state.current_epoch = 2
+        save_state.consumed_samples = 42
+        save_state.total_valid_tokens = 1234
 
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path), _make_actor_args(save_state=save_state)
@@ -453,13 +458,16 @@ class TestCounterRestore:
         assert actor._total_valid_tokens == 0
 
     def test_old_checkpoint_without_total_valid_tokens(self, tmp_path):
-        # Older checkpoints may predate the total_valid_tokens key.
-        save_state = {
-            "consumed_samples": 10,
-            "current_step": 5,
-            "current_epoch": 0,
-            "total_steps": 5,
-        }
+        # Older checkpoints may predate the total_valid_tokens key;
+        # _get_grpo_save_state backfills it with the default.
+        save_state = _get_grpo_save_state(
+            {
+                "consumed_samples": 10,
+                "current_step": 5,
+                "current_epoch": 0,
+                "total_steps": 5,
+            }
+        )
 
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path), _make_actor_args(save_state=save_state)
@@ -474,9 +482,9 @@ class TestCounterRestore:
         # running to max_num_steps=4 must yield 4 total steps (not 2, not 6),
         # with only the post-resume boundary checkpointed.
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
-        save_state = _default_grpo_save_state()
-        save_state["current_step"] = 2
-        save_state["consumed_samples"] = 4
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 2
+        save_state.consumed_samples = 4
 
         actor = _run_train_pump(mc, _make_actor_args(save_state=save_state))
 
@@ -686,7 +694,7 @@ _STEP_3_SAVE_STATE = {
 def _write_checkpoint(
     ckpt_dir: Path,
     step: int,
-    save_state: dict[str, Any],
+    save_state: Union[dict[str, Any], GRPOSaveState],
     *,
     with_optimizer: bool = True,
     dataloader_state: Optional[dict[str, Any]] = None,
@@ -697,7 +705,11 @@ def _write_checkpoint(
     if with_optimizer:
         (step_dir / "policy" / "optimizer").mkdir(parents=True)
     with open(step_dir / "training_info.json", "w") as f:
-        json.dump(save_state, f)
+        # Mirror production serialization: the actor writes vars(save_state)
+        # of the GRPOSaveState dataclass; plain dicts model legacy files.
+        json.dump(
+            save_state if isinstance(save_state, dict) else vars(save_state), f
+        )
     if dataloader_state is not None:
         torch.save(dataloader_state, step_dir / "train_dataloader.pt")
     if config is not None:
@@ -720,17 +732,17 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "num_workers": 0,
             "train": [{"env_name": "math"}],
         },
-        grpo={
-            "max_num_steps": 100,
-            "max_num_epochs": 1,
-            "num_prompts_per_step": 4,
-            "num_generations_per_prompt": 2,
-            "max_rollout_turns": 1,
-            "seed": 42,
-            "val_period": 0,
-            "val_at_start": False,
-            "val_at_end": False,
-        },
+        grpo=GRPOConfig.model_construct(
+            max_num_steps=100,
+            max_num_epochs=1,
+            num_prompts_per_step=4,
+            num_generations_per_prompt=2,
+            max_rollout_turns=1,
+            seed=42,
+            val_period=0,
+            val_at_start=False,
+            val_at_end=False,
+        ),
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
@@ -810,8 +822,9 @@ class TestSetupResumeWiring:
         trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] == step_3 / "policy" / "weights"
         assert trainer_kwargs["optimizer_path"] == step_3 / "policy" / "optimizer"
-        # training_info.json is loaded into the actor args for the actor.
-        assert actor_args.save_state == _STEP_3_SAVE_STATE
+        # training_info.json is loaded into the actor args for the actor
+        # (missing fields backfilled with the GRPOSaveState defaults).
+        assert actor_args.save_state == _get_grpo_save_state(dict(_STEP_3_SAVE_STATE))
         assert actor_args.last_checkpoint_path == str(step_3)
 
     def test_setup_fresh_start_passes_none_paths(
@@ -828,7 +841,7 @@ class TestSetupResumeWiring:
         trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] is None
         assert trainer_kwargs["optimizer_path"] is None
-        assert actor_args.save_state == _default_grpo_save_state()
+        assert actor_args.save_state == _initial_grpo_save_state()
         assert actor_args.last_checkpoint_path is None
 
     def test_setup_forwards_pretrained_checkpoint(
@@ -859,8 +872,8 @@ def _make_int_dataloader() -> StatefulDataLoader:
 class TestDataloaderState:
     def test_save_writes_dataloader_state(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
-        save_state = _default_grpo_save_state()
-        save_state["current_epoch"] = 3
+        save_state = _initial_grpo_save_state()
+        save_state.current_epoch = 3
         dataloader = _FakeDataloader(state={"fake_position": 7})
 
         _run_train_pump(
@@ -884,7 +897,7 @@ class TestDataloaderState:
         step_dir = _write_checkpoint(
             tmp_path,
             5,
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             dataloader_state=dataloader.state_dict(),
             config={"data": {"train": [{"dataset_name": "math_train"}]}},
         )
@@ -903,7 +916,7 @@ class TestDataloaderState:
         step_dir = _write_checkpoint(
             tmp_path,
             5,
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             dataloader_state=dataloader.state_dict(),
             config={"data": {"train": [{"dataset_name": "old_dataset"}]}},
         )
@@ -956,8 +969,8 @@ class TestDataloaderState:
 
 def _matching_save_state() -> dict[str, Any]:
     """save_state whose sampler_name matches _actor_master_config's sampler."""
-    save_state = _default_grpo_save_state()
-    save_state["sampler_name"] = "windowed"
+    save_state = _initial_grpo_save_state()
+    save_state.sampler_name = "windowed"
     return save_state
 
 
@@ -1059,8 +1072,8 @@ class TestReplayBufferPersistence:
         ckpt_dir.mkdir()
         torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
         mc = _actor_master_config(tmp_path, max_num_steps=0)
-        save_state = _default_grpo_save_state()
-        save_state["sampler_name"] = "in_order"  # current run uses windowed
+        save_state = _initial_grpo_save_state()
+        save_state.sampler_name = "in_order"  # current run uses windowed
         buffer = _FakeTQBuffer(load_return=2)
         printed: list[str] = []
         monkeypatch.setattr(
