@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from typing import Any
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
@@ -158,11 +160,14 @@ def _make_buffer(dp: FakeDataPlaneClient) -> TQReplayBuffer:
 
 
 def _add_group(
-    buf: TQReplayBuffer, weight: int, end_weight: int | None = None
+    buf: TQReplayBuffer,
+    weight: int,
+    end_weight: int | None = None,
+    target_step: int | None = None,
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
-    group_id = buf.reserve(weight_version=weight)
+    group_id = buf.reserve(weight_version=weight, target_step=target_step)
     return _run(
         buf.commit(
             group_id,
@@ -516,6 +521,87 @@ class TestTQReplayBufferStateDict:
             assert put["sample_ids"] == list(meta.sample_ids)
             assert put["fields"] == {"payload_for": list(meta.sample_ids)}
             assert put["tags"] == [dict(t) for t in meta.tags]
+
+    def test_round_trip_preserves_end_weight_and_target_step(self):
+        # start != end and a non-None target_step must survive the round-trip:
+        # a load that swapped start/end or dropped target_step (the
+        # InOrderSampler's selection key) would corrupt resume silently.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=1, end_weight=2)
+        _add_group(buf, weight=5, target_step=7)
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        buf2 = _make_buffer(FakeDataPlaneClient())
+        assert _load(buf2, state) == 2
+
+        assert buf2.start_weight_list == [1, 5]
+        assert buf2.end_weight_list == [2, 5]
+        assert buf2.target_step_list == [None, 7]
+
+    def test_round_trip_empty_buffer(self):
+        # Common resume shape: no group committed before the checkpoint.
+        buf = _make_buffer(FakeDataPlaneClient())
+        state = _run(buf.state_dict(saved_capacity=8))
+        assert state["groups"] == []
+
+        dp2 = FakeDataPlaneClient()
+        buf2 = _make_buffer(dp2)
+        assert _load(buf2, state) == 0
+        assert buf2.size() == 0
+        assert dp2.put_calls == []
+
+    def test_state_dict_skips_middle_unready(self):
+        # An unready slot between two ready ones: the by-index skip must not
+        # shift the neighbouring groups' fields.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        first = _add_group(buf, weight=1)
+        buf.reserve(weight_version=2)  # in-flight, sandwiched
+        third = _add_group(buf, weight=3)
+
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        assert [g["start_weight"] for g in state["groups"]] == [1, 3]
+        assert [g["group_id"] for g in state["groups"]] == [
+            _group_id_of(first),
+            _group_id_of(third),
+        ]
+        assert [g["meta"].sample_ids for g in state["groups"]] == [
+            list(first.sample_ids),
+            list(third.sample_ids),
+        ]
+
+    def test_round_trip_tensordict_payload_through_torch_save(self):
+        # The production checkpoint file is torch.save(envelope) with
+        # TensorDict-valued fields_data; exercise that serialization for real
+        # (mixed dtypes + a non-contiguous view) instead of the opaque fake.
+        fields = TensorDict(
+            {
+                "input_ids": torch.arange(12, dtype=torch.long).reshape(2, 6),
+                "prev_logprobs": torch.randn(2, 12, dtype=torch.float32)[:, ::2],
+                "sample_mask": torch.ones(2, dtype=torch.long),
+            },
+            batch_size=(2,),
+        )
+        group = _make_group_entry("g0", weight=1)
+        group["fields_data"] = fields
+        state = _make_envelope([group])
+
+        buffer_bytes = io.BytesIO()
+        torch.save(state, buffer_bytes)
+        buffer_bytes.seek(0)
+        loaded_state = torch.load(buffer_bytes, weights_only=False)
+
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        assert (
+            _load(buf, loaded_state, expected_group_size=len(group["meta"].sample_ids))
+            == 1
+        )
+        put_fields = dp.put_calls[0]["fields"]
+        for key in fields.keys():
+            assert torch.equal(put_fields[key], fields[key])
 
 
 class TestTQReplayBufferLoadPreflight:

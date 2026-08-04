@@ -486,6 +486,26 @@ class TestCounterRestore:
         assert actor._sampler._dispatch_index == 4
         assert actor._total_valid_tokens == 0
 
+    def test_resumed_pump_continues_to_max_steps(self, tmp_path):
+        # Composes counter restore with a live pump: resuming at step 2 and
+        # running to max_num_steps=4 must yield 4 total steps (not 2, not 6),
+        # with only the post-resume boundary checkpointed.
+        mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
+        save_state = _default_grpo_save_state()
+        save_state["current_step"] = 2
+        save_state["consumed_samples"] = 4
+
+        actor = _run_train_pump(mc, _make_actor_args(save_state=save_state))
+
+        assert actor._train_steps == 4
+        assert actor._trainer_version == 4
+        # Steps 3 and 4 ran: one save at the step-4 boundary, none re-written
+        # for the pre-resume step 2.
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_4"}
+        info = _training_info(tmp_path / "checkpoints", 4)
+        assert info["current_step"] == 4
+        assert info["consumed_samples"] == 4 + 2 * 2
+
 
 # ── save trigger + write path ────────────────────────────────────────────────
 
