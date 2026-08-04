@@ -72,13 +72,9 @@ dependencies = [
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
-  # tilelang — replacement Triton kernel mamba-ssm requires when
-  # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
-  # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
-  # crash at first gated-chunk backward with a RuntimeError pointing
-  # at this exact pip install. Linux x86_64 only — mamba-ssm itself
-  # is gated to that pair.
-  "tilelang; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # tilelang — required by fused DSA TileLang kernels on Blackwell and
+  # by mamba-ssm's replacement Triton kernel path on Hopper.
+  "tilelang; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -190,7 +186,7 @@ mcore = [
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
-  # conflicting extras resolve in separate forks — without these direct deps the mcore fork
+  # conflicting extras resolve in separate forks — without these direct deps the mcore stack
   # silently falls back to the PyPI releases instead of the pinned git revs.
   "mamba-ssm",
   "causal-conv1d",
@@ -200,10 +196,15 @@ mcore = [
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Keep the cuDNN Frontend version used by this branch's last passing packed-GLM runs.
+  # Newer Megatron-Bridge/Megatron-LM pins 1.26.0, which is being isolated after a Top-K failure.
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "cuda-python",
-  "apache-tvm-ffi",
+  # Match current NeMo RL main's Linux mcore resolution explicitly so rebuilt worker
+  # venvs do not drift when unbounded transitive dependencies publish new releases.
+  "cuda-python==13.3.1",
+  "cuda-tile==1.5.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "apache-tvm-ffi==0.1.9",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
   # nvidia-cutlass-dsl may inspect/import cupy.testing while generating the
@@ -290,9 +291,11 @@ triton = [
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
-flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", branch = "nv_dev" }
+# FlashMLA derives its version from the Git revision in setup.py. Keep this pin
+# synchronized with the static dependency metadata below.
+flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
@@ -360,7 +363,7 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@e7c550c5f80636cf841a8204b1d6f85a5f3f28b7",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -370,6 +373,7 @@ override-dependencies = [
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
+  "fastapi[standard]<0.139.2",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
@@ -516,11 +520,25 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
+flash_mla = [{ requirement = "torch", match-runtime = true }]
+
+# The current GLM 5.1 recipes use Megatron allgather dispatch and do not consume
+# Transformer Engine's NCCL-EP extension. The pinned TE revision otherwise enables
+# NCCL-EP for Hopper+ and selects the container's incompatible /usr NCCL headers.
+# Keep this package-scoped so uv tracks it as a build input and rebuilds TE when it
+# changes instead of relying on an ad-hoc shell export.
+[tool.uv.extra-build-variables]
+transformer-engine = { NVTE_WITH_NCCL_EP = "0" }
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0+b7643bd"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
@@ -553,13 +571,19 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "transformer-engine"]
+version = "2.18.0+e7c550c5"
+requires-dist = [
+  "einops",
+  "importlib-metadata>=1.0",
+  "nvdlfw-inspect",
+  "nvidia-cudnn-frontend>=1.25.0",
+  "onnx",
+  "onnxscript",
+  "packaging",
+  "pydantic",
+  "torch>=2.1",
+]
+provides-extras = ["core-cu13", "pytorch"]
 
 [[tool.uv.dependency-metadata]]
 name = "nv-grouped-gemm"
