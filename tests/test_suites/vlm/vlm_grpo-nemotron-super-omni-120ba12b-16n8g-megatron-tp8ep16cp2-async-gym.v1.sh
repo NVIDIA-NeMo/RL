@@ -13,8 +13,8 @@ NUM_MINUTES=180
 
 exit_if_max_steps_reached
 
-MODEL_PATH="${NEMOTRON_SUPER_OMNI_MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/pjin/checkpoints/super-omni-textrl-svg-20260629-step-125-hf}"
-TRAIN_PATH="${NEMOTRON_SUPER_OMNI_GYM_DATA_PATH:-/scratch/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/datasets/eagle-next/image_data/rl_data/Super_filtered_samples/random_blend_super_v6_5_gym.jsonl}"
+MODEL_PATH="${NEMOTRON_SUPER_OMNI_MODEL_PATH:-/path/to/nemotron-super-omni-hf-checkpoint}"
+TRAIN_PATH="${NEMOTRON_SUPER_OMNI_GYM_DATA_PATH:-/path/to/super-omni-gym-train.jsonl}"
 CHAT_TEMPLATE="${NEMOTRON_SUPER_OMNI_CHAT_TEMPLATE:-${MODEL_PATH}/chat_template.jinja}"
 
 export NRL_REFIT_BUFFER_MEMORY_RATIO=0.006
