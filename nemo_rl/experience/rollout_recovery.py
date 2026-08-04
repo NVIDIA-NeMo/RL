@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
 ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -158,9 +159,9 @@ def _receipt_staging_keys(receipt: dict[str, Any]) -> list[str]:
 class RolloutRecoveryLedger:
     """Controller-owned prompt-to-attempt lineage for token-capture rollouts.
 
-    This first implementation is deliberately in-memory. ``state_dict`` and
-    ``from_state_dict`` define the versioned boundary that a later checkpoint
-    change will persist alongside the native TQ snapshot.
+    ``state_dict`` and ``from_state_dict`` define the versioned sidecar stored
+    alongside the native TQ snapshot. The sidecar contains lineage and
+    receipts only; token payloads remain in TQ's staging partition.
     """
 
     def __init__(self) -> None:
@@ -210,7 +211,32 @@ class RolloutRecoveryLedger:
     def mark_group_dispatched(self, group_id: str) -> None:
         """Move every current attempt from reserved to dispatched."""
         record = self._require_group(group_id)
-        attempts = [sibling.current_attempt for sibling in record.siblings]
+        self.mark_siblings_dispatched(
+            group_id,
+            generation_indices=[
+                sibling.generation_index for sibling in record.siblings
+            ],
+        )
+
+    def mark_siblings_dispatched(
+        self, group_id: str, *, generation_indices: list[int]
+    ) -> None:
+        """Move selected current attempts from reserved to dispatched."""
+        record = self._require_group(group_id)
+        if not generation_indices or len(set(generation_indices)) != len(
+            generation_indices
+        ):
+            raise ValueError("generation_indices must be non-empty and unique")
+        if any(
+            index < 0 or index >= len(record.siblings) for index in generation_indices
+        ):
+            raise ValueError(
+                f"generation_indices are outside recovery group {group_id!r}"
+            )
+        attempts = [
+            record.siblings[generation_index].current_attempt
+            for generation_index in generation_indices
+        ]
         self._require_statuses(
             attempts,
             allowed={RolloutAttemptStatus.RESERVED},
@@ -325,6 +351,53 @@ class RolloutRecoveryLedger:
     def get_group(self, group_id: str) -> PromptGroupRecoveryRecord:
         """Return a defensive copy of one group."""
         return copy.deepcopy(self._require_group(group_id))
+
+    def groups(self) -> list[PromptGroupRecoveryRecord]:
+        """Return defensive copies of all groups in checkpoint order."""
+        return copy.deepcopy(list(self._groups.values()))
+
+    def discard_canonical_groups(self, group_ids: set[str]) -> int:
+        """Drop groups already represented by canonical replay metadata."""
+        discarded = 0
+        for group_id in group_ids:
+            if group_id in self._groups:
+                del self._groups[group_id]
+                discarded += 1
+        return discarded
+
+    def prepare_for_restart(self) -> None:
+        """Mark physical attempts that cannot survive a process restart abandoned."""
+        for record in self._groups.values():
+            for sibling in record.siblings:
+                attempt = sibling.current_attempt
+                if attempt.status in {
+                    RolloutAttemptStatus.RESERVED,
+                    RolloutAttemptStatus.DISPATCHED,
+                }:
+                    attempt.status = RolloutAttemptStatus.ABANDONED
+
+    def expected_staging_keys(self) -> set[str]:
+        """Return staging rows referenced by reusable sealed receipts."""
+        return {
+            staging_key
+            for record in self._groups.values()
+            for sibling in record.siblings
+            if sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+            for staging_key in sibling.current_attempt.staging_keys
+        }
+
+    def retryable_generation_indices(self, group_id: str) -> list[int]:
+        """Return logical siblings that require a new physical attempt."""
+        record = self._require_group(group_id)
+        return [
+            sibling.generation_index
+            for sibling in record.siblings
+            if sibling.current_attempt.status
+            in {
+                RolloutAttemptStatus.ABANDONED,
+                RolloutAttemptStatus.FAILED,
+            }
+        ]
 
     def __len__(self) -> int:
         """Return the number of unfinished or retryable prompt groups."""

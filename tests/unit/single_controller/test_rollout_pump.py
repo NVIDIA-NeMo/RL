@@ -24,7 +24,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
@@ -84,9 +87,10 @@ class _RecordingRolloutManager:
         prompt: Any,
         *,
         target_step: int | None = None,
+        recovery_group_id: str | None = None,
         inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
     ) -> None:
-        del prompt, inflight_registry
+        del prompt, recovery_group_id, inflight_registry
         self._buffer.reserve(target_step=target_step)
 
 
@@ -112,7 +116,8 @@ def test_rollout_pump_stamps_target_steps(
         diagnostics=False,
     )
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        grpo=GRPOConfig.model_construct(max_num_epochs=1),
+        token_capture=SimpleNamespace(enabled=False),
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
@@ -159,16 +164,18 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
             prompt: Any,
             *,
             target_step: int | None = None,
+            recovery_group_id: str | None = None,
             inflight_registry: dict[str, Any] | None = None,
         ) -> RolloutOutcome:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, recovery_group_id, inflight_registry
             return outcome
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        grpo=GRPOConfig.model_construct(max_num_epochs=1),
+        token_capture=SimpleNamespace(enabled=False),
     )
     ctrl._rollout_manager = _OutcomeRolloutManager()
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -219,7 +226,8 @@ def test_rollout_pump_tops_up_restored_target_step(
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        grpo=GRPOConfig.model_construct(max_num_epochs=1),
+        token_capture=SimpleNamespace(enabled=False),
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # lookahead=0 keeps the single batch on target_step 0.
@@ -317,9 +325,10 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             prompt: Any,
             *,
             target_step: int | None = None,
+            recovery_group_id: str | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del target_step, inflight_registry
+            del target_step, recovery_group_id, inflight_registry
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -344,7 +353,8 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             diagnostics=False,
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(enabled=False),
         )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
@@ -389,9 +399,10 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             prompt: Any,
             *,
             target_step: int | None = None,
+            recovery_group_id: str | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, recovery_group_id, inflight_registry
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -430,7 +441,8 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             diagnostics=False,
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(enabled=False),
         )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
@@ -458,6 +470,69 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
+
+
+def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
+    events: list[str] = []
+
+    class _RecordingRolloutManager:
+        def reserve_prompt_group(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> str:
+            del target_step
+            prompt_id = prompt["idx"]
+            events.append(f"reserve-{prompt_id}")
+            return f"group-{prompt_id}"
+
+        async def generate_and_push(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            recovery_group_id: str | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> None:
+            del target_step, inflight_registry
+            events.append(f"dispatch-{prompt['idx']}-{recovery_group_id}")
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1),
+        token_capture=SimpleNamespace(enabled=True),
+    )
+    ctrl._rollout_manager = _RecordingRolloutManager()
+    ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {
+                "idx": [10, 11],
+                "message_log": [
+                    [{"role": "user", "content": "a"}],
+                    [{"role": "user", "content": "b"}],
+                ],
+            }
+        )
+    ]
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert events == [
+        "reserve-10",
+        "reserve-11",
+        "dispatch-10-group-10",
+        "dispatch-11-group-11",
+    ]
 
 
 @pytest.mark.vllm
