@@ -183,7 +183,7 @@ def _fetch_rows(tq_client, sample_ids):
     )
 
 
-def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions):
+def test_finalize_group_builds_n_rows_with_placeholder(tq_client, partitions):
     group_id = "grp1"
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
@@ -201,12 +201,13 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     )
     assert not finalized.dropped
     assert finalized.meta is not None
+    assert finalized.fields is not None
     assert finalized.meta.sample_ids == rollout_ids
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
 
-    rows = _fetch_rows(tq_client, rollout_ids)
+    rows = finalized.fields
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
     assert sample_mask.tolist() == [1.0, 0.0]
     valid_len = len(expected.token_ids)
@@ -223,9 +224,11 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     rewards = torch.as_tensor(rows["total_reward"]).flatten()
     assert rewards.tolist() == [1.0, 0.0]
 
-    # The finalizer cleared its staged rows after publishing.
-    with pytest.raises(KeyError):
-        finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
+    # Publication and cleanup are owned by the checkpoint-aware replay buffer.
+    assert finalized.staging_keys == [receipt["manifest"][0]["staging_key"]]
+    assert finalizer._source.fetch(finalized.staging_keys)
+    with pytest.raises((KeyError, RuntimeError, ValueError)):
+        _fetch_rows(tq_client, rollout_ids)
 
 
 def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
@@ -241,6 +244,7 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
     )
     assert finalized.dropped
     assert finalized.meta is None
+    assert finalized.fields is None
     assert (finalized.group_min_wv, finalized.group_max_wv) == (3, 3)
     with pytest.raises((KeyError, RuntimeError, ValueError)):
         rows = _fetch_rows(tq_client, rollout_ids)

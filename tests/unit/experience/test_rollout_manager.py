@@ -887,9 +887,10 @@ def test_async_nemo_gym_rollout_manager_matches_original(
 class _FakeFinalizedGroup:
     def __init__(self, *, dropped=False):
         self.meta = None if dropped else "meta-sentinel"
+        self.fields = None if dropped else "fields-sentinel"
         self.group_min_wv = 3
         self.group_max_wv = 4
-        self.staging_keys = []
+        self.staging_keys = ["stage-0"]
         self.metrics = {"finalize/invalid_row_rate": 0.0}
         self.dropped = dropped
 
@@ -913,6 +914,7 @@ class _FakeCaptureBuffer(_FakeBuffer):
         super().__init__()
         self.reserve_rollout_ids: list[list[str] | None] = []
         self.commit_finalized_calls: list[tuple] = []
+        self.abort_finalized_calls: list[tuple[str, list[str]]] = []
 
     def reserve(
         self, *, weight_version, target_step=None, group_id=None, rollout_ids=None
@@ -926,12 +928,23 @@ class _FakeCaptureBuffer(_FakeBuffer):
         )
 
     async def commit_finalized(
-        self, group_id, meta, group_min_wv, group_max_wv, *, staging_keys=None
+        self,
+        group_id,
+        meta,
+        fields,
+        group_min_wv,
+        group_max_wv,
+        *,
+        staging_keys=None,
     ):
         self.commit_finalized_calls.append(
-            (group_id, meta, group_min_wv, group_max_wv, staging_keys)
+            (group_id, meta, fields, group_min_wv, group_max_wv, staging_keys)
         )
         return meta
+
+    async def abort_finalized(self, group_id, *, staging_keys):
+        self.abort_finalized_calls.append((group_id, list(staging_keys)))
+        return self.abort(group_id)
 
 
 class _FakeGymEnvHandle:
@@ -1019,7 +1032,16 @@ class TestGenerateAndFinalizeFlow:
         assert rewards == [0.5, 0.5]
         assert fallback_wv == 7
         # commit_finalized carried the group's min/max call versions.
-        assert buf.commit_finalized_calls == [(group_id, "meta-sentinel", 3, 4, [])]
+        assert buf.commit_finalized_calls == [
+            (
+                group_id,
+                "meta-sentinel",
+                "fields-sentinel",
+                3,
+                4,
+                ["stage-0"],
+            )
+        ]
         # The legacy commit path was not used and nothing failed at the gate.
         assert buf.commit_calls == []
         assert mgr._env_handles["nemo_gym"].failed == []
@@ -1030,6 +1052,7 @@ class TestGenerateAndFinalizeFlow:
         with pytest.raises(RuntimeError, match="min_valid_fraction"):
             _run(mgr.generate_and_push({"prompt": "p"}))
         assert buf.commit_finalized_calls == []
+        assert len(buf.abort_finalized_calls) == 1
         assert len(buf.abort_calls) >= 1
 
     def test_failed_dispatch_aborts_and_fails_gate_rollouts(self):

@@ -858,16 +858,21 @@ class RolloutManager:
             )
             record.rollout_metrics.update(finalized.metrics)
             if finalized.dropped:
-                # min_valid_fraction_per_group rejected the group: nothing
-                # was published, so drop the slot like a failed dispatch.
-                self._tq_buffer.abort(group_id)
+                # The finalizer is read-only. Clear the staged rows and drop
+                # the reservation through the checkpoint-aware buffer.
+                await self._tq_buffer.abort_finalized(
+                    group_id, staging_keys=finalized.staging_keys
+                )
                 raise RuntimeError(
                     f"token capture: group {group_id} dropped "
                     "(min_valid_fraction_per_group)"
                 )
+            assert finalized.meta is not None
+            assert finalized.fields is not None
             await self._tq_buffer.commit_finalized(
                 group_id,
                 finalized.meta,
+                finalized.fields,
                 finalized.group_min_wv,
                 finalized.group_max_wv,
                 staging_keys=finalized.staging_keys,
