@@ -282,6 +282,15 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def is_fastokens_enabled(
+    tokenizer_config: TokenizerConfig | dict[str, Any],
+) -> bool:
+    """Return whether the optional fastokens tokenizer extra is enabled."""
+    if isinstance(tokenizer_config, dict):
+        return bool(tokenizer_config.get("use_fastokens"))
+    return bool((tokenizer_config.model_extra or {}).get("use_fastokens"))
+
+
 def get_tokenizer(
     tokenizer_config: TokenizerConfig | dict[str, Any], get_processor: bool = False
 ) -> PreTrainedTokenizerBase:
@@ -359,9 +368,7 @@ def get_tokenizer(
     if isinstance(tokenizer_config, dict):
         tokenizer_config = TokenizerConfig(**tokenizer_config)
 
-    maybe_patch_fastokens(
-        bool((tokenizer_config.model_extra or {}).get("use_fastokens"))
-    )
+    maybe_patch_fastokens(is_fastokens_enabled(tokenizer_config))
 
     processor = None
 

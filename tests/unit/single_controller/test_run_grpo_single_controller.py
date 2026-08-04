@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from examples import run_grpo_single_controller
+from nemo_rl.models.policy import DraftConfigDisabled
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         policy={
             "tokenizer": {},
             "generation": generation_config,
-            "draft": {"enabled": False},
+            "draft": DraftConfigDisabled(),
             "megatron_cfg": {"mtp_num_layers": 2},
         },
         env={},
