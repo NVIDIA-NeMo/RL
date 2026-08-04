@@ -1,0 +1,43 @@
+# Colocated GLM-5.2 131K production recipe on 64 H100 nodes. Training and
+# vLLM share all 512 GPUs, using GBS64 to populate four TP8/EP128 generation
+# groups. The policy topology remains TP2/PP8/CP32/EP64 (DP1).
+#
+# Keep the GLM-5.2 indexer configuration inherited from the parent. Unlike
+# GLM-5.1, GLM-5.2 uses index_topk_freq=4, index_skip_topk_offset=3, and a
+# model-defined mix of full and shared indexers.
+defaults: ./grpo-glm5.2-72n8g-megatron-131K-full-onpolicy-h100-cudnn-noncolocated.yaml
+
+grpo:
+  # 8 prompts x 8 generations gives the GBS64 rollout/training batch.
+  num_prompts_per_step: 8
+
+policy:
+  train_global_batch_size: 64
+  generation:
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+    vllm_cfg:
+      # EP128 / inherited TP8 gives internal DP16. GBS64 fills four groups.
+      expert_parallel_size: 128
+    vllm_kwargs:
+      # Let vLLM admit the GBS64 requests according to available KV capacity.
+      max_num_seqs: null
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm52-full-64n8g-131k-h100-cudnn-colocated
+  save_period: 12
+  keep_top_k: 1
+  metric_name: null
+  checkpoint_must_save_by: 00:03:30:00
+
+logger:
+  log_dir: logs/grpo-glm52-full-64n8g-131k-h100-cudnn-colocated
+  wandb:
+    entity: nvidia
+    name: grpo-glm52-full-64n8g-131k-h100-cudnn-colocated
+
+cluster:
+  num_nodes: 64
