@@ -18,14 +18,14 @@ from __future__ import annotations
 
 import copy
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Self, TypedDict, cast
 
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 1
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -45,6 +45,9 @@ class RolloutAttemptState(TypedDict):
     attempt_id: str
     gate_rollout_id: str
     status: str
+    receipt: dict[str, Any] | None
+    reward: float | None
+    staging_keys: list[str]
 
 
 class RolloutSiblingState(TypedDict):
@@ -81,6 +84,9 @@ class RolloutAttemptRecord:
     attempt_id: str
     gate_rollout_id: str
     status: RolloutAttemptStatus
+    receipt: dict[str, Any] | None = None
+    reward: float | None = None
+    staging_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -131,6 +137,22 @@ def _new_attempt(logical_rollout_id: str) -> RolloutAttemptRecord:
         gate_rollout_id=f"{logical_rollout_id}_a{attempt_id}",
         status=RolloutAttemptStatus.RESERVED,
     )
+
+
+def _receipt_staging_keys(receipt: dict[str, Any]) -> list[str]:
+    """Validate a sealed receipt and return its ordered staging keys."""
+    manifest = receipt.get("manifest")
+    if not isinstance(manifest, list):
+        raise ValueError("sealed rollout receipt must contain a manifest list")
+    staging_keys: list[str] = []
+    for entry in manifest:
+        if not isinstance(entry, dict) or not isinstance(entry.get("staging_key"), str):
+            raise ValueError(
+                "sealed rollout receipt manifest entries must contain "
+                "string staging_key values"
+            )
+        staging_keys.append(entry["staging_key"])
+    return staging_keys
 
 
 class RolloutRecoveryLedger:
@@ -203,14 +225,51 @@ class RolloutRecoveryLedger:
         attempts = [sibling.current_attempt for sibling in record.siblings]
         self._require_statuses(
             attempts,
-            allowed={
-                RolloutAttemptStatus.DISPATCHED,
-                RolloutAttemptStatus.SEALED,
-            },
+            allowed={RolloutAttemptStatus.SEALED},
             transition="finalize",
         )
         for attempt in attempts:
             attempt.status = RolloutAttemptStatus.FINALIZED
+
+    def mark_sibling_sealed(
+        self,
+        group_id: str,
+        *,
+        generation_index: int,
+        gate_rollout_id: str,
+        receipt: dict[str, Any],
+        reward: float,
+    ) -> None:
+        """Record one streamed sibling receipt before the group completes."""
+        record = self._require_group(group_id)
+        if not 0 <= generation_index < len(record.siblings):
+            raise ValueError(
+                f"generation_index={generation_index} is outside group {group_id!r}"
+            )
+        sibling = record.siblings[generation_index]
+        attempt = sibling.current_attempt
+        if attempt.status != RolloutAttemptStatus.DISPATCHED:
+            raise ValueError(
+                f"cannot seal logical rollout {sibling.logical_rollout_id!r} "
+                f"from status {attempt.status.value!r}"
+            )
+        if gate_rollout_id != attempt.gate_rollout_id:
+            raise ValueError(
+                "streamed rollout identity mismatch: "
+                f"result={gate_rollout_id!r}, expected={attempt.gate_rollout_id!r}"
+            )
+        if receipt.get("rollout_id") != gate_rollout_id:
+            raise ValueError(
+                "receipt rollout identity mismatch: "
+                f"receipt={receipt.get('rollout_id')!r}, "
+                f"expected={gate_rollout_id!r}"
+            )
+        staging_keys = _receipt_staging_keys(receipt)
+
+        attempt.receipt = copy.deepcopy(receipt)
+        attempt.reward = float(reward)
+        attempt.staging_keys = staging_keys
+        attempt.status = RolloutAttemptStatus.SEALED
 
     def release_finalized_group(self, group_id: str) -> None:
         """Drop a group after canonical replay metadata owns its recovery."""
@@ -225,16 +284,19 @@ class RolloutRecoveryLedger:
         del self._groups[group_id]
 
     def abandon_group(self, group_id: str) -> None:
-        """Mark unfinished attempts abandoned after dispatch cleanup."""
+        """Abandon unfinished attempts while preserving sealed siblings."""
         record = self._require_group(group_id)
         for sibling in record.siblings:
             attempt = sibling.current_attempt
-            if attempt.status == RolloutAttemptStatus.FINALIZED:
+            if attempt.status in {
+                RolloutAttemptStatus.SEALED,
+                RolloutAttemptStatus.FINALIZED,
+            }:
                 continue
             attempt.status = RolloutAttemptStatus.ABANDONED
 
     def discard_group(self, group_id: str) -> None:
-        """Drop lineage for a group intentionally skipped by policy."""
+        """Drop a group intentionally rejected or skipped by policy."""
         self._require_group(group_id)
         del self._groups[group_id]
 
@@ -289,6 +351,9 @@ class RolloutRecoveryLedger:
                                     "attempt_id": attempt.attempt_id,
                                     "gate_rollout_id": attempt.gate_rollout_id,
                                     "status": attempt.status.value,
+                                    "receipt": copy.deepcopy(attempt.receipt),
+                                    "reward": attempt.reward,
+                                    "staging_keys": list(attempt.staging_keys),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -406,11 +471,45 @@ class RolloutRecoveryLedger:
                         raise ValueError(
                             f"invalid rollout attempt status={attempt_state.get('status')!r}"
                         ) from error
+                    receipt = attempt_state.get("receipt")
+                    reward = attempt_state.get("reward")
+                    staging_keys = attempt_state.get("staging_keys")
+                    if receipt is not None and not isinstance(receipt, dict):
+                        raise ValueError("rollout receipt must be a mapping or None")
+                    if reward is not None and not isinstance(reward, (int, float)):
+                        raise ValueError("rollout reward must be numeric or None")
+                    if not isinstance(staging_keys, list) or not all(
+                        isinstance(key, str) for key in staging_keys
+                    ):
+                        raise ValueError("staging_keys must be a list of strings")
+                    if status in {
+                        RolloutAttemptStatus.SEALED,
+                        RolloutAttemptStatus.FINALIZED,
+                    }:
+                        if receipt is None or reward is None:
+                            raise ValueError(
+                                f"{status.value} rollout attempt must retain its "
+                                "receipt and reward"
+                            )
+                        if receipt.get("rollout_id") != gate_rollout_id:
+                            raise ValueError(
+                                "restored receipt rollout identity does not match "
+                                "its gate_rollout_id"
+                            )
+                        receipt_staging_keys = _receipt_staging_keys(receipt)
+                        if staging_keys != receipt_staging_keys:
+                            raise ValueError(
+                                "restored staging_keys do not match the receipt "
+                                "manifest"
+                            )
                     attempts.append(
                         RolloutAttemptRecord(
                             attempt_id=attempt_id,
                             gate_rollout_id=gate_rollout_id,
                             status=status,
+                            receipt=copy.deepcopy(receipt),
+                            reward=float(reward) if reward is not None else None,
+                            staging_keys=list(staging_keys),
                         )
                     )
                 siblings.append(

@@ -44,6 +44,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
+    RolloutTimeouts,
 )
 from nemo_rl.experience.rollout_recovery import (
     RolloutAttemptStatus,
@@ -53,6 +54,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -74,6 +76,77 @@ from tests.unit.test_envs import MultiStepCalcMetadata
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+class _StreamingGymEnv:
+    """Ray-style streaming actor stub that yields results out of order."""
+
+    def __init__(self, results):
+        self._results = results
+        self.run_rollouts = self
+
+    def options(self, *, num_returns):
+        assert num_returns == "streaming"
+        return self
+
+    def remote(self, _inputs, _tokenizer, _timer_prefix):
+        async def _stream():
+            for result in self._results:
+
+                async def _result_ref(value=result):
+                    return value
+
+                yield _result_ref()
+
+        return _stream()
+
+
+def test_nemo_gym_stream_callback_runs_before_group_completion() -> None:
+    def _result(rowidx: int) -> tuple[int, dict, None]:
+        rollout_id = f"rollout-{rowidx}"
+        return (
+            rowidx,
+            {
+                "receipt": {"rollout_id": rollout_id, "manifest": []},
+                "rollout_id": rollout_id,
+                "full_result": {"reward": float(rowidx)},
+                "message_log": [],
+                "input_message_log": [],
+            },
+            None,
+        )
+
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._task_to_env = {"nemo_gym": _StreamingGymEnv([_result(1), _result(0)])}
+    impl._tokenizer = None
+    impl._max_gym_row_attempts = 1
+    impl._timeouts = RolloutTimeouts()
+    impl._stats = None
+    impl._compute_rollout_metrics = lambda _completions, _agent_name: {}
+    callback_order: list[int] = []
+
+    async def _record(rowidx: int, _completion: Completion) -> None:
+        callback_order.append(rowidx)
+        if rowidx == 1:
+            assert len(callback_order) == 1
+
+    completions, _, _ = _run(
+        impl._run_rollouts(
+            [
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            Timer(),
+            "timing/test",
+            on_completion=_record,
+        )
+    )
+
+    assert callback_order == [1, 0]
+    assert [completion.env_extras["ng_rollout_id"] for completion in completions] == [
+        "rollout-0",
+        "rollout-1",
+    ]
 
 
 class _FakeBuffer:
@@ -1122,7 +1195,14 @@ def _receipt_record(rollout_ids, receipts):
     )
 
 
-def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
+def _make_capture_manager(
+    buf,
+    finalizer,
+    *,
+    on_run=None,
+    num_generations=2,
+    fail_after_completions=None,
+):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
@@ -1138,14 +1218,29 @@ def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
     class _CaptureImpl:
         def __init__(self):
             self.seen_rollout_ids = None
+            self.streamed_recovery_groups = []
 
-        async def run_rollout(self, _sample, *, rollout_ids=None):
+        async def run_rollout(self, _sample, *, rollout_ids=None, on_completion=None):
             self.seen_rollout_ids = rollout_ids
             if on_run is not None:
                 await on_run(_sample)
-            return _receipt_record(
-                rollout_ids, [{"rollout_id": rid} for rid in rollout_ids]
-            )
+            receipts = [
+                {
+                    "rollout_id": rollout_id,
+                    "manifest": [{"staging_key": f"stage-{generation_index}"}],
+                }
+                for generation_index, rollout_id in enumerate(rollout_ids)
+            ]
+            record = _receipt_record(rollout_ids, receipts)
+            for generation_index, completion in enumerate(record.completions):
+                if on_completion is not None:
+                    await on_completion(generation_index, completion)
+                    self.streamed_recovery_groups.append(
+                        mgr.recovery_ledger.get_group(buf._slots[0])
+                    )
+                if fail_after_completions == generation_index + 1:
+                    raise RuntimeError("stream interrupted")
+            return record
 
     mgr._impl = _CaptureImpl()
     return mgr
@@ -1223,6 +1318,14 @@ class TestGenerateAndFinalizeFlow:
             sibling.current_attempt.status == RolloutAttemptStatus.DISPATCHED
             for sibling in recovery_group.siblings
         )
+        streamed_group = mgr._impl.streamed_recovery_groups[-1]
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+            for sibling in streamed_group.siblings
+        )
+        assert [
+            sibling.current_attempt.staging_keys for sibling in streamed_group.siblings
+        ] == [["stage-0"], ["stage-1"]]
         assert len(mgr.recovery_ledger) == 0
 
     def test_dropped_group_aborts_slot(self):
@@ -1233,6 +1336,27 @@ class TestGenerateAndFinalizeFlow:
         assert buf.commit_finalized_calls == []
         assert len(buf.abort_finalized_calls) == 1
         assert len(buf.abort_calls) >= 1
+        assert len(mgr.recovery_ledger) == 0
+
+    def test_dropped_group_preserves_sealed_receipts_when_cleanup_fails(self):
+        class _FailingCleanupBuffer(_FakeCaptureBuffer):
+            async def abort_finalized(self, group_id, *, staging_keys):
+                self.abort_finalized_calls.append((group_id, list(staging_keys)))
+                raise RuntimeError("staging cleanup failed")
+
+        buf = _FailingCleanupBuffer()
+        mgr = _make_capture_manager(buf, _FakeFinalizer(dropped=True))
+
+        with pytest.raises(RuntimeError, match="staging cleanup failed"):
+            _run(mgr.generate_and_push(_capture_sample()))
+
+        (group_id,) = buf.remove_calls
+        recovery_group = mgr.recovery_ledger.get_group(group_id)
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+            for sibling in recovery_group.siblings
+        )
+        assert mgr._env_handles["nemo_gym"].failed == []
 
     def test_failed_dispatch_aborts_and_fails_gate_rollouts(self):
         buf = _FakeCaptureBuffer()
@@ -1257,3 +1381,35 @@ class TestGenerateAndFinalizeFlow:
             sibling.current_attempt.status == RolloutAttemptStatus.ABANDONED
             for sibling in recovery_group.siblings
         )
+
+    def test_stream_failure_preserves_completed_siblings(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(
+            buf,
+            _FakeFinalizer(),
+            num_generations=3,
+            fail_after_completions=2,
+        )
+
+        with pytest.raises(RuntimeError, match="stream interrupted"):
+            _run(mgr.generate_and_push(_capture_sample()))
+
+        (group_id,) = buf.remove_calls
+        recovery_group = mgr.recovery_ledger.get_group(group_id)
+        assert [
+            sibling.current_attempt.status for sibling in recovery_group.siblings
+        ] == [
+            RolloutAttemptStatus.SEALED,
+            RolloutAttemptStatus.SEALED,
+            RolloutAttemptStatus.ABANDONED,
+        ]
+        assert [
+            sibling.current_attempt.staging_keys
+            for sibling in recovery_group.siblings[:2]
+        ] == [["stage-0"], ["stage-1"]]
+        (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[0]
+        assert failed_ids == [
+            recovery_group.siblings[2].current_attempt.gate_rollout_id
+        ]
+        assert reason == "dispatch_failed"
+        assert buf.commit_finalized_calls == []
