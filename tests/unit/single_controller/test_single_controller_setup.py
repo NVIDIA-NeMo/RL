@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -56,17 +57,17 @@ def _make_master_config(
             "num_workers": 0,
             "train": [{"env_name": "math"}],
         },
-        grpo={
-            "seed": 42,
-            "max_num_steps": max_num_steps,
-            "max_num_epochs": max_num_epochs,
-            "num_prompts_per_step": num_prompts_per_step,
-            "num_generations_per_prompt": 2,
-            "max_rollout_turns": 1,
-            "val_period": 0,
-            "val_at_start": False,
-            "val_at_end": False,
-        },
+        grpo=GRPOConfig.model_construct(
+            seed=42,
+            max_num_steps=max_num_steps,
+            max_num_epochs=max_num_epochs,
+            num_prompts_per_step=num_prompts_per_step,
+            num_generations_per_prompt=2,
+            max_rollout_turns=1,
+            val_period=0,
+            val_at_start=False,
+            val_at_end=False,
+        ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 2,
             "max_total_sequence_length": 32,
@@ -346,7 +347,7 @@ class TestSetup:
         # patched dataloader has len() == 4, so the min picks max_num_steps.
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.grpo["max_num_steps"] == 2
+        assert mc.grpo.max_num_steps == 2
 
     def test_max_num_steps_capped_by_dataloader_epochs(self, patched_factories):
         """grpo.max_num_steps drops to max_num_epochs * len(dataloader) when smaller."""
@@ -358,7 +359,7 @@ class TestSetup:
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.grpo["max_num_steps"] == 8
+        assert mc.grpo.max_num_steps == 8
 
     def test_megatron_train_iters_capped_by_max_num_steps(self, patched_factories):
         """train_iters = min(max_num_steps, max_num_epochs * len(dataloader))."""
@@ -393,7 +394,7 @@ class TestSetup:
         )
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.grpo["max_num_steps"] == 100
+        assert mc.grpo.max_num_steps == 100
         assert mc.policy["megatron_cfg"]["train_iters"] == 100
 
     def test_megatron_train_iters_not_set_when_disabled(self, patched_factories):

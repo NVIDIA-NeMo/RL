@@ -58,7 +58,9 @@ def test_refit_finalization_falls_back_for_older_trtllm():
         model_engine=SimpleNamespace(model=model, model_loader=model_loader)
     )
 
-    with patch.object(backend.WorkerExtension, "finalize_weight_update", None):
+    with patch.object(
+        backend.WorkerExtension, "finalize_weight_update", None, create=True
+    ):
         extension._finalize_weight_update()
 
     model_loader.finalize_update_weights.assert_called_once_with()
