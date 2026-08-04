@@ -28,6 +28,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # determined, fall back to int16.
 ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int16
 
+# A routed-expert row whose every top-k slot is this value means "no route was
+# captured for this token"; the Megatron replay install falls back to the model's
+# own router for those rows. Partially-negative rows are rejected as corruption.
+ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL = -1
+
 _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int8: "int8",
     torch.int16: "int16",

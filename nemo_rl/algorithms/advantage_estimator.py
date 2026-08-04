@@ -29,6 +29,7 @@ Reference papers:
 """
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -40,15 +41,30 @@ from nemo_rl.algorithms.utils import (
 )
 
 
+class AdvEstimatorConfig(BaseModel, extra="allow"):
+    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
+
+    name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
+    # GRPO specific
+    normalize_rewards: bool = True
+    use_leave_one_out_baseline: bool = True
+    # GDPO specific: optional per-component weights w_n for the aggregation.
+    reward_weights: list[float] | None = None
+    # Reinforce++ specific
+    minus_baseline: bool = True
+
+
 class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
 
     Note: GRPO computes advantages over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
@@ -88,12 +104,14 @@ class GDPOAdvantageEstimator:
     Note: GDPO computes advantages for each reward separately over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
         # Optional per-reward weights w_n for the aggregation A = sum_n w_n * A_n
         # (paper: https://arxiv.org/abs/2601.05242). None => equal weights (all 1.0).
-        self.reward_weights = estimator_config.get("reward_weights")
+        self.reward_weights = estimator_config.reward_weights
 
     def compute_advantage(
         self,
@@ -180,8 +198,10 @@ class ReinforcePlusPlusAdvantageEstimator:
         use_kl_in_reward: If True, add KL penalty to reward instead of loss.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.minus_baseline = estimator_config["minus_baseline"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.minus_baseline = estimator_config.minus_baseline
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type

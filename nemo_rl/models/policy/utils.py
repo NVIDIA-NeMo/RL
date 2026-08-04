@@ -443,9 +443,48 @@ def stream_weights_via_ipc_zmq_impl(
                 current_buffer = buffer_a
 
             aligned_size = calculate_aligned_size(tensor.nbytes)
-            assert aligned_size <= buffer_size_bytes, (
-                f"Parameter {name} too large for buffer: {aligned_size} > {buffer_size_bytes}"
-            )
+
+            # A parameter larger than a single staging buffer cannot be packed
+            # at all. Ship it on its own in a buffer sized to fit rather than
+            # failing the refit. The staging buffers are sized from *free
+            # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
+            # for ping-pong) with no floor at the largest parameter, so a big
+            # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
+            # is 1.73 GiB against a 1.65 GiB buffer. This mirrors the HTTP
+            # streaming path, which already gives an oversized parameter a
+            # bucket of its own instead of raising.
+            if aligned_size > buffer_size_bytes:
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    current_buffer = (
+                        buffer_b if current_buffer is buffer_a else buffer_a
+                    )
+                    used_bytes, param_names = 0, []
+
+                oversized_buffer = torch.empty(
+                    aligned_size,
+                    device=current_buffer.device,
+                    dtype=torch.uint8,
+                    requires_grad=False,
+                )
+                try:
+                    packed_bytes = pack_tensor(oversized_buffer, tensor, 0)
+                    send_buffer_group_overlap(
+                        oversized_buffer, [name], packed_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    # Unlike the ping-pong pair, this buffer is not kept alive
+                    # across the next send, so its ACK must be consumed here
+                    # before it is freed.
+                    zmq_socket.recv()
+                    await_recv = False
+                finally:
+                    del oversized_buffer
+                    torch.cuda.empty_cache()
+                continue
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
