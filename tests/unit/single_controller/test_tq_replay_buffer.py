@@ -132,9 +132,16 @@ def _make_record() -> PromptGroupRecord:
     )
 
 
-def _make_buffer(dp: FakeDataPlaneClient) -> TQReplayBuffer:
+def _make_buffer(
+    dp: FakeDataPlaneClient,
+    *,
+    require_routed_experts: bool = False,
+) -> TQReplayBuffer:
     return TQReplayBuffer(
-        dp, partition_id="rollout_data", pad_value_dict={"token_ids": 0}
+        dp,
+        partition_id="rollout_data",
+        pad_value_dict={"token_ids": 0},
+        require_routed_experts=require_routed_experts,
     )
 
 
@@ -193,9 +200,15 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert dp.put_calls == []
 
-    def test_commit_writes_tq_then_fills_meta(self):
+    def test_commit_writes_tq_then_fills_meta(self, monkeypatch):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
+        trace_calls = []
+        monkeypatch.setattr(
+            _replay_buffer_module,
+            "trace_rollout_payload",
+            lambda **kwargs: trace_calls.append(kwargs),
+        )
 
         group_id = buf.reserve(weight_version=3)
         meta = _run(
@@ -221,6 +234,31 @@ class TestTQReplayBufferReserveCommit:
         # TQ tag uses start_weight_version (dispatch time).
         assert meta.tags == [{"weight_version": 3}] * _N_GENS
         assert len(dp.put_calls) == 1
+        assert len(trace_calls) == 1
+        assert trace_calls[0]["keys"] == meta.sample_ids
+        assert trace_calls[0]["data"]["input_lengths"].tolist() == [3, 3]
+
+    def test_commit_requires_routed_experts_before_tq_write(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp, require_routed_experts=True)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(
+            RuntimeError,
+            match="router_replay.enabled=true requires routed_experts",
+        ):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert dp.put_calls == []
+        assert dp.depth() == 0
+        assert buf.ready_list == [False]
 
     def test_commit_raises_for_unknown_group_id(self):
         dp = FakeDataPlaneClient()

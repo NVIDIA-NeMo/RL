@@ -14,7 +14,7 @@
 import os
 import warnings
 from dataclasses import dataclass, fields
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -60,6 +60,21 @@ def _initial_sft_save_state() -> SFTSaveState:
     return SFTSaveState(
         epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
+
+
+def _get_sft_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> SFTSaveState:
+    if loaded_state is None:
+        return _initial_sft_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(SFTSaveState)}
+    state_values = vars(_initial_sft_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return SFTSaveState(**state_values)
 
 
 class SFTConfig(BaseModel, extra="allow"):
@@ -136,17 +151,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known SFTSaveState fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        # Backcompat: checkpoints saved before total_valid_tokens was added.
-        loaded_state.setdefault("total_valid_tokens", 0)
-        known_fields = {f.name for f in fields(SFTSaveState)}
-        sft_save_state = SFTSaveState(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        sft_save_state = _initial_sft_save_state()
+    sft_save_state = _get_sft_save_state(loaded_state)
 
     # ==========================
     #           Data
