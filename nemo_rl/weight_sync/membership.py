@@ -21,8 +21,8 @@ generation shards, so that losing one still leaves a fleet). The dispatch is a h
 ``.remote()`` calls; the rank layout is where an off-by-one silently corrupts a refit.
 """
 
-from dataclasses import dataclass
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
