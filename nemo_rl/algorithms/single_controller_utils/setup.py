@@ -243,11 +243,11 @@ def _clamp_max_num_steps(
 ) -> None:
     """Clamp grpo.max_num_steps to max_num_epochs * len(dataloader)."""
     grpo_config = master_config.grpo
-    max_num_epochs = grpo_config.get("max_num_epochs")
+    max_num_epochs = grpo_config.max_num_epochs
     if max_num_epochs is None:
         return
-    grpo_config["max_num_steps"] = min(
-        grpo_config["max_num_steps"],
+    grpo_config.max_num_steps = min(
+        grpo_config.max_num_steps,
         max_num_epochs * len(dataloader),
     )
 
@@ -258,7 +258,7 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         return
     grpo_config = master_config.grpo
-    policy_config["megatron_cfg"]["train_iters"] = grpo_config["max_num_steps"]
+    policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
 
 
 def setup_single_controller(
@@ -288,11 +288,7 @@ def setup_single_controller(
     generation_config = policy_config["generation"]
     data_config = master_config.data
 
-    if (
-        grpo_config["val_period"] > 0
-        or grpo_config["val_at_start"]
-        or grpo_config["val_at_end"]
-    ):
+    if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "
             "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
@@ -320,7 +316,7 @@ def setup_single_controller(
             "data.use_multiple_dataloader=True yet."
         )
 
-    set_seed(grpo_config["seed"])
+    set_seed(grpo_config.seed)
 
     # ==========================
     # Setup Dataset & Environments
@@ -347,7 +343,7 @@ def setup_single_controller(
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=grpo_config["num_prompts_per_step"],
+        batch_size=grpo_config.num_prompts_per_step,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -437,9 +433,9 @@ def setup_single_controller(
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
-        num_generations_per_prompt=grpo_config["num_generations_per_prompt"],
+        num_generations_per_prompt=grpo_config.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
-        max_rollout_turns=grpo_config.get("max_rollout_turns"),
+        max_rollout_turns=grpo_config.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,

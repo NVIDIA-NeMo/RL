@@ -31,6 +31,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
 )
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -97,7 +98,9 @@ def test_rollout_pump_stamps_target_steps(
         max_inflight_prompts=2,
         diagnostics=False,
     )
-    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -155,7 +158,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             max_inflight_prompts=2,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -234,7 +239,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             max_inflight_prompts=1,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -289,12 +296,12 @@ def test_rollout_pump_writes_expected_tq_data(
 
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": expected_samples},
-        grpo={
-            "num_prompts_per_step": num_prompts,
-            "num_generations_per_prompt": num_generations,
-            "max_num_steps": 1,
-            "max_num_epochs": 1,
-        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=num_prompts,
+            num_generations_per_prompt=num_generations,
+            max_num_steps=1,
+            max_num_epochs=1,
+        ),
         loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             sampler=WindowedSamplerConfig(max_staleness_versions=1),
