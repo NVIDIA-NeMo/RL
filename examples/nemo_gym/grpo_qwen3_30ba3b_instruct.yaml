@@ -67,9 +67,10 @@ policy:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: "linear"  # How captured CUDA-graph sizes are spaced. Options: "exponential" (log-spaced), "linear" (denser at the top end).
       inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
-      num_cuda_graphs: 4
+      num_cuda_graphs: -1
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
@@ -78,7 +79,7 @@ policy:
       kv_cache_management_mode: "persist"
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nvshmem"
+      refit_backend: "nccl"
       parsers: []
       expose_http_server: false
 

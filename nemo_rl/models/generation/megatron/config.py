@@ -37,6 +37,11 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # How the captured CUDA-graph token-count sizes are spaced. Options:
+    # - 'exponential': token counts halve from the max down to tp_size (log-spaced, ~log2(max_tokens) graphs).
+    # - 'linear': small graphs + linear spacing up to 256 + sparser linear spacing above 256 (denser at the top end).
+    # Only meaningful when CUDA graphs are enabled.
+    cuda_graph_sizing_distribution: NotRequired[Literal["exponential", "linear"]]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
