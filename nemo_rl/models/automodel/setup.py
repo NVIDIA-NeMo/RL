@@ -324,10 +324,20 @@ def validate_and_prepare_config(
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
 
+    # Load weights in float32 so the optimizer can keep fp32 master weights.
+    # Exception: TE FusedAdam with master_weights=True keeps its own fp32 master
+    # internally (bf16 params + int16 remainder), so an fp32 load is redundant and
+    # roughly doubles both model- and master-weight memory. In that case load in the
+    # compute dtype instead. See https://github.com/NVIDIA-NeMo/RL/issues/2865.
+    optimizer_cfg = config.get("optimizer") or {}
+    optimizer_kwargs = optimizer_cfg.get("kwargs") or {}
+    optimizer_keeps_fp32_master = bool(optimizer_kwargs.get("master_weights", False))
+    model_load_dtype = dtype if optimizer_keeps_fp32_master else torch.float32
+
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        torch_dtype=model_load_dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
