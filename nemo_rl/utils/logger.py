@@ -51,6 +51,8 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
     entity: NotRequired[str]
+    id: NotRequired[str]
+    resume: NotRequired[str]
 
 
 class SwanlabConfig(TypedDict):
