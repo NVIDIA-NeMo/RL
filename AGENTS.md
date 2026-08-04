@@ -14,6 +14,11 @@ All skills are symlinked into `.claude/skills/` for unified discovery.
 **Always read the relevant `SKILL.md` before starting any task it
 covers — skills are mandatory context, not optional background reading.**
 
+Subagents live in `.cursor/agents/` (symlinked into `.claude/agents/`). The
+`nemo-rl-testing-agent` validates `NemoRLTest`-labeled Megatron-LM PRs against
+the NeMo-RL functional suites; its shared config and scripts are under
+`.agents/nemo-rl-testing-agent/`.
+
 **Workflow — mandatory order for every task:**
 1. **Pull information first.** Read the commit, PR, error log, file, or
    whatever artifact the task is about. Do not reason about it yet.
