@@ -103,10 +103,10 @@ class SingleControllerActor:
         self._async_cfg = master_config.async_rl
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.get("seq_logprob_error_threshold") is None
+            and master_config.grpo.seq_logprob_error_threshold is None
         )
         self._reference_logprobs_required = not bool(
-            master_config.grpo.get("skip_reference_policy_logprobs_calculation")
+            master_config.grpo.skip_reference_policy_logprobs_calculation
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
@@ -131,7 +131,7 @@ class SingleControllerActor:
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
 
-        num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
         self._sampler = create_sampler(
             self._buffer,
             self._async_cfg.sampler,
@@ -301,7 +301,7 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        max_epochs = self._master_config.grpo["max_num_epochs"]
+        max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
@@ -362,7 +362,7 @@ class SingleControllerActor:
         """
         grpo_cfg = self._master_config.grpo
 
-        while self._train_steps < grpo_cfg["max_num_steps"]:
+        while self._train_steps < grpo_cfg.max_num_steps:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             min_sample_version = None
@@ -370,7 +370,7 @@ class SingleControllerActor:
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
+                while groups_dispatched < grpo_cfg.num_prompts_per_step:
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -389,7 +389,7 @@ class SingleControllerActor:
 
                         # Select a batch
                         max_prompt_groups = (
-                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
+                            grpo_cfg.num_prompts_per_step - groups_dispatched
                         )
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
@@ -416,7 +416,7 @@ class SingleControllerActor:
                                     "rollout exhausted before a complete training "
                                     f"step was assembled: dispatched "
                                     f"{groups_dispatched}/"
-                                    f"{grpo_cfg['num_prompts_per_step']} prompt "
+                                    f"{grpo_cfg.num_prompts_per_step} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
@@ -568,7 +568,7 @@ class SingleControllerActor:
             # generated with; lag = training version - oldest sample version.
             lag = version_during_step - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
+                f"train step {self._train_steps}/{grpo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,
