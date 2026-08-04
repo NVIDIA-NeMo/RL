@@ -442,6 +442,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                     self.model,
                     processed_inputs,
                     device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
                     is_reward_model=True,
                     allow_flash_attn_args=False,
