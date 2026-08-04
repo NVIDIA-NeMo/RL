@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Literal, Optional
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -188,6 +188,10 @@ class MegatronGeneration(GenerationInterface):
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional["WeightSynchronizer"] = None
+        # Engine-wide logprob reporting mode; greedy calls temporarily switch it to raw.
+        self._engine_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
+            "processed_logprobs"
+        )
 
         if policy is not None:
             # Reuse the existing training policy.
@@ -272,26 +276,62 @@ class MegatronGeneration(GenerationInterface):
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec.
         """
-        future = self._policy.worker_group.run_single_worker_single_data(
-            method_name="generate",
-            worker_idx=0,
-            data=data,
-            greedy=greedy,
-        )
-        return ray.get(future)
+        # Greedy decoding logprobs are reported as processed by MInf, but expected as raw here.
+        mode = "raw_logprobs" if greedy else "processed_logprobs"
+        if self._engine_logprobs_mode != mode:
+            ray.get(
+                self._policy.worker_group.run_all_workers_single_data(
+                    "set_logprobs_mode", logprobs_mode=mode
+                )
+            )
+            self._engine_logprobs_mode = mode
+        try:
+            future = self._policy.worker_group.run_single_worker_single_data(
+                method_name="generate",
+                worker_idx=0,
+                data=data,
+                greedy=greedy,
+            )
+            return ray.get(future)
+        finally:
+            if greedy:
+                ray.get(
+                    self._policy.worker_group.run_all_workers_single_data(
+                        "set_logprobs_mode", logprobs_mode="processed_logprobs"
+                    )
+                )
+                self._engine_logprobs_mode = "processed_logprobs"
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
-        worker = self._policy.worker_group.workers[0]
-        futures = worker.generate_async.options(num_returns="streaming").remote(
-            data=data, greedy=greedy
-        )
-        async for result_ref in futures:
-            index, result_batch = await result_ref
-            result_batch["gen_leader_worker_idx"] = [0]
-            yield index, result_batch
+        # Greedy decoding logprobs are reported as processed by MInf, but expected as raw here.
+        mode = "raw_logprobs" if greedy else "processed_logprobs"
+        if self._engine_logprobs_mode != mode:
+            ray.get(
+                self._policy.worker_group.run_all_workers_single_data(
+                    "set_logprobs_mode", logprobs_mode=mode
+                )
+            )
+            self._engine_logprobs_mode = mode
+        try:
+            worker = self._policy.worker_group.workers[0]
+            futures = worker.generate_async.options(num_returns="streaming").remote(
+                data=data, greedy=greedy
+            )
+            async for result_ref in futures:
+                index, result_batch = await result_ref
+                result_batch["gen_leader_worker_idx"] = [0]
+                yield index, result_batch
+        finally:
+            if greedy:
+                ray.get(
+                    self._policy.worker_group.run_all_workers_single_data(
+                        "set_logprobs_mode", logprobs_mode="processed_logprobs"
+                    )
+                )
+                self._engine_logprobs_mode = "processed_logprobs"
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
