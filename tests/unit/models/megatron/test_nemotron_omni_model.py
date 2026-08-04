@@ -22,6 +22,12 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+
+# This module is collected by catch-all unit-test lanes that intentionally do
+# not install the mcore extra. Skip before importing MBridge so those lanes can
+# deselect the mcore-marked tests without failing during collection.
+pytest.importorskip("megatron.bridge")
+
 from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
     NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT,
     NemotronOmniModelProvider,
