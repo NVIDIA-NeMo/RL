@@ -227,25 +227,29 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
 
 
 def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
-    """Bin server-returned images by the assistant turn that saw them.
+    """Bin server-returned images by the trainable turn that saw them.
 
-    Walks the Responses-API items in order, accumulating images from every
-    non-assistant item (user turns, tool messages, ``function_call_output``,
-    etc.) into a pending list, and flushing them into a per-turn bucket each
-    time a trainable assistant item (one carrying ``generation_token_ids``) is
-    reached. The returned list has one entry per trainable assistant turn,
-    aligned with the postprocess loop's ``turn_idx``.
+    Walks the Responses-API items in order and flushes ``pending`` into a
+    per-turn bucket each time it hits an item carrying truthy
+    ``generation_token_ids`` — matching the exact gate that
+    ``_postprocess_nemo_gym_to_nemo_rl_result`` uses to decide which items
+    become trainable turns. Every other item (user turns, tool messages,
+    ``function_call_output``, non-trainable reasoning) contributes its images
+    to ``pending`` for the next trainable turn. This ensures the returned list
+    has one entry per trainable turn, aligned with the postprocess loop's
+    ``turn_idx`` even when the trainable item's role is not ``assistant``
+    (e.g. a reasoning-only response, or a ``function_call``).
     """
     per_turn: list[list[Image.Image]] = []
     pending: list[Image.Image] = []
     for item in output:
-        if item.get("role") != "assistant":
-            pending.extend(_extract_input_images_from_message(item))
-        elif item.get(
+        if item.get(
             "generation_token_ids"
-        ):  # if the generation token ids are empty, skip appending to bucket (`verifiers_agent` and `hermes_agent` can return empty generation token ids list)
+        ):  # trainable turn; empty generation_token_ids is skipped by the postprocess loop and must not consume a bucket
             per_turn.append(pending)
             pending = []
+        elif item.get("role") != "assistant":
+            pending.extend(_extract_input_images_from_message(item))
     return per_turn
 
 

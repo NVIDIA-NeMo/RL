@@ -97,3 +97,46 @@ def test_index_per_turn_images_aligns_with_postprocess_skip_of_empty_generations
 
     assert len(per_turn) == 1
     assert [img.size for img in per_turn[0]] == [(2, 2), (6, 6)]
+
+
+def test_index_per_turn_images_flushes_on_non_assistant_trainable_item():
+    """Trainable items whose role is not ``assistant`` (reasoning-only responses,
+    function_call items) still carry ``generation_token_ids`` and are treated as
+    turns by the postprocess loop. The per-turn image bucket must flush for them
+    too, or the batched flatten path will see a ``PackedTensor`` for turns
+    where the model produced a normal assistant message and a missing key for
+    turns where it produced only reasoning — crashing
+    ``PackedTensor.flattened_concat`` on the None entry.
+    """
+    reasoning_only = {"type": "reasoning", "generation_token_ids": [9, 10]}
+    output = [
+        _user(_image((2, 2))),
+        reasoning_only,
+    ]
+    per_turn = _index_per_turn_images(output)
+
+    assert len(per_turn) == 1
+    assert [img.size for img in per_turn[0]] == [(2, 2)]
+
+
+def test_index_per_turn_images_flushes_on_function_call_trainable_item():
+    """Same as the reasoning-only case, but for tool-calling turns where the
+    model call's last output item is a ``function_call`` (no ``role`` field)."""
+    function_call = {
+        "type": "function_call",
+        "name": "tool",
+        "arguments": "{}",
+        "call_id": "c1",
+        "generation_token_ids": [11, 12],
+    }
+    output = [
+        _user(_image((2, 2))),
+        function_call,
+        {"type": "function_call_output", "output": _image((5, 5)), "call_id": "c1"},
+        _assistant([13, 14]),
+    ]
+    per_turn = _index_per_turn_images(output)
+
+    assert len(per_turn) == 2
+    assert [img.size for img in per_turn[0]] == [(2, 2)]
+    assert [img.size for img in per_turn[1]] == [(5, 5)]
