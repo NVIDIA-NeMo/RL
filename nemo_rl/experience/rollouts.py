@@ -330,7 +330,11 @@ def generate_responses(
         generated_part = full_output[input_len:total_length]
         generated_ids.append(generated_part)
 
-    generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    generated_texts = tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
 
     # Append to message log
     for i, (text, input_length, total_length) in enumerate(
@@ -471,7 +475,11 @@ async def generate_responses_async(
         generated_part = full_output[input_len:total_length]
         generated_ids.append(generated_part)
 
-    generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    generated_texts = tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
 
     # Append to message log
     for i, (text, input_length, total_length) in enumerate(
