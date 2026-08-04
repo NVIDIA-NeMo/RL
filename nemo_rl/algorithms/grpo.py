@@ -1982,22 +1982,11 @@ def _preserve_router_replay_routed_experts(
     if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
         target["routed_experts"] = flat_messages["routed_experts"]
 
-
-def _is_vlm_async_run(
-    master_config: MasterConfig,
-    processor: Optional[AutoProcessor],
-) -> bool:
-    """Whether this async run carries multimodal tensors that must reach training."""
-    return bool(master_config.policy.get("is_vlm") or processor is not None)
-
-
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
     repeated_batch: BatchedDataDict,
     policy_config: PolicyConfig,
-    master_config: MasterConfig,
-    processor: Optional[AutoProcessor] = None,
 ) -> BatchedDataDict[ClippedPGLossDataDict]:
     """Build the async no-TQ policy train batch from flattened rollout messages."""
     train_data = BatchedDataDict[ClippedPGLossDataDict](
@@ -2010,15 +1999,8 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
-
+    # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
-    if _is_vlm_async_run(master_config, processor) and not extra_multimodal_data:
-        raise RuntimeError(
-            "Async GRPO: is_vlm=True (or a processor was provided) but "
-            "flat_messages.get_multimodal_dict() returned empty for this replay "
-            "batch. Check that rollout samples carry multimodal tensors and that "
-            "the collector is not stripping them."
-        )
     train_data.update(extra_multimodal_data)
     return train_data
 
@@ -3899,7 +3881,6 @@ def async_grpo_train(
     max_trajectory_age_steps: int = 1,
     teacher_worker_groups: Optional[dict[str, Any]] = None,
     alias_to_group_alias: Optional[dict[str, str]] = None,
-    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -3917,9 +3898,6 @@ def async_grpo_train(
         grpo_save_state: Training state
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
-        processor: Optional HF processor. Required-in-effect for VLM async runs
-            so per-batch multimodal tensors get forwarded to policy.get_logprobs
-            / policy.train (see _build_async_grpo_train_data).
     """
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
@@ -4533,7 +4511,6 @@ def async_grpo_train(
                         repeated_batch,
                         master_config.policy,
                         master_config,
-                        processor=processor,
                     )
                     train_data.to("cpu")
 

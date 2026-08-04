@@ -18,7 +18,7 @@ import logging
 import re
 from collections import defaultdict
 from io import BytesIO
-from typing import Any, Optional, Protocol, Union
+from typing import Any, Optional, Union
 
 import requests
 import torch
@@ -45,6 +45,13 @@ DEFAULT_MEDIA_EXTENSIONS = {
     "audio": ["wav", "flac", "mp3"],
 }
 
+_PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
+    {
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    }
+)
+
 
 # different media namings maybe used in the raw dataset,
 # in which case, they need to be mapped to the allowed ones
@@ -66,85 +73,18 @@ MEDIA_TAG_PATTERN = re.compile(
 
 logger = logging.getLogger(__name__)
 
-def _images_from_messages(messages: list[dict[str, Any]]) -> list[Image.Image]:
-    images = []
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "image":
-                images.append(resolve_to_image(part["image"]))
-    return images
 
+def uses_image_placeholder(processor: Any) -> bool:
+    """Return whether a processor requires explicit image placeholders.
 
-class _HuggingFaceMultimodalProcessorAdapter:
-    """Adapter for processors supporting multimodal ``apply_chat_template``."""
+    Args:
+        processor: Multimodal processor to classify.
 
-    def process(
-        self,
-        processor: Any,
-        messages: list[dict[str, Any]],
-        *,
-        add_generation_prompt: bool,
-    ) -> tuple[str, dict[str, Any]]:
-        formatted_text = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        processed = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_tensors="pt",
-            return_dict=True,
-        )
-        return formatted_text, dict(processed)
-
-
-def process_multimodal_chat(
-    processor: Any,
-    messages: list[dict[str, Any]],
-    *,
-    add_generation_prompt: bool,
-) -> tuple[str, dict[str, Any]]:
-    """Render and process multimodal chat through a registered or HF adapter.
-
-    Processors with a nonstandard multimodal calling convention must register an
-    adapter. All other processors are expected to support Hugging Face's
-    multimodal ``apply_chat_template`` interface.
+    Returns:
+        Whether the processor expands image placeholders through ``__call__``
+        rather than tokenized ``apply_chat_template``.
     """
-    adapter = _HuggingFaceMultimodalProcessorAdapter()
-    formatted_text, processed = adapter.process(
-        processor,
-        messages,
-        add_generation_prompt=add_generation_prompt,
-    )
-    if "input_ids" not in processed:
-        raise ValueError(
-            f"{type(processor).__name__} did not return required input_ids."
-        )
-
-    images = _images_from_messages(messages)
-    model_inputs = extract_multimodal_model_inputs(processor, processed)
-    visual_keys = set(
-        getattr(getattr(processor, "image_processor", None), "model_input_names", [])
-    )
-    visual_keys.update(
-        key
-        for key in get_multimodal_keys_from_processor(processor)
-        if any(marker in key for marker in ("image", "img", "pixel", "aspect_ratio"))
-    )
-    visual_keys.add("imgs_sizes")
-    if images and not any(key in model_inputs for key in visual_keys):
-        raise ValueError(
-            f"{type(processor).__name__} processed {len(images)} image(s) but "
-            "returned no visual model inputs. Register a custom multimodal "
-            "processor adapter if this processor does not support the standard "
-            "Hugging Face multimodal chat-template interface."
-        )
-    return formatted_text, processed
+    return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
 
 
 class PackedTensor:
@@ -432,75 +372,6 @@ def get_dim_to_pack_along(processor, key: str) -> int:
         return 1
     # return zero by default
     return 0
-
-
-def extract_multimodal_model_inputs(
-    processor: Any, processed: dict[str, Any]
-) -> dict[str, PackedTensor | torch.Tensor]:
-    """Extract packed visual inputs and sequence-aligned auxiliary tensors.
-
-    Multimodal inputs declared by the processor are wrapped in ``PackedTensor``.
-    Token-type fields remain ordinary tensors because they align with the full
-    language-model token sequence.
-    """
-    input_ids = processed.get("input_ids")
-    if input_ids is None:
-        raise ValueError("Processor output is missing input_ids.")
-    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim not in (1, 2):
-        raise ValueError(
-            "Processor input_ids must be a one- or two-dimensional torch.Tensor."
-        )
-    if input_ids.ndim == 2 and input_ids.shape[0] != 1:
-        raise ValueError(
-            "Multimodal chat processing expects a single conversation, got "
-            f"input_ids shape {tuple(input_ids.shape)}."
-        )
-    sequence_length = input_ids.shape[-1]
-
-    extracted: dict[str, PackedTensor | torch.Tensor] = {}
-    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # Some remote-code processors omit this per-image input from their declared
-    # model_input_names even though their model forward requires it.
-    if "imgs_sizes" in processed and "imgs_sizes" not in multimodal_keys:
-        multimodal_keys.append("imgs_sizes")
-    for key in multimodal_keys:
-        if key not in processed:
-            continue
-        value = processed[key]
-        if not isinstance(value, torch.Tensor):
-            raise ValueError(
-                f"Processor model input {key!r} must be a torch.Tensor, got "
-                f"{type(value).__name__}."
-            )
-        if key == "imgs_sizes":
-            value = value.to(dtype=torch.int32)
-        extracted[key] = PackedTensor(
-            value, dim_to_pack=get_dim_to_pack_along(processor, key)
-        )
-
-    for key in ("token_type_ids", "mm_token_type_ids"):
-        if key not in processed:
-            continue
-        value = processed[key]
-        if not isinstance(value, torch.Tensor) or value.ndim not in (1, 2):
-            raise ValueError(
-                f"Processor sequence input {key!r} must be a one- or "
-                "two-dimensional torch.Tensor."
-            )
-        if value.ndim == 2:
-            if value.shape[0] != 1:
-                raise ValueError(
-                    f"Processor sequence input {key!r} must contain one "
-                    f"conversation, got shape {tuple(value.shape)}."
-                )
-            value = value[0]
-        if len(value) != sequence_length:
-            raise ValueError(
-                f"Processor sequence input {key!r} has length {len(value)}, "
-                f"but input_ids has length {sequence_length}."
-            )
-        extracted[key] = value
-    return extracted
 
 
 def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:

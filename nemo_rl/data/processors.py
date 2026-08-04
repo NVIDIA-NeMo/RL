@@ -30,7 +30,11 @@ from nemo_rl.data.interfaces import (
     VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
-from nemo_rl.data.multimodal_utils import get_multimodal_keys_from_processor
+from nemo_rl.data.multimodal_utils import (
+    get_dim_to_pack_along,
+    get_multimodal_keys_from_processor,
+    uses_image_placeholder,
+)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -461,9 +465,7 @@ def vlm_hf_data_processor(
     from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
-        extract_multimodal_model_inputs,
         get_multimodal_default_settings_from_processor,
-        process_multimodal_chat,
         resolve_to_image,
     )
 
@@ -552,14 +554,59 @@ def vlm_hf_data_processor(
 
     images = [resolve_to_image(image) for image in images]
 
-    # Render once for vLLM and process the identical conversation for MCore.
-    # Registered adapters cover processors with nonstandard image placeholder
-    # expansion; standard Hugging Face processors use multimodal chat templates.
-    string_formatted_dialog, message = process_multimodal_chat(
-        processor,
-        [user_message],
+    # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
+    # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
+    # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
+    # so we must use processor(text=..., images=...) directly.
+    uses_placeholder = uses_image_placeholder(processor)
+
+    message: dict
+    if uses_placeholder and images:
+        # Convert content list to <image> placeholder text format
+        image_token = getattr(processor, "image_token", "<image>")
+        text_parts = []
+        for content in user_message["content"]:
+            if content["type"] == "image":
+                text_parts.append(image_token)
+            elif content["type"] == "text":
+                text_parts.append(content["text"])
+        user_message_for_tokenize = {"role": "user", "content": "\n".join(text_parts)}
+    else:
+        user_message_for_tokenize = user_message
+
+    # get formatted user message
+    if hasattr(processor, "conversation_preprocessor"):
+        user_message_for_chat_template = processor.conversation_preprocessor(
+            user_message
+        )
+    else:
+        user_message_for_chat_template = user_message_for_tokenize
+
+    string_formatted_dialog = processor.apply_chat_template(
+        [user_message_for_chat_template],
+        tokenize=False,
         add_generation_prompt=True,
     )
+
+    if uses_placeholder and images:
+        # Dynamic-resolution path: keep pixel_values in float32 to match vLLM's
+        # DynamicResolutionImageTiler bit-for-bit. vLLM stores/normalizes in
+        # float32 and only casts at the vision_model boundary; matching that
+        # rounding order tightens rollout/train logprob agreement. The model
+        # forward dispatches on imgs_sizes and handles the bf16 cast.
+        message = processor(
+            text=string_formatted_dialog,
+            images=images,
+            return_tensors="pt",
+        )
+    else:
+        message = processor.apply_chat_template(
+            [user_message_for_tokenize],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
 
     # add this for backward compatibility
     user_message["token_ids"] = message["input_ids"][0]
@@ -571,7 +618,7 @@ def vlm_hf_data_processor(
     # the Nemotron Omni path can patchify it and preserve the processor's exact
     # placeholder count.
     if (
-        _uses_image_placeholder
+        uses_placeholder
         and "pixel_values" in message
         and "imgs_sizes" not in message
         and message["pixel_values"].ndim == 4
@@ -597,7 +644,7 @@ def vlm_hf_data_processor(
             user_message[key] = PackedTensor(
                 message[key],
                 dim_to_pack=get_dim_to_pack_along(processor, key),
-                pad_to_max_shape=_uses_image_placeholder and key == "pixel_values",
+                pad_to_max_shape=uses_placeholder and key == "pixel_values",
             )
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value

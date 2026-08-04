@@ -22,19 +22,18 @@ from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
+from PIL import Image
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
-from PIL import Image
-from transformers import PreTrainedTokenizerBase
-
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     encode_images_in_examples,
     get_dim_to_pack_along,
     get_multimodal_keys_from_processor,
     resolve_to_image,
+    uses_image_placeholder,
 )
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -44,6 +43,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -125,7 +125,7 @@ class NemoGymConfig(TypedDict):
     use_fastokens: NotRequired[bool]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
-        Optional[Dict[str, Any]]
+        Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
 
 
@@ -216,9 +216,7 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     return images
 
 
-def _index_per_turn_images(
-    output: list[dict]
-) -> list[list[Image.Image]]:
+def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
     """Bin server-returned user images by the assistant turn that saw them.
 
     Walks the Responses-API items in order, accumulating images from user-role
@@ -232,7 +230,9 @@ def _index_per_turn_images(
     for item in output:
         if item.get("role") == "user":
             pending.extend(_extract_input_images_from_message(item))
-        elif "generation_token_ids" in item:
+        elif item.get(
+            "generation_token_ids"
+        ):  # if the generation token ids are empty, skip appending to bucket (`verifiers_agent` and `hermes_agent` can return empty generation token ids list)
             per_turn.append(pending)
             pending = []
     return per_turn
@@ -262,12 +262,25 @@ def _attach_multimodal_data_to_user_message(
         images=images,
         return_tensors="pt",
     )
+    uses_placeholder = uses_image_placeholder(processor)
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
+    # Historical checkpoints may emit dynamic image tiles without imgs_sizes.
+    # Mirror the media-metadata handling in vlm_hf_data_processor.
+    if (
+        uses_placeholder
+        and "pixel_values" in processed
+        and "imgs_sizes" not in processed
+        and processed["pixel_values"].ndim == 4
+    ):
+        pixel_values = processed["pixel_values"]
+        num_tiles, _, height, width = pixel_values.shape
+        processed["imgs_sizes"] = torch.tensor(
+            [[height, width]] * num_tiles, dtype=torch.long
+        )
+
     # imgs_sizes / num_frames are not always declared in model_input_names by
-    # bundled image processors, so append them explicitly when present. RADIO
-    # (Nemotron-Omni vision encoder) uses temporal patching even for still
-    # images and requires one num_frames=1 entry per image/tile — mirror the
-    # SFT-path fix at nemo_rl/data/processors.py:589-594.
+    # bundled image processors. RADIO uses temporal patching even for still
+    # images and requires one num_frames=1 entry per image/tile.
     if "imgs_sizes" in processed and "imgs_sizes" not in multimodal_keys:
         multimodal_keys.append("imgs_sizes")
     if "imgs_sizes" in processed and "num_frames" not in processed:
@@ -285,6 +298,7 @@ def _attach_multimodal_data_to_user_message(
         user_message[key] = PackedTensor(
             value,
             dim_to_pack=get_dim_to_pack_along(processor, key),
+            pad_to_max_shape=uses_placeholder and key == "pixel_values",
         )
 
 
@@ -569,9 +583,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
 
             if processor is not None:
                 images_this_turn = (
-                    per_turn_images[turn_idx]
-                    if turn_idx < len(per_turn_images)
-                    else []
+                    per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
                 _attach_multimodal_data_to_user_message(
                     user_message,
