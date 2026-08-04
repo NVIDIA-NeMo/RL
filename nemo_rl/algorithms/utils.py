@@ -916,8 +916,10 @@ def print_performance_metrics(
 def resolve_generation_metrics_logger(
     generation_cfg: dict[str, Any],
 ) -> Optional[float]:
-    """Return the metrics-logger poll interval if a generation backend has its
-    in-flight batching telemetry enabled (async engine only), else None.
+    """Return the metrics-logger poll interval for the active backend.
+
+    Resolves to the configured interval if the backend has in-flight batching
+    telemetry enabled (async engine only), else None.
 
     Backend-agnostic: covers both vLLM (vllm_cfg.enable_vllm_metrics_logger)
     and TRT-LLM (trtllm_cfg.enable_trtllm_metrics_logger) so downstream

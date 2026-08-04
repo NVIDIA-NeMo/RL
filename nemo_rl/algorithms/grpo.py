@@ -4908,10 +4908,8 @@ def async_grpo_train(
                         # inflight-batch-size figure reaches wandb even if the
                         # subsequent refit fails. The post-step logging below is
                         # skipped once this fires to avoid a duplicate log.
-                        _early_gen_metrics_interval = (
-                            resolve_generation_metrics_logger(
-                                master_config.policy["generation"]
-                            )
+                        _early_gen_metrics_interval = resolve_generation_metrics_logger(
+                            master_config.policy["generation"]
                         )
                         if (
                             _early_gen_metrics_interval is not None

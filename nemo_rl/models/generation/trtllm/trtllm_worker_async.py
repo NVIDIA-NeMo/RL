@@ -303,9 +303,11 @@ class TrtllmAsyncGenerationWorkerImpl:
 
     @staticmethod
     def _get_stat_field(obj: Any, *keys: str) -> Any:
-        """Read a nested field from a stats record that may be a dict or an
-        attribute-style object (TRT-LLM has returned both shapes across
-        versions). Returns None if any level is missing."""
+        """Read a nested field from a dict-like or attribute-like stats record.
+
+        TRT-LLM has returned both shapes across versions. Returns None if any
+        level is missing.
+        """
         cur = obj
         for k in keys:
             if cur is None:
@@ -317,8 +319,10 @@ class TrtllmAsyncGenerationWorkerImpl:
         return cur
 
     def _install_ifb_stats_patch(self) -> None:
-        """Expose a SYNC, Ray-picklable ``fetch_stats_serialized`` on TRT-LLM's
-        BaseWorker so the drain can read iteration stats via collective_rpc.
+        """Expose a sync ``fetch_stats_serialized`` on TRT-LLM's BaseWorker.
+
+        This is Ray-picklable, so the drain can read iteration stats via
+        collective_rpc.
 
         The metric can only be read from the real engine worker via
         collective_rpc (the RPC-client get_stats path hits a stats-less engine);
@@ -380,13 +384,13 @@ class TrtllmAsyncGenerationWorkerImpl:
             )
 
     async def _drain_stats_loop(self) -> None:
-        """Continuously drain per-iteration stats from the engine and record
-        the in-flight batching size (context + generation requests scheduled
-        this iteration)."""
+        """Continuously drain per-iteration stats from the engine.
+
+        Records the in-flight batching size (context + generation requests
+        scheduled this iteration).
+        """
         assert self.llm is not None
-        interval = float(
-            self.cfg["trtllm_cfg"]["trtllm_metrics_logger_interval"]
-        )
+        interval = float(self.cfg["trtllm_cfg"]["trtllm_metrics_logger_interval"])
         _err_logged = 0
         while True:
             try:
@@ -468,15 +472,16 @@ class TrtllmAsyncGenerationWorkerImpl:
                                 else dir(kv_stats)
                             )
                             print(
-                                "📋[TRT-LLM Metric Logger] kvCacheStats keys: "
-                                f"{_keys}",
+                                f"📋[TRT-LLM Metric Logger] kvCacheStats keys: {_keys}",
                                 flush=True,
                             )
                         max_blocks = self._get_stat_field(kv_stats, "maxNumBlocks")
                         used_blocks = self._get_stat_field(kv_stats, "usedNumBlocks")
                         free_blocks = self._get_stat_field(kv_stats, "freeNumBlocks")
                         try:
-                            max_blocks = float(max_blocks) if max_blocks is not None else 0.0
+                            max_blocks = (
+                                float(max_blocks) if max_blocks is not None else 0.0
+                            )
                             if max_blocks > 0:
                                 if used_blocks is not None:
                                     kv_sample = float(used_blocks) / max_blocks
