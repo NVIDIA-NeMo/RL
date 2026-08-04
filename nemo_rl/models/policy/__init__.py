@@ -386,6 +386,11 @@ class MegatronConfig(TypedDict):
     # CUDA-graph implementation.
     # Options: 'none', 'local', 'transformer_engine', 'full_iteration'.
     cuda_graph_impl: NotRequired[str]
+    # Training capture regions supported by Megatron-Core: attn, mlp, moe,
+    # moe_router, moe_preprocess, and mamba. An empty list captures whole layers.
+    cuda_graph_modules: NotRequired[str | list[str]]
+    # Number of training warmup steps before CUDA Graph capture; 3 is recommended.
+    cuda_graph_warmup_steps: NotRequired[int]
     # When True, each expert sees a fixed number of tokens for cuda-graph capture.
     # Required when cuda_graph_impl= 'local' with transformer_impl != 'inference_optimized'.
     moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
