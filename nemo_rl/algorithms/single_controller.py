@@ -645,6 +645,14 @@ class SingleControllerActor:
           2. Optionally calibrate FP8 KV-cache scales.
           3. weight_synchronizer.sync_weights(kv_scales=...)
           4. _rollout_permitted.set()   — resume
+
+        Args:
+            calibration_data: Optional data used to calibrate FP8 KV-cache
+                scales before synchronizing weights.
+
+        Returns:
+            The number of stale in-flight rollout groups aborted before the
+            weight synchronization.
         """
         self._rollout_permitted.clear()
 
