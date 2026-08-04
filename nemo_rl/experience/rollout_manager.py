@@ -27,7 +27,13 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.rollouts import _tensorize_by_key, calculate_rewards
+from nemo_rl.experience.rollouts import (
+    _attach_routed_experts_to_message_log_prefix,
+    _dummy_routed_experts_for_tokens,
+    _find_routed_experts_template,
+    _tensorize_by_key,
+    calculate_rewards,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -216,13 +222,17 @@ class AsyncRolloutImpl:
                     tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
                 truncated = True
 
-            current_message_log.append(
-                {
-                    "role": env_output.observations[0]["role"],
-                    "content": env_obs_content,
-                    "token_ids": tokenized_obs,
-                }
-            )
+            env_message: dict[str, Any] = {
+                "role": env_output.observations[0]["role"],
+                "content": env_obs_content,
+                "token_ids": tokenized_obs,
+            }
+            routed_template = _find_routed_experts_template(current_message_log)
+            if routed_template is not None:
+                env_message["routed_experts"] = _dummy_routed_experts_for_tokens(
+                    tokenized_obs, routed_template
+                )
+            current_message_log.append(env_message)
 
             # Update token counts
             env_token_count += len(tokenized_obs)
@@ -303,6 +313,17 @@ class AsyncRolloutImpl:
             assistant_message["generation_logprobs"] = output["logprobs"][
                 0, input_len:total_len
             ]
+        if "routed_experts" in output:
+            routed_experts = output["routed_experts"][0]
+            prefix_length = _attach_routed_experts_to_message_log_prefix(
+                message_log, routed_experts
+            )
+            if prefix_length != input_len:
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {input_len})."
+                )
+            assistant_message["routed_experts"] = routed_experts[input_len:total_len]
 
         # Calculate generation metrics
         gen_metrics: dict[str, Any] = {}

@@ -87,7 +87,7 @@ def validate_sampler_buffer_capacity(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     async_config = master_config.async_rl
-    num_prompts_per_step = master_config.grpo["num_prompts_per_step"]
+    num_prompts_per_step = master_config.grpo.num_prompts_per_step
     if num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
             f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
@@ -96,7 +96,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     rl_step_samples = (
-        num_prompts_per_step * master_config.grpo["num_generations_per_prompt"]
+        num_prompts_per_step * master_config.grpo.num_generations_per_prompt
     )
     train_global_batch_size = master_config.policy["train_global_batch_size"]
     if rl_step_samples != train_global_batch_size:
@@ -126,8 +126,9 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     reference_policy_kl_penalty = getattr(
         master_config.loss_fn, "reference_policy_kl_penalty", 0
     )
-    if reference_policy_kl_penalty and master_config.grpo.get(
-        "skip_reference_policy_logprobs_calculation"
+    if (
+        reference_policy_kl_penalty
+        and master_config.grpo.skip_reference_policy_logprobs_calculation
     ):
         raise ValueError(
             "loss_fn.reference_policy_kl_penalty="
