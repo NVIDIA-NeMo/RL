@@ -53,6 +53,7 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dllm import dllm_config_from_policy
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -679,6 +680,11 @@ class LogprobsPostProcessor:
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+        # Masked diffusion LMs score token i at position i; autoregressive
+        # models score token i+1. Absent a dllm policy this stays True, so every
+        # existing caller is unaffected.
+        dllm_cfg = dllm_config_from_policy(cfg)
+        self.shift_targets = True if dllm_cfg is None else dllm_cfg.shift_targets
 
     def __call__(
         self,
@@ -704,6 +710,13 @@ class LogprobsPostProcessor:
         """
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
+        # Ordinary training scores the model on its own input; corruption-based
+        # objectives feed a corrupted sequence and score the clean tokens.
+        score_ids = (
+            processed_inputs.input_ids
+            if processed_inputs.target_ids is None
+            else processed_inputs.target_ids
+        )
 
         if self.cp_size > 1:
             seq_index_tensor = (
@@ -717,7 +730,7 @@ class LogprobsPostProcessor:
             )
 
             input_ids_dtensor = DTensor.from_local(
-                processed_inputs.input_ids,
+                score_ids,
                 device_mesh=self.cp_mesh,
                 placements=[Shard(sequence_dim)],
             )
@@ -732,28 +745,34 @@ class LogprobsPostProcessor:
                 seq_index_tensor,
                 chunk_size=self.logprob_chunk_size,
                 sampling_params=self.sampling_params,  # top-k and top-p filtering
+                shift_targets=self.shift_targets,
             )
 
-            assert token_logprobs.shape[1] == seq_len - 1
+            assert token_logprobs.shape[1] == (
+                seq_len - 1 if self.shift_targets else seq_len
+            )
         else:
             if isinstance(logits, DTensor):
                 # DTensor path with TP sharding
                 token_logprobs = get_logprobs_from_vocab_parallel_logits(
                     logits,
-                    processed_inputs.input_ids,
+                    score_ids,
                     chunk_size=self.logprob_chunk_size,
                     sampling_params=self.sampling_params,  # top-k and top-p filtering
+                    shift_targets=self.shift_targets,
                 )
             else:
                 # Non-DTensor path (no TP sharding)
                 token_logprobs = self._compute_local_logprobs(
-                    logits, processed_inputs.input_ids
+                    logits, score_ids, shift_targets=self.shift_targets
                 )
 
-        # Prepend 0 for first token to maintain sequence length
-        token_logprobs = torch.cat(
-            [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-        )
+        if self.shift_targets:
+            # Prepend 0 for first token to maintain sequence length. Position-
+            # aligned scoring drops no position, so it needs no such padding.
+            token_logprobs = torch.cat(
+                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+            )
 
         # Handle sequence packing unpacking or mask application
         if self.enable_seq_packing:
@@ -795,12 +814,17 @@ class LogprobsPostProcessor:
         self,
         logits: torch.Tensor,
         input_ids: torch.Tensor,
+        shift_targets: bool = True,
     ) -> torch.Tensor:
         """Compute logprobs locally without distributed processing.
 
         Args:
             logits: Model output logits
-            input_ids: Input token IDs
+            input_ids: Token IDs to score
+            shift_targets: If True (default), position ``i`` scores token ``i+1``
+                and the returned sequence is one shorter. If False, position
+                ``i`` scores token ``i`` and every position is kept -- the
+                masked diffusion convention.
 
         Returns:
             Token log probabilities
@@ -813,7 +837,9 @@ class LogprobsPostProcessor:
         # Input shapes:
         #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
         #   token_ids: [batch_size, sequence_length] - actual tokens
-        next_tokens = input_ids[:, 1:].to(logits.device)
+        next_tokens = (input_ids[:, 1:] if shift_targets else input_ids).to(
+            logits.device
+        )
         target_seq_len = int(next_tokens.shape[1])
 
         if target_seq_len == 0:
