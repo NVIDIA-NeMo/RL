@@ -23,7 +23,10 @@ from modelopt.torch.quantization.calib.max import MaxCalibrator
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from modelopt.torch.quantization.plugins.vllm import disable_compilation
 
-from nemo_rl.modelopt.utils import resolve_quant_cfg
+from nemo_rl.modelopt.utils import (
+    configure_modelopt_kv_cache_quant_skip,
+    resolve_quant_cfg,
+)
 from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
 
 
@@ -98,6 +101,8 @@ def _fakequant_run_prolog_worker(self) -> None:
             # we disable weight quantizers for CUDA graph capture.
             if name.endswith("weight_quantizer"):
                 module.disable()
+
+    configure_modelopt_kv_cache_quant_skip(model)
 
 
 class FakeQuantWorker(NixlVllmWorker):

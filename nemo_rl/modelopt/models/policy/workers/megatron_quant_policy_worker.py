@@ -42,6 +42,7 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
 )
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+    configure_modelopt_kv_cache_quant_skip,
     resolve_nvfp4_real_quant_mode,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -207,6 +208,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             data=self.cfg.get("quant_calib_data"),
             max_sample_length=self.cfg.get("quant_sequence_length"),
         )
+        configure_modelopt_kv_cache_quant_skip(unwrapped_model)
         return model
 
     def _patch_validate_model_paths(self):
@@ -302,6 +304,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if has_modelopt_state(model_path):
             unwrapped_model = unwrap_model(model)
             load_modelopt_state(unwrapped_model, model_path)
+            model_chunks = (
+                unwrapped_model
+                if isinstance(unwrapped_model, (list, tuple))
+                else [unwrapped_model]
+            )
+            for model_chunk in model_chunks:
+                configure_modelopt_kv_cache_quant_skip(model_chunk)
 
     @contextmanager
     def hide_tensor_quantizers(self):

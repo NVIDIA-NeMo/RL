@@ -19,6 +19,10 @@ from typing import Any
 import ray
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.modelopt.utils import (
+    MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N,
+    get_kv_cache_quant_skip_first_n,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
@@ -33,6 +37,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 _EXTRA_ENV_VARS = (
     "VLLM_QUANT_CFG",
     "VLLM_MODELOPT_REAL_QUANT",
+    MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N,
     "PYTHONPATH",
 )
 
@@ -48,6 +53,36 @@ def _configure_quant_engine_kwargs(
     cfg: VllmConfig,
     llm_kwargs: dict[str, Any],
 ) -> None:
+    first_n = get_kv_cache_quant_skip_first_n()
+    if first_n:
+        if cfg.get("real_quant"):
+            raise ValueError(
+                "K/V boundary skipping supports simulated quantization only."
+            )
+        if not cfg.get("quant_cfg"):
+            raise ValueError("K/V boundary skipping requires generation.quant_cfg.")
+        if llm_kwargs.get("kv_cache_dtype") != "auto":
+            raise ValueError("K/V boundary skipping requires kv_cache_dtype='auto'.")
+        if llm_kwargs.get("enable_prefix_caching") is not False:
+            raise ValueError(
+                "K/V boundary skipping requires prefix caching to be disabled."
+            )
+        if llm_kwargs.get("speculative_config") is not None:
+            raise ValueError(
+                "K/V boundary skipping does not support speculative decoding."
+            )
+        if llm_kwargs.get("decode_context_parallel_size", 1) != 1:
+            raise ValueError("K/V boundary skipping does not support vLLM DCP.")
+        if llm_kwargs.get("enable_dbo", False):
+            raise ValueError("K/V boundary skipping does not support vLLM DBO.")
+        attention_backend = llm_kwargs.get("attention_backend")
+        if str(attention_backend).split(".")[-1] != "FLASH_ATTN":
+            raise ValueError(
+                "K/V boundary skipping requires attention_backend='FLASH_ATTN'."
+            )
+        if llm_kwargs.get("enforce_eager") is not True:
+            raise ValueError("K/V boundary skipping requires enforce_eager=true.")
+
     extension_name = "VllmQuantInternalWorkerExtension"
     if checkpoint_engine_refit_config(cfg) is not None:
         extension_name += "WithCheckpointEngine"

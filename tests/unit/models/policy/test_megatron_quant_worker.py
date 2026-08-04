@@ -154,6 +154,45 @@ def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32
 
 
 @requires_weight_folding
+def test_kv_boundary_skip_is_reapplied_after_modelopt_restore(monkeypatch, tmp_path):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    chunks = [object(), object()]
+    calls = []
+    state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(pretrained_checkpoint=str(tmp_path), load=None)
+        )
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker, "has_modelopt_state", lambda _path: True
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker, "unwrap_model", lambda _model: chunks
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "load_modelopt_state",
+        lambda model, path: calls.append(("load", model, path)),
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "configure_modelopt_kv_cache_quant_skip",
+        lambda model: calls.append(("configure", model)),
+    )
+
+    worker._restore_modelopt_state_pre_load(state, object())
+
+    assert calls == [
+        ("load", chunks, str(tmp_path)),
+        ("configure", chunks[0]),
+        ("configure", chunks[1]),
+    ]
+
+
+@requires_weight_folding
 def test_modelopt_layer_spec_config_selects_layer_specs():
     from functools import partial
 

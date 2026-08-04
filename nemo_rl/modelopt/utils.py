@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from typing import Any, Iterator, Literal
 
 MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
+MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N = "MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N"
 
 _QUANT_IGNORE_NAME_SUFFIXES = (
     ".weight",
@@ -43,6 +45,88 @@ DEFAULT_NVFP4_IGNORE = [
 
 NVFP4RealQuantMode = Literal["w4a4", "w4a16"]
 _NVFP4_REAL_QUANT_MODES = frozenset({"w4a4", "w4a16"})
+
+
+def get_kv_cache_quant_skip_first_n() -> int:
+    """Read and validate the ModelOpt K/V first-token skip configuration."""
+    raw = os.environ.get(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, "0")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"{MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N} must be a nonnegative integer; "
+            f"got {raw!r}."
+        ) from error
+    if value < 0:
+        raise ValueError(
+            f"{MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N} must be nonnegative; got {value}."
+        )
+    return value
+
+
+def validate_kv_cache_quant_skip_config(config: Mapping[str, Any]) -> None:
+    """Require matching simulated-quant learner and rollout paths for K/V skipping."""
+    if get_kv_cache_quant_skip_first_n() == 0:
+        return
+
+    if config.get("quant_cfg") is None:
+        raise ValueError(
+            "K/V first-token skipping requires policy.quant_cfg for the learner."
+        )
+    if not config.get("megatron_cfg", {}).get("enabled", False):
+        raise ValueError(
+            "K/V first-token skipping requires the Megatron policy backend."
+        )
+
+    generation = config.get("generation")
+    if not isinstance(generation, Mapping) or generation.get("backend") != "vllm":
+        raise ValueError("K/V first-token skipping requires a vLLM rollout backend.")
+    if generation.get("quant_cfg") is None:
+        raise ValueError(
+            "K/V first-token skipping requires policy.generation.quant_cfg for the "
+            "rollout."
+        )
+    if generation.get("real_quant"):
+        raise ValueError(
+            "K/V first-token skipping supports simulated rollout quantization only."
+        )
+
+
+def configure_modelopt_kv_cache_quant_skip(model) -> int:
+    """Apply K/V first-token skipping to enabled ModelOpt attention quantizers."""
+    first_n = get_kv_cache_quant_skip_first_n()
+    if first_n == 0:
+        return 0
+
+    configured = 0
+    unsupported = []
+    for name, module in model.named_modules():
+        k_quantizer = getattr(module, "k_bmm_quantizer", None)
+        v_quantizer = getattr(module, "v_bmm_quantizer", None)
+        if not (
+            getattr(k_quantizer, "is_enabled", False)
+            or getattr(v_quantizer, "is_enabled", False)
+        ):
+            continue
+        setter = getattr(module, "set_kv_quant_skip_first_tokens", None)
+        if setter is None:
+            unsupported.append(name)
+            continue
+        setter(first_n)
+        configured += 1
+
+    if unsupported:
+        raise RuntimeError(
+            "K/V boundary skipping is not implemented for enabled attention modules: "
+            f"{unsupported[:8]}."
+        )
+    if configured == 0:
+        raise RuntimeError(
+            "K/V boundary skipping was requested, but no enabled K/V quantizers "
+            "support it."
+        )
+    print(f"MODELOPT_KV_CACHE_QUANT_SKIP_ACTIVE first_n={first_n} modules={configured}")
+    return configured
 
 
 def _iter_quant_ignore_suffix_variants(name: str) -> Iterator[str]:

@@ -33,12 +33,20 @@ from nemo_rl.modelopt.models.generation.vllm_modelopt import (
     register_nemo_modelopt_nvfp4,
 )
 from nemo_rl.modelopt.utils import (
+    MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N,
     build_vllm_modelopt_nvfp4_config,
+    configure_modelopt_kv_cache_quant_skip,
+    get_kv_cache_quant_skip_first_n,
     iter_quant_ignore_name_candidates,
     matches_quant_ignore_pattern,
     resolve_nvfp4_real_quant_mode,
     resolve_quant_cfg,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_kv_boundary_skip_env(monkeypatch):
+    monkeypatch.delenv(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -765,6 +773,91 @@ def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
     )
 
     assert "PYTHONPATH" in worker_mod._EXTRA_ENV_VARS
+
+
+def test_quant_worker_forwards_kv_boundary_skip_to_inner_vllm_workers():
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+
+    assert MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N in worker_mod._EXTRA_ENV_VARS
+
+
+@pytest.mark.parametrize("value", ["-1", "one"])
+def test_get_kv_cache_quant_skip_first_n_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, value)
+
+    with pytest.raises(ValueError, match="must be"):
+        get_kv_cache_quant_skip_first_n()
+
+
+def test_configure_modelopt_kv_cache_quant_skip(monkeypatch):
+    calls = []
+
+    class _Quantizer:
+        is_enabled = True
+
+    module = types.SimpleNamespace(
+        k_bmm_quantizer=_Quantizer(),
+        v_bmm_quantizer=_Quantizer(),
+        set_kv_quant_skip_first_tokens=lambda first_n: calls.append(first_n),
+    )
+    model = types.SimpleNamespace(named_modules=lambda: [("attention", module)])
+    monkeypatch.setenv(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, "16")
+
+    assert configure_modelopt_kv_cache_quant_skip(model) == 1
+    assert calls == [16]
+
+
+def test_configure_quant_engine_kwargs_for_kv_boundary_skip(monkeypatch):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.setenv(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, "512")
+    llm_kwargs = {
+        "kv_cache_dtype": "auto",
+        "enable_prefix_caching": False,
+        "attention_backend": "FLASH_ATTN",
+        "enforce_eager": True,
+    }
+
+    worker_mod._configure_quant_engine_kwargs({"quant_cfg": "NVFP4_KV_CFG"}, llm_kwargs)
+
+    assert llm_kwargs["worker_cls"].endswith(".FakeQuantWorker")
+
+
+@pytest.mark.parametrize(
+    ("cfg_update", "llm_update", "message"),
+    [
+        ({"real_quant": True}, {}, "simulated quantization"),
+        ({"quant_cfg": None}, {}, "requires generation.quant_cfg"),
+        ({}, {"kv_cache_dtype": "fp8"}, "kv_cache_dtype='auto'"),
+        ({}, {"enable_prefix_caching": True}, "prefix caching"),
+        ({}, {"speculative_config": {}}, "speculative decoding"),
+        ({}, {"decode_context_parallel_size": 2}, "vLLM DCP"),
+        ({}, {"enable_dbo": True}, "vLLM DBO"),
+        ({}, {"attention_backend": "FLASHINFER"}, "FLASH_ATTN"),
+        ({}, {"enforce_eager": False}, "enforce_eager=true"),
+    ],
+)
+def test_configure_kv_boundary_skip_rejects_unsupported_modes(
+    monkeypatch, cfg_update, llm_update, message
+):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.setenv(MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N, "512")
+    cfg = {"quant_cfg": "NVFP4_KV_CFG", **cfg_update}
+    llm_kwargs = {
+        "kv_cache_dtype": "auto",
+        "enable_prefix_caching": False,
+        "attention_backend": "FLASH_ATTN",
+        "enforce_eager": True,
+        **llm_update,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        worker_mod._configure_quant_engine_kwargs(cfg, llm_kwargs)
 
 
 def test_configure_quant_engine_kwargs_preserves_checkpoint_extension(monkeypatch):

@@ -31,8 +31,53 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
+    resolve_policy_worker_cls,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+def _kv_skip_policy_config() -> dict:
+    return {
+        "quant_cfg": "kv_cache_nvfp4.yaml",
+        "megatron_cfg": {"enabled": True},
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "kv_cache_nvfp4.yaml",
+            "real_quant": False,
+        },
+    }
+
+
+def test_resolve_policy_worker_validates_two_sided_kv_skip(monkeypatch):
+    monkeypatch.setenv("MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N", "512")
+
+    assert resolve_policy_worker_cls("policy.Worker", _kv_skip_policy_config()) == (
+        "policy.Worker"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("quant_cfg",), None, "policy.quant_cfg"),
+        (("megatron_cfg", "enabled"), False, "Megatron policy backend"),
+        (("generation", "backend"), "hf", "vLLM rollout backend"),
+        (("generation", "quant_cfg"), None, "policy.generation.quant_cfg"),
+        (("generation", "real_quant"), True, "simulated rollout quantization"),
+    ],
+)
+def test_resolve_policy_worker_rejects_one_sided_or_unsupported_kv_skip(
+    monkeypatch, path, value, message
+):
+    config = _kv_skip_policy_config()
+    target = config
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    monkeypatch.setenv("MODELOPT_KV_CACHE_QUANT_SKIP_FIRST_N", "512")
+
+    with pytest.raises(ValueError, match=message):
+        resolve_policy_worker_cls("policy.Worker", config)
 
 
 class TestGetMegatronCheckpointDir:
