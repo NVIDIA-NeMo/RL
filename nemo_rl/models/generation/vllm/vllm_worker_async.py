@@ -325,11 +325,6 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def post_init_async(self):
         if self.llm is not None:
-            # AsyncLLM.collective_rpc is a coroutine, so initialization must
-            # happen in the async post-init path rather than shared _load_model.
-            await self.llm.collective_rpc(
-                "_initialize_nemotron_omni_radio_layerscale"
-            )
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
@@ -959,10 +954,20 @@ class VllmAsyncGenerationWorkerImpl(
                 [per_sample_stop_strings] if per_sample_stop_strings else None
             )
 
-            remaining_ctx = (
-                self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
-            )
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            remaining_ctx = max_model_len - current_input_actual_length
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+
+            spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+            spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+            if allowed_new_tokens > 0 and spec_lookahead > 0:
+                allowed_new_tokens = self._request_max_new_tokens(
+                    configured_max_new_tokens=allowed_new_tokens,
+                    input_length=current_input_actual_length,
+                    max_model_len=max_model_len,
+                    cap_to_context=False,
+                    spec_lookahead=spec_lookahead,
+                )
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:

@@ -210,9 +210,48 @@ class TestModelForward:
 
         model_forward(model, processed_inputs_multimodal)
 
-        assert model.pixel_values is processed_inputs_multimodal.vlm_kwargs[
-            "pixel_values"
-        ]
+        assert (
+            model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
+        )
+
+    def test_forward_preserves_dynamic_resolution_omni_inputs(
+        self, processed_inputs_multimodal
+    ):
+        class DynamicResolutionOmniLikeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+                imgs_sizes=None,
+            ):
+                self.forward_kwargs = {
+                    "pixel_values": pixel_values,
+                    "imgs_sizes": imgs_sizes,
+                }
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = DynamicResolutionOmniLikeModel()
+        padded_images = torch.randn(2, 3, 256, 320)
+        image_sizes = torch.tensor([[224, 320], [256, 288]])
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "pixel_values": padded_images,
+                "imgs_sizes": image_sizes,
+                "num_frames": torch.ones(2, dtype=torch.long),
+            }
+        )
+
+        model_forward(model, processed_inputs_multimodal)
+
+        assert model.forward_kwargs["pixel_values"] is padded_images
+        assert model.forward_kwargs["imgs_sizes"] is image_sizes
 
     def test_forward_preserves_multimodal_metadata_for_kwargs_model(
         self, processed_inputs_multimodal

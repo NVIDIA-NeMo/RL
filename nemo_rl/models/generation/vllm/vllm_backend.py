@@ -27,10 +27,6 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
-from nemo_rl.models.generation.vllm.model_patches.omni import (
-    initialize_nemotron_omni_radio_layerscale,
-    validate_nemotron_omni_radio_layerscale_refit,
-)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -325,13 +321,6 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-        validate_nemotron_omni_radio_layerscale_refit(
-            self.model_runner, state_dict_info
-        )
-
-    def _initialize_nemotron_omni_radio_layerscale(self) -> int:
-        """RPC entry point for the Nemotron Omni RADIO LayerScale patch."""
-        return initialize_nemotron_omni_radio_layerscale(self.model_runner)
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]

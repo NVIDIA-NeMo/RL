@@ -592,9 +592,7 @@ class BaseVllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        logprobs_mode = self.cfg["vllm_cfg"].get("logprobs_mode")
-        if logprobs_mode is not None:
-            llm_kwargs["logprobs_mode"] = logprobs_mode
+        llm_kwargs["logprobs_mode"] = self.cfg["vllm_cfg"]["logprobs_mode"]
 
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
@@ -684,6 +682,33 @@ class BaseVllmGenerationWorker:
         return max(
             1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
         )
+
+    @classmethod
+    def _request_max_new_tokens(
+        cls,
+        *,
+        configured_max_new_tokens: int,
+        input_length: int,
+        max_model_len: int,
+        cap_to_context: bool,
+        spec_lookahead: int,
+    ) -> int:
+        """Apply context and speculative-decoding limits to one request."""
+        max_new_tokens = configured_max_new_tokens
+        if cap_to_context:
+            max_new_tokens = _context_capped_max_new_tokens(
+                configured_max_new_tokens=max_new_tokens,
+                input_length=input_length,
+                max_model_len=max_model_len,
+            )
+        if spec_lookahead > 0:
+            max_new_tokens = cls._spec_decode_max_tokens(
+                max_new_tokens,
+                input_length,
+                max_model_len,
+                spec_lookahead,
+            )
+        return max_new_tokens
 
     @staticmethod
     def _patch_vllm_nsight_config() -> None:
@@ -781,13 +806,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def post_init(self):
         if self.llm is not None:
-            # Nemotron Omni checkpoints fold RADIO LayerScale into adjacent
-            # weights, while stock vLLM still allocates ls1/ls2 parameters.
-            # Initialize them before colocated level-1 sleep releases CUDA
-            # storage. Non-Omni worker extensions return without changing state.
-            self.llm.collective_rpc(
-                "_initialize_nemotron_omni_radio_layerscale"
-            )
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:
@@ -851,26 +869,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
 
-        # vLLM 0.20 eagle3 spec decode hits a CUDA illegal memory access when a
+        # vLLM Eagle3 spec decode hits a CUDA illegal memory access when a
         # request's total length reaches max_model_len (the drafter looks ahead
         # past the boundary). Clamp per-request max_tokens so speculative
         # requests stop short of the boundary by the drafter lookahead.
         spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
         spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
-        if spec_lookahead > 0:
-            max_model_len = self.cfg["vllm_cfg"]["max_model_len"]
-            base_max_tokens = sampling_params.max_tokens
-            sampling_params = [
-                self._build_sampling_params(
-                    greedy=greedy,
-                    stop_strings=stop_strings,
-                    max_new_tokens=self._spec_decode_max_tokens(
-                        base_max_tokens, int(input_len), max_model_len, spec_lookahead
-                    ),
-                )
-                for input_len in data["input_lengths"].tolist()
-            ]
-
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
@@ -880,19 +884,29 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        if self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"):
-            max_model_len = int(self.llm.llm_engine.model_config.max_model_len)
+        cap_to_context = bool(self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"))
+        if cap_to_context or spec_lookahead > 0:
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            configured_max_new_tokens = int(self.cfg["max_new_tokens"])
+            per_request_max_new_tokens = []
+            for input_length in input_lengths.tolist():
+                per_request_max_new_tokens.append(
+                    self._request_max_new_tokens(
+                        configured_max_new_tokens=configured_max_new_tokens,
+                        input_length=int(input_length),
+                        max_model_len=max_model_len,
+                        cap_to_context=cap_to_context,
+                        spec_lookahead=spec_lookahead,
+                    )
+                )
+
             sampling_params = [
                 self._build_sampling_params(
                     greedy=greedy,
                     stop_strings=stop_strings,
-                    max_new_tokens=_context_capped_max_new_tokens(
-                        configured_max_new_tokens=int(self.cfg["max_new_tokens"]),
-                        input_length=int(input_length),
-                        max_model_len=max_model_len,
-                    ),
+                    max_new_tokens=max_new_tokens,
                 )
-                for input_length in input_lengths.tolist()
+                for max_new_tokens in per_request_max_new_tokens
             ]
         else:
             sampling_params = self._build_sampling_params(

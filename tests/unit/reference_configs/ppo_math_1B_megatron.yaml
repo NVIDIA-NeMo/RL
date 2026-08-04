@@ -233,6 +233,7 @@ policy:
       unified_memory_level: 0
       max_tokens: 16384
     vllm_cfg:
+      logprobs_mode: processed_logprobs
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
