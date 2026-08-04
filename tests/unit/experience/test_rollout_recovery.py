@@ -31,6 +31,26 @@ def _reserve(ledger: RolloutRecoveryLedger, *, group_id: str = "group-1"):
     )
 
 
+def _receipt(gate_rollout_id: str, generation_index: int) -> dict:
+    return {
+        "rollout_id": gate_rollout_id,
+        "manifest": [{"staging_key": f"stage-{generation_index}"}],
+    }
+
+
+def _seal_all(ledger: RolloutRecoveryLedger, group_id: str) -> None:
+    group = ledger.get_group(group_id)
+    for sibling in group.siblings:
+        gate_rollout_id = sibling.current_attempt.gate_rollout_id
+        ledger.mark_sibling_sealed(
+            group_id,
+            generation_index=sibling.generation_index,
+            gate_rollout_id=gate_rollout_id,
+            receipt=_receipt(gate_rollout_id, sibling.generation_index),
+            reward=float(sibling.generation_index),
+        )
+
+
 def test_reserve_separates_logical_ids_from_attempt_ids() -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(ledger)
@@ -93,15 +113,29 @@ def test_state_dict_round_trip_preserves_lineage() -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(ledger)
     ledger.mark_group_dispatched(group.group_id)
+    gate_rollout_id = group.siblings[0].current_attempt.gate_rollout_id
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=0,
+        gate_rollout_id=gate_rollout_id,
+        receipt=_receipt(gate_rollout_id, 0),
+        reward=0.5,
+    )
     state = ledger.state_dict()
 
     restored = RolloutRecoveryLedger.from_state_dict(deepcopy(state))
 
     assert state["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
     assert restored.state_dict() == state
+    restored_group = restored.get_group(group.group_id)
+    sealed_attempt = restored_group.siblings[0].current_attempt
+    assert sealed_attempt.status == RolloutAttemptStatus.SEALED
+    assert sealed_attempt.reward == 0.5
+    assert sealed_attempt.staging_keys == ["stage-0"]
+    assert sealed_attempt.receipt == _receipt(gate_rollout_id, 0)
     assert all(
         sibling.current_attempt.status == RolloutAttemptStatus.DISPATCHED
-        for sibling in restored.get_group(group.group_id).siblings
+        for sibling in restored_group.siblings[1:]
     )
 
 
@@ -126,9 +160,64 @@ def test_release_requires_finalized_group() -> None:
         ledger.release_finalized_group(group.group_id)
 
     ledger.mark_group_dispatched(group.group_id)
+    _seal_all(ledger, group.group_id)
     ledger.mark_group_finalized(group.group_id)
     ledger.release_finalized_group(group.group_id)
     assert len(ledger) == 0
+
+
+def test_streamed_seal_preserves_completed_sibling_on_group_abort() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    gate_rollout_id = group.siblings[1].current_attempt.gate_rollout_id
+    receipt = _receipt(gate_rollout_id, 1)
+
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=1,
+        gate_rollout_id=gate_rollout_id,
+        receipt=receipt,
+        reward=2.5,
+    )
+    receipt["manifest"][0]["staging_key"] = "mutated"
+    ledger.abandon_group(group.group_id)
+
+    restored_group = ledger.get_group(group.group_id)
+    assert (
+        restored_group.siblings[0].current_attempt.status
+        == RolloutAttemptStatus.ABANDONED
+    )
+    sealed_attempt = restored_group.siblings[1].current_attempt
+    assert sealed_attempt.status == RolloutAttemptStatus.SEALED
+    assert sealed_attempt.receipt == _receipt(gate_rollout_id, 1)
+    assert sealed_attempt.reward == 2.5
+    assert sealed_attempt.staging_keys == ["stage-1"]
+    assert (
+        restored_group.siblings[2].current_attempt.status
+        == RolloutAttemptStatus.ABANDONED
+    )
+
+
+def test_streamed_seal_rejects_receipt_identity_mismatch() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    gate_rollout_id = group.siblings[0].current_attempt.gate_rollout_id
+
+    with pytest.raises(ValueError, match="receipt rollout identity mismatch"):
+        ledger.mark_sibling_sealed(
+            group.group_id,
+            generation_index=0,
+            gate_rollout_id=gate_rollout_id,
+            receipt=_receipt("wrong-attempt", 0),
+            reward=0.0,
+        )
+
+    assert (
+        ledger.get_group(group.group_id).siblings[0].current_attempt.status
+        == RolloutAttemptStatus.DISPATCHED
+    )
 
 
 def test_restore_rejects_identity_mismatch() -> None:
@@ -138,6 +227,25 @@ def test_restore_rejects_identity_mismatch() -> None:
     state["groups"][0]["siblings"][0]["logical_rollout_id"] = "wrong"
 
     with pytest.raises(ValueError, match="logical rollout ID mismatch"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_restore_rejects_staging_keys_that_disagree_with_receipt() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    gate_rollout_id = group.siblings[0].current_attempt.gate_rollout_id
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=0,
+        gate_rollout_id=gate_rollout_id,
+        receipt=_receipt(gate_rollout_id, 0),
+        reward=0.5,
+    )
+    state = ledger.state_dict()
+    state["groups"][0]["siblings"][0]["attempts"][0]["staging_keys"] = ["wrong-stage"]
+
+    with pytest.raises(ValueError, match="do not match the receipt manifest"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
