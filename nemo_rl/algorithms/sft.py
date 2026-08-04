@@ -181,14 +181,6 @@ def _validate_direct_megatron_sft_setup(
         raise ValueError(
             "Direct Megatron-LM prepacked SFT requires sft.val_micro_batch_size=1"
         )
-    if (
-        "sequence_packing" in policy_config
-        and policy_config["sequence_packing"]["enabled"]
-    ):
-        raise ValueError(
-            "Direct Megatron-LM prepacked SFT requires "
-            "policy.sequence_packing.enabled=false"
-        )
     if "router_replay" in policy_config and policy_config["router_replay"]["enabled"]:
         raise NotImplementedError(
             "Direct Megatron-LM prepacked SFT does not support router replay"
