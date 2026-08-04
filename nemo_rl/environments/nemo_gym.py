@@ -417,21 +417,12 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "with enable_return_routed_experts."
                 )
 
-            # A generation response has no route for its final token because
-            # that token is never fed back into the model in the same request.
-            # pad_and_align_routed_expert_indices therefore leaves a valid dummy
-            # route at the end of every assistant turn.  The next request does
-            # process that token as part of its prompt, so replace the previous
-            # turn's dummy with the newly captured real route before appending
-            # the new prompt suffix.
+            # The next prompt prefill supplies the real route for the previous
+            # turn's final token, whose decode route was padded.
             if routed_experts is not None and seen_token_ids:
                 previous_routes = nemo_rl_message_log[-1].get("routed_experts")
-                if not isinstance(previous_routes, torch.Tensor):
-                    raise ValueError(
-                        "A later NeMo Gym turn returned routed_experts but the "
-                        "previous trainable turn did not carry routes to refresh."
-                    )
-                previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
+                if isinstance(previous_routes, torch.Tensor):
+                    previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
 
             prompt_start = len(seen_token_ids)
             prompt_end = len(prompt_token_ids)
