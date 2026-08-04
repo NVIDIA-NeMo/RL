@@ -217,7 +217,7 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
 
 
 def _index_per_turn_images(
-    seed_obs: list[dict], output: list[dict]
+    output: list[dict]
 ) -> list[list[Image.Image]]:
     """Bin server-returned user images by the assistant turn that saw them.
 
@@ -229,7 +229,7 @@ def _index_per_turn_images(
     """
     per_turn: list[list[Image.Image]] = []
     pending: list[Image.Image] = []
-    for item in [*(seed_obs or []), *output]:
+    for item in output:
         if item.get("role") == "user":
             pending.extend(_extract_input_images_from_message(item))
         elif "generation_token_ids" in item:
@@ -487,7 +487,6 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         per_turn_images = _index_per_turn_images(
-            nemo_gym_result["response"].get("seed_obs") or [],
             nemo_gym_result["response"]["output"],
         )
         turn_idx = 0
