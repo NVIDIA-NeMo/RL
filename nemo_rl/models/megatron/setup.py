@@ -61,6 +61,7 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
@@ -234,6 +235,7 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
     router_replay_enabled,
@@ -1475,6 +1477,84 @@ def _patch_bridge_signal_handler_for_worker_threads() -> None:
 
     sig_utils.DistributedSignalHandler.__enter__ = main_thread_only_enter
     _BRIDGE_SIGNAL_HANDLER_PATCHED = True
+
+
+def build_inference_model(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+) -> MegatronModule:
+    """Build a second, inference-layout model for colocated Megatron refit.
+
+    The returned model is resident on GPU; its weights are uninitialized until the first reshard.
+
+    Args:
+        policy_cfg: The inference config
+        megatron_cfg: The training config
+
+    Returns:
+        The inference model module (single element; not DDP-wrapped, no optimizer).
+    """
+    # Deep-copy the training config and apply the inference overrides on top.
+    inference_provider = copy.deepcopy(megatron_cfg.model)
+    train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
+    _apply_parallelism_config(inference_provider, policy_cfg)
+    _apply_moe_config(inference_provider, policy_cfg)
+    if "transformer_impl" in policy_cfg["megatron_cfg"]:
+        inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
+            "transformer_impl"
+        ]
+    # A custom (uneven) pipeline split is tuned for the training PP; reset to an even split
+    # when inference uses a different PP (the reshard maps params across stages by name).
+    if (
+        inference_provider.pipeline_model_parallel_size
+        != train_pipeline_model_parallel_size
+    ):
+        inference_provider.num_layers_in_first_pipeline_stage = None
+        inference_provider.num_layers_in_last_pipeline_stage = None
+    # Sequence parallelism requires TP > 1; force it off otherwise (Megatron asserts this).
+    inference_provider.sequence_parallel = (
+        inference_provider.sequence_parallel
+        and inference_provider.tensor_model_parallel_size > 1
+    )
+    # Inference never trains: disable recompute.
+    inference_provider.recompute_granularity = None
+    inference_provider.recompute_method = None
+    inference_provider.recompute_num_layers = None
+
+    world_size = torch.distributed.get_world_size()
+    inference_pg_collection = build_inference_pg_collection(
+        world_size,
+        tp_size=inference_provider.tensor_model_parallel_size,
+        pp_size=inference_provider.pipeline_model_parallel_size,
+        cp_size=inference_provider.context_parallel_size,
+        ep_size=inference_provider.expert_model_parallel_size,
+        expt_tp_size=inference_provider.expert_tensor_parallel_size,
+        use_tp_pp_dp_mapping=megatron_cfg.dist.use_tp_pp_dp_mapping,
+        rank_offset=0,  # colocated: the same ranks hold both the training and inference models
+    )
+    setattr(inference_provider, "_pg_collection", inference_pg_collection)
+
+    # Match the training mixed-precision wrapper.
+    mixed_precision_wrapper = (
+        MoEFloat16Module
+        if policy_cfg["megatron_cfg"]["freeze_moe_router"]
+        else Float16Module
+    )
+
+    # Only one model's weights stay resident at a time; swap weights in and out at the same address.
+    with inference_model_alloc_region():
+        inference_model = get_model(
+            inference_provider,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            mixed_precision_wrapper=mixed_precision_wrapper,
+            pg_collection=inference_pg_collection,
+            wrap_with_ddp=False,  # never trained: no DDP, no grad buffers, no optimizer
+        )
+    inference_model = inference_model[0]
+    inference_model.eval()
+    return inference_model
 
 
 def setup_model_and_optimizer(

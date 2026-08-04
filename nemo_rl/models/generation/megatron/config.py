@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy import PolicyConfig
 
 
 class MCoreGenerationSpecificArgs(TypedDict):
@@ -69,3 +70,13 @@ class MCoreGenerationConfig(GenerationConfig):
     """Generation config for Megatron Inference."""
 
     mcore_generation_config: MCoreGenerationSpecificArgs
+
+
+def apply_megatron_inference_overrides(policy_config: PolicyConfig) -> None:
+    """Apply inference-only Megatron configs on top of the normal `megatron_cfg`."""
+    generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
+    # The overlay is intentionally dynamic: any inference-only key overwrites
+    # its training-side counterpart, so treat the config as a plain dict.
+    megatron_cfg = cast(dict[str, Any], policy_config["megatron_cfg"])
+    megatron_cfg.update(generation_config["mcore_generation_config"])
+    megatron_cfg["activation_checkpointing"] = False

@@ -25,7 +25,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 if TYPE_CHECKING:
