@@ -68,6 +68,9 @@ loss_fn:
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  # Optional forward-KL distillation against teacher per-token logprobs.
+  # See loss_fn.teacher_distillation in grpo_math_1B.yaml for details.
+  teacher_distillation: null
 
 value_loss_fn:
   scale: 0.4
