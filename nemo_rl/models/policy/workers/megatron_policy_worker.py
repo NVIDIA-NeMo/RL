@@ -483,9 +483,6 @@ class MegatronPolicyWorkerImpl(
                     "transformer_impl=inference_optimized with TP>1: "
                     "enabling megatron_cfg.sequence_parallel."
                 )
-            # TODO: Remove the following two lines after Megatron-Bridge#5164 lands.
-            from megatron.bridge.models.conversion.param_mapping import AutoMapping
-            AutoMapping.register_module_type("InferenceColumnParallelLinear", "column")
         runtime_config = validate_and_set_config(
             config,
             self.rank,
