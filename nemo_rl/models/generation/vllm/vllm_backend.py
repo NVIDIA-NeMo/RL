@@ -233,6 +233,8 @@ class VllmInternalWorkerExtension:
         train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
+        import time as _time
+
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Place vLLM ranks after all training ranks so all training workers can join
@@ -240,14 +242,125 @@ class VllmInternalWorkerExtension:
             rank_prefix, world_size - train_world_size
         )
 
+        _t_phases: dict[str, float] = {}
+        _t_overall = _time.monotonic()
+
+        # Idempotent re-init: destroy the old comm before creating a new one.
+        _t = _time.monotonic()
+        old = getattr(self, "model_update_group", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                torch.cuda.synchronize()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+        _t_phases["destroy_old"] = _time.monotonic() - _t
+
+        _t = _time.monotonic()
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
+        _t_phases["tcp_store_ctor"] = _time.monotonic() - _t
+
+        _t = _time.monotonic()
         # Free cached torch-allocator blocks so NCCL's P2P transport buffers
         # (raw cudaMalloc at comm init) have headroom; otherwise comm_init OOMs
         # on memory-tight shapes (mirror the train side).
         torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=self.device)
+        _t_phases["nccl_init"] = _time.monotonic() - _t
+
+        _t_total = _time.monotonic() - _t_overall
+        if _t_total > 3.0:
+            print(
+                f"[init_collective_timing] rank={rank} world={world_size} "
+                f"total={_t_total:.2f}s "
+                f"destroy_old={_t_phases.get('destroy_old', 0):.2f}s "
+                f"tcp_store_ctor={_t_phases.get('tcp_store_ctor', 0):.2f}s "
+                f"nccl_init={_t_phases.get('nccl_init', 0):.2f}s",
+                flush=True,
+            )
+
+    def reset_collective(self) -> None:
+        """Tear down the cross-cluster NCCL comm. Idempotent; no-op if not held.
+
+        Abort first (kills any hung broadcast immediately), then synchronize
+        and clear cache. The reverse order would block for the full NCCL
+        heartbeat timeout when a peer dies mid-broadcast.
+        """
+        group = getattr(self, "model_update_group", None)
+        if group is None:
+            return
+        try:
+            group.destroy()
+        except Exception as e:  # noqa: BLE001
+            print(f"[vllm_backend.reset_collective] destroy raised {e}", flush=True)
+        for fn in (torch.cuda.synchronize, torch.cuda.empty_cache):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+        self.model_update_group = None  # type: ignore[assignment]
+
+    def warmup_nccl_library(self) -> None:
+        """Pre-warm NCCL's per-process lazy init before the first real collective.
+
+        On TP=PP=EP=1 gen workers there is no intra-shard NCCL group, so the
+        cross-cluster model_update_group is the first NCCL collective the process
+        ever sees. NCCL's lazy init (dlopen, IB probe, cuMemMap workspace) adds
+        15-20s to the first init_collective. This method pre-pays that cost with a
+        throwaway rank-1 communicator so subsequent init_collective calls hit warm
+        state. For TP>1 workers vLLM's own TP group has already triggered lazy
+        init, so this is a cheap no-op guarded by _nccl_library_warmed.
+        """
+        if getattr(self, "_nccl_library_warmed", False):
+            return
+
+        import time as _time
+        from nccl.core.communicator import Communicator
+        from nccl.core.utils import get_unique_id
+
+        _t = _time.monotonic()
+        try:
+            unique_id = get_unique_id()
+            with torch.cuda.device(self.device):
+                comm = Communicator.init(nranks=1, rank=0, unique_id=unique_id)
+                data = torch.ones(1, device=self.device)
+                comm.broadcast(
+                    sendbuf=data,
+                    recvbuf=data,
+                    root=0,
+                    stream=int(torch.cuda.current_stream().cuda_stream),
+                )
+                torch.cuda.current_stream().synchronize()
+                for method in ("abort", "destroy", "finalize"):
+                    fn = getattr(comm, method, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                            break
+                        except Exception:  # noqa: BLE001
+                            continue
+            self._nccl_library_warmed = True  # pyrefly: ignore[implicitly-defined-attribute]
+            print(
+                f"[warmup_nccl_library] device={self.device} "
+                f"total={_time.monotonic() - _t:.2f}s",
+                flush=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[warmup_nccl_library] failed (non-fatal): {e}", flush=True)
+
+    def get_node_id(self) -> str:
+        """Return the Ray node ID this worker is running on."""
+        import ray
+        return ray.get_runtime_context().get_node_id()
 
     def init_nccl_reshard_comm_group(
         self,
@@ -749,6 +862,16 @@ class VllmInternalWorkerExtension:
     )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
+        # A freshly added shard may not yet be in the comm during the debounce
+        # window. Skip the receive; the shard stays joining until a later
+        # re-init includes it.
+        if getattr(self, "model_update_group", None) is None:
+            print(
+                "[vllm_backend.update_weights_from_collective] no comm; skipping",
+                flush=True,
+            )
+            return True
+
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
@@ -771,6 +894,15 @@ class VllmInternalWorkerExtension:
                 "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",
                 e,
             )
+            # On failure, tear down the stale comm so the next init_collective
+            # starts clean. On success, keep it alive across refits.
+            group = getattr(self, "model_update_group", None)
+            if group is not None:
+                try:
+                    group.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.model_update_group = None  # pyrefly: ignore
             return False
 
         gc.collect()
