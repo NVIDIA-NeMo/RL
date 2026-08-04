@@ -392,11 +392,6 @@ def test_setup_rejects_missing_megatron_config_for_direct_packed_sft(
             "requires policy.train_micro_batch_size=1",
         ),
         (
-            {"sequence_packing": {"enabled": True}},
-            {},
-            "requires policy.sequence_packing.enabled=false",
-        ),
-        (
             {"router_replay": {"enabled": True}},
             {},
             "does not support router replay",
@@ -446,6 +441,48 @@ def test_setup_rejects_incompatible_direct_packed_policy_before_side_effects(
                 mock_components["tokenizer"],
                 train_dataset,
                 val_dataset,
+            )
+
+
+def test_setup_allows_sequence_packing_for_direct_packed_context_parallel_sft(
+    mock_components,
+):
+    master_config = mock_components["master_config"]
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    master_config.policy.update(
+        {
+            "megatron_cfg": {
+                "enabled": True,
+                "use_fused_linear_logprobs": False,
+                "context_parallel_size": 2,
+            },
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": True},
+            "draft": {"enabled": False},
+            "router_replay": {"enabled": False},
+        }
+    )
+    processor = partial(MagicMock(), context_parallel_size=2)
+    train_dataset = MagicMock()
+    train_dataset.task_data_processors = {
+        "megatron_sft_packed": (MagicMock(), processor)
+    }
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(
+            AssertionError,
+            match="setup continued into logger initialization",
+        ):
+            setup(
+                master_config,
+                mock_components["tokenizer"],
+                train_dataset,
+                None,
             )
 
 
