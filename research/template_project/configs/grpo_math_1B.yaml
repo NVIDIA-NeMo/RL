@@ -296,7 +296,6 @@ policy:
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
     vllm_cfg:
-      logprobs_mode: processed_logprobs
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

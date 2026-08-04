@@ -229,7 +229,6 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      logprobs_mode: processed_logprobs
       async_engine: true
       precision: ${policy.precision}
       tensor_parallel_size: 1

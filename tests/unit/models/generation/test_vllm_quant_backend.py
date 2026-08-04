@@ -61,7 +61,6 @@ def _make_vllm_config(tokenizer, *, async_engine=False, is_eval=True):
         "stop_strings": None,
         "quant_cfg": _QUANT_CFG,
         "vllm_cfg": {
-            "logprobs_mode": "processed_logprobs",
             "precision": "bfloat16",
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,

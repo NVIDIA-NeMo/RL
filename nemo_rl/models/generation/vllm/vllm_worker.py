@@ -592,7 +592,9 @@ class BaseVllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        llm_kwargs["logprobs_mode"] = self.cfg["vllm_cfg"]["logprobs_mode"]
+        logprobs_mode = self.cfg["vllm_cfg"].get("logprobs_mode")
+        if logprobs_mode is not None:
+            llm_kwargs["logprobs_mode"] = logprobs_mode
 
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(

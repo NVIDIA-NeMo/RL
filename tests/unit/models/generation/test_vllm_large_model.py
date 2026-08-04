@@ -41,7 +41,6 @@ large_model_vllm_config: VllmConfig = {
     "stop_token_ids": None,
     "stop_strings": None,
     "vllm_cfg": {
-        "logprobs_mode": "processed_logprobs",
         "precision": "bfloat16",
         "tensor_parallel_size": 8,
         "pipeline_parallel_size": 2,

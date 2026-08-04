@@ -49,7 +49,6 @@ basic_vllm_test_config: VllmConfig = {
     "stop_token_ids": None,
     "stop_strings": None,
     "vllm_cfg": {
-        "logprobs_mode": "processed_logprobs",
         "async_engine": False,
         "precision": "bfloat16",
         "tensor_parallel_size": 1,

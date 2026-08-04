@@ -378,7 +378,6 @@ policy:
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
-      logprobs_mode: processed_logprobs
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

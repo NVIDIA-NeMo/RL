@@ -328,7 +328,6 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      logprobs_mode: processed_logprobs
       async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

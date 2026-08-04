@@ -222,7 +222,6 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      logprobs_mode: processed_logprobs
       enable_prefix_caching: true
       async_engine: true
       precision: ${policy.precision}
