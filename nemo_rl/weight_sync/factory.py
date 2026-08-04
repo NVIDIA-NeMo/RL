@@ -22,6 +22,7 @@ topology (colocated vs. non-colocated) and the generation backend
 from typing import Any, Optional
 
 from nemo_rl.models.generation.constants import (
+    DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
@@ -59,7 +60,12 @@ def create_weight_synchronizer(
         NotImplementedError: If the requested configuration is not supported.
         ValueError: If required arguments are missing.
     """
-    _SUPPORTED_BACKENDS = {VLLM_BACKEND, SGLANG_BACKEND, MEGATRON_BACKEND}
+    _SUPPORTED_BACKENDS = {
+        VLLM_BACKEND,
+        SGLANG_BACKEND,
+        MEGATRON_BACKEND,
+        DYNAMO_BACKEND,
+    }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
             f"Unknown generation backend {generation_backend!r}. "

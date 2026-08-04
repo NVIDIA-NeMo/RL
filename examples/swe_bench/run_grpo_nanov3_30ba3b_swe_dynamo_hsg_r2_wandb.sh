@@ -13,28 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Four-step Nemotron Nano V3.5 SWE acceptance run:
-# four 4-GPU policy nodes and two TP4 managed Dynamo generation nodes.
+# Four-step public Nemotron-3 Nano SWE/W&B acceptance run: four 4-GPU policy
+# nodes plus two TP4 managed Dynamo generation nodes.
 
 set -euo pipefail
 
-: "${CONTAINER:?Set CONTAINER to the derived Dynamo squashfs image}"
-: "${MODEL_PATH:?Set MODEL_PATH to the Nemotron Nano V3.5 checkpoint}"
+: "${CONTAINER:?Set CONTAINER to a NeMo-RL image built with BUILD_DYNAMO=1}"
 : "${TRAIN_PATH:?Set TRAIN_PATH to the SWE training JSONL}"
 : "${VAL_PATH:?Set VAL_PATH to the SWE validation JSONL}"
-: "${SIF_FORMATTERS:?Set SIF_FORMATTERS to a JSON list of SWE image format strings}"
+: "${SIF_FORMATTERS:?Set SIF_FORMATTERS to a Hydra list of SWE image format strings}"
 : "${SANDBOX_CONTAINER:?Set SANDBOX_CONTAINER to the NeMo Skills sandbox image}"
 : "${SLURM_ACCOUNT:?Set SLURM_ACCOUNT}"
 : "${SLURM_PARTITION:?Set SLURM_PARTITION}"
 : "${WANDB_API_KEY:?Set WANDB_API_KEY}"
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=${REPO_ROOT:-$(cd "${script_dir}/../.." && pwd)}
-config_path=${CONFIG_PATH:-${repo_root}/examples/configs/recipes/llm/grpo-nemotron-nano-v3.5-swe-6n4g-megatron-dynamo-wandb.yaml}
+config_path=${CONFIG_PATH:-${repo_root}/examples/configs/recipes/llm/grpo-nanov3-30ba3b-swe-6n4g-megatron-dynamo-wandb.yaml}
 entrypoint=${ENTRYPOINT:-${repo_root}/examples/nemo_gym/run_grpo_nemo_gym.py}
 ray_sub=${RAY_SUB:-${repo_root}/ray.sub}
-
-wandb_name=${WANDB_NAME:-nemotron-nano-v3.5-swe-dynamo-${USER}}
+model_name=${MODEL_NAME:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}
+wandb_project=${WANDB_PROJECT:-nemo-rl-dynamo-swe}
+wandb_name=${WANDB_NAME:-nemotron-3-nano-swe-dynamo-${USER}}
 results_dir=${RESULTS_DIR:-${repo_root}/results/${wandb_name}}
 log_dir=${LOG_DIR:-${results_dir}/logs}
 slurm_time_limit=${SLURM_TIME_LIMIT:-04:00:00}
@@ -53,8 +53,7 @@ require_path "${config_path}" "recipe"
 require_path "${entrypoint}" "entrypoint"
 require_path "${ray_sub}" "ray.sub"
 if [[ "${dry_run}" != "1" ]]; then
-  require_path "${CONTAINER}" "Dynamo container"
-  require_path "${MODEL_PATH}" "model"
+  require_path "${CONTAINER}" "Dynamo-enabled container"
   require_path "${TRAIN_PATH}" "training dataset"
   require_path "${VAL_PATH}" "validation dataset"
   require_path "${SANDBOX_CONTAINER}" "sandbox container"
@@ -62,19 +61,14 @@ fi
 
 mkdir -p "${results_dir}" "${log_dir}"
 
-export MODEL_PATH TRAIN_PATH VAL_PATH SIF_FORMATTERS SANDBOX_CONTAINER
-export RESULTS_DIR="${results_dir}"
 export WANDB_API_KEY
 export WANDB_MODE=online
-export WANDB_PROJECT=${WANDB_PROJECT:-nemo-rl-dynamo-swe}
-export WANDB_NAME="${wandb_name}"
-export DYNAMO_PYTHON=/opt/dynamo_venv/bin/python
 export GPUS_PER_NODE=4
 export BASE_LOG_DIR="${log_dir}"
-export NEMO_RL_PY_EXECUTABLES_SYSTEM=1
 export NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT:-6000}
 export SANDBOX_COMMAND=${SANDBOX_COMMAND:-/start-with-nginx.sh}
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
+export SANDBOX_CONTAINER
 export MOUNTS="${repo_root}:${repo_root}${EXTRA_MOUNTS:+,${EXTRA_MOUNTS}}"
 
 command=(
@@ -83,6 +77,15 @@ command=(
   "${entrypoint}"
   --config
   "${config_path}"
+  "policy.model_name=${model_name}"
+  "policy.tokenizer.name=${model_name}"
+  "data.train.data_path=${TRAIN_PATH}"
+  "data.validation.data_path=${VAL_PATH}"
+  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${SIF_FORMATTERS}"
+  "logger.log_dir=${results_dir}"
+  "logger.wandb.project=${wandb_project}"
+  "logger.wandb.name=${wandb_name}"
+  "checkpointing.checkpoint_dir=${results_dir}/checkpoints"
 )
 if [[ -n "${EXTRA_HYDRA_ARGS:-}" ]]; then
   # shellcheck disable=SC2206

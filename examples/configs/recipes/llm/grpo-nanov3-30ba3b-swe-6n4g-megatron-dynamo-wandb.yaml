@@ -5,10 +5,9 @@ cluster:
   segment_size: 1
 checkpointing:
   enabled: false
-  checkpoint_dir: ${oc.env:RESULTS_DIR,results/nemotron-nano-swe-dynamo}
+  checkpoint_dir: results/nemotron-3-nano-swe-dynamo
   save_period: 3
-  ft_keep_latest_k: 1
-  ft_save_period: 1
+  keep_top_k: 1
   checkpoint_must_save_by: 00:03:30:00
   model_save_format: safetensors
   save_consolidated: false
@@ -22,10 +21,7 @@ grpo:
   advantage_clip_high: 100
   val_period: 10000
   overlong_filtering: false
-  dynamic_sampling_max_gen_batches: 10
-  penalize_invalid_tool_call: true
   invalid_tool_call_advantage: -5.0
-  penalize_malformed_thinking: true
   malformed_thinking_advantage: -5.0
   reward_shaping:
     overlong_buffer_length: 128
@@ -41,14 +37,12 @@ grpo:
     enabled: true
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
-  use_best_at_k: false
-  best_at_k_k: 8
-  best_at_k_m: 1000
-  use_combined_training: false
-  combined_training_weight_mode: auto
-  combined_training_best_at_k_weight: 0.2
-  combined_training_pass_at_1_weight: 1.0
-  dynamic_sampling_oversample_ratio: 1.0
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: true
+  token_ids: null
 loss_fn:
   truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: 0.2
@@ -56,8 +50,9 @@ loss_fn:
   force_on_policy_ratio: true
   use_kl_in_reward: false
 policy:
-  model_name: ${oc.env:MODEL_PATH,/path/to/nemotron-nano-v3.5-checkpoint}
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     chat_template_kwargs:
       enable_thinking: true
   hf_config_overrides: {}
@@ -91,28 +86,16 @@ policy:
       fp8: e4m3
       fp8_recipe: mxfp8
       fp8_param: false
-    first_last_layers_bf16: true
-    num_layers_at_start_in_bf16: 1
-    num_layers_at_end_in_bf16: 1
     checkpoint:
       ckpt_assume_constant_structure: true
   sequence_packing:
     fuse_loss: true
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
     backend: dynamo
     dynamo_cfg:
-      engine_world_size: 4
-      dynamo_python: /opt/dynamo_venv/bin/python
+      engine: vllm
       startup_timeout_s: 1800
-      namespace: null
-      frontend_port: 0
       request_timeout_s: 7200
-      etcd_port: 0
-      etcd_peer_port: 0
-      nats_port: 0
-      system_port_base: 29000
       metrics_include_prefixes: null
       metrics_exclude_prefixes: null
       worker_args:
@@ -122,7 +105,7 @@ policy:
         enable_structural_tag: false
         structural_tag_scope: auto
         structural_tag_schema: auto
-        custom_jinja_template: ${policy.model_name}/chat_template.jinja
+        custom_jinja_template: null
         endpoint_types:
         - chat
         - completions
@@ -131,14 +114,19 @@ policy:
         tokenizer: fastokens
         tokenizer_cache: true
         tokenizer_cache_bytes: 4294967296
-        router_mode: round-robin
+        router_mode: kv
         router_reset_states: true
         extra_cli_args: []
     vllm_cfg:
+      expert_parallel_size: 4
+      precision: bfloat16
       gpu_memory_utilization: 0.85
       load_format: auto
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
+      env_vars: null
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs: null
     vllm_kwargs:
       attention_backend: FLASH_ATTN
       moe_backend: triton
@@ -160,15 +148,18 @@ policy:
         num_nodes: 2
 data:
   train:
-    data_path: ${oc.env:TRAIN_PATH,/path/to/swe-train.jsonl}
+    data_path: null
   validation:
-    data_path: ${oc.env:VAL_PATH,/path/to/swe-validation.jsonl}
+    data_path: null
 env:
   nemo_gym:
     skip_venv_if_present: true
     num_gpu_nodes: 0
-    port_range_low: 15001
-    port_range_high: 20000
+    effort_levels:
+      low_string: '{reasoning effort: efficient}'
+      low_weight: 0.1
+      low_penalty: 1
+      low_ub: 15000
     invalid_tool_call_patterns:
     - <tool_call>
     - </tool_call>
@@ -189,7 +180,7 @@ env:
           run_with_mixed_prompts: true
           dataset_path: ${data.train.data_path}
           apptainer_memory_limit_mb: 65536
-          container_formatter: ${oc.decode:${oc.env:SIF_FORMATTERS,'["/path/to/swe/{instance_id}.sif"]'}}
+          container_formatter: []
     swe_agents_val:
       responses_api_agents:
         swe_agents:
@@ -201,24 +192,8 @@ env:
           container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
     use_absolute_ip: true
 logger:
-  log_dir: ${oc.env:RESULTS_DIR,results/nemotron-nano-swe-dynamo}
+  log_dir: results/nemotron-3-nano-swe-dynamo
   wandb_enabled: true
   wandb:
-    project: ${oc.env:WANDB_PROJECT,nemo-rl-dynamo-swe}
-    name: ${oc.env:WANDB_NAME,nemotron-nano-v3.5-swe-dynamo}
-  mlflow:
-    experiment_name: grpo-ultra-e2e
-    run_name: grpo-ultra-e2e
-effort_levels:
-  low_string: '{reasoning effort: efficient}'
-  low_weight: 0.1
-  low_penalty: 1
-  low_ub: 15000
-token_ids:
-  eos: 2
-  think_open: 12
-  think_close: 13
-penalize_duplicated_reasoning: true
-penalize_empty_final_answer: true
-penalize_eos_token: true
-penalize_malformed_think_tag: true
+    project: nemo-rl-dynamo-swe
+    name: nemotron-3-nano-swe-dynamo

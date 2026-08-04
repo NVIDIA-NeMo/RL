@@ -20,15 +20,19 @@ import threading
 from copy import deepcopy
 from typing import Any, Optional
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
+from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
     "generation_token_ids",
     "generation_log_probs",
 )
-
-_PREFIX_BOUNDARY_MARKER = "NEMO_RL_DYNAMO_PREFIX_BOUNDARY_7F3A9C1E"
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -76,6 +80,35 @@ def _request_add_generation_prompt(request_body: dict[str, Any]) -> bool:
     return not bool(request_body.get("continue_final_message", False))
 
 
+def _apply_chat_template(
+    *,
+    tokenizer: Any,
+    request_body: dict[str, Any],
+    messages: list[Any],
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    add_generation_prompt: bool,
+    tokenize: bool,
+) -> Any:
+    tools = request_body.get("tools")
+    if request_body.get("tool_choice") == "none":
+        tools = None
+
+    apply_chat_template = type(tokenizer).apply_chat_template
+    return apply_chat_template(
+        tokenizer,
+        messages,
+        tools=tools,
+        documents=request_body.get("documents"),
+        chat_template=request_body.get("chat_template"),
+        add_generation_prompt=add_generation_prompt,
+        continue_final_message=bool(request_body.get("continue_final_message", False)),
+        tokenize=tokenize,
+        return_tensors=None,
+        return_dict=False,
+        **_chat_template_kwargs(request_body, tokenizer_chat_template_kwargs),
+    )
+
+
 def _render_prompt_token_ids(
     *,
     tokenizer: Any,
@@ -84,23 +117,13 @@ def _render_prompt_token_ids(
     tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
     add_generation_prompt: bool,
 ) -> list[int]:
-    tools = request_body.get("tools")
-    if request_body.get("tool_choice") == "none":
-        tools = None
-
-    apply_chat_template = type(tokenizer).apply_chat_template
-    token_ids = apply_chat_template(
-        tokenizer,
-        messages,
-        tools=tools,
-        documents=request_body.get("documents"),
-        chat_template=request_body.get("chat_template"),
+    token_ids = _apply_chat_template(
+        tokenizer=tokenizer,
+        request_body=request_body,
+        messages=messages,
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
         add_generation_prompt=add_generation_prompt,
-        continue_final_message=bool(request_body.get("continue_final_message", False)),
         tokenize=True,
-        return_tensors=None,
-        return_dict=False,
-        **_chat_template_kwargs(request_body, tokenizer_chat_template_kwargs),
     )
 
     if isinstance(token_ids, list) and (
@@ -113,39 +136,6 @@ def _render_prompt_token_ids(
         "Dynamo token wrapper expected chat template rendering to return one "
         "list of prompt token IDs."
     )
-
-
-def _render_prompt_text(
-    *,
-    tokenizer: Any,
-    request_body: dict[str, Any],
-    messages: list[Any],
-    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
-    add_generation_prompt: bool,
-) -> str:
-    tools = request_body.get("tools")
-    if request_body.get("tool_choice") == "none":
-        tools = None
-
-    apply_chat_template = type(tokenizer).apply_chat_template
-    rendered = apply_chat_template(
-        tokenizer,
-        messages,
-        tools=tools,
-        documents=request_body.get("documents"),
-        chat_template=request_body.get("chat_template"),
-        add_generation_prompt=add_generation_prompt,
-        continue_final_message=bool(request_body.get("continue_final_message", False)),
-        tokenize=False,
-        return_tensors=None,
-        return_dict=False,
-        **_chat_template_kwargs(request_body, tokenizer_chat_template_kwargs),
-    )
-    if not isinstance(rendered, str):
-        raise ValueError(
-            "Dynamo token wrapper expected chat template rendering to return text."
-        )
-    return rendered
 
 
 def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
@@ -210,105 +200,6 @@ def _normalize_tool_arguments_for_template(
             )
 
 
-def _render_suffix_after_tokenized_assistant(
-    *,
-    tokenizer: Any,
-    request_body: dict[str, Any],
-    messages: list[Any],
-    assistant_index: int,
-    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
-    add_generation_prompt: bool,
-) -> list[int]:
-    """Render only the contextual suffix following a prior model response.
-
-    Some templates rewrite earlier assistant reasoning based on later user turns.
-    Rendering only through the last assistant can therefore be longer than the
-    complete prompt and cannot identify the splice point. Keep the complete
-    conversation context, replace that assistant payload with a marker, and use
-    the marker's closing EOS to extract the suffix that follows the response.
-    """
-    marked_messages = deepcopy(messages)
-    if any(_PREFIX_BOUNDARY_MARKER in str(message) for message in marked_messages):
-        raise ValueError("Dynamo prefix boundary marker collided with request data.")
-
-    _normalize_tool_arguments_for_template(
-        marked_messages, before_index=assistant_index
-    )
-
-    marked_assistant = marked_messages[assistant_index]
-    if not isinstance(marked_assistant, dict):
-        raise ValueError("Dynamo token metadata must be attached to a message object.")
-    marked_assistant["content"] = _PREFIX_BOUNDARY_MARKER
-    marked_assistant.pop("reasoning_content", None)
-    marked_assistant.pop("reasoning", None)
-    # The tool payload belongs to the prior model response. Removing it from this
-    # diagnostic render makes the marker immediately precede the assistant EOS;
-    # subsequent tool/environment messages retain the same roles and rendering.
-    marked_assistant.pop("tool_calls", None)
-
-    marked_token_ids = _render_prompt_token_ids(
-        tokenizer=tokenizer,
-        request_body=request_body,
-        messages=marked_messages,
-        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-        add_generation_prompt=add_generation_prompt,
-    )
-    marked_text = _render_prompt_text(
-        tokenizer=tokenizer,
-        request_body=request_body,
-        messages=marked_messages,
-        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-        add_generation_prompt=add_generation_prompt,
-    )
-
-    marker_pos = marked_text.find(_PREFIX_BOUNDARY_MARKER)
-    if marker_pos < 0:
-        raise ValueError(
-            "Dynamo chat template did not preserve the prefix boundary marker."
-        )
-    eos_token = getattr(tokenizer, "eos_token", None)
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if not isinstance(eos_token, str) or eos_token_id is None:
-        raise ValueError("Dynamo token wrapper requires tokenizer EOS text and ID.")
-    suffix_pos = marked_text.find(eos_token, marker_pos + len(_PREFIX_BOUNDARY_MARKER))
-    if suffix_pos < 0:
-        raise ValueError(
-            "Dynamo chat template did not close the tokenized assistant with EOS."
-        )
-
-    suffix_text = marked_text[suffix_pos:]
-    suffix_token_ids = _coerce_token_id_list(
-        tokenizer.encode(suffix_text, add_special_tokens=False),
-        "contextual template suffix token IDs",
-    )
-    if not suffix_token_ids or suffix_token_ids[0] != eos_token_id:
-        raise ValueError("Dynamo contextual template suffix must begin with EOS.")
-    if len(suffix_token_ids) > len(marked_token_ids) or (
-        marked_token_ids[-len(suffix_token_ids) :] != suffix_token_ids
-    ):
-        raise ValueError(
-            "Dynamo contextual template suffix did not match the full prompt tokens."
-        )
-    return suffix_token_ids
-
-
-def _join_model_prefix_and_template_suffix(
-    *,
-    tokenizer: Any,
-    model_prefix_token_ids: list[int],
-    template_suffix_token_ids: list[int],
-) -> list[int]:
-    if not model_prefix_token_ids:
-        return template_suffix_token_ids
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is None:
-        raise ValueError("Dynamo token wrapper requires a tokenizer EOS token ID.")
-    model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids[-1] == eos_token_id:
-        model_cut_end -= 1
-    return model_prefix_token_ids[:model_cut_end] + template_suffix_token_ids
-
-
 def _validate_engine_data(response_body: dict[str, Any]) -> None:
     nvext = response_body.get("nvext")
     engine_data = nvext.get("engine_data") if isinstance(nvext, dict) else None
@@ -350,32 +241,39 @@ def prepare_dynamo_chat_completion_request(
 
     required_prefix_token_ids = _derive_required_prefix_token_ids(messages)
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
-    if required_prefix_token_ids is None:
-        full_prompt_token_ids = _render_prompt_token_ids(
-            tokenizer=tokenizer,
-            request_body=prepared_body,
-            messages=stripped_messages,
-            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-            add_generation_prompt=add_generation_prompt,
-        )
-    else:
+    template_messages = deepcopy(stripped_messages)
+    assistant_index: int | None = None
+    if required_prefix_token_ids is not None:
         assistant_index = _latest_tokenized_assistant_index(messages)
         if assistant_index is None:
             raise ValueError(
                 "Dynamo prefix token metadata must be attached to an assistant message."
             )
-        template_suffix_token_ids = _render_suffix_after_tokenized_assistant(
+        _normalize_tool_arguments_for_template(
+            template_messages, before_index=assistant_index + 1
+        )
+
+    full_prompt_token_ids = _render_prompt_token_ids(
+        tokenizer=tokenizer,
+        request_body=prepared_body,
+        messages=template_messages,
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        add_generation_prompt=add_generation_prompt,
+    )
+    if required_prefix_token_ids is not None:
+        assert assistant_index is not None
+        template_prefix_token_ids = _render_prompt_token_ids(
             tokenizer=tokenizer,
             request_body=prepared_body,
-            messages=stripped_messages,
-            assistant_index=assistant_index,
+            messages=template_messages[: assistant_index + 1],
             tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-            add_generation_prompt=add_generation_prompt,
+            add_generation_prompt=False,
         )
-        full_prompt_token_ids = _join_model_prefix_and_template_suffix(
-            tokenizer=tokenizer,
+        full_prompt_token_ids = replace_prefix_tokens(
+            tokenizer,
             model_prefix_token_ids=required_prefix_token_ids,
-            template_suffix_token_ids=template_suffix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=full_prompt_token_ids,
         )
 
     nvext = prepared_body.get("nvext")
@@ -384,7 +282,10 @@ def prepare_dynamo_chat_completion_request(
     if not isinstance(nvext, dict):
         raise ValueError("nvext must be a JSON object.")
     nvext = dict(nvext)
-    nvext["extra_fields"] = ["engine_data"]
+    extra_fields = nvext.get("extra_fields", [])
+    if not isinstance(extra_fields, list):
+        raise ValueError("nvext.extra_fields must be a JSON list.")
+    nvext["extra_fields"] = list(dict.fromkeys([*extra_fields, "engine_data"]))
     nvext["token_data"] = full_prompt_token_ids
     prepared_body["nvext"] = nvext
 
@@ -462,7 +363,10 @@ class DynamoTokenWrapperServer:
             return JSONResponse(content=response_body, status_code=status_code)
 
         node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        free_port = _get_free_port_local(
+            DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
+            DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+        )
         self.base_url = f"http://{node_ip}:{free_port}/v1"
 
         config = uvicorn.Config(

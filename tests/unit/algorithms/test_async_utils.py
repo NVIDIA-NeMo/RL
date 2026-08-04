@@ -1373,7 +1373,7 @@ class TestAsyncTrajectoryCollector:
             "backend": "dynamo",
             "dynamo_cfg": {},
         }
-        collector.master_config.grpo["async_grpo"]["in_flight_weight_updates"] = True
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
         collector.wait_for_pending_generations = mock.MagicMock()
 
         collector.prepare_for_refit()

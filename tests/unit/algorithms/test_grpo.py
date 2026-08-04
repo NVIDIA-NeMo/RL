@@ -429,9 +429,9 @@ def _mock_seq_logprob_error_result() -> dict[str, object]:
 
 
 def _logged_train_metrics_with_key(logger, key: str):
-    for call_info in logger.log_metrics.call_args_list:
-        metrics = call_info.args[0]
-        if call_info.kwargs.get("prefix") == "train" and key in metrics:
+    for call in logger.log_metrics.call_args_list:
+        metrics = call.args[0]
+        if call.kwargs.get("prefix") == "train" and key in metrics:
             return metrics
     raise AssertionError(f"No train metrics payload contained {key}")
 
@@ -1190,54 +1190,6 @@ def test_should_use_async_rollouts_selects_backend_specific_config(
     assert _should_use_async_rollouts(master_config) is expected
 
 
-def test_refit_policy_generation_dynamo_matches_vllm_packed_protocol(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = {}
-
-    class DummyPolicy:
-        def broadcast_weights_for_collective(
-            self, kv_scales=None, *, buffer_size_bytes=None, num_buffers=None
-        ):
-            calls["broadcast"] = {
-                "kv_scales": kv_scales,
-                "buffer_size_bytes": buffer_size_bytes,
-                "num_buffers": num_buffers,
-            }
-            return ["train"]
-
-    class DummyDynamoGeneration:
-        def update_weights_from_collective(self):
-            calls["receive"] = True
-            return ["inference"]
-
-    def fake_ray_get(refs):
-        if refs == ["inference"]:
-            return [True]
-        return refs
-
-    kv_scales = {
-        "model.layers.0.self_attn.k_scale": 1.25,
-        "model.layers.0.self_attn.v_scale": 1.5,
-    }
-    monkeypatch.setattr(grpo_mod, "DynamoGeneration", DummyDynamoGeneration)
-    monkeypatch.setattr(grpo_mod.ray, "get", fake_ray_get)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummyDynamoGeneration(),
-        colocated_inference=False,
-        kv_scales=kv_scales,
-    )
-
-    assert calls["broadcast"] == {
-        "kv_scales": kv_scales,
-        "buffer_size_bytes": grpo_mod.VLLM_PACKED_BUFFER_SIZE_BYTES,
-        "num_buffers": grpo_mod.VLLM_PACKED_NUM_BUFFERS,
-    }
-    assert calls["receive"] is True
-
-
 @contextmanager
 def _patched_logprob_phase(policy):
     """Provide real tensors for the logprob phase of ``grpo_train``.
@@ -1899,17 +1851,62 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     from nemo_rl.algorithms.grpo import setup
 
     master_config = mock_grpo_components["master_config"]
-    master_config.policy["generation"]["backend"] = "dynamo"
-    master_config.policy["generation"]["colocated"] = {
-        "enabled": True,
-        "resources": {"gpus_per_node": None, "num_nodes": None},
+    master_config.policy["generation"] = {
+        "backend": "dynamo",
+        "dynamo_cfg": {
+            "engine": "vllm",
+            "startup_timeout_s": 60,
+            "request_timeout_s": 60,
+            "metrics_include_prefixes": None,
+            "metrics_exclude_prefixes": None,
+            "worker_args": {
+                "tool_call_parser": None,
+                "reasoning_parser": None,
+                "exclude_tools_when_tool_choice_none": True,
+                "enable_structural_tag": False,
+                "structural_tag_scope": "auto",
+                "structural_tag_schema": "auto",
+                "custom_jinja_template": None,
+                "endpoint_types": ["chat", "completions"],
+                "extra_cli_args": [],
+            },
+            "frontend_args": {
+                "tokenizer": "default",
+                "tokenizer_cache": False,
+                "tokenizer_cache_bytes": 1024,
+                "router_mode": "kv",
+                "router_reset_states": True,
+                "extra_cli_args": [],
+            },
+        },
+        "vllm_cfg": {
+            "async_engine": True,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "expert_parallel_size": 1,
+            "gpu_memory_utilization": 0.6,
+            "max_model_len": 512,
+            "kv_cache_dtype": "auto",
+            "load_format": "auto",
+            "precision": "bfloat16",
+            "enforce_eager": True,
+            "expose_http_server": False,
+            "enable_vllm_metrics_logger": True,
+            "vllm_metrics_logger_interval": 1.0,
+            "env_vars": {},
+        },
+        "vllm_kwargs": {},
+        "colocated": {
+            "enabled": True,
+            "resources": {"gpus_per_node": None, "num_nodes": None},
+        },
     }
 
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
         pytest.raises(
-            AssertionError,
-            match="Dynamo generation does not support colocated inference",
+            ValueError,
+            match="must be false",
         ),
     ):
         setup(
@@ -1920,42 +1917,6 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
         )
 
     mock_logger.assert_not_called()
-
-
-def test_ray_managed_dynamo_uses_noncolocated_resource_validation(
-    mock_grpo_components,
-):
-    from nemo_rl.algorithms.grpo import setup
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["generation"]["backend"] = "dynamo"
-    master_config.policy["generation"]["dynamo_cfg"] = {
-        "engine_world_size": 1,
-    }
-    master_config.policy["generation"]["colocated"] = {
-        "enabled": False,
-        "resources": {"gpus_per_node": None, "num_nodes": None},
-    }
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["batch_multiplier"] = 1
-    master_config.cluster["num_nodes"] = 1
-    master_config.cluster["gpus_per_node"] = 8
-    master_config.data["shuffle"] = False
-    master_config.data["num_workers"] = 1
-
-    dataset = MagicMock()
-    dataset.__len__ = MagicMock(return_value=10)
-    with (
-        patch("nemo_rl.algorithms.grpo.Logger"),
-        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
-        pytest.raises(
-            AssertionError,
-            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
-        ),
-    ):
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
-        setup(master_config, MagicMock(), dataset, None)
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
@@ -2181,6 +2142,120 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
+
+
+def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
+    """Guard the TRT-LLM NeMo-Gym startup path in shared GRPO setup."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    class DummyLogger:
+        def log_hyperparams(self, *_args, **_kwargs):
+            pass
+
+        def log_metrics(self, *_args, **_kwargs):
+            pass
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self):
+            return None
+
+        def load_training_info(self, _path):
+            return None
+
+        def get_resume_paths(self, _path):
+            return None, None
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    class DummyCluster:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class DummyPolicy:
+        def print_node_ip_and_gpu_id(self):
+            pass
+
+        def prepare_refit_info(self):
+            return {}
+
+    class DummyTrtllmGeneration:
+        dp_openai_server_base_urls = ["http://trtllm.example/v1"]
+        weight_synchronizer = None
+
+        def finish_generation(self):
+            pass
+
+        def prepare_refit_info(self, _state):
+            pass
+
+    nemo_gym_actor = object()
+    spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
+    monkeypatch.setattr(
+        grpo_mod,
+        "TrtllmGeneration",
+        lambda *_args, **_kwargs: DummyTrtllmGeneration(),
+    )
+    monkeypatch.setattr(grpo_mod, "spinup_nemo_gym_actor", spinup_nemo_gym_actor)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["model_name"] = "test-model"
+    master_config.policy["tokenizer"] = {"use_fastokens": False}
+    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["megatron_cfg"] = {
+        "enabled": False,
+        "pipeline_model_parallel_size": 1,
+    }
+    master_config.policy["generation"] = {
+        "backend": "trtllm",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "colocated": {
+            "enabled": True,
+            "resources": {"gpus_per_node": None, "num_nodes": None},
+        },
+        "trtllm_cfg": {
+            "tensor_parallel_size": 1,
+            "async_engine": True,
+            "expose_http_server": True,
+        },
+    }
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.cluster["gpus_per_node"] = 1
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 0
+
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+    result = grpo_mod.setup(master_config, MagicMock(), dataset, None)
+
+    assert result[2] is nemo_gym_actor
+    spinup_nemo_gym_actor.assert_called_once_with(
+        env_configs=master_config.env,
+        base_urls=["http://trtllm.example/v1"],
+        model_name="test-model",
+        enable_router_replay=False,
+        routed_experts_dtype="int16",
+        use_fastokens=False,
+    )
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(

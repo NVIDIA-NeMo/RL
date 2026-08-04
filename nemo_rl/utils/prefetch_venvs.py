@@ -30,8 +30,7 @@ def prefetch_venvs(filters=None, negative_filters=None):
                 actors whose FQN contains at least one of the filter strings will
                 be prefetched. If None, all venvs are prefetched.
         negative_filters: List of strings to exclude from prefetching. Actors whose
-                FQN or Python executable command contains any of these strings will
-                be skipped.
+                FQN contains any of these strings will be skipped.
     """
     print("Prefetching virtual environments...")
     if filters:
@@ -49,17 +48,12 @@ def prefetch_venvs(filters=None, negative_filters=None):
     # Group venvs by py_executable to avoid duplicating work
     venv_configs = {}
     for actor_fqn, py_executable in ACTOR_ENVIRONMENT_REGISTRY.items():
-        filter_targets = (actor_fqn, py_executable)
         # Apply filters if provided
         if filters and not any(f in actor_fqn for f in filters):
             skipped_by_filter.append(actor_fqn)
             continue
         # Apply negative filters if provided
-        if negative_filters and any(
-            filter_string in target
-            for filter_string in negative_filters
-            for target in filter_targets
-        ):
+        if negative_filters and any(f in actor_fqn for f in negative_filters):
             skipped_by_negative_filter.append(actor_fqn)
             continue
         # Skip system python as it doesn't need a venv
@@ -239,8 +233,8 @@ Examples:
     parser.add_argument(
         "--negative-filters",
         nargs="*",
-        help="Filter strings to exclude from prefetching. Actors whose FQN or "
-        "Python executable command contains any of these strings will be skipped.",
+        help="Filter strings to exclude from prefetching. Actors whose FQN "
+        "contains any of these strings will be skipped.",
     )
     args = parser.parse_args()
 

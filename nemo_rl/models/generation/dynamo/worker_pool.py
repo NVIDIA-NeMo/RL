@@ -21,21 +21,34 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
+    RayVirtualCluster,
+)
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
 )
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 _WORKER_FQN = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
 
 
-def _system_port_for_group(base: int, group_index: int) -> int:
-    port = base + group_index
-    if port > 65535:
-        raise ValueError(f"Computed DYN_SYSTEM_PORT {port} exceeds 65535.")
+def _system_port_for_node_slot(node_slot: int) -> int:
+    port = DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW + node_slot
+    if port >= DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH:
+        raise ValueError(
+            "Managed Dynamo has more node-local engine groups than its "
+            f"system-port band supports: slot={node_slot}"
+        )
     return port
+
+
+def _vllm_port_for_node_slot(node_slot: int) -> int:
+    """Return vLLM's deterministic node-local rendezvous port."""
+    return DEFAULT_VLLM_PORT_RANGE_LOW + node_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
 
 
 class FixedDynamoWorkerPool:
@@ -48,7 +61,6 @@ class FixedDynamoWorkerPool:
         config: dict[str, Any],
         namespace: str,
         engine_world_size: int,
-        system_port_base: int,
         manager_env: dict[str, str],
         startup_timeout_s: float,
     ) -> None:
@@ -56,7 +68,6 @@ class FixedDynamoWorkerPool:
         self._config = config
         self._namespace = namespace
         self._engine_world_size = engine_world_size
-        self._system_port_base = system_port_base
         self._manager_env = manager_env
         self._startup_timeout_s = startup_timeout_s
         self._workers: list[ray.actor.ActorHandle] = []
@@ -74,22 +85,13 @@ class FixedDynamoWorkerPool:
             raise RuntimeError("Managed Dynamo worker pool is already started.")
         placement_groups = self._cluster.get_placement_groups()
         python_env = get_actor_python_env(_WORKER_FQN)
-        if python_env.startswith("uv"):
-            python_env = create_local_venv_on_each_node(
-                py_executable=python_env,
-                venv_name=_WORKER_FQN,
-            )
-        actor_venv = os.path.dirname(os.path.dirname(python_env))
         runtime_env: dict[str, Any] = {
             "py_executable": python_env,
-            "env_vars": {
-                **os.environ,
-                "VIRTUAL_ENV": actor_venv,
-                "UV_PROJECT_ENVIRONMENT": actor_venv,
-            },
+            "env_vars": dict(os.environ),
         }
 
         group_index = 0
+        engine_slots_by_node: dict[str, int] = {}
         for pg_index, placement_group in enumerate(placement_groups):
             bundle_count = placement_group.bundle_count
             if bundle_count % self._engine_world_size != 0:
@@ -115,7 +117,6 @@ class FixedDynamoWorkerPool:
                         ).remote()
                     )
                 self._reservations.extend(reservation_handles)
-                self._cleanup_reservations.append(reservation_handles[0])
                 reservation_metadata = ray.get(
                     [handle.metadata.remote() for handle in reservation_handles]
                 )
@@ -127,12 +128,11 @@ class FixedDynamoWorkerPool:
                         "Multi-node TP/PP is not supported in the fixed-fleet milestone."
                     )
                 cuda_devices = [item["gpu_id"] for item in reservation_metadata]
-                # A node may host several one-bundle placement groups. Use the
-                # global engine index rather than the per-placement-group bundle
-                # offset so TP1 workers never collide on DYN_SYSTEM_PORT.
-                system_port = _system_port_for_group(
-                    self._system_port_base, group_index
-                )
+                node_ip = next(iter(node_ips))
+                node_slot = engine_slots_by_node.get(node_ip, 0)
+                engine_slots_by_node[node_ip] = node_slot + 1
+                system_port = _system_port_for_node_slot(node_slot)
+                vllm_port = _vllm_port_for_node_slot(node_slot)
                 group_name = f"{self._namespace}-dynamo-vllm-{pg_index}-{group_index}"
                 leader_strategy = PlacementGroupSchedulingStrategy(
                     placement_group=placement_group,
@@ -156,14 +156,17 @@ class FixedDynamoWorkerPool:
                     group_name=group_name,
                     cuda_devices=cuda_devices,
                     system_port=system_port,
+                    vllm_port=vllm_port,
                     manager_env=self._manager_env,
                     startup_timeout_s=self._startup_timeout_s,
                     seed=pg_index * 1024 + group_index,
                 )
                 self._workers.append(worker)
+                self._cleanup_reservations.append(reservation_handles[0])
+                self._metadata.append({})
+                metadata = ray.get(worker.metadata.remote())
+                self._metadata[-1] = metadata
                 group_index += 1
-
-        self._metadata = ray.get([worker.metadata.remote() for worker in self._workers])
 
     def refit_workers(self) -> list[dict[str, Any]]:
         return [dict(item) for item in self._metadata]
@@ -206,7 +209,7 @@ class FixedDynamoWorkerPool:
             cleanup_refs = [
                 reservation.cleanup_process_group.remote(metadata["process_pid"])
                 for reservation, metadata in zip(
-                    self._cleanup_reservations, self._metadata, strict=False
+                    self._cleanup_reservations, self._metadata, strict=True
                 )
                 if "process_pid" in metadata
             ]

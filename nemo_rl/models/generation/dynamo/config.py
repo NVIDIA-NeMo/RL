@@ -12,75 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+"""Validated configuration for the managed Dynamo generation backend."""
 
-from pydantic import BaseModel, PositiveInt, model_validator
+import warnings
+from typing import Annotated, Any, Literal
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 
+DYNAMO_VLLM_FLAGS: dict[str, str] = {
+    "tensor_parallel_size": "--tensor-parallel-size",
+    "pipeline_parallel_size": "--pipeline-parallel-size",
+    "gpu_memory_utilization": "--gpu-memory-utilization",
+    "max_model_len": "--max-model-len",
+    "kv_cache_dtype": "--kv-cache-dtype",
+    "load_format": "--load-format",
+    "precision": "--dtype",
+    "enforce_eager": "--enforce-eager",
+}
 
-class DynamoWorkerArgsConfig(TypedDict):
-    """Structured arguments passed to each managed ``dynamo.vllm`` worker."""
+_VLLM_CFG_STRUCTURAL = {
+    "env_vars",
+    "expert_parallel_size",
+}
 
-    tool_call_parser: str | None
-    reasoning_parser: str | None
-    exclude_tools_when_tool_choice_none: bool
-    enable_structural_tag: bool
-    structural_tag_scope: Literal["auto", "always"]
-    structural_tag_schema: Literal["auto", "strict"]
-    custom_jinja_template: str | None
-    endpoint_types: list[Literal["chat", "completions"]]
-    extra_cli_args: list[str]
+_VLLM_CFG_MOVED = {
+    "http_server_serving_chat_kwargs": (
+        "dynamo_cfg.worker_args.custom_jinja_template and tool_call_parser"
+    ),
+    "reasoning_parser_plugin": "dynamo_cfg.worker_args.reasoning_parser",
+    "tool_parser_plugin": "dynamo_cfg.worker_args.tool_call_parser",
+}
 
+_VLLM_CFG_UNSUPPORTED = {
+    "is_mx",
+    "num_first_layers_in_bf16",
+    "num_last_layers_in_bf16",
+    "skip_tokenizer_init",
+    "use_deep_gemm",
+}
 
-class DynamoFrontendArgsConfig(TypedDict):
-    """Structured arguments passed to the managed Dynamo frontend."""
-
-    tokenizer: Literal["default", "fastokens"]
-    tokenizer_cache: bool
-    tokenizer_cache_bytes: int
-    router_mode: Literal[
-        "round-robin",
-        "random",
-        "power-of-two",
-        "kv",
-        "direct",
-        "least-loaded",
-        "device-aware-weighted",
-    ]
-    router_reset_states: bool
-    extra_cli_args: list[str]
-
-
-class DynamoRuntimeConfig(TypedDict):
-    """Configuration for the driver-owned Dynamo service and worker fleet."""
-
-    engine_world_size: int
-    namespace: str | None
-    frontend_port: int
-    dynamo_python: str
-    startup_timeout_s: float
-    request_timeout_s: float | None
-    etcd_port: int
-    etcd_peer_port: int
-    nats_port: int
-    system_port_base: int
-    worker_args: DynamoWorkerArgsConfig
-    frontend_args: DynamoFrontendArgsConfig
-    metrics_include_prefixes: list[str] | None
-    metrics_exclude_prefixes: list[str] | None
-
-
-class DynamoConfig(GenerationConfig):
-    """Generation configuration for a Ray-managed Dynamo vLLM fleet."""
-
-    dynamo_cfg: DynamoRuntimeConfig
-    vllm_cfg: NotRequired[dict[str, Any]]
-    vllm_kwargs: NotRequired[dict[str, Any]]
+_VLLM_CFG_INAPPLICABLE = {
+    "async_engine",
+    "enable_return_routed_experts",
+    "enable_vllm_metrics_logger",
+    "expose_http_server",
+    "http_refit_api_key_env_var",
+    "http_refit_server_port",
+    "use_tqdm",
+    "vllm_metrics_logger_interval",
+    "zmq_refit_server_port",
+}
 
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
-    """Validated managed ``dynamo.vllm`` arguments."""
+    """Structured arguments passed to every managed ``dynamo.vllm`` worker."""
 
     tool_call_parser: str | None
     reasoning_parser: str | None
@@ -95,14 +86,14 @@ class DynamoWorkerArgs(BaseModel, extra="forbid"):
     @model_validator(mode="after")
     def _validate_endpoint_types(self) -> "DynamoWorkerArgs":
         if not self.endpoint_types:
-            raise ValueError("endpoint_types must contain at least one endpoint.")
+            raise ValueError("endpoint_types must contain at least one endpoint")
         if len(self.endpoint_types) != len(set(self.endpoint_types)):
-            raise ValueError("endpoint_types must not contain duplicates.")
+            raise ValueError("endpoint_types must not contain duplicates")
         return self
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
-    """Validated arguments for the managed Dynamo frontend."""
+    """Structured arguments passed to the managed Dynamo frontend."""
 
     tokenizer: Literal["default", "fastokens"]
     tokenizer_cache: bool
@@ -121,40 +112,169 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
-    """Validated driver-owned Dynamo runtime configuration.
+    """Driver-owned Dynamo service and worker-fleet configuration."""
 
-    Defaults intentionally live in exemplar YAML rather than this model.
-    """
-
-    engine_world_size: PositiveInt
-    namespace: str | None
-    frontend_port: int
-    dynamo_python: str
-    startup_timeout_s: float
-    request_timeout_s: float | None
-    etcd_port: int
-    etcd_peer_port: int
-    nats_port: int
-    system_port_base: int
+    engine: Literal["vllm"]
+    startup_timeout_s: PositiveFloat
+    request_timeout_s: PositiveFloat
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None
     metrics_exclude_prefixes: list[str] | None
 
+
+class DynamoVllmConfig(BaseModel, extra="allow"):
+    """Known vLLM settings consumed by ``dynamo.vllm``.
+
+    Additional fields remain visible in ``model_extra`` so argument construction
+    can warn rather than silently dropping an inherited vLLM setting.
+    """
+
+    async_engine: bool
+    tensor_parallel_size: PositiveInt
+    pipeline_parallel_size: PositiveInt
+    expert_parallel_size: PositiveInt
+    gpu_memory_utilization: float
+    max_model_len: PositiveInt
+    kv_cache_dtype: str
+    load_format: str
+    precision: str
+    enforce_eager: bool
+    expose_http_server: bool
+    enable_vllm_metrics_logger: bool
+    vllm_metrics_logger_interval: PositiveFloat
+    env_vars: dict[str, str] | None
+
     @model_validator(mode="after")
-    def _validate_runtime(self) -> "DynamoCfg":
-        if self.startup_timeout_s <= 0:
-            raise ValueError("startup_timeout_s must be positive.")
-        for field_name in ("frontend_port", "etcd_port", "etcd_peer_port", "nats_port"):
-            value = getattr(self, field_name)
-            if not (0 <= value <= 65535):
+    def _validate_parallelism_and_precision(self) -> "DynamoVllmConfig":
+        if self.expert_parallel_size not in (1, self.tensor_parallel_size):
+            raise ValueError(
+                "backend='dynamo' requires expert_parallel_size to be 1 or "
+                "equal tensor_parallel_size"
+            )
+        if self.precision is not None and self.precision.lower() not in {
+            "bf16",
+            "bfloat16",
+        }:
+            raise ValueError(
+                f"policy.generation.vllm_cfg.precision={self.precision!r} is not "
+                "supported by backend='dynamo'; managed weight refit currently "
+                "supports BF16 generation only"
+            )
+        if self.kv_cache_dtype not in (None, "auto"):
+            raise ValueError(
+                f"policy.generation.vllm_cfg.kv_cache_dtype={self.kv_cache_dtype!r} "
+                "is not supported by backend='dynamo'; use 'auto'"
+            )
+        extra = self.model_extra or {}
+        if extra.get("is_mx"):
+            raise ValueError(
+                "policy.generation.vllm_cfg.is_mx is not supported by "
+                "backend='dynamo'; use backend='vllm' for MXFP8 generation"
+            )
+        if (
+            int(extra.get("num_first_layers_in_bf16") or 0) != 0
+            or int(extra.get("num_last_layers_in_bf16") or 0) != 0
+        ):
+            raise ValueError(
+                "mixed BF16/FP8 generation is not supported by backend='dynamo'; "
+                "use backend='vllm'"
+            )
+
+        configured_fields = self.model_fields_set | set(extra)
+        for key, replacement in _VLLM_CFG_MOVED.items():
+            if extra.get(key) is not None:
                 raise ValueError(
-                    f"{field_name} must be 0 (automatic) or between 1 and 65535."
+                    f"policy.generation.vllm_cfg.{key} is not read by the "
+                    f"Dynamo backend; set {replacement} instead"
                 )
-        if not (1 <= self.system_port_base <= 65535):
-            raise ValueError("system_port_base must be between 1 and 65535.")
-        if not self.dynamo_python:
-            raise ValueError("dynamo_python must not be empty.")
-        if self.request_timeout_s is not None and self.request_timeout_s <= 0:
-            raise ValueError("request_timeout_s must be positive when configured.")
+        for key in sorted(_VLLM_CFG_UNSUPPORTED & configured_fields):
+            warnings.warn(
+                f"policy.generation.vllm_cfg.{key} is ignored by backend='dynamo'",
+                stacklevel=2,
+            )
+        classified = (
+            set(DYNAMO_VLLM_FLAGS)
+            | _VLLM_CFG_STRUCTURAL
+            | set(_VLLM_CFG_MOVED)
+            | _VLLM_CFG_UNSUPPORTED
+            | _VLLM_CFG_INAPPLICABLE
+        )
+        unclassified = {
+            key for key in configured_fields if getattr(self, key, None) is not None
+        } - classified
+        if unclassified:
+            warnings.warn(
+                "vllm_cfg keys ignored by backend='dynamo': "
+                f"{sorted(unclassified)}. Add them to DYNAMO_VLLM_FLAGS or an "
+                "explicit not-forwarded classification.",
+                stacklevel=2,
+            )
+        return self
+
+
+def _require_nonempty_vllm_config(value: Any) -> Any:
+    if not isinstance(value, dict) or not value:
+        raise ValueError(
+            "policy.generation.vllm_cfg must be a nonempty mapping when "
+            "backend='dynamo'"
+        )
+    return value
+
+
+class DynamoConfig(BaseModel, extra="allow"):
+    """Validated boundary for ``policy.generation.backend=dynamo``."""
+
+    backend: Literal["dynamo"]
+    dynamo_cfg: DynamoCfg
+    vllm_cfg: Annotated[
+        DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
+    ]
+    vllm_kwargs: dict[str, Any]
+
+    @property
+    def engine_world_size(self) -> int:
+        """Return the derived ranks in each single-node vLLM engine."""
+        return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
+
+    @model_validator(mode="after")
+    def _validate_backend_boundary(self) -> "DynamoConfig":
+        extra = self.model_extra or {}
+        for backend_cfg in ("sglang_cfg", "trtllm_cfg"):
+            if extra.get(backend_cfg):
+                raise ValueError(
+                    f"policy.generation.{backend_cfg} is not valid when "
+                    "backend='dynamo'; Dynamo manages vLLM only"
+                )
+        colocated = extra.get("colocated")
+        if isinstance(colocated, dict) and colocated.get("enabled"):
+            raise ValueError(
+                "policy.generation.colocated.enabled must be false when "
+                "backend='dynamo'"
+            )
+        if extra.get("refit_transport") is not None:
+            raise ValueError(
+                "policy.generation.refit_transport must be null when "
+                "backend='dynamo'; managed Dynamo supports NCCL collective refit only"
+            )
+        for quantization_field in ("quant_cfg", "real_quant"):
+            if extra.get(quantization_field):
+                raise ValueError(
+                    f"policy.generation.{quantization_field} is not supported "
+                    "when backend='dynamo'"
+                )
+        speculative_config = self.vllm_kwargs.get("speculative_config") or (
+            self.vllm_cfg.model_extra or {}
+        ).get("speculative_config")
+        if speculative_config:
+            raise ValueError(
+                "policy.generation.vllm_kwargs.speculative_config is not "
+                "supported by backend='dynamo' because draft weights are not "
+                "refit after step 0"
+            )
+        if self.vllm_kwargs.get("quantization") is not None:
+            raise ValueError(
+                "policy.generation.vllm_kwargs.quantization is not supported "
+                "when backend='dynamo'"
+            )
         return self

@@ -15,83 +15,96 @@
 
 set -euo pipefail
 
-: "${TARGETARCH:?Docker must provide TARGETARCH}"
-: "${DYNAMO_PYTHON_VERSION:?DYNAMO_PYTHON_VERSION is required}"
-: "${ETCD_VERSION:?ETCD_VERSION is required}"
-: "${NATS_VERSION:?NATS_VERSION is required}"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+project_dir=${NEMO_RL_DYNAMO_PROJECT_DIR:-${script_dir}}
+repo_root=$(realpath "${script_dir}/../..")
+dynamo_venv_dir=${NEMO_RL_DYNAMO_VENV_DIR:-${repo_root}/venvs/dynamo}
+dynamo_python_version=${DYNAMO_PYTHON_VERSION:-3.12.11}
+etcd_version=${ETCD_VERSION:-v3.5.21}
+nats_version=${NATS_VERSION:-v2.11.6}
 
-case "${TARGETARCH}" in
-  amd64)
-    etcd_arch=amd64
-    nats_arch=amd64
-    ;;
-  arm64)
-    etcd_arch=arm64
-    nats_arch=arm64
-    ;;
+target_arch=${TARGETARCH:-}
+if [[ -z "${target_arch}" ]]; then
+  case "$(uname -m)" in
+    x86_64) target_arch=amd64 ;;
+    aarch64) target_arch=arm64 ;;
+    *)
+      echo "Unsupported host architecture: $(uname -m)" >&2
+      exit 2
+      ;;
+  esac
+fi
+case "${target_arch}" in
+  amd64|arm64) ;;
   *)
-    echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2
+    echo "Unsupported TARGETARCH: ${target_arch}" >&2
     exit 2
     ;;
 esac
 
-export UV_PYTHON_INSTALL_DIR=/opt/uv-python
-uv python install "${DYNAMO_PYTHON_VERSION}"
-uv venv --python "${DYNAMO_PYTHON_VERSION}" /opt/dynamo_venv
-UV_PROJECT_ENVIRONMENT=/opt/dynamo_venv uv sync \
-  --directory /opt/dynamo_project \
+uv python install "${dynamo_python_version}"
+uv venv --python "${dynamo_python_version}" "${dynamo_venv_dir}"
+UV_PROJECT_ENVIRONMENT="${dynamo_venv_dir}" uv sync \
+  --directory "${project_dir}" \
   --locked \
   --no-dev \
   --no-install-project \
   --link-mode copy
 
-vllm_version=$(
-  /opt/dynamo_venv/bin/python -c \
-    'from importlib.metadata import version; print(version("vllm"))'
-)
+dynamo_python=${dynamo_venv_dir}/bin/python
+vllm_version=$("${dynamo_python}" -c \
+  'from importlib.metadata import version; print(version("vllm"))')
 if [[ "${vllm_version}" != "0.23.0" ]]; then
   echo "Expected vllm==0.23.0 from ai-dynamo[vllm]==1.3.0.post1; got ${vllm_version}" >&2
   exit 1
 fi
 
-vllm_root=$(
-  /opt/dynamo_venv/bin/python -c \
-    'from pathlib import Path; import vllm; print(Path(vllm.__file__).resolve().parent.parent)'
-)
-patch_file=/opt/dynamo_patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
+vllm_root=$("${dynamo_python}" -c \
+  'from pathlib import Path; import vllm; print(Path(vllm.__file__).resolve().parent.parent)')
+patch_file=${project_dir}/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
 
 # Dynamo 1.3.0 pins vLLM 0.23.0, which predates vLLM PR #44814.
 # Without that fix, composed weight loaders can make layerwise reload finalize
 # a layer early, leaving trailing NemotronH/Mamba2 parameters such as mixer.D
 # unloaded and corrupting logits after a weight refit.
 # Remove this backport only after Dynamo pins a vLLM release containing #44814.
-git -C "${vllm_root}" apply --check "${patch_file}"
-git -C "${vllm_root}" apply "${patch_file}"
+if git -C "${vllm_root}" apply --check "${patch_file}"; then
+  git -C "${vllm_root}" apply "${patch_file}"
+elif [[ -f "${dynamo_venv_dir}/VLLM_BACKPORTS" ]] \
+  && git -C "${vllm_root}" apply --reverse --check "${patch_file}"; then
+  echo "vLLM PR #44814 backport is already applied"
+else
+  echo "vLLM PR #44814 backport does not apply cleanly to vLLM ${vllm_version}" >&2
+  exit 1
+fi
 printf '%s\n' \
   'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \
-  > /opt/dynamo_venv/VLLM_BACKPORTS
+  > "${dynamo_venv_dir}/VLLM_BACKPORTS"
+
+download_dir=$(mktemp -d "${TMPDIR:-/tmp}/nemorl-dynamo-install.XXXXXX")
+trap 'rm -rf "${download_dir}"' EXIT
 
 curl --fail --location --retry 3 \
-  "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-${etcd_arch}.tar.gz" \
-  --output /tmp/etcd.tgz
-tar -xzf /tmp/etcd.tgz -C /tmp
+  "https://github.com/etcd-io/etcd/releases/download/${etcd_version}/etcd-${etcd_version}-linux-${target_arch}.tar.gz" \
+  --output "${download_dir}/etcd.tgz"
+tar -xzf "${download_dir}/etcd.tgz" -C "${download_dir}"
 install -m 0755 \
-  "/tmp/etcd-${ETCD_VERSION}-linux-${etcd_arch}/etcd" \
-  /usr/local/bin/etcd
+  "${download_dir}/etcd-${etcd_version}-linux-${target_arch}/etcd" \
+  "${dynamo_venv_dir}/bin/etcd"
 
 curl --fail --location --retry 3 \
-  "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-${nats_arch}.tar.gz" \
-  --output /tmp/nats.tgz
-tar -xzf /tmp/nats.tgz -C /tmp
+  "https://github.com/nats-io/nats-server/releases/download/${nats_version}/nats-server-${nats_version}-linux-${target_arch}.tar.gz" \
+  --output "${download_dir}/nats.tgz"
+tar -xzf "${download_dir}/nats.tgz" -C "${download_dir}"
 install -m 0755 \
-  "/tmp/nats-server-${NATS_VERSION}-linux-${nats_arch}/nats-server" \
-  /usr/local/bin/nats-server
+  "${download_dir}/nats-server-${nats_version}-linux-${target_arch}/nats-server" \
+  "${dynamo_venv_dir}/bin/nats-server"
 
-rm -rf \
-  /opt/dynamo_project \
-  /opt/dynamo_install.sh \
-  /opt/dynamo_patches \
-  /tmp/etcd.tgz \
-  "/tmp/etcd-${ETCD_VERSION}-linux-${etcd_arch}" \
-  /tmp/nats.tgz \
-  "/tmp/nats-server-${NATS_VERSION}-linux-${nats_arch}"
+"${dynamo_python}" -c \
+  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"'
+test -s "${dynamo_venv_dir}/VLLM_BACKPORTS"
+grep -Fqx \
+  'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \
+  "${dynamo_venv_dir}/VLLM_BACKPORTS"
+"${dynamo_venv_dir}/bin/etcd" --version
+"${dynamo_venv_dir}/bin/nats-server" --version

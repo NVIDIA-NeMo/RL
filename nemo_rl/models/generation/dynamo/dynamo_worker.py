@@ -32,11 +32,19 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.venv import (
+    get_dynamo_python,
+    get_dynamo_venv_dir,
+)
+from nemo_rl.utils.packed_tensor import (
+    VLLM_PACKED_BUFFER_SIZE_BYTES,
+    VLLM_PACKED_NUM_BUFFERS,
+)
 
 
 @ray.remote(num_cpus=0)
-class DynamoGpuReservation:
+class DynamoGpuReservation:  # pragma: no cover
     """Hold one placement-group GPU while a sibling actor owns the engine."""
 
     def metadata(self) -> dict[str, Any]:
@@ -62,7 +70,7 @@ class DynamoGpuReservation:
 
 
 @ray.remote(num_cpus=0)
-class DynamoVllmWorker:
+class DynamoVllmWorker:  # pragma: no cover
     """Own one ``dynamo.vllm`` subprocess for a model-parallel GPU group."""
 
     def __init__(
@@ -73,6 +81,7 @@ class DynamoVllmWorker:
         group_name: str,
         cuda_devices: list[int],
         system_port: int,
+        vllm_port: int,
         manager_env: dict[str, str],
         startup_timeout_s: float,
         seed: int,
@@ -80,19 +89,26 @@ class DynamoVllmWorker:
         self._group_name = group_name
         self._node_ip = _get_node_ip_local()
         self._system_port = system_port
+        self._vllm_port = vllm_port
         self._process: subprocess.Popen | None = None
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.bind(("0.0.0.0", system_port))
-        except OSError as exc:
-            raise RuntimeError(
-                f"DYN_SYSTEM_PORT {system_port} is unavailable for {group_name}."
-            ) from exc
+        for env_name, port in (
+            ("DYN_SYSTEM_PORT", system_port),
+            ("VLLM_PORT", vllm_port),
+        ):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("0.0.0.0", port))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"{env_name} {port} is unavailable for {group_name}."
+                ) from exc
 
-        dynamo_cfg = DynamoCfg.model_validate(config["dynamo_cfg"])
-        dynamo_venv = str(Path(dynamo_cfg.dynamo_python).resolve().parent.parent)
-        vllm_cfg = dict(config.get("vllm_cfg") or {})
-        vllm_kwargs = dict(config.get("vllm_kwargs") or {})
+        validated_config = DynamoConfig.model_validate(config)
+        dynamo_cfg = validated_config.dynamo_cfg
+        dynamo_python = get_dynamo_python()
+        dynamo_venv = str(get_dynamo_venv_dir())
+        vllm_cfg = validated_config.vllm_cfg.model_dump()
+        vllm_kwargs = dict(validated_config.vllm_kwargs)
         configured_env = dict(vllm_cfg.get("env_vars") or {})
         worker_env = build_managed_worker_env(
             base_env=os.environ,
@@ -102,6 +118,7 @@ class DynamoVllmWorker:
                 "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
                 "DYN_SYSTEM_PORT": str(system_port),
                 "PYTHONHASHSEED": "0",
+                "VLLM_PORT": str(vllm_port),
                 "VLLM_SKIP_P2P_CHECK": "1",
                 "VIRTUAL_ENV": dynamo_venv,
                 "UV_PROJECT_ENVIRONMENT": dynamo_venv,
@@ -115,9 +132,9 @@ class DynamoVllmWorker:
             vllm_kwargs=vllm_kwargs,
             dynamo_cfg=dynamo_cfg,
         )
-        self._validate_argv(dynamo_cfg.dynamo_python, argv, worker_env)
+        self._validate_argv(dynamo_python, argv, worker_env)
 
-        command = [dynamo_cfg.dynamo_python, "-m", "dynamo.vllm", *argv]
+        command = [dynamo_python, "-m", "dynamo.vllm", *argv]
         relevant_env = {
             key: value
             for key, value in worker_env.items()
@@ -149,7 +166,17 @@ class DynamoVllmWorker:
     ) -> None:
         validator = Path(__file__).with_name("validate_dynamo_vllm_args.py")
         result = subprocess.run(
-            [dynamo_python, str(validator), json.dumps(argv)],
+            [
+                dynamo_python,
+                str(validator),
+                json.dumps(argv),
+                json.dumps(
+                    {
+                        "buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
+                        "num_buffers": VLLM_PACKED_NUM_BUFFERS,
+                    }
+                ),
+            ],
             env=env,
             capture_output=True,
             text=True,
@@ -190,6 +217,7 @@ class DynamoVllmWorker:
             "instance_id": self._group_name,
             "system_url": self.system_url,
             "process_pid": process.pid,
+            "vllm_port": self._vllm_port,
         }
 
     def is_alive(self) -> bool:
