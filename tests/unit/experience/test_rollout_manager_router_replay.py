@@ -38,14 +38,8 @@ def _fallback_routes(count: int) -> torch.Tensor:
 
 
 class _FakeTokenizer:
-    def decode(
-        self,
-        token_ids: torch.Tensor,
-        skip_special_tokens: bool,
-        clean_up_tokenization_spaces: bool,
-    ) -> str:
+    def decode(self, token_ids: torch.Tensor, skip_special_tokens: bool) -> str:
         del token_ids, skip_special_tokens
-        assert clean_up_tokenization_spaces is False
         return "generated"
 
     def __call__(self, text: str, **kwargs) -> SimpleNamespace:
