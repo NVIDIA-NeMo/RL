@@ -101,6 +101,22 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     capture_dir: Optional[str] = None
 
 
+class RolloutCheckpointConfig(BaseModel, extra="allow"):
+    """Frequent TQ/ledger snapshots anchored to durable trainer state.
+
+    ``interval_s=None`` disables the periodic writer. When enabled, snapshots
+    before the first optimizer step bind to a lightweight bootstrap manifest;
+    later snapshots bind to a fully finalized ``step_N`` trainer checkpoint.
+    Therefore ``interval_s`` does not replace trainer checkpoint frequency:
+    after step zero, a snapshot is skipped until the matching trainer step has
+    been made durable by a full-checkpoint trigger such as
+    ``checkpointing.save_period``.
+    """
+
+    interval_s: Optional[float] = Field(default=None, gt=0)
+    keep_latest_k: int = Field(default=2, ge=1)
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -113,6 +129,9 @@ class MasterConfig(BaseModel, extra="allow"):
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+    rollout_checkpointing: RolloutCheckpointConfig = Field(
+        default_factory=RolloutCheckpointConfig
+    )
 
 
 def validate_sampler_buffer_capacity(
