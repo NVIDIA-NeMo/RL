@@ -1169,16 +1169,8 @@ class VllmAsyncGenerationWorkerImpl(
         # Yield results as they become available
         try:
             for completed_task in asyncio.as_completed(sample_tasks):
-                try:
-                    result = await completed_task
-                    yield result
-                except Exception as e:
-                    # Cancel remaining tasks
-                    for task in sample_tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*sample_tasks, return_exceptions=True)
-                    raise e
+                result = await completed_task
+                yield result
         finally:
             for task in sample_tasks:
                 if not task.done():
@@ -1276,16 +1268,8 @@ class VllmAsyncGenerationWorkerImpl(
         # Yield results as they become available
         try:
             for completed_task in asyncio.as_completed(prompt_tasks):
-                try:
-                    result = await completed_task
-                    yield result
-                except Exception as e:
-                    # Cancel remaining tasks
-                    for task in prompt_tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*prompt_tasks, return_exceptions=True)
-                    raise e
+                result = await completed_task
+                yield result
         finally:
             for task in prompt_tasks:
                 if not task.done():
