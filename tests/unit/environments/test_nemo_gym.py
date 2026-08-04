@@ -277,11 +277,25 @@ def test_nemo_gym_postprocess_uses_batch_decode():
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
+                    "routed_experts": [
+                        [[10, 11]],
+                        [[20, 21]],
+                        [[0, 1]],
+                    ],
                 },
                 {
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],
+                    "routed_experts": [
+                        [[10, 11]],
+                        [[20, 21]],
+                        [[30, 31]],
+                        [[40, 41]],
+                        [[50, 51]],
+                        [[60, 61]],
+                        [[0, 1]],
+                    ],
                 },
             ]
         },
@@ -305,6 +319,21 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["message_log"][0]["routed_experts"].tolist() == [
+        [[10, 11]],
+        [[20, 21]],
+    ]
+    # Turn 1 ended with the dummy [0, 1] route.  Turn 2 re-processes token 3
+    # in its prompt and must refresh that row to the real [30, 31] route.
+    assert result["message_log"][1]["routed_experts"].tolist() == [[[30, 31]]]
+    assert result["message_log"][2]["routed_experts"].tolist() == [
+        [[40, 41]],
+        [[50, 51]],
+    ]
+    assert result["message_log"][3]["routed_experts"].tolist() == [
+        [[60, 61]],
+        [[0, 1]],
+    ]
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
