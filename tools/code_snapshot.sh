@@ -34,11 +34,14 @@ else
   exit
 fi
 
-echo2 "Copying git-tracked files and submodules..."
-rsync -a --files-from=<(
-  git ls-files --recurse-submodules --cached --full-name
-) ./ $SNAPSHOT_DIR/
-
+if [[ -n "${SKIP_SNAPSHOT_COPY:-}" ]]; then
+  echo2 "CI mode: skipping snapshot copy, tests run from source tree directly"
+else
+  echo2 "Copying git-tracked files and submodules..."
+  rsync -a --files-from=<(
+    git ls-files --recurse-submodules --cached --full-name
+  ) ./ $SNAPSHOT_DIR/
+fi
 
 # Echo the snapshot directory so the caller can use it to `cd` into it
 echo ${SNAPSHOT_DIR}
