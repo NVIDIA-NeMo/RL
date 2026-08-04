@@ -788,7 +788,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
     # multi-turn multimodal postprocessing).
-    if config.policy.get("is_vlm", False):
+    if config.policy.get("is_vlm"):
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
