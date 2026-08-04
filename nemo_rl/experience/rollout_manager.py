@@ -15,7 +15,6 @@
 import asyncio
 import copy
 import json
-import uuid
 from typing import Any, Optional
 
 import torch
@@ -28,6 +27,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.experience.rollouts import _tensorize_by_key, calculate_rewards
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -721,6 +721,7 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
         finalizer: Optional[Any] = None,
+        recovery_ledger: Optional[RolloutRecoveryLedger] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -728,6 +729,10 @@ class RolloutManager:
         if finalizer is not None:
             assert use_nemo_gym, (
                 "token capture (finalizer) is only supported on the NeMo-Gym path"
+            )
+        if recovery_ledger is not None and finalizer is None:
+            raise ValueError(
+                "rollout recovery ledger is only supported with token capture"
             )
 
         if not use_nemo_gym:
@@ -754,10 +759,22 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._finalizer = finalizer
+        self._recovery_ledger = (
+            recovery_ledger
+            if recovery_ledger is not None
+            else RolloutRecoveryLedger()
+            if finalizer is not None
+            else None
+        )
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
         self._weight_version: int = 0
+
+    @property
+    def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
+        """Return the controller-local token-capture recovery ledger."""
+        return self._recovery_ledger
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -827,34 +844,42 @@ class RolloutManager:
     ) -> None:
         """Token-capture dispatch: receipts in, canonical rows via the finalizer.
 
-        Mints the group's rollout ids up front — sample ids and gate-registered
-        rollout ids are the same strings (``{group_id}_g{i}``) — reserves the
-        slot with them so cleanup can name what it owns before a receipt
-        exists, and commits via ``commit_finalized`` with the group's
-        min/max call weight versions.
+        The recovery ledger mints stable canonical sibling IDs plus a distinct
+        physical gate ID for each execution attempt. The buffer records the
+        physical IDs so cleanup can name what it owns before a receipt exists;
+        the finalizer maps those attempts back to stable canonical rows.
         """
+        assert self._recovery_ledger is not None
         start_version = self._weight_version
-        group_id = str(uuid.uuid4())
-        rollout_ids = [
-            f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
-        ]
-        self._tq_buffer.reserve(
-            weight_version=start_version,
+        recovery_group = self._recovery_ledger.reserve_group(
+            prompt_id=str(input_sample["idx"]),
+            prompt_payload=input_sample,
+            expected_generations=self._num_generations_per_prompt,
             target_step=target_step,
-            group_id=group_id,
-            rollout_ids=rollout_ids,
+            start_weight_version=start_version,
         )
+        group_id = recovery_group.group_id
+        logical_rollout_ids = recovery_group.logical_rollout_ids
+        gate_rollout_ids = recovery_group.gate_rollout_ids
         try:
-            record = await self.run_rollout(input_sample, rollout_ids=rollout_ids)
+            self._tq_buffer.reserve(
+                weight_version=start_version,
+                target_step=target_step,
+                group_id=group_id,
+                rollout_ids=gate_rollout_ids,
+            )
+            self._recovery_ledger.mark_group_dispatched(group_id)
+            record = await self.run_rollout(input_sample, rollout_ids=gate_rollout_ids)
             receipts = [c.env_extras.get("ng_receipt") for c in record.completions]
             rewards = [float(c.reward) for c in record.completions]
             finalized = await asyncio.to_thread(
                 self._finalizer.finalize_group,
                 group_id,
-                rollout_ids,
+                gate_rollout_ids,
                 receipts,
                 rewards,
                 fallback_weight_version=start_version,
+                canonical_sample_ids=logical_rollout_ids,
             )
             record.rollout_metrics.update(finalized.metrics)
             if finalized.dropped:
@@ -879,13 +904,20 @@ class RolloutManager:
             )
         except BaseException:
             self._tq_buffer.abort(group_id)
+            self._recovery_ledger.abandon_group(group_id)
             # Best-effort gate cleanup: no receipt will ever seal these ids.
             nemo_gym_env = self._env_handles.get("nemo_gym")
             if nemo_gym_env is not None:
                 try:
                     await nemo_gym_env.fail_rollouts.remote(
-                        rollout_ids, reason="dispatch_failed"
+                        gate_rollout_ids, reason="dispatch_failed"
                     )
                 except Exception as error:  # noqa: BLE001 — TTL is the backstop
                     print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
             raise
+        else:
+            # Completed groups are recovered through canonical TQ rows plus
+            # replay metadata. Retaining their prompt payload here would grow
+            # controller memory without improving recovery.
+            self._recovery_ledger.mark_group_finalized(group_id)
+            self._recovery_ledger.release_finalized_group(group_id)
