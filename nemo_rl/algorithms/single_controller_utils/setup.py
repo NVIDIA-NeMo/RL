@@ -50,7 +50,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import is_fastokens_enabled, set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
@@ -314,7 +314,7 @@ def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any,
         model_name=generation_config["model_name"],
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
-        use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        use_fastokens=is_fastokens_enabled(policy_config["tokenizer"]),
     )
     return actor, time.perf_counter() - t0
 
