@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, patch
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
 
 
 class _SplitStubWorker(TQWorkerMixin):
@@ -127,6 +127,56 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
 
 
 class TestTQPolicySplitFanout:
+    def test_train_aggregation_preserves_one_prefetch_source_per_dp(self):
+        def _result(rank: int, wait_s: float) -> dict:
+            return {
+                "rank": rank,
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [0.1]},
+                "train_microbatch_prefetch_metrics": {
+                    "consumer_wait_s": wait_s,
+                },
+            }
+
+        out = _aggregate_train_results([_result(0, 0.1), _result(16, 0.2)])
+
+        assert out["train_microbatch_prefetch_source_metrics"] == [
+            {"rank": 0, "consumer_wait_s": 0.1},
+            {"rank": 16, "consumer_wait_s": 0.2},
+        ]
+
+    def test_train_from_meta_executes_pp_and_returns_replicated_outputs(self):
+        p, wg = _make_tq_policy()
+        result = {
+            "global_loss": 1.0,
+            "grad_norm": 0.5,
+            "all_mb_metrics": {"loss": [0.1]},
+        }
+        wg.get_all_worker_results.return_value = [result, result]
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ),
+        ):
+            p.train_from_meta(meta, loss_fn=object())
+
+        dispatch = wg.run_all_workers_sharded_data.call_args.kwargs
+        assert dispatch["replicate_on_axes"] == [
+            "context_parallel",
+            "tensor_parallel",
+            "pipeline_parallel",
+        ]
+        assert dispatch["output_is_replicated"] == [
+            "context_parallel",
+            "tensor_parallel",
+            "pipeline_parallel",
+        ]
+
     def test_begin_consumes_single_data_futures_with_ray_get(self):
         """run_all_workers_single_data returns plain ObjectRefs, not a
         MultiWorkerFuture — the fan-out must ray.get them (PR #2683

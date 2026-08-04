@@ -112,6 +112,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        train_prefetch_enabled = bool(
+            (config.get("train_microbatch_prefetch") or {}).get("enabled", False)
+        )
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -121,6 +124,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
+            )
+        if train_prefetch_enabled and not megatron_enable:
+            raise ValueError(
+                "policy.train_microbatch_prefetch.enabled=true requires the "
+                "Megatron policy backend"
             )
         if draft_enabled and bool(
             config.get("sequence_packing", {}).get("enabled", False)

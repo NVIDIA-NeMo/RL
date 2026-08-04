@@ -36,6 +36,7 @@ from dataclasses import replace
 from typing import Any, Optional
 
 import ray
+import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
@@ -44,6 +45,8 @@ from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
+    GLOBAL_VALID_SEQS_PER_GB,
+    GLOBAL_VALID_TOKS_PER_GB,
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
 )
@@ -51,6 +54,48 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
+
+
+def _stamp_train_normalization(
+    meta: KVBatchMeta,
+    *,
+    sample_mask: torch.Tensor,
+    token_mask: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Carry per-global-batch loss denominators in the metadata plan."""
+    sample_count = len(meta.sample_ids)
+    if sample_mask.ndim != 1 or sample_mask.shape[0] != sample_count:
+        raise ValueError(
+            "sample_mask must have shape [num_samples]; got "
+            f"{tuple(sample_mask.shape)} for {sample_count} samples"
+        )
+    if token_mask.ndim != 2 or token_mask.shape[0] != sample_count:
+        raise ValueError(
+            "token_mask must have shape [num_samples, sequence]; got "
+            f"{tuple(token_mask.shape)} for {sample_count} samples"
+        )
+    if batch_size <= 0 or sample_count % batch_size != 0:
+        raise ValueError(
+            f"sample count {sample_count} must be divisible by GBS {batch_size}"
+        )
+
+    valid_seqs: list[float] = []
+    valid_toks: list[float] = []
+    for start in range(0, sample_count, batch_size):
+        end = start + batch_size
+        batch_sample_mask = sample_mask[start:end]
+        valid_seqs.append(float(batch_sample_mask.sum().item()))
+        valid_toks.append(
+            float(
+                (token_mask[start:end, 1:] * batch_sample_mask.unsqueeze(-1))
+                .sum()
+                .item()
+            )
+        )
+    meta.extra_info[GLOBAL_VALID_SEQS_PER_GB] = valid_seqs
+    meta.extra_info[GLOBAL_VALID_TOKS_PER_GB] = valid_toks
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-stage aggregators that assemble per-rank worker results into the
@@ -67,6 +112,16 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    # train_from_meta returns the axis-zero worker for each DP replica, so
+    # these are intentionally source-side metrics rather than all-rank stats.
+    if "train_microbatch_prefetch_metrics" in results[0]:
+        out["train_microbatch_prefetch_source_metrics"] = [
+            {
+                "rank": result["rank"],
+                **result["train_microbatch_prefetch_metrics"],
+            }
+            for result in results
+        ]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -365,15 +420,18 @@ class TQPolicy(Policy):
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
         train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
+        sample_mask: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
         ``meta`` names per-sample keys; columns written by the rollout
         actor + worker logprob deltas + driver-side advantage delta have
         all landed under the same keys at this point. Workers fetch the
-        union via ``train_presharded`` → ``self._fetch(meta)``. No
-        partition drain here — sync 1-hop's trainer calls ``clear_samples``
-        once at end of step.
+        union via ``train_presharded``. The default worker path fetches the
+        complete DP shard; optional microbatch prefetch uses the same known keys
+        and fields one packed microbatch at a time. No partition drain here —
+        sync 1-hop's trainer calls ``clear_samples`` once at end of step.
 
         Args:
             meta: Full-step ``KVBatchMeta`` (consumed by all DP ranks).
@@ -384,6 +442,9 @@ class TQPolicy(Policy):
                 full ``DP_TRAIN_FIELDS`` schema. Caller may narrow it to drop
                 columns it skipped writing (e.g. ``prev_logprobs`` when
                 ``force_on_policy_ratio=True``).
+            sample_mask: Driver-resident sequence mask used to stamp eager loss
+                normalization metadata when microbatch prefetch is enabled.
+            token_mask: Driver-resident token mask used for the same purpose.
 
         Returns:
             Aggregated training-step output dict.
@@ -392,6 +453,19 @@ class TQPolicy(Policy):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
         self._stamp_pad_seqlen(meta)
+        prefetch_cfg = self.cfg.get("train_microbatch_prefetch") or {}
+        if prefetch_cfg.get("enabled"):
+            if sample_mask is None or token_mask is None:
+                raise ValueError(
+                    "train microbatch prefetch requires sample_mask and token_mask "
+                    "to construct loss-normalization metadata"
+                )
+            _stamp_train_normalization(
+                meta,
+                sample_mask=sample_mask,
+                token_mask=token_mask,
+                batch_size=batch_size,
+            )
         spa, dba = self._packing_args("train_mb_tokens")
         # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written

@@ -56,6 +56,7 @@ def _broadcast_batched_data_dict(
     is_leader: bool,
     src: int,
     group: Any,
+    keep_on_broadcast_device: bool = False,
 ) -> BatchedDataDict[Any]:
     """Broadcast a BatchedDataDict from ``src`` to all ranks in ``group``.
 
@@ -63,7 +64,9 @@ def _broadcast_batched_data_dict(
     descriptor (per-key dtype/shape) ships via ``broadcast_object_list``
     first, then each tensor's data ships via ``broadcast`` on its
     current device. The leader supplies ``data``; non-leaders pass
-    ``None`` and get an empty BatchedDataDict filled in-place.
+    ``None`` and get an empty BatchedDataDict filled in-place. By default,
+    receivers restore tensors to the leader's source device; callers may keep
+    them on the broadcast device instead.
     """
     # NCCL groups can only broadcast CUDA tensors; pick the broadcast
     # device from the group backend so CPU TQ outputs are moved to GPU
@@ -110,6 +113,7 @@ def _broadcast_batched_data_dict(
             # so downstream code sees the same layout pre-broadcast.
             if (
                 not is_leader
+                and not keep_on_broadcast_device
                 and torch.device(src_device).type != torch.device(bcast_device).type
             ):
                 out[key] = tensor.to(src_device)
