@@ -103,6 +103,12 @@ class DataPlaneCheckpointBarrier:
         self._condition = asyncio.Condition()
         self._checkpoint_active = False
         self._active_mutations = 0
+        self._mutation_version = 0
+
+    @property
+    def mutation_version(self) -> int:
+        """Monotonic marker used to skip unchanged periodic snapshots."""
+        return self._mutation_version
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[None]:
@@ -115,6 +121,10 @@ class DataPlaneCheckpointBarrier:
         finally:
             async with self._condition:
                 self._active_mutations -= 1
+                # Count completed mutation sections even when their body raised.
+                # A false-positive snapshot is safe; missing a partial mutation
+                # that changed TQ or controller metadata is not.
+                self._mutation_version += 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
 

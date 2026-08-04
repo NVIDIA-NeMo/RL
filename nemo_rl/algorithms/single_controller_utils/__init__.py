@@ -18,6 +18,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -28,6 +29,7 @@ __all__ = [
     "AdvantageConfig",
     "AsyncRLConfig",
     "MasterConfig",
+    "RolloutCheckpointConfig",
     "SingleControllerActorArgs",
     "setup_single_controller",
 ]

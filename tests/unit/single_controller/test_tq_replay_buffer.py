@@ -195,6 +195,20 @@ def _add_group(
 
 
 class TestDataPlaneCheckpointBarrier:
+    def test_mutation_version_advances_after_each_section(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            assert barrier.mutation_version == 0
+            async with barrier.mutation():
+                assert barrier.mutation_version == 0
+            assert barrier.mutation_version == 1
+            with pytest.raises(RuntimeError, match="injected"):
+                async with barrier.mutation():
+                    raise RuntimeError("injected")
+            assert barrier.mutation_version == 2
+
+        asyncio.run(exercise())
+
     def test_mutations_run_concurrently_without_checkpoint(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
