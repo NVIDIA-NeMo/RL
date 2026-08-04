@@ -198,6 +198,7 @@ project-includes = [
   "nemo_rl/models/policy/dllm/__init__.py",
   "nemo_rl/models/policy/dllm/config.py",
   "nemo_rl/models/policy/dllm/elbo.py",
+  "nemo_rl/models/policy/dllm/setup.py",
   "nemo_rl/models/policy/interfaces.py",
   "nemo_rl/models/policy/utils.py",
   "nemo_rl/models/policy/workers/__init__.py",

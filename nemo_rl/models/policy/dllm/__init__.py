@@ -25,11 +25,17 @@ from nemo_rl.models.policy.dllm.elbo import (
     SdmcElboEstimator,
     get_quadrature,
 )
+from nemo_rl.models.policy.dllm.setup import (
+    dllm_config_from_policy,
+    validate_dllm_policy,
+)
 
 __all__ = [
     "DllmConfig",
+    "dllm_config_from_policy",
     "MaskPoint",
     "resolve_mask_id",
     "SdmcElboEstimator",
     "get_quadrature",
+    "validate_dllm_policy",
 ]
