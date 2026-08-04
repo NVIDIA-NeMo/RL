@@ -268,6 +268,15 @@ class SdmcElboEstimator:
         Bernoulli(t) draw per token. This is a stratification that removes the
         binomial spread in the number of masked tokens, and matches the
         reference implementation the published results were produced with.
+
+        Algebraically this is the same batched exact-k selection as Automodel's
+        ``nemo_automodel.components.datasets.dllm.corruption._batched_gumbel_topk``
+        (ranking by noise and taking the top k is invariant to whether the noise
+        is uniform or Gumbel). That helper is deliberately *not* reused: it draws
+        via ``torch.rand_like`` with no ``generator`` parameter, so sharing masks
+        between the old, reference, and current ELBOs would mean seeding global
+        RNG inside a Ray worker -- where it is shared with dropout and other
+        sampling. Threading a generator keeps that determinism local.
         """
         batch, seq_len = completion_mask.shape
         scorable = completion_mask.sum(-1)
