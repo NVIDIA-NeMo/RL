@@ -41,14 +41,14 @@ def test_extract_input_images_returns_empty_for_string_content():
     assert _extract_input_images_from_message({"role": "user"}) == []
 
 
-def test_index_per_turn_images_bins_seed_and_intermediate_images():
-    seed_obs = [_user(_image((2, 2)))]
+def test_index_per_turn_images_bins_images():
     output = [
+        _user(_image((2, 2))),
         _assistant([1, 2]),
         _user(_image((3, 3)), _image((4, 4))),
         _assistant([3, 4]),
     ]
-    per_turn = _index_per_turn_images(seed_obs, output)
+    per_turn = _index_per_turn_images(output)
 
     assert len(per_turn) == 2
     assert [img.size for img in per_turn[0]] == [(2, 2)]
@@ -62,7 +62,7 @@ def test_index_per_turn_images_text_only_rollout_yields_empty_buckets():
         {"role": "user", "content": "and this"},
         _assistant([3, 4]),
     ]
-    assert _index_per_turn_images([], output) == [[], []]
+    assert _index_per_turn_images(output) == [[], []]
 
 
 def test_index_per_turn_images_assigns_tool_result_image_to_next_turn():
@@ -73,7 +73,7 @@ def test_index_per_turn_images_assigns_tool_result_image_to_next_turn():
         {"type": "function_call_output", "output": _image((5, 5))},
         _assistant([3, 4]),
     ]
-    per_turn = _index_per_turn_images([], output)
+    per_turn = _index_per_turn_images(output)
 
     assert len(per_turn) == 2
     assert [img.size for img in per_turn[0]] == [(2, 2)]
@@ -93,7 +93,7 @@ def test_index_per_turn_images_aligns_with_postprocess_skip_of_empty_generations
         _user(_image((6, 6))),
         _assistant([7, 8]),
     ]
-    per_turn = _index_per_turn_images([], output)
+    per_turn = _index_per_turn_images(output)
 
     assert len(per_turn) == 1
     assert [img.size for img in per_turn[0]] == [(2, 2), (6, 6)]

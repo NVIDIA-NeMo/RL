@@ -195,8 +195,18 @@ def _detect_invalid_tool_call_and_malformed_thinking(
 
 
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
-    """Pull PIL images out of a Responses-API user-role item's content list."""
+    """Pull PIL images out of a non-assistant Responses-API item.
+
+    Handles both content-list items (user / tool messages carrying
+    ``input_image``/``image``/``image_url`` parts) and ``function_call_output``
+    items whose ``output`` field is an image data URL.
+    """
     images: list[Image.Image] = []
+    if item.get("type") == "function_call_output":
+        src = item.get("output")
+        if isinstance(src, str):
+            images.append(resolve_to_image(src))
+        return images
     content = item.get("content") or []
     if not isinstance(content, list):
         return images
@@ -217,10 +227,11 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
 
 
 def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
-    """Bin server-returned user images by the assistant turn that saw them.
+    """Bin server-returned images by the assistant turn that saw them.
 
-    Walks the Responses-API items in order, accumulating images from user-role
-    items into a pending list, and flushing them into a per-turn bucket each
+    Walks the Responses-API items in order, accumulating images from every
+    non-assistant item (user turns, tool messages, ``function_call_output``,
+    etc.) into a pending list, and flushing them into a per-turn bucket each
     time a trainable assistant item (one carrying ``generation_token_ids``) is
     reached. The returned list has one entry per trainable assistant turn,
     aligned with the postprocess loop's ``turn_idx``.
@@ -228,7 +239,7 @@ def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
     per_turn: list[list[Image.Image]] = []
     pending: list[Image.Image] = []
     for item in output:
-        if item.get("role") == "user":
+        if item.get("role") != "assistant":
             pending.extend(_extract_input_images_from_message(item))
         elif item.get(
             "generation_token_ids"
