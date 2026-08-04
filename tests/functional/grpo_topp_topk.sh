@@ -30,7 +30,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.temperature=0.8 \
     policy.generation.top_p=0.9 \
     policy.generation.top_k=50 \
-    policy.generation.vllm_cfg.logprobs_mode=processed_logprobs \
+    +policy.generation.vllm_cfg.logprobs_mode=processed_logprobs \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
