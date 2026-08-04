@@ -1599,7 +1599,15 @@ def test_distillation_topk_non_tp_defers_fp32_upcast():
     batch, seq, vocab, k = 1, 8, 512, 4
     logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
     teacher_topk_logits = torch.randn(batch, seq, k)
-    teacher_topk_indices = torch.randint(0, vocab, (batch, seq, k))
+    # distinct per position, as torch.topk returns: with duplicate indices the
+    # gather backward would accumulate into the (now bf16) input rather than an
+    # fp32 copy, which is a different computation
+    teacher_topk_indices = torch.stack(
+        [
+            torch.stack([torch.randperm(vocab)[:k] for _ in range(seq)])
+            for _ in range(batch)
+        ]
+    )
 
     student = logits.clone().requires_grad_(True)
     topk_logprobs, _, h_all = get_distillation_topk_logprobs_from_logits(

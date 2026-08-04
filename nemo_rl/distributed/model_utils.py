@@ -2003,6 +2003,9 @@ def get_distillation_topk_logprobs_from_logits(
 
         # Non-distributed processing
         else:
+            # teacher_topk_indices are distinct per position (torch.topk), so the
+            # gather backward scatters rather than accumulates and this stays
+            # bitwise equal to gathering from an fp32 copy.
             student_topk_logits = student_logits.gather(
                 dim=-1, index=teacher_topk_indices
             ).to(torch.float32)
