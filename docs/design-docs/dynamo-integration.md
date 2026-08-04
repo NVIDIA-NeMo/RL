@@ -1,133 +1,62 @@
-# Managed Dynamo Generation
+# Managed Dynamo generation design
 
-NeMo RL can own a fixed Dynamo vLLM fleet inside the same Ray allocation as
-GRPO training. This integration is intended for Slurm. It does not discover or
-manage external Dynamo or Kubernetes deployments.
+The managed Dynamo backend owns a fixed vLLM fleet inside the Ray allocation.
+It is deliberately narrower than Dynamo itself: there is no external-runtime,
+Kubernetes, DGD, multi-node engine-group, or non-vLLM mode.
 
-## Runtime ownership
+## Ownership and placement
 
-When `policy.generation.backend: dynamo`, the Ray driver starts and owns:
+Constructing `ManagedDynamoRuntime` is inert. Its explicit `start()` method
+allocates ports, launches etcd and NATS JetStream, creates one Ray-managed
+`dynamo.vllm` process per model-parallel group, and starts the frontend. A
+worker group must fit on one node. Its world size is derived from vLLM tensor
+parallelism times pipeline parallelism; expert parallelism must be either one
+or equal to tensor parallelism.
 
-1. an ephemeral etcd server;
-2. a NATS server with JetStream enabled;
-3. one fixed Ray-scheduled `dynamo.vllm` worker group per inference resource
-   group;
-4. the Dynamo frontend.
+Startup completes only after the frontend sees the same fixed membership at
+the generation and RL endpoints and advertises the configured model. Worker
+handles are recorded before readiness checks so partial startup failures can
+be torn down. Shutdown is idempotent and guards the frontend, worker pool,
+NATS, etcd, and temporary state independently.
 
-Startup succeeds only after the frontend reports every fixed worker at both
-its generation and RL endpoints and advertises the configured model. Shutdown
-stops the frontend first, then worker actors, NATS, and etcd, and removes their
-temporary state directories.
+## Generation state
 
-The managed backend must be non-colocated. `engine_world_size` is the tensor
-parallel size multiplied by the pipeline parallel size of each vLLM worker.
-Inference GPU resources are declared under
-`policy.generation.colocated.resources`.
+Both GRPO trainers use `DynamoGeneration.generate_async()` against the managed
+frontend. NeMo-Gym traffic passes through a process-local token wrapper. It
+uses the policy tokenizer, preserves caller `nvext.extra_fields`, adds Dynamo
+engine metadata, and translates rendered multi-turn prefixes back to the exact
+caller token IDs.
 
-## Configuration
+Serialized rollout copies contain only frontend URLs and immutable worker
+admin endpoints. They cannot own or stop services. Those endpoints are enough
+for AREAL-style post-refit cache invalidation; Magistral keeps its existing
+driver-side invalidation lifecycle.
 
-Defaults live in YAML. A complete minimal runtime section is:
+## Weight refit
 
-```yaml
-policy:
-  generation:
-    backend: dynamo
-    dynamo_cfg:
-      engine_world_size: 1
-      namespace: null
-      frontend_port: 0
-      dynamo_python: /opt/dynamo_venv/bin/python
-      startup_timeout_s: 600
-      request_timeout_s: 900
-      etcd_port: 0
-      etcd_peer_port: 0
-      nats_port: 0
-      system_port_base: 29000
-      metrics_include_prefixes: null
-      metrics_exclude_prefixes: null
-      worker_args:
-        tool_call_parser: null
-        reasoning_parser: null
-        exclude_tools_when_tool_choice_none: true
-        enable_structural_tag: false
-        structural_tag_scope: auto
-        structural_tag_schema: auto
-        custom_jinja_template: null
-        endpoint_types: [chat, completions]
-        extra_cli_args: []
-      frontend_args:
-        tokenizer: default
-        tokenizer_cache: false
-        tokenizer_cache_bytes: 52428800
-        router_mode: round-robin
-        router_reset_states: true
-        extra_cli_args: []
-    vllm_cfg:
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-    colocated:
-      enabled: false
-      resources:
-        gpus_per_node: 1
-        num_nodes: 1
-```
+Dynamo uses `CollectiveWeightSynchronizer`. If each engine has world size `E`,
+worker `i` starts at rank `training_world_size + i * E`. The policy sender uses
+vLLM's peer initialization and its fixed packed-transfer geometry: two 1-GiB
+buffers. The isolated vLLM environment validates the same constants before a
+worker starts.
 
-Zero-valued service ports are allocated automatically. When `namespace` is
-null, the runtime derives a sanitized namespace from `SLURM_JOB_ID`. Every
-worker group receives a unique `DYN_SYSTEM_PORT`. Inherited `DYN_*` variables
-are removed before managed values are added.
+Generation is drained before refit. The worker then runs vLLM's native
+`start_weight_update`, `update_weights`, and `finish_weight_update` transaction.
+KV-cache invalidation stays outside the generic synchronizer because GRPO's
+cache mode determines where it runs.
 
-`vllm_cfg` owns standard engine topology and dtype fields. `vllm_kwargs` owns
-advanced vLLM engine arguments. `dynamo_cfg.worker_args` and
-`dynamo_cfg.frontend_args` own Dynamo-specific behavior. Managed model,
-namespace, discovery, endpoint, and refit flags cannot be overridden through
-the raw argument escape hatches.
+## Dependency isolation
 
-## Generation and refit
+`BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
+It contains only `ai-dynamo[vllm]==1.3.0.post1`, its pinned vLLM 0.23.0, etcd,
+and NATS. NeMo-RL's normal Ray and engine environments are unchanged.
 
-Both synchronous and asynchronous GRPO allocate a separate inference virtual
-cluster for Dynamo. Direct token generation uses the frontend completions
-endpoint. NeMo-Gym uses the local token wrapper, which translates chat
-requests, preserves multi-turn prefix tokens, and forwards tokenized
-completions.
-
-The worker fleet is frozen before collective setup. For worker `i` with engine
-world size `E`:
-
-```text
-inference_world_size = worker_count * E
-worker_rank_offset = training_world_size + i * E
-total_world_size = training_world_size + inference_world_size
-```
-
-Policy ranks and all vLLM ranks join one stateless NCCL group. Each weight
-update drains pending generation first, sends checkpoint-format packed weights,
-finishes vLLM's layerwise reload transaction, and then optionally invalidates
-the KV cache. A dead actor or changed worker identity fails the update instead
-of serving mixed model versions.
-
-## Telemetry
-
-When `vllm_cfg.enable_vllm_metrics_logger` is true, NeMo RL samples each fixed
-worker's Prometheus endpoint and writes curated metrics under
-`generation_metrics/*`. Include and exclude prefix lists can narrow the
-published series. The normal logger routes those samples to enabled sinks,
-including W&B, and stops the sampler during shutdown.
-
-## Derived image
-
-Dynamo is not a root Python extra. `docker/dynamo/Dockerfile` derives from the
-standard NeMo RL release image and installs `ai-dynamo[vllm]==1.3.0.post1` into
-an isolated Python 3.12 `/opt/dynamo_venv`. The normal NeMo RL Ray and vLLM
-environments remain unchanged.
-
-Dynamo 1.3.0.post1 pins vLLM 0.23.0. That vLLM release predates PR #44814,
-which fixes layerwise reload accounting for composed weight loaders. Without
-the fix, a refit can finalize a layer before trailing NemotronH/Mamba2
-parameters are loaded. The image build asserts vLLM 0.23.0, runs
-`git apply --check`, applies the backport, and records upstream merge commit
+vLLM 0.23.0 predates PR #44814, which fixes layerwise reload accounting for
+composed loaders. The installer asserts the exact vLLM version, checks and
+applies the backport, and records upstream merge commit
 `c9e5bf813530fb9ce06024e075da0f520b0718c8` in
-`/opt/dynamo_venv/VLLM_BACKPORTS`.
+`/opt/dynamo_venv/VLLM_BACKPORTS`. Remove the backport only after Dynamo pins a
+vLLM release containing that fix.
 
-See `examples/slurm/dynamo/README.md` for the two-GPU smoke and the
-parameterized six-node SWE/W&B acceptance run.
+See [Managed Dynamo generation on Slurm](../guides/dynamo-generation.md) for
+build, configuration, and launch instructions.

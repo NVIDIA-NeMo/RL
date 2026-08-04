@@ -18,66 +18,17 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
-
-_STANDARD_VLLM_FLAGS: dict[str, str] = {
-    "tensor_parallel_size": "--tensor-parallel-size",
-    "pipeline_parallel_size": "--pipeline-parallel-size",
-    "gpu_memory_utilization": "--gpu-memory-utilization",
-    "max_model_len": "--max-model-len",
-    "kv_cache_dtype": "--kv-cache-dtype",
-    "load_format": "--load-format",
-    "precision": "--dtype",
-    "enforce_eager": "--enforce-eager",
-}
+from nemo_rl.models.generation.dynamo.config import (
+    DYNAMO_VLLM_FLAGS,
+    DynamoCfg,
+    DynamoVllmConfig,
+)
 
 _MANAGED_FLAGS = {
     "--component",
-    "--model",
     "--model-name",
     "--model-path",
-    "--served-model-name",
-    "--namespace",
     "--endpoint",
-    "--discovery-backend",
-    "--request-plane",
-    "--event-plane",
-    "--enable-rl",
-    "--weight-transfer-config",
-    "--trust-remote-code",
-    "--seed",
-    "--http-host",
-    "--http-port",
-    "--namespace-prefix",
-    "--router-mode",
-}
-
-_STRUCTURED_ENGINE_FLAGS = set(_STANDARD_VLLM_FLAGS.values()) | {
-    "--enable-expert-parallel",
-}
-
-_STRUCTURED_DYNAMO_FLAGS = {
-    "--dyn-tool-call-parser",
-    "--dyn-reasoning-parser",
-    "--exclude-tools-when-tool-choice-none",
-    "--dyn-enable-structural-tag",
-    "--dyn-structural-tag-scope",
-    "--dyn-structural-tag-schema",
-    "--custom-jinja-template",
-    "--endpoint-types",
-    "--router-reset-states",
-}
-
-_RESERVED_ENV_KEYS = {
-    "CUDA_VISIBLE_DEVICES",
-    "DYNAMO_VLLM_PYTHON",
-    "ETCD_ENDPOINTS",
-    "NATS_SERVER",
-    "DYN_DISCOVERY_BACKEND",
-    "DYN_EVENT_PLANE",
-    "DYN_NAMESPACE",
-    "DYN_REQUEST_PLANE",
-    "DYN_SYSTEM_PORT",
 }
 
 
@@ -132,14 +83,6 @@ class _ArgvBuilder:
                     raise ValueError(
                         f"{source} may not override managed option {normalised}."
                     )
-                if normalised in _STRUCTURED_DYNAMO_FLAGS:
-                    raise ValueError(
-                        f"{source} may not set structured Dynamo option {normalised}."
-                    )
-                if normalised in _STRUCTURED_ENGINE_FLAGS:
-                    raise ValueError(
-                        f"{source} may not set structured engine option {normalised}."
-                    )
                 if normalised in self.sources:
                     raise ValueError(
                         f"Dynamo worker option {normalised} is set by both "
@@ -182,7 +125,7 @@ def build_dynamo_vllm_argv(
     builder.add("--trust-remote-code", source="managed runtime")
     builder.add("--seed", seed, source="managed runtime")
 
-    for key, flag in _STANDARD_VLLM_FLAGS.items():
+    for key, flag in DYNAMO_VLLM_FLAGS.items():
         value = vllm_cfg.get(key)
         if value is not None:
             builder.add(flag, value, source=f"vllm_cfg.{key}")
@@ -192,24 +135,6 @@ def build_dynamo_vllm_argv(
             "--enable-expert-parallel",
             source="vllm_cfg.expert_parallel_size",
         )
-
-    for key, value in vllm_kwargs.items():
-        if value is None:
-            continue
-        flag = _flag_for_key(key)
-        normalised = _normalise_flag(flag)
-        source = f"vllm_kwargs.{key}"
-        if normalised in _MANAGED_FLAGS:
-            raise ValueError(f"{source} may not override managed option {normalised}.")
-        if normalised in _STRUCTURED_DYNAMO_FLAGS:
-            raise ValueError(
-                f"{source} may not set structured Dynamo option {normalised}."
-            )
-        if normalised in _STRUCTURED_ENGINE_FLAGS:
-            raise ValueError(
-                f"{source} may not set structured engine option {normalised}."
-            )
-        builder.add(flag, value, source=source)
 
     worker_args = dynamo_cfg.worker_args
     if worker_args.tool_call_parser is not None:
@@ -255,6 +180,23 @@ def build_dynamo_vllm_argv(
         ",".join(worker_args.endpoint_types),
         source="dynamo_cfg.worker_args.endpoint_types",
     )
+
+    for key, value in vllm_kwargs.items():
+        if value is None:
+            continue
+        if key == "speculative_config":
+            raise ValueError(
+                "policy.generation.vllm_kwargs.speculative_config is not "
+                "supported by backend='dynamo' because draft weights are not "
+                "refit after step 0"
+            )
+        flag = _flag_for_key(key)
+        normalised = _normalise_flag(flag)
+        source = f"vllm_kwargs.{key}"
+        if normalised in _MANAGED_FLAGS:
+            raise ValueError(f"{source} may not override managed option {normalised}.")
+        builder.add(flag, value, source=source)
+
     builder.add_raw(
         worker_args.extra_cli_args,
         source="dynamo_cfg.worker_args.extra_cli_args",
@@ -296,14 +238,7 @@ def build_dynamo_frontend_argv(
 
 def validate_managed_vllm_config(vllm_cfg: Mapping[str, Any]) -> None:
     """Validate settings whose meaning differs between NeMo-RL and Dynamo."""
-    tp = int(vllm_cfg.get("tensor_parallel_size", 1))
-    pp = int(vllm_cfg.get("pipeline_parallel_size", 1))
-    ep = int(vllm_cfg.get("expert_parallel_size", 1))
-    if tp <= 0 or pp <= 0 or ep <= 0:
-        raise ValueError(
-            "tensor_parallel_size, pipeline_parallel_size, and "
-            "expert_parallel_size must be positive."
-        )
+    DynamoVllmConfig.model_validate(vllm_cfg)
 
 
 def build_managed_worker_env(
@@ -313,10 +248,11 @@ def build_managed_worker_env(
     manager_env: Mapping[str, str],
 ) -> dict[str, str]:
     """Return a reproducible worker environment with semantic overrides blocked."""
+    reserved_env_keys = set(manager_env)
     forbidden = sorted(
         key
         for key in configured_env
-        if key.startswith("DYN_") or key in _RESERVED_ENV_KEYS
+        if key.startswith("DYN_") or key in reserved_env_keys
     )
     if forbidden:
         raise ValueError(
@@ -327,7 +263,7 @@ def build_managed_worker_env(
     env = {
         key: value
         for key, value in base_env.items()
-        if not key.startswith("DYN_") and key not in _RESERVED_ENV_KEYS
+        if not key.startswith("DYN_") and key not in reserved_env_keys
     }
     env.update(configured_env)
     env.update(manager_env)

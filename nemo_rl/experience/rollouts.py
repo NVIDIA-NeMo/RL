@@ -535,6 +535,7 @@ async def generate_responses_async(
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
     # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
     # TRT-LLM requires its flag; the Megatron backend is always async.
+    # Managed Dynamo always exposes its rollout frontend asynchronously.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -546,6 +547,8 @@ async def generate_responses_async(
         use_async_generation = bool(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
+    elif backend == "dynamo":
+        use_async_generation = True
     elif backend == "trtllm":
         assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "

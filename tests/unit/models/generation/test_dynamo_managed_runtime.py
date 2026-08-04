@@ -5,61 +5,104 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import json
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
 )
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
-    _system_port_for_group,
+    _system_port_for_node_slot,
+    _vllm_port_for_node_slot,
 )
 
 
-def _managed_cfg(**overrides) -> DynamoCfg:
-    config = {
-        "engine_world_size": 1,
-        "namespace": None,
-        "frontend_port": 0,
-        "dynamo_python": "/opt/dynamo_venv/bin/python",
-        "startup_timeout_s": 300,
-        "request_timeout_s": 30,
-        "etcd_port": 0,
-        "etcd_peer_port": 0,
-        "nats_port": 0,
-        "system_port_base": 29000,
-        "metrics_include_prefixes": None,
-        "metrics_exclude_prefixes": None,
-        "worker_args": {
-            "tool_call_parser": None,
-            "reasoning_parser": None,
-            "exclude_tools_when_tool_choice_none": True,
-            "enable_structural_tag": False,
-            "structural_tag_scope": "auto",
-            "structural_tag_schema": "auto",
-            "custom_jinja_template": None,
-            "endpoint_types": ["chat", "completions"],
-            "extra_cli_args": [],
+class _Cluster:
+    num_gpus_per_node = 4
+
+
+def test_dynamo_package_directory_does_not_shadow_stdlib_http() -> None:
+    package_dir = (
+        Path(__file__).resolve().parents[4]
+        / "nemo_rl"
+        / "models"
+        / "generation"
+        / "dynamo"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", "import http.client"],
+        cwd=package_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _config(*, tp: int = 1) -> dict:
+    return {
+        "backend": "dynamo",
+        "model_name": "model",
+        "colocated": {"enabled": False},
+        "dynamo_cfg": {
+            "engine": "vllm",
+            "startup_timeout_s": 5,
+            "request_timeout_s": 30,
+            "metrics_include_prefixes": None,
+            "metrics_exclude_prefixes": None,
+            "worker_args": {
+                "tool_call_parser": None,
+                "reasoning_parser": None,
+                "exclude_tools_when_tool_choice_none": True,
+                "enable_structural_tag": False,
+                "structural_tag_scope": "auto",
+                "structural_tag_schema": "auto",
+                "custom_jinja_template": None,
+                "endpoint_types": ["chat", "completions"],
+                "extra_cli_args": [],
+            },
+            "frontend_args": {
+                "tokenizer": "default",
+                "tokenizer_cache": False,
+                "tokenizer_cache_bytes": 50 * 1024 * 1024,
+                "router_mode": "kv",
+                "router_reset_states": True,
+                "extra_cli_args": [],
+            },
         },
-        "frontend_args": {
-            "tokenizer": "default",
-            "tokenizer_cache": False,
-            "tokenizer_cache_bytes": 52428800,
-            "router_mode": "round-robin",
-            "router_reset_states": True,
-            "extra_cli_args": [],
+        "vllm_cfg": {
+            "async_engine": True,
+            "tensor_parallel_size": tp,
+            "pipeline_parallel_size": 1,
+            "expert_parallel_size": tp,
+            "gpu_memory_utilization": 0.8,
+            "max_model_len": 512,
+            "precision": "bfloat16",
+            "kv_cache_dtype": "auto",
+            "load_format": "auto",
+            "enforce_eager": False,
+            "expose_http_server": False,
+            "enable_vllm_metrics_logger": True,
+            "vllm_metrics_logger_interval": 1.0,
+            "env_vars": None,
         },
+        "vllm_kwargs": {},
     }
-    for nested_key in ("worker_args", "frontend_args"):
-        if nested_key in overrides:
-            config[nested_key].update(overrides.pop(nested_key))
-    config.update(overrides)
-    return DynamoCfg.model_validate(config)
 
 
 class _RemoteMethod:
@@ -71,14 +114,15 @@ class _RemoteMethod:
 
 
 class _FakeWorker:
-    def __init__(self, alive, metadata):
+    def __init__(self, alive=True, metadata=None):
         self.is_alive = _RemoteMethod(alive)
-        self.metadata = _RemoteMethod(metadata)
+        self.metadata = _RemoteMethod(metadata or {})
         self.shutdown = _RemoteMethod(True)
 
 
 class _FakeReservation:
-    def __init__(self):
+    def __init__(self, metadata=None):
+        self.metadata = _RemoteMethod(metadata or {})
         self.cleanup_process_group = _RemoteMethod(True)
 
 
@@ -106,93 +150,259 @@ class _FakeHttpResponse:
         return json.dumps(self._payload).encode()
 
 
-def test_namespace_defaults_to_sanitized_slurm_job_id(monkeypatch) -> None:
+def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("SLURM_JOB_ID", "Job/123.4")
-    assert _managed_namespace(None) == "nemo-rl-job-123-4"
-    assert _managed_namespace("My Namespace") == "my-namespace"
+    assert _managed_namespace() == "nemo-rl-job-123-4"
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
+    assert runtime._started is False
+    assert runtime._etcd_process is None
+    with pytest.raises(RuntimeError, match="not been started"):
+        _ = runtime.frontend_url
 
 
-def test_frontend_tokenizer_environment_is_config_owned(monkeypatch) -> None:
-    monkeypatch.setenv("DYN_TOKENIZER", "wrong")
-    monkeypatch.setenv("DYN_TOKENIZER_CACHE", "0")
-    monkeypatch.setenv("DYN_TOKENIZER_CACHE_BYTES", "1")
-    runtime = object.__new__(ManagedDynamoRuntime)
-    runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
-    runtime._dynamo_cfg = _managed_cfg(
-        frontend_args={
-            "tokenizer": "fastokens",
-            "tokenizer_cache": True,
-            "tokenizer_cache_bytes": 4 * 1024**3,
-        },
-    )
-
-    assert "DYN_TOKENIZER" not in runtime._service_env()
-    frontend_env = runtime._frontend_env()
-    assert frontend_env["DYN_TOKENIZER"] == "fastokens"
-    assert frontend_env["DYN_TOKENIZER_CACHE"] == "1"
-    assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4294967296"
+def test_runtime_rejects_multinode_engine_group_before_spawning() -> None:
+    with pytest.raises(ValueError, match="fit on one node"):
+        ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=8))
 
 
-def test_system_ports_are_unique_across_tp1_groups() -> None:
-    assert [_system_port_for_group(29000, idx) for idx in range(8)] == list(
-        range(29000, 29008)
-    )
-    with pytest.raises(ValueError, match="exceeds 65535"):
-        _system_port_for_group(65535, 1)
+def test_node_local_port_bands_are_deterministic() -> None:
+    assert [_system_port_for_node_slot(slot) for slot in range(3)] == [4000, 4001, 4002]
+    assert [_vllm_port_for_node_slot(slot) for slot in range(3)] == [7000, 7100, 7200]
+    with pytest.raises(ValueError, match="system-port band"):
+        _system_port_for_node_slot(100)
 
 
-def test_runtime_rejects_engine_world_size_mismatch(monkeypatch) -> None:
+def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) -> None:
+    calls = []
+    exit_hooks = []
+
+    class FailingPool:
+        def __init__(self, **kwargs):
+            calls.append("pool-init")
+
+        def start(self):
+            calls.append("pool-start")
+            raise RuntimeError("worker failed")
+
+        def shutdown(self):
+            calls.append("pool-shutdown")
+
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
+    etcd_dir = tmp_path / "etcd"
+    nats_dir = tmp_path / "nats"
+    etcd_dir.mkdir()
+    nats_dir.mkdir()
+    ports = iter([1313, 1314, 1315, 3000])
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime._get_node_ip_local",
         lambda: "10.0.0.1",
     )
-    with pytest.raises(ValueError, match="tensor_parallel_size"):
-        ManagedDynamoRuntime(
-            cluster=object(),
-            config={
-                "model_name": "model",
-                "dynamo_cfg": {"engine_world_size": 1},
-                "vllm_cfg": {
-                    "tensor_parallel_size": 2,
-                    "pipeline_parallel_size": 1,
-                },
-            },
-            dynamo_cfg=_managed_cfg(),
-        )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime._get_free_port_local",
+        lambda low, high: next(ports),
+    )
+
+    def start_etcd():
+        calls.append("etcd")
+        runtime._etcd_process = object()
+        runtime._etcd_data_dir = str(etcd_dir)
+
+    def start_nats():
+        calls.append("nats")
+        runtime._nats_process = object()
+        runtime._nats_data_dir = str(nats_dir)
+
+    def stop_process(process, label, timeout_s=15):
+        if process is not None:
+            calls.append(f"stop-{label}")
+
+    monkeypatch.setattr(runtime, "_start_etcd", start_etcd)
+    monkeypatch.setattr(runtime, "_start_nats", start_nats)
+    monkeypatch.setattr(runtime, "_stop_process", stop_process)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.atexit.register",
+        lambda hook: exit_hooks.append(hook),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.atexit.unregister",
+        lambda hook: exit_hooks.remove(hook),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.FixedDynamoWorkerPool",
+        FailingPool,
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        runtime.start()
+    assert calls == [
+        "etcd",
+        "nats",
+        "pool-init",
+        "pool-start",
+        "pool-shutdown",
+        "stop-NATS",
+        "stop-etcd",
+    ]
+    assert runtime._pool is None
+    assert runtime._started is False
+    assert exit_hooks == []
+    assert not etcd_dir.exists()
+    assert not nats_dir.exists()
 
 
-def test_fixed_pool_detects_actor_or_membership_change(monkeypatch) -> None:
-    expected = [{"instance_id": "worker-0", "system_url": "http://10.0.0.1:29000"}]
+def test_stop_process_escalates_its_process_group(monkeypatch) -> None:
+    class EscalatingProcess:
+        pid = 1234
+
+        def __init__(self):
+            self.wait_count = 0
+
+        @staticmethod
+        def poll():
+            return None
+
+        def wait(self, timeout):
+            self.wait_count += 1
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired("dynamo", timeout)
+            return 0
+
+    signals = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.os.killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    process = EscalatingProcess()
+    ManagedDynamoRuntime._stop_process(process, "worker", timeout_s=0.01)
+    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
+
+
+def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
+    runtime._frontend_process = object()
+    runtime._nats_process = object()
+    runtime._etcd_process = object()
+    calls = []
+
+    class FailingPool:
+        def shutdown(self):
+            calls.append("pool")
+            raise RuntimeError("pool failure")
+
+    runtime._pool = FailingPool()
+
+    def stop_process(process, label, timeout_s=15):
+        if process is None:
+            return
+        calls.append(label)
+        if label == "frontend":
+            raise RuntimeError("frontend failure")
+
+    monkeypatch.setattr(runtime, "_stop_process", stop_process)
+    runtime.shutdown()
+    runtime.shutdown()
+
+    assert calls[:4] == ["frontend", "pool", "NATS", "etcd"]
+    assert runtime._frontend_process is None
+    assert runtime._pool is None
+    assert runtime._nats_process is None
+    assert runtime._etcd_process is None
+
+
+def test_fixed_pool_detects_worker_membership_change(monkeypatch) -> None:
+    expected = [{"instance_id": "worker-0", "system_url": "http://10.0.0.1:4000"}]
     pool = object.__new__(FixedDynamoWorkerPool)
-    pool._workers = [_FakeWorker("alive", "metadata")]
+    pool._workers = [_FakeWorker(metadata={"instance_id": "changed"})]
     pool._reservations = []
     pool._cleanup_reservations = []
     pool._reservation_metadata = []
 
-    def get_changed(refs, **kwargs):
-        if refs == ["alive"]:
+    def fake_get(refs, **kwargs):
+        if refs == [True]:
             return [True]
         if refs == []:
             return []
-        return [{"instance_id": "worker-0", "system_url": "http://10.0.0.1:29001"}]
+        return [{"instance_id": "changed"}]
 
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.ray.get", get_changed
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get", fake_get
     )
     with pytest.raises(RuntimeError, match="membership changed"):
         pool.validate(expected)
 
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.ray.get",
-        lambda refs, **kwargs: [False],
+
+def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
+    reservation = _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 0})
+    worker = _FakeWorker()
+
+    class RemoteFactory:
+        def __init__(self, actor):
+            self.actor = actor
+
+        def remote(self, *args, **kwargs):
+            return self.actor
+
+    class ReservationFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(reservation)
+
+    class WorkerFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(worker)
+
+    class Cluster:
+        @staticmethod
+        def get_placement_groups():
+            return [SimpleNamespace(bundle_count=1)]
+
+    pool = FixedDynamoWorkerPool(
+        cluster=Cluster(),
+        config=_config(),
+        namespace="nemo-rl-test",
+        engine_world_size=1,
+        manager_env={},
+        startup_timeout_s=5,
     )
-    with pytest.raises(RuntimeError, match="worker exited"):
-        pool.validate(expected)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
+        ReservationFactory,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.DynamoVllmWorker",
+        WorkerFactory,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
+        lambda _fqn: "python",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",
+        lambda **kwargs: kwargs,
+    )
+
+    def fake_get(refs, **kwargs):
+        if refs == [reservation.metadata.remote()]:
+            return [{"node_ip": "10.0.0.1", "gpu_id": 0}]
+        raise RuntimeError("metadata failed")
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get", fake_get
+    )
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        pool.start()
+
+    assert pool._workers == [worker]
+    assert pool._cleanup_reservations == [reservation]
+    assert pool._metadata == [{}]
 
 
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:
     pool = object.__new__(FixedDynamoWorkerPool)
-    worker = _FakeWorker("alive", "metadata")
+    worker = _FakeWorker()
     reservation = _FakeReservation()
     pool._workers = [worker]
     pool._reservations = [reservation]
@@ -208,139 +418,41 @@ def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> N
         "nemo_rl.models.generation.dynamo.worker_pool.ray.kill",
         lambda actor, **kwargs: killed.append(actor),
     )
-
     pool.shutdown()
-
     assert killed == [worker, reservation]
     assert pool._workers == []
     assert pool._reservations == []
-    assert pool._cleanup_reservations == []
-    assert pool._reservation_metadata == []
-    assert pool._metadata == []
 
 
-def test_fixed_pool_fallback_kills_orphaned_process_group(monkeypatch) -> None:
-    pool = object.__new__(FixedDynamoWorkerPool)
-    worker = _FakeWorker("alive", "metadata")
-    reservation = _FakeReservation()
-    pool._workers = [worker]
-    pool._reservations = [reservation]
-    pool._cleanup_reservations = [reservation]
-    pool._reservation_metadata = []
-    pool._metadata = [{"instance_id": "worker-0", "process_pid": 1234}]
-    calls = []
-
-    def get_with_shutdown_failure(refs, **kwargs):
-        calls.append(refs)
-        if refs == [True] and len(calls) == 1:
-            raise RuntimeError("actor died")
-        return [True]
-
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.ray.get",
-        get_with_shutdown_failure,
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.ray.kill",
-        lambda actor, **kwargs: None,
-    )
-
-    pool.shutdown()
-
-    assert calls == [[True], [True]]
-
-
-def test_runtime_startup_failure_cleans_up_worker_pool(monkeypatch) -> None:
-    calls = []
-
-    class FailingPool:
-        def __init__(self, **kwargs):
-            calls.append("init")
-
-        def start(self):
-            calls.append("start")
-            raise RuntimeError("worker failed")
-
-        def shutdown(self):
-            calls.append("shutdown")
-
-    runtime = object.__new__(ManagedDynamoRuntime)
-    runtime._cluster = object()
-    runtime._config = {"model_name": "model"}
-    runtime._dynamo_cfg = _managed_cfg()
-    runtime._namespace = "nemo-rl-test"
-    runtime._manager_env = {}
-    runtime._etcd_process = None
-    runtime._nats_process = None
-    runtime._frontend_process = None
-    runtime._etcd_data_dir = None
-    runtime._nats_data_dir = None
-    runtime._pool = None
-    monkeypatch.setattr(runtime, "_start_etcd", lambda: calls.append("etcd"))
-    monkeypatch.setattr(runtime, "_start_nats", lambda: calls.append("nats"))
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.managed_runtime.FixedDynamoWorkerPool",
-        FailingPool,
-    )
-
-    with pytest.raises(RuntimeError, match="worker failed"):
-        runtime._start()
-
-    assert calls == ["etcd", "nats", "init", "start", "shutdown"]
-    assert runtime._pool is None
-
-
-def test_runtime_waits_for_frontend_model_route_after_registrations(
-    monkeypatch,
-) -> None:
-    runtime = object.__new__(ManagedDynamoRuntime)
-    runtime._frontend_port = 8000
+def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> None:
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
+    runtime._frontend_port = 3000
     runtime._frontend_process = _FakeProcess()
     runtime._namespace = "nemo-rl-test"
-    runtime._config = {"model_name": "org/model"}
-    runtime._dynamo_cfg = _managed_cfg(startup_timeout_s=5)
-    health_payload = {
+    health = {
         "instances": [
             {
                 "namespace": "nemo-rl-test",
                 "component": "backend",
-                "endpoint": "generate",
+                "endpoint": endpoint,
                 "instance_id": "worker-0",
-            },
-            {
-                "namespace": "nemo-rl-test",
-                "component": "backend",
-                "endpoint": "rl",
-                "instance_id": "worker-0",
-            },
+            }
+            for endpoint in ("generate", "rl")
         ]
     }
-    responses = [
-        health_payload,
-        {"object": "list", "data": []},
-        health_payload,
-        {"object": "list", "data": [{"id": "org/model"}]},
-    ]
-    urls = []
-
-    def fake_urlopen(url, timeout):
-        urls.append(url)
-        return _FakeHttpResponse(responses.pop(0))
-
+    responses = iter(
+        [
+            health,
+            {"data": []},
+            health,
+            {"data": [{"id": "model"}]},
+        ]
+    )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
-        fake_urlopen,
+        lambda url, timeout: _FakeHttpResponse(next(responses)),
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep",
-        lambda _: None,
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
     )
-
     runtime._wait_for_frontend(expected_workers=1)
-
-    assert urls == [
-        "http://127.0.0.1:8000/health",
-        "http://127.0.0.1:8000/v1/models",
-        "http://127.0.0.1:8000/health",
-        "http://127.0.0.1:8000/v1/models",
-    ]

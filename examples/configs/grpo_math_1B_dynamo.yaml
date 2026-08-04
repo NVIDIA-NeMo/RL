@@ -1,69 +1,50 @@
-# Two-step Qwen2.5-1.5B GRPO smoke with a Ray-managed Dynamo vLLM worker.
-
-defaults: ../../configs/grpo_math_1B.yaml
+# Two-step, two-GPU smoke for the Ray-managed Dynamo vLLM backend.
+defaults: grpo_math_1B.yaml
 
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 2
-  max_rollout_turns: 1
   max_num_steps: 2
   val_period: 0
   val_at_start: false
   val_at_end: false
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
 
 checkpointing:
   enabled: false
 
-data:
-  train:
-    dataset_name: gsm8k
-
 policy:
-  model_name: Qwen/Qwen2.5-1.5B
-  tokenizer:
-    name: ${policy.model_name}
-    chat_template: null
-    chat_template_kwargs: null
-  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_global_batch_size: 4
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 512
-
   sequence_packing:
     enabled: false
-
   dtensor_cfg:
-    enabled: true
     _v2: false
+    enabled: true
     cpu_offload: false
     activation_checkpointing: false
-    sequence_parallel: false
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    custom_parallel_plan: null
-
   megatron_cfg:
     enabled: false
-
   generation:
     backend: dynamo
     max_new_tokens: 128
     temperature: 0.7
     top_p: 0.95
     top_k: 50
-    stop_token_ids: null
-    stop_strings: null
     dynamo_cfg:
-      engine_world_size: 1
-      dynamo_python: ${oc.env:DYNAMO_PYTHON,/opt/dynamo_venv/bin/python}
+      engine: vllm
       startup_timeout_s: 600
-      namespace: null
-      frontend_port: 0
       request_timeout_s: 900
-      etcd_port: 0
-      etcd_peer_port: 0
-      nats_port: 0
-      system_port_base: 29000
       metrics_include_prefixes: null
       metrics_exclude_prefixes: null
       worker_args:
@@ -80,11 +61,11 @@ policy:
         tokenizer: default
         tokenizer_cache: false
         tokenizer_cache_bytes: 52428800
-        router_mode: round-robin
+        router_mode: kv
         router_reset_states: true
         extra_cli_args: []
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -92,7 +73,11 @@ policy:
       load_format: auto
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
+      kv_cache_dtype: auto
       enforce_eager: true
+      expose_http_server: false
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
       env_vars:
         NCCL_MNNVL_ENABLE: "0"
     vllm_kwargs:
@@ -101,21 +86,14 @@ policy:
       enabled: false
       resources:
         gpus_per_node: 1
-        num_nodes: null
+        num_nodes: 1
 
 logger:
-  log_dir: ${oc.env:RESULTS_DIR,results/dynamo-slurm-smoke}
-  num_val_samples_to_print: 0
+  log_dir: results/grpo-math-1b-dynamo
   wandb_enabled: false
-  tensorboard_enabled: false
-  mlflow_enabled: false
-  swanlab_enabled: false
+  tensorboard_enabled: true
   monitor_gpus: false
 
 cluster:
-  # ray.sub still claims all eight physical H100s. The smoke deliberately uses
-  # only one GPU for training and one for Dynamo inference.
   gpus_per_node: 2
   num_nodes: 1
-  master_port_range_low: 25000
-  master_port_range_high: 28000

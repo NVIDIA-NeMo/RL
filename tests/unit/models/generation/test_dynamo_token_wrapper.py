@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
     _validate_engine_data,
@@ -133,11 +134,39 @@ def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
     assert "logprobs" not in prepared
     assert "return_tokens_as_token_ids" not in prepared
     assert prepared["nvext"] == {
-        "extra_fields": ["engine_data"],
+        "extra_fields": ["timing", "engine_data"],
         "trace": "keep-me",
         "token_data": [10, 99],
     }
     assert tokenizer.calls[0]["kwargs"] == {"enable_thinking": False}
+
+
+def test_public_qwen3_tokenizer_first_turn_matches_chat_template(
+    tiny_qwen3_model_path,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_qwen3_model_path)
+    messages = [{"role": "user", "content": "Solve 2 + 2."}]
+    template_kwargs = {"enable_thinking": False}
+    expected = tokenizer.apply_chat_template(
+        messages,
+        tools=None,
+        documents=None,
+        chat_template=None,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        tokenize=True,
+        return_tensors=None,
+        return_dict=False,
+        **template_kwargs,
+    )
+
+    prepared = prepare_dynamo_chat_completion_request(
+        {"model": "Qwen/Qwen3-0.6B", "messages": messages},
+        tokenizer=tokenizer,
+        tokenizer_chat_template_kwargs=template_kwargs,
+    )
+
+    assert prepared["nvext"]["token_data"] == expected
 
 
 def test_prepare_dynamo_chat_completion_request_preserves_logprob_fields() -> None:
@@ -185,9 +214,24 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
     assert "generation_token_ids" not in prepared["messages"][1]
     assert "generation_log_probs" not in prepared["messages"][1]
     assert tokenizer.calls[0]["add_generation_prompt"] is True
-    assert tokenizer.calls[1]["add_generation_prompt"] is True
+    assert tokenizer.calls[1]["add_generation_prompt"] is False
     assert tokenizer.calls[0]["tokenize"] is True
-    assert tokenizer.calls[1]["tokenize"] is False
+    assert tokenizer.calls[1]["tokenize"] is True
+
+
+def test_prepare_dynamo_chat_completion_request_validates_extra_fields() -> None:
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "nvext": {"extra_fields": ["engine_data", "timing", "engine_data"]},
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=_Tokenizer())
+
+    assert prepared["nvext"]["extra_fields"] == ["engine_data", "timing"]
+
+    body["nvext"]["extra_fields"] = "timing"
+    with pytest.raises(ValueError, match="extra_fields must be a JSON list"):
+        prepare_dynamo_chat_completion_request(body, tokenizer=_Tokenizer())
 
 
 def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments() -> (

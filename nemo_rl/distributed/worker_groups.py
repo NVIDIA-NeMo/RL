@@ -14,7 +14,6 @@
 import importlib
 import math
 import os
-import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -584,9 +583,8 @@ class RayWorkerGroup:
                 # Build the worker's runtime_env with per-worker env_vars
                 runtime_env = {
                     "env_vars": worker_env_vars,
+                    "py_executable": py_executable,
                 }
-                if py_executable != sys.executable:
-                    runtime_env["py_executable"] = py_executable
                 py_venv = os.path.dirname(
                     os.path.dirname(py_executable)
                 )  # to remove the "bin/python" suffix

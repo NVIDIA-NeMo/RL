@@ -242,10 +242,6 @@ def main() -> None:
                     master_config,
                 )
     finally:
-        try:
-            logger.close()
-        except Exception as error:
-            print(f"Error shutting down logger: {error}", flush=True)
         if config.policy["generation"]["backend"] == "dynamo":
             try:
                 policy_generation.shutdown()

@@ -19,6 +19,10 @@ from typing import Any, List, Tuple
 
 import torch
 
+# Must match vLLM's packed weight-transfer defaults exactly. Producer and
+# consumer recompute chunk boundaries independently with no negotiation, so a
+# mismatch can desynchronize the broadcast. Re-verify whenever Dynamo's pinned
+# vLLM changes.
 VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
 VLLM_PACKED_NUM_BUFFERS = 2
 

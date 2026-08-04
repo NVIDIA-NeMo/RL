@@ -100,7 +100,15 @@ class StatelessProcessGroup:
         )
 
     def init_nccl_communicator(self, device: int, *, peer: str = "nemo") -> None:
-        """Initialize NCCL using the metadata and warmup protocol of the peer."""
+        """Initialize NCCL using the metadata and warmup protocol of the peer.
+
+        ``peer="nemo"`` publishes the raw 128-byte unique ID under
+        ``nccl_unique_id`` and warms up with a rank-zero broadcast.
+        ``peer="vllm"`` additionally publishes vLLM's pickled ``ncclUniqueId``
+        under ``broadcast_from/0/0`` and warms up with an all-reduce, matching
+        ``PyNcclCommunicator``. The receiver protocol is not negotiable, so a
+        generation backend must select the peer it implements.
+        """
         if peer not in ("nemo", "vllm"):
             raise ValueError(f"Unsupported NCCL peer protocol: {peer!r}.")
 

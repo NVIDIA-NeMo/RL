@@ -21,8 +21,10 @@ import sys
 
 def main() -> None:
     os.environ.setdefault("PYTHONHASHSEED", "0")
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: validate_dynamo_vllm_args.py '<json argv>'")
+    if len(sys.argv) != 3:
+        raise SystemExit(
+            "usage: validate_dynamo_vllm_args.py '<json argv>' '<json packed geometry>'"
+        )
 
     # Parser construction evaluates vLLM device defaults. Image builds and
     # unit preflights may run on CPU-only Slurm nodes, where a CUDA wheel leaves
@@ -36,11 +38,31 @@ def main() -> None:
         vllm.platforms.current_platform = CpuPlatform()
 
     from dynamo.vllm.args import parse_args
+    from vllm.distributed.weight_transfer.packed_tensor import (
+        DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+        DEFAULT_PACKED_NUM_BUFFERS,
+    )
 
     argv = json.loads(sys.argv[1])
     if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
         raise TypeError("resolved Dynamo argv must be a JSON list of strings")
     parse_args(argv)
+
+    expected = json.loads(sys.argv[2])
+    actual_geometry = (
+        DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+        DEFAULT_PACKED_NUM_BUFFERS,
+    )
+    expected_geometry = (
+        expected["buffer_size_bytes"],
+        expected["num_buffers"],
+    )
+    if actual_geometry != expected_geometry:
+        raise SystemExit(
+            "vLLM packed-transfer geometry changed: "
+            f"engine has {actual_geometry}, NeMo RL sends {expected_geometry}. "
+            "Update the Dynamo CollectiveSenderSpec and VLLM_PACKED_* constants."
+        )
 
 
 if __name__ == "__main__":

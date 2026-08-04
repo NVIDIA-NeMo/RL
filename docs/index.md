@@ -80,7 +80,7 @@ Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for dist
 :::
 
 :::{grid-item-card} {octicon}`workflow` Managed Dynamo Generation
-:link: design-docs/dynamo-integration
+:link: guides/dynamo-generation
 :link-type: doc
 
 Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
@@ -333,6 +333,7 @@ guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/dynamo-generation.md
 guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md

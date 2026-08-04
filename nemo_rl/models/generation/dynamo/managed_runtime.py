@@ -14,7 +14,9 @@
 
 """Driver-owned lifecycle for a fixed Ray-managed Dynamo deployment."""
 
+import atexit
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +30,10 @@ import urllib.request
 from typing import Any
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+    DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
     RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
@@ -36,14 +42,19 @@ from nemo_rl.models.generation.dynamo.arguments import (
     build_dynamo_frontend_argv,
     redact_argv,
     redact_environment,
-    validate_managed_vllm_config,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.venv import (
+    get_dynamo_executable,
+    get_dynamo_python,
+)
 from nemo_rl.models.generation.dynamo.worker_pool import FixedDynamoWorkerPool
 
+LOGGER = logging.getLogger(__name__)
 
-def _managed_namespace(configured: str | None) -> str:
-    raw = configured or f"nemo-rl-{os.environ.get('SLURM_JOB_ID', os.getpid())}"
+
+def _managed_namespace() -> str:
+    raw = f"nemo-rl-{os.environ.get('SLURM_JOB_ID', os.getpid())}"
     namespace = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(raw)).strip("-_").lower()
     if not namespace:
         raise ValueError(f"Could not derive a valid Dynamo namespace from {raw!r}.")
@@ -58,13 +69,27 @@ class ManagedDynamoRuntime:
         *,
         cluster: RayVirtualCluster,
         config: dict[str, Any],
-        dynamo_cfg: DynamoCfg,
     ) -> None:
+        validated_config = DynamoConfig.model_validate(config)
         self._cluster = cluster
-        self._config = config
-        self._dynamo_cfg = dynamo_cfg
-        self._namespace = _managed_namespace(dynamo_cfg.namespace)
-        self._host = _get_node_ip_local()
+        self._config = validated_config.model_dump()
+        self._dynamo_cfg = validated_config.dynamo_cfg
+        self._engine_world_size = validated_config.engine_world_size
+        if self._engine_world_size > cluster.num_gpus_per_node:
+            raise ValueError(
+                "Managed Dynamo requires each TP/PP engine group to fit on one "
+                f"node: tp*pp={self._engine_world_size} exceeds "
+                f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
+            )
+        self._namespace = _managed_namespace()
+        self._host = ""
+        self._etcd_port = 0
+        self._etcd_peer_port = 0
+        self._nats_port = 0
+        self._frontend_port = 0
+        self._manager_env: dict[str, str] = {}
+        self._started = False
+        self._atexit_registered = False
         self._etcd_process: subprocess.Popen | None = None
         self._nats_process: subprocess.Popen | None = None
         self._frontend_process: subprocess.Popen | None = None
@@ -72,43 +97,51 @@ class ManagedDynamoRuntime:
         self._nats_data_dir: str | None = None
         self._pool: FixedDynamoWorkerPool | None = None
 
-        vllm_cfg = dict(config.get("vllm_cfg") or {})
-        validate_managed_vllm_config(vllm_cfg)
-        engine_world_size = int(dynamo_cfg.engine_world_size)
-        configured_world_size = int(vllm_cfg.get("tensor_parallel_size", 1)) * int(
-            vllm_cfg.get("pipeline_parallel_size", 1)
-        )
-        if configured_world_size != engine_world_size:
-            raise ValueError(
-                "dynamo_cfg.engine_world_size must equal "
-                "vllm_cfg.tensor_parallel_size * vllm_cfg.pipeline_parallel_size: "
-                f"{engine_world_size} != {configured_world_size}."
-            )
+    @property
+    def frontend_url(self) -> str:
+        if not self._started:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        host = f"[{self._host}]" if ":" in self._host else self._host
+        return f"http://{host}:{self._frontend_port}/v1"
 
+    def start(self) -> None:
+        """Start the complete managed service fleet."""
+        if self._started:
+            raise RuntimeError("Managed Dynamo runtime is already started")
+        # Managed services use new process groups and would survive an
+        # exception that escapes GRPO setup. Keep an interpreter-exit fallback
+        # in addition to the normal explicit shutdown path.
+        atexit.register(self.shutdown)
+        self._atexit_registered = True
+        self._host = _get_node_ip_local()
         used_ports: set[int] = set()
 
-        def allocate_port(configured: int) -> int:
-            if configured:
-                if configured in used_ports:
-                    raise ValueError(
-                        f"Managed Dynamo service port {configured} is configured more than once."
-                    )
-                used_ports.add(configured)
-                return configured
-            for _ in range(100):
-                candidate = _get_free_port_local()
+        def allocate_port(*, low: int, high: int) -> int:
+            for _ in range(high - low):
+                candidate = _get_free_port_local(low, high)
                 if candidate not in used_ports:
                     used_ports.add(candidate)
                     return candidate
             raise RuntimeError(
-                "Could not allocate a distinct managed Dynamo service port."
+                f"Could not allocate a distinct managed Dynamo port in [{low}, {high})"
             )
 
-        self._etcd_port = allocate_port(dynamo_cfg.etcd_port)
-        self._etcd_peer_port = allocate_port(dynamo_cfg.etcd_peer_port)
-        self._nats_port = allocate_port(dynamo_cfg.nats_port)
-        self._frontend_port = allocate_port(dynamo_cfg.frontend_port)
-
+        self._etcd_port = allocate_port(
+            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
+        )
+        self._etcd_peer_port = allocate_port(
+            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
+        )
+        self._nats_port = allocate_port(
+            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
+        )
+        self._frontend_port = allocate_port(
+            low=DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
+            high=DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+        )
         self._manager_env = {
             "ETCD_ENDPOINTS": f"http://{self._host}:{self._etcd_port}",
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
@@ -119,18 +152,6 @@ class ManagedDynamoRuntime:
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
         }
-        self._start()
-
-    @property
-    def frontend_url(self) -> str:
-        host = f"[{self._host}]" if ":" in self._host else self._host
-        return f"http://{host}:{self._frontend_port}/v1"
-
-    @property
-    def namespace(self) -> str:
-        return self._namespace
-
-    def _start(self) -> None:
         print(
             f"  [Dynamo] managed environment={redact_environment(self._manager_env)!r}",
             flush=True,
@@ -142,14 +163,14 @@ class ManagedDynamoRuntime:
                 cluster=self._cluster,
                 config=self._config,
                 namespace=self._namespace,
-                engine_world_size=self._dynamo_cfg.engine_world_size,
-                system_port_base=self._dynamo_cfg.system_port_base,
+                engine_world_size=self._engine_world_size,
                 manager_env=self._manager_env,
                 startup_timeout_s=self._dynamo_cfg.startup_timeout_s,
             )
             self._pool.start()
             self._start_frontend()
             self._wait_for_frontend(self._pool.size)
+            self._started = True
         except Exception:
             self.shutdown()
             raise
@@ -198,7 +219,7 @@ class ManagedDynamoRuntime:
         self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_etcd_")
         peer_url = f"http://{self._host}:{self._etcd_peer_port}"
         command = [
-            "etcd",
+            get_dynamo_executable("etcd"),
             "--listen-client-urls",
             f"http://0.0.0.0:{self._etcd_port}",
             "--advertise-client-urls",
@@ -238,7 +259,7 @@ class ManagedDynamoRuntime:
         self._nats_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_nats_")
         self._nats_process = subprocess.Popen(
             [
-                "nats-server",
+                get_dynamo_executable("nats-server"),
                 "-js",
                 "-sd",
                 self._nats_data_dir,
@@ -273,7 +294,7 @@ class ManagedDynamoRuntime:
             dynamo_cfg=self._dynamo_cfg,
         )
         command = [
-            self._dynamo_cfg.dynamo_python,
+            get_dynamo_python(),
             "-m",
             "dynamo.frontend",
             *argv,
@@ -400,14 +421,28 @@ class ManagedDynamoRuntime:
                 )
 
     def shutdown(self) -> None:
-        self._stop_process(self._frontend_process, "frontend")
+        """Best-effort, idempotent teardown of every owned resource."""
+        try:
+            self._stop_process(self._frontend_process, "frontend")
+        except Exception:
+            LOGGER.exception("Failed to stop the managed Dynamo frontend")
         self._frontend_process = None
-        if self._pool is not None:
-            self._pool.shutdown()
-            self._pool = None
-        self._stop_process(self._nats_process, "NATS")
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to stop the managed Dynamo worker pool")
+        try:
+            self._stop_process(self._nats_process, "NATS")
+        except Exception:
+            LOGGER.exception("Failed to stop managed Dynamo NATS")
         self._nats_process = None
-        self._stop_process(self._etcd_process, "etcd")
+        try:
+            self._stop_process(self._etcd_process, "etcd")
+        except Exception:
+            LOGGER.exception("Failed to stop managed Dynamo etcd")
         self._etcd_process = None
         if self._etcd_data_dir is not None:
             shutil.rmtree(self._etcd_data_dir, ignore_errors=True)
@@ -415,3 +450,7 @@ class ManagedDynamoRuntime:
         if self._nats_data_dir is not None:
             shutil.rmtree(self._nats_data_dir, ignore_errors=True)
             self._nats_data_dir = None
+        if self._atexit_registered:
+            atexit.unregister(self.shutdown)
+            self._atexit_registered = False
+        self._started = False

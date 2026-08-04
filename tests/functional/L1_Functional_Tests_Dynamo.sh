@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Constants for generation backend names.
+#!/bin/bash
+set -xeuo pipefail
 
-These should be used instead of raw string literals when checking or
-comparing backend names in config values.
-"""
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+PROJECT_ROOT=$(realpath "${SCRIPT_DIR}/../..")
+cd "${PROJECT_ROOT}"
 
-VLLM_BACKEND = "vllm"
-SGLANG_BACKEND = "sglang"
-MEGATRON_BACKEND = "megatron"
-DYNAMO_BACKEND = "dynamo"
+uv run --no-sync bash ./tests/functional/grpo_dynamo.sh
+
+cd "${PROJECT_ROOT}/tests"
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

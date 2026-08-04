@@ -15,7 +15,6 @@
 
 import asyncio
 import logging
-import threading
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
@@ -24,9 +23,16 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoConfig
+from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.http_client import (
+    format_dynamo_error,
+    http_post_json,
+)
+from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
+from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
 from nemo_rl.models.generation.interfaces import (
+    CollectiveSenderSpec,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
@@ -41,55 +47,6 @@ if TYPE_CHECKING:
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
 _RETRYABLE_HTTP_STATUS_CODES = {408, 429}
-
-
-def _http_post_json(
-    url: str, payload: dict[str, Any], timeout_s: float
-) -> dict[str, Any]:
-    """POST a JSON body to a URL and parse the JSON response.
-
-    Returns the parsed dict (or a ``{"status": "error", ...}`` shape on
-    transport / HTTP error). Never raises — caller decides how to handle
-    a non-ok status.
-    """
-    import json
-    import urllib.error
-    import urllib.request
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read()
-    except urllib.error.HTTPError as exc:
-        err = exc.read().decode("utf-8", "replace") if exc.fp else ""
-        return {"status": "error", "http_status": exc.code, "raw": err}
-    except (urllib.error.URLError, TimeoutError) as exc:
-        return {"status": "error", "transport_error": f"{type(exc).__name__}: {exc}"}
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        return {
-            "status": "error",
-            "json_decode_error": True,
-            "raw": body.decode("utf-8", "replace"),
-        }
-
-
-def _format_dynamo_error(response: dict[str, Any]) -> str:
-    """Format the internal error shape returned by ``_http_post_json``."""
-    if "http_status" in response:
-        return f"HTTP {response['http_status']}: {response.get('raw', '')}"
-    if "transport_error" in response:
-        return str(response["transport_error"])
-    if "raw" in response:
-        return str(response["raw"])
-    return str(response)
 
 
 def _is_retryable_http_response(response: Any) -> bool:
@@ -115,7 +72,7 @@ def _parse_dynamo_completion_response(
     if response.get("status") == "error":
         raise RuntimeError(
             f"Dynamo completion request to {request_url} failed: "
-            f"{_format_dynamo_error(response)}"
+            f"{format_dynamo_error(response)}"
         )
 
     choices = response.get("choices")
@@ -185,183 +142,22 @@ def _parse_dynamo_completion_response(
     )
 
 
-_DEFAULT_METRICS_EXCLUDE_PREFIXES = ("python_", "process_")
-
-_DYNAMO_RUNTIME_METRIC_PREFIXES = (
-    "dynamo_component_gpu_cache_usage",
-    "dynamo_component_inflight_requests",
-    "dynamo_work_handler_queue_depth",
-    "dynamo_component_requests_total",
-    "dynamo_work_handler_time_to_first_response",
-)
-_ENGINE_PASSTHROUGH_METRIC_PREFIXES = (
-    "vllm:generation_tokens",
-    "vllm:prompt_tokens_total",
-    "vllm:inter_token_latency",
-)
-_CURATED_METRICS_INCLUDE_PREFIXES = (
-    _DYNAMO_RUNTIME_METRIC_PREFIXES + _ENGINE_PASSTHROUGH_METRIC_PREFIXES
-)
-
-_CANONICAL_LOGGER_ALIASES: dict[str, list[str]] = {
-    "inflight_batch_sizes": [
-        "dynamo_component_inflight_requests",
-        "vllm_num_requests_running",
-    ],
-    "num_pending_samples": [
-        "dynamo_work_handler_queue_depth",
-        "vllm_num_requests_waiting",
-    ],
-    "kv_cache_usage_perc": [
-        "dynamo_component_gpu_cache_usage_percent",
-        "vllm_kv_cache_usage_perc",
-        "vllm_gpu_cache_usage_perc",
-    ],
-    "generation_tokens": [
-        "vllm_generation_tokens_total",
-        "vllm_generation_tokens",
-    ],
-}
-
-
-def _http_get_text(url: str, timeout_s: float) -> Optional[str]:
-    """Return a decoded HTTP response body, or None on a transport error."""
-    import urllib.error
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as response:
-            return response.read().decode("utf-8", "replace")
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
-        return None
-
-
-def _parse_prometheus_metrics(
-    text: str,
-    include_prefixes: Optional[tuple[str, ...]] = None,
-    exclude_prefixes: tuple[str, ...] = _DEFAULT_METRICS_EXCLUDE_PREFIXES,
-) -> dict[str, float]:
-    """Parse Prometheus text exposition into summed scalar metric values."""
-    metrics: dict[str, float] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "{" in line:
-            name = line[: line.index("{")]
-            try:
-                value_text = line[line.rindex("}") + 1 :]
-            except ValueError:
-                continue
-        else:
-            parts = line.split(None, 1)
-            if len(parts) != 2:
-                continue
-            name, value_text = parts
-        if name.endswith(("_bucket", "_created")):
-            continue
-        if include_prefixes and not name.startswith(include_prefixes):
-            continue
-        if exclude_prefixes and name.startswith(exclude_prefixes):
-            continue
-        value_parts = value_text.split()
-        if not value_parts:
-            continue
-        try:
-            value = float(value_parts[0])
-        except ValueError:
-            continue
-        key = name.replace(":", "_")
-        metrics[key] = metrics.get(key, 0.0) + value
-    return metrics
-
-
-@ray.remote(num_cpus=0)
-def _post_dynamo_worker_route_remote(
-    *,
-    system_url: str,
-    route: str,
-    payload: dict[str, Any],
-    timeout_s: float,
-) -> bool:
-    """POST one Dynamo worker admin route and raise on failure."""
-    response = _http_post_json(
-        f"{system_url}/engine/{route}",
-        payload,
-        timeout_s,
-    )
-    if response.get("status") != "ok":
-        raise RuntimeError(
-            f"Dynamo worker {system_url} route {route} failed: "
-            f"{_format_dynamo_error(response)}"
-        )
-    print(f"  [Dynamo] worker={system_url} route={route} status=ok", flush=True)
-    return True
-
-
-@ray.remote(num_cpus=0)
-def _update_dynamo_worker_weights_remote(
-    *,
-    system_url: str,
-    update_info: dict[str, Any],
-    timeout_s: float,
-) -> bool:
-    """Run one native vLLM NCCL weight-update transaction."""
-    common: dict[str, Any] = {
-        "allow_unpaused": True,
-        "reset_prefix_cache": False,
-    }
-    steps: tuple[tuple[str, dict[str, Any]], ...] = (
-        (
-            "start_weight_update",
-            {"is_checkpoint_format": True},
-        ),
-        (
-            "update_weights",
-            {"update_info": update_info},
-        ),
-        (
-            "finish_weight_update",
-            {},
-        ),
-    )
-    for engine_rpc, kwargs in steps:
-        response = _http_post_json(
-            f"{system_url}/engine/update_weights_from_distributed",
-            {
-                **common,
-                "engine_rpc": engine_rpc,
-                **kwargs,
-            },
-            timeout_s,
-        )
-        if response.get("status") != "ok":
-            raise RuntimeError(
-                f"Dynamo worker {system_url} RPC {engine_rpc} failed: "
-                f"{_format_dynamo_error(response)}"
-            )
-        print(
-            f"  [Dynamo] worker={system_url} refit_rpc={engine_rpc} status=ok",
-            flush=True,
-        )
-    return True
-
-
 class DynamoGeneration(GenerationInterface):
     """Own a fixed Dynamo service fleet and expose it for NeMo-RL rollouts."""
 
     def __init__(
         self,
         cluster: Optional[RayVirtualCluster],
-        config: DynamoConfig,
+        config: dict[str, Any],
         tokenizer: Any | None = None,
         tokenizer_config: Optional[dict[str, Any]] = None,
     ):
-        self.cfg = config
-        self._dynamo_cfg = DynamoCfg.model_validate(config["dynamo_cfg"])
+        validated_config = DynamoConfig.model_validate(config)
+        self.cfg = validated_config.model_dump()
+        self._dynamo_cfg = validated_config.dynamo_cfg
         dynamo_cfg = self._dynamo_cfg
-        vllm_cfg = config.get("vllm_cfg") or {}
-        expose_http_server = bool(vllm_cfg.get("expose_http_server"))
+        vllm_cfg = validated_config.vllm_cfg
+        expose_http_server = vllm_cfg.expose_http_server
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
         if expose_http_server:
             if tokenizer is None:
@@ -390,77 +186,54 @@ class DynamoGeneration(GenerationInterface):
             )
         self._managed_runtime: Optional["ManagedDynamoRuntime"] = ManagedDynamoRuntime(
             cluster=cluster,
-            config=config,
-            dynamo_cfg=dynamo_cfg,
+            config=self.cfg,
         )
-        self._owns_managed_runtime = True
-        url = self._managed_runtime.frontend_url
-        self._dynamo_frontend_base_url = url
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
-
-        if expose_http_server:
-            request_timeout_s: Optional[float] = None
-            if dynamo_cfg.request_timeout_s is not None:
-                request_timeout_s = dynamo_cfg.request_timeout_s
-            self._token_wrapper_server = DynamoTokenWrapperServer(
-                dynamo_frontend_base_url=url,
-                tokenizer=tokenizer,
-                tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-                request_timeout_s=request_timeout_s,
+        self._dynamo_frontend_base_url = ""
+        self.dp_openai_server_base_urls: list[Optional[str]] = []
+        self._refit_channel: DynamoRefitChannel | None = None
+        self._metrics_sampler: DynamoMetricsSampler | None = None
+        try:
+            self._managed_runtime.start()
+            url = self._managed_runtime.frontend_url
+            self._dynamo_frontend_base_url = url
+            workers = self._managed_runtime.refit_workers()
+            self._refit_channel = DynamoRefitChannel(
+                workers,
+                engine_world_size=validated_config.engine_world_size,
+                request_timeout_s=dynamo_cfg.request_timeout_s,
+                validate_workers=self._managed_runtime.validate_workers,
             )
-            try:
-                wrapper_url = self._token_wrapper_server.start()
-            except Exception:
-                if self._owns_managed_runtime and self._managed_runtime is not None:
-                    self._managed_runtime.shutdown()
-                    self._managed_runtime = None
-                    self._owns_managed_runtime = False
-                self._token_wrapper_server = None
-                raise
-            self.dp_openai_server_base_urls: list[Optional[str]] = [wrapper_url]
-            print(
-                "  [Dynamo] Forwarding rollout chat requests through token "
-                f"wrapper {wrapper_url} -> {url}",
-                flush=True,
-            )
-        else:
-            self.dp_openai_server_base_urls = [url]
-            print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
 
-        self._refit_workers: Optional[list[dict[str, Any]]] = None
-        self._refit_update_info: Optional[dict[str, Any]] = None
-
-        self._metrics_enabled = bool(vllm_cfg.get("enable_vllm_metrics_logger"))
-        self._metrics_interval_s = (
-            float(vllm_cfg["vllm_metrics_logger_interval"])
-            if self._metrics_enabled
-            else 0.0
-        )
-        include_prefixes = dynamo_cfg.metrics_include_prefixes
-        self._metrics_include_prefixes: Optional[tuple[str, ...]] = (
-            tuple(include_prefixes)
-            if include_prefixes is not None
-            else _CURATED_METRICS_INCLUDE_PREFIXES
-        )
-        exclude_prefixes = dynamo_cfg.metrics_exclude_prefixes
-        self._metrics_exclude_prefixes = (
-            tuple(exclude_prefixes)
-            if exclude_prefixes is not None
-            else _DEFAULT_METRICS_EXCLUDE_PREFIXES
-        )
-        self._dynamo_logger_metrics: dict[str, dict[int, list[float]]] = {}
-        self._metrics_lock = threading.Lock()
-        self._metrics_stop: Optional[threading.Event] = None
-        self._metrics_thread: Optional[threading.Thread] = None
-        self._metrics_worker_ordinals: dict[Any, int] = {}
-        self._metrics_workers: Optional[list[dict[str, Any]]] = None
-        if self._metrics_enabled:
-            self._metrics_workers = self._managed_runtime.refit_workers()
-            if not self._metrics_workers:
-                raise RuntimeError(
-                    "Managed Dynamo metrics require at least one vLLM worker."
+            if expose_http_server:
+                self._token_wrapper_server = DynamoTokenWrapperServer(
+                    dynamo_frontend_base_url=url,
+                    tokenizer=tokenizer,
+                    tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                    request_timeout_s=dynamo_cfg.request_timeout_s,
                 )
-            self._start_metrics_sampler()
+                wrapper_url = self._token_wrapper_server.start()
+                self.dp_openai_server_base_urls = [wrapper_url]
+                print(
+                    "  [Dynamo] Forwarding rollout chat requests through token "
+                    f"wrapper {wrapper_url} -> {url}",
+                    flush=True,
+                )
+            else:
+                self.dp_openai_server_base_urls = [url]
+                print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
+
+            if vllm_cfg.enable_vllm_metrics_logger:
+                self._metrics_sampler = DynamoMetricsSampler(
+                    workers,
+                    interval_s=vllm_cfg.vllm_metrics_logger_interval,
+                    include_prefixes=dynamo_cfg.metrics_include_prefixes,
+                    exclude_prefixes=dynamo_cfg.metrics_exclude_prefixes,
+                )
+                self._metrics_sampler.start()
+        except Exception:
+            self.shutdown()
+            raise
 
     # ------------------------------------------------------------------
     # GenerationInterface — lifecycle
@@ -472,137 +245,55 @@ class DynamoGeneration(GenerationInterface):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         return True
 
-    def _start_metrics_sampler(self) -> None:
-        stop = threading.Event()
-        self._metrics_stop = stop
-        self._metrics_thread = threading.Thread(
-            target=self._metrics_loop,
-            name="dynamo-metrics-sampler",
-            daemon=True,
-        )
-        self._metrics_thread.start()
-
-    def _metrics_worker_ordinal(self, instance_id: Any) -> int:
-        ordinal = self._metrics_worker_ordinals.get(instance_id)
-        if ordinal is None:
-            ordinal = len(self._metrics_worker_ordinals)
-            self._metrics_worker_ordinals[instance_id] = ordinal
-        return ordinal
-
-    def _metrics_loop(self) -> None:
-        stop = self._metrics_stop
-        fixed_workers = self._metrics_workers
-        assert stop is not None
-        assert fixed_workers is not None
-
-        stop.wait(min(2.0, self._metrics_interval_s))
-        workers = list(fixed_workers)
-        while not stop.is_set():
-            for worker in workers:
-                text = _http_get_text(
-                    f"{worker['system_url']}/metrics",
-                    timeout_s=self._metrics_interval_s + 2.0,
-                )
-                if stop.is_set():
-                    break
-                if not text:
-                    continue
-                metrics = _parse_prometheus_metrics(
-                    text,
-                    self._metrics_include_prefixes,
-                    self._metrics_exclude_prefixes,
-                )
-                ordinal = self._metrics_worker_ordinal(worker["instance_id"])
-                with self._metrics_lock:
-                    for name, value in metrics.items():
-                        self._dynamo_logger_metrics.setdefault(name, {}).setdefault(
-                            ordinal, []
-                        ).append(value)
-            stop.wait(self._metrics_interval_s)
-
-    def _stop_metrics_sampler(self) -> None:
-        stop = getattr(self, "_metrics_stop", None)
-        thread = getattr(self, "_metrics_thread", None)
-        if stop is not None:
-            stop.set()
-        if (
-            thread is not None
-            and thread is not threading.current_thread()
-            and thread.is_alive()
-        ):
-            thread.join(timeout=max(5.0, self._metrics_interval_s + 3.0))
-            if thread.is_alive():
-                LOGGER.warning("Dynamo metrics sampler did not stop before shutdown.")
-        self._metrics_stop = None
-        self._metrics_thread = None
-
     def get_logger_metrics(self) -> dict[str, Any]:
         """Return per-worker Dynamo metric timelines for generation logging."""
-        if not getattr(self, "_metrics_enabled", False):
-            return {}
-        with self._metrics_lock:
-            metrics = {
-                name: {
-                    worker_id: list(samples)
-                    for worker_id, samples in worker_metrics.items()
-                }
-                for name, worker_metrics in self._dynamo_logger_metrics.items()
-            }
-        for alias, sources in _CANONICAL_LOGGER_ALIASES.items():
-            if alias in metrics:
-                continue
-            source = next((name for name in sources if name in metrics), None)
-            metrics[alias] = dict(metrics[source]) if source is not None else {}
-            if source is not None:
-                del metrics[source]
-        return metrics
+        sampler = self._metrics_sampler
+        return {} if sampler is None else sampler.snapshot()
 
     def clear_logger_metrics(self) -> None:
         """Clear the Dynamo metric timelines for the next logging window."""
-        if not getattr(self, "_metrics_enabled", False):
-            return
-        with self._metrics_lock:
-            self._dynamo_logger_metrics = {}
-
-    def _get_refit_workers(self) -> list[dict[str, Any]]:
-        """Return and freeze the managed Dynamo vLLM worker fleet."""
-        if self._refit_workers is not None:
-            return self._refit_workers
-
-        if self._managed_runtime is None:
-            raise RuntimeError(
-                "Managed Dynamo refit state is only available on the driver "
-                "instance that owns the runtime."
-            )
-        workers = self._managed_runtime.refit_workers()
-        if not workers:
-            raise RuntimeError("Managed Dynamo started with no vLLM workers.")
-        self._refit_workers = workers
-        return workers
-
-    def _validate_refit_workers(self) -> list[dict[str, Any]]:
-        """Fail if the fixed worker fleet changed after collective setup."""
-        expected = self._get_refit_workers()
-        if self._managed_runtime is None:
-            raise RuntimeError("Managed Dynamo runtime is not owned here.")
-        return self._managed_runtime.validate_workers(expected)
+        sampler = self._metrics_sampler
+        if sampler is not None:
+            sampler.clear()
 
     def get_inference_world_size(self) -> int:
         """Return the number of vLLM ranks across all discovered workers."""
-        engine_world_size = self._dynamo_cfg.engine_world_size
-        return len(self._get_refit_workers()) * engine_world_size
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        return channel.inference_world_size
+
+    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
+        """Return vLLM's NCCL protocol and packed-transfer geometry."""
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        return channel.sender_spec
 
     def shutdown(self) -> bool:
         """Stop process-local helpers and any driver-owned managed runtime."""
-        self._stop_metrics_sampler()
+        sampler = self._metrics_sampler
+        self._metrics_sampler = None
+        if sampler is not None:
+            try:
+                sampler.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to stop the Dynamo metrics sampler")
         token_wrapper_server = self._token_wrapper_server
+        self._token_wrapper_server = None
         if token_wrapper_server is not None:
-            token_wrapper_server.shutdown()
-            self._token_wrapper_server = None
-        if self._owns_managed_runtime and self._managed_runtime is not None:
-            self._managed_runtime.shutdown()
-            self._managed_runtime = None
-            self._owns_managed_runtime = False
+            try:
+                token_wrapper_server.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to stop the Dynamo token wrapper")
+        managed_runtime = self._managed_runtime
+        self._managed_runtime = None
+        if managed_runtime is not None:
+            try:
+                managed_runtime.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to stop the managed Dynamo runtime")
+        self._refit_channel = None
         return True
 
     # ------------------------------------------------------------------
@@ -610,15 +301,27 @@ class DynamoGeneration(GenerationInterface):
     # ------------------------------------------------------------------
 
     def __getstate__(self) -> dict[str, Any]:
+        """Serialize only HTTP clients needed by Ray rollout actors.
+
+        Driver-owned subprocesses, threads, and Ray worker handles are excluded.
+        The endpoint-only refit channel is retained so AREAL-style cache
+        invalidation still reaches every managed worker after deserialization.
+        """
+        refit_channel = self._refit_channel
         return {
             "cfg": self.cfg,
             "dp_openai_server_base_urls": self.dp_openai_server_base_urls,
             "_dynamo_frontend_base_url": self._dynamo_frontend_base_url,
+            "_refit_channel": (
+                None if refit_channel is None else refit_channel.client_copy()
+            ),
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a client-only rollout copy with no service ownership."""
         self.cfg = state["cfg"]
-        self._dynamo_cfg = DynamoCfg.model_validate(self.cfg["dynamo_cfg"])
+        validated_config = DynamoConfig.model_validate(self.cfg)
+        self._dynamo_cfg = validated_config.dynamo_cfg
         self.dp_openai_server_base_urls = state["dp_openai_server_base_urls"]
         frontend_url = state.get(
             "_dynamo_frontend_base_url",
@@ -629,20 +332,8 @@ class DynamoGeneration(GenerationInterface):
         self._dynamo_frontend_base_url = frontend_url
         self._token_wrapper_server = None
         self._managed_runtime = None
-        self._owns_managed_runtime = False
-        self._metrics_enabled = False
-        self._metrics_interval_s = 0.0
-        self._metrics_include_prefixes = None
-        self._metrics_exclude_prefixes = _DEFAULT_METRICS_EXCLUDE_PREFIXES
-        self._dynamo_logger_metrics = {}
-        self._metrics_lock = threading.Lock()
-        self._metrics_stop = None
-        self._metrics_thread = None
-        self._metrics_worker_ordinals = {}
-        self._metrics_workers = None
-        # Refit state is process-local; Ray copies must rediscover the worker fleet.
-        self._refit_workers = None
-        self._refit_update_info = None
+        self._metrics_sampler = None
+        self._refit_channel = state["_refit_channel"]
 
     def _completion_url(self) -> str:
         base_url = self._dynamo_frontend_base_url
@@ -651,13 +342,7 @@ class DynamoGeneration(GenerationInterface):
         return f"{base_url.rstrip('/')}/completions"
 
     def _request_timeout_s(self) -> float:
-        request_timeout_s = self._dynamo_cfg.request_timeout_s
-        if request_timeout_s is None:
-            raise RuntimeError(
-                "DynamoGeneration direct generate() requires "
-                "policy.generation.dynamo_cfg.request_timeout_s."
-            )
-        return request_timeout_s
+        return self._dynamo_cfg.request_timeout_s
 
     def _merge_stop_strings(self, batch_stop_strings: Any) -> Optional[list[str]]:
         stop_set: set[str] = set()
@@ -762,7 +447,7 @@ class DynamoGeneration(GenerationInterface):
         )
         response: dict[str, Any] = {}
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
-            response = _http_post_json(request_url, payload, self._request_timeout_s())
+            response = http_post_json(request_url, payload, self._request_timeout_s())
             if not _is_retryable_http_response(response):
                 break
             if attempt == _HTTP_MAX_ATTEMPTS:
@@ -772,7 +457,7 @@ class DynamoGeneration(GenerationInterface):
                 attempt,
                 _HTTP_MAX_ATTEMPTS,
                 _HTTP_RETRY_DELAY_S,
-                _format_dynamo_error(response),
+                format_dynamo_error(response),
             )
             time.sleep(_HTTP_RETRY_DELAY_S)
         return _parse_dynamo_completion_response(response, request_url=request_url)
@@ -840,139 +525,14 @@ class DynamoGeneration(GenerationInterface):
         data: BatchedDataDict["GenerationDatumSpec"],
         greedy: bool = False,
     ) -> BatchedDataDict["GenerationOutputSpec"]:
-        """Generate a batch of token-ID prompts through the managed frontend."""
-        assert isinstance(data, BatchedDataDict), (
-            f"data must be a BatchedDataDict, got type: {type(data)}"
-        )
-        assert "input_ids" in data and "input_lengths" in data, (
-            "input_ids and input_lengths are required in data for Dynamo generation"
-        )
+        """Reject the unused blocking interface.
 
-        input_ids = data["input_ids"]
-        input_lengths = data["input_lengths"]
-        if len(input_ids) == 0:
-            return BatchedDataDict[GenerationOutputSpec](
-                {
-                    "output_ids": torch.zeros(
-                        (0, 0), dtype=torch.long, device=input_ids.device
-                    ),
-                    "logprobs": torch.zeros(
-                        (0, 0), dtype=torch.float, device=input_ids.device
-                    ),
-                    "generation_lengths": torch.zeros(
-                        0, dtype=torch.long, device=input_ids.device
-                    ),
-                    "unpadded_sequence_lengths": torch.zeros(
-                        0, dtype=torch.long, device=input_ids.device
-                    ),
-                    "truncated": torch.zeros(
-                        0, dtype=torch.bool, device=input_ids.device
-                    ),
-                }
-            )
-
-        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
-
-        batch_stop_strings = data.get("stop_strings", [])
-        padded_input_length = input_ids.size(1)
-
-        per_sample_results = []
-        max_generated_length = 0
-        for sample_idx in range(input_ids.shape[0]):
-            input_length = int(input_lengths[sample_idx].item())
-            per_sample_stop_strings = None
-            if batch_stop_strings and sample_idx < len(batch_stop_strings):
-                per_sample_stop_strings = batch_stop_strings[sample_idx]
-            stop_strings = self._merge_stop_strings(
-                [per_sample_stop_strings] if per_sample_stop_strings else None
-            )
-            allowed_new_tokens = self._allowed_new_tokens(input_length)
-            if allowed_new_tokens == 0:
-                result = ([], [], False)
-            else:
-                result = self._post_completion_request(
-                    prompt_token_ids=self._prompt_token_ids(data, sample_idx),
-                    greedy=greedy,
-                    stop_strings=stop_strings,
-                    max_new_tokens=allowed_new_tokens,
-                )
-            generated_token_ids, generated_logprobs, truncated = result
-            per_sample_results.append(
-                (generated_token_ids, generated_logprobs, truncated)
-            )
-            max_generated_length = max(max_generated_length, len(generated_token_ids))
-
-        total_length = padded_input_length + max_generated_length
-        output_ids_list = []
-        logprobs_list = []
-        generation_lengths = []
-        unpadded_sequence_lengths = []
-        truncated_list = []
-
-        for sample_idx, (
-            generated_token_ids,
-            generated_logprobs,
-            truncated,
-        ) in enumerate(per_sample_results):
-            input_length = int(input_lengths[sample_idx].item())
-            full_output = torch.full(
-                (total_length,),
-                self.cfg["_pad_token_id"],
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            full_output[:input_length] = input_ids[sample_idx, :input_length]
-            if generated_token_ids:
-                full_output[input_length : input_length + len(generated_token_ids)] = (
-                    torch.tensor(
-                        generated_token_ids,
-                        dtype=input_ids.dtype,
-                        device=input_ids.device,
-                    )
-                )
-
-            full_logprobs = torch.zeros(
-                total_length,
-                dtype=torch.float32,
-                device=input_ids.device,
-            )
-            for idx, logprob in enumerate(
-                generated_logprobs[: len(generated_token_ids)]
-            ):
-                full_logprobs[input_length + idx] = logprob
-
-            response_length = input_length + len(generated_token_ids)
-            self._assert_response_within_context(
-                input_length=input_length,
-                generated_length=len(generated_token_ids),
-            )
-
-            output_ids_list.append(full_output)
-            logprobs_list.append(full_logprobs)
-            generation_lengths.append(len(generated_token_ids))
-            unpadded_sequence_lengths.append(response_length)
-            truncated_list.append(truncated)
-
-        return BatchedDataDict[GenerationOutputSpec](
-            {
-                "output_ids": torch.stack(output_ids_list),
-                "logprobs": torch.stack(logprobs_list),
-                "generation_lengths": torch.tensor(
-                    generation_lengths,
-                    dtype=torch.long,
-                    device=input_ids.device,
-                ),
-                "unpadded_sequence_lengths": torch.tensor(
-                    unpadded_sequence_lengths,
-                    dtype=torch.long,
-                    device=input_ids.device,
-                ),
-                "truncated": torch.tensor(
-                    truncated_list,
-                    dtype=torch.bool,
-                    device=input_ids.device,
-                ),
-            }
+        Both synchronous and asynchronous GRPO trainers use ``generate_async``
+        for the managed HTTP frontend.
+        """
+        raise NotImplementedError(
+            "Dynamo generation uses generate_async() for both synchronous and "
+            "asynchronous GRPO trainers"
         )
 
     async def generate_async(
@@ -1053,66 +613,22 @@ class DynamoGeneration(GenerationInterface):
         train_world_size: int,
     ) -> list[ray.ObjectRef]:
         """Initialize native vLLM NCCL transfer on every managed worker."""
-        workers = self._get_refit_workers()
-        engine_world_size = self._dynamo_cfg.engine_world_size
-        inference_world_size = len(workers) * engine_world_size
-        expected_world_size = train_world_size + inference_world_size
-        if world_size != expected_world_size:
-            raise ValueError(
-                f"NCCL world_size={world_size} does not match "
-                f"train_world_size={train_world_size} + Dynamo inference "
-                f"world size={inference_world_size}."
-            )
-
-        rank_offsets = [
-            train_world_size + worker_idx * engine_world_size
-            for worker_idx in range(len(workers))
-        ]
-        print(
-            f"  [Dynamo] initializing NCCL world_size={world_size} "
-            f"train_world_size={train_world_size} "
-            f"engine_world_size={engine_world_size} rank_offsets={rank_offsets}",
-            flush=True,
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        return channel.init_collective(
+            ip,
+            port,
+            world_size,
+            train_world_size=train_world_size,
         )
-
-        timeout_s = self._request_timeout_s()
-        return [
-            _post_dynamo_worker_route_remote.remote(
-                system_url=worker["system_url"],
-                route="init_weights_update_group",
-                payload={
-                    "engine_rpc": "init_weight_transfer_engine",
-                    "init_info": {
-                        "master_address": ip,
-                        "master_port": port,
-                        "rank_offset": train_world_size
-                        + worker_idx * engine_world_size,
-                        "world_size": world_size,
-                    },
-                },
-                timeout_s=timeout_s,
-            )
-            for worker_idx, worker in enumerate(workers)
-        ]
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Serialize checkpoint-format tensor metadata for native vLLM refit."""
-        if state_dict_info is None:
-            raise ValueError("state_dict_info must not be None for Dynamo refit.")
-
-        names: list[str] = []
-        dtype_names: list[str] = []
-        shapes: list[list[int]] = []
-        for name, (shape, dtype) in state_dict_info.items():
-            names.append(name)
-            dtype_names.append(str(dtype).removeprefix("torch."))
-            shapes.append(list(shape))
-        self._refit_update_info = {
-            "names": names,
-            "dtype_names": dtype_names,
-            "shapes": shapes,
-            "packed": True,
-        }
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.prepare(state_dict_info)
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         raise NotImplementedError(
@@ -1121,31 +637,14 @@ class DynamoGeneration(GenerationInterface):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Receive packed checkpoint-format weights on every Dynamo worker."""
-        if self._refit_update_info is None:
-            raise RuntimeError(
-                "prepare_refit_info() must be called before Dynamo weight updates."
-            )
-        workers = self._validate_refit_workers()
-        timeout_s = self._request_timeout_s()
-        return [
-            _update_dynamo_worker_weights_remote.remote(
-                system_url=worker["system_url"],
-                update_info=self._refit_update_info,
-                timeout_s=timeout_s,
-            )
-            for worker in workers
-        ]
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        return channel.update_weights()
 
     def invalidate_kv_cache(self) -> bool:
         """Flush every fixed Dynamo worker's prefix/KV cache."""
-        workers = self._validate_refit_workers()
-        futures = [
-            _post_dynamo_worker_route_remote.remote(
-                system_url=worker["system_url"],
-                route="flush_cache",
-                payload={},
-                timeout_s=self._request_timeout_s(),
-            )
-            for worker in workers
-        ]
-        return all(ray.get(futures))
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        return channel.flush_cache()
