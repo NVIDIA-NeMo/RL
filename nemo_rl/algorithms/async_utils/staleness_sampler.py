@@ -114,6 +114,10 @@ class PromptGroupSampler(Protocol):
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
 
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        """Seed the dispatch cursor when resuming from a checkpoint."""
+        ...
+
 
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
@@ -123,26 +127,28 @@ class BaseSampler(abc.ABC):
     select-finalize / weight-window-evict helpers.
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, resume_from_step: int = 0) -> None:
-        """Initialize shared sampler state.
+    def __init__(self, buffer: TQReplayBuffer) -> None:
+        self._buffer = buffer
+        # Pre-incremented before each admitted batch, so -1 lets the first
+        # batch through a zero-staleness gate.
+        self._dispatch_index: int = -1
+
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        """Seed the dispatch cursor when resuming from a checkpoint.
 
         Args:
-            buffer: Shared TQReplayBuffer holding the candidate slots.
             resume_from_step: Trainer step this run starts from — 0 for a
-                fresh run, the restored ``current_step`` when resuming from a
-                checkpoint. Seeds the dispatch cursor so gated ``admit`` and
+                fresh run, the restored ``current_step`` when resuming. Sets
+                the cursor to ``resume_from_step - 1`` so gated ``admit`` and
                 ``InOrderSampler``'s target_step stamps line up with the
-                restored trainer version exactly as they would at step 0 of
-                a fresh run.
+                restored trainer version exactly as at step 0 of a fresh run.
+                Call before the first ``admit``.
         """
         if resume_from_step < 0:
             raise ValueError(
                 f"resume_from_step must be non-negative, got {resume_from_step}"
             )
-        self._buffer = buffer
-        # Pre-incremented before each admitted batch, so the cursor trails
-        # the run's starting step by one.
-        self._dispatch_index: int = resume_from_step - 1
+        self._dispatch_index = resume_from_step - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -244,9 +250,8 @@ class WindowedSampler(BaseSampler):
         *,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
-        resume_from_step: int = 0,
     ) -> None:
-        super().__init__(buffer, resume_from_step=resume_from_step)
+        super().__init__(buffer)
         if max_staleness_versions < 0:
             raise ValueError(
                 f"max_staleness_versions must be non-negative, got "
@@ -311,14 +316,8 @@ class _GatedSampler(BaseSampler):
     (``gate_window`` versions of lookahead).
     """
 
-    def __init__(
-        self,
-        buffer: TQReplayBuffer,
-        *,
-        gate_window: int,
-        resume_from_step: int = 0,
-    ) -> None:
-        super().__init__(buffer, resume_from_step=resume_from_step)
+    def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
+        super().__init__(buffer)
         if gate_window < 0:
             raise ValueError(f"gate_window must be non-negative, got {gate_window}")
         self._gate_window = gate_window
@@ -350,18 +349,8 @@ class WeightFifoSampler(_GatedSampler):
     that weight's batch to fill. Evict uses the weight window (default).
     """
 
-    def __init__(
-        self,
-        buffer: TQReplayBuffer,
-        *,
-        max_staleness_versions: int,
-        resume_from_step: int = 0,
-    ) -> None:
-        super().__init__(
-            buffer,
-            gate_window=max_staleness_versions,
-            resume_from_step=resume_from_step,
-        )
+    def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
+        super().__init__(buffer, gate_window=max_staleness_versions)
         self.max_staleness_versions = max_staleness_versions
 
     async def select(
@@ -401,18 +390,8 @@ class InOrderSampler(_GatedSampler):
     upcoming is never dropped early, and evict/select can't disagree.
     """
 
-    def __init__(
-        self,
-        buffer: TQReplayBuffer,
-        *,
-        max_lookahead_versions: int,
-        resume_from_step: int = 0,
-    ) -> None:
-        super().__init__(
-            buffer,
-            gate_window=max_lookahead_versions,
-            resume_from_step=resume_from_step,
-        )
+    def __init__(self, buffer: TQReplayBuffer, *, max_lookahead_versions: int) -> None:
+        super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
 
     def _stamp(self) -> Optional[int]:
@@ -516,40 +495,20 @@ def required_buffer_capacity_for_config(
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
-    *,
-    resume_from_step: int = 0,
 ) -> PromptGroupSampler:
-    """Build a sampler from its config (or import one by FQN).
-
-    Args:
-        buffer: Shared TQReplayBuffer holding the candidate slots.
-        cfg: Discriminated sampler config selecting the policy.
-        resume_from_step: Trainer step this run starts from; 0 for a fresh
-            run, the restored ``current_step`` on checkpoint resume (see
-            ``BaseSampler.__init__``). Custom samplers receive it only on
-            resume, so fresh starts don't constrain their constructor
-            signature — a custom class that doesn't accept the kwarg fails
-            loudly the first time a run actually resumes with it.
-    """
+    """Build a sampler from its config (or import one by FQN)."""
     if isinstance(cfg, WindowedSamplerConfig):
         return WindowedSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
-            resume_from_step=resume_from_step,
         )
     if isinstance(cfg, WeightFifoSamplerConfig):
         return WeightFifoSampler(
-            buffer,
-            max_staleness_versions=cfg.max_staleness_versions,
-            resume_from_step=resume_from_step,
+            buffer, max_staleness_versions=cfg.max_staleness_versions
         )
     if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(
-            buffer,
-            max_lookahead_versions=cfg.max_lookahead_versions,
-            resume_from_step=resume_from_step,
-        )
+        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
     if isinstance(cfg, CustomSamplerConfig):
         module_name, sep, class_name = cfg.target.partition(":")
         if not sep:
@@ -557,15 +516,13 @@ def create_sampler(
                 f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
             )
         sampler_cls = getattr(importlib.import_module(module_name), class_name)
-        custom_kwargs = dict(cfg.model_extra or {})
-        if resume_from_step != 0:
-            custom_kwargs["resume_from_step"] = resume_from_step
-        sampler = sampler_cls(buffer, **custom_kwargs)
+        sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
-                f"interface (needs admit/select/evict, is_on_policy, "
-                f"supports_buffer_checkpoint, required_buffer_capacity)"
+                f"interface (needs admit/select/evict, set_dispatch_index, "
+                f"is_on_policy, supports_buffer_checkpoint, "
+                f"required_buffer_capacity)"
             )
         return sampler
     raise ValueError(f"unknown sampler config {type(cfg).__name__}")

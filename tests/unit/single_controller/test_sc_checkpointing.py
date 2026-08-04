@@ -24,7 +24,7 @@ Covers:
   - metric_name behavior (val:* warn-and-save, train:* value recorded);
   - dataloader state: train_dataloader.pt written at save, position
     round-trip through a real StatefulDataLoader, dataset-swap guard,
-    setup restore wiring + missing-file fresh-position fallback;
+    setup restore wiring + missing-file corruption check;
   - replay buffer persistence gated on sampler.supports_buffer_checkpoint;
   - setup_single_controller resume-path wiring (get_resume_paths forwarded
     to the trainer factory, save_state loaded from training_info.json).
@@ -192,6 +192,9 @@ class _FakeSampler:
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
+
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        pass
 
 
 class _FakeDPClient:
@@ -809,8 +812,15 @@ class TestSetupResumeWiring:
         tmp_path,
     ):
         ckpt_dir = tmp_path / "ckpts"
-        _write_checkpoint(ckpt_dir, 1, {**_STEP_3_SAVE_STATE, "current_step": 1})
-        step_3 = _write_checkpoint(ckpt_dir, 3, _STEP_3_SAVE_STATE)
+        _write_checkpoint(
+            ckpt_dir,
+            1,
+            {**_STEP_3_SAVE_STATE, "current_step": 1},
+            dataloader_state={"fake_position": 1},
+        )
+        step_3 = _write_checkpoint(
+            ckpt_dir, 3, _STEP_3_SAVE_STATE, dataloader_state={"fake_position": 3}
+        )
         mc = _setup_master_config(str(ckpt_dir))
 
         actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -941,32 +951,23 @@ class TestDataloaderState:
         fake_dataloader.load_state_dict.assert_called_once()
         assert fake_dataloader.load_state_dict.call_args.args[0] == sentinel
 
-    def test_setup_missing_dataloader_state_starts_fresh(
+    def test_setup_missing_dataloader_state_raises(
         self,
         patched_factories,  # noqa: F811
         tmp_path,
-        monkeypatch,
     ):
         # Checkpoint with training_info.json + policy/ but no
-        # train_dataloader.pt. Setup must warn and keep the fresh position
-        # while still forwarding the weight resume paths.
+        # train_dataloader.pt. SC always writes it on save, so a missing file
+        # means a corrupted checkpoint — setup must raise, not silently start
+        # from a fresh dataloader position (matching GRPO's contract).
         ckpt_dir = tmp_path / "ckpts"
-        step_3 = _write_checkpoint(ckpt_dir, 3, _STEP_3_SAVE_STATE)
+        _write_checkpoint(ckpt_dir, 3, _STEP_3_SAVE_STATE)
         mc = _setup_master_config(str(ckpt_dir))
-        printed: list[str] = []
-        # Repo addopts run pytest with -s, so capsys sees nothing; record
-        # print calls instead.
-        monkeypatch.setattr(
-            "builtins.print",
-            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
-        )
 
-        setup_single_controller(mc, MagicMock(pad_token_id=0))
+        with pytest.raises(FileNotFoundError):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         patched_factories["dataloader"].load_state_dict.assert_not_called()
-        assert any("No dataloader state found" in line for line in printed)
-        trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
-        assert trainer_kwargs["weights_path"] == step_3 / "policy" / "weights"
 
 
 # ── replay buffer persistence ────────────────────────────────────────────────

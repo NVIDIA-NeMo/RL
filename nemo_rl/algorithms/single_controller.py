@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import time
 import warnings
 from functools import partial
@@ -156,11 +155,8 @@ class SingleControllerActor:
         self._inference_cluster = actor_args.inference_cluster
 
         num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
-        self._sampler = create_sampler(
-            self._buffer,
-            self._async_cfg.sampler,
-            resume_from_step=actor_args.save_state["current_step"],
-        )
+        self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
+        self._sampler.set_dispatch_index(actor_args.save_state["current_step"])
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
         validate_sampler_buffer_capacity(
             self._async_cfg,
@@ -234,21 +230,9 @@ class SingleControllerActor:
             rollout_task.cancel()
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
-            # Flush the last checkpoint's background finalization; a failure
-            # raises on a clean exit but never masks a propagating exception.
-            propagating = sys.exc_info()[0] is not None
-            try:
-                await asyncio.to_thread(self._checkpointer.shutdown)
-            except Exception:
-                if not propagating:
-                    raise
-                warnings.warn(
-                    "Checkpoint finalization failed while handling an "
-                    "exception; the original exception will be re-raised.",
-                    stacklevel=2,
-                )
-            finally:
-                self._logger.finish()
+            self._logger.finish()
+            # Flush the last checkpoint's background finalization before exit.
+            await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
             "train_steps": self._train_steps,

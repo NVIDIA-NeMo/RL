@@ -21,7 +21,6 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -373,19 +372,8 @@ def setup_single_controller(
         num_workers=data_config["num_workers"],
     )
     if last_checkpoint_path is not None:
-        dataloader_state_path = os.path.join(
-            last_checkpoint_path, "train_dataloader.pt"
-        )
-        if os.path.exists(dataloader_state_path):
-            print(
-                f"📦 Restoring dataloader state from checkpoint: {dataloader_state_path}"
-            )
-            load_dataloader_state(dataloader, last_checkpoint_path, data_config)
-        else:
-            print(
-                f"⚠️ No dataloader state found at {dataloader_state_path}. "
-                "Starting with a fresh dataloader position."
-            )
+        print(f"📦 Restoring dataloader state from checkpoint: {last_checkpoint_path}")
+        load_dataloader_state(dataloader, last_checkpoint_path, data_config)
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
