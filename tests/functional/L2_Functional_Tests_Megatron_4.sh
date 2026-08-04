@@ -20,6 +20,14 @@ PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
 cd ${PROJECT_ROOT}
 
+# L2 Megatron generation tests: nano-3.5 (30B-A3B mamba-hybrid MoE) async
+# non-colocated generation with the Megatron inference backend, exercising extra
+# features on top of the base non-colocated path. These are CLUSTER tests: they
+# must run from /opt/nemo-rl on the HEAD of a 2-node `cog submit --launcher ray`
+# allocation on GB200 / oci-hsg (1 gen node + 1 train node, 4 GPUs each -> EP=4),
+# with the nano-3.5 checkpoint mounted. See
+# .claude/skills/run-nano35-megatron-inference-cog/SKILL.md.
+
 # run_test [fast] <command...>
 # - "run_test fast <cmd>" = always runs (both fast and full modes)
 # - "run_test <cmd>"      = only runs in full mode; skipped when FAST=1
@@ -35,17 +43,8 @@ run_test() {
 }
 
 
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
-# DISABLED: Megatron top-p/top-k generation logprobs do not match the training-side
-# filtered logprobs closely enough (token_mult_prob_error ~1.12 > 1.05). MCore's
-# flashinfer top-k/top-p renormalization uses a different nucleus convention than
-# NeMo-RL's apply_top_k_top_p (and vLLM), so this cannot be closed purely in NeMo-RL.
-# run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
+run_test      bash ./tests/functional/grpo_megatron_generation_async_prefix_caching.sh
+run_test      bash ./tests/functional/grpo_megatron_generation_async_mxfp8.sh
 
 
 cd ${PROJECT_ROOT}/tests
