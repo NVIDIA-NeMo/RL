@@ -923,17 +923,20 @@ def resolve_generation_metrics_logger(
     and TRT-LLM (trtllm_cfg.enable_trtllm_metrics_logger) so downstream
     console/wandb visualization fires for whichever backend is active.
     """
-    vllm_cfg = generation_cfg.get("vllm_cfg", {}) or {}
-    if vllm_cfg.get("enable_vllm_metrics_logger", False) and vllm_cfg.get(
-        "async_engine", False
-    ):
-        return vllm_cfg["vllm_metrics_logger_interval"]
+    backend = generation_cfg.get("backend")
 
-    trtllm_cfg = generation_cfg.get("trtllm_cfg", {}) or {}
-    if trtllm_cfg.get("enable_trtllm_metrics_logger") and trtllm_cfg.get(
-        "async_engine", False
-    ):
-        return trtllm_cfg["trtllm_metrics_logger_interval"]
+    if backend == "vllm":
+        vllm_cfg = generation_cfg.get("vllm_cfg", {}) or {}
+        if vllm_cfg.get("enable_vllm_metrics_logger", False) and vllm_cfg.get(
+            "async_engine", False
+        ):
+            return vllm_cfg["vllm_metrics_logger_interval"]
+    elif backend == "trtllm":
+        trtllm_cfg = generation_cfg.get("trtllm_cfg", {}) or {}
+        if trtllm_cfg.get("enable_trtllm_metrics_logger", False) and trtllm_cfg.get(
+            "async_engine", False
+        ):
+            return trtllm_cfg["trtllm_metrics_logger_interval"]
 
     return None
 
