@@ -908,20 +908,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
         )
 
 
-_mxfp8_shuffle_scratch_buffers: dict[
-    tuple[str, tuple[int, ...], torch.device], torch.Tensor
-] = {}
-
-
-def _mxfp8_scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:
-    key = (tag, tuple(shape), device)
-    buffer = _mxfp8_shuffle_scratch_buffers.get(key)
-    if buffer is None:
-        buffer = torch.empty(shape, dtype=torch.uint8, device=device)
-        _mxfp8_shuffle_scratch_buffers[key] = buffer
-    return buffer
-
-
 def _mxfp8_moe_row_permutations(
     layer,
     w13_weight: torch.Tensor,
@@ -971,35 +957,15 @@ def _shuffle_mxfp8_moe_batched(
     num_experts = w13_weight.shape[0]
     w13_u8 = w13_weight.view(torch.uint8)
     w2_u8 = w2_weight.view(torch.uint8)
-    w13_shuffled = torch.index_select(
-        w13_u8,
-        1,
-        perm_w13,
-        out=_mxfp8_scratch("w13", w13_u8.shape, w13_u8.device),
-    )
-    w2_shuffled = torch.index_select(
-        w2_u8,
-        1,
-        perm_w2,
-        out=_mxfp8_scratch("w2", w2_u8.shape, w2_u8.device),
-    )
+    w13_shuffled = torch.index_select(w13_u8, 1, perm_w13)
+    w2_shuffled = torch.index_select(w2_u8, 1, perm_w2)
 
     w13_scale_u8 = pad_flashinfer_scale_k(w13_scale.view(torch.uint8))
     w2_scale_u8 = pad_flashinfer_scale_k(w2_scale.view(torch.uint8))
     assert w13_scale_u8.shape[1] % 128 == 0
     assert w2_scale_u8.shape[1] % 128 == 0
-    w13_scale_gathered = torch.index_select(
-        w13_scale_u8,
-        1,
-        perm_w13,
-        out=_mxfp8_scratch("w13_scale", w13_scale_u8.shape, w13_scale_u8.device),
-    )
-    w2_scale_gathered = torch.index_select(
-        w2_scale_u8,
-        1,
-        perm_w2,
-        out=_mxfp8_scratch("w2_scale", w2_scale_u8.shape, w2_scale_u8.device),
-    )
+    w13_scale_gathered = torch.index_select(w13_scale_u8, 1, perm_w13)
+    w2_scale_gathered = torch.index_select(w2_scale_u8, 1, perm_w2)
     w13_scale_shuffled = (
         block_scale_interleave(w13_scale_gathered)
         .view(MXFP8_SCALE_DTYPE)

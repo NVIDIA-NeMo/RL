@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import types
+import weakref
 
 import pytest
 import torch
@@ -158,6 +160,16 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert actual.shape == expected.shape
         assert actual.dtype == expected.dtype
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    value_storage_owners = []
+    for tensor in batched[:2]:
+        while tensor._base is not None:
+            tensor = tensor._base
+        value_storage_owners.append(tensor)
+    value_storage_refs = [weakref.ref(tensor) for tensor in value_storage_owners]
+    del batched, value_storage_owners, tensor
+    gc.collect()
+    assert all(ref() is None for ref in value_storage_refs)
 
 
 @pytest.mark.parametrize("use_batched", [True, False])
