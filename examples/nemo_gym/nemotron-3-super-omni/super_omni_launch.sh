@@ -165,7 +165,14 @@ export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 # container. Transformers then treats an absent local path as a Hub repo id and
 # fails with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'",
 # which says nothing about mounts. Check here instead.
-for path_var in MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE; do
+mount_checked_vars=(MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE)
+# GYM_VENV_DIR defaults to a container-internal path, which needs no mount. It
+# only has to be checked when pointed at host storage -- worth doing, because
+# putting it on a shared filesystem is how Gym's skip_venv_if_present actually
+# takes effect: the container-local default is discarded with the container, so
+# every run rebuilds ~175 packages per resource server.
+[[ "${GYM_VENV_DIR}" != /opt/* ]] && mount_checked_vars+=(GYM_VENV_DIR)
+for path_var in "${mount_checked_vars[@]}"; do
     path_value="${!path_var}"
     mounted=false
     IFS=',' read -ra mount_specs <<< "${MOUNTS}"
