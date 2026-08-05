@@ -36,3 +36,27 @@ def test_spec_decode_max_tokens_clamp(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("cap_to_context", "spec_lookahead", "expected"),
+    [
+        (False, 0, 400),
+        (True, 0, 300),
+        (False, 5, 294),
+        (True, 5, 294),
+    ],
+)
+def test_request_max_new_tokens_combines_context_and_spec_limits(
+    cap_to_context, spec_lookahead, expected
+):
+    assert (
+        BaseVllmGenerationWorker._request_max_new_tokens(
+            configured_max_new_tokens=400,
+            input_length=700,
+            max_model_len=1000,
+            cap_to_context=cap_to_context,
+            spec_lookahead=spec_lookahead,
+        )
+        == expected
+    )

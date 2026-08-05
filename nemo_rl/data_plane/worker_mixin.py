@@ -134,6 +134,12 @@ class TQWorkerMixin:
 
         Called once by the driver after worker construction. Idempotent.
         """
+        if getattr(self, "model_slices_context_parallel_inputs", False):
+            raise NotImplementedError(
+                "TransferQueue/SingleController does not yet support models that "
+                "insert media before context-parallel input selection. Use the "
+                "synchronous NeMo-RL policy path for Nemotron Omni."
+            )
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
