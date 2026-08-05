@@ -30,11 +30,6 @@ from nemo_rl.data.interfaces import (
     VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
-from nemo_rl.data.multimodal_utils import (
-    get_dim_to_pack_along,
-    get_multimodal_keys_from_processor,
-    uses_image_placeholder,
-)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -465,6 +460,9 @@ def vlm_hf_data_processor(
     from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
+        get_dim_to_pack_along,
+        get_multimodal_keys_from_processor,
+        uses_image_placeholder,
         get_multimodal_default_settings_from_processor,
         resolve_to_image,
     )
@@ -560,7 +558,6 @@ def vlm_hf_data_processor(
     # so we must use processor(text=..., images=...) directly.
     uses_placeholder = uses_image_placeholder(processor)
 
-    message: dict
     if uses_placeholder and images:
         # Convert content list to <image> placeholder text format
         image_token = getattr(processor, "image_token", "<image>")
