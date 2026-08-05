@@ -95,9 +95,7 @@ class SingleControllerActor:
         Args:
             master_config: SC MasterConfig.
             actor_args: Pre-built actor args from setup_single_controller.
-            setup_timing_metrics: Per-phase timings collected on the driver in
-                setup_single_controller; logged here because Logger backends
-                can't be cloudpickled into the actor.
+            setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
         validate_single_controller_config(master_config)
 

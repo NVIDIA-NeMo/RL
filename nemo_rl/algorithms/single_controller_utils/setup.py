@@ -464,7 +464,8 @@ def setup_single_controller(
         """Build generation then trainer serially.
 
         Args:
-            defer_generation_model_load: If True, `generation` is a pre-reserved handle and this call finishes its model load; if False, builds generation from scratch.
+            defer_generation_model_load: If True, generation is a pre-reserved handle and this call
+                finishes its model load; if False, builds generation from scratch.
             generation: Pre-reserved generation handle when defer_generation_model_load=True; None otherwise.
 
         Returns:
@@ -534,6 +535,8 @@ def setup_single_controller(
             _build_trainer,
             train_cluster=train_cluster,
             master_config=master_config,
+            tokenizer=tokenizer,
+            processor=processor,
         )
 
     # Submit build tasks and get results
