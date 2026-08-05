@@ -342,6 +342,7 @@ def test_build_in_dataset(dataset_name, tokenizer):
     [
         ("OpenMathInstruct-2", "expected_answer"),
         ("OpenMathInstruct-2", "generated_solution"),
+        ("NuminaMath-1.5", None),
         ("OpenR1-Math-220k", None),
         ("tulu3_sft_mixture", None),
     ],
@@ -371,6 +372,14 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
         elif output_key == "generated_solution":
             assert (
                 first_example["messages"][1]["content"][:20] == "Let's denote the poi"
+            )
+    elif dataset_name == "NuminaMath-1.5":
+        # The default filters drop the non-verifiable sentinel answers, so no
+        # surviving row (train or val) may carry one.
+        for example in (first_example, first_val_example):
+            assert example["messages"][1]["content"].strip().lower() not in (
+                "proof",
+                "notfound",
             )
     elif dataset_name == "OpenR1-Math-220k":
         assert first_example["messages"][1]["content"][:20] == " (n, k) = (5, 2) "
