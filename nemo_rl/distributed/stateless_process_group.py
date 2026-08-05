@@ -236,8 +236,7 @@ class StatelessProcessGroup:
         stream: Optional[torch.cuda.Stream] = None,
         timeout: Optional[timedelta] = None,
     ) -> None:
-        """Interruptible replacement for ``stream.synchronize()`` on a stream
-        carrying this group's NCCL collectives.
+        """Interruptible replacement for ``stream.synchronize()``.
 
         Polls a CUDA completion event together with the comm's async-error
         state. On peer death or timeout, aborts the comm (unblocking the hung

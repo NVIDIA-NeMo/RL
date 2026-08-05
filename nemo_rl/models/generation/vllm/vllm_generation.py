@@ -1228,7 +1228,6 @@ class VllmGeneration(GenerationInterface):
             "input_ids and input_lengths are required in data for vLLM generation"
         )
 
-        from ray.exceptions import RayActorError
 
         self._generating.set()
         try:

@@ -57,7 +57,8 @@ def decide_collective_sync(
     removed/evicted, so the last-synced group is wedged. If it changed since
     our last sync we re-init PROACTIVELY — even when the shard count is
     unchanged (backfill restored it) — instead of reusing a dead group and
-    eating a failed broadcast first."""
+    eating a failed broadcast first.
+    """
     # Rendezvous the frozen JOINABLE cohort (not the raw alive set): cold
     # backfills are excluded until warm, so they never sabotage the handshake.
     target_ws = effective_train_ws + joinable_gen_ws

@@ -518,7 +518,8 @@ class GenerationRouter:
         so its weights are still stale ``load_format=dummy``. Promoting it
         would route the data plane to garbage; it promotes on the refit AFTER
         a grow re-init pulls it into the comm. (Also subsumes the old
-        "added after dispatch" guard: such a shard is never in_comm.)"""
+        "added after dispatch" guard: such a shard is never in_comm.)
+        """
         return {
             sid
             for sid, e in self._shards.items()
@@ -1592,7 +1593,8 @@ class GenerationRouter:
         iterates workers in ascending index): ``shard_ids[i]`` is the shard
         whose leader future is the i-th in the returned futures list, which is
         what ``_evict_failed_workers_inline`` relies on to map a failed index
-        back to its shard. ``worker_indices`` is the flat, sorted dispatch set."""
+        back to its shard. ``worker_indices`` is the flat, sorted dispatch set.
+        """
         now = time.monotonic()
         joinable = [
             (min(s.worker_indices) if s.worker_indices else 0, sid, s)
@@ -1605,8 +1607,11 @@ class GenerationRouter:
         return sids, indices
 
     def joinable_world_size(self) -> int:
-        """Joinable shard count × per-shard world size (subset of
-        ``current_gen_world_size``; equal to it at a settled point)."""
+        """Joinable gen world size.
+
+        Joinable shard count × per-shard world size; a subset of
+        ``current_gen_world_size``, equal to it at a settled point.
+        """
         return self.joinable_shard_count() * self._per_shard_world_size
 
     def _refresh_joinable_stability(self) -> None:
@@ -1614,7 +1619,8 @@ class GenerationRouter:
 
         Called once per health-poll tick (2 s granularity is plenty for a
         ~45 s debounce). Idempotent: a tick with no change leaves the timer
-        alone so ``joinable_stable_for_s`` keeps growing."""
+        alone so ``joinable_stable_for_s`` keeps growing.
+        """
         count = self.joinable_shard_count()
         if count != self._last_joinable_count:
             self._last_joinable_count = count

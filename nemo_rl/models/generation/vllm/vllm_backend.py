@@ -233,8 +233,6 @@ class VllmInternalWorkerExtension:
         train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
-        import time as _time
-
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Place vLLM ranks after all training ranks so all training workers can join

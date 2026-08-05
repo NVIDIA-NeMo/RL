@@ -495,8 +495,9 @@ def maybe_launch_fault_injector(
     config: dict[str, Any],
     vllm_gen: Any,
 ) -> list[threading.Thread]:
-    """Convenience hook: if ``fault_inject.enabled`` is true in config, spawn
-    one FaultInjector background thread per scheduled fault.
+    """Launch fault injector threads if ``fault_inject.enabled`` is true in config.
+
+    Spawns one FaultInjector background thread per scheduled fault.
 
     Single fault::
 
