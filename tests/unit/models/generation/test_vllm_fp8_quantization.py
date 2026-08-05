@@ -259,7 +259,12 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     assert args[2].data_ptr() == w13_scale_from_checkpoint.data_ptr()
     assert args[3].data_ptr() == w2_scale_from_checkpoint.data_ptr()
     assert args[4:] == (is_gated, 128)
-    assert swap_calls == ([w13_weight, w13_scale_from_checkpoint] if is_gated else [])
+    expected_swap_ptrs = (
+        [w13_weight.data_ptr(), w13_scale_from_checkpoint.data_ptr()]
+        if is_gated
+        else []
+    )
+    assert [tensor.data_ptr() for tensor in swap_calls] == expected_swap_ptrs
 
     parameters = (
         layer.w13_weight,
