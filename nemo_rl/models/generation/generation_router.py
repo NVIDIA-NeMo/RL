@@ -186,7 +186,11 @@ class GenerationRouter:
         self._total_shards_at_bootstrap: int = 0
         self._cumulative_shards_removed: int = 0
         self._cumulative_shards_added: int = 0
-        self._last_fault_event: Optional[dict[str, Any]] = None
+        # Queue of (node_id, bundle_indices) tuples from recent remove_shard
+        # calls, consumed in FIFO order by add_shard.  Storing all removes
+        # (not just the last) means a retried or back-to-back recovery still
+        # gets the correct placement for each freed slot.
+        self._freed_shard_slots: list[tuple[Optional[str], Any]] = []
 
     # =====================================================================
     # Shard table mutation
@@ -238,12 +242,6 @@ class GenerationRouter:
                 return
             entry.status = "cordoned"
             entry.consecutive_successes = 0
-            self._last_fault_event = {
-                "kind": "cordon",
-                "shard_id": shard_id,
-                "reason": reason,
-                "monotonic_ts": time.monotonic(),
-            }
 
     async def uncordon(self, shard_id: str) -> None:
         async with self._table_lock:
@@ -336,47 +334,37 @@ class GenerationRouter:
 
             await loop.run_in_executor(None, _kill_actors)
 
+            # Resolve worker_group and update its state. Reading _worker_metadata
+            # and calling mark_workers_dead don't require _table_lock (which
+            # only protects _shards). _lifecycle_lock (held throughout) prevents
+            # concurrent add_shard from modifying worker_group state.
+            _wg = (
+                getattr(self._generation, "worker_group", None)
+                if self._generation is not None and worker_indices
+                else None
+            )
+            dead_bundle_indices: Optional[tuple[int, list[int]]] = None
+            if _wg is not None:
+                # Capture bundle info so add_shard can reuse the freed slot.
+                _meta = _wg._worker_metadata
+                leader = worker_indices[0]
+                if isinstance(_meta, list) and leader < len(_meta):
+                    dead_bundle_indices = _meta[leader].get("bundle_indices")
+                # Skip dead actor indices on future dispatches.
+                if hasattr(_wg, "mark_workers_dead"):
+                    _wg.mark_workers_dead(worker_indices)
+                if hasattr(self._generation, "dp_size"):
+                    self._generation.dp_size = _wg.dp_size
+
             # Drop the shard from the table. Health poller no longer probes
-            # it; routing skips it. The autoscaler v2 + minReplicas:0
-            # combination is what reclaims the pod from here.
+            # it; routing skips it.
             async with self._table_lock:
                 removed_entry = self._shards.pop(shard_id, None)
                 self._cumulative_shards_removed += 1
                 # Bump epoch if the removed shard was in the live comm; forces proactive re-init.
                 if removed_entry is not None and removed_entry.in_comm:
                     self._comm_reset_epoch += 1
-                # Capture the dead shard's PG bundle info before marking dead,
-                # so add_shard can reuse the freed bundle slot.
-                dead_bundle_indices: Optional[tuple[int, list[int]]] = None
-                if self._generation is not None and worker_indices:
-                    _wg = getattr(self._generation, "worker_group", None)
-                    if _wg is not None:
-                        _meta = _wg._worker_metadata
-                        leader = worker_indices[0]
-                        if isinstance(_meta, list) and leader < len(_meta):
-                            dead_bundle_indices = _meta[leader].get("bundle_indices")
-                self._last_fault_event = {
-                    "kind": "remove",
-                    "shard_id": shard_id,
-                    "reason": reason,
-                    "node_id": node_id,
-                    "bundle_indices": dead_bundle_indices,
-                    "monotonic_ts": time.monotonic(),
-                }
-
-            # Tell the underlying VllmGeneration's worker_group to skip these
-            # actor indices on subsequent dispatches (init_collective /
-            # reset_collective / generate). Without this, the next call from
-            # either side would dispatch onto a ray.kill'd actor and raise
-            # RayActorError.
-            if self._generation is not None and worker_indices:
-                wg = getattr(self._generation, "worker_group", None)
-                if wg is not None and hasattr(wg, "mark_workers_dead"):
-                    wg.mark_workers_dead(worker_indices)
-                # VllmGeneration tracks dp_size separately for init_collective
-                # rank computation; pull it down to the surviving count.
-                if hasattr(self._generation, "dp_size") and wg is not None:
-                    self._generation.dp_size = wg.dp_size
+                self._freed_shard_slots.append((node_id, dead_bundle_indices))
 
             # reset_collective is NOT dispatched here — redundant with per-refit self-teardown
             # and caused cascade evictions under burst kills. The next refit's
@@ -415,11 +403,13 @@ class GenerationRouter:
 
             # Heavy work: vLLM worker init (~1-2min for 4B). Run on a thread so
             # the asyncio loop stays responsive (health poll, /metrics, /shards).
-            target_node_id = (self._last_fault_event or {}).get("node_id") or None
-            # Bundle indices of the dead shard: lets add_dp_worker reuse the
-            # freed PG bundle slot so Ray grants the GPU immediately instead of
-            # waiting for a non-PG GPU that may never become available.
-            target_bundle_indices = (self._last_fault_event or {}).get("bundle_indices") or None
+            # Pop the oldest freed slot so each recovery goes back to the
+            # correct node/bundles regardless of how many shards have died or
+            # how many retries have occurred.
+            if self._freed_shard_slots:
+                target_node_id, target_bundle_indices = self._freed_shard_slots.pop(0)
+            else:
+                target_node_id = target_bundle_indices = None
 
             def _do_add() -> tuple[list[Any], Any, list[int], Optional[str]]:
                 return self._generation.add_dp_worker(
@@ -491,12 +481,6 @@ class GenerationRouter:
                     f"unix_ts={time.time():.6f} reason={reason}",
                     flush=True,
                 )
-                self._last_fault_event = {
-                    "kind": "add",
-                    "shard_id": shard_id,
-                    "reason": reason,
-                    "monotonic_ts": time.monotonic(),
-                }
 
             # reset_collective not dispatched here — same reasoning as remove_shard.
             # The next refit's init_collective destroys the old comm naturally.
@@ -1769,11 +1753,6 @@ class GenerationRouter:
             "joinable_stable_for_s": self.joinable_stable_for_s(),
             "comm_epoch": self._comm_reset_epoch,
             "nccl_reinit_in_progress": self._nccl_reinit_in_progress,
-            "last_fault_event": (
-                dict(self._last_fault_event)
-                if self._last_fault_event is not None
-                else None
-            ),
             "per_shard": per_shard,
         }
 
