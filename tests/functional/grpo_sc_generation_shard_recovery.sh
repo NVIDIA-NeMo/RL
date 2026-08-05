@@ -145,13 +145,20 @@ grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" || {
 # This matters more here than in the chaos test: this one asserts the run COMPLETES, so
 # killing a non-actor leaves both shards serving, the run finishes exactly as it would have
 # anyway, and the test reports a pass having never exercised recovery.
-mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
+# Retry: the actors are certainly up by train step 3, but a single query races Ray's
+# GCS write and one empty result would abort a run that is otherwise fine.
+GEN_PIDS=()
+for _ in $(seq 1 10); do
+    mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
+    (( ${#GEN_PIDS[@]} == GEN_GPUS )) && break
+    sleep 3
+done
 
 if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     echo "[recovery] FAIL: expected exactly $GEN_GPUS generation actors, found ${#GEN_PIDS[@]}"
     echo "[recovery] this is a harness problem, not a recovery failure -- killing the wrong"
     echo "[recovery] process would let the run complete and report a false pass."
-    echo "[recovery] --- what Ray reports ---"
+    echo "[recovery] --- what Ray reports (full actor table on stderr) ---"
     uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
     echo "[recovery] --- every process with 'eneration' in its command line ---"
     # Unfiltered on purpose. The previous diagnostic grepped for "ray::" and so printed

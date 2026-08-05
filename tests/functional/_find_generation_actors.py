@@ -12,28 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Print the pid of every live generation actor, one per line.
+"""Print the pid of every live generation actor, one per line, on stdout.
+
+Everything else goes to stderr, so callers can do `$(... 2>/dev/null)`.
 
 Used by the chaos and recovery functional tests to pick a victim.
 
 WHY NOT `ps`/`pgrep`. Both tests originally matched Ray's process *title*
-(``ray::VllmAsyncGenerationWorker``), which Ray sets with setproctitle. That worked on a
-2-GPU workstation and found **zero** actors on a GB200 cluster (job 5861743), where the
-recovery test reported "expected exactly 2 generation actors, found 0" at train step 3 with
-generation demonstrably working. Titles are an implementation detail of the runtime and are
-not portable; the GCS actor table is the runtime's own record and is authoritative.
+(``ray::VllmAsyncGenerationWorker``), set via setproctitle. That worked on a 2-GPU
+workstation and found zero actors on a GB200 cluster. Titles are a runtime implementation
+detail; the GCS actor table is the runtime's own record of which pid is which actor.
 
-WHY NOT `ray.util.state.list_actors`. That goes through the dashboard's HTTP state server,
-and NeMo-RL's ``init_ray`` starts Ray with ``include_dashboard=False``, so it raises
-ServerUnavailable. ``ray._private.state.actors()`` reads the GCS directly and needs no
-dashboard.
+WHY NOT ``ray.util.state.list_actors``. It goes through the dashboard HTTP state server,
+which is not reachable in every configuration. ``ray._private.state.actors()`` reads the
+GCS directly.
 
-Output: one pid per line, sorted. Exit 1 with a message on stderr if Ray cannot be reached.
+WHY IT PRINTS SO MUCH TO STDERR. On job 5866390 this returned zero pids and said nothing,
+which left no way to tell "no actors" from "wrong field name" from "wrong state string".
+It now always reports what the actor table actually contained, so one run answers that.
 """
 
+import os
 import sys
 
 DEFAULT_MATCH = "GenerationWorker"
+
+
+def _err(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
 
 def main() -> int:
@@ -41,30 +47,58 @@ def main() -> int:
 
     import ray
 
+    address = os.environ.get("RAY_ADDRESS", "auto")
     try:
-        # address="auto" attaches to the cluster the training job already started. This
-        # registers a short-lived extra driver, which is why it shuts down immediately.
-        ray.init(address="auto", log_to_driver=False, include_dashboard=False)
+        ray.init(address=address, log_to_driver=False, include_dashboard=False)
     except Exception as exc:  # noqa: BLE001 - the message is the whole point
-        print(f"could not attach to a running Ray cluster: {exc}", file=sys.stderr)
+        _err(f"[actors] could not attach to Ray at address={address!r}: {exc}")
+        _err(
+            "[actors] if the training job is still up, its cluster may use a non-default"
+        )
+        _err("[actors] temp dir; try RAY_ADDRESS=<ip:port> or check `ray status`.")
         return 1
 
     try:
         import ray._private.state as rstate
 
-        pids = sorted(
-            rec["Pid"]
-            for rec in rstate.actors().values()
-            if match in rec.get("ActorClassName", "")
-            and rec.get("State") == "ALIVE"
-            and rec.get("Pid")
-        )
+        table = rstate.actors()
+        _err(f"[actors] GCS actor table: {len(table)} entries")
+
+        rows = []
+        for rec in table.values():
+            rows.append(
+                (
+                    rec.get("ActorClassName", "<no ActorClassName>"),
+                    rec.get("State", "<no State>"),
+                    rec.get("Pid", 0),
+                    rec.get("Name", "") or "",
+                )
+            )
+
+        # Always dump the table. The whole point is to stop guessing at field values.
+        for cls, state, pid, name in sorted(rows):
+            _err(f"[actors]   class={cls!r} state={state!r} pid={pid} name={name!r}")
+
+        matched = [
+            (cls, state, pid)
+            for cls, state, pid in ((r[0], r[1], r[2]) for r in rows)
+            if match in cls
+        ]
+        _err(f"[actors] {len(matched)} entries match {match!r}")
+
+        # Deliberately permissive about State: a shard that is RESTARTING or PENDING is
+        # still a real process worth reporting, and over-filtering here is exactly what
+        # produced a silent empty result before. Pid 0 means Ray has no process for it,
+        # so those cannot be killed and are excluded, but they are reported above.
+        pids = sorted({pid for _cls, _state, pid in matched if pid})
+        if not pids:
+            _err(f"[actors] no killable pid for any actor matching {match!r}")
     finally:
         ray.shutdown()
 
     for pid in pids:
         print(pid)
-    return 0
+    return 0 if pids else 2
 
 
 if __name__ == "__main__":

@@ -72,6 +72,10 @@ VICTIM_STATE=${VICTIM_STATE:-idle}
 # How long to wait for the worker to be observed in that state. Generous because `serving`
 # is a narrow window -- generate_async was only ~2% of samples, against ~34% for idle.
 VICTIM_WAIT_S=${VICTIM_WAIT_S:-300}
+# Separate budget for finding the actors at all, before any state is considered.
+# Generation takes a while to come up, and conflating the two made 'no actors' and
+# 'actors never reached the state' indistinguishable in the log.
+ACTOR_WAIT_S=${ACTOR_WAIT_S:-300}
 # GPUs this test pins itself to, independent of how many the host has. One shard of
 # generation and one trainer: killing the shard leaves the fleet empty, which is the
 # scenario -- a bounded failure with nothing to fall back to. Defined once because the
@@ -178,12 +182,36 @@ case "$VICTIM_STATE" in
     *) echo "[chaos] FAIL: VICTIM_STATE must be idle, serving or any; got '$VICTIM_STATE'"; exit 1 ;;
 esac
 
-echo "[chaos] waiting up to ${VICTIM_WAIT_S}s for a generation actor in state '$VICTIM_STATE'..."
+# Discover the actors ONCE, then poll their titles.
+#
+# Not once per 0.2s tick: each helper call is a full ray.init/shutdown of about three
+# seconds, so polling it at tick rate would make VICTIM_WAIT_S=300 mean roughly 60 checks
+# instead of 1500, and burn the budget on Ray handshakes rather than on watching for the
+# state. The actor SET is stable once generation is up; only the STATE changes.
+echo "[chaos] discovering generation actors (up to ${ACTOR_WAIT_S}s)..."
+ACTORS=()
+for _ in $(seq 1 $((ACTOR_WAIT_S / 3))); do
+    kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before any actor appeared"; break; }
+    mapfile -t ACTORS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
+    (( ${#ACTORS[@]} > 0 )) && break
+    sleep 3
+done
+
+if (( ${#ACTORS[@]} == 0 )); then
+    echo "[chaos] FAIL: no generation actors found in ${ACTOR_WAIT_S}s"
+    echo "[chaos] --- what Ray reports (full actor table on stderr) ---"
+    uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
+    echo "[chaos] --- every process with 'eneration' in its command line ---"
+    ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//' | grep -i "eneration" | grep -v grep | head -20
+    exit 1
+fi
+echo "[chaos] generation actors: ${ACTORS[*]}"
+
+echo "[chaos] waiting up to ${VICTIM_WAIT_S}s for one in state '$VICTIM_STATE'..."
 VICTIM=""
 TITLES_SEEN=0
 for _ in $(seq 1 $((VICTIM_WAIT_S * 5))); do
     kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before the kill"; break; }
-    mapfile -t ACTORS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
     for pid in "${ACTORS[@]}"; do
         [[ -z "$pid" ]] && continue
         title=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed -E 's/ +$//')
