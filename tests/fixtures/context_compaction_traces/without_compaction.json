@@ -1,0 +1,960 @@
+{
+  "checks": {
+    "all_completion_ids_unique": true,
+    "all_completions_present_once": true,
+    "all_logprobs_aligned": true,
+    "boundary_records_cover_rewrites": true,
+    "eligible_trainable_token_count": 5,
+    "media_order_valid": true,
+    "model_call_count": 5,
+    "ok": true,
+    "physical_trace_count": 1,
+    "prefixes_valid_inside_traces": true,
+    "trainable_token_count": 5
+  },
+  "final_policy_decision": {
+    "config_digest": "golden-policy-v1",
+    "decision_turn": 5,
+    "lineage": {
+      "configuration_digest": "golden-policy-v1",
+      "deterministic": true,
+      "generator_contract_id": null,
+      "lossy": false,
+      "transformation_id": "transform-5",
+      "transformation_type": "identity",
+      "transformation_version": "1",
+      "unit_records": [
+        {
+          "disposition": "kept",
+          "output_digests": [
+            "digest-5"
+          ],
+          "output_unit_ids": [
+            "part-5"
+          ],
+          "source_digest": "digest-5",
+          "source_unit_id": "part-5"
+        }
+      ],
+      "validator_result": "passed"
+    },
+    "omitted_part_count": 0,
+    "policy_name": "identity",
+    "policy_version": "1",
+    "retained_part_count": 1,
+    "selection_digest": "selection-5",
+    "transformation_id": "transform-5"
+  },
+  "generation_contract": {
+    "generation_contract_id": "golden-generation-contract-v1",
+    "incomplete_reasons": [
+      "golden-fixture"
+    ],
+    "training_eligible": false
+  },
+  "group_id": "golden-without-cc",
+  "lineage_deltas": [
+    {
+      "configuration_digest": "golden-policy-v1",
+      "deterministic": true,
+      "generator_contract_id": null,
+      "lossy": false,
+      "parent_transformation_id": null,
+      "source_unit_count": 1,
+      "state_digest": "81aa6f6d1268dc55b2f6dbc9f36b926c48557362769df9075cfbb104ff2e2c22",
+      "transformation_id": "transform-1",
+      "transformation_type": "identity",
+      "transformation_version": "1",
+      "unit_upserts": [
+        {
+          "disposition": "kept",
+          "output_digests": [
+            "digest-5"
+          ],
+          "output_unit_ids": [
+            "part-5"
+          ],
+          "source_digest": "digest-5",
+          "source_unit_id": "part-5"
+        }
+      ],
+      "validator_result": "passed"
+    },
+    {
+      "configuration_digest": "golden-policy-v1",
+      "deterministic": true,
+      "generator_contract_id": null,
+      "lossy": false,
+      "parent_transformation_id": "transform-1",
+      "source_unit_count": 1,
+      "state_digest": "81aa6f6d1268dc55b2f6dbc9f36b926c48557362769df9075cfbb104ff2e2c22",
+      "transformation_id": "transform-2",
+      "transformation_type": "identity",
+      "transformation_version": "1",
+      "unit_upserts": [],
+      "validator_result": "passed"
+    },
+    {
+      "configuration_digest": "golden-policy-v1",
+      "deterministic": true,
+      "generator_contract_id": null,
+      "lossy": false,
+      "parent_transformation_id": "transform-2",
+      "source_unit_count": 1,
+      "state_digest": "81aa6f6d1268dc55b2f6dbc9f36b926c48557362769df9075cfbb104ff2e2c22",
+      "transformation_id": "transform-3",
+      "transformation_type": "identity",
+      "transformation_version": "1",
+      "unit_upserts": [],
+      "validator_result": "passed"
+    },
+    {
+      "configuration_digest": "golden-policy-v1",
+      "deterministic": true,
+      "generator_contract_id": null,
+      "lossy": false,
+      "parent_transformation_id": "transform-3",
+      "source_unit_count": 1,
+      "state_digest": "81aa6f6d1268dc55b2f6dbc9f36b926c48557362769df9075cfbb104ff2e2c22",
+      "transformation_id": "transform-4",
+      "transformation_type": "identity",
+      "transformation_version": "1",
+      "unit_upserts": [],
+      "validator_result": "passed"
+    },
+    {
+      "configuration_digest": "golden-policy-v1",
+      "deterministic": true,
+      "generator_contract_id": null,
+      "lossy": false,
+      "parent_transformation_id": "transform-4",
+      "source_unit_count": 1,
+      "state_digest": "81aa6f6d1268dc55b2f6dbc9f36b926c48557362769df9075cfbb104ff2e2c22",
+      "transformation_id": "transform-5",
+      "transformation_type": "identity",
+      "transformation_version": "1",
+      "unit_upserts": [],
+      "validator_result": "passed"
+    }
+  ],
+  "model_calls": [
+    {
+      "action_id": "action-1",
+      "boundary_before_id": null,
+      "call_index": 0,
+      "compaction_event_id": null,
+      "completion_id": "completion-1",
+      "context_epoch": 0,
+      "eligible": true,
+      "evidence_source": "golden_fixture",
+      "expected_append_compatible": false,
+      "finish_reason": "stop",
+      "generation_contract_id": "golden-generation-contract-v1",
+      "media_append_compatible": true,
+      "media_ids": [
+        "screen-1"
+      ],
+      "media_occurrences": [
+        {
+          "media_id": "screen-1",
+          "model_call_id": "model-call-1",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 0,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        }
+      ],
+      "new_media_ids": [
+        "screen-1"
+      ],
+      "policy_decision": {
+        "config_digest": "golden-policy-v1",
+        "decision_turn": 1,
+        "lineage": {
+          "configuration_digest": "golden-policy-v1",
+          "deterministic": true,
+          "generator_contract_id": null,
+          "lossy": false,
+          "transformation_id": "transform-1",
+          "transformation_type": "identity",
+          "transformation_version": "1",
+          "unit_records": [
+            {
+              "disposition": "kept",
+              "output_digests": [
+                "digest-1"
+              ],
+              "output_unit_ids": [
+                "part-1"
+              ],
+              "source_digest": "digest-1",
+              "source_unit_id": "part-1"
+            }
+          ],
+          "validator_result": "passed"
+        },
+        "omitted_part_count": 0,
+        "policy_name": "identity",
+        "policy_version": "1",
+        "retained_part_count": 1,
+        "selection_digest": "selection-1",
+        "transformation_id": "transform-1"
+      },
+      "policy_output_spans": [
+        {
+          "action_ids": [
+            "action-1"
+          ],
+          "eligible": true,
+          "end": 1,
+          "model_call_id": "model-call-1",
+          "old_logprobs_alignment": "sampled_tokens",
+          "policy_output_span_id": "span-1",
+          "start": 0
+        }
+      ],
+      "prepared_request_id": "prepared-request-1",
+      "processor_fingerprint": "golden-processor-v1",
+      "prompt_delta_token_ids": [
+        100,
+        101
+      ],
+      "prompt_token_ids": [
+        100,
+        101
+      ],
+      "request_id": "request-1",
+      "sampled_logprobs": [
+        -0.01
+      ],
+      "sampled_token_ids": [
+        201
+      ],
+      "segment_id": "computer-use-without-cc:segment-0",
+      "segment_index": 0,
+      "source_rollout_id": "computer-use-without-cc",
+      "starts_physical_trace": true,
+      "token_append_compatible": true,
+      "trace_id": "computer-use-without-cc:trace-000000",
+      "turn_id": 1
+    },
+    {
+      "action_id": "action-2",
+      "boundary_before_id": null,
+      "call_index": 1,
+      "compaction_event_id": null,
+      "completion_id": "completion-2",
+      "context_epoch": 0,
+      "eligible": true,
+      "evidence_source": "golden_fixture",
+      "expected_append_compatible": true,
+      "finish_reason": "stop",
+      "generation_contract_id": "golden-generation-contract-v1",
+      "media_append_compatible": true,
+      "media_ids": [
+        "screen-1",
+        "screen-2"
+      ],
+      "media_occurrences": [
+        {
+          "media_id": "screen-1",
+          "model_call_id": "model-call-2",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 0,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-2",
+          "model_call_id": "model-call-2",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 1,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        }
+      ],
+      "new_media_ids": [
+        "screen-2"
+      ],
+      "policy_decision": {
+        "config_digest": "golden-policy-v1",
+        "decision_turn": 2,
+        "lineage": {
+          "configuration_digest": "golden-policy-v1",
+          "deterministic": true,
+          "generator_contract_id": null,
+          "lossy": false,
+          "transformation_id": "transform-2",
+          "transformation_type": "identity",
+          "transformation_version": "1",
+          "unit_records": [
+            {
+              "disposition": "kept",
+              "output_digests": [
+                "digest-2"
+              ],
+              "output_unit_ids": [
+                "part-2"
+              ],
+              "source_digest": "digest-2",
+              "source_unit_id": "part-2"
+            }
+          ],
+          "validator_result": "passed"
+        },
+        "omitted_part_count": 0,
+        "policy_name": "identity",
+        "policy_version": "1",
+        "retained_part_count": 1,
+        "selection_digest": "selection-2",
+        "transformation_id": "transform-2"
+      },
+      "policy_output_spans": [
+        {
+          "action_ids": [
+            "action-2"
+          ],
+          "eligible": true,
+          "end": 1,
+          "model_call_id": "model-call-2",
+          "old_logprobs_alignment": "sampled_tokens",
+          "policy_output_span_id": "span-2",
+          "start": 0
+        }
+      ],
+      "prepared_request_id": "prepared-request-2",
+      "processor_fingerprint": "golden-processor-v1",
+      "prompt_delta_token_ids": [
+        102
+      ],
+      "prompt_token_ids": [
+        100,
+        101,
+        201,
+        102
+      ],
+      "request_id": "request-2",
+      "sampled_logprobs": [
+        -0.02
+      ],
+      "sampled_token_ids": [
+        202
+      ],
+      "segment_id": "computer-use-without-cc:segment-0",
+      "segment_index": 0,
+      "source_rollout_id": "computer-use-without-cc",
+      "starts_physical_trace": false,
+      "token_append_compatible": true,
+      "trace_id": "computer-use-without-cc:trace-000000",
+      "turn_id": 2
+    },
+    {
+      "action_id": "action-3",
+      "boundary_before_id": null,
+      "call_index": 2,
+      "compaction_event_id": null,
+      "completion_id": "completion-3",
+      "context_epoch": 0,
+      "eligible": true,
+      "evidence_source": "golden_fixture",
+      "expected_append_compatible": true,
+      "finish_reason": "stop",
+      "generation_contract_id": "golden-generation-contract-v1",
+      "media_append_compatible": true,
+      "media_ids": [
+        "screen-1",
+        "screen-2",
+        "screen-3"
+      ],
+      "media_occurrences": [
+        {
+          "media_id": "screen-1",
+          "model_call_id": "model-call-3",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 0,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-2",
+          "model_call_id": "model-call-3",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 1,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-3",
+          "model_call_id": "model-call-3",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 2,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        }
+      ],
+      "new_media_ids": [
+        "screen-3"
+      ],
+      "policy_decision": {
+        "config_digest": "golden-policy-v1",
+        "decision_turn": 3,
+        "lineage": {
+          "configuration_digest": "golden-policy-v1",
+          "deterministic": true,
+          "generator_contract_id": null,
+          "lossy": false,
+          "transformation_id": "transform-3",
+          "transformation_type": "identity",
+          "transformation_version": "1",
+          "unit_records": [
+            {
+              "disposition": "kept",
+              "output_digests": [
+                "digest-3"
+              ],
+              "output_unit_ids": [
+                "part-3"
+              ],
+              "source_digest": "digest-3",
+              "source_unit_id": "part-3"
+            }
+          ],
+          "validator_result": "passed"
+        },
+        "omitted_part_count": 0,
+        "policy_name": "identity",
+        "policy_version": "1",
+        "retained_part_count": 1,
+        "selection_digest": "selection-3",
+        "transformation_id": "transform-3"
+      },
+      "policy_output_spans": [
+        {
+          "action_ids": [
+            "action-3"
+          ],
+          "eligible": true,
+          "end": 1,
+          "model_call_id": "model-call-3",
+          "old_logprobs_alignment": "sampled_tokens",
+          "policy_output_span_id": "span-3",
+          "start": 0
+        }
+      ],
+      "prepared_request_id": "prepared-request-3",
+      "processor_fingerprint": "golden-processor-v1",
+      "prompt_delta_token_ids": [
+        103
+      ],
+      "prompt_token_ids": [
+        100,
+        101,
+        201,
+        102,
+        202,
+        103
+      ],
+      "request_id": "request-3",
+      "sampled_logprobs": [
+        -0.03
+      ],
+      "sampled_token_ids": [
+        203
+      ],
+      "segment_id": "computer-use-without-cc:segment-0",
+      "segment_index": 0,
+      "source_rollout_id": "computer-use-without-cc",
+      "starts_physical_trace": false,
+      "token_append_compatible": true,
+      "trace_id": "computer-use-without-cc:trace-000000",
+      "turn_id": 3
+    },
+    {
+      "action_id": "action-4",
+      "boundary_before_id": null,
+      "call_index": 3,
+      "compaction_event_id": null,
+      "completion_id": "completion-4",
+      "context_epoch": 0,
+      "eligible": true,
+      "evidence_source": "golden_fixture",
+      "expected_append_compatible": true,
+      "finish_reason": "stop",
+      "generation_contract_id": "golden-generation-contract-v1",
+      "media_append_compatible": true,
+      "media_ids": [
+        "screen-1",
+        "screen-2",
+        "screen-3",
+        "screen-4"
+      ],
+      "media_occurrences": [
+        {
+          "media_id": "screen-1",
+          "model_call_id": "model-call-4",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 0,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-2",
+          "model_call_id": "model-call-4",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 1,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-3",
+          "model_call_id": "model-call-4",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 2,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-4",
+          "model_call_id": "model-call-4",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 3,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        }
+      ],
+      "new_media_ids": [
+        "screen-4"
+      ],
+      "policy_decision": {
+        "config_digest": "golden-policy-v1",
+        "decision_turn": 4,
+        "lineage": {
+          "configuration_digest": "golden-policy-v1",
+          "deterministic": true,
+          "generator_contract_id": null,
+          "lossy": false,
+          "transformation_id": "transform-4",
+          "transformation_type": "identity",
+          "transformation_version": "1",
+          "unit_records": [
+            {
+              "disposition": "kept",
+              "output_digests": [
+                "digest-4"
+              ],
+              "output_unit_ids": [
+                "part-4"
+              ],
+              "source_digest": "digest-4",
+              "source_unit_id": "part-4"
+            }
+          ],
+          "validator_result": "passed"
+        },
+        "omitted_part_count": 0,
+        "policy_name": "identity",
+        "policy_version": "1",
+        "retained_part_count": 1,
+        "selection_digest": "selection-4",
+        "transformation_id": "transform-4"
+      },
+      "policy_output_spans": [
+        {
+          "action_ids": [
+            "action-4"
+          ],
+          "eligible": true,
+          "end": 1,
+          "model_call_id": "model-call-4",
+          "old_logprobs_alignment": "sampled_tokens",
+          "policy_output_span_id": "span-4",
+          "start": 0
+        }
+      ],
+      "prepared_request_id": "prepared-request-4",
+      "processor_fingerprint": "golden-processor-v1",
+      "prompt_delta_token_ids": [
+        104
+      ],
+      "prompt_token_ids": [
+        100,
+        101,
+        201,
+        102,
+        202,
+        103,
+        203,
+        104
+      ],
+      "request_id": "request-4",
+      "sampled_logprobs": [
+        -0.04
+      ],
+      "sampled_token_ids": [
+        204
+      ],
+      "segment_id": "computer-use-without-cc:segment-0",
+      "segment_index": 0,
+      "source_rollout_id": "computer-use-without-cc",
+      "starts_physical_trace": false,
+      "token_append_compatible": true,
+      "trace_id": "computer-use-without-cc:trace-000000",
+      "turn_id": 4
+    },
+    {
+      "action_id": "action-5",
+      "boundary_before_id": null,
+      "call_index": 4,
+      "compaction_event_id": null,
+      "completion_id": "completion-5",
+      "context_epoch": 0,
+      "eligible": true,
+      "evidence_source": "golden_fixture",
+      "expected_append_compatible": true,
+      "finish_reason": "stop",
+      "generation_contract_id": "golden-generation-contract-v1",
+      "media_append_compatible": true,
+      "media_ids": [
+        "screen-1",
+        "screen-2",
+        "screen-3",
+        "screen-4",
+        "screen-5"
+      ],
+      "media_occurrences": [
+        {
+          "media_id": "screen-1",
+          "model_call_id": "model-call-5",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 0,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-2",
+          "model_call_id": "model-call-5",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 1,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-3",
+          "model_call_id": "model-call-5",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 2,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-4",
+          "model_call_id": "model-call-5",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 3,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        },
+        {
+          "media_id": "screen-5",
+          "model_call_id": "model-call-5",
+          "model_specific_sidecars": {},
+          "occurrence_ordinal": 4,
+          "placeholder_span_or_position": null,
+          "processed_dimensions": null
+        }
+      ],
+      "new_media_ids": [
+        "screen-5"
+      ],
+      "policy_decision": {
+        "config_digest": "golden-policy-v1",
+        "decision_turn": 5,
+        "lineage": {
+          "configuration_digest": "golden-policy-v1",
+          "deterministic": true,
+          "generator_contract_id": null,
+          "lossy": false,
+          "transformation_id": "transform-5",
+          "transformation_type": "identity",
+          "transformation_version": "1",
+          "unit_records": [
+            {
+              "disposition": "kept",
+              "output_digests": [
+                "digest-5"
+              ],
+              "output_unit_ids": [
+                "part-5"
+              ],
+              "source_digest": "digest-5",
+              "source_unit_id": "part-5"
+            }
+          ],
+          "validator_result": "passed"
+        },
+        "omitted_part_count": 0,
+        "policy_name": "identity",
+        "policy_version": "1",
+        "retained_part_count": 1,
+        "selection_digest": "selection-5",
+        "transformation_id": "transform-5"
+      },
+      "policy_output_spans": [
+        {
+          "action_ids": [
+            "action-5"
+          ],
+          "eligible": true,
+          "end": 1,
+          "model_call_id": "model-call-5",
+          "old_logprobs_alignment": "sampled_tokens",
+          "policy_output_span_id": "span-5",
+          "start": 0
+        }
+      ],
+      "prepared_request_id": "prepared-request-5",
+      "processor_fingerprint": "golden-processor-v1",
+      "prompt_delta_token_ids": [
+        105
+      ],
+      "prompt_token_ids": [
+        100,
+        101,
+        201,
+        102,
+        202,
+        103,
+        203,
+        104,
+        204,
+        105
+      ],
+      "request_id": "request-5",
+      "sampled_logprobs": [
+        -0.05
+      ],
+      "sampled_token_ids": [
+        205
+      ],
+      "segment_id": "computer-use-without-cc:segment-0",
+      "segment_index": 0,
+      "source_rollout_id": "computer-use-without-cc",
+      "starts_physical_trace": false,
+      "token_append_compatible": true,
+      "trace_id": "computer-use-without-cc:trace-000000",
+      "turn_id": 5
+    }
+  ],
+  "physical_traces": [
+    {
+      "boundary_before": null,
+      "completion_spans": [
+        {
+          "completion_id": "completion-1",
+          "eligible": true,
+          "end": 3,
+          "start": 2,
+          "turn_id": 1
+        },
+        {
+          "completion_id": "completion-2",
+          "eligible": true,
+          "end": 5,
+          "start": 4,
+          "turn_id": 2
+        },
+        {
+          "completion_id": "completion-3",
+          "eligible": true,
+          "end": 7,
+          "start": 6,
+          "turn_id": 3
+        },
+        {
+          "completion_id": "completion-4",
+          "eligible": true,
+          "end": 9,
+          "start": 8,
+          "turn_id": 4
+        },
+        {
+          "completion_id": "completion-5",
+          "eligible": true,
+          "end": 11,
+          "start": 10,
+          "turn_id": 5
+        }
+      ],
+      "context_epoch": 0,
+      "ordered_media_ids": [
+        "screen-1",
+        "screen-2",
+        "screen-3",
+        "screen-4",
+        "screen-5"
+      ],
+      "segment_id": "computer-use-without-cc:segment-0",
+      "segment_index": 0,
+      "segments": [
+        {
+          "kind": "prompt",
+          "loss_mask": [
+            0,
+            0
+          ],
+          "media_ids": [
+            "screen-1"
+          ],
+          "token_ids": [
+            100,
+            101
+          ],
+          "turn_id": 1
+        },
+        {
+          "completion_id": "completion-1",
+          "eligible": true,
+          "generation_logprobs": [
+            -0.01
+          ],
+          "kind": "completion",
+          "loss_mask": [
+            1
+          ],
+          "token_ids": [
+            201
+          ],
+          "turn_id": 1
+        },
+        {
+          "kind": "prompt",
+          "loss_mask": [
+            0
+          ],
+          "media_ids": [
+            "screen-2"
+          ],
+          "token_ids": [
+            102
+          ],
+          "turn_id": 2
+        },
+        {
+          "completion_id": "completion-2",
+          "eligible": true,
+          "generation_logprobs": [
+            -0.02
+          ],
+          "kind": "completion",
+          "loss_mask": [
+            1
+          ],
+          "token_ids": [
+            202
+          ],
+          "turn_id": 2
+        },
+        {
+          "kind": "prompt",
+          "loss_mask": [
+            0
+          ],
+          "media_ids": [
+            "screen-3"
+          ],
+          "token_ids": [
+            103
+          ],
+          "turn_id": 3
+        },
+        {
+          "completion_id": "completion-3",
+          "eligible": true,
+          "generation_logprobs": [
+            -0.03
+          ],
+          "kind": "completion",
+          "loss_mask": [
+            1
+          ],
+          "token_ids": [
+            203
+          ],
+          "turn_id": 3
+        },
+        {
+          "kind": "prompt",
+          "loss_mask": [
+            0
+          ],
+          "media_ids": [
+            "screen-4"
+          ],
+          "token_ids": [
+            104
+          ],
+          "turn_id": 4
+        },
+        {
+          "completion_id": "completion-4",
+          "eligible": true,
+          "generation_logprobs": [
+            -0.04
+          ],
+          "kind": "completion",
+          "loss_mask": [
+            1
+          ],
+          "token_ids": [
+            204
+          ],
+          "turn_id": 4
+        },
+        {
+          "kind": "prompt",
+          "loss_mask": [
+            0
+          ],
+          "media_ids": [
+            "screen-5"
+          ],
+          "token_ids": [
+            105
+          ],
+          "turn_id": 5
+        },
+        {
+          "completion_id": "completion-5",
+          "eligible": true,
+          "generation_logprobs": [
+            -0.05
+          ],
+          "kind": "completion",
+          "loss_mask": [
+            1
+          ],
+          "token_ids": [
+            205
+          ],
+          "turn_id": 5
+        }
+      ],
+      "source_turn_ids": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "token_count": 11,
+      "trace_id": "computer-use-without-cc:trace-000000",
+      "trace_index": 0,
+      "trainable_token_count": 5
+    }
+  ],
+  "policy_name": "identity",
+  "reward": 1.0,
+  "rollout_id": "computer-use-without-cc",
+  "schema_version": 3,
+  "source_row_index": 0
+}
