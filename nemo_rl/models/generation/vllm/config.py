@@ -150,6 +150,9 @@ class VllmConfig(GenerationConfig):
     # CPU offload remains the default. Disabling it is supported only for
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
+    # Optional safetensors artifact containing fixed W4A4 input calibration.
+    # BF16-source enforcement happens when the rollout worker prepares refit.
+    real_quant_calibration_path: NotRequired[str | None]
     real_quant_ignore: NotRequired[list[str]]
 
 

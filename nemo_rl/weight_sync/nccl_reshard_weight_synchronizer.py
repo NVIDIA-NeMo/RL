@@ -24,9 +24,11 @@ between layouts, avoiding a full gather + broadcast.
 
 Lifecycle:
   init_communicator():
-    1. policy/generation.init_collective()           -- model_update_group (misc)
-    2. policy/generation.init_nccl_reshard_comm_group()  -- per-PP-stage bulk groups
-    3. policy.prepare_nccl_reshard_refit_info()
+    1. policy.prepare_refit_info()
+       -> generation.prepare_refit_info()             -- receiver validation
+    2. policy/generation.init_collective()            -- model_update_group (misc)
+    3. policy/generation.init_nccl_reshard_comm_group()  -- per-PP-stage bulk groups
+    4. policy.prepare_nccl_reshard_refit_info()
        -> generation.prepare_nccl_reshard_refit_info()   -- backend-agnostic metadata
   sync_weights():
     policy.nccl_reshard_refit(kv_scales) + generation.nccl_reshard_refit(); verify.
@@ -142,7 +144,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
-        # 1. model_update_group: shared channel for the misc packed-broadcast
+        # Validate the generation-side destination before creating collectives.
+        state_dict_info = self._policy.prepare_refit_info()
+        if state_dict_info is None:
+            raise RuntimeError("NCCL reshard requires policy refit metadata")
+        self._generation.prepare_refit_info(state_dict_info)
+
+        # 2. model_update_group: shared channel for the misc packed-broadcast
         #    (and the FP8 KV-cache scales).  Same setup as the collective path.
         ip, port = self._train_cluster.get_master_address_and_port()
         futures_train = self._policy.init_collective(
@@ -153,7 +161,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         )
         ray.get(futures_train + futures_inference)
 
-        # 2. Bulk-path comm group(s): one per PP stage, each spanning that
+        # 3. Bulk-path comm group(s): one per PP stage, each spanning that
         #    stage's train ranks + all gen ranks (non-PP == a single stage over
         #    all train + gen ranks).  Separate NCCL communicator from
         #    model_update_group; the workers run the misc broadcast strictly
@@ -196,7 +204,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         )
         ray.get(futures_train + futures_inference)
 
-        # 3. Refit metadata.  Train builds backend-agnostic per-layer metadata
+        # 4. Refit metadata. Train builds backend-agnostic per-layer metadata
         #    (HF naming convention); gen maps it into its own fused layout
         #    (e.g. vLLM's w13/w2).
         nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(

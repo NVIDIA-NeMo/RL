@@ -537,6 +537,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
     vllm_cfg = generation.get("vllm_cfg", {}) or {}
     vllm_kwargs = generation.get("vllm_kwargs", {}) or {}
+    real_nvfp4 = bool(generation.get("real_quant"))
 
     violations: list[str] = []
 
@@ -576,6 +577,57 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "policy.dtensor_cfg.enabled must be False "
             "(this initial version supports the Megatron train backend only)."
         )
+
+    if real_nvfp4:
+        if policy.get("quant_cfg") is not None:
+            violations.append(
+                "policy.quant_cfg must be null for real NVFP4 NCCL refit; "
+                "the trainer must keep plain BF16 storage and the vLLM receiver "
+                "performs NVFP4 serialization."
+            )
+        policy_precision = policy.get("precision")
+        if policy_precision not in {"bf16", "bfloat16"}:
+            violations.append(
+                "policy.precision must be 'bf16' or 'bfloat16' for real NVFP4 "
+                f"NCCL refit (got {policy_precision!r})."
+            )
+
+        fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
+        if fp8_cfg.get("fp8_param"):
+            violations.append(
+                "real NVFP4 NCCL refit requires plain BF16 Megatron storage; "
+                "policy.megatron_cfg.fp8_cfg.fp8_param must be False."
+            )
+
+        quant_cfg = generation.get("quant_cfg")
+        effective_mode = None
+        if not isinstance(quant_cfg, str) or not quant_cfg.strip():
+            violations.append(
+                "real NVFP4 requires a non-empty policy.generation.quant_cfg."
+            )
+        else:
+            try:
+                from nemo_rl.modelopt.utils import resolve_nvfp4_real_quant_mode
+
+                effective_mode = resolve_nvfp4_real_quant_mode(quant_cfg)
+            except (ImportError, TypeError, ValueError) as error:
+                violations.append(
+                    "policy.generation.quant_cfg must resolve to a supported "
+                    f"NVFP4 mode: {error}"
+                )
+
+        if effective_mode not in {None, "w4a16", "w4a4"}:
+            violations.append(
+                "real NVFP4 effective mode must be 'w4a16' or 'w4a4' "
+                f"(got {effective_mode!r})."
+            )
+        if effective_mode == "w4a4":
+            calibration_path = generation.get("real_quant_calibration_path")
+            if not isinstance(calibration_path, str) or not calibration_path.strip():
+                violations.append(
+                    "real NVFP4 W4A4 requires a non-empty "
+                    "policy.generation.real_quant_calibration_path."
+                )
 
     if megatron_enabled:
         etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
@@ -667,7 +719,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
-        if gen_ep != 1 and gen_ep != gen_tp:
+        if real_nvfp4 and gen_ep != 1:
+            violations.append(
+                "policy.generation.vllm_cfg.expert_parallel_size must be 1 for "
+                f"real NVFP4 NCCL refit (got ep={gen_ep})."
+            )
+        elif gen_ep != 1 and gen_ep != gen_tp:
             violations.append(
                 "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "
                 f"equal to tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."
