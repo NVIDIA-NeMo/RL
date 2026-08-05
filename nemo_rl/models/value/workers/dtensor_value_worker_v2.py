@@ -273,9 +273,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         loss_post_processor = LossPostProcessor(
             loss_fn=wrapped_loss_fn,
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
