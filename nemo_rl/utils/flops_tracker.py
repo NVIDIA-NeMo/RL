@@ -47,6 +47,64 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
     )
 
 
+def _get_glm_moe_layer_pattern(config: PretrainedConfig) -> list[int]:
+    """Return the GLM dense/MoE layer pattern from the model config."""
+    mlp_layer_types = getattr(config, "mlp_layer_types", None)
+    if mlp_layer_types is None:
+        first_k_dense = config.first_k_dense_replace
+        if not 0 <= first_k_dense <= config.num_hidden_layers:
+            raise ValueError(
+                "GLM first_k_dense_replace must be between zero and the number "
+                f"of hidden layers, got {first_k_dense}"
+            )
+        return [0] * first_k_dense + [1] * (config.num_hidden_layers - first_k_dense)
+
+    if len(mlp_layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            "GLM mlp_layer_types must contain one entry per hidden layer, got "
+            f"{len(mlp_layer_types)} entries for {config.num_hidden_layers} layers"
+        )
+
+    valid_layer_types = {"dense", "sparse"}
+    invalid_layer_types = set(mlp_layer_types) - valid_layer_types
+    if invalid_layer_types:
+        raise ValueError(f"Unsupported GLM MLP layer types: {invalid_layer_types}")
+    return [0 if layer_type == "dense" else 1 for layer_type in mlp_layer_types]
+
+
+def _get_glm_index_compute_layers(config: PretrainedConfig) -> int:
+    """Return how many GLM layers compute, rather than reuse, DSA indices."""
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        if len(indexer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "GLM indexer_types must contain one entry per hidden layer, got "
+                f"{len(indexer_types)} entries for {config.num_hidden_layers} layers"
+            )
+
+        valid_indexer_types = {"full", "shared"}
+        invalid_indexer_types = set(indexer_types) - valid_indexer_types
+        if invalid_indexer_types:
+            raise ValueError(
+                f"Unsupported GLM DSA indexer types: {invalid_indexer_types}"
+            )
+        return sum(indexer_type == "full" for indexer_type in indexer_types)
+
+    topk_freq = getattr(config, "index_topk_freq", 1) or 1
+    skip_topk_offset = getattr(config, "index_skip_topk_offset", 0) or 0
+    if topk_freq < 1:
+        raise ValueError(f"GLM index_topk_freq must be positive, got {topk_freq}")
+    if skip_topk_offset < 0:
+        raise ValueError(
+            f"GLM index_skip_topk_offset must be non-negative, got {skip_topk_offset}"
+        )
+    skip_topk_offset = max(skip_topk_offset, 1)
+    return sum(
+        max(layer_number - skip_topk_offset, 0) % topk_freq == 0
+        for layer_number in range(1, config.num_hidden_layers + 1)
+    )
+
+
 def convert_config_to_flops_config(
     config: PretrainedConfig,
 ) -> tuple[FLOPSConfig, Callable]:
@@ -107,9 +165,6 @@ def convert_config_to_flops_config(
             causal_self_attn=True,
         ), deepseekv3
     elif config.__class__.model_type == "glm_moe_dsa":
-        moe_layer_freq = [0] * config.first_k_dense_replace + [1] * (
-            config.num_hidden_layers - config.first_k_dense_replace
-        )
         return FLOPSConfig(
             gbs=0,
             hs=config.hidden_size,
@@ -124,7 +179,7 @@ def convert_config_to_flops_config(
             qk_head_dim=config.qk_nope_head_dim,
             qk_pos_emb_head_dim=config.qk_rope_head_dim,
             v_head_dim=config.v_head_dim,
-            moe_layer_freq=moe_layer_freq,
+            moe_layer_freq=_get_glm_moe_layer_pattern(config),
             moe_shared_expert_intermediate_size=(
                 config.moe_intermediate_size * config.n_shared_experts
             ),
@@ -136,6 +191,7 @@ def convert_config_to_flops_config(
             dsa_indexer_n_heads=config.index_n_heads,
             dsa_indexer_head_dim=config.index_head_dim,
             dsa_indexer_topk=config.index_topk,
+            dsa_indexer_compute_layers=_get_glm_index_compute_layers(config),
         ), glm_moe_dsa
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")

@@ -87,7 +87,9 @@ def test_qwen3_flops_wide_attention():
     assert wide > standard
 
 
-def _glm_moe_dsa_flops_config(index_topk=2048):
+def _glm_moe_dsa_flops_config(
+    index_topk: int = 2048, index_compute_layers: int = 78
+) -> FLOPSConfig:
     return FLOPSConfig(
         gbs=1,
         enc_seq_len=4096,
@@ -111,6 +113,7 @@ def _glm_moe_dsa_flops_config(index_topk=2048):
         dsa_indexer_n_heads=32,
         dsa_indexer_head_dim=128,
         dsa_indexer_topk=index_topk,
+        dsa_indexer_compute_layers=index_compute_layers,
     )
 
 
@@ -120,20 +123,81 @@ def test_glm_moe_dsa_flops_scale_with_sparse_topk():
     assert larger_topk > smaller_topk
 
 
-def test_glm_moe_dsa_config_is_supported():
-    config = GlmMoeDsaConfigForTest()
+def test_glm_moe_dsa_flops_components():
+    config = FLOPSConfig(
+        gbs=2,
+        enc_seq_len=8,
+        hs=4,
+        layers=2,
+        ffn_hs=8,
+        attention_heads=2,
+        moe_router_topk=2,
+        vocab_size=16,
+        q_lora_rank=3,
+        kv_lora_rank=2,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=1,
+        v_head_dim=2,
+        moe_layer_freq=[0, 1],
+        moe_shared_expert_intermediate_size=2,
+        moe_ffn_hidden_size=2,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=2,
+        dsa_indexer_topk=4,
+        dsa_indexer_compute_layers=1,
+    )
 
-    flops_config, flops_formula = convert_config_to_flops_config(config)
+    # Per input: 15,168 linear + 2,880 sparse attention + 960 indexer
+    # + 3,072 vocabulary projection FLOPs; gbs=2.
+    assert glm_moe_dsa(config) == 44_160
+
+
+def _glm_5_2_indexer_types() -> list[str]:
+    return [
+        "full" if layer_number <= 3 or (layer_number - 3) % 4 == 0 else "shared"
+        for layer_number in range(1, 79)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model_config", "expected_index_compute_layers"),
+    [
+        (GlmMoeDsaConfigForTest(), 78),
+        (
+            GlmMoeDsaConfigForTest(
+                mlp_layer_types=["dense"] * 3 + ["sparse"] * 75,
+                indexer_types=_glm_5_2_indexer_types(),
+            ),
+            21,
+        ),
+    ],
+    ids=["glm-5.1", "glm-5.2"],
+)
+def test_glm_moe_dsa_config_is_supported(model_config, expected_index_compute_layers):
+    flops_config, flops_formula = convert_config_to_flops_config(model_config)
+
     assert flops_formula is glm_moe_dsa
     assert flops_config.moe_layer_freq == [0] * 3 + [1] * 75
     assert flops_config.moe_shared_expert_intermediate_size == 2048
     assert flops_config.dsa_indexer_n_heads == 32
     assert flops_config.dsa_indexer_head_dim == 128
     assert flops_config.dsa_indexer_topk == 2048
+    assert flops_config.dsa_indexer_compute_layers == expected_index_compute_layers
 
-    flops_tracker = FLOPTracker.from_config("glm-moe-dsa-test", config)
+    flops_tracker = FLOPTracker.from_config("glm-moe-dsa-test", model_config)
     flops_tracker.track(n_samples=1, padded_seq_len=4096)
     assert flops_tracker.total_flops > 0
+
+
+def test_glm_5_2_reused_indices_reduce_indexer_flops():
+    glm_5_1_config = _glm_moe_dsa_flops_config(index_compute_layers=78)
+    glm_5_2_config = _glm_moe_dsa_flops_config(index_compute_layers=21)
+
+    actual_difference = glm_moe_dsa(glm_5_1_config) - glm_moe_dsa(glm_5_2_config)
+    seq_len = glm_5_1_config.enc_seq_len
+    projection_params = 2048 * 32 * 128 + 6144 * 128 + 6144 * 32
+    per_layer_indexer_flops = 2 * (seq_len * projection_params + seq_len**2 * 32 * 128)
+    assert actual_difference == (78 - 21) * per_layer_indexer_flops
 
 
 def test_worker_total_flops_aggregation_megatron_path():

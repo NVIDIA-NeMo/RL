@@ -61,8 +61,7 @@ class FLOPSConfig:
     dsa_indexer_n_heads: Optional[int] = None
     dsa_indexer_head_dim: Optional[int] = None
     dsa_indexer_topk: Optional[int] = None
-    dsa_indexer_topk_freq: int = 1
-    dsa_indexer_skip_topk_offset: int = 0
+    dsa_indexer_compute_layers: Optional[int] = None
 
 
 def gpt3(config: FLOPSConfig):
@@ -401,123 +400,8 @@ def flux(config: FLOPSConfig):
     return joint_layer_flops + single_layer_flops + other_flops
 
 
-def deepseekv3(config: FLOPSConfig):
-    """Model FLOPs for DeepSeek V3."""
-    # self-attention flops
-    bmm1_flops = (
-        0.5
-        * (config.qk_head_dim + config.qk_pos_emb_head_dim)
-        * config.attention_heads
-        * (config.enc_seq_len**2)
-    )
-    bmm2_flops = (
-        0.5 * config.v_head_dim * config.attention_heads * (config.enc_seq_len**2)
-    )
-    per_input_attention_flops = 6 * (bmm1_flops + bmm2_flops) * config.layers
-    if config.mtp_num_layers is not None:
-        per_input_attention_flops += (
-            6 * (bmm1_flops + bmm2_flops) * config.mtp_num_layers
-        )
-
-    # linear layer flops
-    # Q projection: check if using MLA (q_lora_rank is set) or standard attention
-    if config.q_lora_rank is not None:
-        # MLA for Q (e.g., DeepSeek-V3)
-        per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
-            (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
-        )  # Q
-    else:
-        # Standard attention for Q (e.g., Moonlight)
-        per_layer_mla_params = config.hs * (
-            (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
-        )  # Q
-
-    per_layer_mla_params += config.hs * config.qk_pos_emb_head_dim  # K^R
-    per_layer_mla_params += config.hs * config.kv_lora_rank + config.kv_lora_rank * (
-        (config.qk_head_dim + config.v_head_dim) * config.attention_heads
-    )  # K^C and V^C
-    per_layer_mla_params += (
-        config.v_head_dim * config.attention_heads * config.hs
-    )  # Proj
-    mla_params = per_layer_mla_params * config.layers
-    if config.mtp_num_layers is not None:
-        mla_params += per_layer_mla_params * config.mtp_num_layers
-
-    dense_layer_ffn_params = config.hs * config.ffn_hs * 3  # gated linear unit
-    per_shared_expert_params = (
-        config.hs * config.moe_shared_expert_intermediate_size * 3
-    )
-    per_selected_expert_params = config.hs * config.moe_ffn_hidden_size * 3
-    ffn_params = 0
-
-    if isinstance(config.moe_layer_freq, int):
-        moe_layer_pattern = [
-            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.layers)
-        ]
-    else:
-        moe_layer_pattern = config.moe_layer_freq
-    for i in moe_layer_pattern:
-        if i == 0:
-            ffn_params += dense_layer_ffn_params
-        else:
-            ffn_params += per_shared_expert_params + (
-                per_selected_expert_params * config.moe_router_topk
-            )
-    if config.mtp_num_layers is not None:
-        for i in range(config.mtp_num_layers):
-            ffn_params += per_shared_expert_params + (
-                per_selected_expert_params * config.moe_router_topk
-            )
-    per_input_params = mla_params + ffn_params
-    per_input_linear_flops = 6 * per_input_params * config.enc_seq_len
-
-    # vocab flops
-    per_input_vocab_flops = 6 * config.vocab_size * config.hs * config.enc_seq_len
-    if config.mtp_num_layers is not None:
-        for i in range(config.mtp_num_layers):
-            per_input_vocab_flops += (
-                6 * config.vocab_size * config.hs * config.enc_seq_len
-            )
-            per_input_vocab_flops += 6 * config.hs * 2 * config.hs * config.enc_seq_len
-
-    return (
-        per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops
-    ) * config.gbs
-
-
-def _moe_ffn_params(config: FLOPSConfig):
-    dense_layer_ffn_params = config.hs * config.ffn_hs * 3  # gated linear unit
-    per_shared_expert_params = (
-        config.hs * config.moe_shared_expert_intermediate_size * 3
-    )
-    per_selected_expert_params = config.hs * config.moe_ffn_hidden_size * 3
-    ffn_params = 0
-
-    if isinstance(config.moe_layer_freq, int):
-        moe_layer_pattern = [
-            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.layers)
-        ]
-    else:
-        moe_layer_pattern = config.moe_layer_freq
-
-    for i in moe_layer_pattern:
-        if i == 0:
-            ffn_params += dense_layer_ffn_params
-        else:
-            ffn_params += per_shared_expert_params + (
-                per_selected_expert_params * config.moe_router_topk
-            )
-
-    if config.mtp_num_layers is not None:
-        for _ in range(config.mtp_num_layers):
-            ffn_params += per_shared_expert_params + (
-                per_selected_expert_params * config.moe_router_topk
-            )
-
-    return ffn_params
-
-
-def _mla_projection_params(config: FLOPSConfig):
+def _mla_projection_params(config: FLOPSConfig) -> int:
+    """Return the per-layer MLA projection parameter count."""
     if config.q_lora_rank is not None:
         per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
             (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
@@ -535,28 +419,75 @@ def _mla_projection_params(config: FLOPSConfig):
     return per_layer_mla_params
 
 
+def _moe_ffn_params(config: FLOPSConfig) -> int:
+    """Return activated dense/MoE FFN parameters for all model and MTP layers."""
+    dense_layer_ffn_params = config.hs * config.ffn_hs * 3  # gated linear unit
+    per_shared_expert_params = (
+        config.hs * config.moe_shared_expert_intermediate_size * 3
+    )
+    per_selected_expert_params = config.hs * config.moe_ffn_hidden_size * 3
+    ffn_params = 0
+
+    if isinstance(config.moe_layer_freq, int):
+        moe_layer_pattern = [
+            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.layers)
+        ]
+    else:
+        moe_layer_pattern = config.moe_layer_freq
+
+    for i in moe_layer_pattern:
+        if i == 0:
+            ffn_params += dense_layer_ffn_params
+        else:
+            ffn_params += per_shared_expert_params + (
+                per_selected_expert_params * config.moe_router_topk
+            )
+    for _ in range(config.mtp_num_layers or 0):
+        ffn_params += per_shared_expert_params + (
+            per_selected_expert_params * config.moe_router_topk
+        )
+    return ffn_params
+
+
+def _mla_moe_linear_flops(config: FLOPSConfig) -> int:
+    """Return MLA projection and activated FFN training FLOPs per input."""
+    mla_layers = config.layers + (config.mtp_num_layers or 0)
+    mla_params = _mla_projection_params(config) * mla_layers
+    return 6 * (mla_params + _moe_ffn_params(config)) * config.enc_seq_len
+
+
+def _vocab_and_mtp_flops(config: FLOPSConfig) -> int:
+    """Return output projection and MTP embedding projection FLOPs per input."""
+    vocab_flops = 6 * config.vocab_size * config.hs * config.enc_seq_len
+    for _ in range(config.mtp_num_layers or 0):
+        vocab_flops += 6 * config.vocab_size * config.hs * config.enc_seq_len
+        vocab_flops += 6 * config.hs * 2 * config.hs * config.enc_seq_len
+    return vocab_flops
+
+
+def deepseekv3(config: FLOPSConfig) -> float:
+    """Model FLOPs for DeepSeek V3."""
+    attention_layers = config.layers + (config.mtp_num_layers or 0)
+    attention_dims = config.qk_head_dim + config.qk_pos_emb_head_dim + config.v_head_dim
+    causal_pairs = 0.5 * config.enc_seq_len**2
+    attention_flops = (
+        6 * attention_layers * causal_pairs * config.attention_heads * attention_dims
+    )
+
+    return (
+        attention_flops + _mla_moe_linear_flops(config) + _vocab_and_mtp_flops(config)
+    ) * config.gbs
+
+
 def _causal_topk_pairs(seq_len: int, topk: int) -> float:
     """Approximate causal sparse-attention query/key pairs with dense formula conventions."""
     effective_topk = min(topk, seq_len)
     if effective_topk == seq_len:
         return 0.5 * seq_len * seq_len
-    return effective_topk * seq_len - 0.5 * effective_topk * effective_topk
+    return effective_topk * seq_len - 0.5 * effective_topk**2
 
 
-def _dsa_index_compute_layers(config: FLOPSConfig):
-    def is_skip_layer(layer_number: int):
-        skip_topk_offset = max(config.dsa_indexer_skip_topk_offset, 1)
-        return (
-            max(layer_number - skip_topk_offset, 0) % config.dsa_indexer_topk_freq
-        ) != 0
-
-    return sum(
-        0 if is_skip_layer(layer_number) else 1
-        for layer_number in range(1, config.layers + 1)
-    )
-
-
-def glm_moe_dsa(config: FLOPSConfig):
+def glm_moe_dsa(config: FLOPSConfig) -> float:
     """Model FLOPs for GLM MoE DSA.
 
     GLM-MoE-DSA uses MLA projections and MoE FFNs like DeepSeek-style MoE models,
@@ -566,14 +497,6 @@ def glm_moe_dsa(config: FLOPSConfig):
     forward+backward training factor used for trainable model-path GEMMs.
     """
     seq_len = config.enc_seq_len
-
-    # MLA projections and MoE FFNs.
-    per_layer_mla_params = _mla_projection_params(config)
-    mla_params = per_layer_mla_params * config.layers
-    if config.mtp_num_layers is not None:
-        mla_params += per_layer_mla_params * config.mtp_num_layers
-
-    per_input_linear_flops = 6 * (mla_params + _moe_ffn_params(config)) * seq_len
 
     # DSA sparse attention. In absorbed MLA DSA, scores use latent KV + RoPE
     # channels and value aggregation uses latent KV channels.
@@ -590,28 +513,25 @@ def glm_moe_dsa(config: FLOPSConfig):
 
     # DSA indexer: q_lora -> index heads, hidden -> index key, hidden -> head weights,
     # then dense index-score matmul before top-k selection. Top-k itself is not counted.
-    index_compute_layers = _dsa_index_compute_layers(config)
     indexer_projection_params = (
         config.q_lora_rank * config.dsa_indexer_n_heads * config.dsa_indexer_head_dim
         + config.hs * config.dsa_indexer_head_dim
         + config.hs * config.dsa_indexer_n_heads
     )
-    per_input_indexer_flops = 2 * index_compute_layers * (
-        seq_len * indexer_projection_params
-        + (seq_len**2) * config.dsa_indexer_n_heads * config.dsa_indexer_head_dim
+    per_input_indexer_flops = (
+        2
+        * config.dsa_indexer_compute_layers
+        * (
+            seq_len * indexer_projection_params
+            + (seq_len**2) * config.dsa_indexer_n_heads * config.dsa_indexer_head_dim
+        )
     )
 
-    per_input_vocab_flops = 6 * config.vocab_size * config.hs * seq_len
-    if config.mtp_num_layers is not None:
-        for _ in range(config.mtp_num_layers):
-            per_input_vocab_flops += 6 * config.vocab_size * config.hs * seq_len
-            per_input_vocab_flops += 6 * config.hs * 2 * config.hs * seq_len
-
     return (
-        per_input_linear_flops
+        _mla_moe_linear_flops(config)
         + per_input_sparse_attention_flops
         + per_input_indexer_flops
-        + per_input_vocab_flops
+        + _vocab_and_mtp_flops(config)
     ) * config.gbs
 
 
