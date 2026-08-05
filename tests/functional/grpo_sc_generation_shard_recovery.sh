@@ -160,7 +160,9 @@ grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" || {
 # Check the job on every attempt so "the run ended" is reported as itself rather than
 # surfacing later as the far more confusing "expected 2 generation actors, found 0".
 GEN_PIDS=()
+ATTEMPT=0
 for _ in $(seq 1 10); do
+    ATTEMPT=$((ATTEMPT + 1))
     if ! kill -0 $TRAIN_PID 2>/dev/null; then
         echo "[recovery] FAIL: the run ended before a shard could be killed."
         echo "[recovery] It reached step $KILL_AFTER_STEP, then finished or died while the"
@@ -168,19 +170,28 @@ for _ in $(seq 1 10); do
         echo "[recovery] all $MAX_STEPS steps, raise MAX_STEPS or lower KILL_AFTER_STEP --"
         echo "[recovery] this hardware runs a step in seconds."
         echo "[recovery] --- helper stderr from the last attempt (job was still alive) ---"
-        # This dump used to exist only on the other failure path, so the run that actually
-        # happens printed nothing about why discovery failed. It is the whole diagnostic.
-        tail -30 "$EXP_DIR/actors.err" 2>/dev/null || echo "  <none captured>"
+        echo "${ACTORS_ERR:-<no attempt completed>}" | tail -25 | sed 's/^/[recovery]   /'
         echo "[recovery] --- last 60 lines of the training log ---"
         tail -60 "$RUN_LOG"
         exit 1
     fi
     # Keep stderr. Discarding it is why three rounds of this were undiagnosable: the
     # helper explains itself there, and the loop was throwing that away.
-    # timeout: an attempt that cannot connect costs two ray.init timeouts, about 40s.
-    # Ten of those ate the whole 7 minutes this run had left after step 3, so the loop
-    # outlived the job it was supposed to interrupt. Bound it and fail fast instead.
-    mapfile -t GEN_PIDS < <(timeout "$ACTOR_QUERY_TIMEOUT_S" uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>"$EXP_DIR/actors.err" | sort -n)
+    # Print the helper's stderr INLINE, into this log.
+    #
+    # Two previous attempts routed it to $EXP_DIR/actors.err and neither produced a file
+    # that survived to be read. A separate artifact is one more thing that has to be
+    # written, kept, and collected; the harness log is already captured, so put it there.
+    # stdout (the pids) goes to a temp file, stderr into a variable.
+    : > "$EXP_DIR/pids.tmp"
+    ACTORS_ERR=$(timeout "$ACTOR_QUERY_TIMEOUT_S" uv run --no-sync python \
+        "$SCRIPT_DIR/_find_generation_actors.py" 2>&1 >"$EXP_DIR/pids.tmp" || true)
+    mapfile -t GEN_PIDS < <(sort -n < "$EXP_DIR/pids.tmp")
+    if (( ${#GEN_PIDS[@]} != GEN_GPUS )) && [[ -n "$ACTORS_ERR" && $ATTEMPT -le 2 ]]; then
+        # Only the first couple of attempts, or a 10-attempt loop floods the log.
+        echo "[recovery] discovery attempt $ATTEMPT found ${#GEN_PIDS[@]} pid(s); helper said:"
+        echo "$ACTORS_ERR" | tail -25 | sed 's/^/[recovery]   /'
+    fi
     (( ${#GEN_PIDS[@]} == GEN_GPUS )) && break
     sleep 3
 done
@@ -192,7 +203,7 @@ if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     echo "[recovery] --- helper stderr from the LAST in-loop attempt (job was alive) ---"
     # This is the one that matters: the diagnostic call below runs after the job has gone,
     # so it can only ever say "cluster not found".
-    tail -30 "$EXP_DIR/actors.err" 2>/dev/null || echo "  <none captured>"
+    echo "${ACTORS_ERR:-<no attempt completed>}" | tail -25 | sed 's/^/[recovery]   /'
     echo "[recovery] --- what Ray reports now (job already gone) ---"
     uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
     echo "[recovery] --- every process with 'eneration' in its command line ---"
