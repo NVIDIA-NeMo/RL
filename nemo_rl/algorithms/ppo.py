@@ -232,8 +232,9 @@ class PPOConfig(TypedDict):
     critic_ppo_epochs: NotRequired[Optional[int]]
     # Re-score the rollout batch with a forward-only pass after the final critic
     # update, emitting critic/explained_var_post_update and
-    # critic/loss_post_update. critic/* without the suffix are measured by a
-    # training pass, i.e. BEFORE that pass's update. Costs one extra critic
+    # critic/loss_post_update. critic/explained_var is always the PRE-update EV,
+    # computed from the rollout-time values GAE consumed (critic/loss and
+    # critic/grad_norm come from the last training pass). Costs one extra critic
     # forward over the batch per step, so this defaults to off.
     log_post_update_critic_metrics: NotRequired[bool]
     reward_shaping: RewardShapingConfig
@@ -1520,6 +1521,12 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
 
     # Compute explained variance from sufficient statistics:
     # EV = 1 - Var(returns - values) / Var(returns)
+    # NOTE: these statistics come from a TRAINING pass's forward, so with
+    # critic_ppo_epochs > 1 they see a critic already fitted by the earlier
+    # passes. ppo_train/async_ppo_train overwrite critic/explained_var with the
+    # pre-update EV from the rollout-time values (_pooled_explained_var); this
+    # loss-derived one only survives as critic/explained_var_post_update, where
+    # the post-update timing is the point.
     r_mean = critic_metrics.get("critic/returns_mean", 0)
     v_mean = critic_metrics.get("critic/values_mean", 0)
     r_sq = critic_metrics.get("critic/returns_sq_mean", 0)
@@ -1528,6 +1535,31 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     var_residual = res_sq - (r_mean - v_mean) ** 2
     critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(var_returns, 1e-8)
     return critic_metrics
+
+
+def _pooled_explained_var(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> float:
+    """Pooled EV = 1 - Var(returns - values) / Var(returns) over valid tokens.
+
+    Computed driver-side from the rollout-time values -- the exact tensors GAE
+    consumed -- so it describes the critic BEFORE any update this step,
+    regardless of critic_ppo_epochs or gbs-vs-rollout microbatching. Masked like
+    the value loss (token_mask * sample_mask) so it is directly comparable to
+    critic/explained_var_post_update.
+    """
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    if int(mask.sum()) < 2:
+        return 0.0
+    r = returns[mask].float()
+    v = values[mask].float()
+    var_returns = r.var(unbiased=False)
+    if var_returns <= 1e-8:
+        return 0.0
+    return (1.0 - (r - v).var(unbiased=False) / var_returns).item()
 
 
 def _calibration_ece(
@@ -2447,11 +2479,22 @@ def ppo_train(
                 # Extract critic metrics from value training results
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
-                    # critic/explained_var above is measured by the last training
-                    # pass's forward, i.e. BEFORE that pass's update. This is the
-                    # same quantity re-measured AFTER every update this step, so
-                    # the pair shows how much the critic actually gained on the
-                    # batch it just fit.
+                    # critic/explained_var must describe the critic BEFORE any
+                    # update this step (the values GAE consumed). The loss-derived
+                    # EV from _compute_critic_metrics comes from the last training
+                    # pass's forward, which with critic_ppo_epochs > 1 has already
+                    # fit this batch -- overwrite it with the pre-update EV.
+                    # critic/loss and critic/grad_norm still describe the last
+                    # training pass.
+                    if "values" in train_data and "returns" in train_data:
+                        metrics["critic/explained_var"] = _pooled_explained_var(
+                            train_data["values"],
+                            train_data["returns"],
+                            train_data["token_mask"],
+                            train_data["sample_mask"],
+                        )
+                    # The other end of the bracket: the same batch re-scored AFTER
+                    # every update this step (ppo.log_post_update_critic_metrics).
                     if post_value_results is not None:
                         post_metrics = _compute_critic_metrics(post_value_results)
                         metrics["critic/explained_var_post_update"] = post_metrics[
@@ -3696,8 +3739,17 @@ def async_ppo_train(
                     metrics.update(train_results["all_mb_metrics"])
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
-                    # Same quantity re-measured AFTER every update this step; see
-                    # the sync loop.
+                    # Overwrite critic/explained_var with the pre-update EV (the
+                    # values GAE consumed); see the sync loop for why.
+                    if "values" in train_data and "returns" in train_data:
+                        metrics["critic/explained_var"] = _pooled_explained_var(
+                            train_data["values"],
+                            train_data["returns"],
+                            train_data["token_mask"],
+                            train_data["sample_mask"],
+                        )
+                    # The other end of the bracket: re-scored AFTER every update
+                    # this step (ppo.log_post_update_critic_metrics).
                     if post_value_results is not None:
                         post_metrics = _compute_critic_metrics(post_value_results)
                         metrics["critic/explained_var_post_update"] = post_metrics[

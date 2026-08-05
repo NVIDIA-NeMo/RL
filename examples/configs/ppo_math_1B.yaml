@@ -14,9 +14,10 @@ ppo:
   # critic-only passes, fitting the critic harder without over-training the actor.
   critic_ppo_epochs: null
   # Re-score the batch with a forward-only critic pass after the final update,
-  # adding critic/explained_var_post_update + critic/loss_post_update (the
-  # unsuffixed critic/* are measured BEFORE the last update). Costs one extra
-  # critic forward per step.
+  # adding critic/explained_var_post_update + critic/loss_post_update.
+  # critic/explained_var is always the PRE-update EV (from the rollout-time
+  # values GAE consumed); critic/loss is from the last training pass. Costs one
+  # extra critic forward per step.
   log_post_update_critic_metrics: false
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   val_period: 20

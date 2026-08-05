@@ -1155,6 +1155,48 @@ def test_resolve_critic_ppo_epochs_rejects_zero_ppo_epochs():
         _resolve_critic_ppo_epochs({"ppo_epochs": 0})
 
 
+def test_pooled_explained_var_pre_update():
+    """Pre-update EV: perfect prediction -> 1, mean prediction -> 0, and both
+    masks are respected (values at masked positions must not leak in)."""
+    from nemo_rl.algorithms.ppo import _pooled_explained_var
+
+    token_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+    sample_mask = torch.tensor([1.0, 1.0])
+    returns = torch.tensor([[1.0, 1.0, 1.0, 9.0], [0.0, 0.0, 9.0, 9.0]])
+
+    # Perfect prediction on valid tokens; garbage on masked tokens is ignored.
+    values = returns.clone()
+    values[0, 3] = 7.0
+    values[1, 2] = 7.0
+    assert _pooled_explained_var(values, returns, token_mask, sample_mask) == (
+        pytest.approx(1.0)
+    )
+
+    # Constant prediction at the valid-token mean explains nothing.
+    mean_pred = torch.full_like(returns, 0.6)  # mean of [1,1,1,0,0]
+    assert _pooled_explained_var(mean_pred, returns, token_mask, sample_mask) == (
+        pytest.approx(0.0, abs=1e-6)
+    )
+
+    # sample_mask knocks out the second sequence; the survivor has constant
+    # returns (zero variance), which reports 0.0 rather than dividing by ~0.
+    solo = torch.tensor([1.0, 0.0])
+    assert _pooled_explained_var(returns.clone(), returns, token_mask, solo) == 0.0
+
+    # Matches the sufficient-statistics form used by the loss-side metrics.
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    noisy = returns + 0.25 * torch.tensor(
+        [[1.0, -1.0, 0.5, 0.0], [-0.5, 1.0, 0.0, 0.0]]
+    )
+    r, v = returns[mask], noisy[mask]
+    r_mean, v_mean = r.mean(), v.mean()
+    r_sq, res_sq = (r**2).mean(), ((r - v) ** 2).mean()
+    ev_suff = 1.0 - (res_sq - (r_mean - v_mean) ** 2) / (r_sq - r_mean**2)
+    assert _pooled_explained_var(noisy, returns, token_mask, sample_mask) == (
+        pytest.approx(ev_suff.item(), abs=1e-6)
+    )
+
+
 # NeMo-Gym IS supported for async PPO: the AsyncTrajectoryCollector runs the gym
 # rollout internally (checks _should_use_nemo_gym, passes master_config.reward_penalties),
 # so async_ppo_train no longer guards it out. Validate-side dispatch is covered by
