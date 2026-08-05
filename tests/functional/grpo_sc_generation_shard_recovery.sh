@@ -168,7 +168,9 @@ for _ in $(seq 1 10); do
         tail -60 "$RUN_LOG"
         exit 1
     fi
-    mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
+    # Keep stderr. Discarding it is why three rounds of this were undiagnosable: the
+    # helper explains itself there, and the loop was throwing that away.
+    mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>"$EXP_DIR/actors.err" | sort -n)
     (( ${#GEN_PIDS[@]} == GEN_GPUS )) && break
     sleep 3
 done
@@ -177,7 +179,11 @@ if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     echo "[recovery] FAIL: expected exactly $GEN_GPUS generation actors, found ${#GEN_PIDS[@]}"
     echo "[recovery] this is a harness problem, not a recovery failure -- killing the wrong"
     echo "[recovery] process would let the run complete and report a false pass."
-    echo "[recovery] --- what Ray reports (full actor table on stderr) ---"
+    echo "[recovery] --- helper stderr from the LAST in-loop attempt (job was alive) ---"
+    # This is the one that matters: the diagnostic call below runs after the job has gone,
+    # so it can only ever say "cluster not found".
+    tail -30 "$EXP_DIR/actors.err" 2>/dev/null || echo "  <none captured>"
+    echo "[recovery] --- what Ray reports now (job already gone) ---"
     uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
     echo "[recovery] --- every process with 'eneration' in its command line ---"
     # Unfiltered on purpose. The previous diagnostic grepped for "ray::" and so printed
