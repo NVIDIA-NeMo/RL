@@ -34,6 +34,7 @@ from transformers import (
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
@@ -46,8 +47,8 @@ from nemo_rl.models.automodel.setup import (
     validate_and_prepare_config,
 )
 from nemo_rl.models.automodel.train import (
-    LossPostProcessor,
     ScorePostProcessor,
+    ValueLossPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
@@ -71,6 +72,65 @@ def right_shift_values(values: torch.Tensor) -> torch.Tensor:
     column t-1.
     """
     return torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
+
+
+def gather_and_right_shift_values(
+    values: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    sequence_dim: int = 1,
+) -> torch.Tensor:
+    """Restore global CP sequence order before value temporal alignment."""
+    if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+        values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=sequence_dim)
+    return right_shift_values(values)
+
+
+def validate_context_parallel_sequence_length(seq_len: int, cp_size: int) -> None:
+    """Require the 2*CP chunks used by load-balanced causal attention."""
+    if cp_size > 1 and seq_len % (2 * cp_size) != 0:
+        raise ValueError(
+            f"Sequence length {seq_len} must be divisible by 2 * context "
+            f"parallel size ({2 * cp_size})."
+        )
+
+
+def pad_batch_for_context_parallel(
+    data: BatchedDataDict[Any],
+    cp_size: int,
+    pad_token_id: int,
+) -> tuple[BatchedDataDict[Any], int]:
+    """Right-pad sequence-aligned tensors for load-balanced CP attention.
+
+    PPO rollout batches are padded according to the policy topology, which can
+    differ from the value topology. A CP value model therefore has to enforce
+    its own ``2 * cp_size`` sequence multiple before creating CP buffers.
+    """
+    _, original_seq_len = check_sequence_dim(data)
+    if cp_size <= 1:
+        return data, original_seq_len
+
+    multiple = 2 * cp_size
+    padded_seq_len = ((original_seq_len + multiple - 1) // multiple) * multiple
+    if padded_seq_len == original_seq_len:
+        return data, original_seq_len
+
+    pad_len = padded_seq_len - original_seq_len
+    padded = BatchedDataDict[Any](data.copy())
+    for key, value in data.items():
+        if (
+            torch.is_tensor(value)
+            and value.ndim > 1
+            and value.shape[1] == original_seq_len
+        ):
+            pad_value = pad_token_id if key == "input_ids" else 0
+            padded[key] = torch.nn.functional.pad(
+                value,
+                (0, 0) * (value.ndim - 2) + (0, pad_len),
+                mode="constant",
+                value=pad_value,
+            )
+
+    return padded, original_seq_len
 
 
 class RightShiftLossWrapper:
@@ -275,6 +335,11 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
+        data, _ = pad_batch_for_context_parallel(
+            data,
+            self.cp_size,
+            self.tokenizer.eos_token_id or 0,
+        )
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
@@ -285,7 +350,8 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         # Validate sequence dimension
-        sequence_dim, _ = check_sequence_dim(data)
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        validate_context_parallel_sequence_length(seq_dim_size, self.cp_size)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -299,7 +365,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         # with the megatron value worker (V[t]=V(s_t) instead of V(s_{t+1}))
         # so GAE / MseValueLossFn / value clipping are self-consistent.
         wrapped_loss_fn = RightShiftLossWrapper(loss_fn)
-        loss_post_processor = LossPostProcessor(
+        loss_post_processor = ValueLossPostProcessor(
             loss_fn=wrapped_loss_fn,
             cfg=self.cfg,
             device_mesh=self.device_mesh,
@@ -371,7 +437,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
                     is_reward_model=True,  # Value models use reward model architecture
-                    allow_flash_attn_args=False,  # Typically False for value models
+                    allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                     sequence_dim=sequence_dim,
@@ -453,8 +519,15 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             else self.cfg.get("logprob_batch_size", self.cfg["train_micro_batch_size"])
         )
 
+        data, original_seq_len = pad_batch_for_context_parallel(
+            data,
+            self.cp_size,
+            self.tokenizer.eos_token_id or 0,
+        )
+
         # Validate sequence dimension
         sequence_dim, seq_dim_size = check_sequence_dim(data)
+        validate_context_parallel_sequence_length(seq_dim_size, self.cp_size)
 
         all_values = []
         self.model.eval()
@@ -462,6 +535,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         # Create value post-processor
         value_post_processor = ScorePostProcessor(
             cfg=self.cfg,
+            enable_seq_packing=self.enable_seq_packing,
         )
 
         with torch.no_grad():
@@ -493,12 +567,17 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                         post_processing_fn=value_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,  # Value models use reward model architecture
-                        allow_flash_attn_args=False,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sequence_dim=sequence_dim,
                     )
-                    # Mirror train()'s right-shift so GAE / value clipping /
-                    # value targets all see V(s_t) semantics (megatron parity).
-                    values = right_shift_values(values)
+                    # CP emits load-balanced sequence shards. Restore global
+                    # token order before shifting, including across shard
+                    # boundaries, to match train() and Megatron semantics.
+                    values = gather_and_right_shift_values(
+                        values,
+                        self.cp_mesh.get_group() if self.cp_size > 1 else None,
+                        sequence_dim,
+                    )
 
                 # Skip dummy batches
                 if batch_idx >= iterator_len:
@@ -517,7 +596,9 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                     val, (0, padding_needed), mode="constant", value=0.0
                 )
             all_values_padded.append(val)
-        return_data["values"] = torch.cat(all_values_padded, dim=0).cpu()
+        return_data["values"] = torch.cat(all_values_padded, dim=0)[
+            :, :original_seq_len
+        ].cpu()
 
         return return_data
 
