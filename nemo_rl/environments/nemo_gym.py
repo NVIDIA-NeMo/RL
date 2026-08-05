@@ -402,7 +402,7 @@ def _attach_multimodal_data_to_user_message(
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
     )
 def _token_capture_metrics(
-    per_rollout: list[dict[str, Any]], rebuilt: int, unbuilt: int
+    per_rollout: list[dict[str, Any]], rebuilt: int, unbuilt: int, masked: int = 0
 ) -> dict[str, float]:
     """Summarize a batch's token capture for the training metrics.
 
@@ -449,11 +449,15 @@ def _token_capture_metrics(
         # How often a recorded parent link could not be used, so the builder inferred the parent
         # from token prefixes instead. Inference is correct but cannot disambiguate a retry.
         "token_capture/parent_link_fallbacks": float(
-            sum(sum((m.get("parent_link_fallbacks") or {}).values()) for m in per_rollout)
+            sum(
+                sum((m.get("parent_link_fallbacks") or {}).values())
+                for m in per_rollout
+            )
         ),
-        "token_capture/masked_rollouts": float(
-            sum(1 for m in per_rollout if m.get("mask_sample"))
-        ),
+        # Counted from the build rather than the metrics dict: Gym puts the verdict at the top of
+        # the rollout record, so a consumer reads one field to decide, and the metrics dict below
+        # carries only the reasons.
+        "token_capture/masked_rollouts": float(masked),
         "token_capture/incomplete_rollouts": float(
             sum(1 for m in per_rollout if m.get("capture_incomplete"))
         ),
@@ -637,21 +641,26 @@ Depending on your data shape, you may want to change these values."""
 
         timer.start("_run_rollouts_total")
 
-        # Correlate each rollout so the Gym model server captures its model calls under a stable id,
-        # and resolve the token-capture dirs so we can rebuild a token-bearing response for training.
-        # NeMo Gym's low-level run_examples (unlike its rollout_collection) does not stamp the
-        # task/rollout indices; without them an external harness's model calls reach the model server
-        # uncorrelated (no /ng-rollout prefix) and nothing is captured.
-        from nemo_gym.base_responses_api_model import maybe_rollout_id_from_run_body
-        from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+        # Correlate each rollout so the Gym model server captures its model calls under a stable
+        # id, and resolve the token-capture dirs so a token-bearing response can be rebuilt for
+        # training. NeMo Gym's low-level run_examples (unlike its rollout_collection) does not
+        # stamp the correlation id; without one an external harness's model calls reach the model
+        # server uncorrelated (no /ng-rollout prefix) and nothing is captured.
+        from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
         from nemo_gym.token_id_capture import (
             TokenCaptureStore,
             token_id_capture_dirs_from_config,
-            trajectories_for_rollout,
         )
+        from nemo_gym.token_id_capture.delivery import finalize_rollout_token_capture
 
         global_config_dict = self.cfg.get("initial_global_config_dict") or {}
         token_capture_dirs = token_id_capture_dirs_from_config(global_config_dict)
+        # Where records are read from and retired. The colocated file store for now; a framework
+        # staging records through its own data plane passes its own TokenSource here instead, and
+        # nothing else in this path changes.
+        token_source = (
+            TokenCaptureStore(token_capture_dirs[0]) if token_capture_dirs else None
+        )
         if token_capture_dirs and not getattr(self, "_checked_capture_dirs", False):
             self._checked_capture_dirs = True
             # Writer (the Gym model server) and reader (this actor) are on the same node, so the
@@ -674,12 +683,15 @@ Depending on your data shape, you may want to change these values."""
         # sharding K actors would each start at 0 and collide across shards -- harmless while the
         # capture dir is node-local, silently corrupting the moment it is not. A per-actor random
         # base makes the id unique regardless.
+        #
+        # This goes in Gym's dedicated correlation key rather than its task/rollout indices. Those
+        # mean "which dataset row", which is not what this is, and Gym derives an id from them only
+        # as a fallback for callers that have nothing better.
         if not hasattr(self, "_rollout_seq"):
             self._rollout_seq = 0
             self._rollout_id_base = uuid.uuid4().int % (1 << 24)
         for row in nemo_gym_examples:
-            row[TASK_INDEX_KEY_NAME] = self._rollout_id_base
-            row[ROLLOUT_INDEX_KEY_NAME] = self._rollout_seq
+            row[ROLLOUT_ID_KEY_NAME] = f"s{self._rollout_id_base}-{self._rollout_seq}"
             self._rollout_seq += 1
 
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -691,6 +703,7 @@ Depending on your data shape, you may want to change these values."""
         capture_metrics: list[dict[str, Any]] = []
         rebuilt_rollouts = 0
         unbuilt_rollouts = 0
+        masked_rollouts = 0
 
         num_results = 0
         for task in nemo_gym_result_iterator:
@@ -712,64 +725,25 @@ Depending on your data shape, you may want to change these values."""
                         raise typed from None
                     raise
 
-            # External-harness path: the harness's returned output carries no token ids. Rebuild the
-            # training-facing response.output from this rollout's captured model calls so the
-            # postprocess below sees token-bearing assistant items. No-op when capture is off.
-            if token_capture_dirs and isinstance(nemo_gym_result.get("response"), dict):
-                rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
-                # Only rebuild for agents that opted in. A native agent already returns correct
-                # token ids inline; replacing them with a reconstruction would mean silently
-                # training on the reconstruction wherever the two differ.
-                if rollout_id is not None and _agent_opted_into_token_capture(
-                    global_config_dict, nemo_gym_row
-                ):
-                    try:
-                        built = trajectories_for_rollout(
-                            rollout_id,
-                            token_capture_dirs,
-                            model=str(nemo_gym_result["response"].get("model") or ""),
-                        )
-                    except Exception as error:
-                        # One malformed capture must not take down the batch. The builder contains
-                        # its own errors; this is the backstop for what it cannot (a corrupt file,
-                        # an unreadable directory).
-                        print(
-                            f"WARNING: could not build a trajectory for rollout {rollout_id}: "
-                            f"{type(error).__name__}: {error}",
-                            flush=True,
-                        )
-                        built = None
-
-                    projected = (built or {}).get("rebuilt_response")
-                    capture_metrics.append((built or {}).get("metrics") or {})
-                    if projected is not None:
-                        nemo_gym_result["response"]["output"] = projected["output"]
+            # A rollout whose returned output has no token ids gets them attached from what was
+            # recorded for it; one that already carries them is left alone. Gym decides that from
+            # the rollout itself, so a batch can mix native agents and external harnesses, and this
+            # call does not need to know which this is.
+            if token_source is not None:
+                # run_examples returns the harness result without the correlation key, which the
+                # lookup needs. Gym's rollout collection copies it onto the result for the same
+                # reason; this is that copy for the low-level path.
+                nemo_gym_result[ROLLOUT_ID_KEY_NAME] = nemo_gym_row[ROLLOUT_ID_KEY_NAME]
+                built = await finalize_rollout_token_capture(
+                    nemo_gym_result, token_source
+                )
+                if built is not None:
+                    capture_metrics.append(built.get("metrics") or {})
+                    masked_rollouts += bool(built.get("mask_sample"))
+                    if built.get("rebuilt_response") is not None:
                         rebuilt_rollouts += 1
-                    elif built is not None:
-                        unbuilt_rollouts += 1
-                        print(
-                            f"WARNING: rollout {rollout_id} produced no trainable trajectory "
-                            f"({built.get('error') or built.get('metrics')}); it will be "
-                            "token-less.",
-                            flush=True,
-                        )
                     else:
                         unbuilt_rollouts += 1
-                        print(
-                            f"WARNING: token capture is enabled but nothing was captured for "
-                            f"rollout {rollout_id}; its response.output was not rebuilt. Check "
-                            "that the agent has token_id_capture: true and that its model calls "
-                            "used the /ng-rollout base URL.",
-                            flush=True,
-                        )
-
-                    # Delete on consume. Rollouts each write hundreds of KB and the store appends,
-                    # so keeping consumed files grows the dir without bound and lets a later run
-                    # with the same id append onto them. A FAILED build keeps its records: they are
-                    # the only evidence of why it failed. (NG_KEEP_TOKCAP=1 retains for debugging.)
-                    if projected is not None and not os.environ.get("NG_KEEP_TOKCAP"):
-                        for capture_dir in token_capture_dirs:
-                            TokenCaptureStore(capture_dir).delete(rollout_id)
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -794,7 +768,10 @@ Depending on your data shape, you may want to change these values."""
                 )
                 timing_metrics.update(
                     _token_capture_metrics(
-                        capture_metrics, rebuilt_rollouts, unbuilt_rollouts
+                        capture_metrics,
+                        rebuilt_rollouts,
+                        unbuilt_rollouts,
+                        masked_rollouts,
                     )
                 )
 

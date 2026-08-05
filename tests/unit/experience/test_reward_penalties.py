@@ -93,6 +93,7 @@ class _FakeTokenizer:
 
 class TestExtractMaskSampleFlags:
     def test_reads_mask_sample_from_instance_config(self):
+        """An agent that judges its own rollout unusable sets it in the instance config."""
         results = [
             {"full_result": {"instance_config": {"mask_sample": True}}},
             {"full_result": {"instance_config": {"mask_sample": False}}},
@@ -107,6 +108,21 @@ class TestExtractMaskSampleFlags:
         assert torch.equal(
             mask_sample, torch.tensor([True, False, False, False, False])
         )
+
+    def test_reads_mask_sample_from_the_top_of_the_record(self):
+        """Gym's token capture puts it there: rollout collection does not own the agent's
+        instance config, and a consumer should not have to know the feature exists to find it."""
+        results = [
+            {"full_result": {"mask_sample": True}},
+            {"full_result": {"mask_sample": False}},
+            # Either location masks, so a rollout flagged by the agent still counts.
+            {"full_result": {"instance_config": {"mask_sample": True}}},
+            {"full_result": {}},
+        ]
+
+        mask_sample = _extract_mask_sample_flags(results)
+
+        assert torch.equal(mask_sample, torch.tensor([True, False, True, False]))
 
 
 class TestShouldMaskFlaggedSamples:

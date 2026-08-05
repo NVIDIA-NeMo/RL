@@ -29,7 +29,6 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
-    _agent_opted_into_token_capture,
     _token_capture_metrics,
     NemoGym,
     NemoGymConfig,
@@ -815,45 +814,6 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
         )
 
 
-class TestAgentOptedIntoTokenCapture:
-    """Which rollouts get their response.output rebuilt from the token store.
-
-    A native agent already returns exact token ids inline. Rebuilding its
-    response would replace those with a reconstruction whose per-call
-    prompt_token_ids the projection rewrites, so wherever the two differ we
-    would silently train on the reconstruction.
-    """
-
-    CONFIG = {
-        "ext_agent": {
-            "responses_api_agents": {"claude_code_agent": {"token_id_capture": True}}
-        },
-        "native_agent": {"responses_api_agents": {"simple_agent": {}}},
-    }
-
-    def test_external_harness_is_rebuilt(self):
-        row = {"agent_ref": {"type": "responses_api_agents", "name": "ext_agent"}}
-        assert _agent_opted_into_token_capture(self.CONFIG, row) is True
-
-    def test_native_agent_keeps_its_inline_tokens(self):
-        row = {"agent_ref": {"type": "responses_api_agents", "name": "native_agent"}}
-        assert _agent_opted_into_token_capture(self.CONFIG, row) is False
-
-    @pytest.mark.parametrize(
-        "row",
-        [
-            {},
-            {"agent_ref": None},
-            {"agent_ref": {"name": "unknown_agent"}},
-            {"agent_ref": {"name": "ext_agent"}},
-        ],
-    )
-    def test_fails_open_when_the_agent_cannot_be_identified(self, row):
-        """A missing rebuild is a hard failure downstream ("empty generation");
-        an unnecessary one is not. So an unrecognised shape rebuilds."""
-        assert _agent_opted_into_token_capture({"ext_agent": "not-a-dict"}, row) is True
-
-
 class TestTokenCaptureMetrics:
     """The numbers that make silent training loss visible.
 
@@ -908,14 +868,15 @@ class TestTokenCaptureMetrics:
     def test_counts_masked_incomplete_and_unbuilt(self):
         per_rollout = [
             {
-                "mask_sample": True,
                 "capture_incomplete": True,
                 "empty_generation_calls": 1,
                 "parent_link_fallbacks": {"parent_digest_mismatch": 2},
             },
             {"empty_generation_calls": 2, "parent_link_fallbacks": {}},
         ]
-        got = _token_capture_metrics(per_rollout, rebuilt=1, unbuilt=1)
+        # The mask verdict is counted from the build, not read out of the metrics dict, because
+        # Gym now puts it at the top of the rollout record and leaves only reasons in the dict.
+        got = _token_capture_metrics(per_rollout, rebuilt=1, unbuilt=1, masked=1)
         assert got["token_capture/masked_rollouts"] == 1.0
         assert got["token_capture/incomplete_rollouts"] == 1.0
         assert got["token_capture/empty_generation_calls"] == 3.0
