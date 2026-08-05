@@ -90,7 +90,8 @@ For each labeled PR:
 - [ ] Report the PR summary to the user, then move on
 
 Once the sweep is done:
-- [ ] `learnings.py list` — make each queued edit in the file that owns it
+- [ ] `learnings.py list`, then edit each target file yourself — the queue is a
+      worklist, and nothing changes until the skill itself changes
 - [ ] One draft PR carrying them, then `learnings.py resolve` each entry
 ```
 

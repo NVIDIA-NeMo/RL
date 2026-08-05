@@ -84,13 +84,55 @@ finding about the instructions, not a duplicate to wave through.
 uv run --script .agents/nemo-rl-testing-agent/scripts/learnings.py list
 ```
 
-For each pending entry, make the edit in the target file. Then:
+**No script does this part.** `learnings.py` only holds the worklist; you open
+each target file and rewrite it yourself, editing it exactly as you would any
+other file in the repo. A learning left sitting in the queue has changed
+nothing, because no stage reads the queue — the next sweep reads the skills.
+
+### What one promotion looks like
+
+Take `bridge-pin-needed-with-mcore-swap`, targeting
+`megatron-pr-test-run/SKILL.md`. Find the sentence that let the mistake happen.
+Here it was the description of the mcore swap, which said what prep did to
+megatron-core and nothing about Bridge:
+
+> Swap the megatron-core revision with `--mcore-ref`; prep checks it out over
+> the editable install.
+
+The edit replaces that sentence — it does not add a warning underneath it:
+
+> Swap the megatron-core revision with `--mcore-ref`; prep pins Megatron-Bridge
+> in the same step, defaulting to the sha NeMo-RL itself pins. A current mcore
+> against the image's older Bridge fails every test at import and reads as the
+> author's bug.
+
+That shape is not hypothetical. The Bridge pin the skill documents today exists
+because of exactly that failure — the one recorded next to
+`CONTAINER_BRIDGE_DIR` in `config.env` — and it is the kind of correction this
+queue exists to make routine instead of accidental.
+
+Then check the old wording is gone rather than merely outnumbered:
+
+```bash
+rg -n 'checks it out over the editable install' .agents/ .claude/agents/
+```
+
+Two copies of an instruction that disagree is the worst outcome available: the
+next sweep may follow either. If the search still hits, the promotion is not
+done.
+
+Once every entry is edited:
 
 ```bash
 git checkout -b nrlta-learnings-<yyyy-mm-dd>
 git add .agents/ .claude/agents/nemo-rl-testing-agent.md
 git commit -s -m "docs: fold nemo-rl-testing-agent sweep learnings back into the skills"
 ```
+
+Read the diff before committing. It should be small, and every hunk should
+correspond to a queue entry — a promotion that rewrites a section nobody
+recorded a learning about is scope creep in the one place it is hardest to
+review.
 
 One branch and one **draft** PR against `NVIDIA-NeMo/RL` `main` per sweep, not
 per learning — these are small correlated edits and a reviewer wants them
