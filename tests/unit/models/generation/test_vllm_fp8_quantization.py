@@ -313,7 +313,13 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
 
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", shuffle)
 
+    from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
 
     def make_kernel(**kwargs):
         kernel_calls.append(kwargs)
