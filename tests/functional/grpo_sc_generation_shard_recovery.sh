@@ -85,6 +85,9 @@ KILL_AFTER_STEP=${KILL_AFTER_STEP:-3}
 # Generous: a rebuild plus the next refit, not a hang budget. The pass condition is
 # completion, so this only bounds a wedge.
 COMPLETION_DEADLINE_S=${COMPLETION_DEADLINE_S:-1800}
+# Hard bound on ONE actor-discovery attempt. Generous enough for a healthy connect,
+# short enough that ten failures cannot outlast the run.
+ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-20}
 # Both NCCL transports rebuild, by different routes: the plain collective re-inits one
 # group, nccl_reshard also rebuilds its per-PP-stage bulk groups and regenerates the
 # refit plan. Worth running both, since only the reshard path has to keep a plan and a
@@ -164,13 +167,20 @@ for _ in $(seq 1 10); do
         echo "[recovery] harness was still locating the generation actors. If it completed"
         echo "[recovery] all $MAX_STEPS steps, raise MAX_STEPS or lower KILL_AFTER_STEP --"
         echo "[recovery] this hardware runs a step in seconds."
+        echo "[recovery] --- helper stderr from the last attempt (job was still alive) ---"
+        # This dump used to exist only on the other failure path, so the run that actually
+        # happens printed nothing about why discovery failed. It is the whole diagnostic.
+        tail -30 "$EXP_DIR/actors.err" 2>/dev/null || echo "  <none captured>"
         echo "[recovery] --- last 60 lines of the training log ---"
         tail -60 "$RUN_LOG"
         exit 1
     fi
     # Keep stderr. Discarding it is why three rounds of this were undiagnosable: the
     # helper explains itself there, and the loop was throwing that away.
-    mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>"$EXP_DIR/actors.err" | sort -n)
+    # timeout: an attempt that cannot connect costs two ray.init timeouts, about 40s.
+    # Ten of those ate the whole 7 minutes this run had left after step 3, so the loop
+    # outlived the job it was supposed to interrupt. Bound it and fail fast instead.
+    mapfile -t GEN_PIDS < <(timeout "$ACTOR_QUERY_TIMEOUT_S" uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>"$EXP_DIR/actors.err" | sort -n)
     (( ${#GEN_PIDS[@]} == GEN_GPUS )) && break
     sleep 3
 done
