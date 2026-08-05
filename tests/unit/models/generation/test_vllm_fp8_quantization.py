@@ -160,6 +160,65 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.parametrize("use_batched", [True, False])
+def test_process_mxfp8_moe_refit_uses_configured_shuffle(
+    fp8_module, monkeypatch, use_batched
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+        refit_batched_moe_shuffle=use_batched,
+    )
+
+    w13_weight = torch.zeros(2, 4, 3)
+    w2_weight = torch.zeros(2, 3, 2)
+    w13_scale = torch.zeros(2, 4, 1)
+    w2_scale = torch.zeros(2, 3, 1)
+    layer = types.SimpleNamespace(
+        w13_weight=w13_weight,
+        w2_weight=w2_weight,
+        w13_weight_scale=w13_scale,
+        w2_weight_scale=w2_scale,
+        w13_weight_scale_from_checkpoint=types.SimpleNamespace(
+            data=torch.ones_like(w13_scale)
+        ),
+        w2_weight_scale_from_checkpoint=types.SimpleNamespace(
+            data=torch.ones_like(w2_scale)
+        ),
+    )
+    quant_method = types.SimpleNamespace(
+        moe=types.SimpleNamespace(is_act_and_mul=False)
+    )
+    shuffled = (
+        torch.full_like(w13_weight, 1),
+        torch.full_like(w2_weight, 2),
+        torch.full_like(w13_scale, 3),
+        torch.full_like(w2_scale, 4),
+    )
+    calls = []
+
+    def batched_shuffle(*_args):
+        calls.append("batched")
+        return shuffled
+
+    def per_expert_shuffle(*_args):
+        calls.append("per_expert")
+        return shuffled
+
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", batched_shuffle)
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", per_expert_shuffle)
+
+    fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    assert calls == ["batched" if use_batched else "per_expert"]
+    assert torch.equal(layer.w13_weight, shuffled[0])
+    assert torch.equal(layer.w2_weight, shuffled[1])
+    assert torch.equal(layer.w13_weight_scale, shuffled[2])
+    assert torch.equal(layer.w2_weight_scale, shuffled[3])
+
+
 @pytest.mark.parametrize(
     ("field", "error"),
     [
