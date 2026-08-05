@@ -1022,7 +1022,9 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
     if "use_mamba_mem_eff_path" in config["megatron_cfg"]:
-        model_cfg.use_mamba_mem_eff_path = config["megatron_cfg"]["use_mamba_mem_eff_path"]
+        model_cfg.use_mamba_mem_eff_path = config["megatron_cfg"][
+            "use_mamba_mem_eff_path"
+        ]
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
@@ -1562,6 +1564,9 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         return
     import os
 
+    from nemo_rl.models.policy.workers.mamba_determinism_patches import (
+        apply_mamba_determinism_patch,
+    )
     from nemo_rl.models.policy.workers.moe_determinism_patches import (
         apply_moe_unpermute_determinism_patch,
     )
@@ -1572,17 +1577,15 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     mc.setdefault("attention_backend", "flash")
     generation = config.get("generation")
     if generation is not None and "mcore_generation_config" in generation:
-        generation["mcore_generation_config"]["transformer_impl"] = (
-            "transformer_engine"
-        )
+        generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
     apply_te_gemm_cublas_pinned_patch()
     apply_moe_unpermute_determinism_patch()
+    apply_mamba_determinism_patch()
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
     os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
     # Force fixed-order MoE unpermute to eliminate scatter_add nondeterminism.
-
 
 
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False
