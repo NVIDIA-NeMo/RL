@@ -1236,37 +1236,34 @@ class Logger(LoggerInterface):
         prev_logprobs = data["prev_logprobs"][:, 1:]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
-        mask = token_mask * sample_mask.unsqueeze(-1)
+        diff = (generation_logprobs - prev_logprobs).abs()
+        valid_token_counts = mask.sum(dim=-1)
+        valid_samples = valid_token_counts > 0
+        if not torch.any(valid_samples):
+            print(
+                "Skipping token_mult_prob_error plot because no sample has eligible tokens"
+            )
+            return
 
-        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+        weighted_error_sum = (torch.exp(diff) * mask).sum(dim=-1)
+        mult_prob_error = torch.full_like(weighted_error_sum, -torch.inf)
+        mult_prob_error[valid_samples] = (
+            weighted_error_sum[valid_samples] / valid_token_counts[valid_samples]
+        )
 
         sample_idx = torch.argmax(mult_prob_error)
         sample_error = mult_prob_error[sample_idx]
 
-        # plot the sample with the highest log probability error
-        # offset by 1 token for next token prediction
-        generation_start_idx, generation_end_idx = (
-            data["prompt_lengths"][sample_idx] - 1,
-            data["full_lengths"][sample_idx] - 1,
-        )
-
-        if generation_start_idx >= generation_end_idx:
-            print(
-                f"Skipping token_mult_prob_error plot because generation_start_idx ({generation_start_idx}) >= generation_end_idx ({generation_end_idx})"
-            )
-            return
-
-        generation_logprob = generation_logprobs[
-            sample_idx, int(generation_start_idx) : int(generation_end_idx)
-        ]
-        prev_logprob = (
-            prev_logprobs[
-                sample_idx, int(generation_start_idx) : int(generation_end_idx)
-            ]
-            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
-        )
-        diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        # A compacted physical trace can contain multiple, non-contiguous
+        # completion spans. Select the eligible positions from the token mask
+        # instead of assuming one prompt followed by one completion. This also
+        # excludes synthetic padding rows, whose token masks are all zero.
+        eligible_token_indices = torch.nonzero(
+            mask[sample_idx] > 0, as_tuple=False
+        ).flatten()
+        generation_logprob = generation_logprobs[sample_idx, eligible_token_indices]
+        prev_logprob = prev_logprobs[sample_idx, eligible_token_indices]
+        diff_i = diff[sample_idx, eligible_token_indices]
 
         # Find max absolute error token
         max_abs_error_idx = torch.argmax(diff_i).item()
@@ -1280,7 +1277,7 @@ class Logger(LoggerInterface):
         max_rel_error = relative_error[max_rel_error_idx].item()
 
         fig = plt.figure()
-        step_idx = torch.arange(int(generation_start_idx), int(generation_end_idx))
+        step_idx = eligible_token_indices
 
         plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
         plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")

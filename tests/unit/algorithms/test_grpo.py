@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
     AsyncGRPOConfig,
+    ContextCompactionTrainingConfig,
     GRPOConfig,
     MasterConfig,
     RewardPenaltyConfig,
@@ -36,6 +38,9 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _assign_context_compaction_generation_replica_indices,
+    _context_compaction_batch_quantum,
+    _dedup_cc_replay_groups,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -44,6 +49,8 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
     _validate_use_kl_in_reward_compat,
+    _validate_async_context_compaction_replay_groups,
+    _validate_context_compaction_training_config,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -66,7 +73,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
-from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.experience.rollouts import NemoGymRolloutResult, calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -107,6 +114,34 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+
+
+def test_noncolocated_refit_offloads_before_weight_broadcast():
+    """The refit helper, not async training, owns pre-transfer offload."""
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy.broadcast_weights_for_collective.return_value = []
+    policy_generation.update_weights_from_collective.return_value = [True]
+
+    def assert_offloaded_before_broadcast(*, kv_scales):
+        policy.offload_before_refit.assert_called_once_with()
+        assert kv_scales is None
+        return []
+
+    policy.broadcast_weights_for_collective.side_effect = (
+        assert_offloaded_before_broadcast
+    )
+
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference=False,
+        )
+
+    policy.offload_before_refit.assert_called_once_with()
+    policy.broadcast_weights_for_collective.assert_called_once_with(kv_scales=None)
 
 
 class TestMaskSampleFilter:
@@ -162,6 +197,30 @@ def test_initial_policy_generation_stale() -> None:
 
     generation.weight_synchronizer.is_stale = True
     assert _initial_policy_generation_stale(generation, completed_steps=0)
+
+
+def test_context_compaction_generation_replicas_receive_unique_stable_indices():
+    repeated_batch = BatchedDataDict(
+        {
+            "extra_env_info": [
+                {
+                    "context_compaction_contract_version": 2,
+                    "context_compaction_rollout_index": base_index,
+                }
+                for base_index in (4, 4, 7, 7)
+            ]
+        }
+    )
+
+    _assign_context_compaction_generation_replica_indices(
+        repeated_batch,
+        num_generations_per_prompt=2,
+    )
+
+    assert [
+        row["context_compaction_rollout_index"]
+        for row in repeated_batch["extra_env_info"]
+    ] == [8, 9, 14, 15]
 
 
 @pytest.fixture
@@ -324,6 +383,8 @@ def mock_grpo_components():
             },
             "logger": {
                 "num_val_samples_to_print": 5,
+                "wandb_enabled": False,
+                "wandb": {},
             },
             "data": {
                 "use_multiple_dataloader": False,
@@ -429,6 +490,1109 @@ def _logged_train_metrics_with_key(logger, key: str):
         if call.kwargs.get("prefix") == "train" and key in metrics:
             return metrics
     raise AssertionError(f"No train metrics payload contained {key}")
+
+
+def _context_compaction_master_config():
+    return SimpleNamespace(
+        grpo={
+            "context_compaction_training": {"enabled": True},
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 2,
+            "async_grpo": {"enabled": False},
+            "use_dynamic_sampling": False,
+            "reward_scaling": {"enabled": False},
+            "reward_shaping": {"enabled": False},
+            "overlong_filtering": False,
+            "seq_logprob_error_threshold": None,
+            "calculate_advantages_on_gpu": False,
+            "advantage_clip_low": None,
+            "advantage_clip_high": None,
+            "invalid_tool_call_advantage": None,
+            "malformed_thinking_advantage": None,
+            "adv_estimator": {"name": "grpo"},
+        },
+        policy={
+            "train_global_batch_size": 4,
+            "train_micro_batch_size": 2,
+            "megatron_cfg": {"enabled": True},
+            "dtensor_cfg": {"enabled": False},
+        },
+        loss_fn=ClippedPGLossConfig(
+            token_level_loss=True,
+            sequence_level_importance_ratios=False,
+        ),
+        env={"should_use_nemo_gym": True},
+        data_plane=None,
+    )
+
+
+def test_context_compaction_training_config_accepts_initial_supported_subset():
+    _validate_context_compaction_training_config(_context_compaction_master_config())
+
+
+def test_context_compaction_training_config_accepts_async_replay():
+    config = _context_compaction_master_config()
+    config.grpo["async_grpo"]["enabled"] = True
+    config.loss_fn.use_importance_sampling_correction = True
+
+    _validate_context_compaction_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda cfg: cfg.env.update(should_use_nemo_gym=False),
+            "should_use_nemo_gym",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(use_dynamic_sampling=True),
+            "dynamic sampling",
+        ),
+        (
+            lambda cfg: cfg.grpo["reward_scaling"].update(enabled=True),
+            "reward scaling",
+        ),
+        (
+            lambda cfg: cfg.grpo["reward_shaping"].update(enabled=True),
+            "reward shaping",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(overlong_filtering=True),
+            "overlong rollout masking",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(seq_logprob_error_threshold=1.02),
+            "logprob-error masking",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(calculate_advantages_on_gpu=True),
+            "GPU-side advantage",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(advantage_clip_low=-1.0),
+            "advantage clipping",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(invalid_tool_call_advantage=-1.0),
+            "invalid-tool advantage",
+        ),
+        (
+            lambda cfg: cfg.grpo.update(malformed_thinking_advantage=-1.0),
+            "malformed-thinking advantage",
+        ),
+        (
+            lambda cfg: cfg.grpo["adv_estimator"].update(name="reinforce_plus_plus"),
+            "standard GRPO advantage",
+        ),
+        (
+            lambda cfg: setattr(cfg.loss_fn, "sequence_level_importance_ratios", True),
+            "sequence-level importance ratios",
+        ),
+        (
+            lambda cfg: setattr(cfg.loss_fn, "token_level_loss", False),
+            "sequence-level loss reduction",
+        ),
+        (
+            lambda cfg: setattr(
+                cfg.loss_fn,
+                "truncated_importance_sampling_type",
+                "seq-mask-tis",
+            ),
+            "sequence-level TIS",
+        ),
+        (
+            lambda cfg: setattr(cfg.loss_fn, "use_kl_in_reward", True),
+            "KL-in-reward",
+        ),
+        (
+            lambda cfg: setattr(cfg.loss_fn, "positive_example_nll_weight", 0.1),
+            "positive-example",
+        ),
+        (
+            lambda cfg: (
+                cfg.grpo["async_grpo"].update(enabled=True),
+                setattr(cfg.loss_fn, "force_on_policy_ratio", True),
+            ),
+            "force_on_policy_ratio",
+        ),
+        (
+            lambda cfg: (
+                cfg.grpo["async_grpo"].update(enabled=True),
+                setattr(cfg.loss_fn, "use_importance_sampling_correction", False),
+            ),
+            "importance sampling correction",
+        ),
+        (
+            lambda cfg: cfg.policy.update(train_global_batch_size=8),
+            "logical rollout count",
+        ),
+        (
+            lambda cfg: cfg.policy["megatron_cfg"].update(enabled=False),
+            "Megatron policy backend",
+        ),
+        (
+            lambda cfg: cfg.policy["dtensor_cfg"].update(enabled=True),
+            "Megatron policy backend",
+        ),
+        (
+            lambda cfg: setattr(cfg, "data_plane", {"enabled": True}),
+            "data-plane",
+        ),
+    ],
+)
+def test_context_compaction_training_config_fails_closed(mutate, match):
+    config = _context_compaction_master_config()
+    mutate(config)
+
+    with pytest.raises(ValueError, match=match):
+        _validate_context_compaction_training_config(config)
+
+
+def test_context_compaction_batch_quantum_covers_dp_and_microbatch():
+    policy = SimpleNamespace(data_parallel_size=4)
+    config = _context_compaction_master_config()
+    config.policy["train_micro_batch_size"] = 3
+
+    assert _context_compaction_batch_quantum(policy, config) == 12
+
+
+def _async_context_compaction_replay_group(
+    *,
+    generation_weight_version: int = 3,
+    target_weight_version: int = 4,
+    rollout_ids: tuple[str, ...] = ("rollout-a", "rollout-b"),
+    group_id: str = "group-a",
+) -> dict[str, Any]:
+    policy_version = f"async-policy-weight-{generation_weight_version:08d}"
+    return {
+        "batch": BatchedDataDict(
+            {
+                "rollout_trace_bundle": [
+                    {
+                        "rollout_id": rollout_id,
+                        "group_id": group_id,
+                        "training_admission": {
+                            "generation_policy_version": policy_version
+                        },
+                    }
+                    for rollout_id in rollout_ids
+                ]
+            }
+        ),
+        "generation_weight_version": generation_weight_version,
+        "target_weight_version": target_weight_version,
+    }
+
+
+def test_async_context_compaction_replay_requires_complete_group_and_provenance():
+    trajectory = _async_context_compaction_replay_group()
+
+    _validate_async_context_compaction_replay_groups(
+        [trajectory],
+        expected_prompt_groups=1,
+        expected_rollouts_per_group=2,
+        current_weight_version=4,
+        max_age_steps=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda trajectory: trajectory.update(target_weight_version=5),
+            "targets weight",
+        ),
+        (
+            lambda trajectory: trajectory.update(generation_weight_version=2),
+            "trajectory age",
+        ),
+        (
+            lambda trajectory: trajectory["batch"]["rollout_trace_bundle"][1].update(
+                group_id="group-b"
+            ),
+            "mixes comparison groups",
+        ),
+        (
+            lambda trajectory: trajectory["batch"]["rollout_trace_bundle"][1][
+                "training_admission"
+            ].update(generation_policy_version="wrong-policy"),
+            "generation-policy provenance",
+        ),
+    ],
+)
+def test_async_context_compaction_replay_fails_closed(mutate, match):
+    trajectory = _async_context_compaction_replay_group()
+    mutate(trajectory)
+
+    with pytest.raises(ValueError, match=match):
+        _validate_async_context_compaction_replay_groups(
+            [trajectory],
+            expected_prompt_groups=1,
+            expected_rollouts_per_group=2,
+            current_weight_version=4,
+            max_age_steps=1,
+        )
+
+
+def _bundle_with_traces(
+    rollout_id: str,
+    group_id: str,
+    token_ids: list[int],
+    policy_version: str = "async-policy-weight-00000003",
+) -> dict:
+    """Build a minimal CC bundle with physical-trace tokens for fingerprint tests."""
+    return {
+        "rollout_id": rollout_id,
+        "group_id": group_id,
+        "training_admission": {"generation_policy_version": policy_version},
+        "physical_traces": [
+            {"segments": [{"kind": "completion", "token_ids": token_ids}]}
+        ],
+    }
+
+
+def _cc_group_with_traces(
+    rollout_ids: tuple[str, ...],
+    token_seqs: tuple[list[int], ...],
+    generation_weight_version: int = 3,
+    target_weight_version: int = 4,
+    group_id: str = "group-a",
+) -> dict:
+    policy_version = f"async-policy-weight-{generation_weight_version:08d}"
+    return {
+        "batch": BatchedDataDict(
+            {
+                "rollout_trace_bundle": [
+                    _bundle_with_traces(rid, group_id, toks, policy_version)
+                    for rid, toks in zip(rollout_ids, token_seqs)
+                ]
+            }
+        ),
+        "generation_weight_version": generation_weight_version,
+        "target_weight_version": target_weight_version,
+    }
+
+
+def test_identical_cc_retry_is_deduplicated():
+    tokens_a, tokens_b = [10, 20, 30], [40, 50]
+    group = _cc_group_with_traces(("r-a", "r-b"), (tokens_a, tokens_b))
+    duplicate = _cc_group_with_traces(("r-a", "r-b"), (tokens_a, tokens_b))
+
+    kept, deduped = _dedup_cc_replay_groups([group, duplicate])
+
+    assert deduped == 1
+    assert len(kept) == 1
+    assert kept[0] is group
+
+
+def test_conflicting_cc_retry_is_rejected():
+    group_a = _cc_group_with_traces(("r-a", "r-b"), ([10, 20], [30]))
+    group_b = _cc_group_with_traces(("r-a", "r-b"), ([10, 99], [30]))
+
+    with pytest.raises(ValueError, match="conflicting retry"):
+        _dedup_cc_replay_groups([group_a, group_b])
+
+
+def test_incomplete_prompt_group_count_rejected():
+    trajectory = _async_context_compaction_replay_group()
+
+    with pytest.raises(ValueError, match="complete prompt groups"):
+        _validate_async_context_compaction_replay_groups(
+            [trajectory],
+            expected_prompt_groups=2,
+            expected_rollouts_per_group=2,
+            current_weight_version=4,
+            max_age_steps=1,
+        )
+
+
+def test_incomplete_rollout_count_per_group_rejected():
+    # Group with only 1 rollout when 2 are expected
+    trajectory = _async_context_compaction_replay_group(rollout_ids=("rollout-a",))
+
+    with pytest.raises(ValueError, match="exactly 2 logical rollouts"):
+        _validate_async_context_compaction_replay_groups(
+            [trajectory],
+            expected_prompt_groups=1,
+            expected_rollouts_per_group=2,
+            current_weight_version=4,
+            max_age_steps=1,
+        )
+
+
+def test_dedup_passes_through_groups_without_physical_traces():
+    group_a = _async_context_compaction_replay_group(rollout_ids=("r-1", "r-2"))
+    group_b = _async_context_compaction_replay_group(
+        rollout_ids=("r-3", "r-4"), group_id="group-b"
+    )
+
+    kept, deduped = _dedup_cc_replay_groups([group_a, group_b])
+
+    assert deduped == 0
+    assert kept == [group_a, group_b]
+
+
+def test_grpo_context_compaction_uses_one_physical_batch_and_logical_scheduler(
+    mock_grpo_components,
+):
+    config = mock_grpo_components["master_config"]
+    config.grpo.max_num_steps = 1
+    config.grpo.max_num_epochs = 1
+    config.grpo.context_compaction_training = ContextCompactionTrainingConfig(
+        enabled=True
+    )
+    config.policy["train_global_batch_size"] = 1
+    config.policy["train_micro_batch_size"] = 1
+    config.policy["megatron_cfg"] = {"enabled": True}
+    config.policy["dtensor_cfg"] = {"enabled": False}
+    config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    config.env["should_use_nemo_gym"] = True
+    config.data_plane = None
+    policy = mock_grpo_components["policy"]
+    policy.data_parallel_size = 1
+
+    final_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([4]),
+                        "generation_logprobs": torch.tensor([-0.5]),
+                    },
+                ]
+            ],
+            "length": torch.tensor([3]),
+            "total_reward": torch.tensor([1.0]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "mask_sample": torch.tensor([False]),
+            "truncated": torch.tensor([False]),
+            "rollout_trace_bundle": [{"rollout_id": "rollout-1"}],
+            "physical_message_logs": [[]],
+        }
+    )
+    trace_train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                    [9, 10, 11, 12],
+                    [0, 0, 0, 0],
+                ]
+            ),
+            "input_lengths": torch.tensor([4, 4, 4, 1]),
+            "generation_logprobs": torch.zeros(4, 4),
+            "token_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1],
+                    [0, 0, 0, 1],
+                    [0, 0, 0, 1],
+                    [0, 0, 0, 0],
+                ]
+            ),
+            "sample_mask": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "advantages": torch.zeros(4, 4),
+            "prev_logprobs": torch.zeros(4, 4),
+            "reference_policy_logprobs": torch.zeros(4, 4),
+        }
+    )
+    trace_plan = {
+        "logical_rollout_count": 1,
+        "physical_trace_count": 3,
+        "padding_row_count": 1,
+        "total_row_count": 4,
+        "eligible_action_token_count": 3,
+        "parent_indices": [0, 0, 0, -1],
+    }
+    trace_preparation = {
+        "rollout_advantages": {"rollout-1": 0.0},
+        "plan": trace_plan,
+        "materialization": {
+            "train_data": trace_train_data,
+            "row_rewards": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "materialized_message_logs": [
+                [{"content": "trace-1"}],
+                [{"content": "trace-2"}],
+                [{"content": "trace-3"}],
+                [{"content": ""}],
+            ],
+        },
+        "logprob_data": BatchedDataDict({}),
+    }
+    rollout_result = NemoGymRolloutResult(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        final_batch=final_batch,
+        rollout_metrics={
+            "mean_gen_tokens_per_sample": 1.0,
+            "max_gen_tokens": 1,
+            "min_gen_tokens": 1,
+        },
+        task_index=None,
+    )
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+            return_value=rollout_result,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.prepare_trace_batch_for_scoring",
+            return_value=trace_preparation,
+        ) as prepare_trace_batch,
+        patch(
+            "nemo_rl.algorithms.grpo.score_prepared_trace_batch",
+            return_value={
+                "preparation": trace_preparation,
+                "train_data": trace_train_data,
+            },
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+    ):
+        grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+
+    assert prepare_trace_batch.call_args.kwargs["training_admission"] is True
+    policy.train.assert_called_once()
+    train_call = policy.train.call_args
+    assert train_call.args[0] is trace_train_data
+    assert train_call.kwargs["gbs"] == 4
+    assert train_call.kwargs["mbs"] == 1
+    assert train_call.kwargs["scheduler_step_increment"] == 1
+
+
+def test_async_grpo_context_compaction_replays_logical_group_then_trains_physical_rows(
+    mock_grpo_components,
+):
+    config = mock_grpo_components["master_config"]
+    config.grpo.max_num_steps = 1
+    config.grpo.max_num_epochs = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    config.grpo.context_compaction_training = ContextCompactionTrainingConfig(
+        enabled=True
+    )
+    config.grpo.async_grpo.enabled = True
+    config.policy["train_global_batch_size"] = 1
+    config.policy["train_micro_batch_size"] = 1
+    config.policy["megatron_cfg"] = {"enabled": True}
+    config.policy["dtensor_cfg"] = {"enabled": False}
+    config.policy["generation"]["colocated"]["enabled"] = False
+    config.env["should_use_nemo_gym"] = True
+    config.data_plane = None
+
+    policy = mock_grpo_components["policy"]
+    policy.data_parallel_size = 1
+
+    logical_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([4]),
+                        "generation_logprobs": torch.tensor([-0.5]),
+                    },
+                ]
+            ],
+            "length": torch.tensor([3]),
+            "total_reward": torch.tensor([1.0]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "mask_sample": torch.tensor([False]),
+            "truncated": torch.tensor([False]),
+            "rollout_trace_bundle": [
+                {
+                    "rollout_id": "async-rollout-1",
+                    "group_id": "async-group-1",
+                    "training_admission": {
+                        "generation_policy_version": "async-policy-weight-00000000"
+                    },
+                }
+            ],
+            "physical_message_logs": [[]],
+        }
+    )
+    trace_train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                    [9, 10, 11, 12],
+                    [0, 0, 0, 0],
+                ]
+            ),
+            "input_lengths": torch.tensor([4, 4, 4, 1]),
+            "generation_logprobs": torch.zeros(4, 4),
+            "token_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1],
+                    [0, 0, 0, 1],
+                    [0, 0, 0, 1],
+                    [0, 0, 0, 0],
+                ]
+            ),
+            "sample_mask": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "advantages": torch.zeros(4, 4),
+            "prev_logprobs": torch.zeros(4, 4),
+            "reference_policy_logprobs": torch.zeros(4, 4),
+        }
+    )
+    trace_plan = {
+        "logical_rollout_count": 1,
+        "physical_trace_count": 3,
+        "padding_row_count": 1,
+        "total_row_count": 4,
+        "eligible_action_token_count": 3,
+        "duplicate_retry_count": 0,
+        "parent_indices": [0, 0, 0, -1],
+    }
+    trace_preparation = {
+        "rollout_advantages": {"async-rollout-1": 0.0},
+        "plan": trace_plan,
+        "materialization": {
+            "train_data": trace_train_data,
+            "row_rewards": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "materialized_message_logs": [
+                [{"content": "trace-1"}],
+                [{"content": "trace-2"}],
+                [{"content": "trace-3"}],
+                [{"content": ""}],
+            ],
+        },
+        "logprob_data": BatchedDataDict({}),
+    }
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 1.0,
+        "max_gen_tokens": 1,
+        "min_gen_tokens": 1,
+    }
+
+    with (
+        mock_async_grpo_infrastructure(
+            logical_batch,
+            rollout_metrics,
+            generation_weight_version=0,
+            target_weight_version=0,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.prepare_trace_batch_for_scoring",
+            return_value=trace_preparation,
+        ) as prepare_trace_batch,
+        patch(
+            "nemo_rl.algorithms.grpo.score_prepared_trace_batch",
+            return_value={
+                "preparation": trace_preparation,
+                "train_data": trace_train_data,
+            },
+        ),
+    ):
+        async_grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+
+    assert prepare_trace_batch.call_args.kwargs["training_admission"] is True
+    policy.train.assert_called_once()
+    train_call = policy.train.call_args
+    assert train_call.args[0] is trace_train_data
+    assert train_call.kwargs["gbs"] == 4
+    assert train_call.kwargs["mbs"] == 1
+    assert train_call.kwargs["scheduler_step_increment"] == 1
+    # Verify explicit CC metrics were logged with the training step
+    logger = mock_grpo_components["logger"]
+    cc_metrics = _logged_train_metrics_with_key(
+        logger, "context_compaction/optimizer_steps"
+    )
+    assert cc_metrics["context_compaction/optimizer_steps"] == 1
+    assert (
+        cc_metrics["context_compaction/scheduler_step_increment"]
+        == trace_plan["logical_rollout_count"]
+    )
+    assert cc_metrics["context_compaction/selected_groups_from_buffer"] == 1
+    assert cc_metrics["context_compaction/deduped_retry_groups"] == 0
+
+
+def test_async_cc_scheduler_increment_tracks_logical_not_physical_rollouts(
+    mock_grpo_components,
+):
+    """Scheduler increment equals logical-rollout count, not physical-trace count.
+
+    When a group has 2 logical rollouts each expanded to 3 physical traces (K=3),
+    the policy scheduler must advance by 2 (logical) rather than 6 (physical).
+    This is the key invariant distinguishing logical progress from physical expansion.
+    """
+    config = mock_grpo_components["master_config"]
+    config.grpo.max_num_steps = 1
+    config.grpo.max_num_epochs = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    config.grpo.context_compaction_training = ContextCompactionTrainingConfig(
+        enabled=True
+    )
+    config.grpo.async_grpo.enabled = True
+    config.grpo.num_prompts_per_step = 1
+    config.grpo.num_generations_per_prompt = 2  # 2 logical rollouts per group
+    config.policy["train_global_batch_size"] = (
+        2  # must equal num_prompts * num_generations
+    )
+    config.policy["train_micro_batch_size"] = 1
+    config.policy["megatron_cfg"] = {"enabled": True}
+    config.policy["dtensor_cfg"] = {"enabled": False}
+    config.policy["generation"]["colocated"]["enabled"] = False
+    config.env["should_use_nemo_gym"] = True
+    config.data_plane = None
+
+    policy = mock_grpo_components["policy"]
+    policy.data_parallel_size = 1
+
+    logical_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "q1",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "a1",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": "q1",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "a2",
+                        "token_ids": torch.tensor([3]),
+                        "generation_logprobs": torch.tensor([-0.2]),
+                    },
+                ],
+            ],
+            "length": torch.tensor([1, 1]),
+            "total_reward": torch.tensor([1.0, 2.0]),
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "mask_sample": torch.tensor([False, False]),
+            "truncated": torch.tensor([False, False]),
+            "rollout_trace_bundle": [
+                {
+                    "rollout_id": "r-1",
+                    "group_id": "g-1",
+                    "training_admission": {
+                        "generation_policy_version": "async-policy-weight-00000000"
+                    },
+                },
+                {
+                    "rollout_id": "r-2",
+                    "group_id": "g-1",
+                    "training_admission": {
+                        "generation_policy_version": "async-policy-weight-00000000"
+                    },
+                },
+            ],
+            "physical_message_logs": [[], []],
+        }
+    )
+    # 2 logical rollouts each expanded to 3 physical traces = 6 physical + 2 padding = 8 rows
+    trace_plan = {
+        "logical_rollout_count": 2,
+        "physical_trace_count": 6,
+        "padding_row_count": 2,
+        "total_row_count": 8,
+        "eligible_action_token_count": 6,
+        "duplicate_retry_count": 0,
+        "parent_indices": [0, 0, 0, 1, 1, 1, -1, -1],
+    }
+    trace_train_data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(8, 4, dtype=torch.long),
+            "input_lengths": torch.tensor([4, 4, 4, 4, 4, 4, 1, 1]),
+            "generation_logprobs": torch.zeros(8, 4),
+            "token_mask": torch.zeros(8, 4, dtype=torch.bool),
+            "sample_mask": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
+            "advantages": torch.zeros(8, 4),
+            "prev_logprobs": torch.zeros(8, 4),
+            "reference_policy_logprobs": torch.zeros(8, 4),
+        }
+    )
+    trace_preparation = {
+        "rollout_advantages": {"r-1": -0.5, "r-2": 0.5},
+        "plan": trace_plan,
+        "materialization": {
+            "train_data": trace_train_data,
+            "row_rewards": torch.tensor([1.0] * 6 + [0.0, 0.0]),
+            "materialized_message_logs": [[{"content": f"t{i}"}] for i in range(8)],
+        },
+        "logprob_data": BatchedDataDict({}),
+    }
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 1.0,
+        "max_gen_tokens": 1,
+        "min_gen_tokens": 1,
+    }
+
+    with (
+        mock_async_grpo_infrastructure(
+            logical_batch,
+            rollout_metrics,
+            generation_weight_version=0,
+            target_weight_version=0,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.prepare_trace_batch_for_scoring",
+            return_value=trace_preparation,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.score_prepared_trace_batch",
+            return_value={
+                "preparation": trace_preparation,
+                "train_data": trace_train_data,
+            },
+        ),
+    ):
+        async_grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+
+    policy.train.assert_called_once()
+    train_call = policy.train.call_args
+    # Scheduler must advance by logical-rollout count (2), not physical-trace count (6)
+    assert (
+        train_call.kwargs["scheduler_step_increment"]
+        == trace_plan["logical_rollout_count"]
+    )
+    assert (
+        train_call.kwargs["scheduler_step_increment"]
+        != trace_plan["physical_trace_count"]
+    )
+
+
+def test_real_trace_bundle_passes_async_cc_dedup_and_validation():
+    """A bundle with physical_traces passes dedup (no fingerprint collision) and validation."""
+    group = _cc_group_with_traces(
+        ("r-1", "r-2"),
+        ([10, 20, 30], [40, 50]),
+        generation_weight_version=3,
+        target_weight_version=4,
+    )
+
+    kept, deduped = _dedup_cc_replay_groups([group])
+
+    assert deduped == 0
+    assert kept == [group]
+
+    _validate_async_context_compaction_replay_groups(
+        kept,
+        expected_prompt_groups=1,
+        expected_rollouts_per_group=2,
+        current_weight_version=4,
+        max_age_steps=1,
+    )
+
+
+def test_delayed_replay_within_max_age_passes_validation():
+    """A bundle replayed after lag=2 steps passes validation when max_age_steps >= 2."""
+    group = _cc_group_with_traces(
+        ("r-a", "r-b"),
+        ([1, 2, 3], [4, 5]),
+        generation_weight_version=2,  # lag = current(4) - gen(2) = 2
+        target_weight_version=4,
+    )
+
+    _validate_async_context_compaction_replay_groups(
+        [group],
+        expected_prompt_groups=1,
+        expected_rollouts_per_group=2,
+        current_weight_version=4,
+        max_age_steps=2,
+    )
+
+
+def test_delayed_replay_exceeding_max_age_is_rejected():
+    """A bundle replayed after lag=3 steps is rejected when max_age_steps=2."""
+    group = _cc_group_with_traces(
+        ("r-x", "r-y"),
+        ([1, 2], [3, 4]),
+        generation_weight_version=1,  # lag = current(4) - gen(1) = 3
+        target_weight_version=4,
+    )
+
+    with pytest.raises(ValueError, match="trajectory age"):
+        _validate_async_context_compaction_replay_groups(
+            [group],
+            expected_prompt_groups=1,
+            expected_rollouts_per_group=2,
+            current_weight_version=4,
+            max_age_steps=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "use_async", [False, True], ids=["sync-cc", "async-cc-zero-lag"]
+)
+def test_cc_policy_train_call_parity_at_zero_lag(mock_grpo_components, use_async):
+    """Sync CC and async CC (zero lag) must call policy.train with identical arguments.
+
+    Both parametrizations assert the same expected values for the train_data object,
+    gbs, mbs, and scheduler_step_increment.  A failure on either side means the
+    paths disagree and async replays would silently compute different gradients.
+    """
+    config = mock_grpo_components["master_config"]
+    policy = mock_grpo_components["policy"]
+
+    config.grpo.max_num_steps = 1
+    config.grpo.max_num_epochs = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    config.grpo.context_compaction_training = ContextCompactionTrainingConfig(
+        enabled=True
+    )
+    config.policy["train_global_batch_size"] = 1
+    config.policy["train_micro_batch_size"] = 1
+    config.policy["megatron_cfg"] = {"enabled": True}
+    config.policy["dtensor_cfg"] = {"enabled": False}
+    config.env["should_use_nemo_gym"] = True
+    config.data_plane = None
+    policy.data_parallel_size = 1
+
+    trace_train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([4, 4, 4, 1]),
+            "generation_logprobs": torch.zeros(4, 4),
+            "token_mask": torch.tensor(
+                [[0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 0]]
+            ),
+            "sample_mask": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "advantages": torch.zeros(4, 4),
+            "prev_logprobs": torch.zeros(4, 4),
+            "reference_policy_logprobs": torch.zeros(4, 4),
+        }
+    )
+    trace_plan = {
+        "logical_rollout_count": 1,
+        "physical_trace_count": 3,
+        "padding_row_count": 1,
+        "total_row_count": 4,
+        "eligible_action_token_count": 3,
+        "duplicate_retry_count": 0,
+        "parent_indices": [0, 0, 0, -1],
+    }
+    trace_preparation = {
+        "rollout_advantages": {"parity-rollout": 0.0},
+        "plan": trace_plan,
+        "materialization": {
+            "train_data": trace_train_data,
+            "row_rewards": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "materialized_message_logs": [
+                [{"content": "t1"}],
+                [{"content": "t2"}],
+                [{"content": "t3"}],
+                [{"content": ""}],
+            ],
+        },
+        "logprob_data": BatchedDataDict({}),
+    }
+    scored = {"preparation": trace_preparation, "train_data": trace_train_data}
+
+    if use_async:
+        config.grpo.async_grpo.enabled = True
+        config.policy["generation"]["colocated"]["enabled"] = False
+        mock_batch = BatchedDataDict(
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "q",
+                            "token_ids": torch.tensor([1]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "a",
+                            "token_ids": torch.tensor([2]),
+                            "generation_logprobs": torch.tensor([-0.1]),
+                        },
+                    ]
+                ],
+                "length": torch.tensor([1]),
+                "total_reward": torch.tensor([1.0]),
+                "loss_multiplier": torch.tensor([1.0]),
+                "mask_sample": torch.tensor([False]),
+                "truncated": torch.tensor([False]),
+                "rollout_trace_bundle": [
+                    {
+                        "rollout_id": "parity-rollout",
+                        "group_id": "parity-group",
+                        "training_admission": {
+                            "generation_policy_version": "async-policy-weight-00000000"
+                        },
+                    }
+                ],
+                "physical_message_logs": [[]],
+            }
+        )
+        mock_metrics = {
+            "mean_gen_tokens_per_sample": 1.0,
+            "max_gen_tokens": 1,
+            "min_gen_tokens": 1,
+        }
+        path_ctx = mock_async_grpo_infrastructure(
+            mock_batch,
+            mock_metrics,
+            generation_weight_version=0,
+            target_weight_version=0,
+        )
+        runner = async_grpo_train
+    else:
+        config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+        final_batch = BatchedDataDict(
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "q",
+                            "token_ids": torch.tensor([1]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "a",
+                            "token_ids": torch.tensor([2]),
+                            "generation_logprobs": torch.tensor([-0.1]),
+                        },
+                    ]
+                ],
+                "length": torch.tensor([1]),
+                "total_reward": torch.tensor([1.0]),
+                "loss_multiplier": torch.tensor([1.0]),
+                "mask_sample": torch.tensor([False]),
+                "truncated": torch.tensor([False]),
+                "rollout_trace_bundle": [{"rollout_id": "parity-rollout"}],
+                "physical_message_logs": [[]],
+            }
+        )
+        rollout_result = NemoGymRolloutResult(
+            input_ids=torch.tensor([[1, 2]]),
+            final_batch=final_batch,
+            rollout_metrics={
+                "mean_gen_tokens_per_sample": 1.0,
+                "max_gen_tokens": 1,
+                "min_gen_tokens": 1,
+            },
+            task_index=None,
+        )
+        path_ctx = ExitStack()
+        path_ctx.enter_context(
+            patch(
+                "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+                return_value=rollout_result,
+            )
+        )
+        path_ctx.enter_context(
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=_mock_seq_logprob_error_result(),
+            )
+        )
+        runner = grpo_train
+
+    with (
+        path_ctx,
+        patch(
+            "nemo_rl.algorithms.grpo.prepare_trace_batch_for_scoring",
+            return_value=trace_preparation,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.score_prepared_trace_batch",
+            return_value=scored,
+        ),
+    ):
+        runner(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+
+    policy.train.assert_called_once()
+    call = policy.train.call_args
+    assert call.args[0] is trace_train_data
+    assert call.kwargs["gbs"] == trace_plan["total_row_count"]
+    assert call.kwargs["mbs"] == 1
+    assert (
+        call.kwargs["scheduler_step_increment"] == trace_plan["logical_rollout_count"]
+    )
 
 
 def test_apply_message_level_advantage_penalties_targets_flagged_message_spans():
@@ -767,11 +1931,20 @@ class StubReplayBuffer:
     Each method returns a MagicMock with a 'remote' attribute that can be called.
     """
 
-    def __init__(self, initial_size=10, mock_batch=None, mock_rollout_metrics=None):
+    def __init__(
+        self,
+        initial_size=10,
+        mock_batch=None,
+        mock_rollout_metrics=None,
+        generation_weight_version=None,
+        target_weight_version=None,
+    ):
         self._size = initial_size
         self._trajectories = []
         self._mock_batch = mock_batch
         self._mock_rollout_metrics = mock_rollout_metrics or {}
+        self._generation_weight_version = generation_weight_version
+        self._target_weight_version = target_weight_version
 
     @property
     def size(self):
@@ -786,13 +1959,19 @@ class StubReplayBuffer:
 
         def _sample(num_prompt_groups, current_weight_version, max_age_steps):
             # Return proper trajectory structure expected by async GRPO
-            trajectories = [
-                {
+            trajectories = []
+            for _ in range(num_prompt_groups):
+                trajectory = {
                     "batch": self._mock_batch,
                     "rollout_metrics": self._mock_rollout_metrics,
                 }
-                for _ in range(num_prompt_groups)
-            ]
+                if self._generation_weight_version is not None:
+                    trajectory["generation_weight_version"] = (
+                        self._generation_weight_version
+                    )
+                if self._target_weight_version is not None:
+                    trajectory["target_weight_version"] = self._target_weight_version
+                trajectories.append(trajectory)
             return {
                 "trajectories": trajectories,
                 "avg_trajectory_age": 0.5,
@@ -968,7 +2147,11 @@ class StubAsyncTrajectoryCollector:
 
 
 def mock_async_grpo_infrastructure(
-    mock_batch, mock_rollout_metrics, seq_logprob_error_result=None
+    mock_batch,
+    mock_rollout_metrics,
+    seq_logprob_error_result=None,
+    generation_weight_version=None,
+    target_weight_version=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -984,6 +2167,8 @@ def mock_async_grpo_infrastructure(
         initial_size=10,
         mock_batch=mock_batch,
         mock_rollout_metrics=mock_rollout_metrics,
+        generation_weight_version=generation_weight_version,
+        target_weight_version=target_weight_version,
     )
     stub_collector = StubAsyncTrajectoryCollector()
 

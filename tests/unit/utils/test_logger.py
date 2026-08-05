@@ -1835,6 +1835,75 @@ class TestLogger:
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_plot_token_mult_prob_error_ignores_padding_rows(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Padding rows with no eligible tokens must not be selected for plotting."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        data = {
+            "token_mask": torch.tensor(
+                [
+                    [0, 0, 1, 1, 0, 1],
+                    [0, 0, 0, 0, 0, 0],
+                ]
+            ),
+            "sample_mask": torch.tensor([1, 0]),
+            "generation_logprobs": torch.randn((2, 6)),
+            "prev_logprobs": torch.randn((2, 6)),
+            "prompt_lengths": torch.tensor([2, 0]),
+            "full_lengths": torch.tensor([6, 1]),
+        }
+
+        logger.log_plot_token_mult_prob_error(data, step=10, name="test_plot")
+
+        mock_wandb_logger.return_value.log_plot.assert_called_once()
+        mock_tb_logger.return_value.log_plot.assert_called_once()
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_plot_token_mult_prob_error_skips_all_padding_batch(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """An all-padding batch should not produce a plot."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        data = {
+            "token_mask": torch.zeros((2, 6)),
+            "sample_mask": torch.zeros(2),
+            "generation_logprobs": torch.randn((2, 6)),
+            "prev_logprobs": torch.randn((2, 6)),
+            "prompt_lengths": torch.zeros(2, dtype=torch.long),
+            "full_lengths": torch.ones(2, dtype=torch.long),
+        }
+
+        logger.log_plot_token_mult_prob_error(data, step=10, name="test_plot")
+
+        mock_wandb_logger.return_value.log_plot.assert_not_called()
+        mock_tb_logger.return_value.log_plot.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")
     def test_init_mlflow_only(
         self, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir

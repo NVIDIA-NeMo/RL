@@ -16,6 +16,7 @@ import json
 import os
 import time
 import warnings
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
@@ -80,6 +81,9 @@ from nemo_rl.distributed.virtual_cluster import (
     get_ray_cluster_topology,
     prepare_segment_topology,
 )
+from nemo_rl.environments.generation_contract import (
+    build_runtime_generation_contract,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
@@ -99,6 +103,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     resolve_routed_experts_dtype_name_for_model,
+)
+from nemo_rl.experience.trace_batch_scoring import (
+    prepare_trace_batch_for_scoring,
+    score_prepared_trace_batch,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -183,6 +191,12 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
+
+
+class ContextCompactionTrainingConfig(BaseModel, extra="forbid"):
+    """Fail-closed opt-in for exact multi-trace GRPO training."""
+
+    enabled: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -282,6 +296,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     malformed_thinking_advantage: float | None = None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: AdvEstimatorConfig = Field(default_factory=AdvEstimatorConfig)
+    context_compaction_training: ContextCompactionTrainingConfig = Field(
+        default_factory=ContextCompactionTrainingConfig
+    )
 
 
 @dataclass
@@ -397,6 +414,7 @@ def setup(
     )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+    _validate_context_compaction_training_config(master_config)
 
     # Set seed for all random number generators
     set_seed(grpo_config.seed)
@@ -598,6 +616,29 @@ def setup(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
+    context_compaction_runtime_contract = None
+    if enable_nemo_gym:
+        if _context_compaction_training_enabled(master_config):
+            context_compaction_runtime_contract = build_runtime_generation_contract(
+                model_name=policy_config["model_name"],
+                model_revision=str(
+                    last_checkpoint_path
+                    or policy_config.get("pretrained_checkpoint")
+                    or policy_config["model_name"]
+                ),
+                tokenizer=tokenizer,
+                processor=processor,
+                tokenizer_config=policy_config["tokenizer"],
+                generation_config=generation_config,
+            )
+            if not context_compaction_runtime_contract["training_eligible"]:
+                raise ValueError(
+                    "Context-compaction training requires a complete launcher "
+                    "runtime generation contract:\n- "
+                    + "\n- ".join(
+                        context_compaction_runtime_contract["incomplete_reasons"]
+                    )
+                )
 
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo Gym actor against the given generation server URLs."""
@@ -615,6 +656,7 @@ def setup(
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            context_compaction_runtime_contract=(context_compaction_runtime_contract),
         )
         return actor, time.perf_counter() - t0
 
@@ -1982,6 +2024,7 @@ def _preserve_router_replay_routed_experts(
     if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
         target["routed_experts"] = flat_messages["routed_experts"]
 
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
@@ -2058,6 +2101,358 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     )
 
     return should_use_nemo_gym
+
+
+def _context_compaction_training_enabled(master_config: MasterConfig) -> bool:
+    cc_config = _config_value(
+        master_config.grpo,
+        "context_compaction_training",
+        ContextCompactionTrainingConfig(),
+    )
+    return bool(_config_value(cc_config, "enabled", False))
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    """Read a config field from either a Pydantic model or a test mapping."""
+    if isinstance(config, Mapping):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _validate_context_compaction_training_config(
+    master_config: MasterConfig,
+) -> None:
+    """Reject semantics that have not been qualified for physical trace rows."""
+    if not _context_compaction_training_enabled(master_config):
+        return
+
+    errors: list[str] = []
+    grpo_config = master_config.grpo
+    policy_config = master_config.policy
+    loss_config = master_config.loss_fn
+    async_grpo_enabled = bool(
+        _config_value(_config_value(grpo_config, "async_grpo", {}), "enabled", False)
+    )
+
+    if not master_config.env.get("should_use_nemo_gym"):
+        errors.append("env.should_use_nemo_gym must be true")
+    if _config_value(grpo_config, "use_dynamic_sampling", False):
+        errors.append("dynamic sampling is not supported")
+    if _config_value(
+        _config_value(grpo_config, "reward_scaling", {}), "enabled", False
+    ):
+        errors.append("post-rollout reward scaling is not supported")
+    if _config_value(
+        _config_value(grpo_config, "reward_shaping", {}), "enabled", False
+    ):
+        errors.append("post-rollout reward shaping is not supported")
+    if _config_value(grpo_config, "overlong_filtering", False):
+        errors.append("overlong rollout masking is not supported")
+    if _config_value(grpo_config, "seq_logprob_error_threshold") is not None:
+        errors.append("sequence-level logprob-error masking is not supported")
+    if _config_value(grpo_config, "calculate_advantages_on_gpu", False):
+        errors.append("GPU-side advantage calculation is not supported")
+    if (
+        _config_value(grpo_config, "advantage_clip_low") is not None
+        or _config_value(grpo_config, "advantage_clip_high") is not None
+    ):
+        errors.append("post-normalization advantage clipping is not supported")
+    if _config_value(grpo_config, "invalid_tool_call_advantage") is not None:
+        errors.append(
+            "message-level invalid-tool advantage overrides are not supported"
+        )
+    if _config_value(grpo_config, "malformed_thinking_advantage") is not None:
+        errors.append(
+            "message-level malformed-thinking advantage overrides are not supported"
+        )
+
+    adv_config = _config_value(grpo_config, "adv_estimator", {"name": "grpo"})
+    if _config_value(adv_config, "name", "grpo") != "grpo":
+        errors.append("only the standard GRPO advantage estimator is supported")
+    if loss_config.sequence_level_importance_ratios:
+        errors.append("sequence-level importance ratios are not supported")
+    if not loss_config.token_level_loss:
+        errors.append("sequence-level loss reduction is not supported")
+    if loss_config.truncated_importance_sampling_type == "seq-mask-tis":
+        errors.append("sequence-level TIS masking is not supported")
+    if loss_config.use_kl_in_reward:
+        errors.append("KL-in-reward advantage rewriting is not supported")
+    if loss_config.positive_example_nll_weight != 0:
+        errors.append("positive-example sequence weighting is not supported")
+    if async_grpo_enabled and loss_config.force_on_policy_ratio:
+        errors.append(
+            "async replay requires measured token-level importance ratios; "
+            "force_on_policy_ratio is not supported"
+        )
+    if async_grpo_enabled and not loss_config.use_importance_sampling_correction:
+        errors.append(
+            "async replay requires token-level importance sampling correction"
+        )
+
+    megatron_enabled = bool(policy_config.get("megatron_cfg", {}).get("enabled"))
+    dtensor_enabled = bool(policy_config.get("dtensor_cfg", {}).get("enabled"))
+    if not megatron_enabled or dtensor_enabled:
+        errors.append("the initial implementation requires the Megatron policy backend")
+    if (master_config.data_plane or {}).get("enabled", False):
+        errors.append("the data-plane/TQ training path is not supported")
+
+    logical_rollout_count = _config_value(
+        grpo_config, "num_prompts_per_step"
+    ) * _config_value(grpo_config, "num_generations_per_prompt")
+    if policy_config["train_global_batch_size"] != logical_rollout_count:
+        errors.append(
+            "policy.train_global_batch_size must equal the logical rollout count "
+            "(num_prompts_per_step * num_generations_per_prompt)"
+        )
+    if errors:
+        raise ValueError(
+            "grpo.context_compaction_training.enabled=true is incompatible with:\n- "
+            + "\n- ".join(errors)
+        )
+
+
+def _context_compaction_batch_quantum(
+    policy: ColocatablePolicyInterface,
+    master_config: MasterConfig,
+) -> int:
+    data_parallel_size = getattr(policy, "data_parallel_size", None)
+    if (
+        isinstance(data_parallel_size, bool)
+        or not isinstance(data_parallel_size, int)
+        or data_parallel_size <= 0
+    ):
+        raise ValueError(
+            "Context-compaction training requires a positive policy data_parallel_size"
+        )
+    micro_batch_size = master_config.policy["train_micro_batch_size"]
+    if (
+        isinstance(micro_batch_size, bool)
+        or not isinstance(micro_batch_size, int)
+        or micro_batch_size <= 0
+    ):
+        raise ValueError("policy.train_micro_batch_size must be positive")
+    return data_parallel_size * micro_batch_size
+
+
+def _compute_group_token_fingerprint(
+    trajectory: dict[str, Any],
+) -> tuple | None:
+    """Return a content fingerprint for a CC replay group from its physical trace tokens.
+
+    Sorts bundles by rollout_id for determinism.  Returns None when no physical
+    traces are available so the caller can decide how to treat the gap.
+    """
+    batch = trajectory.get("batch")
+    if not isinstance(batch, BatchedDataDict):
+        return None
+    bundles = batch.get("rollout_trace_bundle")
+    if not isinstance(bundles, list):
+        return None
+    bundle_tokens: list[tuple[str, tuple]] = []
+    for bundle in bundles:
+        if not isinstance(bundle, Mapping):
+            continue
+        rollout_id = bundle.get("rollout_id", "")
+        traces = bundle.get("physical_traces") or []
+        tokens: list[int] = []
+        for trace in traces:
+            for seg in trace.get("segments", []):
+                tokens.extend(seg.get("token_ids", []))
+        bundle_tokens.append((rollout_id, tuple(tokens)))
+    bundle_tokens.sort(key=lambda x: x[0])
+    return tuple((rid, toks) for rid, toks in bundle_tokens)
+
+
+def _dedup_cc_replay_groups(
+    trajectories: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove identical-retry duplicate groups from a CC replay selection.
+
+    Two groups are identical retries when they share the same rollout-ID set
+    AND their physical-trace token sequences are also identical.  The later
+    entry is silently dropped and counted in the returned dedup count.
+
+    Two groups that share rollout IDs but have different token content are
+    *conflicting* retries; a ValueError is raised immediately so training
+    fails closed before any advantage is computed.
+
+    Groups whose bundles carry no physical_traces are passed through unchanged
+    (fingerprint unavailable); the downstream validator will still catch
+    genuine rollout-ID collisions.
+
+    Returns (deduplicated_trajectories, num_deduped).
+    """
+    seen: dict[frozenset, tuple | None] = {}
+    kept: list[dict[str, Any]] = []
+    deduped = 0
+    for trajectory in trajectories:
+        batch = trajectory.get("batch")
+        bundles = (
+            batch.get("rollout_trace_bundle")
+            if isinstance(batch, BatchedDataDict)
+            else None
+        )
+        if not isinstance(bundles, list):
+            kept.append(trajectory)
+            continue
+        rollout_ids = frozenset(
+            bundle.get("rollout_id", "")
+            for bundle in bundles
+            if isinstance(bundle, Mapping)
+        )
+        fingerprint = _compute_group_token_fingerprint(trajectory)
+        if rollout_ids in seen:
+            prev = seen[rollout_ids]
+            if prev is None or fingerprint is None:
+                raise ValueError(
+                    f"Async CC replay: duplicate rollout IDs {sorted(rollout_ids)!r} "
+                    "in groups without physical-trace fingerprint"
+                )
+            if prev == fingerprint:
+                deduped += 1
+                continue
+            raise ValueError(
+                f"Async CC conflicting retry: rollout IDs {sorted(rollout_ids)!r} "
+                "appear with different physical-trace content"
+            )
+        seen[rollout_ids] = fingerprint
+        kept.append(trajectory)
+    return kept, deduped
+
+
+def _validate_async_context_compaction_replay_groups(
+    trajectories: list[dict[str, Any]],
+    *,
+    expected_prompt_groups: int,
+    expected_rollouts_per_group: int,
+    current_weight_version: int,
+    max_age_steps: int,
+) -> None:
+    """Prove async replay selected complete logical groups with stable provenance."""
+    if len(trajectories) != expected_prompt_groups:
+        raise ValueError(
+            "Async context-compaction replay must return exactly "
+            f"{expected_prompt_groups} complete prompt groups"
+        )
+
+    observed_rollout_ids: set[str] = set()
+    for group_index, trajectory in enumerate(trajectories):
+        if not isinstance(trajectory, dict):
+            raise TypeError(
+                f"Async context-compaction replay group {group_index} is not a mapping"
+            )
+        batch = trajectory.get("batch")
+        if (
+            not isinstance(batch, BatchedDataDict)
+            or batch.size != expected_rollouts_per_group
+        ):
+            raise ValueError(
+                f"Async context-compaction replay group {group_index} must contain "
+                f"exactly {expected_rollouts_per_group} logical rollouts"
+            )
+
+        generation_weight_version = trajectory.get("generation_weight_version")
+        target_weight_version = trajectory.get("target_weight_version")
+        if (
+            isinstance(generation_weight_version, bool)
+            or not isinstance(generation_weight_version, int)
+            or isinstance(target_weight_version, bool)
+            or not isinstance(target_weight_version, int)
+        ):
+            raise ValueError(
+                f"Async context-compaction replay group {group_index} is missing "
+                "integer generation/target weight provenance"
+            )
+        if target_weight_version != current_weight_version:
+            raise ValueError(
+                f"Async context-compaction replay group {group_index} targets "
+                f"weight {target_weight_version}, expected {current_weight_version}"
+            )
+        trajectory_age = current_weight_version - generation_weight_version
+        if trajectory_age < 0 or trajectory_age > max_age_steps:
+            raise ValueError(
+                f"Async context-compaction replay group {group_index} has invalid "
+                f"trajectory age {trajectory_age}"
+            )
+
+        bundles = batch.get("rollout_trace_bundle")
+        if not isinstance(bundles, list) or len(bundles) != batch.size:
+            raise ValueError(
+                f"Async context-compaction replay group {group_index} has no "
+                "rollout-aligned trace bundles"
+            )
+        group_ids: set[str] = set()
+        expected_policy_version = f"async-policy-weight-{generation_weight_version:08d}"
+        for bundle_index, bundle in enumerate(bundles):
+            if not isinstance(bundle, Mapping):
+                raise TypeError(
+                    f"Async replay bundle {group_index}:{bundle_index} is not a mapping"
+                )
+            rollout_id = bundle.get("rollout_id")
+            group_id = bundle.get("group_id")
+            if not isinstance(rollout_id, str) or not rollout_id:
+                raise ValueError(
+                    f"Async replay bundle {group_index}:{bundle_index} has no "
+                    "logical rollout identity"
+                )
+            if rollout_id in observed_rollout_ids:
+                raise ValueError(
+                    f"Async replay selected duplicate logical rollout ID {rollout_id!r}"
+                )
+            observed_rollout_ids.add(rollout_id)
+            if not isinstance(group_id, str) or not group_id:
+                raise ValueError(
+                    f"Async replay bundle {rollout_id!r} has no comparison-group identity"
+                )
+            group_ids.add(group_id)
+
+            admission = bundle.get("training_admission")
+            if (
+                not isinstance(admission, Mapping)
+                or admission.get("generation_policy_version") != expected_policy_version
+            ):
+                raise ValueError(
+                    f"Async replay bundle {rollout_id!r} generation-policy "
+                    "provenance disagrees with its replay entry"
+                )
+        if len(group_ids) != 1:
+            raise ValueError(
+                f"Async context-compaction replay group {group_index} mixes "
+                f"comparison groups {sorted(group_ids)!r}"
+            )
+
+
+def _assign_context_compaction_generation_replica_indices(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    *,
+    num_generations_per_prompt: int,
+) -> None:
+    """Assign a distinct, retry-stable rollout index to each GRPO replica."""
+    if num_generations_per_prompt <= 0:
+        raise ValueError("num_generations_per_prompt must be positive")
+    rows = repeated_batch.get("extra_env_info")
+    if not isinstance(rows, list):
+        return
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        if row.get("context_compaction_contract_version") != 2:
+            continue
+        base_rollout_index = row.get("context_compaction_rollout_index")
+        if (
+            isinstance(base_rollout_index, bool)
+            or not isinstance(base_rollout_index, int)
+            or base_rollout_index < 0
+        ):
+            raise ValueError(
+                "Version 2 context compaction rows require a non-negative "
+                "integer context_compaction_rollout_index before GRPO "
+                "generation replication"
+            )
+        generation_replica_index = row_index % num_generations_per_prompt
+        row["context_compaction_rollout_index"] = (
+            base_rollout_index * num_generations_per_prompt + generation_replica_index
+        )
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
@@ -2232,8 +2627,13 @@ def refit_policy_generation(
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
 
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
-        policy.offload_before_refit()
+    # Always offload optimizer states and grad buffers to CPU before weight transfer.
+    # After training, the optimizer occupies enough GPU memory that the broadcast
+    # buffer (broadcast_weights_for_collective) or colocated IPC buffer cannot be
+    # allocated without first freeing it.  prepare_for_training() unconditionally
+    # reloads the optimizer to GPU before the next training step, so this is safe
+    # for all callers regardless of generation backend.
+    policy.offload_before_refit()
     # Colocated inference needs to prepare for generation.
     # Megatron non-colocated inference needs to enter inference mode after refit.
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
@@ -2610,6 +3010,7 @@ def grpo_train(
     master_config: MasterConfig,
 ) -> None:
     """Run GRPO training algorithm."""
+    _validate_context_compaction_training_config(master_config)
     timer = Timer(context={"worker": "driver"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -2658,6 +3059,7 @@ def grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
+    context_compaction_training = _context_compaction_training_enabled(master_config)
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -2748,6 +3150,12 @@ def grpo_train(
                         batch.repeat_interleave(
                             master_config.grpo.num_generations_per_prompt
                         )
+                    )
+                    _assign_context_compaction_generation_replica_indices(
+                        repeated_batch,
+                        num_generations_per_prompt=(
+                            master_config.grpo.num_generations_per_prompt
+                        ),
                     )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
@@ -2849,6 +3257,11 @@ def grpo_train(
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
+                            ),
+                            generation_policy_version=(
+                                f"sync-policy-step-{total_steps:08d}"
+                                if context_compaction_training
+                                else None
                             ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
@@ -3009,63 +3422,123 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config.grpo.overlong_filtering
-                    if use_overlong_filtering:
-                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                        truncated = repeated_batch["truncated"]
+                    trace_scoring_preparation = None
+                    if context_compaction_training:
+                        metrics["num_mask_sample_filtered"] = 0
+                        trace_scoring_preparation = prepare_trace_batch_for_scoring(
+                            repeated_batch,
+                            prompt_ids=prompt_ids_for_adv,
+                            advantage_estimator=adv_estimator,
+                            expected_rollouts_per_group=(
+                                master_config.grpo.num_generations_per_prompt
+                            ),
+                            batch_quantum=_context_compaction_batch_quantum(
+                                policy, master_config
+                            ),
+                            optimizer_step_id=(f"grpo-step-{total_steps + 1:08d}"),
+                            pad_token_id=tokenizer.pad_token_id,
+                            make_sequence_length_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                            training_admission=True,
+                        )
+                        train_data = trace_scoring_preparation["materialization"][
+                            "train_data"
+                        ]
+                        input_lengths = train_data["input_lengths"]
+                        metrics_logging_data["content"] = [
+                            "".join(
+                                str(message.get("content", ""))
+                                for message in message_log
+                            )
+                            for message_log in trace_scoring_preparation[
+                                "materialization"
+                            ]["materialized_message_logs"]
+                        ]
+                        trace_plan = trace_scoring_preparation["plan"]
+                        metrics.update(
+                            {
+                                "context_compaction/logical_rollouts": trace_plan[
+                                    "logical_rollout_count"
+                                ],
+                                "context_compaction/physical_traces": trace_plan[
+                                    "physical_trace_count"
+                                ],
+                                "context_compaction/padding_rows": trace_plan[
+                                    "padding_row_count"
+                                ],
+                                "context_compaction/physical_rows": trace_plan[
+                                    "total_row_count"
+                                ],
+                                "context_compaction/eligible_action_tokens": (
+                                    trace_plan["eligible_action_token_count"]
+                                ),
+                            }
+                        )
+                    else:
+                        use_overlong_filtering = master_config.grpo.overlong_filtering
+                        if use_overlong_filtering:
+                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                            truncated = repeated_batch["truncated"]
 
-                        if isinstance(truncated, list):
-                            truncated = torch.tensor(truncated, dtype=torch.bool)
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
 
-                        loss_multiplier[truncated] = 0
-                        repeated_batch["loss_multiplier"] = loss_multiplier
+                            loss_multiplier[truncated] = 0
+                            repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
-                    metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
+                        num_mask_sample_filtered = _apply_mask_sample_filter(
+                            repeated_batch
+                        )
+                        metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
-                    add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
-                    )
+                        add_grpo_token_loss_masks_and_generation_logprobs(
+                            repeated_batch["message_log"]
+                        )
 
-                    # Convert updated LLMMessageLogType to FlatMessagesType for training
-                    flat_messages, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config.policy[
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
+                        # Convert updated LLMMessageLogType to FlatMessagesType for training
+                        flat_messages, input_lengths = (
+                            batched_message_log_to_flat_message(
+                                repeated_batch["message_log"],
+                                pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                                make_sequence_length_divisible_by=master_config.policy[
+                                    "make_sequence_length_divisible_by"
+                                ],
+                            )
+                        )
 
-                    # Create training data from flattened messages
-                    # Note: advantages will be computed and added after logprobs are available
-                    train_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "generation_logprobs": flat_messages["generation_logprobs"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
-                    )
-                    # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    # This is also used to populate part of the downstream logprob calculation data
-                    extra_multimodal_data = flat_messages.get_multimodal_dict(
-                        as_tensors=False
-                    )
-                    train_data.update(extra_multimodal_data)
-                    # Router replay (R3) on the legacy data_plane.enabled=false
-                    # driver path: routed_experts already rides flat_messages
-                    # (attached to message_log during rollout, then batched into
-                    # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
-                    # but the train_data whitelist above drops it. Copy it back so
-                    # the Megatron worker's train-stage router-replay guard finds
-                    # it. Mirrors the TQ producer (sync_rollout_actor.py).
-                    _preserve_router_replay_routed_experts(
-                        train_data, flat_messages, master_config.policy
-                    )
-                    train_data.to("cpu")
+                        # Create training data from flattened messages
+                        # Note: advantages will be computed and added after logprobs are available
+                        train_data = BatchedDataDict[ClippedPGLossDataDict](
+                            {
+                                "input_ids": flat_messages["token_ids"],
+                                "input_lengths": input_lengths,
+                                "generation_logprobs": flat_messages[
+                                    "generation_logprobs"
+                                ],
+                                "token_mask": flat_messages["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                            }
+                        )
+                        # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                        # This is also used to populate part of the downstream logprob calculation data
+                        extra_multimodal_data = flat_messages.get_multimodal_dict(
+                            as_tensors=False
+                        )
+                        train_data.update(extra_multimodal_data)
+                        # Router replay (R3) on the legacy data_plane.enabled=false
+                        # driver path: routed_experts already rides flat_messages
+                        # (attached to message_log during rollout, then batched into
+                        # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
+                        # but the train_data whitelist above drops it. Copy it back so
+                        # the Megatron worker's train-stage router-replay guard finds
+                        # it. Mirrors the TQ producer (sync_rollout_actor.py).
+                        _preserve_router_replay_routed_experts(
+                            train_data, flat_messages, master_config.policy
+                        )
+                        train_data.to("cpu")
 
-                    metrics_logging_data["content"] = flat_messages["content"]
+                        metrics_logging_data["content"] = flat_messages["content"]
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -3082,67 +3555,85 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
-                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": train_data["input_ids"],
-                            "input_lengths": train_data["input_lengths"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                            **extra_multimodal_data,
-                        }
-                    )
-                    # Router replay (R3): the prev-logprobs forward replays the
-                    # recorded routed_experts, so logprob_data must carry the
-                    # field too (it is a separate whitelist from train_data). The
-                    # reference-policy logprobs call reuses logprob_data but
-                    # intentionally ignores routed_experts (require_router_replay
-                    # =False short-circuits before the field is read), so a
-                    # present-but-unused field here is safe.
-                    _preserve_router_replay_routed_experts(
-                        logprob_data, flat_messages, master_config.policy
-                    )
-
-                    if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            logprob_data, timer=timer
-                        )["logprobs"]
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        scored_trace_batch = score_prepared_trace_batch(
+                            trace_scoring_preparation,
+                            policy=policy,
+                            timer=timer,
+                            skip_policy_logprobs=skip_prev_logprobs,
+                            skip_reference_logprobs=skip_reference_logprobs,
+                        )
+                        train_data = scored_trace_batch["train_data"]
+                        del scored_trace_batch
                     else:
-                        print(
-                            "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
-                            flush=True,
+                        # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
+                        logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                            {
+                                "input_ids": train_data["input_ids"],
+                                "input_lengths": train_data["input_lengths"],
+                                "token_mask": flat_messages["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                                **extra_multimodal_data,
+                            }
                         )
-                        train_data["prev_logprobs"] = torch.zeros_like(
-                            train_data["generation_logprobs"]
-                        )
-
-                    if not skip_reference_logprobs:
-                        train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
-                                logprob_data,
-                                timer=timer,
-                            )["reference_logprobs"]
-                        )
-                    else:
-                        print(
-                            "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
-                            flush=True,
-                        )
-                        train_data["reference_policy_logprobs"] = torch.zeros_like(
-                            train_data["prev_logprobs"]
+                        # Router replay (R3): the prev-logprobs forward replays the
+                        # recorded routed_experts, so logprob_data must carry the
+                        # field too (it is a separate whitelist from train_data). The
+                        # reference-policy logprobs call reuses logprob_data but
+                        # intentionally ignores routed_experts (require_router_replay
+                        # =False short-circuits before the field is read), so a
+                        # present-but-unused field here is safe.
+                        _preserve_router_replay_routed_experts(
+                            logprob_data, flat_messages, master_config.policy
                         )
 
-                    del logprob_data
-                    del extra_multimodal_data
+                        if not skip_prev_logprobs:
+                            train_data["prev_logprobs"] = policy.get_logprobs(
+                                logprob_data, timer=timer
+                            )["logprobs"]
+                        else:
+                            print(
+                                "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                                flush=True,
+                            )
+                            train_data["prev_logprobs"] = torch.zeros_like(
+                                train_data["generation_logprobs"]
+                            )
+
+                        if not skip_reference_logprobs:
+                            train_data["reference_policy_logprobs"] = (
+                                policy.get_reference_policy_logprobs(
+                                    logprob_data,
+                                    timer=timer,
+                                )["reference_logprobs"]
+                            )
+                        else:
+                            print(
+                                "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
+                                flush=True,
+                            )
+                            train_data["reference_policy_logprobs"] = torch.zeros_like(
+                                train_data["prev_logprobs"]
+                            )
+
+                        del logprob_data
+                        del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
+                    seq_error_rewards = (
+                        trace_scoring_preparation["materialization"]["row_rewards"]
+                        if context_compaction_training
+                        and trace_scoring_preparation is not None
+                        else rewards
+                    )
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
-                        rewards=rewards,
+                        rewards=seq_error_rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
                     seq_logprob_error_metrics = seq_error_result
@@ -3153,42 +3644,69 @@ def grpo_train(
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
-                    print("▶ Computing advantages...", flush=True)
-                    # Get token-level mask: token_mask * sample_mask
-                    token_mask = train_data["token_mask"]
-                    sample_mask = train_data["sample_mask"]
-                    mask = token_mask * sample_mask.unsqueeze(-1)
-
-                    train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
-                        mask=mask,
-                        repeated_batch=repeated_batch,
-                        logprobs_policy=train_data["prev_logprobs"],
-                        logprobs_reference=train_data.get("reference_policy_logprobs"),
-                    )
-                    del prompt_ids_for_adv
-
-                    # Log rewards and advantages information
-                    _log_mixed_rewards_and_advantages_information(
-                        logger=logger,
-                        total_steps=total_steps,
-                        metrics=metrics,
-                        baseline=baseline_for_log,
-                        advantages=train_data["advantages"],
-                    )
-                    del baseline_for_log
-
-                    penalty_metrics = (
-                        _apply_configured_message_level_advantage_penalties(
-                            train_data, repeated_batch["message_log"], master_config
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        logical_advantages = torch.tensor(
+                            [
+                                trace_scoring_preparation["rollout_advantages"][
+                                    bundle["rollout_id"]
+                                ]
+                                for bundle in repeated_batch["rollout_trace_bundle"]
+                            ],
+                            dtype=torch.float32,
+                        ).unsqueeze(-1)
+                        _log_mixed_rewards_and_advantages_information(
+                            logger=logger,
+                            total_steps=total_steps,
+                            metrics=metrics,
+                            baseline=baseline_for_log,
+                            advantages=logical_advantages,
                         )
-                    )
+                        penalty_metrics = {}
+                        del logical_advantages
+                        del prompt_ids_for_adv
+                        del baseline_for_log
+                    else:
+                        print("▶ Computing advantages...", flush=True)
+                        # Get token-level mask: token_mask * sample_mask
+                        token_mask = train_data["token_mask"]
+                        sample_mask = train_data["sample_mask"]
+                        mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    # Clip advantages to prevent extreme values from small std normalization
-                    train_data["advantages"] = _clip_grpo_advantages(
-                        train_data["advantages"], master_config.grpo
-                    )
+                        train_data["advantages"] = adv_estimator.compute_advantage(
+                            prompt_ids=prompt_ids_for_adv,
+                            rewards=rewards,
+                            mask=mask,
+                            repeated_batch=repeated_batch,
+                            logprobs_policy=train_data["prev_logprobs"],
+                            logprobs_reference=train_data.get(
+                                "reference_policy_logprobs"
+                            ),
+                        )
+                        del prompt_ids_for_adv
+
+                        # Log rewards and advantages information
+                        _log_mixed_rewards_and_advantages_information(
+                            logger=logger,
+                            total_steps=total_steps,
+                            metrics=metrics,
+                            baseline=baseline_for_log,
+                            advantages=train_data["advantages"],
+                        )
+                        del baseline_for_log
+
+                        penalty_metrics = (
+                            _apply_configured_message_level_advantage_penalties(
+                                train_data,
+                                repeated_batch["message_log"],
+                                master_config,
+                            )
+                        )
+
+                        # Clip advantages to prevent extreme values from small std normalization
+                        train_data["advantages"] = _clip_grpo_advantages(
+                            train_data["advantages"], master_config.grpo
+                        )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -3198,11 +3716,29 @@ def grpo_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        trace_plan = trace_scoring_preparation["plan"]
+                        if train_data.size != trace_plan["total_row_count"]:
+                            raise ValueError(
+                                "Trace training data size changed after scoring"
+                            )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            gbs=trace_plan["total_row_count"],
+                            mbs=master_config.policy["train_micro_batch_size"],
+                            scheduler_step_increment=trace_plan[
+                                "logical_rollout_count"
+                            ],
+                            timer=timer,
+                        )
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -3272,7 +3808,7 @@ def grpo_train(
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
+                flat_token_mask = train_data["token_mask"]
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -3484,9 +4020,25 @@ def grpo_train(
             if not _should_log_nemo_gym_responses(master_config):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
-                log_data["content"] = flat_messages["content"]
-                log_data["rewards"] = rewards.tolist()
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        log_data["agent_ref"] = [
+                            repeated_batch["agent_ref"][parent_index]
+                            if parent_index >= 0
+                            else None
+                            for parent_index in trace_scoring_preparation["plan"][
+                                "parent_indices"
+                            ]
+                        ]
+                    else:
+                        log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = metrics_logging_data["content"]
+                log_data["rewards"] = (
+                    trace_scoring_preparation["materialization"]["row_rewards"].tolist()
+                    if context_compaction_training
+                    and trace_scoring_preparation is not None
+                    else rewards.tolist()
+                )
                 if master_config.grpo.use_dynamic_sampling:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
@@ -3504,16 +4056,33 @@ def grpo_train(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
                 del log_data
-            del flat_messages
+            if not context_compaction_training:
+                del flat_messages
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
             # track example with high token mult prob error above 1.05
             if metrics["token_mult_prob_error"] > 1.05:
+                if context_compaction_training:
+                    assert trace_scoring_preparation is not None
+                    logical_prompt_lengths = repeated_batch["length"]
+                    prompt_lengths_for_plot = torch.tensor(
+                        [
+                            int(logical_prompt_lengths[parent_index])
+                            if parent_index >= 0
+                            else 0
+                            for parent_index in trace_scoring_preparation["plan"][
+                                "parent_indices"
+                            ]
+                        ],
+                        dtype=logical_prompt_lengths.dtype,
+                    )
+                else:
+                    prompt_lengths_for_plot = repeated_batch["length"]
                 logger.log_plot_token_mult_prob_error(
                     {
-                        "prompt_lengths": repeated_batch["length"],
+                        "prompt_lengths": prompt_lengths_for_plot,
                         "full_lengths": input_lengths,
                         "generation_logprobs": train_data["generation_logprobs"],
                         "prev_logprobs": train_data["prev_logprobs"],
@@ -3720,6 +4289,7 @@ def validate(
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
                     ),
+                    generation_only=True,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -3899,6 +4469,9 @@ def async_grpo_train(
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
+    _validate_context_compaction_training_config(master_config)
+    context_compaction_training = _context_compaction_training_enabled(master_config)
+
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
@@ -4389,6 +4962,44 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    buffer_size_before_sample = sample_result.get(
+                        "buffer_size_before_sample", len(trajectories)
+                    )
+                    evicted_stale_count = sample_result.get("evicted_stale_count", 0)
+                    selected_groups_from_buffer = len(trajectories)
+
+                    deduped_retry_count = 0
+                    if context_compaction_training:
+                        # Deduplicate identical-retry groups before validation.
+                        # Conflicting retries (same IDs, different content) raise
+                        # immediately so training fails closed before any advantage
+                        # is computed.
+                        trajectories, deduped_retry_count = _dedup_cc_replay_groups(
+                            trajectories
+                        )
+                        if deduped_retry_count > 0:
+                            print(
+                                f"⚠️ Deduped {deduped_retry_count} identical-retry "
+                                f"group(s); {len(trajectories)} unique group(s) remain"
+                            )
+                        if len(trajectories) < num_prompt_groups_needed:
+                            print(
+                                f"⚠️ After dedup only {len(trajectories)} unique groups "
+                                f"remain (need {num_prompt_groups_needed}). "
+                                "Waiting for buffer to refill."
+                            )
+                            with timer.time("idle/buffer_starvation"):
+                                time.sleep(0.5)
+                            continue
+                        _validate_async_context_compaction_replay_groups(
+                            trajectories,
+                            expected_prompt_groups=num_prompt_groups_needed,
+                            expected_rollouts_per_group=(
+                                master_config.grpo.num_generations_per_prompt
+                            ),
+                            current_weight_version=weight_version,
+                            max_age_steps=max_trajectory_age_steps,
+                        )
 
                     print(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
@@ -4428,7 +5039,10 @@ def async_grpo_train(
 
                 # Optional sanity: ensure DP divisibility to avoid sharding issues
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                if expected_batch_size % dp_size != 0:
+                if (
+                    not context_compaction_training
+                    and expected_batch_size % dp_size != 0
+                ):
                     raise AssertionError(
                         f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
                     )
@@ -4470,48 +5084,119 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Apply overlong filtering - mask out truncated sequences from loss computation
-                    with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo.overlong_filtering
-                        if use_overlong_filtering:
-                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                            truncated = repeated_batch["truncated"]
+                    trace_scoring_preparation = None
+                    context_compaction_metrics: dict[str, Any] = {}
+                    if context_compaction_training:
+                        trace_scoring_preparation = prepare_trace_batch_for_scoring(
+                            repeated_batch,
+                            prompt_ids=prompt_ids_for_adv,
+                            advantage_estimator=adv_estimator,
+                            expected_rollouts_per_group=(
+                                master_config.grpo.num_generations_per_prompt
+                            ),
+                            batch_quantum=_context_compaction_batch_quantum(
+                                policy, master_config
+                            ),
+                            optimizer_step_id=(f"async-grpo-step-{step + 1:08d}"),
+                            pad_token_id=tokenizer.pad_token_id,
+                            make_sequence_length_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                            training_admission=True,
+                        )
+                        train_data = trace_scoring_preparation["materialization"][
+                            "train_data"
+                        ]
+                        input_lengths = train_data["input_lengths"]
+                        flat_messages_content = [
+                            "".join(
+                                str(message.get("content", ""))
+                                for message in message_log
+                            )
+                            for message_log in trace_scoring_preparation[
+                                "materialization"
+                            ]["materialized_message_logs"]
+                        ]
+                        trace_plan = trace_scoring_preparation["plan"]
+                        context_compaction_metrics = {
+                            "context_compaction/logical_rollouts": trace_plan[
+                                "logical_rollout_count"
+                            ],
+                            "context_compaction/physical_traces": trace_plan[
+                                "physical_trace_count"
+                            ],
+                            "context_compaction/padding_rows": trace_plan[
+                                "padding_row_count"
+                            ],
+                            "context_compaction/physical_rows": trace_plan[
+                                "total_row_count"
+                            ],
+                            "context_compaction/eligible_action_tokens": trace_plan[
+                                "eligible_action_token_count"
+                            ],
+                            "context_compaction/duplicate_retries": trace_plan[
+                                "duplicate_retry_count"
+                            ],
+                            "context_compaction/deduped_retry_groups": deduped_retry_count,
+                            "context_compaction/selected_groups_from_buffer": selected_groups_from_buffer,
+                            "context_compaction/buffer_size_before_sample": buffer_size_before_sample,
+                            "context_compaction/evicted_stale_groups": evicted_stale_count,
+                            "context_compaction/scheduler_step_increment": trace_plan[
+                                "logical_rollout_count"
+                            ],
+                            "context_compaction/optimizer_steps": 1,
+                        }
+                    else:
+                        # Apply overlong filtering - mask out truncated sequences from loss computation
+                        with timer.time("overlong_filter"):
+                            use_overlong_filtering = (
+                                master_config.grpo.overlong_filtering
+                            )
+                            if use_overlong_filtering:
+                                loss_multiplier = repeated_batch[
+                                    "loss_multiplier"
+                                ].clone()
+                                truncated = repeated_batch["truncated"]
 
-                            if isinstance(truncated, list):
-                                truncated = torch.tensor(truncated, dtype=torch.bool)
+                                if isinstance(truncated, list):
+                                    truncated = torch.tensor(
+                                        truncated, dtype=torch.bool
+                                    )
 
-                            loss_multiplier[truncated] = 0
-                            repeated_batch["loss_multiplier"] = loss_multiplier
+                                loss_multiplier[truncated] = 0
+                                repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    with timer.time("mask_sample_filter"):
-                        num_mask_sample_filtered = _apply_mask_sample_filter(
-                            repeated_batch
+                        with timer.time("mask_sample_filter"):
+                            num_mask_sample_filtered = _apply_mask_sample_filter(
+                                repeated_batch
+                            )
+
+                        # Add loss mask to each message
+                        # Only unmask assistant messages that were actually generated (have generation_logprobs),
+                        # not assistant messages that were part of the prompt history
+                        add_grpo_token_loss_masks_and_generation_logprobs(
+                            repeated_batch["message_log"]
                         )
 
-                    # Add loss mask to each message
-                    # Only unmask assistant messages that were actually generated (have generation_logprobs),
-                    # not assistant messages that were part of the prompt history
-                    add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
-                    )
+                        # Convert to flat format for training
+                        flat_messages, input_lengths = (
+                            batched_message_log_to_flat_message(
+                                repeated_batch["message_log"],
+                                pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                                make_sequence_length_divisible_by=master_config.policy[
+                                    "make_sequence_length_divisible_by"
+                                ],
+                            )
+                        )
 
-                    # Convert to flat format for training
-                    flat_messages, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config.policy[
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
-
-                    # Create training data. Advantages are added after logprobs.
-                    train_data = _build_async_grpo_train_data(
-                        flat_messages,
-                        input_lengths,
-                        repeated_batch,
-                        master_config.policy,
-                    )
-                    train_data.to("cpu")
+                        # Create training data. Advantages are added after logprobs.
+                        train_data = _build_async_grpo_train_data(
+                            flat_messages,
+                            input_lengths,
+                            repeated_batch,
+                            master_config.policy,
+                        )
+                        train_data.to("cpu")
 
                 # Training phase (same as sync version)
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -4528,39 +5213,57 @@ def async_grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            train_data, timer=timer
-                        )["logprobs"]
-                    else:
-                        train_data["prev_logprobs"] = torch.zeros_like(
-                            train_data["generation_logprobs"]
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        scored_trace_batch = score_prepared_trace_batch(
+                            trace_scoring_preparation,
+                            policy=policy,
+                            timer=timer,
+                            skip_policy_logprobs=skip_prev_logprobs,
+                            skip_reference_logprobs=skip_reference_logprobs,
                         )
+                        train_data = scored_trace_batch["train_data"]
+                        del scored_trace_batch
+                    else:
+                        if not skip_prev_logprobs:
+                            train_data["prev_logprobs"] = policy.get_logprobs(
+                                train_data, timer=timer
+                            )["logprobs"]
+                        else:
+                            train_data["prev_logprobs"] = torch.zeros_like(
+                                train_data["generation_logprobs"]
+                            )
 
-                    if not skip_reference_logprobs:
-                        train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
-                                train_data,
-                                timer=timer,
-                            )["reference_logprobs"]
-                        )
-                    else:
-                        print(
-                            "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
-                            flush=True,
-                        )
-                        train_data["reference_policy_logprobs"] = torch.zeros_like(
-                            train_data["prev_logprobs"]
-                        )
+                        if not skip_reference_logprobs:
+                            train_data["reference_policy_logprobs"] = (
+                                policy.get_reference_policy_logprobs(
+                                    train_data,
+                                    timer=timer,
+                                )["reference_logprobs"]
+                            )
+                        else:
+                            print(
+                                "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
+                                flush=True,
+                            )
+                            train_data["reference_policy_logprobs"] = torch.zeros_like(
+                                train_data["prev_logprobs"]
+                            )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
+                    seq_error_rewards = (
+                        trace_scoring_preparation["materialization"]["row_rewards"]
+                        if context_compaction_training
+                        and trace_scoring_preparation is not None
+                        else rewards
+                    )
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
-                        rewards=rewards,
+                        rewards=seq_error_rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
                     seq_logprob_error_metrics = seq_error_result
@@ -4577,59 +5280,83 @@ def async_grpo_train(
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
-                    print("▶ Computing advantages...", flush=True)
-                    # Get token-level mask: token_mask * sample_mask
-                    token_mask = train_data["token_mask"]
-                    sample_mask = train_data["sample_mask"]
-                    mask = token_mask * sample_mask.unsqueeze(-1)
-
-                    train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
-                        mask=mask,
-                        repeated_batch=repeated_batch,
-                        logprobs_policy=train_data["prev_logprobs"],
-                        logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        # OPD kwargs (ignored by non-OPD estimators via **kwargs)
-                        teacher_logprobs=trajectory_teacher_logprobs.to(
-                            train_data["prev_logprobs"].device
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        logical_advantages = torch.tensor(
+                            [
+                                trace_scoring_preparation["rollout_advantages"][
+                                    bundle["rollout_id"]
+                                ]
+                                for bundle in repeated_batch["rollout_trace_bundle"]
+                            ],
+                            dtype=torch.float32,
                         )
-                        if trajectory_teacher_logprobs is not None
-                        else None,
-                        prev_logprobs=train_data["prev_logprobs"],
-                        generation_logprobs=train_data["generation_logprobs"],
-                        sample_mask=train_data["sample_mask"],
-                    )
-                    if (
-                        hasattr(adv_estimator, "last_metrics")
-                        and adv_estimator.last_metrics
-                    ):
-                        rollout_metrics.update(adv_estimator.last_metrics)
-                    del prompt_ids_for_adv
-
-                    # Log advantages stats
-                    # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are
-                    # already normalized advantages (equivalent to "Normalized advantages stats"
-                    # in older versions). For ReinforcePlusPlusAdvantageEstimator, advantages
-                    # are globally normalized across valid tokens.
-                    advantages = train_data["advantages"]
-                    print(
-                        f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
-                    )
-
-                    penalty_metrics = (
-                        _apply_configured_message_level_advantage_penalties(
-                            train_data,
-                            repeated_batch["message_log"],
-                            master_config,
-                            log_config=True,
+                        print(
+                            "  📊 Logical advantages stats: "
+                            f"min={logical_advantages.min():.4f}, "
+                            f"max={logical_advantages.max():.4f}, "
+                            f"mean={logical_advantages.mean():.4f}, "
+                            f"std={logical_advantages.std(unbiased=False):.4f}"
                         )
-                    )
+                        penalty_metrics = {}
+                        del logical_advantages
+                        del prompt_ids_for_adv
+                    else:
+                        print("▶ Computing advantages...", flush=True)
+                        # Get token-level mask: token_mask * sample_mask
+                        token_mask = train_data["token_mask"]
+                        sample_mask = train_data["sample_mask"]
+                        mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    # Clip advantages to prevent extreme values from small std normalization
-                    train_data["advantages"] = _clip_grpo_advantages(
-                        train_data["advantages"], master_config.grpo
-                    )
+                        train_data["advantages"] = adv_estimator.compute_advantage(
+                            prompt_ids=prompt_ids_for_adv,
+                            rewards=rewards,
+                            mask=mask,
+                            repeated_batch=repeated_batch,
+                            logprobs_policy=train_data["prev_logprobs"],
+                            logprobs_reference=train_data.get(
+                                "reference_policy_logprobs"
+                            ),
+                            # OPD kwargs (ignored by non-OPD estimators via **kwargs)
+                            teacher_logprobs=trajectory_teacher_logprobs.to(
+                                train_data["prev_logprobs"].device
+                            )
+                            if trajectory_teacher_logprobs is not None
+                            else None,
+                            prev_logprobs=train_data["prev_logprobs"],
+                            generation_logprobs=train_data["generation_logprobs"],
+                            sample_mask=train_data["sample_mask"],
+                        )
+                        if (
+                            hasattr(adv_estimator, "last_metrics")
+                            and adv_estimator.last_metrics
+                        ):
+                            rollout_metrics.update(adv_estimator.last_metrics)
+                        del prompt_ids_for_adv
+
+                        # Log advantages stats
+                        # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are
+                        # already normalized advantages (equivalent to "Normalized advantages stats"
+                        # in older versions). For ReinforcePlusPlusAdvantageEstimator, advantages
+                        # are globally normalized across valid tokens.
+                        advantages = train_data["advantages"]
+                        print(
+                            f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                        )
+
+                        penalty_metrics = (
+                            _apply_configured_message_level_advantage_penalties(
+                                train_data,
+                                repeated_batch["message_log"],
+                                master_config,
+                                log_config=True,
+                            )
+                        )
+
+                        # Clip advantages to prevent extreme values from small std normalization
+                        train_data["advantages"] = _clip_grpo_advantages(
+                            train_data["advantages"], master_config.grpo
+                        )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
@@ -4638,11 +5365,29 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        trace_plan = trace_scoring_preparation["plan"]
+                        if train_data.size != trace_plan["total_row_count"]:
+                            raise ValueError(
+                                "Async trace training data size changed after scoring"
+                            )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            gbs=trace_plan["total_row_count"],
+                            mbs=master_config.policy["train_micro_batch_size"],
+                            scheduler_step_increment=trace_plan[
+                                "logical_rollout_count"
+                            ],
+                            timer=timer,
+                        )
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
@@ -4739,10 +5484,13 @@ def async_grpo_train(
                             trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
-                # Save content for logging before deleting flat_messages
-                flat_messages_content = flat_messages.get("content", [])
-                del flat_messages
+                if context_compaction_training:
+                    flat_token_mask = train_data["token_mask"]
+                else:
+                    flat_token_mask = flat_messages["token_loss_mask"]
+                    # Save content for logging before deleting flat_messages
+                    flat_messages_content = flat_messages.get("content", [])
+                    del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -4779,6 +5527,7 @@ def async_grpo_train(
                     metrics["draft_grad_norm"] = train_results[
                         "draft_grad_norm"
                     ].numpy()
+                metrics.update(context_compaction_metrics)
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
@@ -4942,9 +5691,25 @@ def async_grpo_train(
             if not _should_log_nemo_gym_responses(master_config):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                    if context_compaction_training:
+                        assert trace_scoring_preparation is not None
+                        log_data["agent_ref"] = [
+                            repeated_batch["agent_ref"][parent_index]
+                            if parent_index >= 0
+                            else None
+                            for parent_index in trace_scoring_preparation["plan"][
+                                "parent_indices"
+                            ]
+                        ]
+                    else:
+                        log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages_content
-                log_data["rewards"] = rewards.tolist()
+                log_data["rewards"] = (
+                    trace_scoring_preparation["materialization"]["row_rewards"].tolist()
+                    if context_compaction_training
+                    and trace_scoring_preparation is not None
+                    else rewards.tolist()
+                )
                 if master_config.grpo.use_dynamic_sampling:
                     # In dynamic sampling, `rewards` corresponds to filtered rewards
                     log_data["filtered_rewards"] = rewards.tolist()
