@@ -113,10 +113,7 @@ def _env_builder(
     )
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
-    Path(NEMO_RL_VENV_DIR).mkdir(parents=True, exist_ok=True)
-    # Keep the marker outside the venv: force_rebuild deletes venv_path, and
-    # therefore an in-venv marker, before the shared rebuild is complete.
-    started_file = Path(NEMO_RL_VENV_DIR) / f".{venv_name}.STARTED_ENV_BUILDER"
+    started_file = venv_path / "STARTED_ENV_BUILDER"
 
     # Skip early return if force_rebuild is True
     if not force_rebuild and python_path.exists():
@@ -126,29 +123,22 @@ def _env_builder(
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)
 
-    try:
-        fd = os.open(started_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        owns_build = True
-    except FileExistsError:
-        owns_build = False
-
-    if not owns_build:
+    if started_file.exists():
         # Another node is already building, wait for completion
         logger.info(
             f"Node {node_idx}: Another node is building {venv_name}, skipping..."
         )
         # Wait for the venv to be ready (check for python executable)
         python_path = venv_path / "bin" / "python"
-        while started_file.exists():
+        while not python_path.exists():
             time.sleep(1)
-        if not python_path.exists():
-            raise RuntimeError(f"Venv build failed before {python_path} was created")
         return str(python_path)
 
     # Create the venv directory if needed
     venv_path.mkdir(parents=True, exist_ok=True)
 
+    # Touch the started file to signal we're building
+    started_file.touch()
     try:
         # Create the virtual environment on this node
         return create_local_venv(py_executable, venv_name, force_rebuild=force_rebuild)
