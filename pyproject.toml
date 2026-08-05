@@ -13,7 +13,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "nemo-rl"
 dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.13.13,<3.14"
+requires-python = ">=3.13.14,<3.14"
 license = { text = "Apache 2.0" }
 maintainers = [
   { name = "Yi-Fu Wu", email = "yifuw@nvidia.com" },
@@ -354,9 +354,10 @@ override-dependencies = [
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.23.0",
-  # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous.
+  # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
+  # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
-  "nvidia-nccl-cu13==2.30.4",
+  "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
