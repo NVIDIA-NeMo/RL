@@ -853,6 +853,25 @@ def setup(
             value_optimizer_path = _resolve_resume_optimizer_path(
                 _value_optim, value_weights_path, value_config
             )
+            # Warm-start seed (prep_warm_start.sh): the critic weights come from a
+            # stage-B run whose expert-parallel layout may differ from this run's.
+            # Megatron's distributed optimizer state is sharded by (expert-)DP group
+            # index, so it cannot reshard across a changed EP -- the load dies with
+            # "Missing key in checkpoint state_dict: chained_1.optimizer.distributed.
+            # dp_group_idx_N...". Model weights DO reshard, so take those and rebuild
+            # Adam + the LR schedule fresh (value_lr_warmup_iters re-warms it).
+            # Self-limiting: only the fabricated seed carries the provenance file, so
+            # ordinary step_N resumes keep restoring the optimizer normally.
+            if (
+                value_optimizer_path is not None
+                and (Path(last_checkpoint_path) / "warm_start_provenance.txt").exists()
+            ):
+                print(
+                    "  ⚠ Warm-start seed detected: loading critic weights only "
+                    "(fresh optimizer + LR schedule).",
+                    flush=True,
+                )
+                value_optimizer_path = None
             if value_weights_path is None:
                 print(
                     f"  ⚠ Value weights not found in checkpoint {last_checkpoint_path} "
