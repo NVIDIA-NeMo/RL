@@ -150,6 +150,28 @@ sbatch ray.sub \
     allocation or to override detection.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
+* - `DEDICATED_RAY_HEAD=0`
+  - Set to `1` to run the first allocated node as a GPU-free Ray head: it hosts
+    only the Ray control plane and the driver, advertises `--num-gpus=0`, and
+    carries neither `worker_units` nor the topology resources, so no GPU actor
+    or topology-constrained placement group can land on it. Use this when driver
+    or head-node memory pressure is destabilizing training.
+
+    **You must shrink the driver's node count yourself.** `ray.sub` cannot see
+    inside your `COMMAND`, so it only prints the effective GPU-node count. With
+    `--nodes=N` and `DEDICATED_RAY_HEAD=1`, `cluster.num_nodes` (plus
+    `env.nemo_gym.num_gpu_nodes` when set) must sum to `N - 1`. If you leave it
+    at `N`, cluster bringup still succeeds and the driver instead fails minutes
+    later with `Maximum number of retries reached (6). Cluster resources may be
+    insufficient...`.
+
+    **The head's GPUs are idled, not freed.** Under `#SBATCH --exclusive` the
+    head node is still allocated with `--gres`, so this costs one node's worth
+    of GPUs.
+
+    **Watch segment divisibility.** With topology-aware placement the allocation
+    becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
+    `NUM_NODES`" check in `tools/launch`.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `NODE_MANAGER_PORT=1301`

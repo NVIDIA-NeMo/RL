@@ -104,6 +104,18 @@ def create_weight_synchronizer(
                 "for non-colocated weight synchronization."
             )
 
+        if generation.cfg.get("refit_transport") == "nccl_reshard":
+            from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+                NcclReshardWeightSynchronizer,
+            )
+
+            return NcclReshardWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
+
         from nemo_rl.weight_sync.collective_weight_synchronizer import (
             CollectiveWeightSynchronizer,
         )

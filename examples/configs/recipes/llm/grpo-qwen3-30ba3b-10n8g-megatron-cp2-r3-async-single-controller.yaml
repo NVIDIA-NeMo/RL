@@ -1,0 +1,29 @@
+# SingleController async+TQ variant of the Qwen3-30B-A3B R3 recipe.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
+defaults: ./grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.yaml
+
+# SC does not support validation and checkpointing yet.
+grpo:
+  val_period: 0
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller
+
+# TransferQueue is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+async_rl:
+  sampler:
+    name: windowed
+    max_staleness_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: 64
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller
+  wandb:
+    name: grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller

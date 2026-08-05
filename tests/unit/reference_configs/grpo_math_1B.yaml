@@ -8,12 +8,17 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -32,6 +37,7 @@ grpo:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
@@ -39,6 +45,8 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  skip_reference_policy_logprobs_calculation: false
+  calculate_advantages_on_gpu: false
   seq_logprob_error_threshold: null
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null
@@ -50,7 +58,7 @@ grpo:
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -336,6 +344,9 @@ policy:
     # null = topology default (IPC colocated, NCCL non-colocated).
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    # Keep real-quant export tensors on CPU by default. Set false only for
+    # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
+    real_quant_export_cpu_offload: true
     refit_cfg:
       nixl:
         update_weights_bucket_memory_ratio: 0.05
