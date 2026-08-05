@@ -65,7 +65,7 @@ import time
 from typing import Any, Literal, Optional
 
 FaultMode = Literal["cordon", "actor-kill", "ray-kill"]
-TriggerOn = Literal["time", "during_generation"]
+TriggerOn = Literal["time", "during_generation", "during_refit"]
 
 
 class FaultInjector:
@@ -236,12 +236,16 @@ class FaultInjector:
           (a separate process), so the main process's VllmGeneration._generating
           event is never set and this trigger will block indefinitely. Use
           ``"time"`` instead when async_grpo.enabled is true.
+        - ``"during_refit"``: block until VllmGeneration._refitting is set
+          (update_weights_from_collective() is in progress), then sleep delay_s.
         """
         if self.trigger_on == "time":
             time.sleep(delay_s)
             return
 
-        event_name = "_generating"
+        event_name = (
+            "_generating" if self.trigger_on == "during_generation" else "_refitting"
+        )
         event = getattr(self._gen, event_name, None)
         if event is None:
             print(

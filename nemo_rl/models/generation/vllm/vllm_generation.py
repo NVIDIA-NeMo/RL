@@ -812,7 +812,10 @@ class VllmGeneration(GenerationInterface):
             COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S,
             REJOIN_DEBOUNCE_S,
         )
-        from nemo_rl.models.generation.ft_utils import decide_collective_sync
+        from nemo_rl.models.generation.ft_utils import (
+            _should_respawn_refit_worker,
+            decide_collective_sync,
+        )
 
         for attempt in range(1, COLLECTIVE_SYNC_MAX_ATTEMPTS + 1):
             # Wait until no lifecycle op is in flight.
@@ -828,7 +831,15 @@ class VllmGeneration(GenerationInterface):
             stable_for_s = self._router.joinable_stable_for_s()
             comm_epoch = self._router._comm_reset_epoch
 
-            effective_train_ws = policy.worker_group.cluster.world_size()
+            uses_refit_worker = bool(getattr(policy, "_use_refit_worker", False))
+            effective_train_ws = (
+                1
+                if uses_refit_worker
+                else policy.worker_group.cluster.world_size()
+            )
+            refit_worker_alive = (not uses_refit_worker) or (
+                getattr(policy, "_refit_worker", None) is not None
+            )
 
             action, target_ws = decide_collective_sync(
                 alive_gen_ws=alive_gen_ws,
@@ -836,6 +847,7 @@ class VllmGeneration(GenerationInterface):
                 stable_for_s=stable_for_s,
                 effective_train_ws=effective_train_ws,
                 last_synced_ws=self._last_synced_world_size,
+                refit_worker_alive=refit_worker_alive,
                 rejoin_debounce_s=REJOIN_DEBOUNCE_S,
                 comm_epoch=comm_epoch,
                 last_synced_epoch=self._last_synced_comm_epoch,
@@ -892,6 +904,9 @@ class VllmGeneration(GenerationInterface):
                         f"respawn={respawn})",
                         flush=True,
                     )
+                    # Always abort train side — it is blocked in the NCCL rendezvous.
+                    # For RefitWorker: also kill+respawn (poisoned context) or soft-reset
+                    # (clean timeout), matching the exception path below.
                     if hasattr(policy, "abort_collective"):
                         try:
                             ray.get(policy.abort_collective(), timeout=30)
@@ -899,6 +914,15 @@ class VllmGeneration(GenerationInterface):
                             print(
                                 f"  ! abort_collective raised "
                                 f"{type(abort_e).__name__}: {abort_e}",
+                                flush=True,
+                            )
+                    if uses_refit_worker and not respawn and hasattr(policy, "reset_collective"):
+                        try:
+                            policy.reset_collective()
+                        except Exception as reset_e:  # noqa: BLE001
+                            print(
+                                f"  ! policy.reset_collective raised "
+                                f"{type(reset_e).__name__}: {reset_e}",
                                 flush=True,
                             )
                     self._last_synced_world_size = None
@@ -918,11 +942,30 @@ class VllmGeneration(GenerationInterface):
                         )
                     return
             except Exception as e:  # noqa: BLE001 - catastrophic/unexpected error
+                respawn = _should_respawn_refit_worker(e)
                 print(
                     f"  ⚠ ensure_collective_synced attempt {attempt} unexpected error: "
-                    f"{type(e).__name__}: {e}",
+                    f"{type(e).__name__}: {e} (respawn={respawn})",
                     flush=True,
                 )
+                if uses_refit_worker and respawn and hasattr(policy, "abort_collective"):
+                    try:
+                        ray.get(policy.abort_collective(), timeout=30)
+                    except Exception as abort_e:  # noqa: BLE001
+                        print(
+                            f"  ! abort_collective raised "
+                            f"{type(abort_e).__name__}: {abort_e}",
+                            flush=True,
+                        )
+                elif not respawn and hasattr(policy, "reset_collective"):
+                    try:
+                        policy.reset_collective()
+                    except Exception as reset_e:  # noqa: BLE001
+                        print(
+                            f"  ! policy.reset_collective raised "
+                            f"{type(reset_e).__name__}: {reset_e}",
+                            flush=True,
+                        )
                 self._last_synced_world_size = None
 
                 if attempt >= COLLECTIVE_SYNC_MAX_ATTEMPTS:
