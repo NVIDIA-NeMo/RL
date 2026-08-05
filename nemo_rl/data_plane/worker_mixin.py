@@ -41,7 +41,7 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_LENGTHS,
     Layout,
 )
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
@@ -296,7 +296,7 @@ class TQWorkerMixin:
         dynbatch = cfg.get("dynamic_batching", {}) or {}
 
         if seqpack.get("enabled", False):
-            spa = {
+            spa: SequencePackingArgs = {
                 "algorithm": seqpack["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
@@ -305,10 +305,12 @@ class TQWorkerMixin:
                 ],
                 "max_tokens_per_microbatch": seqpack["train_mb_tokens"],
             }
+            microbatch_order = seqpack.get("microbatch_order")
+            if microbatch_order is not None:
+                spa["microbatch_order"] = microbatch_order
             packed, _ = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
-                # pyrefly: ignore  # bad-argument-type
                 sequence_packing_args=spa,
             )
             return packed[0]
