@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import json
+
 import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
+    DynamoTokenWrapperServer,
+    _inject_gym_token_metadata,
     _validate_engine_data,
     prepare_dynamo_chat_completion_request,
 )
@@ -115,6 +120,43 @@ class _Tokenizer:
         return token_ids if tokenize else rendered
 
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }
+]
+
+
+def _tool_conversation() -> list[dict]:
+    return [
+        {"role": "user", "content": "What is the weather in San Francisco?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"San Francisco"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "Sunny, 20C"},
+        {"role": "user", "content": "What about tomorrow?"},
+    ]
+
+
 def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
     tokenizer = _Tokenizer()
     body = {
@@ -128,6 +170,7 @@ def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
         body,
         tokenizer=tokenizer,
         tokenizer_chat_template_kwargs={"enable_thinking": True},
+        exclude_tools_when_tool_choice_none=True,
     )
 
     assert prepared["messages"] == [{"role": "user", "content": "hello"}]
@@ -164,9 +207,95 @@ def test_public_qwen3_tokenizer_first_turn_matches_chat_template(
         {"model": "Qwen/Qwen3-0.6B", "messages": messages},
         tokenizer=tokenizer,
         tokenizer_chat_template_kwargs=template_kwargs,
+        exclude_tools_when_tool_choice_none=True,
     )
 
     assert prepared["nvext"]["token_data"] == expected
+
+
+def test_public_qwen3_tool_conversation_matches_plain_chat_template(
+    tiny_qwen3_model_path,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_qwen3_model_path)
+    messages = _tool_conversation()
+    template_kwargs = {"enable_thinking": False}
+    expected = tokenizer.apply_chat_template(
+        messages,
+        tools=TOOLS,
+        tokenize=True,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        return_tensors=None,
+        return_dict=False,
+        **template_kwargs,
+    )
+
+    prepared = prepare_dynamo_chat_completion_request(
+        {"model": "Qwen/Qwen3-0.6B", "messages": messages, "tools": TOOLS},
+        tokenizer=tokenizer,
+        tokenizer_chat_template_kwargs=template_kwargs,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert prepared["nvext"]["token_data"] == expected
+
+
+def test_public_qwen3_multiturn_prefix_splice_parity(
+    tiny_qwen3_model_path,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_qwen3_model_path)
+    messages = _tool_conversation()
+    template_kwargs = {"enable_thinking": False}
+    expected = tokenizer.apply_chat_template(
+        messages,
+        tools=TOOLS,
+        tokenize=True,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        return_tensors=None,
+        return_dict=False,
+        **template_kwargs,
+    )
+    assistant_prefix = tokenizer.apply_chat_template(
+        messages[:2],
+        tools=TOOLS,
+        tokenize=True,
+        add_generation_prompt=False,
+        continue_final_message=False,
+        return_tensors=None,
+        return_dict=False,
+        **template_kwargs,
+    )
+    first_prompt = tokenizer.apply_chat_template(
+        messages[:1],
+        tools=TOOLS,
+        tokenize=True,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        return_tensors=None,
+        return_dict=False,
+        **template_kwargs,
+    )
+    generation_token_ids = assistant_prefix[len(first_prompt) : -1]
+    messages[1]["prompt_token_ids"] = first_prompt
+    messages[1]["generation_token_ids"] = generation_token_ids
+    messages[1]["generation_log_probs"] = [-0.1] * len(generation_token_ids)
+
+    assistant_eos_index = [
+        index
+        for index, token_id in enumerate(expected)
+        if token_id == tokenizer.eos_token_id
+    ][2]
+    expected_splice = assistant_prefix[:-2] + expected[assistant_eos_index:]
+
+    prepared = prepare_dynamo_chat_completion_request(
+        {"model": "Qwen/Qwen3-0.6B", "messages": messages, "tools": TOOLS},
+        tokenizer=tokenizer,
+        tokenizer_chat_template_kwargs=template_kwargs,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert prepared["nvext"]["token_data"] == expected_splice
 
 
 def test_prepare_dynamo_chat_completion_request_preserves_logprob_fields() -> None:
@@ -178,7 +307,11 @@ def test_prepare_dynamo_chat_completion_request_preserves_logprob_fields() -> No
         "return_tokens_as_token_ids": True,
     }
 
-    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=tokenizer)
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
 
     assert prepared["logprobs"] is True
     assert prepared["return_tokens_as_token_ids"] is True
@@ -206,7 +339,11 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
         ],
     }
 
-    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=tokenizer)
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
 
     assert prepared["nvext"]["token_data"] == [10, 31, 32, 2, 40, 99]
     assert "required_prefix_token_ids" not in prepared
@@ -225,13 +362,45 @@ def test_prepare_dynamo_chat_completion_request_validates_extra_fields() -> None
         "nvext": {"extra_fields": ["engine_data", "timing", "engine_data"]},
     }
 
-    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=_Tokenizer())
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=_Tokenizer(),
+        exclude_tools_when_tool_choice_none=True,
+    )
 
     assert prepared["nvext"]["extra_fields"] == ["engine_data", "timing"]
 
     body["nvext"]["extra_fields"] = "timing"
     with pytest.raises(ValueError, match="extra_fields must be a JSON list"):
-        prepare_dynamo_chat_completion_request(body, tokenizer=_Tokenizer())
+        prepare_dynamo_chat_completion_request(
+            body,
+            tokenizer=_Tokenizer(),
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+
+def test_tool_choice_none_honors_worker_exclusion_setting() -> None:
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": TOOLS,
+        "tool_choice": "none",
+    }
+    excluded_tokenizer = _Tokenizer()
+    included_tokenizer = _Tokenizer()
+
+    prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=excluded_tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
+    prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=included_tokenizer,
+        exclude_tools_when_tool_choice_none=False,
+    )
+
+    assert excluded_tokenizer.calls[0]["tools"] is None
+    assert included_tokenizer.calls[0]["tools"] == TOOLS
 
 
 def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments() -> (
@@ -274,7 +443,11 @@ def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments(
         ],
     }
 
-    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=tokenizer)
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
 
     assert prepared["nvext"]["token_data"] == [10, 777, 2, 40, 31, 32, 2, 40, 99]
     assert prepared["messages"][1]["tool_calls"][0]["function"]["arguments"] == (
@@ -290,6 +463,7 @@ def test_prepare_dynamo_chat_completion_request_rejects_stream() -> None:
         prepare_dynamo_chat_completion_request(
             {"messages": [{"role": "user", "content": "hello"}], "stream": True},
             tokenizer=_Tokenizer(),
+            exclude_tools_when_tool_choice_none=True,
         )
 
 
@@ -298,6 +472,7 @@ def test_prepare_dynamo_chat_completion_request_rejects_multiple_choices() -> No
         prepare_dynamo_chat_completion_request(
             {"messages": [{"role": "user", "content": "hello"}], "n": 2},
             tokenizer=_Tokenizer(),
+            exclude_tools_when_tool_choice_none=True,
         )
 
 
@@ -319,3 +494,75 @@ def test_validate_engine_data_requires_prompt_and_completion_tokens() -> None:
         _validate_engine_data({"nvext": {"engine_data": {"completion_token_ids": []}}})
     with pytest.raises(ValueError, match="completion_token_ids"):
         _validate_engine_data({"nvext": {"engine_data": {"prompt_token_ids": []}}})
+
+
+def test_inject_gym_token_metadata_validates_and_populates_message() -> None:
+    response = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "answer"},
+                "logprobs": {"token_logprobs": [-0.25, -0.5]},
+            }
+        ],
+        "nvext": {
+            "engine_data": {
+                "prompt_token_ids": [1, 2, 3],
+                "completion_token_ids": [4, 5],
+            }
+        },
+    }
+
+    _inject_gym_token_metadata(response)
+
+    assert response["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "answer",
+        "prompt_token_ids": [1, 2, 3],
+        "generation_token_ids": [4, 5],
+        "generation_log_probs": [-0.25, -0.5],
+    }
+
+    response["choices"][0]["logprobs"]["token_logprobs"] = [-0.25]
+    with pytest.raises(ValueError, match="1 generation log probabilities for 2"):
+        _inject_gym_token_metadata(response)
+
+
+def test_forward_chat_completion_reuses_loop_bound_session() -> None:
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def text(self):
+            return json.dumps({"choices": []})
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, *, json, headers):
+            self.calls.append((url, json, headers))
+            return FakeResponse()
+
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+    )
+    session = FakeSession()
+    server._client_session = session
+
+    async def forward_twice():
+        await server._forward_chat_completion({}, authorization=None)
+        await server._forward_chat_completion({}, authorization="Bearer token")
+
+    asyncio.run(forward_twice())
+
+    assert len(session.calls) == 2
+    assert session.calls[1][2]["Authorization"] == "Bearer token"

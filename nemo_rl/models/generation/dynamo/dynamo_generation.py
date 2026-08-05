@@ -201,7 +201,7 @@ class DynamoGeneration(GenerationInterface):
             self._refit_channel = DynamoRefitChannel(
                 workers,
                 engine_world_size=validated_config.engine_world_size,
-                request_timeout_s=dynamo_cfg.request_timeout_s,
+                control_timeout_s=dynamo_cfg.control_timeout_s,
                 validate_workers=self._managed_runtime.validate_workers,
             )
 
@@ -210,6 +210,9 @@ class DynamoGeneration(GenerationInterface):
                     dynamo_frontend_base_url=url,
                     tokenizer=tokenizer,
                     tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                    exclude_tools_when_tool_choice_none=(
+                        dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
+                    ),
                     request_timeout_s=dynamo_cfg.request_timeout_s,
                 )
                 wrapper_url = self._token_wrapper_server.start()
@@ -360,6 +363,11 @@ class DynamoGeneration(GenerationInterface):
                 else:
                     stop_set.update(sample_stop_strings)
 
+        if len(stop_set) > 4:
+            raise ValueError(
+                "Dynamo supports at most 4 stop strings after merging configured "
+                "and per-sample values"
+            )
         return list(stop_set) if stop_set else None
 
     def _prompt_token_ids(
@@ -396,7 +404,6 @@ class DynamoGeneration(GenerationInterface):
             "top_k": top_k_val,
             "n": 1,
             "logprobs": 0,
-            "return_tokens_as_token_ids": True,
             "include_stop_str_in_output": True,
             "nvext": {"extra_fields": ["completion_token_ids"]},
         }
@@ -410,18 +417,17 @@ class DynamoGeneration(GenerationInterface):
 
     def _allowed_new_tokens(self, input_length: int) -> int:
         """Return the generation budget for a prompt."""
-        if "vllm_cfg" not in self.cfg or "max_model_len" not in self.cfg["vllm_cfg"]:
-            return self.cfg["max_new_tokens"]
-
         remaining_ctx = int(self.cfg["vllm_cfg"]["max_model_len"]) - input_length
-        return max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+        if remaining_ctx <= 0:
+            raise ValueError(
+                f"Dynamo prompt length {input_length} must be less than "
+                f"vllm_cfg.max_model_len={self.cfg['vllm_cfg']['max_model_len']}"
+            )
+        return min(self.cfg["max_new_tokens"], remaining_ctx)
 
     def _assert_response_within_context(
         self, *, input_length: int, generated_length: int
     ) -> None:
-        if "vllm_cfg" not in self.cfg or "max_model_len" not in self.cfg["vllm_cfg"]:
-            return
-
         response_length = input_length + generated_length
         max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
         if response_length > max_model_len:
@@ -572,19 +578,6 @@ class DynamoGeneration(GenerationInterface):
 
         allowed_new_tokens = self._allowed_new_tokens(input_length)
         input_ids = input_ids_batch[sample_idx]
-        if allowed_new_tokens == 0:
-            yield (
-                sample_idx,
-                self._single_sample_output(
-                    input_ids=input_ids,
-                    input_length=input_length,
-                    generated_token_ids=[],
-                    generated_logprobs=[],
-                    truncated=False,
-                ),
-            )
-            return
-
         generated_token_ids, generated_logprobs, truncated = await asyncio.to_thread(
             self._post_completion_request,
             prompt_token_ids=self._prompt_token_ids(data, sample_idx),

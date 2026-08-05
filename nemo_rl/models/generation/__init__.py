@@ -43,7 +43,11 @@ def configure_generation_config(
     if config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
-    # vllm setting
+    # vLLM setting shared by the standard and managed Dynamo backends.
+    if config["backend"] in ("vllm", "dynamo"):
+        vllm_backed_config = cast(VllmConfig, config)
+        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
         if config.get("real_quant"):
@@ -64,11 +68,8 @@ def configure_generation_config(
                 )
 
         # set load_format
-        config["vllm_cfg"]["load_format"] = (
-            "auto"
-            if is_eval or config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
-            else "dummy"
-        )
+        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+            config["vllm_cfg"]["load_format"] = "auto"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:
             # Speculative decoding needs real draft weights at startup, since the

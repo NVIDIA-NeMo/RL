@@ -35,13 +35,16 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry() -> None:
     assert config["cluster"]["segment_size"] == 1
     assert config["grpo"]["max_num_steps"] == 4
     assert config["grpo"]["async_grpo"]["enabled"] is True
+    assert config["grpo"]["async_grpo"]["in_flight_weight_updates"] is False
     assert generation["colocated"]["resources"] == {
         "gpus_per_node": 4,
         "num_nodes": 2,
     }
     assert validated.engine_world_size == 4
     assert validated.dynamo_cfg.frontend_args.router_mode == "kv"
+    assert validated.dynamo_cfg.control_timeout_s == 600
     assert validated.vllm_cfg.enable_vllm_metrics_logger is True
+    assert validated.vllm_cfg.load_format == "dummy"
     assert config["env"]["nemo_gym"]["effort_levels"]["low_ub"] == 15000
     assert config["reward_penalties"]["penalize_unwanted_tokens"] is False
     assert config["logger"]["wandb_enabled"] is True

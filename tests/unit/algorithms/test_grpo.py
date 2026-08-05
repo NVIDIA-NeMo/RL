@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _should_use_async_rollouts,
+    _should_use_nemo_gym,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -1307,6 +1308,39 @@ def test_should_use_async_rollouts_selects_backend_specific_config(
     assert _should_use_async_rollouts(master_config) is expected
 
 
+def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {
+        "generation": {
+            "backend": "dynamo",
+            "vllm_cfg": {"expose_http_server": False},
+        }
+    }
+
+    with pytest.raises(AssertionError, match="expose_http_server: true"):
+        _should_use_nemo_gym(master_config)
+
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    assert _should_use_nemo_gym(master_config) is True
+
+
+def test_should_use_nemo_gym_preserves_megatron_sync_engine_exemption() -> None:
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {
+                "async_engine": False,
+                "expose_http_server": True,
+            },
+        }
+    }
+
+    assert _should_use_nemo_gym(master_config) is True
+
+
 @contextmanager
 def _patched_logprob_phase(policy):
     """Provide real tensors for the logprob phase of ``grpo_train``.
@@ -2025,12 +2059,14 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     from nemo_rl.algorithms.grpo import setup
 
     master_config = mock_grpo_components["master_config"]
+    master_config.policy["hf_config_overrides"] = {"rope_theta": 1_000_000.0}
     master_config.policy["generation"] = {
         "backend": "dynamo",
         "dynamo_cfg": {
             "engine": "vllm",
             "startup_timeout_s": 60,
             "request_timeout_s": 60,
+            "control_timeout_s": 30,
             "metrics_include_prefixes": None,
             "metrics_exclude_prefixes": None,
             "worker_args": {
@@ -2076,6 +2112,21 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
         },
     }
 
+    master_config.grpo.async_grpo.in_flight_weight_updates = True
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(ValueError, match="in_flight_weight_updates must be false"),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
+
+    master_config.grpo.async_grpo.in_flight_weight_updates = False
+
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
         pytest.raises(
@@ -2091,6 +2142,10 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
         )
 
     mock_logger.assert_not_called()
+    assert (
+        master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"]
+        == (master_config.policy["hf_config_overrides"])
+    )
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
