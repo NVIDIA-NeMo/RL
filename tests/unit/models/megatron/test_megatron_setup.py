@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -910,6 +910,19 @@ class TestApplyPrecisionConfig:
 class TestApplyPerformanceConfig:
     """Tests for _apply_performance_config function."""
 
+    @staticmethod
+    def _config(*, attention_backend=None):
+        megatron_cfg = {
+            "activation_checkpointing": False,
+            "apply_rope_fusion": False,
+            "bias_activation_fusion": False,
+            "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
+        }
+        if attention_backend is not None:
+            megatron_cfg["attention_backend"] = attention_backend
+        return {"megatron_cfg": megatron_cfg}
+
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
@@ -953,6 +966,94 @@ class TestApplyPerformanceConfig:
         assert model_cfg.recompute_granularity == "full"
         assert model_cfg.recompute_method == "uniform"
         assert model_cfg.recompute_num_layers == 1
+
+    def test_expanded_omni_defaults_to_auto_attention(self, monkeypatch):
+        """Expanded Omni uses backend dispatch without relying on a recipe."""
+        from megatron.core.transformer.enums import AttnBackend
+
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        for variable in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+            monkeypatch.setenv(variable, "1")
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            attention_backend=AttnBackend.flash,
+            nemotron_omni_contract="expanded_sequence_v1",
+        )
+        _apply_performance_config(model_cfg, self._config())
+
+        assert model_cfg.attention_backend is AttnBackend.auto
+        for variable in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+            assert variable not in os.environ
+
+    @pytest.mark.parametrize("attention_backend", ["auto", "unfused"])
+    def test_expanded_omni_preserves_supported_explicit_attention_backend(
+        self, attention_backend
+    ):
+        """Expanded Omni preserves an explicitly selected compatible backend."""
+        from megatron.core.transformer.enums import AttnBackend
+
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            attention_backend=AttnBackend.flash,
+            nemotron_omni_contract="expanded_sequence_v1",
+        )
+        _apply_performance_config(
+            model_cfg, self._config(attention_backend=attention_backend)
+        )
+
+        assert model_cfg.attention_backend is AttnBackend[attention_backend]
+
+    def test_expanded_omni_rejects_flash_attention(self):
+        """Flash cannot represent expanded Omni's padded multi-row THD batches."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            nemotron_omni_contract="expanded_sequence_v1",
+        )
+        with pytest.raises(
+            ValueError,
+            match="does not support attention_backend='flash'",
+        ):
+            _apply_performance_config(
+                model_cfg, self._config(attention_backend="flash")
+            )
+
+    @pytest.mark.parametrize(
+        "model_contract",
+        [None, "llava_collapse_expand_v1"],
+        ids=["non-omni", "legacy-llava"],
+    )
+    def test_non_expanded_model_preserves_provider_attention_backend(
+        self, model_contract
+    ):
+        """Models outside the expanded Omni contract retain provider defaults."""
+        from megatron.core.transformer.enums import AttnBackend
+
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            attention_backend=AttnBackend.flash,
+            nemotron_omni_contract=model_contract,
+        )
+        _apply_performance_config(model_cfg, self._config())
+
+        assert model_cfg.attention_backend is AttnBackend.flash
+
+    def test_invalid_attention_backend_raises(self):
+        """Invalid explicit backends retain the generic validation behavior."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        with pytest.raises(ValueError, match="Invalid attention backend"):
+            _apply_performance_config(
+                model_cfg, self._config(attention_backend="invalid")
+            )
 
     def test_activation_func_required_when_not_gated(self):
         """Test that activation_func is required when not using gated_linear_unit."""

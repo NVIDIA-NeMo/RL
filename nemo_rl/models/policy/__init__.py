@@ -215,6 +215,9 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    # Preserve the packer's order (or omit for backward compatibility), or
+    # execute each DP rank's assigned bins largest-first for allocator reuse.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
 
 
 class RewardModelConfig(TypedDict):

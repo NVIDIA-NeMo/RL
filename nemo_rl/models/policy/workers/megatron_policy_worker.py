@@ -139,16 +139,65 @@ def _model_self_packs_for_cp(model: Any) -> bool:
 
     Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
     forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
-    pre-packing + CP-sharding itself. The only such model today is mbridge's
-    Qwen3VL, which is also the only mbridge VLM that supports context
-    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    pre-packing + CP-sharding itself. New wrappers advertise the capability
+    through ``model_owns_packing``. The Qwen3VL type check remains as a
+    compatibility fallback until that upstream model exposes the capability.
     """
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+    return any(
+        bool(getattr(chunk, "model_owns_packing", False))
+        or isinstance(chunk, Qwen3VLModel)
+        for chunk in chunks
+    )
+
+
+def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
+    """Whether a self-packing model also aligns and CP-shards MTP masks."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
+        for chunk in chunks
+    )
+
+
+def _model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in chunks
+    )
+
+
+def _estimate_refit_tensor_size_in_bytes(
+    param: torch.Tensor,
+    *,
+    export_dtype: torch.dtype,
+    tp_size: int,
+    ep_size: int,
+) -> int:
+    """Estimate the gathered tensor size produced by Bridge export.
+
+    Floating-point model weights are exported at the policy dtype. Integral
+    state (for example BatchNorm ``num_batches_tracked`` buffers) keeps its
+    original dtype and must not be looked up in a floating-point-only table.
+    """
+    element_size = (
+        torch.empty((), dtype=export_dtype).element_size()
+        if param.is_floating_point()
+        else param.element_size()
+    )
+    return param.numel() * tp_size * ep_size * element_size
 
 
 @contextmanager
@@ -501,6 +550,41 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+        self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
+            self.model
+        )
+        assert (
+            not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
+        ), "A model cannot own MTP-mask packing without owning sequence packing"
+        self.model_slices_context_parallel_inputs = (
+            _model_slices_context_parallel_inputs(self.model)
+        )
+        if self.model_slices_context_parallel_inputs:
+            if self.delegate_pack_to_model:
+                raise RuntimeError(
+                    "A model cannot both own sequence packing and consume caller-packed "
+                    "full THD inputs."
+                )
+            model_config = self._get_model_config()
+            mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+            if mtp_num_layers is not None and mtp_num_layers > 0:
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
+                    "Disable MTP for the Nano image/text path."
+                )
+            if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not support "
+                    "use_fused_linear_logprobs=true."
+                )
+            virtual_pipeline_size = self.cfg["megatron_cfg"].get(
+                "virtual_pipeline_model_parallel_size"
+            )
+            if virtual_pipeline_size not in (None, 1):
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not yet support "
+                    "virtual pipeline parallelism."
+                )
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -703,6 +787,8 @@ class MegatronPolicyWorkerImpl(
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                     delegate_pack_to_model=self.delegate_pack_to_model,
+                    delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1535,6 +1621,8 @@ class MegatronPolicyWorkerImpl(
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -1752,6 +1840,8 @@ class MegatronPolicyWorkerImpl(
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -1974,18 +2064,11 @@ class MegatronPolicyWorkerImpl(
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
             else:
-                # Calculate size for this parameter
-                prec_to_bytes = {
-                    torch.bfloat16: 2,
-                    torch.float16: 2,
-                    torch.float32: 4,
-                    torch.float8_e4m3fn: 1,
-                    torch.float8_e5m2: 1,
-                    torch.uint8: 1,
-                }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
-                size_in_bytes = (
-                    param.element_size() * param.numel() * tp_size * ep_size * scale
+                size_in_bytes = _estimate_refit_tensor_size_in_bytes(
+                    param,
+                    export_dtype=self.dtype,
+                    tp_size=tp_size,
+                    ep_size=ep_size,
                 )
 
             # Broadcast size_in_bytes across pipeline parallel ranks

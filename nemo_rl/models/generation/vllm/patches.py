@@ -491,6 +491,81 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         )
 
 
+def _patch_vllm_radio_layerscale_loader(logger) -> None:
+    """Load explicit RADIO LayerScale weights and initialize folded weights.
+
+    vLLM 0.25.1 uses ``ls1`` and ``ls2`` in ``RadioVisionEncoderLayer`` but
+    skips them in ``RadioModel.load_weights``. Explicit checkpoint values are
+    therefore ignored, while folded checkpoints leave the parameters at dummy
+    initialization. Patch the loader so explicit values are loaded and absent
+    values are initialized to RADIO's configured identity factor.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/radio.py")
+    except RuntimeError:
+        logger.warning("Could not locate radio.py for the LayerScale loader patch.")
+        return
+
+    old_snippet = """            elif sub.startswith("model.blocks."):
+                # Encoder blocks: HF 'model.blocks.{i}.' ->
+                # vLLM 'model.encoder.layers.{i}.'
+                parts = sub.split(".")
+                if len(parts) >= 4:
+                    layer_idx = parts[2]
+                    suffix = ".".join(parts[3:])
+                    # Skip layer-scale entries that vLLM doesn't use
+                    if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
+                        continue
+                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+
+            if vllm_key and vllm_key in params_dict:
+                param = params_dict[vllm_key]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)
+                loaded_params.add(vllm_key)
+
+        return loaded_params
+"""
+    new_snippet = """            elif sub.startswith("model.blocks."):
+                # Encoder blocks: HF 'model.blocks.{i}.' ->
+                # vLLM 'model.encoder.layers.{i}.'
+                parts = sub.split(".")
+                if len(parts) >= 4:
+                    layer_idx = parts[2]
+                    suffix = ".".join(parts[3:])
+                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+
+            if vllm_key and vllm_key in params_dict:
+                param = params_dict[vllm_key]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)
+                loaded_params.add(vllm_key)
+
+        initializer_factor = self.config.initializer_factor
+        for name, param in params_dict.items():
+            if name.endswith((".ls1", ".ls2")) and name not in loaded_params:
+                param.data.fill_(initializer_factor)
+                loaded_params.add(name)
+
+        return loaded_params
+"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            logger.info("vLLM RADIO LayerScale loader patch already applied.")
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply vLLM RADIO LayerScale loader patch: expected "
+                "vLLM 0.25.1 source shape was not found in %s.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Successfully patched vLLM RADIO LayerScale loading.")
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -502,7 +577,9 @@ def ensure_vllm_source_compat() -> None:
     """
     from vllm.logger import init_logger
 
-    _patch_vllm_tool_parser_namespace_tool(init_logger("vllm_patch"))
+    patch_logger = init_logger("vllm_patch")
+    _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_radio_layerscale_loader(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -556,3 +633,4 @@ def _apply_vllm_patches(
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
+    _patch_vllm_radio_layerscale_loader(patch_logger)
