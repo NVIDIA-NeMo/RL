@@ -259,6 +259,71 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     assert torch.equal(layer.w2_weight_scale, shuffled[3])
 
 
+def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+        refit_batched_moe_shuffle=True,
+    )
+
+    w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
+    w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    w13_scale = torch.nn.Parameter(torch.zeros(2, 4, 1), requires_grad=False)
+    w2_scale = torch.nn.Parameter(torch.zeros(2, 3, 1), requires_grad=False)
+    layer = types.SimpleNamespace(
+        w13_weight=w13_weight,
+        w2_weight=w2_weight,
+        w13_weight_scale=w13_scale,
+        w2_weight_scale=w2_scale,
+        w13_weight_scale_from_checkpoint=types.SimpleNamespace(
+            data=torch.ones_like(w13_scale)
+        ),
+        w2_weight_scale_from_checkpoint=types.SimpleNamespace(
+            data=torch.ones_like(w2_scale)
+        ),
+        _expert_routing_tables=lambda: (None, None, None),
+    )
+    moe_config = types.SimpleNamespace(is_act_and_mul=False)
+    quant_config = object()
+    experts_cls = object()
+    quant_method = types.SimpleNamespace(
+        moe=moe_config,
+        moe_kernel=None,
+        mxfp8_backend="flashinfer_trtllm",
+        experts_cls=experts_cls,
+        get_fused_moe_quant_config=lambda _layer: quant_config,
+    )
+    shuffled = (w13_weight, w2_weight, w13_scale, w2_scale)
+    kernel = object()
+    kernel_calls = []
+
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", lambda *_args: shuffled)
+
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    def make_kernel(**kwargs):
+        kernel_calls.append(kwargs)
+        return kernel
+
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+
+    fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+    fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    assert quant_method.moe_kernel is kernel
+    assert len(kernel_calls) == 1
+    assert kernel_calls[0] == {
+        "moe_quant_config": quant_config,
+        "moe_config": moe_config,
+        "fp8_backend": "flashinfer_trtllm",
+        "experts_cls": experts_cls,
+        "routing_tables": (None, None, None),
+        "layer": layer,
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "error"),
     [
