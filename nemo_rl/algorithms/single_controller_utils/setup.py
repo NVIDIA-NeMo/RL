@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -492,7 +492,7 @@ def setup_single_controller(
         return generation, trainer, time_metrics
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
-    build_tasks = {}
+    build_tasks: dict[str, Callable[[], Any]] = {}
     generation = None
     defer_generation_model_load = False
     if use_nemo_gym:

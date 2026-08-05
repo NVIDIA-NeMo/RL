@@ -18,7 +18,7 @@ import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
@@ -850,7 +850,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
 
 def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
-    base_urls: list[Optional[str]],
+    base_urls: list[str],
     model_name: str,
     *,
     enable_router_replay: bool,
