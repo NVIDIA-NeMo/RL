@@ -332,9 +332,10 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self.collection_failed = True
         finally:
-            self.running = False
             if dataloader_exhausted:
                 self.data_exhausted = True
+            self.running = False
+            if dataloader_exhausted:
                 print(
                     "❌ Trajectory collection stopped: dataloader exhausted "
                     "(max_num_epochs reached). No more data available for generation. "
@@ -429,6 +430,17 @@ class AsyncTrajectoryCollector:
             if use_nemo_gym:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
             repeated_batch = rollout_batch.repeat_interleave(num_generations)
+            # Compaction identity belongs to each logical generation replica,
+            # not only to the source prompt. Stamp it even when CC training is
+            # disabled so contract-v2 rollout IDs remain unique and stable.
+            from nemo_rl.algorithms.grpo import (
+                _assign_context_compaction_generation_replica_indices,
+            )
+
+            _assign_context_compaction_generation_replica_indices(
+                repeated_batch,
+                num_generations_per_prompt=num_generations,
+            )
 
             def _run_rollout_batch() -> None:
                 asyncio.run(
@@ -738,6 +750,7 @@ class AsyncTrajectoryCollector:
     async def _iter_rollout_groups(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
@@ -776,6 +789,13 @@ class AsyncTrajectoryCollector:
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env
+                ),
+                generation_policy_version=(
+                    f"async-policy-weight-{generation_weight_version:08d}"
+                    if self.master_config.grpo.get(
+                        "context_compaction_training", {}
+                    ).get("enabled", False)
+                    else None
                 ),
             ):
                 task_index = rollout_result.task_index
@@ -919,6 +939,8 @@ class AsyncTrajectoryCollector:
             "batch": final_batch_cpu,
             "rollout_metrics": rollout_metrics,
             "timestamp": time.time(),
+            "generation_weight_version": generation_weight_version,
+            "target_weight_version": target_weight_version,
         }
         if rollout_result.task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = rollout_result.task_index
@@ -926,7 +948,7 @@ class AsyncTrajectoryCollector:
         backoff_delay = 0.01
         backoff_started_at: float | None = None
         try:
-            while self.running:
+            while self.running or self.data_exhausted:
                 status = await self.replay_buffer.add.remote(
                     trajectory_group,
                     generation_weight_version,
@@ -996,6 +1018,7 @@ class AsyncTrajectoryCollector:
             try:
                 async for rollout_result in self._iter_rollout_groups(
                     repeated_batch=repeated_batch,
+                    generation_weight_version=generation_weight_version,
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,

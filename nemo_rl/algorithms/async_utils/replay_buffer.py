@@ -194,7 +194,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         loses its last chance to be used for its intended training step.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with 'trajectories', 'avg_trajectory_age',
+            'buffer_size_before_sample', and 'evicted_stale_count' keys,
+            or None if insufficient data.
         """
         with self._lock:
             if not self.trajectories:
@@ -221,9 +223,10 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 for i, v in enumerate(self.trajectory_versions)
                 if v < min_valid_version
             ]
+            evicted_stale_count = len(old_indices)
             if old_indices:
                 print(
-                    f"   Evicting {len(old_indices)} stale trajectories "
+                    f"   Evicting {evicted_stale_count} stale trajectories "
                     f"(version < {min_valid_version})"
                 )
                 self._remove_indices(old_indices)
@@ -313,6 +316,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                "buffer_size_before_sample": total_trajectories,
+                "evicted_stale_count": evicted_stale_count,
             }
 
     def size(self) -> int:
