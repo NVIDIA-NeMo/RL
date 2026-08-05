@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Public launcher for Nemotron 3.5 Nano post-training on a SLURM cluster.
 #
-# The SWE and RLVR workload semantics live in sibling YAML files. This launcher
+# The SWE, RLVR, and MOPD workload semantics live in sibling YAML files. This launcher
 # handles Slurm submission, code snapshotting, persistent caches, container
 # mounts, and deployment-specific overrides.
 #
@@ -39,6 +39,17 @@ set -euo pipefail
 #   SAFETY_JUDGE_MODEL=/path/to/safety-checkpoint \
 #   bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh rlvr
 #
+#   EXP_NAME=nano35-mopd \
+#   MODEL_PATH=/path/to/nano35-checkpoint \
+#   TRAIN_PATH=/path/to/mopd-train.jsonl \
+#   VAL_PATH=/path/to/mopd-val.jsonl \
+#   CONTAINER=/path/to/nemo-rl-container.sqsh \
+#   SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
+#   PERSISTENT_CACHE=/path/to/persistent/cache \
+#   SLURM_PARTITION=batch \
+#   SLURM_ACCOUNT=your_account \
+#   bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh mopd
+#
 # Optional knobs:
 #   WALLTIME=4:00:00                       Slurm --time
 #   SLURM_QOS=                             Slurm --qos; defaults to short when
@@ -50,6 +61,10 @@ set -euo pipefail
 #   NUM_TRAIN_NODES=                        Training (Megatron) nodes
 #   NUM_GEN_NODES=                          Policy-generation nodes
 #   NUM_GYM_NODES=                          In-cluster NeMo Gym judge nodes
+#   NUM_NODES_PER_TEACHER=4                 MOPD teacher nodes
+#   TEACHER_TP=4, TEACHER_CP=4              MOPD teacher parallelism
+#   TEACHER_EP=16, TEACHER_PP=1
+#   NRL_TEACHER_PATH=$MODEL_PATH             MOPD teacher checkpoint
 #   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray
 #   EXTERNAL_VLLM_SEGMENT_SIZE=             Segment size for the external
 #                                          service hetgroup; legacy
@@ -93,7 +108,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: bash ${BASH_SOURCE[0]} <swe|rlvr> [Hydra overrides ...]" >&2
+  echo "Usage: bash ${BASH_SOURCE[0]} <swe|rlvr|mopd> [Hydra overrides ...]" >&2
   exit 2
 fi
 
@@ -244,8 +259,25 @@ case "${RECIPE}" in
       NUM_GENRM_NODES \
       NUM_NL2BASH_NODES
     ;;
+  mopd)
+    CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/mopd.yaml}"
+    NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-16}"
+    NUM_GEN_NODES="${NUM_GEN_NODES:-60}"
+    NUM_GYM_NODES="${NUM_GYM_NODES:-0}"
+    NUM_EXTERNAL_SERVICE_NODES=0
+    SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
+    GENRM_BASE_URL=""
+    GENRM_MODEL=""
+    GENRM_API_MODEL_NAME=""
+    NL2BASH_BASE_URL=""
+    NL2BASH_JUDGE_MODEL=""
+    NL2BASH_API_MODEL_NAME=""
+    SAFETY_JUDGE_MODEL=""
+    RAY_SUB="${PROJECT_ROOT}/ray.sub"
+    BATCH_SCRIPT="${RAY_SUB}"
+    ;;
   *)
-    echo "ERROR: unknown recipe '${RECIPE}'; expected swe or rlvr." >&2
+    echo "ERROR: unknown recipe '${RECIPE}'; expected swe, rlvr, or mopd." >&2
     exit 2
     ;;
 esac
@@ -474,7 +506,26 @@ fi
 # =============================================================================
 NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-${EXTERNAL_VLLM_NUM_NODES:-0}}"
 
-NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
+NUM_TEACHER_NODES=0
+MOPD_OVERRIDES=""
+if [[ "${RECIPE}" == "mopd" ]]; then
+  NRL_TEACHER_PATH="${NRL_TEACHER_PATH:-${MODEL_PATH}}"
+  NUM_NODES_PER_TEACHER="${NUM_NODES_PER_TEACHER:-4}"
+  TEACHER_TP="${TEACHER_TP:-4}"
+  TEACHER_CP="${TEACHER_CP:-4}"
+  TEACHER_EP="${TEACHER_EP:-16}"
+  TEACHER_PP="${TEACHER_PP:-1}"
+  NUM_TEACHER_NODES="${NUM_NODES_PER_TEACHER}"
+
+  MOPD_OVERRIDES="_teachers.general=${NRL_TEACHER_PATH} \
+on_policy_distillation.non_colocated_teachers.default_teacher_cfg.tensor_model_parallel_size=${TEACHER_TP} \
+on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size=${TEACHER_CP} \
+on_policy_distillation.non_colocated_teachers.default_teacher_cfg.pipeline_model_parallel_size=${TEACHER_PP} \
+on_policy_distillation.non_colocated_teachers.default_teacher_cfg.expert_model_parallel_size=${TEACHER_EP} \
+on_policy_distillation.non_colocated_teachers.default_teacher_cfg.num_nodes=${NUM_NODES_PER_TEACHER}"
+fi
+
+NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES + NUM_TEACHER_NODES))
 NUM_RAY_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
 NUM_TOTAL_NODES=$((NUM_RAY_NODES + NUM_EXTERNAL_SERVICE_NODES))
 
@@ -490,6 +541,25 @@ fi
 if (( NUM_EXTERNAL_SERVICE_NODES < 0 )); then
   echo "ERROR: NUM_EXTERNAL_SERVICE_NODES must be >= 0 (got ${NUM_EXTERNAL_SERVICE_NODES})" >&2; exit 1
 fi
+if (( NUM_TEACHER_NODES < 0 )); then
+  echo "ERROR: NUM_TEACHER_NODES must be >= 0 (got ${NUM_TEACHER_NODES})" >&2; exit 1
+fi
+if [[ "${RECIPE}" == "mopd" ]]; then
+  if (( NUM_NODES_PER_TEACHER <= 0 || TEACHER_TP <= 0 || TEACHER_CP <= 0 || TEACHER_EP <= 0 || TEACHER_PP <= 0 )); then
+    echo "ERROR: MOPD teacher node counts and parallelism must be > 0." >&2
+    exit 1
+  fi
+  TEACHER_WORLD_SIZE=$((NUM_NODES_PER_TEACHER * GPUS_PER_NODE))
+  TEACHER_MODEL_PARALLEL_SIZE=$((TEACHER_TP * TEACHER_CP * TEACHER_PP))
+  if (( TEACHER_WORLD_SIZE % TEACHER_MODEL_PARALLEL_SIZE != 0 )); then
+    echo "ERROR: Teacher world size ${TEACHER_WORLD_SIZE} is not divisible by TP×CP×PP=${TEACHER_MODEL_PARALLEL_SIZE}." >&2
+    exit 1
+  fi
+  if (( TEACHER_WORLD_SIZE % TEACHER_EP != 0 )); then
+    echo "ERROR: Teacher world size ${TEACHER_WORLD_SIZE} is not divisible by EP=${TEACHER_EP}." >&2
+    exit 1
+  fi
+fi
 
 # GB200 NVL72 topology: validate the training and external-service components
 # separately because Slurm schedules them as distinct heterogeneous groups.
@@ -501,7 +571,7 @@ if (( NUM_RAY_NODES < SEGMENT_SIZE )); then
 fi
 if (( NUM_RAY_NODES % SEGMENT_SIZE != 0 )); then
   echo "ERROR: NeMo RL nodes=${NUM_RAY_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
-  echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Gym=${NUM_GYM_NODES} = ${NUM_RAY_NODES}" >&2
+  echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Teachers=${NUM_TEACHER_NODES} + Gym=${NUM_GYM_NODES} = ${NUM_RAY_NODES}" >&2
   exit 1
 fi
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
@@ -910,6 +980,7 @@ logger.wandb.name=${WANDB_NAME} \
 logger.wandb.project=${WANDB_PROJ} \
 ${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
 ${MTP_EXTRA_ARGS} \
+${MOPD_OVERRIDES} \
 ${*}"
 
 export COMMAND="${TRAIN_CMD}"
@@ -932,6 +1003,10 @@ echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
 fi
 echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"
+if (( NUM_TEACHER_NODES > 0 )); then
+echo "    Teacher:   ${NUM_TEACHER_NODES}  ($((NUM_TEACHER_NODES * GPUS_PER_NODE)) GPUs; TP=${TEACHER_TP}, CP=${TEACHER_CP}, EP=${TEACHER_EP}, PP=${TEACHER_PP})"
+echo "      Model:   ${NRL_TEACHER_PATH}"
+fi
 echo "    Gym:       ${NUM_GYM_NODES}  ($((NUM_GYM_NODES * GPUS_PER_NODE)) GPUs)"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external-service nodes  (segment=${EXTERNAL_VLLM_SEGMENT_SIZE})"
