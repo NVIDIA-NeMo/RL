@@ -553,11 +553,15 @@ def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_cho
 
 def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
     routed_experts = [[[1]], [[2]]]
+    prompt_token_ids = [11, 12, 13]
 
     class Response:
         choices = [
             SimpleNamespace(
-                message=SimpleNamespace(routed_experts=routed_experts),
+                message=SimpleNamespace(
+                    routed_experts=routed_experts,
+                    prompt_token_ids=prompt_token_ids,
+                ),
             )
         ]
 
@@ -576,6 +580,9 @@ def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
     response_dict = model_dump_chat_response_with_routed_experts(Response())
 
     assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
+    assert response_dict["choices"][0]["message"]["prompt_token_ids"] == (
+        prompt_token_ids
+    )
 
 
 @pytest.mark.vllm

@@ -22,6 +22,7 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _compute_splice_inputs,
     _make_parse_tool_calls,
     _resolve_tool_parser_name,
+    _tokens_for_response_text,
 )
 
 
@@ -47,6 +48,23 @@ class _RecordingTokenizer:
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
         return [1, 2, 3]
+
+
+def test_response_text_excludes_stops_without_mutating_training_tokens():
+    generation_token_ids = [10, 20, 2, 3]
+
+    text_token_ids = _tokens_for_response_text(generation_token_ids, {2, 3})
+
+    assert text_token_ids == [10, 20]
+    assert generation_token_ids == [10, 20, 2, 3]
+
+
+def test_response_text_reuses_unterminated_generation_tokens():
+    generation_token_ids = [10, 20]
+
+    assert (
+        _tokens_for_response_text(generation_token_ids, {2, 3}) is generation_token_ids
+    )
 
 
 def test_explicit_tool_parser_overrides_model_auto_resolution():
