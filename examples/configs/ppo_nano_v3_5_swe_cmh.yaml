@@ -636,7 +636,8 @@ env:
         swe_agents:
           agent_max_turns: 200
           concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
-          swebench_agent_timeout: 3600
+          swebench_agent_timeout: 2700
+          swebench_tests_timeout: 900
           run_with_mixed_prompts: true
           dataset_path: ${data.train.data_path}
           apptainer_memory_limit_mb: 65536
