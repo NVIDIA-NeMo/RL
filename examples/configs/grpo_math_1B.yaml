@@ -16,6 +16,7 @@ grpo:
   advantage_clip_high: null
   max_val_samples: 256
   # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
   val_num_generations_per_prompt: 1
   # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
   stop_at_validation_metric: null

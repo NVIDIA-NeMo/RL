@@ -98,7 +98,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
-    SamplingParams,
+    GenerationSamplingParams,
     resolve_routed_experts_dtype_name_for_model,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -247,6 +247,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool = False
+    # Counts PROMPTS, not rollouts: with val_num_generations_per_prompt = k,
+    # total validation rollouts = max_val_samples * k.
     max_val_samples: int | None = 256  # None for NeMo-Gym compatibility
     # Number of independent validation rollouts generated for each prompt;
     # k > 1 additionally reports pass@k over each prompt's k rollouts as the
@@ -417,8 +419,24 @@ def setup(
             "generation.val_temperature/val_top_p/val_top_k differing from the "
             "train sampling params is only supported for vLLM NeMo-Gym rollouts."
         )
+        # The NeMo-Gym path only stamps temperature/top_p onto requests and
+        # rejects any top_k at rollout time, so a val_top_k override can never
+        # be honored — fail here instead of at the first validation step.
+        assert not generation_config["val_top_k"], (
+            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
+            "only honors val_temperature/val_top_p. Leave val_top_k null."
+        )
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
+    )
+    # pass_k is only reported when k > 1; catch the mismatch here instead of
+    # at the first validation step.
+    assert not (
+        grpo_config.stop_at_validation_metric == "pass_k"
+        and grpo_config.val_num_generations_per_prompt <= 1
+    ), (
+        "grpo.stop_at_validation_metric='pass_k' requires "
+        "grpo.val_num_generations_per_prompt > 1"
     )
 
     # Set seed for all random number generators
@@ -3730,7 +3748,7 @@ def validate(
                 # Validation-only sampling (e.g. near-greedy validation);
                 # defaults to the train profile via the exemplar YAML
                 # interpolations. Training rollouts keep policy.generation.
-                val_sampling_params = SamplingParams(
+                val_sampling_params = GenerationSamplingParams(
                     temperature=generation_config["val_temperature"],
                     top_p=generation_config["val_top_p"],
                     top_k=generation_config["val_top_k"],

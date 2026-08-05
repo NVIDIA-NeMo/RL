@@ -55,7 +55,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    SamplingParams,
+    GenerationSamplingParams,
 )
 from nemo_rl.utils.timer import Timer
 
@@ -2010,7 +2010,7 @@ def apply_reward_penalties(
 def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
-    sampling_params: SamplingParams,
+    sampling_params: GenerationSamplingParams,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
     for row_index, row in enumerate(rows):
@@ -2062,7 +2062,7 @@ async def run_async_nemo_gym_rollout(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
-    sampling_params: Optional[SamplingParams] = None,
+    sampling_params: Optional[GenerationSamplingParams] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2147,7 +2147,9 @@ async def run_async_nemo_gym_rollout(
         "Stop strings is not supported in the generation config in NeMo-Gym path!"
     )
     if sampling_params is None:
-        sampling_params = SamplingParams.from_generation_config(generation_config)
+        sampling_params = GenerationSamplingParams.from_generation_config(
+            generation_config
+        )
     # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
     assert not sampling_params.top_k, (
         "Top k is not supported in the sampling params in NeMo-Gym path!"
@@ -2257,7 +2259,7 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
-    sampling_params: Optional[SamplingParams] = None,
+    sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
