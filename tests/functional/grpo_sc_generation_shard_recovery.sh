@@ -96,7 +96,13 @@ REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
 
 echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
-uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
+# PYTHONUNBUFFERED: the harness detects progress by grepping RUN_LOG, and that only
+# works if the driver actually writes to it. The actor prints with flush=True, but
+# that just reaches the DRIVER -- Ray forwards actor output there, and the driver's
+# own stdout is a redirected file, so Python block-buffers it. Job 5892910 wrote
+# "train step 3/24" at 10:40:38 and the harness did not see it until 10:48:21, by
+# which time the run had finished and there was nothing left to kill.
+PYTHONUNBUFFERED=1 uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     --config "$PROJECT_ROOT"/examples/configs/grpo_math_1B_megatron_single_controller.yaml \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
