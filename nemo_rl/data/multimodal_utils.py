@@ -20,7 +20,6 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
-import decord
 import requests
 import torch
 from PIL import Image
@@ -358,7 +357,12 @@ def load_media_from_message(
                     )
                 except (RuntimeError, FileNotFoundError, OSError) as e:
                     logger.warning("Audio loading failed. Fall back to decord.")
-                    # use decord
+                    # Imported lazily (same as nemo_rl/data/datasets/utils.py) so that
+                    # text-only runs work in containers whose prebaked venvs omit
+                    # decord -- a top-level import here reaches every entrypoint via
+                    # batched_data_dict and kills the driver with ModuleNotFoundError.
+                    import decord
+
                     loaded_audio = decord.AudioReader(
                         aud,
                         sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],
