@@ -16,11 +16,11 @@
 Owns the authoritative shard table (health poller, NCCL lifecycle, fault
 eviction) and exposes async control-plane methods (``run_init_collective``,
 ``run_update_weights_from_collective``, etc.) that the training side calls
-directly via Ray — no HTTP required when everything runs in the same cluster.
+directly via Ray.
 
-The health poller still uses aiohttp to probe per-shard vLLM HTTP endpoints
-(``/openapi.json``), which is a lightweight in-cluster HTTP call, not an
-inter-cluster hop.
+The health poller uses aiohttp to probe per-shard vLLM HTTP endpoints
+(``/openapi.json``) when ``expose_http_server=True``; otherwise it falls back
+to Ray actor liveness checks.
 """
 
 from __future__ import annotations
@@ -158,9 +158,8 @@ class GenerationRouter:
         # only one lifecycle op may be in flight at a time.
         self._lifecycle_lock = asyncio.Lock()
 
-        # Flips false while shard lifecycle is mid-flight; /refit_ready reads
-        # it. Set inside add_shard / remove_shard, cleared once the gen-side
-        # workers have completed reset_collective + init_collective.
+        # Flips True while shard lifecycle is mid-flight; cleared once the
+        # gen-side workers have completed reset_collective + init_collective.
         self._nccl_reinit_in_progress: bool = False
         # Count of refit broadcasts handled. FaultInjector waits for >=1 before triggering.
         self._refit_attempts: int = 0
@@ -402,7 +401,7 @@ class GenerationRouter:
                 self._nccl_reinit_in_progress = True
 
             # Heavy work: vLLM worker init (~1-2min for 4B). Run on a thread so
-            # the asyncio loop stays responsive (health poll, /metrics, /shards).
+            # the asyncio loop stays responsive (health poll, lifecycle ops).
             # Pop the oldest freed slot so each recovery goes back to the
             # correct node/bundles regardless of how many shards have died or
             # how many retries have occurred.
@@ -438,9 +437,8 @@ class GenerationRouter:
                 }
 
             if base_url is None:
-                # Sync engines have no OpenAI server — the proxy can't route
-                # to the new shard, but it still participates in NCCL. We
-                # still register it so init_collective sees the new worker.
+                # Sync engines have no HTTP server; register with empty URL so
+                # init_collective still sees the new worker.
                 proxy_url = ""
             else:
                 proxy_url = base_url
@@ -539,9 +537,9 @@ class GenerationRouter:
         the data plane can now route to it without serving stale completions.
 
         ``eligible_sids``: optional set of shard ids that were ``joining``
-        at the moment the refit dispatch began. A shard added via
-        ``/admin/add_shard`` AFTER dispatch did NOT participate in the
-        broadcast — its weights are still the random ``load_format=dummy``
+        at the moment the refit dispatch began. A shard added AFTER dispatch
+        did NOT participate in the broadcast — its weights are still the
+        random ``load_format=dummy``
         bring-up state — so promoting it would let the data plane serve
         garbage (rewards observed to collapse to 0 in this case). When
         ``eligible_sids`` is supplied, we only promote shards in that set
@@ -997,8 +995,7 @@ class GenerationRouter:
             print(
                 f"[router] skipping auto-remove of {shard_id} "
                 f"({reason}): would drop fleet to 0 alive shards. "
-                f"Cordoned shard left in table; manual /admin/uncordon "
-                f"or remove via /admin/remove_shard if truly dead.",
+                f"Cordoned shard left in table; call remove_shard() directly if truly dead.",
                 flush=True,
             )
             return
@@ -1142,9 +1139,8 @@ class GenerationRouter:
             return False
 
     # =====================================================================
-    # Control-plane methods (called directly via Ray, no HTTP).
-    # Each is an async coroutine that mirrors the body of the old HTTP
-    # endpoint handler.  Call them via call_async() from a non-async context.
+    # Control-plane methods (called directly via Ray).
+    # Call them via call_async() from a non-async context.
     # =====================================================================
 
     async def run_init_collective(
@@ -1152,9 +1148,8 @@ class GenerationRouter:
     ) -> dict:
         """Gen-side init_collective: rendezvous the joinable cohort.
 
-        Returns ``{"success": True}`` on success.  On recoverable failure
-        (503 in the old HTTP path) returns ``{"success": False, "error": ...}``.
-        Raises ``RuntimeError`` for unrecoverable errors.
+        Returns ``{"success": True}`` on success, ``{"success": False, "error": ...}``
+        on recoverable failure, or raises ``RuntimeError`` for unrecoverable errors.
         """
         generation = self._generation
         if generation is None:
@@ -1636,7 +1631,7 @@ class GenerationRouter:
 
         Synchronous accessor — reads the shard table without taking
         ``_table_lock``. The shard dict is mutated only from the asyncio
-        event loop (health poll loop, proxy hot path, lifecycle ops); a
+        event loop (health poll loop, lifecycle ops); a
         synchronous reader on the same thread sees a consistent enough view
         for wandb's per-step rollup. Callers must NOT block on this from
         inside an asyncio coroutine where ``_table_lock`` is held.

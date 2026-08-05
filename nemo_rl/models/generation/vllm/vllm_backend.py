@@ -242,11 +242,7 @@ class VllmInternalWorkerExtension:
             rank_prefix, world_size - train_world_size
         )
 
-        _t_phases: dict[str, float] = {}
-        _t_overall = _time.monotonic()
-
         # Idempotent re-init: destroy the old comm before creating a new one.
-        _t = _time.monotonic()
         old = getattr(self, "model_update_group", None)
         if old is not None:
             try:
@@ -261,32 +257,15 @@ class VllmInternalWorkerExtension:
                 torch.cuda.empty_cache()
             except Exception:  # noqa: BLE001
                 pass
-        _t_phases["destroy_old"] = _time.monotonic() - _t
 
-        _t = _time.monotonic()
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
-        _t_phases["tcp_store_ctor"] = _time.monotonic() - _t
-
-        _t = _time.monotonic()
         # Free cached torch-allocator blocks so NCCL's P2P transport buffers
         # (raw cudaMalloc at comm init) have headroom; otherwise comm_init OOMs
         # on memory-tight shapes (mirror the train side).
         torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=self.device)
-        _t_phases["nccl_init"] = _time.monotonic() - _t
-
-        _t_total = _time.monotonic() - _t_overall
-        if _t_total > 3.0:
-            print(
-                f"[init_collective_timing] rank={rank} world={world_size} "
-                f"total={_t_total:.2f}s "
-                f"destroy_old={_t_phases.get('destroy_old', 0):.2f}s "
-                f"tcp_store_ctor={_t_phases.get('tcp_store_ctor', 0):.2f}s "
-                f"nccl_init={_t_phases.get('nccl_init', 0):.2f}s",
-                flush=True,
-            )
 
     def reset_collective(self) -> None:
         """Tear down the cross-cluster NCCL comm. Idempotent; no-op if not held.
