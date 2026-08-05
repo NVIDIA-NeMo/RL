@@ -2028,13 +2028,15 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     if not should_use_nemo_gym:
         return should_use_nemo_gym
 
-    # Validate the setup for training with NeMo-Gym
-    assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
-    )
+    # Validate the setup for training with NeMo-Gym.
+    # Megatron Inference is exempt: there is no difference between its sync and async engines.
+    generation_config = master_config.policy["generation"]
+    if generation_config["backend"] != "megatron":
+        assert _should_use_async_rollouts(master_config), (
+            "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
+        )
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    generation_config = master_config.policy["generation"]
     if generation_config["backend"] == "vllm":
         should_expose_http_server = generation_config["vllm_cfg"].get(
             "expose_http_server"
