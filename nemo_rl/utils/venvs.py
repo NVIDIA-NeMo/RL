@@ -87,9 +87,6 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
-    if force_rebuild:
-        # Serialize installs to avoid CUTLASS DSL wheel overlap races during cache rebuilds.
-        env.setdefault("UV_CONCURRENT_INSTALLS", "1")
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
@@ -116,8 +113,7 @@ def _env_builder(
     )
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
-    Path(NEMO_RL_VENV_DIR).mkdir(parents=True, exist_ok=True)
-    started_file = Path(NEMO_RL_VENV_DIR) / f".{venv_name}.STARTED_ENV_BUILDER"
+    started_file = venv_path / "STARTED_ENV_BUILDER"
 
     # Skip early return if force_rebuild is True
     if not force_rebuild and python_path.exists():
@@ -127,31 +123,22 @@ def _env_builder(
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)
 
-    try:
-        fd = os.open(started_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        owns_build = True
-    except FileExistsError:
-        owns_build = False
-
-    if not owns_build:
+    if started_file.exists():
         # Another node is already building, wait for completion
         logger.info(
             f"Node {node_idx}: Another node is building {venv_name}, skipping..."
         )
         # Wait for the venv to be ready (check for python executable)
         python_path = venv_path / "bin" / "python"
-        while started_file.exists():
-            if python_path.exists():
-                return str(python_path)
+        while not python_path.exists():
             time.sleep(1)
-        if not python_path.exists():
-            raise RuntimeError(f"Venv build failed before {python_path} was created")
         return str(python_path)
 
     # Create the venv directory if needed
     venv_path.mkdir(parents=True, exist_ok=True)
 
+    # Touch the started file to signal we're building
+    started_file.touch()
     try:
         # Create the virtual environment on this node
         return create_local_venv(py_executable, venv_name, force_rebuild=force_rebuild)
