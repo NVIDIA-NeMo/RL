@@ -237,6 +237,9 @@ class TeacherWorkerGroup:
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": self.sequence_length_pad_multiple,
             }
+            microbatch_order = cfg["sequence_packing"].get("microbatch_order")
+            if microbatch_order is not None:
+                self.sequence_packing_args["microbatch_order"] = microbatch_order
 
     def get_logprobs(
         self,
