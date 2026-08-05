@@ -34,7 +34,7 @@ from typing import Any, Literal, Optional
 
 import aiohttp
 
-ShardStatus = Literal["ready", "draining", "cordoned", "joining"]
+ShardStatus = Literal["ready", "cordoned", "joining"]
 
 # vLLM's HTTP server exposes /openapi.json as a stable always-200 liveness probe.
 _HEALTH_PATH = "/openapi.json"
@@ -65,12 +65,8 @@ class ShardEntry:
     url: str
     status: ShardStatus = "joining"
     last_health_ok_at: float = 0.0
-    inflight: int = 0
     consecutive_failures: int = 0
     consecutive_successes: int = 0
-    # Gates joining→ready: requires >=2 successful refits to avoid post-join weight corruption
-    # from an incomplete NCCL bootstrap on the first refit.
-    successful_refits_since_join: int = 0
     # True once this shard is in the live weight-sync comm. Freshly added shards start False;
     # the data plane skips them until in_comm is set by /init_collective success.
     in_comm: bool = False
@@ -260,7 +256,6 @@ class GenerationRouter:
             entry.consecutive_failures = 0
             entry.consecutive_successes = 0
             # Reset refit counter — NCCL state may be wedged; re-apply warmup gate.
-            entry.successful_refits_since_join = 0
             entry.last_health_ok_at = time.monotonic()
 
     # =====================================================================
@@ -284,23 +279,11 @@ class GenerationRouter:
                 entry = self._shards.get(shard_id)
                 if entry is None:
                     return {"shard_id": shard_id, "removed": False, "reason": "not found"}
-                entry.status = "draining"
+                entry.status = "cordoned"
                 self._nccl_reinit_in_progress = True
                 actor_handles = list(entry.actor_handles)
                 node_id = entry.node_id
                 worker_indices = list(entry.worker_indices)
-
-            # Drain inflight outside the lock so the proxy hot path keeps
-            # decrementing inflight for in-progress requests.
-            deadline = time.monotonic() + drain_timeout_s
-            while time.monotonic() < deadline:
-                async with self._table_lock:
-                    if entry.inflight == 0:
-                        break
-                await asyncio.sleep(0.05)
-
-            async with self._table_lock:
-                entry.status = "cordoned"
 
             # Kill the actors. Blocking Ray op; run in executor so the
             # event loop keeps serving health checks etc.
@@ -674,7 +657,6 @@ class GenerationRouter:
                                 entry.consecutive_failures = 0
                                 entry.consecutive_successes = 0
                                 # Reset refit counter; next refit re-certifies weights.
-                                entry.successful_refits_since_join = 0
                                 n_alive_or_joining = 1
                                 print(
                                     f"[router] auto-uncordoned {shard_id} "
@@ -1073,7 +1055,6 @@ class GenerationRouter:
         for sid in targets:
             try:
                 # drain_timeout_s=0: shard is already wedged in NCCL/CUDA,
-                # no real inflight to drain. ``remove_shard`` already
                 # acquires ``_lifecycle_lock`` and runs reset_collective on
                 # survivors after killing the dead actor.
                 res = await self.remove_shard(
@@ -1200,7 +1181,6 @@ class GenerationRouter:
                         entry.status = "joining"
                         entry.consecutive_failures = 0
                         entry.consecutive_successes = 0
-                        entry.successful_refits_since_join = 0
                         n_alive_or_joining = 1
                         print(
                             f"[router] auto-uncordoned {shard_id} "
@@ -1650,7 +1630,7 @@ class GenerationRouter:
     def shard_count_alive_for_collective(self) -> int:
         """Number of shards in the cross-cluster NCCL group (``ready`` + ``joining``).
 
-        Excludes ``cordoned``/``draining`` shards whose actors are being torn down.
+        Excludes ``cordoned`` shards whose actors are being torn down.
         """
         return sum(
             1
@@ -1662,9 +1642,8 @@ class GenerationRouter:
         """World size to advertise to the train side for init_collective.
 
         Sums per-shard world size over shards that participate in the
-        cross-cluster NCCL group (``ready`` + ``joining``). Cordoned /
-        draining shards are excluded — their actors are being torn down
-        on the next ``init_collective``.
+        cross-cluster NCCL group (``ready`` + ``joining``). Cordoned shards
+        are excluded — their actors are being torn down.
         """
         return self.shard_count_alive_for_collective() * self._per_shard_world_size
 
@@ -1755,7 +1734,7 @@ class GenerationRouter:
         daemon restarts (e.g. ``--replace``). Documented limitation.
         """
         now = time.monotonic()
-        ready = joining = cordoned = draining = 0
+        ready = joining = cordoned = 0
         per_shard: list[dict[str, Any]] = []
         for s in self._shards.values():
             if s.status == "ready":
@@ -1764,13 +1743,10 @@ class GenerationRouter:
                 joining += 1
             elif s.status == "cordoned":
                 cordoned += 1
-            elif s.status == "draining":
-                draining += 1
             per_shard.append(
                 {
                     "shard_id": s.shard_id,
                     "status": s.status,
-                    "inflight": s.inflight,
                     "consecutive_failures": s.consecutive_failures,
                     "last_health_ok_age_s": (
                         max(0.0, now - s.last_health_ok_at)
@@ -1783,7 +1759,6 @@ class GenerationRouter:
             "num_ready_shards": ready,
             "num_joining_shards": joining,
             "num_cordoned_shards": cordoned,
-            "num_draining_shards": draining,
             "num_total_shards": len(self._shards),
             "total_shards_at_bootstrap": self._total_shards_at_bootstrap,
             "cumulative_shards_removed": self._cumulative_shards_removed,
