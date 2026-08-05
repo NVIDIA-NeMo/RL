@@ -37,6 +37,7 @@ grpo:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
@@ -44,6 +45,8 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  skip_reference_policy_logprobs_calculation: false
+  calculate_advantages_on_gpu: false
   seq_logprob_error_threshold: null
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null
