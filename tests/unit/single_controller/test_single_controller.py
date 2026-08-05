@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -42,10 +43,10 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": 4},
-        grpo={
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 4,
-        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
     )
@@ -86,10 +87,10 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": 8},
-        grpo={
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 4,
-        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
         loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=1,
@@ -240,10 +241,10 @@ def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._master_config = SimpleNamespace(
-        grpo={
-            "num_prompts_per_step": 2,
-            "max_num_steps": 1,
-        }
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            max_num_steps=1,
+        )
     )
     ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
     ctrl._advantage_cfg = AdvantageConfig()
