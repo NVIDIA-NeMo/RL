@@ -425,9 +425,7 @@ class DTensorPolicyWorkerV2Impl(
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
@@ -595,10 +593,6 @@ class DTensorPolicyWorkerV2Impl(
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
@@ -755,10 +749,7 @@ class DTensorPolicyWorkerV2Impl(
         # Create top-k post-processor
         topk_post_processor = TopkLogitsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
             k=k,
             enable_seq_packing=self.enable_seq_packing,
         )
@@ -866,9 +857,7 @@ class DTensorPolicyWorkerV2Impl(
 
         post_processor = FullLogitsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
         )
