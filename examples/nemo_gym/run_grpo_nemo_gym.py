@@ -97,6 +97,7 @@ def collect_trajectories(
             log_full_result_tables=True,
             max_rollout_turns=None,
             greedy=False,
+            generation_only=True,
         )
 
         rows_to_log: list[str] = []

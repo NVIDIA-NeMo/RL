@@ -2059,6 +2059,8 @@ async def run_async_nemo_gym_rollout(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
+    generation_only: bool = False,
+    generation_policy_version: str | None = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2089,6 +2091,10 @@ async def run_async_nemo_gym_rollout(
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
+        generation_only: Preserve compacted trace evidence without admitting it
+            to training (used by validation and generation qualification).
+        generation_policy_version: Synchronized policy identity required by
+            exact-trace training contracts.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2174,7 +2180,13 @@ async def run_async_nemo_gym_rollout(
         with timer.time(run_rollouts_timer_label):
             rollout_gen = nemo_gym_environment.run_rollouts.options(
                 num_returns="streaming"
-            ).remote(nemo_gym_rows, tokenizer, timer_prefix)
+            ).remote(
+                nemo_gym_rows,
+                tokenizer,
+                timer_prefix,
+                generation_only=generation_only,
+                generation_policy_version=generation_policy_version,
+            )
         rollout_iterator = rollout_gen.__aiter__()
 
     while True:
@@ -2249,6 +2261,8 @@ def run_nemo_gym_rollout_sync(
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    generation_only: bool = False,
+    generation_policy_version: str | None = None,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2304,6 +2318,8 @@ def run_nemo_gym_rollout_sync(
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
+            generation_only=generation_only,
+            generation_policy_version=generation_policy_version,
         ):
             pass
         if rollout_result is None:
@@ -2490,6 +2506,11 @@ def _postprocess_single_nemo_gym_group(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            # Exact context-compaction authority. Keep these rollout-aligned
+            # and nested until logical GRPO statistics are fixed; physical-row
+            # expansion happens later in the driver.
+            "physical_message_logs": [r["physical_message_logs"] for r in results],
+            "rollout_trace_bundle": [r["rollout_trace_bundle"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]

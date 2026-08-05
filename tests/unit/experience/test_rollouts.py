@@ -1109,7 +1109,17 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             assert num_returns == "streaming"
             return self
 
-        def remote(self, rows, tokenizer, timer_prefix):
+        def remote(
+            self,
+            rows,
+            tokenizer,
+            timer_prefix,
+            *,
+            generation_only,
+            generation_policy_version,
+        ):
+            assert generation_only is False
+            assert generation_policy_version is None
             del rows, tokenizer, timer_prefix
             # Both groups complete out of order internally and group 1 completes first.
             completion_order = [3, 1, 2, 0]
@@ -1273,6 +1283,18 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
+                "physical_message_logs": [
+                    [
+                        input_message,
+                        {
+                            "role": "assistant",
+                            "content": "answer",
+                            "token_ids": torch.tensor([2]),
+                            "generation_logprobs": torch.tensor([-0.1]),
+                        },
+                    ]
+                ],
+                "rollout_trace_bundle": {"rollout_id": f"rollout-{reward}"},
                 "full_result": {"reward": reward},
             }
         )
@@ -1523,6 +1545,13 @@ def test_run_async_nemo_gym_rollout(
         assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
+    assert len(actual_result["final_batch"]["physical_message_logs"]) == len(rows)
+    assert len(actual_result["final_batch"]["rollout_trace_bundle"]) == len(rows)
+    for message_logs, bundle in zip(
+        actual_result["final_batch"]["physical_message_logs"],
+        actual_result["final_batch"]["rollout_trace_bundle"],
+    ):
+        assert len(message_logs) == len(bundle["physical_traces"])
 
     expected_result = {
         "final_batch": {
@@ -1626,6 +1655,8 @@ def test_run_async_nemo_gym_rollout(
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
         final_batch.pop("message_log", None)
+        final_batch.pop("physical_message_logs", None)
+        final_batch.pop("rollout_trace_bundle", None)
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()

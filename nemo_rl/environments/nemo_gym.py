@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,12 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
+import json
 import math
 import os
+import resource
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
@@ -42,7 +46,14 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.environments.generation_contract import (
+    bind_runtime_generation_contract,
+    build_training_admission_contract,
+    canonical_digest,
+    validate_runtime_generation_contract,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_trace import build_rollout_trace_bundle
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -64,6 +75,20 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+_EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
+    "id",
+    "status",
+    "error",
+    "incomplete_details",
+    "usage",
+    "output",
+    "context_compaction_contract",
+    "chunk_records",
+    "boundary_events",
+    "guard_records",
+)
+_MEDIA_PART_TYPES = frozenset({"input_image", "image", "image_url"})
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -127,6 +152,132 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
+    context_compaction_runtime_contract: NotRequired[
+        Optional[Dict[str, Any]]
+    ]  # Launcher-owned model/tokenizer/template/processor identity
+
+
+def _compact_json_size(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=repr,
+        ).encode("utf-8")
+    )
+
+
+def _actor_peak_rss_gib() -> float:
+    """Return this Linux actor process's lifetime peak resident set size."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024**2)
+
+
+def _project_semantic_value(value: Any) -> Any:
+    """Remove raw media and generation-private bulk from a semantic log value."""
+    if isinstance(value, list):
+        projected = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") in _MEDIA_PART_TYPES:
+                continue
+            projected.append(_project_semantic_value(item))
+        return projected
+    if isinstance(value, dict):
+        return {
+            key: _project_semantic_value(item)
+            for key, item in value.items()
+            if key
+            not in {
+                "encrypted_content",
+                "prompt_str",
+                "prompt_token_ids",
+                "generation_token_ids",
+                "generation_log_probs",
+                "routed_experts",
+            }
+            and not (
+                key in {"image", "image_url", "url"}
+                and isinstance(item, str)
+                and item.startswith("data:image")
+            )
+        }
+    return value
+
+
+def _build_exact_trace_full_result_projection(
+    nemo_gym_result: dict[str, Any],
+    *,
+    trace_bundle: dict[str, Any],
+    generation_only: bool,
+) -> dict[str, Any]:
+    """Build the bounded Ray/logging projection after exact trace factoring.
+
+    The complete Gym HTTP result is required until tokens and media have been
+    independently validated and materialized. After that point, training
+    consumers need only scalar environment results and a small semantic
+    projection used by reward penalties. Exact token/media authority lives in
+    ``trace_bundle`` and the physical message logs, not in ``full_result``.
+    """
+    gym_http_bytes = _compact_json_size(nemo_gym_result)
+    response = nemo_gym_result["response"]
+    response_projection = {
+        key: (
+            _project_semantic_value(response[key])
+            if key == "output"
+            else deepcopy(response[key])
+        )
+        for key in _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS
+        if key in response and response[key] is not None
+    }
+    projection = {
+        key: deepcopy(value)
+        for key, value in nemo_gym_result.items()
+        if key
+        not in {
+            "response",
+            "responses_create_params",
+            "nemo_rl_trace_bundle",
+        }
+    }
+    projection["response"] = response_projection
+
+    projection["context_compaction_gym_http_bytes"] = gym_http_bytes
+    projection["context_compaction_ray_env_extras_bytes"] = 0
+    projection["context_compaction_transport_reduction_ratio"] = 0.0
+    # These metrics contribute a few bytes to the object they measure. Iterate
+    # to a fixed point so the reported projection size includes the final
+    # integer and ratio rather than their zero placeholders.
+    for _ in range(8):
+        ray_env_extras_bytes = _compact_json_size(projection)
+        reduction_ratio = (
+            1.0 - (ray_env_extras_bytes / gym_http_bytes) if gym_http_bytes else 0.0
+        )
+        current = (
+            projection["context_compaction_ray_env_extras_bytes"],
+            projection["context_compaction_transport_reduction_ratio"],
+        )
+        updated = (ray_env_extras_bytes, reduction_ratio)
+        projection["context_compaction_ray_env_extras_bytes"] = ray_env_extras_bytes
+        projection["context_compaction_transport_reduction_ratio"] = reduction_ratio
+        if current == updated:
+            break
+    if generation_only:
+        # Trajectory collection intentionally persists the canonical trace
+        # bundle. Training already carries it through the dedicated
+        # rollout_trace_bundle field and must not duplicate it in env_extras.
+        projection["nemo_rl_trace_bundle"] = trace_bundle
+        projection["context_compaction_trajectory_record_bytes"] = 0
+        for _ in range(8):
+            trajectory_record_bytes = _compact_json_size(projection)
+            if (
+                projection["context_compaction_trajectory_record_bytes"]
+                == trajectory_record_bytes
+            ):
+                break
+            projection["context_compaction_trajectory_record_bytes"] = (
+                trajectory_record_bytes
+            )
+    return projection
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -226,7 +377,9 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     return images
 
 
-def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
+def _index_per_turn_images(
+    initial_input: list[dict], seed_obs: list[dict], output: list[dict]
+) -> list[list[Image.Image]]:
     """Bin server-returned images by the trainable turn that saw them.
 
     Walks the Responses-API items in order and flushes ``pending`` into a
@@ -242,15 +395,42 @@ def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
     """
     per_turn: list[list[Image.Image]] = []
     pending: list[Image.Image] = []
-    for item in output:
+    for item in [*(initial_input or []), *(seed_obs or []), *output]:
         if item.get(
             "generation_token_ids"
-        ):  # trainable turn; empty generation_token_ids is skipped by the postprocess loop and must not consume a bucket
+        ):  # empty generations are not trainable and must not consume a bucket
             per_turn.append(pending)
             pending = []
         elif item.get("role") != "assistant":
             pending.extend(_extract_input_images_from_message(item))
     return per_turn
+
+
+def _resolve_images_by_media_id(
+    media_assets: dict[str, dict[str, Any]],
+    media_ids: list[str],
+) -> list[Image.Image]:
+    """Resolve ordered media occurrences from the rollout-owned media arena."""
+    images: list[Image.Image] = []
+    for media_id in media_ids:
+        try:
+            asset = media_assets[media_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Completion evidence references unknown media ID {media_id!r}"
+            ) from exc
+        part = asset.get("source_part", asset) if isinstance(asset, dict) else asset
+        if not isinstance(part, dict):
+            raise TypeError(f"Media asset {media_id!r} source_part must be a mapping")
+        src = part.get("image") or part.get("image_url") or part.get("url")
+        if isinstance(src, dict):
+            src = src.get("url")
+        if src is None:
+            raise ValueError(
+                f"Media asset {media_id!r} does not contain an image source"
+            )
+        images.append(resolve_to_image(src))
+    return images
 
 
 def _attach_multimodal_data_to_user_message(
@@ -317,6 +497,83 @@ def _attach_multimodal_data_to_user_message(
         )
 
 
+def _stamp_context_compaction_rollout_ids(
+    rows: list[dict[str, Any]],
+    *,
+    rollout_batch_index: int,
+    runtime_contract: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Stamp caller-owned logical rollout IDs before Gym dispatch."""
+    if runtime_contract is not None:
+        validate_runtime_generation_contract(runtime_contract)
+    stamped_ids: set[str] = set()
+    for row in rows:
+        contract_version = row.get("context_compaction_contract_version")
+        if contract_version is None:
+            if runtime_contract is not None:
+                raise ValueError(
+                    "Context-compaction training rows require "
+                    "context_compaction_contract_version"
+                )
+            continue
+        if contract_version not in {1, 2}:
+            raise ValueError(
+                "Unsupported context compaction row contract version: "
+                f"{contract_version!r}"
+            )
+        row_index = row.get("_rowidx")
+        group_id = row.get("context_compaction_group_id")
+        if (
+            not isinstance(row_index, int)
+            or not isinstance(group_id, str)
+            or not group_id
+        ):
+            raise ValueError(
+                "Context compaction rows require an integer _rowidx and a "
+                "non-empty context_compaction_group_id"
+            )
+        if contract_version == 1:
+            rollout_id = (
+                f"{group_id}:batch-{rollout_batch_index:06d}:row-{row_index:06d}"
+            )
+        else:
+            task_id = row.get("context_compaction_task_id")
+            rollout_index = row.get("context_compaction_rollout_index")
+            attempt_index = row.get("context_compaction_attempt_index")
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or not isinstance(rollout_index, int)
+                or rollout_index < 0
+                or not isinstance(attempt_index, int)
+                or attempt_index < 0
+            ):
+                raise ValueError(
+                    "Version 2 context compaction rows require a non-empty "
+                    "context_compaction_task_id and non-negative integer "
+                    "context_compaction_rollout_index and "
+                    "context_compaction_attempt_index"
+                )
+            identity = json.dumps(
+                {
+                    "task_id": task_id,
+                    "group_id": group_id,
+                    "rollout_index": rollout_index,
+                    "attempt_index": attempt_index,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            rollout_id = f"rollout-{digest[:24]}"
+        if rollout_id in stamped_ids:
+            raise ValueError(f"Duplicate context compaction rollout ID {rollout_id!r}")
+        stamped_ids.add(rollout_id)
+        row["context_compaction_rollout_id"] = rollout_id
+        if runtime_contract is not None:
+            row["context_compaction_runtime_contract"] = runtime_contract
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
@@ -326,6 +583,14 @@ class NemoGym(EnvironmentInterface):
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
+        self._rollout_batch_index = 0
+        self._context_compaction_runtime_contract = cfg.get(
+            "context_compaction_runtime_contract"
+        )
+        if self._context_compaction_runtime_contract is not None:
+            validate_runtime_generation_contract(
+                self._context_compaction_runtime_contract
+            )
         tokenizer_config = cfg.get("tokenizer_config")
         if tokenizer_config:
             from nemo_rl.algorithms.utils import get_tokenizer
@@ -432,6 +697,8 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
+        generation_only: bool = False,
+        generation_policy_version: Optional[str] = None,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
@@ -448,6 +715,27 @@ Depending on your data shape, you may want to change these values."""
         # examples with base64 data URLs before shipping to vLLM. No-op when
         # examples carry no `input_image` items (text-only case).
         encode_images_in_examples(nemo_gym_examples)
+        rollout_batch_index = self._rollout_batch_index
+        self._rollout_batch_index += 1
+        runtime_contract = None
+        if (
+            self._context_compaction_runtime_contract is not None
+            and not generation_only
+        ):
+            if generation_policy_version is None:
+                raise ValueError(
+                    "Context-compaction training requires a synchronized "
+                    "generation_policy_version"
+                )
+            runtime_contract = bind_runtime_generation_contract(
+                self._context_compaction_runtime_contract,
+                generation_policy_version=generation_policy_version,
+            )
+        _stamp_context_compaction_rollout_ids(
+            nemo_gym_examples,
+            rollout_batch_index=rollout_batch_index,
+            runtime_contract=runtime_contract,
+        )
 
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -470,7 +758,10 @@ Depending on your data shape, you may want to change these values."""
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+                    nemo_gym_row,
+                    nemo_gym_result,
+                    tokenizer,
+                    generation_only=generation_only,
                 )
                 if _has_nan_generation_logprobs(nemo_rl_result):
                     raise RuntimeError("Generation logprobs contain NaN")
@@ -485,6 +776,9 @@ Depending on your data shape, you may want to change these values."""
                     100
                     * timing_metrics[f"{timer_prefix}/postprocess_results"]
                     / total_time
+                )
+                timing_metrics[f"{timer_prefix}/nemo_gym_actor_peak_rss_gib"] = (
+                    _actor_peak_rss_gib()
                 )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
@@ -507,20 +801,268 @@ Depending on your data shape, you may want to change these values."""
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
+        nemo_gym_row: dict,
         nemo_gym_result: dict,
         tokenizer: PreTrainedTokenizerBase,
+        *,
+        generation_only: bool = False,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
         processor = getattr(self, "_processor", None)
+        response = nemo_gym_result["response"]
+        contract = response.get("context_compaction_contract")
+        exact_trace_authority = contract is not None
+        if exact_trace_authority:
+            if not isinstance(contract, dict):
+                raise TypeError("context_compaction_contract must be a mapping")
+            contract_version = contract.get("schema_version")
+            if (
+                contract_version not in {2, 3}
+                or contract.get("mode") != "exact_trace_authority"
+            ):
+                raise ValueError(
+                    f"Unsupported context compaction response contract: {contract!r}"
+                )
+            expected_rollout_id = nemo_gym_row.get("context_compaction_rollout_id")
+            if not expected_rollout_id:
+                raise ValueError(
+                    "An exact-trace response requires a caller-stamped "
+                    "context_compaction_rollout_id"
+                )
+            if contract.get("rollout_id") != expected_rollout_id:
+                raise ValueError(
+                    "Gym returned evidence for the wrong logical rollout: "
+                    f"expected={expected_rollout_id!r}, "
+                    f"observed={contract.get('rollout_id')!r}"
+                )
+            expected_group_id = nemo_gym_row.get("context_compaction_group_id")
+            if contract.get("group_id") != expected_group_id:
+                raise ValueError(
+                    "Gym returned the wrong context compaction group ID: "
+                    f"expected={expected_group_id!r}, "
+                    f"observed={contract.get('group_id')!r}"
+                )
+            for contract_field, row_field in (
+                ("task_id", "context_compaction_task_id"),
+                ("rollout_index", "context_compaction_rollout_index"),
+                ("attempt_index", "context_compaction_attempt_index"),
+            ):
+                if contract.get(contract_field) != nemo_gym_row.get(row_field):
+                    raise ValueError(
+                        "Gym returned the wrong context compaction "
+                        f"{contract_field}: expected="
+                        f"{nemo_gym_row.get(row_field)!r}, observed="
+                        f"{contract.get(contract_field)!r}"
+                    )
+            if not isinstance(contract.get("generation_contract"), dict):
+                raise ValueError(
+                    "Version 2 exact-trace response is missing its generation contract"
+                )
+            runtime_contract = nemo_gym_row.get("context_compaction_runtime_contract")
+            training_admission = (
+                build_training_admission_contract(
+                    contract["generation_contract"],
+                    runtime_contract,
+                )
+                if runtime_contract is not None
+                else None
+            )
+        else:
+            training_admission = None
+
+        initial_input = response.get("agent_input")
+        if initial_input is None:
+            initial_input = nemo_gym_row.get("responses_create_params", {}).get(
+                "input", []
+            )
         per_turn_images = _index_per_turn_images(
-            nemo_gym_result["response"]["output"],
+            initial_input,
+            response.get("seed_obs") or [],
+            response["output"],
         )
+        trainable_output_items = [
+            item
+            for item in response["output"]
+            if "generation_token_ids" in item and item["generation_token_ids"]
+        ]
+        evidence_field = (
+            "model_call_metadata"
+            if exact_trace_authority and contract["schema_version"] == 3
+            else "completion_evidence"
+        )
+        completion_evidence = response.get(evidence_field) or []
+        if exact_trace_authority and not completion_evidence:
+            raise ValueError(
+                f"Exact-trace authority response is missing {evidence_field}"
+            )
+        if (exact_trace_authority or completion_evidence) and len(
+            completion_evidence
+        ) != len(trainable_output_items):
+            raise ValueError(
+                "Completion evidence count does not match trainable model calls: "
+                f"evidence={len(completion_evidence)} "
+                f"calls={len(trainable_output_items)}"
+            )
+
+        trace_calls = []
+        for call_index, output_item in enumerate(trainable_output_items):
+            evidence = completion_evidence[call_index] if completion_evidence else None
+            if evidence is not None:
+                canonical_arrays = {
+                    "prompt_token_ids": output_item["prompt_token_ids"],
+                    "sampled_token_ids": output_item["generation_token_ids"],
+                    "sampled_logprobs": output_item["generation_log_probs"],
+                }
+                if contract["schema_version"] == 2:
+                    evidence_arrays = {
+                        "prompt_token_ids": evidence["prompt_token_ids"],
+                        "sampled_token_ids": evidence["sampled_token_ids"],
+                        "sampled_logprobs": evidence["sampled_logprobs"],
+                    }
+                    if evidence_arrays != canonical_arrays:
+                        raise ValueError(
+                            "Gym completion evidence does not exactly match the "
+                            f"generation response at call {call_index}: "
+                            f"expected={canonical_arrays}, actual={evidence_arrays}"
+                        )
+                elif evidence.get("generation_evidence_digest") != canonical_digest(
+                    canonical_arrays
+                ):
+                    raise ValueError(
+                        "Gym model-call metadata digest does not match the "
+                        f"canonical generation arrays at call {call_index}"
+                    )
+                turn_id = evidence["turn_id"]
+                completion_id = evidence["completion_id"]
+                media_ids = evidence.get("media_ids") or []
+            else:
+                turn_id = call_index + 1
+                completion_id = output_item.get("id") or f"completion-{turn_id:06d}"
+                media_ids = []
+            trace_calls.append(
+                {
+                    "turn_id": turn_id,
+                    "completion_id": completion_id,
+                    "prompt_token_ids": output_item["prompt_token_ids"],
+                    "sampled_token_ids": output_item["generation_token_ids"],
+                    "sampled_logprobs": output_item["generation_log_probs"],
+                    "media_ids": media_ids,
+                    "prepared_request_id": (
+                        evidence.get("prepared_request_id")
+                        if evidence is not None
+                        else None
+                    ),
+                    "request_id": (
+                        evidence.get("request_id") if evidence is not None else None
+                    ),
+                    "context_epoch": (
+                        evidence.get("context_epoch") if evidence is not None else None
+                    ),
+                    "segment_index": (
+                        evidence.get("segment_index") if evidence is not None else None
+                    ),
+                    "segment_id": (
+                        evidence.get("segment_id") if evidence is not None else None
+                    ),
+                    "expected_append_compatible": (
+                        evidence.get("expected_append_compatible")
+                        if evidence is not None
+                        else None
+                    ),
+                    "compaction_event_id": (
+                        evidence.get("compaction_event_id")
+                        if evidence is not None
+                        else None
+                    ),
+                    "rollout_id": (
+                        evidence.get("rollout_id") if evidence is not None else None
+                    ),
+                    "action_id": (
+                        evidence.get("action_id") if evidence is not None else None
+                    ),
+                    "finish_reason": (
+                        evidence.get("finish_reason") if evidence is not None else None
+                    ),
+                    "policy_decision": (
+                        evidence.get("policy_decision")
+                        if evidence is not None
+                        else None
+                    ),
+                    "processor_fingerprint": (
+                        evidence.get("processor_fingerprint")
+                        if evidence is not None
+                        else None
+                    ),
+                    "generation_contract_id": (
+                        evidence.get("generation_contract_id")
+                        if evidence is not None
+                        else None
+                    ),
+                    "policy_output_spans": (
+                        evidence.get("policy_output_spans")
+                        if evidence is not None
+                        else None
+                    ),
+                    "media_occurrences": (
+                        evidence.get("media_occurrences")
+                        if evidence is not None
+                        else None
+                    ),
+                    "eligible": (
+                        evidence.get("eligible", True) if evidence is not None else True
+                    ),
+                    "evidence_source": (
+                        evidence.get("evidence_source")
+                        if evidence is not None
+                        else None
+                    ),
+                }
+            )
+
+        rollout_id = (
+            contract["rollout_id"]
+            if exact_trace_authority
+            else completion_evidence[0]["rollout_id"]
+            if completion_evidence
+            else f"nemo-gym-row-{nemo_gym_row.get('_rowidx', 0)}"
+        )
+        policy_name = None
+        if completion_evidence:
+            policy_name = (
+                completion_evidence[0].get("policy_decision", {}).get("policy_name")
+            )
+        media_assets = response.get("media_assets")
+        if exact_trace_authority and media_assets is None:
+            raise ValueError(
+                "Exact-trace authority response is missing its media asset arena"
+            )
+        media_assets = media_assets or {}
+        trace_bundle = build_rollout_trace_bundle(
+            rollout_id=rollout_id,
+            calls=trace_calls,
+            boundary_events=response.get("boundary_events") or [],
+            policy_name=policy_name,
+            group_id=(contract.get("group_id") if exact_trace_authority else None),
+            source_row_index=nemo_gym_row.get("_rowidx"),
+            reward=nemo_gym_result.get("reward"),
+            media_assets=media_assets,
+            generation_contract=(
+                contract.get("generation_contract") if exact_trace_authority else None
+            ),
+            training_admission=training_admission,
+            final_policy_decision=response.get("final_policy_decision"),
+            lineage_deltas=response.get("lineage_deltas"),
+            strict=exact_trace_authority,
+        )
+        trace_model_calls = trace_bundle["model_calls"]
         turn_idx = 0
 
         nemo_rl_message_log = []
+        physical_message_logs: list[list[dict[str, Any]]] = []
+        current_physical_message_log: list[dict[str, Any]] | None = None
         seen_token_ids: List[int] = []
         batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
@@ -536,14 +1078,36 @@ Depending on your data shape, you may want to change these values."""
             ):
                 continue
 
-            assert (
+            trace_call = trace_model_calls[turn_idx]
+            if trace_call["starts_physical_trace"]:
+                current_physical_message_log = []
+                physical_message_logs.append(current_physical_message_log)
+                if turn_idx > 0 and (exact_trace_authority or generation_only):
+                    # The trace planner has already independently verified the
+                    # declared token/media rewrite for exact-authority
+                    # responses. Generation-only collection also preserves
+                    # inspectable rewrites, while legacy training remains
+                    # fail-closed below.
+                    seen_token_ids = []
+
+            prompt_is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not prompt_is_contiguous and not generation_only:
+                raise AssertionError(
+                    f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
 """
+                )
+
+            if not trace_call["starts_physical_trace"] and not prompt_is_contiguous:
+                raise AssertionError(
+                    "Trace planner and NeMo-Gym postprocessor disagree about "
+                    f"prefix continuity at turn {turn_idx + 1}"
+                )
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
@@ -595,11 +1159,21 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
+            assert current_physical_message_log is not None
+            current_physical_message_log.append(user_message)
 
             if processor is not None:
-                images_this_turn = (
-                    per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
-                )
+                if completion_evidence:
+                    images_this_turn = _resolve_images_by_media_id(
+                        media_assets,
+                        trace_call["new_media_ids"],
+                    )
+                else:
+                    images_this_turn = (
+                        per_turn_images[turn_idx]
+                        if turn_idx < len(per_turn_images)
+                        else []
+                    )
                 _attach_multimodal_data_to_user_message(
                     user_message,
                     images=images_this_turn,
@@ -631,6 +1205,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     generation_start:generation_end
                 ]
             nemo_rl_message_log.append(assistant_message)
+            current_physical_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
@@ -681,10 +1256,21 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 f"  → If (2): inspect why no assistant content was produced for this rollout."
             )
 
+        if exact_trace_authority:
+            full_result = _build_exact_trace_full_result_projection(
+                nemo_gym_result,
+                trace_bundle=trace_bundle,
+                generation_only=generation_only,
+            )
+        else:
+            nemo_gym_result["nemo_rl_trace_bundle"] = trace_bundle
+            full_result = nemo_gym_result
         return {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
-            "full_result": nemo_gym_result,
+            "physical_message_logs": physical_message_logs,
+            "rollout_trace_bundle": trace_bundle,
+            "full_result": full_result,
         }
 
     def shutdown(self) -> None:
@@ -801,6 +1387,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
+    context_compaction_runtime_contract: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -819,6 +1406,8 @@ def spinup_nemo_gym_actor(
             resolved by the caller from the model's expert count.
         use_fastokens: Forwarded from policy.tokenizer.use_fastokens so the rollout actor
             patches its tokenizer consistently with the driver.
+        context_compaction_runtime_contract: Launcher-owned generation identity
+            bound to a synchronized policy version for exact-trace training.
 
     Returns:
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
@@ -849,6 +1438,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        context_compaction_runtime_contract=context_compaction_runtime_contract,
         initial_global_config_dict=nemo_gym_dict,
     )
 
