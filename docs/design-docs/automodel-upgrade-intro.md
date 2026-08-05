@@ -242,7 +242,7 @@ full-sequence loss.
 
 ### 2.5 GRPO Test Results
 
-We compared `CP=1/2/4` over 20 GRPO/DAPO steps using `train/reward`,
+We compared `CP=1/2/4` in short GRPO/DAPO runs using `train/reward`,
 `train/mean_gen_tokens_per_sample`, and `train/gen_kl_error`. The three CP configurations
 show similar short-run trends without a persistent CP-size-dependent shift. These runs check
 functional and short-run numerical consistency; they are not long-horizon convergence tests.
@@ -258,3 +258,7 @@ functional and short-run numerical consistency; they are not long-horizon conver
 #### Qwen3.5 35B-A3B (GRPO)
 
 ![Qwen3.5 35B-A3B GRPO comparison for CP1, CP2, and CP4](../assets/cp-upgrade-exp/qwen3.5-35ba3b.png)
+
+#### Qwen3.5 9B (GRPO)
+
+![Qwen3.5 9B GRPO comparison for CP1, CP2, and CP4](../assets/cp-upgrade-exp/qwen3.5-9b.png)
