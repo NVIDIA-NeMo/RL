@@ -178,7 +178,7 @@ def test_build_generation_passes_sglang_config():
     inference_cluster = MagicMock(name="inference_cluster")
 
     with patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang:
-        generation = sc_setup_mod._build_generation(
+        generation, _ = sc_setup_mod._build_generation(
             inference_cluster,
             master_config,
         )
@@ -314,7 +314,7 @@ class TestSetup:
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert factory_kwargs["policy"] is patched_factories["fake_policy"]
         assert factory_kwargs["generation"] is patched_factories["fake_gen"]
-        assert factory_kwargs["gen_backend"] == "vllm"
+        assert factory_kwargs["generation_backend"] == "vllm"
         assert factory_kwargs["colocated"] is False
 
     def test_custom_partition_id(self, patched_factories):

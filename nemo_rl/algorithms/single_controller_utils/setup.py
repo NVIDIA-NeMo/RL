@@ -446,7 +446,13 @@ def setup_single_controller(
     setup_start_time = time.perf_counter()
     setup_timing_metrics = SetupTimingMetrics()
     gen_backend = generation_config["backend"]
-    gen_init_time_key = f"{gen_backend}_init_time_s"
+    # TODO: SC doesn't support megatron generation yet; the megatron branch is
+    # defensive — mirrors grpo.py so the metric key stays valid if we add it.
+    gen_init_time_key = (
+        "megatron_generation_init_time_s"
+        if gen_backend == "megatron"
+        else f"{gen_backend}_init_time_s"
+    )
 
     # Create clusters
     train_cluster, inference_cluster = _build_clusters(master_config)
@@ -562,7 +568,7 @@ def setup_single_controller(
     weight_synchronizer = create_weight_synchronizer(
         policy=trainer,
         generation=generation,
-        gen_backend=gen_backend,
+        generation_backend=gen_backend,
         colocated=colocated,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
