@@ -92,11 +92,60 @@ def materialise(parent, targets):
             os.replace(tmp, path)
 
 
-def run_patch(parent, patch_path, dry_run=False, reverse=False):
-    cmd = ["patch", f"-p{STRIP}", "--batch", "-d", parent, "-i", patch_path]
+def signatures_of(patch_path, per_file=5):
+    """Distinctive added lines per target file, used to detect the patch by content.
+
+    Do NOT use `patch --dry-run --reverse` to test whether a patch is already
+    applied: it exits 0 against a stock file as readily as a patched one, so it
+    reports every install as "already applied" and the build silently ships
+    unpatched code. Content is the only check that cannot lie.
+
+    The longest added lines are chosen because they are the least likely to
+    collide with something already in the file.
+    """
+    sig, cur = {}, None
+    with open(patch_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = re.match(r"^\+\+\+ b/(\S+)", line)
+            if m:
+                cur = "/".join(m.group(1).split("/")[STRIP - 1 :])
+                continue
+            if cur and line.startswith("+") and not line.startswith("+++"):
+                s = line[1:].strip()
+                if len(s) >= 16:
+                    sig.setdefault(cur, set()).add(s)
+    return {f: sorted(v, key=len, reverse=True)[:per_file] for f, v in sig.items() if v}
+
+
+def patch_state(parent, sigs):
+    """'applied' | 'stock' | 'partial', decided purely on file content."""
+    present = total = 0
+    for rel, lines in sigs.items():
+        with open(os.path.join(parent, rel), encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+        for s in lines:
+            total += 1
+            present += s in body
+    if present == 0:
+        return "stock"
+    if present == total:
+        return "applied"
+    return "partial"
+
+
+def run_patch(parent, patch_path, dry_run=False):
+    cmd = [
+        "patch",
+        f"-p{STRIP}",
+        "--batch",
+        "--forward",
+        "-d",
+        parent,
+        "-i",
+        patch_path,
+    ]
     if dry_run:
         cmd.append("--dry-run")
-    cmd.append("--reverse" if reverse else "--forward")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
@@ -118,41 +167,61 @@ def main():
         return 2
 
     print(f"{len(patches)} patch(es), {len(installs)} sglang install(s)")
+    applied = 0
     for parent in installs:
         if not os.access(parent, os.W_OK):
             print(f"FAIL: not writable: {parent}", file=sys.stderr)
             return 3
         for patch_path in patches:
             name = os.path.basename(patch_path)
-            targets = targets_of(patch_path)
-            materialise(parent, targets)
+            sigs = signatures_of(patch_path)
+            if not sigs:
+                print(f"FAIL: {name} has no usable content signature", file=sys.stderr)
+                return 4
+            materialise(parent, targets_of(patch_path))
 
-            # Already applied? A reverse dry-run succeeds only if it is present.
-            if run_patch(parent, patch_path, dry_run=True, reverse=True)[0] == 0:
+            state = patch_state(parent, sigs)
+            if state == "applied":
                 print(f"  [already applied] {name} -> {parent}")
                 continue
-
-            rc, out = run_patch(parent, patch_path, dry_run=True)
-            if rc != 0:
+            if state == "partial":
                 print(
-                    f"FAIL: {name} does not apply to {parent}\n{out}", file=sys.stderr
-                )
-                return 4
-            rc, out = run_patch(parent, patch_path)
-            if rc != 0:
-                print(
-                    f"FAIL: {name} failed after a clean dry-run\n{out}", file=sys.stderr
-                )
-                return 5
-            if run_patch(parent, patch_path, dry_run=True, reverse=True)[0] != 0:
-                print(
-                    f"FAIL: {name} not detectable after applying to {parent}",
+                    f"FAIL: {name} is only partly present in {parent}; refusing to "
+                    f"patch a half-modified tree",
                     file=sys.stderr,
                 )
-                return 6
-            print(f"  [applied] {name} -> {parent}")
+                return 5
 
-    print(f"OK: {len(patches)} patch(es) present in {len(installs)} install(s)")
+            rc, out = run_patch(parent, patch_path)
+            if rc != 0:
+                print(f"FAIL: {name} did not apply to {parent}\n{out}", file=sys.stderr)
+                return 6
+            # Verify by content, never by patch(1)'s exit code.
+            if patch_state(parent, sigs) != "applied":
+                print(
+                    f"FAIL: {name} reported success but {parent} does not carry it",
+                    file=sys.stderr,
+                )
+                return 7
+            print(f"  [applied] {name} -> {parent}")
+            applied += 1
+
+    # Final gate: re-read every install from disk. Nothing here trusts an
+    # earlier in-memory result or a tool exit code.
+    for parent in installs:
+        for patch_path in patches:
+            state = patch_state(parent, signatures_of(patch_path))
+            if state != "applied":
+                print(
+                    f"FAIL: {os.path.basename(patch_path)} is {state} in {parent}",
+                    file=sys.stderr,
+                )
+                return 8
+
+    print(
+        f"OK: {len(patches)} patch(es) verified by content in {len(installs)} "
+        f"install(s) ({applied} applied this run)"
+    )
     return 0
 
 
