@@ -2499,6 +2499,10 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
 
     with (
         patch(
+            "nemo_rl.models.policy.workers.mamba_determinism_patches."
+            "apply_mamba_determinism_patch"
+        ) as apply_mamba_patch,
+        patch(
             "nemo_rl.models.policy.workers.moe_determinism_patches."
             "apply_moe_unpermute_determinism_patch"
         ),
@@ -2512,3 +2516,4 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
         config["generation"]["mcore_generation_config"]["transformer_impl"]
         == "transformer_engine"
     )
+    apply_mamba_patch.assert_called_once_with()
