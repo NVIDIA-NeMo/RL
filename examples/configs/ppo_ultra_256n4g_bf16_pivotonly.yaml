@@ -78,7 +78,18 @@ ppo:
   max_num_epochs: 1
   max_num_steps: 1000000
   # One optimizer pass per rollout batch (PPO-epochs>1 reuses the batch).
+  # This is the ACTOR's epoch count.
   ppo_epochs: 1
+  # Critic (value) passes over each rollout batch. null = same as ppo_epochs
+  # (coupled, the historical behavior); must be >= ppo_epochs. The surplus runs
+  # as extra critic-only passes, fitting the critic harder without
+  # over-training the actor.
+  critic_ppo_epochs: null
+  # Re-score the batch with a forward-only critic pass after the final update,
+  # adding critic/explained_var_post_update + critic/loss_post_update (the
+  # unsuffixed critic/* are measured BEFORE the last update). Costs one extra
+  # critic forward per step.
+  log_post_update_critic_metrics: false
   # Critic-only warmup: policy training is skipped for the first N steps while
   # the (fresh-head) value model trains on rollouts from the frozen policy.
   # Overridden by the launch script.
