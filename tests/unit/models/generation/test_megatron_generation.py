@@ -391,7 +391,12 @@ def test_megatron_generation_colocated(
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
-    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    # Eager engine startup (expose_http_server) flips MLM's process-wide
+    # InferenceMode on at construction; the inference_optimized leg trains
+    # before any generate/suspend cycle, so it must construct engine-less.
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = (
+        transformer_impl == "transformer_engine"
+    )
     config["megatron_cfg"]["transformer_impl"] = transformer_impl
 
     # construction guard: exactly one of `cluster` / `policy` is required
@@ -414,10 +419,11 @@ def test_megatron_generation_colocated(
         assert "max_tokens" not in config["megatron_cfg"]
         assert config["megatron_cfg"] == megatron_cfg_before
 
-        # setup() hands dp_openai_server_base_urls to NeMo Gym right after
-        # construction, so the colocated constructor must have collected them.
-        assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
-        assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+        if transformer_impl == "transformer_engine":
+            # setup() hands dp_openai_server_base_urls to NeMo Gym right after
+            # construction, so the colocated constructor must have collected them.
+            assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
+            assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
 
         if transformer_impl == "inference_optimized":
             # Dual-mode: the same shared model must run the trainable TE
