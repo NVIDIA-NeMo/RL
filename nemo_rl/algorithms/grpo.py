@@ -1509,22 +1509,25 @@ def setup(
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
+        kv_cache_dtype = generation_config["vllm_cfg"]["kv_cache_dtype"]
+        if kv_cache_dtype.startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
             assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
+                f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not should_use_async_rollouts(generation_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+            # These restrictions come from synchronizing separately stored KV
+            # scales. DeepSeek V4 MLA packs its scales into the cache tensor.
+            if kv_cache_dtype != "fp8_ds_mla":
+                assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                    "DTensor backend is not supported with kv cache fp8 enabled."
+                )
+                assert not should_use_async_rollouts(generation_config), (
+                    "Async rollouts is not supported with kv cache fp8 enabled."
+                )
+                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+                )
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})

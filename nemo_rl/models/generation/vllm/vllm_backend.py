@@ -502,11 +502,14 @@ class VllmInternalWorkerExtension:
         return sorted(applier.discover_native_skips(state_dict_info))
 
     def _uses_fp8_kv_cache(self) -> bool:
-        """Return whether this worker owns an FP8 KV cache."""
+        """Return whether this worker owns separately refittable FP8 KV scales."""
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
         kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
-        return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+        if kv_cache_dtype is None:
+            return False
+        kv_cache_dtype = str(kv_cache_dtype).lower()
+        return "fp8" in kv_cache_dtype and kv_cache_dtype != "fp8_ds_mla"
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""

@@ -858,6 +858,43 @@ class TestSetupDistributed:
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
 
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_overlays_ep_on_dp_cp_mesh(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """CP8 and EP64 can share a 64-rank mesh; their sizes do not multiply."""
+        mock_torch_dist.get_world_size.return_value = 64
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=MagicMock()
+        )
+        mock_config["dtensor_cfg"].update(
+            {
+                "tensor_parallel_size": 1,
+                "context_parallel_size": 8,
+                "expert_parallel_size": 64,
+            }
+        )
+
+        setup_distributed(mock_config, mock_runtime_config)
+
+        parallelism = mock_mesh_context.build.call_args.args[1]
+        assert parallelism.tp_size == 1
+        assert parallelism.cp_size == 8
+        assert parallelism.ep_size == 64
+        assert mock_mesh_context.build.call_args.kwargs["world_size"] == 64
+
 
 @pytest.mark.automodel
 class TestSetupModelAndOptimizer:
@@ -1926,6 +1963,34 @@ class TestGetTokenizer:
         get_tokenizer({"name": "gpt2"})
 
         assert mock_tokenizer.pad_token == "<eos>"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    @patch("nemo_rl.models.automodel.setup.get_deepseek_v4_tokenizer")
+    def test_uses_vllm_deepseek_v4_renderer(
+        self, mock_get_deepseek_v4_tokenizer, mock_nemo_auto_tokenizer, capsys
+    ):
+        base_tokenizer = MagicMock()
+        base_tokenizer.pad_token = "<pad>"
+        tokenizer = MagicMock()
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+        mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+        result = get_tokenizer(
+            {
+                "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+                "chat_template": "deepseek_v4",
+            }
+        )
+
+        assert result is tokenizer
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+        )
+        mock_get_deepseek_v4_tokenizer.assert_called_once_with(base_tokenizer)
+        assert (
+            "Using vLLM 0.25.1's DeepSeek V4 chat renderer"
+            in capsys.readouterr().out
+        )
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_does_not_override_existing_pad_token(self, mock_nemo_auto_tokenizer):

@@ -1022,6 +1022,56 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
         ]
 
 
+def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    patched_paths = []
+
+    class FakePatch:
+        def start(self):
+            pass
+
+    def fake_patch(path, _replacement):
+        patched_paths.append(path)
+        return FakePatch()
+
+    monkeypatch.setattr(fp8, "patch", fake_patch)
+
+    fp8.apply_fp8_patches(
+        None,
+        fp8.FP8Config(
+            use_fp8_weights=True,
+            model_parallel_size=1,
+            kv_cache_dtype="fp8_ds_mla",
+        ),
+    )
+
+    assert not any("BaseKVCacheMethod" in path for path in patched_paths)
+
+
+def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "fp8_ds_mla",
+            "async_engine": False,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert vllm_kwargs["kv_cache_dtype"] == "fp8_ds_mla"
+    assert fp8.global_fp8_config.kv_cache_dtype == "fp8_ds_mla"
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
