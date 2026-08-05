@@ -338,6 +338,23 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_rejects_token_capture_buffer_smaller_than_prompt_batch(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.token_capture.enabled = True
+        mc.async_rl.max_buffered_rollouts = 3
+
+        with pytest.raises(
+            ValueError, match="one dataloader batch can own capacity"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
     def test_multiple_dataloader_not_supported(self):
         mc = _make_master_config(use_multiple_dataloader=True)
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
