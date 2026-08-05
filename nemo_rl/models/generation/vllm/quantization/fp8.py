@@ -448,6 +448,8 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     )
 
     value, scale = mxfp8_e4m3_quantize(weight)
+    value = value.reshape(weight.shape)
+    scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
     return value, scale
 
