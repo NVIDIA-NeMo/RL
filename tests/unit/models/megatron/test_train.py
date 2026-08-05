@@ -165,6 +165,55 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["position_ids"] is None
 
+    def test_model_forward_converts_video_payload_for_llava(self):
+        """The LLaVA handoff must not forward generation-style pixel_values."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        class FakeLlavaModel:
+            dynamic_resolution = True
+            temporal_patch_dim = 2
+            vision_model = SimpleNamespace(
+                patch_dim=16,
+                dynamic_resolution=True,
+                temporal_patch_dim=2,
+            )
+
+            def __init__(self):
+                self.call_kwargs = None
+
+            def __call__(self, **kwargs):
+                self.call_kwargs = kwargs
+                return torch.randn(1, 8, 32)
+
+        model = FakeLlavaModel()
+        data_dict = MagicMock()
+        data_dict.get_multimodal_dict.return_value = {
+            "pixel_values": torch.zeros(2, 3, 32, 32),
+            "imgs_sizes": torch.tensor([[32, 32], [32, 32]], dtype=torch.int32),
+            "num_frames": torch.tensor([2], dtype=torch.int32),
+        }
+        collapsed_input_ids = torch.tensor([[1, 18, 2]])
+
+        output = model_forward(
+            model=model,
+            data_dict=data_dict,
+            input_ids_cp_sharded=collapsed_input_ids,
+            input_ids=collapsed_input_ids,
+            position_ids=torch.tensor([[0, 1, 2]]),
+            attention_mask=torch.ones(1, 3),
+            defer_fp32_logits=True,
+            use_llava_handoff=True,
+        )
+
+        assert output.shape == (1, 8, 32)
+        assert model.call_kwargs is not None
+        assert "pixel_values" not in model.call_kwargs
+        assert "fp32_output" not in model.call_kwargs
+        assert model.call_kwargs["position_ids"] is None
+        assert model.call_kwargs["images"].shape == (1, 8, 3 * 16 * 16)
+        assert model.call_kwargs["num_image_tiles"].tolist() == [1, 1]
+        assert model.call_kwargs["num_frames"].tolist() == [2]
+
 
 class TestApplyTemperatureScaling:
     """Tests for apply_temperature_scaling function."""
@@ -264,6 +313,70 @@ class TestForwardWithPostProcessingFn:
         # forward_with_post_processing_fn should return a callable
         assert callable(wrapped_fn)
         assert isinstance(output, torch.Tensor)
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_restores_uncollapsed_vlm_targets(
+        self, mock_model_forward, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """LLaVA consumes collapsed ids while post-processing uses original ids."""
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+        logits = torch.randn(1, 7, 100)
+        mock_model_forward.return_value = (logits, None)
+
+        collapsed_ids = torch.tensor([[1, 18, 2, 3, 4]])
+        original_ids = torch.tensor([[1, 18, 18, 18, 2, 3, 4]])
+        original_lengths = torch.tensor([7])
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": collapsed_ids,
+                "input_lengths": torch.tensor([5]),
+            }
+        )
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=collapsed_ids,
+            input_ids_cp_sharded=collapsed_ids,
+            attention_mask=torch.ones(1, 5),
+            position_ids=torch.arange(5).unsqueeze(0),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            use_llava_handoff=True,
+            original_input_ids=original_ids,
+            original_input_lengths=original_lengths,
+        )
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(),
+            cfg={"sequence_packing": {"enabled": False}},
+        )
+
+        output, _ = forward_with_post_processing_fn(
+            data_iterator=iter([processed_mb]),
+            model=MagicMock(),
+            post_processing_fn=post_processor,
+        )
+
+        assert output is logits
+        assert torch.equal(data_dict["input_ids"], original_ids)
+        assert torch.equal(data_dict["input_lengths"], original_lengths)
+        call_kwargs = mock_model_forward.call_args.kwargs
+        assert torch.equal(call_kwargs["input_ids"], collapsed_ids)
+        assert call_kwargs["use_llava_handoff"] is True
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_logprobs_post_processor(self, mock_model_forward):

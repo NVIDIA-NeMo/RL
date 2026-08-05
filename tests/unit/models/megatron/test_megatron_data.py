@@ -1339,6 +1339,74 @@ class TestMakeProcessedMicrobatchIterator:
         # Verify data was moved to CUDA
         mock_data_dict.to.assert_called_once_with("cuda")
 
+    def test_make_processed_microbatch_iterator_prepares_llava_handoff(self):
+        """The real model must trigger token collapse and preserve original targets."""
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        input_ids = torch.tensor([[1, 19, 18, 18, 20, 2]])
+        input_lengths = torch.tensor([6])
+        removed = torch.tensor([1])
+        mock_data_dict = MagicMock()
+        mock_data_dict.to.return_value = mock_data_dict
+        mock_data_dict.__contains__.side_effect = lambda key: key == "input_lengths"
+        mock_data_dict.__getitem__.side_effect = lambda key: {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+        }[key]
+        mock_data_dict.pop.side_effect = lambda key, default=None: (
+            removed if key == "tokens_removed_per_sample" else default
+        )
+        model = MagicMock()
+
+        processed = ProcessedInputs(
+            input_ids=torch.tensor([[1, 19, 18, 20, 2]]),
+            input_ids_cp_sharded=torch.tensor([[1, 19, 18, 20, 2]]),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            use_llava_handoff=True,
+            original_input_ids=input_ids,
+            original_input_lengths=input_lengths,
+        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.is_llava_model",
+                return_value=True,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.collapse_multimodal_tokens",
+                return_value=mock_data_dict,
+            ) as mock_collapse,
+            patch(
+                "nemo_rl.models.megatron.data.process_microbatch",
+                return_value=processed,
+            ) as mock_process,
+        ):
+            result = next(
+                make_processed_microbatch_iterator(
+                    raw_iterator=iter([mock_data_dict]),
+                    cfg={"sequence_packing": {"enabled": False}},
+                    seq_length_key=None,
+                    pad_individual_seqs_to_multiple_of=1,
+                    pad_packed_seq_to_multiple_of=1,
+                    straggler_timer=MagicMock(),
+                    pad_full_seq_to=None,
+                    model=model,
+                )
+            )
+
+        mock_collapse.assert_called_once_with(mock_data_dict, model)
+        call_kwargs = mock_process.call_args.kwargs
+        assert call_kwargs["use_llava_handoff"] is True
+        assert torch.equal(call_kwargs["tokens_removed_per_sample"], removed)
+        assert torch.equal(call_kwargs["original_input_ids"], input_ids)
+        assert torch.equal(call_kwargs["original_input_lengths"], input_lengths)
+        assert result.use_llava_handoff is True
+
     @patch("nemo_rl.models.megatron.data.process_microbatch")
     def test_make_processed_microbatch_iterator_with_packing(self, mock_process):
         """Test make_processed_microbatch_iterator with sequence packing."""

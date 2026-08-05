@@ -295,6 +295,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         import_reasoning_parser = MagicMock()
 
     make_module(
+        "vllm.entrypoints.chat_utils",
+        load_chat_template=lambda template: template,
+    )
+    make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
         ChatCompletionResponse=type("ChatCompletionResponse", (), {}),

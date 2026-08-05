@@ -1,0 +1,62 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Two-node synchronous Gym video GRPO validation overlay.
+defaults: grpo_nemotron_omni_30ba3b_video_async.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  # Run until the configured dataset epochs are exhausted.
+  max_num_steps: -1
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+
+loss_fn:
+  use_importance_sampling_correction: false
+
+policy:
+  train_global_batch_size: 4
+  max_total_sequence_length: 16384
+  refit_buffer_size_gb: 5
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    # H100 nodes use CUDA compute capability 9.0. Megatron requires this
+    # explicitly when the runtime container does not provide it.
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: "9.0"
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 4
+    context_parallel_size: 1
+    moe_shared_expert_overlap: false
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      # Match the TP4 policy topology so raw generation and training logprobs
+      # use the validated numerical decomposition.
+      tensor_parallel_size: 4
+      max_model_len: ${policy.max_total_sequence_length}
+    vllm_kwargs:
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+    colocated:
+      enabled: true
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

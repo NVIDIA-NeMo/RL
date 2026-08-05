@@ -780,9 +780,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # For tensors, use repeat_interleave to repeat each element
                 repeated_batch[k] = v.repeat_interleave(num_repeats, dim=0)
             elif isinstance(v, PackedTensor):
-                raise NotImplementedError(
-                    "PackedTensor does not currently support repeat_interleave"
-                )
+                repeated_batch[k] = v.repeat_interleave(num_repeats)
             else:
                 # For lists or other sequences, use a list comprehension to repeat each element
                 repeated_batch[k] = [

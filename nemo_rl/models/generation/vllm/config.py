@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
@@ -32,6 +33,10 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Frozen multimodal encoders can explicitly retain their caches across
+    # text-only refits. When omitted, multimodal engines reset safely.
+    reset_mm_cache_after_refit: NotRequired[bool]
+    limit_mm_per_prompt: NotRequired[dict[str, Any]]
     load_format: NotRequired[str]
     precision: NotRequired[str]
     # Whether vLLM returns logprobs before or after generation-time logit
@@ -144,6 +149,7 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    deduplicate_multimodal_data: NotRequired[bool]
     # Null uses the topology default (IPC colocated, NCCL non-colocated).
     # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
@@ -160,6 +166,20 @@ class VllmConfig(GenerationConfig):
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+
+def should_reset_mm_cache_after_refit(config: Mapping[str, Any]) -> bool:
+    """Return whether a refit must invalidate multimodal/encoder caches."""
+    vllm_cfg = config.get("vllm_cfg", {})
+    explicit = vllm_cfg.get("reset_mm_cache_after_refit")
+    if explicit is not None:
+        return bool(explicit)
+
+    vllm_kwargs = config.get("vllm_kwargs", {})
+    return bool(
+        vllm_kwargs.get("limit_mm_per_prompt")
+        or vllm_cfg.get("limit_mm_per_prompt")
+    )
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:

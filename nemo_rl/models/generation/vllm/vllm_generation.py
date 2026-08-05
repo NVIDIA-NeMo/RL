@@ -212,6 +212,15 @@ class VllmGeneration(GenerationInterface):
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
+        # The packed-broadcast producer and every vLLM consumer must use the
+        # same chunk size and stream count when users tune the refit transport.
+        for refit_env_var in (
+            "NRL_REFIT_NUM_BUFFERS",
+            "NRL_REFIT_BUFFER_MEMORY_RATIO",
+        ):
+            if refit_env_var in os.environ:
+                env_vars[refit_env_var] = os.environ[refit_env_var]
+
         if needs_cross_node_parallelism:
             # When using cross-node model parallelism with non-colocated inference,
             # we are disabling NCCL_NVLS_ENABLE to avoid the NCCL error.

@@ -70,6 +70,27 @@ _HF_CONFIG_PATCHED = False
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
 
+_VLM_PROVIDER_OVERRIDE_KEYS = (
+    "freeze_vision_model",
+    "freeze_vision_projection",
+    "freeze_sound_encoder",
+    "freeze_sound_projection",
+)
+
+
+def _apply_vlm_provider_config(model_cfg: Any, config: "PolicyConfig") -> None:
+    """Forward explicitly configured VLM freeze controls to Bridge providers."""
+    megatron_cfg = config["megatron_cfg"]
+    for key in _VLM_PROVIDER_OVERRIDE_KEYS:
+        if key not in megatron_cfg:
+            continue
+        if not hasattr(model_cfg, key):
+            raise ValueError(
+                f"policy.megatron_cfg.{key} was configured, but provider "
+                f"{type(model_cfg).__name__} does not support it."
+            )
+        setattr(model_cfg, key, megatron_cfg[key])
+
 
 def _patch_hf_config_double_instantiation():
     """Patch HF config classes whose __post_init__ fails with Megatron's recursive instantiation.
@@ -639,6 +660,9 @@ def setup_model_config(
 
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
+
+    # Apply optional multimodal provider settings before provider finalization.
+    _apply_vlm_provider_config(model_cfg, config)
 
     # Validate optimizer configuration
     _validate_optimizer_config(config)

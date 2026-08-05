@@ -350,6 +350,11 @@ class MegatronConfig(TypedDict):
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    # Nemotron Omni provider controls. These names match Megatron-Bridge.
+    freeze_vision_model: NotRequired[bool]
+    freeze_vision_projection: NotRequired[bool]
+    freeze_sound_encoder: NotRequired[bool]
+    freeze_sound_projection: NotRequired[bool]
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.

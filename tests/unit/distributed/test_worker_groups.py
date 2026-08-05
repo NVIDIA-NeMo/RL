@@ -25,7 +25,27 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     PY_EXECUTABLES,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.distributed.worker_groups import (
+    RayWorkerBuilder,
+    RayWorkerGroup,
+    _get_initializer_import_env_vars,
+)
+
+
+def test_initializer_import_env_vars_include_shared_hf_module_path():
+    env_vars = {
+        "HF_HOME": "/shared/hf",
+        "HF_MODULES_CACHE": "/shared/hf/modules",
+        "PYTHONPATH": "/shared/hf/modules:/repo",
+        "RANK": "7",
+        "RAY_CLIENT_MODE": "1",
+    }
+
+    assert _get_initializer_import_env_vars(env_vars) == {
+        "HF_HOME": "/shared/hf",
+        "HF_MODULES_CACHE": "/shared/hf/modules",
+        "PYTHONPATH": "/shared/hf/modules:/repo",
+    }
 
 
 @ray.remote

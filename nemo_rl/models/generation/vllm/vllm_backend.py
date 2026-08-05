@@ -605,6 +605,30 @@ class VllmInternalWorkerExtension:
             )
         return self._sparse_delta_applier
 
+    def _clear_multimodal_caches_after_weight_update(
+        self, reset_mm_cache_after_refit: bool = True
+    ) -> None:
+        """Drop worker-local multimodal caches that depend on model weights."""
+        if not reset_mm_cache_after_refit:
+            return
+
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return
+        if hasattr(model_runner, "reset_mm_cache"):
+            model_runner.reset_mm_cache()
+        if hasattr(model_runner, "reset_encoder_cache"):
+            model_runner.reset_encoder_cache()
+            return
+
+        encoder_cache = getattr(model_runner, "encoder_cache", None)
+        if encoder_cache is None:
+            return
+        if hasattr(encoder_cache, "reset_encoder_cache"):
+            encoder_cache.reset_encoder_cache()
+        elif hasattr(encoder_cache, "clear"):
+            encoder_cache.clear()
+
     @contextmanager
     def _weight_update_lifecycle(
         self, transport: WeightUpdateTransport
@@ -622,6 +646,13 @@ class VllmInternalWorkerExtension:
                     self.model_runner.model, self.model_config, self.device
                 )
             self._maybe_process_mtp_drafter_after_loading()
+            # Post-load processing can enqueue asynchronous CUDA work (for
+            # example, converting MoE weights to their runtime layout).  The
+            # collective RPC may execute inference on a different host thread
+            # and CUDA stream immediately after this method returns, so it
+            # cannot rely on implicit default-stream ordering.  Fence the full
+            # refit before reporting success to the caller.
+            torch.accelerator.synchronize()
 
         yield finalize
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
@@ -637,7 +668,9 @@ class VllmInternalWorkerExtension:
         torch.cuda.current_stream().synchronize()
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self, reset_mm_cache_after_refit: bool = True
+    ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
@@ -732,6 +765,9 @@ class VllmInternalWorkerExtension:
                         buffer = None
                         self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
+            self._clear_multimodal_caches_after_weight_update(
+                reset_mm_cache_after_refit
+            )
             gc.collect()
             torch.cuda.empty_cache()
             return True
@@ -747,7 +783,9 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, reset_mm_cache_after_refit: bool = True
+    ) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -773,6 +811,7 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+        self._clear_multimodal_caches_after_weight_update(reset_mm_cache_after_refit)
         gc.collect()
         torch.cuda.empty_cache()
         return True

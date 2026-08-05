@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -66,6 +67,59 @@ def create_mock_model_params():
 def create_mock_state_dict_info(params):
     """Create state dict info (name -> (shape, dtype)) from params."""
     return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
+
+
+def test_packed_broadcast_orders_adjacent_streams():
+    """Producer and consumer serialize adjacent packed-broadcast chains."""
+    params = [
+        ("weight_0", torch.arange(4, dtype=torch.float32)),
+        ("weight_1", torch.arange(4, 8, dtype=torch.float32)),
+    ]
+    streams = [MagicMock() for _ in range(4)]
+    original_empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs.pop("device", None)
+        return original_empty(*args, **kwargs)
+
+    producer_group = MockCommunicationGroup()
+    unpacked_tensors = {}
+
+    def save_unpacked(tensor_list):
+        unpacked_tensors.update(tensor_list)
+
+    with (
+        patch(
+            "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+            return_value=1,
+        ),
+        patch("nemo_rl.utils.packed_tensor.get_num_buffers", return_value=2),
+        patch("nemo_rl.utils.packed_tensor.torch.cuda.Stream", side_effect=streams),
+        patch(
+            "nemo_rl.utils.packed_tensor.torch.cuda.stream",
+            side_effect=lambda _stream: nullcontext(),
+        ),
+        patch("nemo_rl.utils.packed_tensor.torch.empty", side_effect=cpu_empty),
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=producer_group,
+            src=0,
+            post_iter_func=lambda item: item[1],
+        )
+        packed_broadcast_consumer(
+            iterator=iter(create_mock_state_dict_info(params).items()),
+            group=MockConsumerCommunicationGroup(producer_group.broadcasted_tensors),
+            src=0,
+            post_unpack_func=save_unpacked,
+        )
+
+    streams[1].wait_stream.assert_any_call(streams[0])
+    streams[0].wait_stream.assert_any_call(streams[1])
+    streams[3].wait_stream.assert_any_call(streams[2])
+    streams[2].wait_stream.assert_any_call(streams[3])
+    for name, tensor in params:
+        torch.testing.assert_close(unpacked_tensors[name], tensor)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

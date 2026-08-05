@@ -14,6 +14,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from math import gcd
 from typing import Any, Iterator, Optional, Tuple
 
 import torch
@@ -30,7 +31,14 @@ from megatron.core.utils import StragglerDetector
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.megatron.common import (
+    _round_up_to_multiple,
+    _vlm_sp_repad_collapsed,
+)
+from nemo_rl.models.megatron.multimodal import (
+    collapse_multimodal_tokens,
+    is_llava_model,
+)
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -50,6 +58,9 @@ class ProcessedInputs:
     mtp_loss_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
+    use_llava_handoff: bool = False
+    original_input_ids: Optional[torch.Tensor] = None
+    original_input_lengths: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -72,6 +83,11 @@ class ProcessedMicrobatch:
             None when MTP is disabled or token/sample masks are absent.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
+        use_llava_handoff: Whether the model expects collapsed, unsharded token
+            ids and LLaVA-style multimodal tensors.
+        original_input_ids: Uncollapsed token ids used to align model outputs
+            with loss and logprob targets after LLaVA expands image tokens.
+        original_input_lengths: Valid lengths for ``original_input_ids``.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -84,6 +100,9 @@ class ProcessedMicrobatch:
     mtp_loss_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
+    use_llava_handoff: bool = False
+    original_input_ids: Optional[torch.Tensor] = None
+    original_input_lengths: Optional[torch.Tensor] = None
 
 
 def make_processed_microbatch_iterator(
@@ -97,6 +116,7 @@ def make_processed_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    model: Any = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -111,15 +131,34 @@ def make_processed_microbatch_iterator(
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
+        model: Optional Megatron model used to detect and prepare a LLaVA handoff.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
+    use_llava_handoff = bool(model is not None and is_llava_model(model))
 
     for data_dict in raw_iterator:
         # Move to GPU
         data_dict = data_dict.to("cuda")
+
+        original_input_ids: Optional[torch.Tensor] = None
+        original_input_lengths: Optional[torch.Tensor] = None
+        if use_llava_handoff:
+            original_input_ids = data_dict["input_ids"].clone()
+            if "input_lengths" in data_dict:
+                original_input_lengths = data_dict["input_lengths"].clone()
+
+            data_dict = collapse_multimodal_tokens(data_dict, model)
+
+        tokens_removed_per_sample = data_dict.pop("tokens_removed_per_sample", None)
+        vision_expansion_per_sample = data_dict.pop("vision_expansion_per_sample", None)
+        expansion_per_sample = (
+            vision_expansion_per_sample
+            if vision_expansion_per_sample is not None
+            else tokens_removed_per_sample
+        )
 
         # Process the microbatch
         processed_inputs = process_microbatch(
@@ -133,6 +172,11 @@ def make_processed_microbatch_iterator(
             delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
+            tokens_removed_per_sample=expansion_per_sample,
+            use_llava_handoff=use_llava_handoff,
+            policy_cfg=cfg,
+            original_input_ids=original_input_ids,
+            original_input_lengths=original_input_lengths,
         )
 
         yield ProcessedMicrobatch(
@@ -146,6 +190,9 @@ def make_processed_microbatch_iterator(
             mtp_loss_mask=processed_inputs.mtp_loss_mask,
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
+            use_llava_handoff=processed_inputs.use_llava_handoff,
+            original_input_ids=processed_inputs.original_input_ids,
+            original_input_lengths=processed_inputs.original_input_lengths,
         )
 
 
@@ -158,6 +205,7 @@ def get_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    model: Any = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -170,6 +218,7 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        model: Optional Megatron model used to prepare LLaVA-style microbatches.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -224,6 +273,7 @@ def get_microbatch_iterator(
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        model=model,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -261,6 +311,11 @@ def process_microbatch(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    tokens_removed_per_sample: Optional[torch.Tensor] = None,
+    use_llava_handoff: bool = False,
+    policy_cfg: Optional[dict[str, Any]] = None,
+    original_input_ids: Optional[torch.Tensor] = None,
+    original_input_lengths: Optional[torch.Tensor] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
@@ -288,6 +343,11 @@ def process_microbatch(
         mtp_loss_mask = None
 
         if pack_sequences:
+            if use_llava_handoff:
+                raise NotImplementedError(
+                    "LLaVA video handoff currently requires "
+                    "sequence_packing.enabled=false on this data path."
+                )
             # For packed sequences with padded input, we need sequence lengths
             assert seq_length_key is not None, (
                 "seq_length_key must be provided for packed sequences"
@@ -504,6 +564,30 @@ def process_microbatch(
                 position_ids = None
                 attention_mask = None
         else:
+            # LLaVA rebuilds the visual embedding sequence after token collapse.
+            # Re-pad in collapsed space so the expanded length is divisible by
+            # the shard factor used by sequence/context parallelism.
+            if policy_cfg is not None and tokens_removed_per_sample is not None:
+                megatron_cfg = policy_cfg.get("megatron_cfg", {}) or {}
+                sequence_parallel = bool(megatron_cfg.get("sequence_parallel", False))
+                tp_size = int(megatron_cfg.get("tensor_model_parallel_size", 1))
+                cp_size = int(megatron_cfg.get("context_parallel_size", 1))
+                divisor = tp_size if sequence_parallel and tp_size > 1 else 1
+                if cp_size > 1:
+                    cp_factor = cp_size * 2
+                    divisor = (
+                        (divisor * cp_factor) // gcd(divisor, cp_factor)
+                        if divisor > 1
+                        else cp_factor
+                    )
+                if divisor > 1:
+                    input_ids = _vlm_sp_repad_collapsed(
+                        input_ids,
+                        tokens_removed_per_sample,
+                        divisor,
+                    )
+                    data_dict["input_ids"] = input_ids
+
             if routed_experts is not None:
                 if "input_lengths" not in data_dict:
                     raise ValueError(
@@ -558,6 +642,9 @@ def process_microbatch(
         mtp_loss_mask=mtp_loss_mask,
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
+        use_llava_handoff=use_llava_handoff,
+        original_input_ids=original_input_ids,
+        original_input_lengths=original_input_lengths,
     )
 
 
