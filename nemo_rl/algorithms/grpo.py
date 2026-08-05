@@ -1733,6 +1733,33 @@ def get_idx_grouping(
     return prompt_ids_for_adv
 
 
+def extract_initial_prompt_messages(
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    prompt_lengths: torch.Tensor,
+) -> list[LLMMessageLogType | VLMMessageLogType]:
+    """Extract the initial prompt messages from each message log by token count.
+
+    Args:
+        message_logs: Batch of full conversation message logs (prompt + responses).
+        prompt_lengths: Per-sample prompt token counts.
+
+    Returns:
+        List of message lists containing only the prompt-portion messages.
+    """
+    result: list[LLMMessageLogType | VLMMessageLogType] = []
+    for message_log, prompt_len in zip(message_logs, prompt_lengths.tolist()):
+        prompt_len = int(prompt_len)
+        prompt_msgs: LLMMessageLogType | VLMMessageLogType = []
+        cumulative = 0
+        for msg in message_log:
+            if cumulative >= prompt_len:
+                break
+            prompt_msgs.append(msg)
+            cumulative += len(cast(torch.Tensor, msg["token_ids"]))
+        result.append(prompt_msgs)
+    return result
+
+
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
 ) -> None:

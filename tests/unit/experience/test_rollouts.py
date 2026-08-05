@@ -38,8 +38,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl, RolloutManager
 from nemo_rl.experience.rollouts import (
     _tokenize_env_observation,
