@@ -160,6 +160,28 @@ BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3r
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
+# The checkpoint, dataset and caches live outside the code snapshot, so their
+# filesystems have to be bind-mounted or they simply do not exist inside the
+# container. Transformers then treats an absent local path as a Hub repo id and
+# fails with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'",
+# which says nothing about mounts. Check here instead.
+for path_var in MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE; do
+    path_value="${!path_var}"
+    mounted=false
+    IFS=',' read -ra mount_specs <<< "${MOUNTS}"
+    for spec in "${mount_specs[@]}"; do
+        host_path="${spec%%:*}"
+        [[ -n "${host_path}" && "${path_value}" == "${host_path}"* ]] && mounted=true && break
+    done
+    if [[ "${mounted}" != true ]]; then
+        echo "Error: ${path_var}=${path_value}" >&2
+        echo "  is not under any path in MOUNTS, so it will not exist in the container." >&2
+        echo "  Add its filesystem to EXTRA_MOUNTS, e.g." >&2
+        echo "    EXTRA_MOUNTS=/host/path:/host/path,/other/path:/other/path" >&2
+        exit 1
+    fi
+done
+
 echo "========================================"
 echo " Experiment : ${EXP_NAME}"
 echo " Config     : ${CONFIG_PATH}"
