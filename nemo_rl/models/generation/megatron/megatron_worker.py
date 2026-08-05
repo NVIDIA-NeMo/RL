@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import asyncio
-import threading
 import gc
+import threading
 import time
 import warnings
 from typing import AsyncGenerator, Optional
