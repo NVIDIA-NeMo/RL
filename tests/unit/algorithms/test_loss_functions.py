@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -2707,6 +2708,35 @@ def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     ce_single = loss_fn._compute_ce(logits[:1], data_single, gvt_single)
 
     assert torch.allclose(ce_masked, ce_single, atol=1e-6)
+
+
+def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_windows(tmp_path):
+    """Precomputed CE sums contiguous CP-window contributions exactly once."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    data = BatchedDataDict({"sample_mask": torch.ones(1)})
+    next_token_logprobs = torch.tensor([[-1.0, -2.0]])
+    next_token_mask = torch.ones_like(next_token_logprobs)
+    cp_group = object()
+
+    with patch(
+        "nemo_rl.algorithms.loss.loss_functions.group_all_reduce_sum_with_grad",
+        side_effect=lambda value, group: value,
+    ) as reduce_sum:
+        ce = loss_fn._compute_ce(
+            torch.empty(0),
+            data,
+            torch.tensor(2.0),
+            student_next_token_logprobs=next_token_logprobs,
+            student_next_token_mask=next_token_mask,
+            cp_group=cp_group,
+        )
+
+    torch.testing.assert_close(ce, torch.tensor(1.5))
+    reduced_value, reduced_group = reduce_sum.call_args.args
+    torch.testing.assert_close(reduced_value, torch.tensor(1.5))
+    assert reduced_group is cp_group
 
 
 # ── Metric-normalization advertisement (PR #2683) ─────────────────────────

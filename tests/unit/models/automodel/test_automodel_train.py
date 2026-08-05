@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
 
 try:
     import nemo_automodel  # noqa: F401
@@ -34,6 +35,7 @@ from nemo_rl.models.automodel.data import (
     make_processed_microbatch_iterator,
 )
 from nemo_rl.models.automodel.train import (
+    PreparedModelForward,
     LogprobsPostProcessor,
     LossPostProcessor,
     ScorePostProcessor,
@@ -43,7 +45,26 @@ from nemo_rl.models.automodel.train import (
     extract_logits,
     forward_with_post_processing_fn,
     model_forward,
+    prepare_model_forward,
 )
+
+
+def _prepare_cp1(
+    model: Any,
+    processed_inputs: ProcessedInputs,
+    *,
+    is_reward_model: bool = False,
+    allow_flash_attn_args: bool = True,
+) -> PreparedModelForward:
+    return prepare_model_forward(
+        model,
+        processed_inputs,
+        device_mesh=None,
+        cp_size=1,
+        padding_token_id=0,
+        is_reward_model=is_reward_model,
+        allow_flash_attn_args=allow_flash_attn_args,
+    )
 
 
 @pytest.fixture
@@ -109,8 +130,6 @@ def processed_inputs_no_flash():
         position_ids=torch.arange(64).repeat(4, 1),
         flash_attn_kwargs={},
         vlm_kwargs={},
-        cp_buffers=[],
-        seq_index=None,
     )
 
 
@@ -128,8 +147,6 @@ def processed_inputs_with_flash():
         position_ids=torch.arange(128).unsqueeze(0),
         flash_attn_kwargs=flash_kwargs,
         vlm_kwargs={},
-        cp_buffers=[],
-        seq_index=None,
     )
 
 
@@ -142,8 +159,6 @@ def processed_inputs_multimodal():
         position_ids=None,
         flash_attn_kwargs={},
         vlm_kwargs={"pixel_values": torch.randn(2, 3, 224, 224)},
-        cp_buffers=[],
-        seq_index=None,
     )
 
 
@@ -153,7 +168,8 @@ def processed_inputs_multimodal():
 @pytest.mark.automodel
 class TestModelForward:
     def test_basic_forward(self, mock_model, processed_inputs_no_flash):
-        result = model_forward(mock_model, processed_inputs_no_flash)
+        prepared = _prepare_cp1(mock_model, processed_inputs_no_flash)
+        model_forward(mock_model, prepared.model_batch)
 
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
@@ -165,14 +181,16 @@ class TestModelForward:
     def test_forward_with_flash_attention(
         self, mock_model, processed_inputs_with_flash
     ):
-        result = model_forward(mock_model, processed_inputs_with_flash)
+        prepared = _prepare_cp1(mock_model, processed_inputs_with_flash)
+        model_forward(mock_model, prepared.model_batch)
 
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" in call_kwargs
 
     def test_forward_with_multimodal(self, mock_model, processed_inputs_multimodal):
-        result = model_forward(mock_model, processed_inputs_multimodal)
+        prepared = _prepare_cp1(mock_model, processed_inputs_multimodal)
+        model_forward(mock_model, prepared.model_batch)
 
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
@@ -334,9 +352,10 @@ class TestModelForward:
     def test_forward_reward_model_removes_flash_attn(
         self, mock_model, processed_inputs_with_flash
     ):
-        result = model_forward(
+        prepared = _prepare_cp1(
             mock_model, processed_inputs_with_flash, is_reward_model=True
         )
+        model_forward(mock_model, prepared.model_batch)
 
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
@@ -346,9 +365,12 @@ class TestModelForward:
     def test_forward_disallow_flash_attn_args(
         self, mock_model, processed_inputs_with_flash
     ):
-        result = model_forward(
-            mock_model, processed_inputs_with_flash, allow_flash_attn_args=False
+        prepared = _prepare_cp1(
+            mock_model,
+            processed_inputs_with_flash,
+            allow_flash_attn_args=False,
         )
+        model_forward(mock_model, prepared.model_batch)
 
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
@@ -360,7 +382,8 @@ class TestModelForward:
         # Gemma 4 needs mm_token_type_ids even for text-only inputs.
         mock_model.config.model_type = "gemma4"
 
-        result = model_forward(mock_model, processed_inputs_no_flash)
+        prepared = _prepare_cp1(mock_model, processed_inputs_no_flash)
+        model_forward(mock_model, prepared.model_batch)
 
         call_kwargs = mock_model.call_args[1]
         assert "mm_token_type_ids" in call_kwargs
@@ -374,7 +397,8 @@ class TestModelForward:
     ):
         mock_model.config.model_type = "llama"
 
-        result = model_forward(mock_model, processed_inputs_no_flash)
+        prepared = _prepare_cp1(mock_model, processed_inputs_no_flash)
+        model_forward(mock_model, prepared.model_batch)
 
         call_kwargs = mock_model.call_args[1]
         assert "mm_token_type_ids" not in call_kwargs
@@ -462,9 +486,7 @@ class TestLossPostProcessor:
         processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -489,6 +511,7 @@ class TestLossPostProcessor:
             processed_inputs=processed_inputs_no_flash,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            cp_sharder=None,
         )
 
         # Verify loss function was called
@@ -517,9 +540,7 @@ class TestLossPostProcessor:
         processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
             enable_seq_packing=True,
@@ -545,6 +566,7 @@ class TestLossPostProcessor:
             processed_inputs=processed_inputs_with_flash,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            cp_sharder=None,
         )
 
         # Verify SequencePackingLossWrapper was created
@@ -563,9 +585,7 @@ class TestLossPostProcessor:
         processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=2,
             dp_size=4,
         )
@@ -614,10 +634,6 @@ class TestLogprobsPostProcessor:
     ):
         processor = LogprobsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
-            cp_size=1,
         )
 
         batch_size = 4
@@ -636,8 +652,6 @@ class TestLogprobsPostProcessor:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         result = processor(
@@ -646,6 +660,7 @@ class TestLogprobsPostProcessor:
             processed_inputs=processed_inputs,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
+            cp_sharder=None,
         )
 
         assert result.shape == (batch_size, seq_len)
@@ -656,10 +671,6 @@ class TestLogprobsPostProcessor:
         cfg_with_chunk = {**base_cfg, "logprob_chunk_size": 16}
         processor = LogprobsPostProcessor(
             cfg=cfg_with_chunk,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
-            cp_size=1,
         )
 
         batch_size = 4
@@ -678,8 +689,6 @@ class TestLogprobsPostProcessor:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         result = processor(
@@ -688,6 +697,7 @@ class TestLogprobsPostProcessor:
             processed_inputs=processed_inputs,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
+            cp_sharder=None,
         )
 
         assert result.shape == (batch_size, seq_len)
@@ -702,10 +712,7 @@ class TestTopkLogitsPostProcessor:
         k = 10
         processor = TopkLogitsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
             tp_mesh=mock_tp_mesh,
-            cp_size=1,
             k=k,
         )
 
@@ -724,8 +731,6 @@ class TestTopkLogitsPostProcessor:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         vals, idx = processor(
@@ -734,6 +739,7 @@ class TestTopkLogitsPostProcessor:
             processed_inputs=processed_inputs,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
+            cp_sharder=None,
         )
 
         assert vals.shape == (batch_size, seq_len, k)
@@ -801,7 +807,6 @@ class TestMakeProcessedMicrobatchIterator:
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         results = list(processed_iterator)
@@ -865,27 +870,6 @@ class TestCheckSequenceDim:
 # =====================
 @pytest.mark.automodel
 class TestProcessedInputsProperties:
-    def test_has_context_parallel_false(self, processed_inputs_no_flash):
-        assert processed_inputs_no_flash.has_context_parallel is False
-
-    def test_has_context_parallel_true(self):
-        input_ids = torch.randint(0, 1000, (2, 128))
-        position_ids = torch.arange(128).repeat(2, 1)
-        seq_index = torch.arange(128).repeat(1, 1)
-
-        processed = ProcessedInputs(
-            input_ids=input_ids,
-            seq_len=128,
-            attention_mask=torch.ones(2, 128, dtype=torch.bool),
-            position_ids=position_ids,
-            flash_attn_kwargs={},
-            vlm_kwargs={},
-            cp_buffers=[input_ids, position_ids, seq_index],
-            seq_index=seq_index,
-        )
-
-        assert processed.has_context_parallel is True
-
     def test_has_flash_attention_false(self, processed_inputs_no_flash):
         assert processed_inputs_no_flash.has_flash_attention is False
 
@@ -926,8 +910,6 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -951,9 +933,7 @@ class TestForwardWithPostProcessingFn:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -961,6 +941,7 @@ class TestForwardWithPostProcessingFn:
         # Call forward_with_post_processing_fn
         _, _, returned_mb = forward_with_post_processing_fn(
             model=mock_model,
+            prepared=_prepare_cp1(mock_model, processed_inputs),
             post_processing_fn=loss_post_processor,
             processed_mb=processed_mb,
             global_valid_seqs=torch.tensor(batch_size),
@@ -997,8 +978,6 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1024,9 +1003,9 @@ class TestForwardWithPostProcessingFn:
         # Call forward_with_post_processing_fn
         result, metrics, _ = forward_with_post_processing_fn(
             model=mock_model,
+            prepared=_prepare_cp1(mock_model, processed_inputs, is_reward_model=True),
             post_processing_fn=score_post_processor,
             processed_mb=processed_mb,
-            is_reward_model=True,
         )
 
         # Verify model was called
@@ -1066,8 +1045,6 @@ class TestAutomodelForwardBackward:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1091,9 +1068,7 @@ class TestAutomodelForwardBackward:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -1103,6 +1078,9 @@ class TestAutomodelForwardBackward:
             model=mock_model,
             data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size),
             global_valid_toks=torch.tensor(batch_size * seq_len),
@@ -1140,8 +1118,6 @@ class TestAutomodelForwardBackward:
                 position_ids=torch.arange(seq_len).repeat(batch_size, 1),
                 flash_attn_kwargs={},
                 vlm_kwargs={},
-                cp_buffers=[],
-                seq_index=None,
             )
 
             data_dict = BatchedDataDict(
@@ -1165,9 +1141,7 @@ class TestAutomodelForwardBackward:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -1177,6 +1151,9 @@ class TestAutomodelForwardBackward:
             model=mock_model,
             data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),
             global_valid_toks=torch.tensor(batch_size * seq_len * num_microbatches),
@@ -1191,8 +1168,10 @@ class TestAutomodelForwardBackward:
         # Verify loss function was called num_microbatches times
         assert mock_loss_fn.call_count == num_microbatches
 
-    def test_forward_backward_with_train_context_fn(
+    @patch("nemo_rl.models.automodel.train.prepare_model_forward")
+    def test_forward_backward_enters_prepared_and_autocast_contexts(
         self,
+        mock_prepare_model_forward,
         mock_model,
         mock_loss_fn,
         base_cfg,
@@ -1200,7 +1179,7 @@ class TestAutomodelForwardBackward:
         mock_cp_mesh,
         mock_tp_mesh,
     ):
-        """Test automodel_forward_backward with train_context_fn callback."""
+        """The loop enters the Automodel and worker precision contexts."""
         batch_size = 4
         seq_len = 64
         vocab_size = 32000
@@ -1214,8 +1193,6 @@ class TestAutomodelForwardBackward:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1239,41 +1216,50 @@ class TestAutomodelForwardBackward:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
 
-        # Track context manager calls
         context_calls = []
 
         class MockContext:
+            def __init__(self, name):
+                self.name = name
+
             def __enter__(self):
-                context_calls.append("enter")
+                context_calls.append(f"{self.name}_enter")
                 return self
 
             def __exit__(self, *args):
-                context_calls.append("exit")
+                context_calls.append(f"{self.name}_exit")
                 return False
 
-        def mock_train_context_fn(processed_inputs):
-            return MockContext()
+        mock_prepare_model_forward.return_value = PreparedModelForward(
+            model_batch={"input_ids": input_ids, "use_cache": False},
+            cp_size=1,
+            cp_sharder=None,
+            model_context_factory=lambda: MockContext("model"),
+        )
 
-        # Call automodel_forward_backward with train_context_fn
         results = automodel_forward_backward(
             model=mock_model,
             data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=lambda: MockContext("autocast"),
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size),
             global_valid_toks=torch.tensor(batch_size * seq_len),
-            train_context_fn=mock_train_context_fn,
         )
 
-        # Verify context manager was called
-        assert context_calls == ["enter", "exit"]
+        assert context_calls == [
+            "model_enter",
+            "autocast_enter",
+            "autocast_exit",
+            "model_exit",
+        ]
         assert len(results) == 1
 
     def test_forward_backward_with_on_microbatch_start(
@@ -1302,8 +1288,6 @@ class TestAutomodelForwardBackward:
                 position_ids=torch.arange(seq_len).repeat(batch_size, 1),
                 flash_attn_kwargs={},
                 vlm_kwargs={},
-                cp_buffers=[],
-                seq_index=None,
             )
 
             data_dict = BatchedDataDict(
@@ -1327,9 +1311,7 @@ class TestAutomodelForwardBackward:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -1345,6 +1327,9 @@ class TestAutomodelForwardBackward:
             model=mock_model,
             data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),
             global_valid_toks=torch.tensor(batch_size * seq_len * num_microbatches),
@@ -1382,8 +1367,6 @@ class TestAutomodelForwardBackward:
                 position_ids=torch.arange(seq_len).repeat(batch_size, 1),
                 flash_attn_kwargs={},
                 vlm_kwargs={},
-                cp_buffers=[],
-                seq_index=None,
             )
 
             data_dict = BatchedDataDict(
@@ -1407,9 +1390,7 @@ class TestAutomodelForwardBackward:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -1419,6 +1400,9 @@ class TestAutomodelForwardBackward:
             model=mock_model,
             data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_valid_microbatches),
             global_valid_toks=torch.tensor(
@@ -1462,8 +1446,6 @@ class TestForwardWithPostProcessingFnAdditional:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1486,15 +1468,12 @@ class TestForwardWithPostProcessingFnAdditional:
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
-            cp_size=1,
         )
 
         # Call forward_with_post_processing_fn
         result, metrics, returned_mb = forward_with_post_processing_fn(
             model=mock_model,
+            prepared=_prepare_cp1(mock_model, processed_inputs),
             post_processing_fn=logprobs_post_processor,
             processed_mb=processed_mb,
         )
@@ -1534,8 +1513,6 @@ class TestForwardWithPostProcessingFnAdditional:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1558,16 +1535,14 @@ class TestForwardWithPostProcessingFnAdditional:
         # Create topk post-processor
         topk_post_processor = TopkLogitsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
             tp_mesh=mock_tp_mesh,
-            cp_size=1,
             k=k,
         )
 
         # Call forward_with_post_processing_fn
         result, metrics, _ = forward_with_post_processing_fn(
             model=mock_model,
+            prepared=_prepare_cp1(mock_model, processed_inputs),
             post_processing_fn=topk_post_processor,
             processed_mb=processed_mb,
         )
@@ -1603,8 +1578,6 @@ class TestForwardWithPostProcessingFnAdditional:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1634,6 +1607,7 @@ class TestForwardWithPostProcessingFnAdditional:
         with pytest.raises(TypeError, match="Unknown post-processing function type"):
             forward_with_post_processing_fn(
                 model=mock_model,
+                prepared=_prepare_cp1(mock_model, processed_inputs),
                 post_processing_fn=unknown_post_processor,
                 processed_mb=processed_mb,
             )
@@ -1661,8 +1635,6 @@ class TestForwardWithPostProcessingFnAdditional:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -1686,9 +1658,7 @@ class TestForwardWithPostProcessingFnAdditional:
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -1696,6 +1666,7 @@ class TestForwardWithPostProcessingFnAdditional:
         # Call forward_with_post_processing_fn with processed_mb directly (no iterator)
         _, _, returned_mb = forward_with_post_processing_fn(
             model=mock_model,
+            prepared=_prepare_cp1(mock_model, processed_inputs),
             post_processing_fn=loss_post_processor,
             processed_mb=processed_mb,  # Directly provided
             global_valid_seqs=torch.tensor(batch_size),
@@ -1710,138 +1681,6 @@ class TestForwardWithPostProcessingFnAdditional:
 
 
 # =====================
-# Test redistribute_logits_for_cp
-# =====================
-@pytest.mark.automodel
-class TestRedistributeLogitsForCP:
-    def test_redistribute_regular_tensor(self, mock_device_mesh, mock_cp_mesh):
-        """Test redistribute_logits_for_cp with regular tensor input."""
-        from nemo_rl.models.automodel.train import redistribute_logits_for_cp
-
-        batch_size = 4
-        seq_len = 64
-        vocab_size = 32000
-
-        logits = torch.randn(batch_size, seq_len, vocab_size)
-
-        # Mock device_mesh to return cp_mesh
-        mock_device_mesh.__getitem__ = MagicMock(return_value=mock_cp_mesh)
-
-        with patch(
-            "nemo_rl.models.automodel.train.DTensor.from_local"
-        ) as mock_from_local:
-            mock_dtensor = MagicMock()
-            mock_from_local.return_value = mock_dtensor
-
-            result = redistribute_logits_for_cp(
-                logits, mock_device_mesh, mock_cp_mesh, sequence_dim=1
-            )
-
-            # Verify DTensor.from_local was called with correct args
-            mock_from_local.assert_called_once()
-            call_args = mock_from_local.call_args
-            assert torch.equal(call_args[0][0], logits)
-
-    def test_redistribute_dtensor_input(self, mock_device_mesh, mock_cp_mesh):
-        """Test redistribute_logits_for_cp with DTensor input."""
-        from nemo_rl.models.automodel.train import redistribute_logits_for_cp
-
-        batch_size = 4
-        seq_len = 64
-        vocab_size = 32000
-
-        # Create mock DTensor
-        mock_dtensor = MagicMock(spec=DTensor)
-        mock_dtensor.to_local.return_value = torch.randn(
-            batch_size, seq_len, vocab_size
-        )
-
-        # Mock device_mesh properties
-        mock_tp_mesh = MagicMock()
-        mock_tp_mesh.ndim = 1
-        mock_tp_mesh.mesh_dim_names = ["tp"]
-        mock_dtensor.device_mesh = mock_tp_mesh
-
-        mock_device_mesh.__getitem__ = MagicMock(return_value=mock_cp_mesh)
-
-        with patch(
-            "nemo_rl.models.automodel.train.DTensor.from_local"
-        ) as mock_from_local:
-            mock_result_dtensor = MagicMock()
-            mock_from_local.return_value = mock_result_dtensor
-
-            result = redistribute_logits_for_cp(
-                mock_dtensor, mock_device_mesh, mock_cp_mesh, sequence_dim=1
-            )
-
-            # Verify to_local was called
-            mock_dtensor.to_local.assert_called_once()
-
-            # Verify DTensor.from_local was called
-            mock_from_local.assert_called_once()
-
-
-# =====================
-# Test prepare_data_for_cp
-# =====================
-@pytest.mark.automodel
-class TestPrepareDataForCP:
-    def test_prepare_data_for_cp(self, mock_cp_mesh):
-        """Test prepare_data_for_cp function."""
-        from nemo_rl.models.automodel.train import prepare_data_for_cp
-
-        batch_size = 4
-        seq_len = 64
-        vocab_size = 32000
-
-        # Create input data
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
-        position_ids = torch.arange(seq_len).repeat(batch_size, 1)
-        seq_index = torch.arange(seq_len).unsqueeze(0)
-
-        # Create processed inputs with cp_buffers
-        processed_inputs = ProcessedInputs(
-            input_ids=input_ids,
-            seq_len=seq_len,
-            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
-            position_ids=position_ids,
-            flash_attn_kwargs={},
-            vlm_kwargs={},
-            cp_buffers=[input_ids, position_ids],
-            seq_index=seq_index,
-        )
-
-        # Create data dict
-        mb = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "position_ids": position_ids,
-                "other_tensor": torch.ones(batch_size, seq_len),
-            }
-        )
-
-        with patch(
-            "nemo_rl.models.automodel.train.DTensor.from_local"
-        ) as mock_from_local:
-            # Mock DTensor behavior
-            mock_dtensor = MagicMock()
-            mock_full_tensor = MagicMock()
-            mock_full_tensor.squeeze.return_value = seq_index.squeeze(0)
-            mock_dtensor.full_tensor.return_value = mock_full_tensor
-            mock_from_local.return_value = mock_dtensor
-
-            seq_index_result, updated_mb = prepare_data_for_cp(
-                mb, processed_inputs, mock_cp_mesh, sequence_dim=1
-            )
-
-            # Verify seq_index was added to mb
-            assert "seq_index" in updated_mb
-
-            # Verify DTensor.from_local was called for cp_buffers
-            assert mock_from_local.call_count >= 1
-
-
-# =====================
 # Test LogprobsPostProcessor with sequence packing
 # =====================
 @pytest.mark.automodel
@@ -1852,10 +1691,6 @@ class TestLogprobsPostProcessorSeqPacking:
         """Test LogprobsPostProcessor with sequence packing enabled."""
         processor = LogprobsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
-            cp_size=1,
             enable_seq_packing=True,
         )
 
@@ -1884,8 +1719,6 @@ class TestLogprobsPostProcessorSeqPacking:
             position_ids=torch.arange(packed_seq_len).unsqueeze(0),
             flash_attn_kwargs=flash_kwargs,
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         result = processor(
@@ -1894,6 +1727,7 @@ class TestLogprobsPostProcessorSeqPacking:
             processed_inputs=processed_inputs,
             original_batch_size=original_batch_size,
             original_seq_len=original_seq_len,
+            cp_sharder=None,
         )
 
         # Result should be unpacked to original shape
@@ -1905,10 +1739,6 @@ class TestLogprobsPostProcessorSeqPacking:
         """Test LogprobsPostProcessor applies mask when sequence packing is disabled."""
         processor = LogprobsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
-            cp_size=1,
         )
 
         batch_size = 4
@@ -1927,8 +1757,6 @@ class TestLogprobsPostProcessorSeqPacking:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         result = processor(
@@ -1937,6 +1765,7 @@ class TestLogprobsPostProcessorSeqPacking:
             processed_inputs=processed_inputs,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
+            cp_sharder=None,
         )
 
         # Verify result shape
@@ -1960,10 +1789,7 @@ class TestTopkLogitsPostProcessorSeqPacking:
         k = 10
         processor = TopkLogitsPostProcessor(
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
             tp_mesh=mock_tp_mesh,
-            cp_size=1,
             k=k,
             enable_seq_packing=True,
         )
@@ -1992,8 +1818,6 @@ class TestTopkLogitsPostProcessorSeqPacking:
             position_ids=torch.arange(packed_seq_len).unsqueeze(0),
             flash_attn_kwargs=flash_kwargs,
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         vals, idx = processor(
@@ -2002,6 +1826,7 @@ class TestTopkLogitsPostProcessorSeqPacking:
             processed_inputs=processed_inputs,
             original_batch_size=original_batch_size,
             original_seq_len=original_seq_len,
+            cp_sharder=None,
         )
 
         # Result should be unpacked to original shape
@@ -2051,8 +1876,6 @@ class TestAutomodelForwardBackwardWithGradients:
             position_ids=torch.arange(seq_len).repeat(batch_size, 1),
             flash_attn_kwargs={},
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         # Create data dict
@@ -2083,9 +1906,7 @@ class TestAutomodelForwardBackwardWithGradients:
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
         )
@@ -2098,6 +1919,9 @@ class TestAutomodelForwardBackwardWithGradients:
             model=model,
             data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
             forward_only=False,  # Enable backward pass
             global_valid_seqs=torch.tensor(batch_size),
             global_valid_toks=torch.tensor(batch_size * seq_len),
