@@ -17,16 +17,23 @@ policy:
       # acceleration while avoiding the captured full-forward replay path.
       compilation_config:
         cudagraph_mode: PIECEWISE
-#
-# Speculative decoding is NOT configured here. Drive it with
-# ENABLE_MTP_INFERENCE=1, which is the in-tree recipe in super_launch.sh:
-# it sets speculative_config.{method,num_speculative_tokens} plus the
-# Mamba-specific settings this model needs -- mamba_cache_mode=align for
-# rolling back SSM state on rejected draft tokens, chunked prefill, and a
-# reduced max_num_batched_tokens. Keeping it in one place avoids two
-# sources of truth, and that recipe is written against this container's
-# vLLM (the reference tree's block sets speculative_config.attention_backend,
-# a field this vLLM's SpeculativeConfig rejects).
+      # MTP speculative decoding. Only method and num_speculative_tokens are
+      # set: this container's vLLM SpeculativeConfig has no attention_backend
+      # field and rejects it, and the backend is already selected globally by
+      # vllm_kwargs.attention_backend.
+      speculative_config:
+        method: mtp
+        num_speculative_tokens: 5
+      # Super is a hybrid Mamba model, so the recurrent SSM state must roll back
+      # when draft tokens are rejected. MambaCacheMode defaults to "none";
+      # "align" is what makes rejection correct for this model.
+      mamba_cache_mode: align
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+    vllm_cfg:
+      # Off for this configuration, matching the reference. Not the remedy for
+      # the MTP+bad_words cudagraph crash -- PIECEWISE above is.
+      enable_prefix_caching: false
 checkpointing:
   checkpoint_dir: results/nemotron-super-omni-async-gym-mtp-specdec
   save_period: 5
