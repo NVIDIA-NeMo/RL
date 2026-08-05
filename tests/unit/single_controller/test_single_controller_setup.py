@@ -438,24 +438,23 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
     def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
-        """Colocated vLLM records vllm+policy+collective+total keys, parallel disabled."""
+        """Colocated vLLM records vllm+policy+collective+total fields, parallel disabled."""
         mc = _make_master_config(colocated=True, backend="vllm")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        for key in (
+        for field in (
             "vllm_init_time_s",
             "policy_init_time_s",
             "collective_init_time_s",
             "total_setup_time_s",
             "other_setup_time_s",
         ):
-            assert key in metrics, f"missing {key} in {metrics}"
-            assert metrics[key] >= 0
-        assert metrics["parallel_init_enabled"] == 0.0
-        assert "parallel_wall_time_s" not in metrics
-        # Order-of-phases sanity: worker_init_complete <= total.
-        assert metrics["other_setup_time_s"] >= 0
+            value = getattr(metrics, field)
+            assert value is not None, f"missing {field} on {metrics}"
+            assert value >= 0
+        assert metrics.parallel_init_enabled == 0.0
+        assert metrics.parallel_wall_time_s is None
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records parallel_wall_time_s and parallel_init_enabled=1.0."""
@@ -463,20 +462,20 @@ class TestSetup:
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert metrics["parallel_init_enabled"] == 1.0
-        assert "parallel_wall_time_s" in metrics
-        assert metrics["parallel_wall_time_s"] >= 0
-        assert "vllm_init_time_s" in metrics
-        assert "policy_init_time_s" in metrics
+        assert metrics.parallel_init_enabled == 1.0
+        assert metrics.parallel_wall_time_s is not None
+        assert metrics.parallel_wall_time_s >= 0
+        assert metrics.vllm_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
 
     def test_setup_timing_uses_sglang_key_for_sglang_backend(self, patched_factories):
-        """Generation-init key follows the backend name (sglang_init_time_s)."""
+        """Generation-init field follows the backend name (sglang_init_time_s)."""
         mc = _make_master_config(colocated=True, backend="sglang")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert "sglang_init_time_s" in metrics
-        assert "vllm_init_time_s" not in metrics
+        assert metrics.sglang_init_time_s is not None
+        assert metrics.vllm_init_time_s is None
 
     def test_setup_timing_includes_nemo_gym_when_enabled(self, patched_factories):
         """nemo_gym_init_time_s appears when NeMo-Gym is spun up."""
@@ -496,7 +495,7 @@ class TestSetup:
         ):
             _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert "nemo_gym_init_time_s" in metrics
+        assert metrics.nemo_gym_init_time_s is not None
 
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):

@@ -43,6 +43,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -87,7 +88,7 @@ class SingleControllerActor:
         self,
         master_config: MasterConfig,
         actor_args: SingleControllerActorArgs,
-        setup_timing_metrics: dict[str, Any],
+        setup_timing_metrics: SetupTimingMetrics,
     ) -> None:
         """Initialize the SingleController actor.
 
@@ -129,7 +130,9 @@ class SingleControllerActor:
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
         self._logger.log_hyperparams(master_config.model_dump())
-        self._logger.log_metrics(setup_timing_metrics, step=0, prefix="timing/setup")
+        self._logger.log_metrics(
+            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+        )
         self._timer = Timer()
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.

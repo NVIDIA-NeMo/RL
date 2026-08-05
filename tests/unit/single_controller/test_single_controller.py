@@ -24,6 +24,7 @@ import torch
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -76,7 +77,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         controller_cls(
             master_config=master_config,
             actor_args=actor_args,
-            setup_timing_metrics={},
+            setup_timing_metrics=SetupTimingMetrics(),
         )
 
 
@@ -118,7 +119,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     controller_cls(
         master_config=master_config,
         actor_args=actor_args,
-        setup_timing_metrics={},
+        setup_timing_metrics=SetupTimingMetrics(),
     )
 
     logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
@@ -144,7 +145,7 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
         ),
         logger={},
     )
-    setup_metrics = {"vllm_init_time_s": 1.5, "policy_init_time_s": 2.5}
+    setup_metrics = SetupTimingMetrics(vllm_init_time_s=1.5, policy_init_time_s=2.5)
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
         dp_client=None,
@@ -168,7 +169,7 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
     )
 
     logger.log_metrics.assert_called_once_with(
-        setup_metrics, step=0, prefix="timing/setup"
+        setup_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
     )
 
 

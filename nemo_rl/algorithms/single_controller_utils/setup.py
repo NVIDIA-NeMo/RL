@@ -38,6 +38,10 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    SetupTimingMetrics,
+    print_setup_timing_summary,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
@@ -268,7 +272,7 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
-) -> tuple[SingleControllerActorArgs, dict[str, Any]]:
+) -> tuple[SingleControllerActorArgs, SetupTimingMetrics]:
     """Build the full SC actor args driver-side.
 
     Args:
@@ -359,7 +363,7 @@ def setup_single_controller(
     # Setup Clusters & Workers
     # ==========================
     setup_start_time = time.perf_counter()
-    setup_timing_metrics: dict[str, Any] = {}
+    setup_timing_metrics = SetupTimingMetrics()
     gen_backend = generation_config["backend"]
     gen_init_time_key = f"{gen_backend}_init_time_s"
 
@@ -381,9 +385,9 @@ def setup_single_controller(
         # comes up before the policy.
         generation, gen_time = _timed_build_generation()
         policy, policy_time = _timed_build_trainer()
-        setup_timing_metrics[gen_init_time_key] = gen_time
-        setup_timing_metrics["policy_init_time_s"] = policy_time
-        setup_timing_metrics["parallel_init_enabled"] = 0.0
+        setattr(setup_timing_metrics, gen_init_time_key, gen_time)
+        setup_timing_metrics.policy_init_time_s = policy_time
+        setup_timing_metrics.parallel_init_enabled = 0.0
     else:
         # Non-colocated: generation + policy run on disjoint GPUs, so
         # bring them up in parallel.
@@ -393,12 +397,12 @@ def setup_single_controller(
             policy_future = executor.submit(_timed_build_trainer)
             generation, gen_time = gen_future.result()
             policy, policy_time = policy_future.result()
-        setup_timing_metrics[gen_init_time_key] = gen_time
-        setup_timing_metrics["policy_init_time_s"] = policy_time
-        setup_timing_metrics["parallel_wall_time_s"] = (
+        setattr(setup_timing_metrics, gen_init_time_key, gen_time)
+        setup_timing_metrics.policy_init_time_s = policy_time
+        setup_timing_metrics.parallel_wall_time_s = (
             time.perf_counter() - parallel_start_time
         )
-        setup_timing_metrics["parallel_init_enabled"] = 1.0
+        setup_timing_metrics.parallel_init_enabled = 1.0
 
     # ==========================
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
@@ -421,7 +425,7 @@ def setup_single_controller(
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
-        setup_timing_metrics["nemo_gym_init_time_s"] = time.perf_counter() - t0
+        setup_timing_metrics.nemo_gym_init_time_s = time.perf_counter() - t0
 
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -442,7 +446,7 @@ def setup_single_controller(
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
     )
     weight_synchronizer.init_communicator()
-    setup_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 
     # ==========================
     # Setup Algorithm + Rollout Wiring
@@ -474,11 +478,11 @@ def setup_single_controller(
 
     # Print setup timing metrics
     total_setup_time = time.perf_counter() - setup_start_time
-    setup_timing_metrics["total_setup_time_s"] = total_setup_time
-    setup_timing_metrics["other_setup_time_s"] = (
+    setup_timing_metrics.total_setup_time_s = total_setup_time
+    setup_timing_metrics.other_setup_time_s = (
         total_setup_time - worker_init_complete_time
     )
-    _print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
 
     # Build actor args and return
     actor_args = SingleControllerActorArgs(
@@ -497,24 +501,3 @@ def setup_single_controller(
         partition_id=partition_id,
     )
     return actor_args, setup_timing_metrics
-
-
-def _print_setup_timing_summary(
-    metrics: dict[str, Any], gen_init_time_key: str
-) -> None:
-    """Log-style summary of setup-phase timings; mirrors grpo.py's block."""
-    print("\n▶ Worker Initialization Timing:")
-    gen_time = metrics.get(gen_init_time_key, 0)
-    if gen_time:
-        print(
-            f"  {gen_init_time_key.removesuffix('_init_time_s')} init: {gen_time:.1f}s"
-        )
-    policy_time = metrics.get("policy_init_time_s", 0)
-    if policy_time:
-        print(f"  Policy init: {policy_time:.1f}s")
-    nemo_gym_time = metrics.get("nemo_gym_init_time_s", 0)
-    if nemo_gym_time:
-        print(f"  NeMo-Gym init: {nemo_gym_time:.1f}s")
-    other_time = metrics.get("other_setup_time_s", 0)
-    print(f"  Other setup: {other_time:.1f}s")
-    print(f"  Total setup: {metrics.get('total_setup_time_s', 0):.1f}s", flush=True)
