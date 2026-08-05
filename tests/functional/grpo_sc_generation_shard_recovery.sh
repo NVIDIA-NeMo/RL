@@ -147,8 +147,22 @@ grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" || {
 # anyway, and the test reports a pass having never exercised recovery.
 # Retry: the actors are certainly up by train step 3, but a single query races Ray's
 # GCS write and one empty result would abort a run that is otherwise fine.
+# Each attempt is a full ray.init/shutdown of a few seconds, so this loop is also a
+# multi-second delay -- and on fast hardware the remaining steps can finish inside it.
+# Check the job on every attempt so "the run ended" is reported as itself rather than
+# surfacing later as the far more confusing "expected 2 generation actors, found 0".
 GEN_PIDS=()
 for _ in $(seq 1 10); do
+    if ! kill -0 $TRAIN_PID 2>/dev/null; then
+        echo "[recovery] FAIL: the run ended before a shard could be killed."
+        echo "[recovery] It reached step $KILL_AFTER_STEP, then finished or died while the"
+        echo "[recovery] harness was still locating the generation actors. If it completed"
+        echo "[recovery] all $MAX_STEPS steps, raise MAX_STEPS or lower KILL_AFTER_STEP --"
+        echo "[recovery] this hardware runs a step in seconds."
+        echo "[recovery] --- last 60 lines of the training log ---"
+        tail -60 "$RUN_LOG"
+        exit 1
+    fi
     mapfile -t GEN_PIDS < <(uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" 2>/dev/null | sort -n)
     (( ${#GEN_PIDS[@]} == GEN_GPUS )) && break
     sleep 3
@@ -164,6 +178,10 @@ if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     # Unfiltered on purpose. The previous diagnostic grepped for "ray::" and so printed
     # nothing precisely when the ray:: assumption was the thing that was wrong.
     ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//' | grep -i "eneration" | grep -v grep | head -20
+    echo "[recovery] --- last 60 lines of the training log ---"
+    # Without this the log says only "found 0 actors", which reads as a harness bug even
+    # when the real event is the training job ending. That cost a full debug round.
+    tail -60 "$RUN_LOG"
     exit 1
 fi
 VICTIM=${GEN_PIDS[0]}
