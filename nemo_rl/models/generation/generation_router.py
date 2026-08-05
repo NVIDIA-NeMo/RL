@@ -81,6 +81,14 @@ class ShardEntry:
     # A proven shard bypasses the age gate on re-add.
     proven: bool = False
     actor_handles: list[Any] = field(default_factory=list, repr=False)
+    # Internal vLLM RayWorkerProc actor handles (TP rank workers spawned by
+    # RayExecutorV2).  These are NOT children of actor_handles and survive
+    # ray.kill on the outer actors as zombies.  We kill them explicitly.
+    tp_worker_handles: list[Any] = field(default_factory=list, repr=False)
+    # OS PIDs of internal TP worker processes (multiproc_executor path).
+    # Populated when Ray handles are unavailable (single-node TP).
+    # Killed via os.kill dispatched to the right node on shard removal.
+    tp_worker_pids: list[int] = field(default_factory=list, repr=False)
     # SLURM node the shard ran on — used by add_shard to pin the replacement
     # actor back to the same node via NodeAffinitySchedulingStrategy.
     node_id: str = ""
@@ -298,7 +306,14 @@ class GenerationRouter:
             # event loop keeps serving health checks etc.
             loop = asyncio.get_running_loop()
 
+            tp_handles = list(entry.tp_worker_handles) if entry is not None else []
+
+            tp_pids = list(entry.tp_worker_pids) if entry is not None else []
+            shard_node_id = entry.node_id if entry is not None else ""
+
             def _kill_actors() -> None:
+                import os
+                import signal
                 import ray
 
                 for actor in actor_handles:
@@ -306,6 +321,35 @@ class GenerationRouter:
                         ray.kill(actor, no_restart=True)
                     except Exception as e:  # noqa: BLE001
                         print(f"[router] ray.kill on {shard_id} actor raised {e}", flush=True)
+                # Kill internal RayWorkerProc TP actors (RayExecutorV2 path).
+                for tp_actor in tp_handles:
+                    try:
+                        ray.kill(tp_actor, no_restart=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if tp_handles:
+                    print(
+                        f"[router] killed {len(tp_handles)} internal TP worker(s) for {shard_id}",
+                        flush=True,
+                    )
+                # Kill internal TP worker processes by PID (multiproc_executor
+                # path: subprocess workers survive outer actor kill as orphans).
+                if tp_pids:
+                    killed = 0
+                    for pid in tp_pids:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                            killed += 1
+                        except ProcessLookupError:
+                            pass  # already dead
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if killed:
+                        print(
+                            f"[router] killed {killed} TP worker process(es) "
+                            f"by PID for {shard_id}",
+                            flush=True,
+                        )
 
             await loop.run_in_executor(None, _kill_actors)
 
@@ -402,9 +446,10 @@ class GenerationRouter:
                 )
 
             try:
-                actor_handles, _pg, worker_indices, base_url = (
+                actor_handles, _tp_info, worker_indices, base_url = (
                     await loop.run_in_executor(None, _do_add)
                 )
+                tp_worker_handles, tp_worker_pids = _tp_info if isinstance(_tp_info, tuple) else (_tp_info or [], [])
             except Exception as e:  # noqa: BLE001 - bubble up a structured error
                 # If the gate was raised by the hook, drop it so refit
                 # isn't permanently wedged by a failed add_shard.
@@ -452,6 +497,8 @@ class GenerationRouter:
                     status="joining",
                     last_health_ok_at=time.monotonic(),
                     actor_handles=list(actor_handles),
+                    tp_worker_handles=list(tp_worker_handles),
+                    tp_worker_pids=list(tp_worker_pids),
                     node_id=new_node_id,
                     worker_indices=list(worker_indices),
                 )
@@ -1518,6 +1565,14 @@ class GenerationRouter:
             f"(shards={len(self._shards)}, ready={self.shard_count_ready()})",
             flush=True,
         )
+
+    async def _set_shard_tp_handles(self, shard_id: str, handles: list, pids: list = []) -> None:
+        """Store internal TP worker handles/PIDs on an existing shard entry."""
+        async with self._table_lock:
+            entry = self._shards.get(shard_id)
+            if entry is not None:
+                entry.tp_worker_handles = list(handles)
+                entry.tp_worker_pids = list(pids)
 
     def enable_health_polling(self) -> None:
         """Allow the health poller to start probing shards.

@@ -448,6 +448,41 @@ class FaultInjector:
             except Exception as e:  # noqa: BLE001
                 print(f"[fault-inject] ray.kill on {self.target_shard} raised {e}", flush=True)
 
+        # Kill internal TP workers — they survive the outer actor kill as
+        # GPU/NCCL zombies and block recovery from getting GPU resources.
+        # RayExecutorV2 path: kill via Ray actor handles.
+        tp_handles = getattr(entry, "tp_worker_handles", [])
+        for tp_actor in tp_handles:
+            try:
+                ray.kill(tp_actor, no_restart=True)
+            except Exception:  # noqa: BLE001
+                pass
+        if tp_handles:
+            print(
+                f"[fault-inject] killed {len(tp_handles)} internal TP worker(s) for {self.target_shard}",
+                flush=True,
+            )
+        # multiproc_executor path: kill orphaned subprocess workers by PID.
+        tp_pids = getattr(entry, "tp_worker_pids", [])
+        if tp_pids and not tp_handles:
+            import os
+            import signal
+            killed = 0
+            for pid in tp_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+                except ProcessLookupError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            if killed:
+                print(
+                    f"[fault-inject] killed {killed} TP worker process(es) "
+                    f"by PID for {self.target_shard}: {tp_pids}",
+                    flush=True,
+                )
+
         print(
             f"[fault-inject] ray.killed {len(entry.actor_handles)} actor(s) "
             f"for {self.target_shard}; health poll will detect and evict",

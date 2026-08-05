@@ -1026,10 +1026,28 @@ class VllmGeneration(GenerationInterface):
         # Use the unified placement group if we have the dead shard's bundle
         # info so the replacement claims the freed bundle slot immediately.
         pgs = self.cluster.get_placement_groups() if hasattr(self, "cluster") else []
-        target_pg = pgs[0] if pgs and dead_bundle_indices is not None else None
+        # Use dead_bundle_indices[0] as the PG index (pg_idx) so recovery lands
+        # on the SAME placement group as the dead shard — i.e. the same node.
+        # Using pgs[0] always picks the first gen PG (dp-0's node), which is
+        # wrong when the dead shard was on a different node (e.g. dp-1 on node B
+        # with pg_idx=1).  dead_bundle_indices = (pg_idx, [local_bundles]).
+        _pg_idx = dead_bundle_indices[0] if dead_bundle_indices is not None else 0
+        target_pg = (
+            pgs[_pg_idx]
+            if pgs and dead_bundle_indices is not None and _pg_idx < len(pgs)
+            else (pgs[0] if pgs and dead_bundle_indices is not None else None)
+        )
         # node_id scheduling is incompatible with PG placement; rely on the PG
         # bundle to pin the actor to the right node.
         effective_node_id = None if target_pg is not None else node_id
+
+        _t_spawn_start = time.monotonic()
+        print(
+            f"[add_dp_worker] starting recovery spawn: "
+            f"dp_shard_idx={dp_shard_idx} model_parallel_size={model_parallel_size} "
+            f"bundles={dead_bundle_indices[1] if dead_bundle_indices else 'default'}",
+            flush=True,
+        )
 
         actors: list[Any] = []
         names: list[str] = []
@@ -1046,9 +1064,16 @@ class VllmGeneration(GenerationInterface):
             else list(range(model_parallel_size))
         )
 
+        # Use the dead shard's original pg_idx as node_idx so configure_worker
+        # computes the same seed → same VLLM_CACHE_ROOT → warm torch.compile cache.
+        # dp_shard_idx would produce a different seed and a cold cache dir.
+        bi_node_idx = (
+            dead_bundle_indices[0] if dead_bundle_indices is not None else dp_shard_idx
+        )
+
         for local_rank in range(model_parallel_size):
             bi: Optional[tuple[int, list[int]]] = (
-                (dp_shard_idx, actual_bundles) if local_rank == 0 else None
+                (bi_node_idx, actual_bundles) if local_rank == 0 else None
             )
             # Map local_rank to the correct PG bundle index from the dead shard.
             if dead_bundle_indices is not None and local_rank < len(dead_bundle_indices[1]):
@@ -1071,29 +1096,42 @@ class VllmGeneration(GenerationInterface):
             names.append(name)
             bis.append(bi_resolved)
 
+        _t_actors_spawned = time.monotonic()
+        print(
+            f"[add_dp_worker] {len(actors)} actor(s) submitted to Ray "
+            f"({_t_actors_spawned - _t_spawn_start:.1f}s); "
+            f"waiting for model load + engine init ...",
+            flush=True,
+        )
+
         # Warm NCCL on the new actor while vLLM is still loading the model.
         # This hides the 15-20s lazy-init cost behind model-load time so the
         # first init_collective including this shard doesn't spike step time.
+        # For large models (30B+) with TP>1, __init__ can take 10-20 minutes,
+        # so these timeouts should be set generously via env vars.
+        _warmup_timeout = float(os.environ.get("NRL_ADD_SHARD_WARMUP_TIMEOUT_S", "60"))
+        _refit_timeout = float(os.environ.get("NRL_ADD_SHARD_REFIT_TIMEOUT_S", "1800"))
+        _url_timeout = float(os.environ.get("NRL_ADD_SHARD_URL_TIMEOUT_S", "1800"))
+
         is_async = self.cfg["vllm_cfg"]["async_engine"]
         try:
             warmup_method = getattr(
                 actors[0],
                 "warmup_nccl_library_async" if is_async else "warmup_nccl_library",
             )
-            ray.get(warmup_method.remote(), timeout=60)
+            ray.get(warmup_method.remote(), timeout=_warmup_timeout)
+            print(
+                f"[add_dp_worker] model loaded + NCCL warmed "
+                f"({time.monotonic() - _t_spawn_start:.1f}s from spawn)",
+                flush=True,
+            )
         except Exception as e:  # noqa: BLE001
-            print(f"[add_dp_worker] warmup_nccl_library failed (non-fatal): {e}", flush=True)
-
-        cached_info = getattr(self, "_cached_state_dict_info", None)
-        if cached_info is not None:
-            try:
-                refit_method = getattr(
-                    actors[0],
-                    "prepare_refit_info_async" if is_async else "prepare_refit_info",
-                )
-                ray.get(refit_method.remote(cached_info), timeout=300)
-            except Exception as e:
-                print(f"[add_dp_worker] prepare_refit_info failed: {e}", flush=True)
+            print(
+                f"[add_dp_worker] warmup_nccl_library timed out after {_warmup_timeout:.0f}s "
+                f"({time.monotonic() - _t_spawn_start:.1f}s from spawn); "
+                f"model still initializing in background (non-fatal): {e}",
+                flush=True,
+            )
 
         worker_indices: list[int] = []
         for i, (actor, name, bi) in enumerate(zip(actors, names, bis)):
@@ -1109,17 +1147,111 @@ class VllmGeneration(GenerationInterface):
             )
             worker_indices.append(new_idx)
 
+        print(
+            f"[add_dp_worker] shard registered in fleet "
+            f"({time.monotonic() - _t_spawn_start:.1f}s from spawn)",
+            flush=True,
+        )
+
+        # Dispatch prepare_refit_info via run_all_workers_single_data with
+        # restrict_to_indices so it uses the same Ray object-store path as the
+        # initial shards.  The direct actor.prepare_refit_info_async.remote()
+        # path goes through vLLM's collective_rpc → multiproc_executor →
+        # _convert_msgspec_args which mangled the state_dict args for some
+        # vLLM versions, causing a TypeError in the TP worker subprocess.
+        cached_info = getattr(self, "_cached_state_dict_info", None)
+        if cached_info is not None and worker_indices:
+            leader_idx = worker_indices[0]
+            method_name = (
+                "prepare_refit_info_async" if is_async else "prepare_refit_info"
+            )
+            try:
+                futures = self.worker_group.run_all_workers_single_data(
+                    method_name,
+                    state_dict_info=cached_info,
+                    run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                    restrict_to_indices={leader_idx},
+                )
+                ray.get(futures, timeout=_refit_timeout)
+                print(
+                    f"[add_dp_worker] prepare_refit_info complete "
+                    f"({time.monotonic() - _t_spawn_start:.1f}s from spawn)",
+                    flush=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[add_dp_worker] prepare_refit_info failed after {_refit_timeout:.0f}s "
+                    f"({time.monotonic() - _t_spawn_start:.1f}s from spawn): {e}",
+                    flush=True,
+                )
+
         base_url = None
         if self.cfg["vllm_cfg"]["async_engine"]:
             try:
                 base_url = ray.get(
-                    actors[0].report_dp_openai_server_base_url.remote(), timeout=120
+                    actors[0].report_dp_openai_server_base_url.remote(), timeout=_url_timeout
                 )
                 self.dp_openai_server_base_urls.append(base_url)
+                print(
+                    f"[add_dp_worker] base_url registered "
+                    f"({time.monotonic() - _t_spawn_start:.1f}s from spawn): {base_url}",
+                    flush=True,
+                )
             except Exception as e:
-                print(f"[add_dp_worker] base_url fetch failed: {e}", flush=True)
+                print(
+                    f"[add_dp_worker] base_url fetch failed after {_url_timeout:.0f}s "
+                    f"({time.monotonic() - _t_spawn_start:.1f}s from spawn): {e}",
+                    flush=True,
+                )
 
-        return actors, None, worker_indices, base_url
+        # Collect Ray handles (RayExecutorV2) and/or OS PIDs (multiproc_executor)
+        # for internal TP workers so the router can kill them on shard removal.
+        # Zombie TP processes hold GPU memory and block recovery spawning on
+        # the same bundles.
+        tp_worker_handles: list = []
+        tp_worker_pids: list = []
+        if is_async and self.tp_size > 1:
+            try:
+                tp_worker_handles = ray.get(
+                    actors[0].collect_tp_worker_handles_async.remote(),
+                    timeout=_warmup_timeout,
+                )
+                if tp_worker_handles:
+                    print(
+                        f"[add_dp_worker] collected {len(tp_worker_handles)} TP worker handle(s) "
+                        f"({time.monotonic() - _t_spawn_start:.1f}s from spawn)",
+                        flush=True,
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[add_dp_worker] collect_tp_worker_handles failed (non-fatal): {e}",
+                    flush=True,
+                )
+            if not tp_worker_handles:
+                # Fall back to PID collection (multiproc_executor / subprocess path).
+                try:
+                    tp_worker_pids = ray.get(
+                        actors[0].collect_tp_process_pids_async.remote(),
+                        timeout=_warmup_timeout,
+                    )
+                    if tp_worker_pids:
+                        print(
+                            f"[add_dp_worker] collected {len(tp_worker_pids)} TP worker PID(s) "
+                            f"({time.monotonic() - _t_spawn_start:.1f}s from spawn): {tp_worker_pids}",
+                            flush=True,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[add_dp_worker] collect_tp_process_pids failed (non-fatal): {e}",
+                        flush=True,
+                    )
+
+        print(
+            f"[add_dp_worker] done ({time.monotonic() - _t_spawn_start:.1f}s total)",
+            flush=True,
+        )
+        # Return TP handles and PIDs as a tuple in the second slot.
+        return actors, (tp_worker_handles, tp_worker_pids), worker_indices, base_url
 
     def _cordon_dead_workers(self) -> None:
         """Ping all DP leaders to find dead actors, mark them, and cordon router shards.
@@ -1550,6 +1682,39 @@ class VllmGeneration(GenerationInterface):
 
         # Cache so add_dp_worker can replay this on a newly-spawned worker.
         self._cached_state_dict_info = state_dict_info
+
+        # Collect internal RayWorkerProc handles for each initial shard so the
+        # router can kill them explicitly on shard removal.  Only needed when
+        # TP>1 with async vLLM (RayExecutorV2 creates separate Ray actors).
+        if (
+            self._router is not None
+            and self.cfg["vllm_cfg"]["async_engine"]
+            and self.tp_size > 1
+        ):
+            shard_ids = list(self._router._shards.keys())
+            leaders = list(self.worker_group.dp_leader_worker_indices)
+            for shard_id, leader_idx in zip(shard_ids, leaders):
+                try:
+                    leader_actor = self.worker_group.workers[leader_idx]
+                    tp_handles = ray.get(
+                        leader_actor.collect_tp_worker_handles_async.remote(),
+                        timeout=30.0,
+                    )
+                    tp_pids: list = []
+                    if not tp_handles:
+                        tp_pids = ray.get(
+                            leader_actor.collect_tp_process_pids_async.remote(),
+                            timeout=30.0,
+                        )
+                    self._router.call_async(
+                        self._router._set_shard_tp_handles(shard_id, tp_handles or [], tp_pids or [])
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[prepare_refit_info] collect_tp_worker_handles for {shard_id} "
+                        f"failed (non-fatal): {e}",
+                        flush=True,
+                    )
 
         # Enable health polling now that the full cluster is ready (model
         # loaded, refit info distributed).  The background event loop was

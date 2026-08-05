@@ -362,6 +362,35 @@ class VllmInternalWorkerExtension:
         import ray
         return ray.get_runtime_context().get_node_id()
 
+    def get_tp_worker_actor_handle(self) -> Any:
+        """Return this TP worker's own Ray actor handle (RayExecutorV2 path).
+
+        Called via ``collective_rpc`` on all TP ranks so the outer
+        ``VllmAsyncGenerationWorker`` can cache handles to every internal
+        ``RayWorkerProc`` actor.  These actors are NOT killed when the outer
+        actor is killed, so we need explicit handles to clean them up and
+        avoid GPU-memory / NCCL zombies that slow down shard recovery.
+
+        Returns ``None`` for subprocess-based executors (``multiproc_executor``);
+        callers should fall back to ``get_tp_worker_pid`` in that case.
+        """
+        import ray
+        try:
+            return ray.get_runtime_context().current_actor
+        except Exception:  # noqa: BLE001
+            return None
+
+    def get_tp_worker_pid(self) -> int:
+        """Return this TP worker's own OS process ID.
+
+        Works for both ``RayExecutorV2`` (Ray actor processes) and
+        ``multiproc_executor`` (subprocess workers).  PIDs can be killed
+        directly via ``os.kill`` from a process on the same node, which is
+        the correct fallback when ``get_tp_worker_actor_handle`` returns None.
+        """
+        import os
+        return os.getpid()
+
     def init_nccl_reshard_comm_group(
         self,
         rank_prefix: int,
