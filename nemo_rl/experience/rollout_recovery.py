@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Self, TypedDict, cast
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 
 
@@ -75,6 +75,7 @@ class RolloutRecoveryState(TypedDict):
     """Versioned envelope for the complete in-memory ledger."""
 
     schema_version: int
+    staging_partition: str
     groups: list[PromptGroupRecoveryState]
 
 
@@ -403,8 +404,10 @@ class RolloutRecoveryLedger:
         """Return the number of unfinished or retryable prompt groups."""
         return len(self._groups)
 
-    def state_dict(self) -> RolloutRecoveryState:
-        """Return a versioned, tensor-compatible checkpoint envelope."""
+    def state_dict(self, *, staging_partition: str) -> RolloutRecoveryState:
+        """Return a checkpoint envelope bound to one TQ staging partition."""
+        if not staging_partition:
+            raise ValueError("staging_partition must not be empty")
         groups: list[PromptGroupRecoveryState] = []
         for record in self._groups.values():
             groups.append(
@@ -437,16 +440,33 @@ class RolloutRecoveryLedger:
             )
         return {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "staging_partition": staging_partition,
             "groups": groups,
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> Self:
+    def from_state_dict(
+        cls,
+        state: dict[str, Any],
+        *,
+        expected_staging_partition: str,
+    ) -> Self:
         """Validate and restore a ledger checkpoint into a fresh instance."""
         if state.get("schema_version") != ROLLOUT_RECOVERY_SCHEMA_VERSION:
             raise ValueError(
                 "Unsupported rollout-recovery schema version: "
                 f"{state.get('schema_version')!r}"
+            )
+        staging_partition = state.get("staging_partition")
+        if not isinstance(staging_partition, str) or not staging_partition:
+            raise ValueError(
+                "rollout-recovery state must contain a non-empty staging_partition"
+            )
+        if staging_partition != expected_staging_partition:
+            raise ValueError(
+                "rollout-recovery staging partition does not match the current "
+                f"configuration: checkpoint={staging_partition!r}, "
+                f"expected={expected_staging_partition!r}"
             )
         raw_groups = state.get("groups")
         if not isinstance(raw_groups, list):

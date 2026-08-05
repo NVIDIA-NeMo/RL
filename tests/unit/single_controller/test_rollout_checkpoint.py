@@ -14,9 +14,11 @@
 
 import json
 from typing import Any, cast
+from unittest.mock import Mock, call
 
 import pytest
 
+from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     RolloutSnapshotManifest,
@@ -161,3 +163,32 @@ def test_resolver_fails_when_no_committed_snapshot_matches_anchor(tmp_path):
             expected_trainer_version=0,
             expected_bootstrap_fingerprint="fingerprint-v1",
         )
+
+
+def test_commit_snapshot_flushes_payload_before_publication(tmp_path, monkeypatch):
+    anchor = tmp_path / "step_1"
+    anchor.mkdir()
+    tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(anchor)
+    (tmp_snapshot / "payload").write_text("payload")
+    fsync_tree = Mock()
+    fsync_file = Mock()
+    fsync_directory = Mock()
+    monkeypatch.setattr(rollout_checkpoint, "_fsync_tree", fsync_tree)
+    monkeypatch.setattr(rollout_checkpoint, "_fsync_file", fsync_file)
+    monkeypatch.setattr(rollout_checkpoint, "_fsync_directory", fsync_directory)
+
+    commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=1)
+
+    fsync_tree.assert_called_once_with(tmp_snapshot)
+    assert fsync_file.call_args_list == [
+        call(tmp_snapshot / "COMMITTED"),
+        call(anchor / "rollout_snapshots" / "LATEST.tmp"),
+    ]
+    assert fsync_directory.call_args_list[:2] == [
+        call(tmp_snapshot),
+        call(anchor / "rollout_snapshots"),
+    ]
+    assert (final_snapshot / "COMMITTED").is_file()
+    assert (
+        anchor / "rollout_snapshots" / "LATEST"
+    ).read_text().strip() == final_snapshot.name

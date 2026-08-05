@@ -1260,6 +1260,45 @@ class TestGenerateAndFinalizeFlow:
         ]
         assert len(mgr.recovery_ledger) == 0
 
+    def test_recover_dropped_group_cleans_staging_and_releases_lineage(self):
+        buf = _FakeCaptureBuffer()
+        finalizer = _FakeFinalizer(dropped=True)
+        mgr = _make_capture_manager(buf, finalizer)
+        group = mgr.recovery_ledger.reserve_group(
+            group_id="recovery-g0",
+            prompt_id="42",
+            prompt_payload=_capture_sample(),
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=7,
+        )
+        mgr.recovery_ledger.mark_group_dispatched(group.group_id)
+        for sibling in group.siblings:
+            rollout_id = sibling.current_attempt.gate_rollout_id
+            mgr.recovery_ledger.mark_sibling_sealed(
+                group.group_id,
+                generation_index=sibling.generation_index,
+                gate_rollout_id=rollout_id,
+                receipt={
+                    "rollout_id": rollout_id,
+                    "manifest": [
+                        {"staging_key": f"stage-{sibling.generation_index}"}
+                    ],
+                },
+                reward=0.5,
+            )
+
+        committed = _run(mgr.recover_group(group.group_id))
+
+        assert committed is False
+        assert buf.commit_finalized_calls == []
+        assert buf.abort_finalized_calls == [(group.group_id, ["stage-0"])]
+        assert buf.abort_calls == [group.group_id]
+        assert len(mgr.recovery_ledger) == 0
+        assert mgr._env_handles["nemo_gym"].failed == [
+            (group.gate_rollout_ids, "finalizer_dropped")
+        ]
+
     def test_recover_partial_group_redispatches_only_missing_siblings(self):
         buf = _FakeCaptureBuffer()
         finalizer = _FakeFinalizer()

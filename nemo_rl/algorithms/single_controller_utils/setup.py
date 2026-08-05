@@ -255,6 +255,7 @@ def _maybe_restore_rollout_recovery_ledger(
     last_checkpoint_path: Optional[str],
     data_plane_checkpoint_metadata: Optional[dict[str, Any]],
     token_capture_enabled: bool,
+    expected_staging_partition: str,
 ) -> Optional[RolloutRecoveryLedger]:
     """Load and bind the rollout-recovery sidecar to the restored TQ cut."""
     if last_checkpoint_path is None:
@@ -290,7 +291,10 @@ def _maybe_restore_rollout_recovery_ledger(
             "Rollout-recovery sidecar must contain a state dictionary, "
             f"got {type(state).__name__}"
         )
-    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    ledger = RolloutRecoveryLedger.from_state_dict(
+        state,
+        expected_staging_partition=expected_staging_partition,
+    )
     expected_group_count = data_plane_checkpoint_metadata.get(
         "rollout_recovery_group_count"
     )
@@ -821,6 +825,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         token_capture_enabled=token_capture_cfg.enabled,
+        expected_staging_partition=token_capture_cfg.staging_partition,
     )
 
     # ==========================
