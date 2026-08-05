@@ -206,6 +206,7 @@ def _nemo_gym_eval_config(
                 "vllm_metrics_logger_interval": 0.5,
             },
         },
+        tokenizer={"name": "test-tokenizer"},
         data=NemoGymEvalDataConfig(
             dataset_name="NemoGymDataset",
             data_path="eval.jsonl",
@@ -251,6 +252,8 @@ def test_setup_nemo_gym_environment_uses_rollout_engine_endpoints(monkeypatch) -
         base_urls=["http://worker-0:8000/v1"],
         model_name="test-model",
         enable_router_replay=False,
+        routed_experts_dtype="int16",
+        use_fastokens=False,
     )
 
 
@@ -444,7 +447,7 @@ def test_nemo_gym_eval_logs_results_and_generation_metrics(monkeypatch) -> None:
         ),
     ]
     run_rollout = MagicMock(side_effect=rollout_results)
-    monkeypatch.setattr("nemo_rl.evals.eval.run_async_nemo_gym_rollout", run_rollout)
+    monkeypatch.setattr("nemo_rl.evals.eval.run_nemo_gym_rollout_sync", run_rollout)
     monkeypatch.setattr("nemo_rl.evals.eval._print_results", MagicMock())
     monkeypatch.setattr("nemo_rl.evals.eval.ray.get", lambda value: value)
     log_generation_metrics = MagicMock()
@@ -546,7 +549,7 @@ def test_nemo_gym_eval_tracks_multiple_generations_per_prompt(monkeypatch) -> No
         },
     )
     run_rollout = MagicMock(return_value=rollout_result)
-    monkeypatch.setattr("nemo_rl.evals.eval.run_async_nemo_gym_rollout", run_rollout)
+    monkeypatch.setattr("nemo_rl.evals.eval.run_nemo_gym_rollout_sync", run_rollout)
     monkeypatch.setattr("nemo_rl.evals.eval._print_results", MagicMock())
     monkeypatch.setattr("nemo_rl.evals.eval.ray.get", lambda value: value)
 
@@ -607,7 +610,7 @@ def test_nemo_gym_eval_rejects_incomplete_full_results(monkeypatch) -> None:
         },
     )
     monkeypatch.setattr(
-        "nemo_rl.evals.eval.run_async_nemo_gym_rollout",
+        "nemo_rl.evals.eval.run_nemo_gym_rollout_sync",
         MagicMock(return_value=rollout_result),
     )
     monkeypatch.setattr("nemo_rl.evals.eval.ray.get", lambda value: value)
