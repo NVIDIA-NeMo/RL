@@ -595,81 +595,24 @@ class GenerationRouter:
                         if s.status in ("ready", "joining", "cordoned")
                         and s.url  # skip shards with no HTTP server
                     ]
-                if not targets:
+                if targets:
+                    results = await asyncio.gather(
+                        *(self._probe(self._http_session, url, timeout) for _, url, _ in targets),
+                        return_exceptions=False,
+                    )
+                    async with self._table_lock:
+                        nccl_paused = self._nccl_reinit_in_progress
+                        n_alive_or_joining = self.shard_count_alive_for_collective()
+                        for (shard_id, _, _prev_status), ok in zip(targets, results):
+                            entry = self._shards.get(shard_id)
+                            if entry is None:
+                                continue
+                            n_alive_or_joining = self._apply_shard_health_result(
+                                entry, shard_id, ok, n_alive_or_joining, nccl_paused
+                            )
+                else:
                     # No HTTP-probing shards — fall back to Ray actor liveness.
                     await self._check_actor_liveness()
-                    try:
-                        self._refresh_joinable_stability()
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[router] joinable refresh failed: {e}", flush=True)
-                    try:
-                        await self._reconcile_recovery()
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[router] reconcile recovery failed: {e}", flush=True)
-                    await asyncio.sleep(self.health_poll_interval_s)
-                    continue
-                results = await asyncio.gather(
-                    *(self._probe(self._http_session, url, timeout) for _, url, _ in targets),
-                    return_exceptions=False,
-                )
-                async with self._table_lock:
-                    nccl_paused = self._nccl_reinit_in_progress
-                    # Count alive shards for deadlock detection (all cordoned = auto-recovery path).
-                    n_alive_or_joining = sum(
-                        1 for s in self._shards.values()
-                        if s.status in ("ready", "joining")
-                    )
-                    for (shard_id, _, prev_status), ok in zip(targets, results):
-                        entry = self._shards.get(shard_id)
-                        if entry is None:
-                            continue
-                        if ok:
-                            entry.consecutive_failures = 0
-                            entry.consecutive_successes += 1
-                            entry.last_health_ok_at = time.monotonic()
-                            # Health poller never auto-promotes to ready. joining→ready
-                            # requires a successful refit broadcast. cordoned→joining
-                            # only when ALL shards are cordoned (deadlock escape hatch).
-                            if (
-                                entry.status == "cordoned"
-                                and n_alive_or_joining == 0
-                                and entry.consecutive_successes
-                                >= self.join_success_threshold
-                            ):
-                                successes = entry.consecutive_successes
-                                entry.status = "joining"
-                                entry.consecutive_failures = 0
-                                entry.consecutive_successes = 0
-                                # Reset refit counter; next refit re-certifies weights.
-                                n_alive_or_joining = 1
-                                print(
-                                    f"[router] auto-uncordoned {shard_id} "
-                                    f"(0 alive shards, {successes} "
-                                    f"successful probes); status=joining; "
-                                    f"will re-promote on next refit",
-                                    flush=True,
-                                )
-                        else:
-                            entry.consecutive_successes = 0
-                            # During NCCL re-init the vLLM engine's event loop
-                            # may stall briefly, causing probe misses that are
-                            # not real failures.  Reset the failure counter
-                            # rather than accumulating it, so the first tick
-                            # after reinit completes doesn't immediately cordon.
-                            if nccl_paused:
-                                entry.consecutive_failures = 0
-                                continue
-                            entry.consecutive_failures += 1
-                            if (
-                                entry.status in ("ready", "joining")
-                                and entry.consecutive_failures >= self.failure_threshold
-                            ):
-                                entry.status = "cordoned"
-                                # Fire cordon hook outside the lock to avoid
-                                # re-entrance from cordon callbacks.
-                                asyncio.create_task(
-                                    self._fire_cordon_hook(shard_id, "health threshold breached")
-                                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - keep loop alive across transient errors
@@ -818,20 +761,12 @@ class GenerationRouter:
     def _is_rendezvous_master_failure(
         failed_idxs: list[int], exception_types: list[Optional[str]]
     ) -> bool:
-        """Detect "the rendezvous master timed out" pattern.
+        """Return True if all failures look like a TCPStore master timeout.
 
-        When the StatelessProcessGroup master (RefitWorker, rank 0) fails
-        to bind its TCPStore in time, EVERY gen-side client raises
-        ``DistNetworkError`` ("client socket has timed out trying to
-        connect"). Mass-evicting all gen workers on that signal is wrong:
-        the gen workers were healthy, the master was the problem.
-        Heuristic: if every failed worker raised
-        ``DistStoreError``/``DistNetworkError`` AND that's all the workers
-        we dispatched to, treat it as a transient rendezvous-master
-        failure and let the train-side retry loop handle it.
-
-        See ``docs/scratch/tcpstore-fix-report.md`` for the empirical
-        repro that motivated this.
+        When the train-side TCPStore master fails, every gen worker raises
+        ``DistStoreError``/``DistNetworkError``.  Evicting healthy gen
+        workers in that case is wrong — return True to let the caller skip
+        eviction and allow the train-side retry loop to handle it instead.
         """
         if not failed_idxs:
             return False
@@ -848,38 +783,14 @@ class GenerationRouter:
     async def _filter_targets_by_liveness(
         self, candidate_sids: list[str], probe_timeout_s: float = 5.0
     ) -> tuple[list[str], list[str]]:
-        """Split candidate shards into (confirmed_dead, alive) by ``is_alive`` ping.
+        """Split candidates into ``(dead, alive)`` via ``is_alive`` ping.
 
-        At TP>1, when a burst kill removes multiple shards simultaneously,
-        the surviving leaders' ``init_collective`` futures fail for two
-        VERY different reasons that look the same to the dispatch layer:
+        Needed at TP>1 where a single shard kill causes ALL survivors'
+        ``init_collective`` futures to fail (the dead shard's TP partners
+        never connect, so rendezvous times out for everyone).  Without this
+        filter, the eviction path would mass-evict the healthy survivors.
 
-        1. **Actually dead**: the leader's Ray actor was killed by the FI.
-           Future raises ``RayActorError``. ``is_alive`` raises
-           ``RayActorError`` too — confirmed dead.
-
-        2. **Alive but blocked on a dead peer**: the leader's TCPStore
-           rendezvous timed out waiting for the killed shards' TP partners
-           to connect. Future raises ``DistNetworkError`` /
-           ``DistStoreError`` (or a ``RayActorError`` if a peer's
-           ``cudaErrorLaunchFailure`` propagates back via vLLM's
-           ``collective_rpc``). The actor process is still healthy and
-           ``is_alive`` returns True — we MUST NOT evict.
-
-        Without this filter, the eviction path treats every failed future
-        the same and mass-evicts the survivors, cascading the world to
-        zero. The TP=1 path got away with the cascade-without-this-check
-        only because a single FI kill leaves ≥1 survivor whose future
-        still succeeds (rendezvous reaches the smaller-world quorum
-        organically); at TP>1 the per-shard world is multi-rank and a
-        single kill takes out ALL ranks in that shard, so quorum can't
-        be reached and EVERY survivor's future fails.
-
-        Returns ``(dead_shard_ids, alive_shard_ids)``. Caller evicts only
-        the dead set; the alive set retries via the train-side
-        ``ensure_collective_synced`` loop, which re-reads the world size
-        (still N) and rendezvouses again now that the dead shards have
-        been evicted.
+        Returns ``(dead_shard_ids, alive_shard_ids)``.
         """
         import ray
 
@@ -1101,29 +1012,92 @@ class GenerationRouter:
                 flush=True,
             )
 
+    def _apply_shard_health_result(
+        self,
+        entry: "ShardEntry",
+        shard_id: str,
+        ok: bool,
+        n_alive_or_joining: int,
+        nccl_paused: bool,
+        *,
+        definitive_death: bool = False,
+    ) -> int:
+        """Apply one health-check result to a shard entry.
+
+        Shared state machine used by both the HTTP-probe path and the Ray
+        actor-liveness path.  Must be called with ``_table_lock`` held.
+
+        Returns the (possibly updated) ``n_alive_or_joining`` count — it can
+        increase by 1 when a cordoned shard is auto-uncordoned.
+
+        ``definitive_death`` (actor path only): the actor raised
+        ``RayActorError``, meaning it is definitively gone.  This bypasses the
+        consecutive-failure threshold so the shard is cordoned immediately
+        rather than waiting for ``failure_threshold`` ticks.
+        """
+        if ok:
+            entry.consecutive_failures = 0
+            entry.consecutive_successes += 1
+            entry.last_health_ok_at = time.monotonic()
+            # Auto-uncordon deadlock escape: when ALL shards are cordoned the
+            # fleet can't recover without help.  Promote back to joining once
+            # enough consecutive successes confirm the actor is healthy again.
+            if (
+                entry.status == "cordoned"
+                and n_alive_or_joining == 0
+                and entry.consecutive_successes >= self.join_success_threshold
+            ):
+                successes = entry.consecutive_successes
+                entry.status = "joining"
+                entry.consecutive_failures = 0
+                entry.consecutive_successes = 0
+                n_alive_or_joining = 1
+                print(
+                    f"[router] auto-uncordoned {shard_id} "
+                    f"(0 alive shards, {successes} successful health checks); "
+                    f"status=joining; will re-promote on next refit",
+                    flush=True,
+                )
+        else:
+            entry.consecutive_successes = 0
+            # During NCCL reinit the worker event loop may stall, causing
+            # transient probe misses.  Reset rather than accumulate so the
+            # first tick after reinit completes doesn't immediately cordon.
+            # Exception: a definitive RayActorError means the actor is gone
+            # regardless of NCCL state — cordon it immediately.
+            if nccl_paused and not definitive_death:
+                entry.consecutive_failures = 0
+                return n_alive_or_joining
+            if definitive_death:
+                entry.consecutive_failures = self.failure_threshold
+            else:
+                entry.consecutive_failures += 1
+            if (
+                entry.status in ("ready", "joining")
+                and entry.consecutive_failures >= self.failure_threshold
+            ):
+                entry.status = "cordoned"
+                print(f"[router] actor liveness check failed for {shard_id}; cordoning", flush=True)
+                asyncio.create_task(
+                    self._fire_cordon_hook(shard_id, "health threshold breached")
+                )
+        return n_alive_or_joining
+
     async def _check_actor_liveness(self) -> None:
         """Ping Ray actor handles for shards that have no HTTP URL.
 
         Used when expose_http_server=False so the health poller can still
-        detect crashed actors without HTTP probing.
-
-        Mirrors the HTTP probing path:
-        - Successful ping increments ``consecutive_successes`` (so joining
-          shards become joinable without HTTP).
-        - Failed pings accumulate ``consecutive_failures``; cordon fires only
-          after ``failure_threshold`` consecutive failures, not on the first.
-        - During NCCL reinit, failure counter is reset instead of accumulated
-          (actor event loop may stall during collective ops).
+        detect crashed actors without HTTP probing.  Health results are applied
+        via ``_apply_shard_health_result``, the same state machine as the HTTP
+        path, with ``definitive_death=True`` on ``RayActorError`` to bypass the
+        consecutive-failure threshold and cordon immediately.
         """
         import ray
         from ray.exceptions import GetTimeoutError, RayActorError
 
         async with self._table_lock:
             nccl_paused = self._nccl_reinit_in_progress
-            n_alive_or_joining = sum(
-                1 for s in self._shards.values()
-                if s.status in ("ready", "joining")
-            )
+            n_alive_or_joining = self.shard_count_alive_for_collective()
             actor_targets = [
                 (s.shard_id, list(s.actor_handles))
                 for s in self._shards.values()
@@ -1151,59 +1125,16 @@ class GenerationRouter:
                 entry = self._shards.get(shard_id)
                 if entry is None:
                     continue
-                if ok:
-                    entry.consecutive_failures = 0
-                    entry.consecutive_successes += 1
-                    entry.last_health_ok_at = time.monotonic()
-                    # Auto-uncordon deadlock escape: same logic as HTTP path.
-                    if (
-                        entry.status == "cordoned"
-                        and n_alive_or_joining == 0
-                        and entry.consecutive_successes >= self.join_success_threshold
-                    ):
-                        successes = entry.consecutive_successes
-                        entry.status = "joining"
-                        entry.consecutive_failures = 0
-                        entry.consecutive_successes = 0
-                        n_alive_or_joining = 1
-                        print(
-                            f"[router] auto-uncordoned {shard_id} "
-                            f"(0 alive shards, {successes} successful pings); "
-                            f"status=joining; will re-promote on next refit",
-                            flush=True,
-                        )
-                else:
-                    entry.consecutive_successes = 0
-                    if nccl_paused and not definitive_death:
-                        # During NCCL reinit, transient timeouts are expected.
-                        # But a RayActorError means the actor is gone — still
-                        # cordon immediately even while NCCL is reinitializing.
-                        entry.consecutive_failures = 0
-                        continue
-                    # RayActorError: actor is definitively dead (ray.kill or crash).
-                    # Skip the consecutive-failure threshold and cordon immediately
-                    # so the next weight broadcast excludes it rather than hanging.
-                    if definitive_death:
-                        entry.consecutive_failures = self.failure_threshold
-                    else:
-                        entry.consecutive_failures += 1
-                    if (
-                        entry.status in ("ready", "joining")
-                        and entry.consecutive_failures >= self.failure_threshold
-                    ):
-                        entry.status = "cordoned"
-                        print(
-                            f"[router] actor liveness check failed for {shard_id}; cordoning",
-                            flush=True,
-                        )
-                        asyncio.create_task(
-                            self._fire_cordon_hook(shard_id, "actor liveness threshold breached")
-                        )
+                n_alive_or_joining = self._apply_shard_health_result(
+                    entry, shard_id, ok, n_alive_or_joining, nccl_paused,
+                    definitive_death=definitive_death,
+                )
 
     @staticmethod
     async def _probe(
         session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
     ) -> bool:
+        """GET url and return True iff the response is HTTP 200."""
         try:
             async with session.get(url, timeout=timeout) as resp:
                 return resp.status == 200
