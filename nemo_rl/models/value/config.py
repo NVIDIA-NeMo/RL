@@ -41,6 +41,7 @@ class ValueConfig(TypedDict):
 
     model_name: str
     tokenizer: TokenizerConfig
+    seed: int
 
     # Training batch sizes
     train_global_batch_size: int
