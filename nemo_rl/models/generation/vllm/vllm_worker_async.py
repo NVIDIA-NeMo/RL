@@ -1325,10 +1325,6 @@ class VllmAsyncGenerationWorkerImpl(
             self._tp_worker_handles = []
         return self._tp_worker_handles
 
-    def get_tp_worker_handles(self) -> list:
-        """Return cached TP worker handles."""
-        return getattr(self, "_tp_worker_handles", [])
-
     async def collect_tp_process_pids_async(self) -> list:
         """Collect OS PIDs for all internal TP worker processes.
 
@@ -1354,10 +1350,6 @@ class VllmAsyncGenerationWorkerImpl(
             )
             self._tp_worker_pids = []
         return self._tp_worker_pids
-
-    def get_tp_worker_pids(self) -> list:
-        """Return cached TP worker PIDs."""
-        return getattr(self, "_tp_worker_pids", [])
 
     async def reset_collective_async(self) -> None:
         """Async version of reset_collective.

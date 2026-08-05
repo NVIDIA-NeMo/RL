@@ -1147,12 +1147,6 @@ class VllmGeneration(GenerationInterface):
             )
             worker_indices.append(new_idx)
 
-        print(
-            f"[add_dp_worker] shard registered in fleet "
-            f"({time.monotonic() - _t_spawn_start:.1f}s from spawn)",
-            flush=True,
-        )
-
         # Dispatch prepare_refit_info via run_all_workers_single_data with
         # restrict_to_indices so it uses the same Ray object-store path as the
         # initial shards.  The direct actor.prepare_refit_info_async.remote()
@@ -1192,11 +1186,6 @@ class VllmGeneration(GenerationInterface):
                     actors[0].report_dp_openai_server_base_url.remote(), timeout=_url_timeout
                 )
                 self.dp_openai_server_base_urls.append(base_url)
-                print(
-                    f"[add_dp_worker] base_url registered "
-                    f"({time.monotonic() - _t_spawn_start:.1f}s from spawn): {base_url}",
-                    flush=True,
-                )
             except Exception as e:
                 print(
                     f"[add_dp_worker] base_url fetch failed after {_url_timeout:.0f}s "
@@ -1216,12 +1205,6 @@ class VllmGeneration(GenerationInterface):
                     actors[0].collect_tp_worker_handles_async.remote(),
                     timeout=_warmup_timeout,
                 )
-                if tp_worker_handles:
-                    print(
-                        f"[add_dp_worker] collected {len(tp_worker_handles)} TP worker handle(s) "
-                        f"({time.monotonic() - _t_spawn_start:.1f}s from spawn)",
-                        flush=True,
-                    )
             except Exception as e:  # noqa: BLE001
                 print(
                     f"[add_dp_worker] collect_tp_worker_handles failed (non-fatal): {e}",
@@ -1234,20 +1217,20 @@ class VllmGeneration(GenerationInterface):
                         actors[0].collect_tp_process_pids_async.remote(),
                         timeout=_warmup_timeout,
                     )
-                    if tp_worker_pids:
-                        print(
-                            f"[add_dp_worker] collected {len(tp_worker_pids)} TP worker PID(s) "
-                            f"({time.monotonic() - _t_spawn_start:.1f}s from spawn): {tp_worker_pids}",
-                            flush=True,
-                        )
                 except Exception as e:  # noqa: BLE001
                     print(
                         f"[add_dp_worker] collect_tp_process_pids failed (non-fatal): {e}",
                         flush=True,
                     )
 
+        _tp_summary = (
+            f"{len(tp_worker_handles)} handles" if tp_worker_handles
+            else f"{len(tp_worker_pids)} PIDs" if tp_worker_pids
+            else "none"
+        )
         print(
-            f"[add_dp_worker] done ({time.monotonic() - _t_spawn_start:.1f}s total)",
+            f"[add_dp_worker] done ({time.monotonic() - _t_spawn_start:.1f}s total, "
+            f"tp_workers={_tp_summary})",
             flush=True,
         )
         # Return TP handles and PIDs as a tuple in the second slot.
