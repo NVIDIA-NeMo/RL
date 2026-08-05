@@ -45,7 +45,7 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
+    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.

@@ -39,6 +39,42 @@ def _make_collective_update_extension(backend):
     return ext, state_info
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
+)
+def test_uses_fp8_kv_cache_excludes_deepseek_mla(cache_dtype, expected):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype)
+        )
+    )
+
+    assert ext._uses_fp8_kv_cache() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
+)
+def test_generation_kv_scale_sync_excludes_deepseek_mla(cache_dtype, expected):
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"kv_cache_dtype": cache_dtype}}
+    generation.weight_synchronizer = None
+    generation.worker_group = SimpleNamespace(shutdown=lambda **_kwargs: True)
+
+    assert generation.requires_kv_scale_sync is expected
+
+
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
 
