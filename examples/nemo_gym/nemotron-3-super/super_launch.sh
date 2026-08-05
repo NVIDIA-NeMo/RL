@@ -43,29 +43,6 @@ EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 # Optional: path to directory containing .sif images for SWE-bench (Stage 2.2).
 SIF_DIR="${SIF_DIR:-}"
 CONTAINER_FORMATTER="${CONTAINER_FORMATTER:-}"
-# Training entrypoint. The Omni recipes need the multimodal Gym driver.
-ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_grpo_nemo_gym.py}"
-# Extra Hydra overrides appended verbatim to the training command.
-EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
-# Gated Omni behavior: pinned Megatron sources, Gym verifier staging, and the
-# dynamic-module preflights. Ordinary Super runs are unchanged.
-SUPER_OMNI_MODE="${SUPER_OMNI_MODE:-false}"
-
-# ---- W&B preflight ----
-# The driver builds the W&B run inside Logger() before any worker starts, so a
-# missing credential kills the job about two minutes into a full allocation.
-# ~/.netrc is not enough when /home is unmounted in the training container, so
-# only the environment carries the key through sbatch --export=ALL.
-WANDB_MODE="${WANDB_MODE:-online}"
-if [[ ! "${EXTRA_OVERRIDES}" =~ logger\.wandb_enabled=([Ff]alse|0) ]] \
-    && [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
-    echo "Error: W&B logging is on but WANDB_API_KEY is unset." >&2
-    echo "  export WANDB_API_KEY=<key>   to log live," >&2
-    echo "  export WANDB_MODE=offline    to log locally and 'wandb sync' later, or" >&2
-    echo "  add logger.wandb_enabled=false to EXTRA_OVERRIDES to skip W&B." >&2
-    exit 1
-fi
-export WANDB_MODE
 
 # ---- MTP speculative decoding (optional) ----
 # Set ENABLE_MTP_INFERENCE=1 to turn on MTP (multi-token prediction) speculative
@@ -77,11 +54,6 @@ export WANDB_MODE
 ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
-# Pinned cudagraph capture sizes conflict with the variable batch shapes that
-# speculative decoding produces, so they are removed when MTP is on. Hydra's
-# delete fails outright if the key is absent, and only the text-only Super
-# stage configs define it -- set this to 0 for a recipe that does not.
-MTP_DROP_CUDAGRAPH_CAPTURE_SIZES="${MTP_DROP_CUDAGRAPH_CAPTURE_SIZES:-1}"
 MTP_EXTRA_ARGS=""
 if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
     MTP_EXTRA_ARGS="\
@@ -89,12 +61,9 @@ if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
 ++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
 ++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
 ++policy.generation.vllm_kwargs.mamba_cache_mode=align \
+~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes \
 ++policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS} \
 ++policy.generation.vllm_kwargs.speculative_config.method=mtp"
-    if [[ "${MTP_DROP_CUDAGRAPH_CAPTURE_SIZES}" == "1" ]]; then
-        MTP_EXTRA_ARGS="${MTP_EXTRA_ARGS} \
-~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes"
-    fi
     echo "MTP speculative decoding ENABLED (num_speculative_tokens=${NUM_SPECULATIVE_TOKENS})"
 fi
 
@@ -158,51 +127,6 @@ fi
 
 cd "${SNAPSHOT_DIR}"
 
-# ---- Super Omni staging ----
-SUPER_OMNI_COMMAND_SETUP=""
-SUPER_OMNI_DYNAMIC_MODULE_CHECK=""
-COMMAND_RUNNER="python"
-if [[ "${SUPER_OMNI_MODE}" == true ]]; then
-    MEGATRON_BRIDGE_SRC="${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src"
-    MEGATRON_LM_SRC="${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
-    GYM_ROOT="${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym"
-    SUPER_GYM_EXTENSIONS="${SNAPSHOT_DIR}/examples/nemo_gym/nemotron-3-super/gym_extensions/resources_servers"
-
-    # Ray starts its head and worker interpreters before COMMAND runs, so the
-    # module cache has to be exported from the submitting shell for isolated
-    # actors to import trust_remote_code classes while deserializing arguments.
-    export HF_MODULES_CACHE="${HF_MODULES_CACHE_DIR}"
-    export PYTHONPATH="${HF_MODULES_CACHE_DIR}:${SNAPSHOT_DIR}:${MEGATRON_BRIDGE_SRC}:${MEGATRON_LM_SRC}:${PYTHONPATH:-}"
-
-    # The blended Super dataset uses two lightweight verifiers that are not part
-    # of the pinned Gym revision. Stage them only for the Omni recipe.
-    # Copy rather than symlink: each server's requirements.txt installs the Gym
-    # workspace through the relative path ../../, which only resolves when the
-    # server really sits inside Gym's resources_servers directory.
-    # Gym resolves relative config_paths against its own checkout when the venv
-    # is built from this tree, but against the run directory when nemo-gym comes
-    # from a prebuilt image. Stage both so either resolution finds them.
-    if [[ "${DRY_RUN}" != true ]]; then
-        mkdir -p "${SNAPSHOT_DIR}/resources_servers"
-        for extension in gui_coordinate string_match; do
-            for dest in "${GYM_ROOT}/resources_servers" "${SNAPSHOT_DIR}/resources_servers"; do
-                rm -rf "${dest:?}/${extension}"
-                cp -r "${SUPER_GYM_EXTENSIONS}/${extension}" "${dest}/${extension}"
-            done
-            # The vendored requirements install Gym through the relative path
-            # ../../, which is only correct inside Gym's own resources_servers.
-            # The run-directory copy has to name the checkout explicitly.
-            sed -i "s#^-e nemo-gym.*#-e nemo-gym[dev] @ ${GYM_ROOT}#" \
-                "${SNAPSHOT_DIR}/resources_servers/${extension}/requirements.txt"
-        done
-    fi
-
-    SUPER_OMNI_COMMAND_SETUP="export PYTHONPATH=${HF_MODULES_CACHE_DIR}:${SNAPSHOT_DIR}:${MEGATRON_BRIDGE_SRC}:${MEGATRON_LM_SRC}:\${PYTHONPATH:-} ; \
-        python -c \"import importlib.util; bridge = importlib.util.find_spec('megatron.bridge'); core = importlib.util.find_spec('megatron.core'); assert bridge and core; print('Megatron sources:', bridge.origin, core.origin)\" ;"
-    SUPER_OMNI_DYNAMIC_MODULE_CHECK="python -c \"import importlib, sys; from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${MODEL_PATH}'; config = AutoConfig.from_pretrained(p, trust_remote_code=True); processor = AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); tokenizer = AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); loaded = (config, processor, getattr(processor, 'image_processor', None), tokenizer); modules = sorted({type(obj).__module__ for obj in loaded if obj is not None and type(obj).__module__.startswith('transformers_modules.')}); [sys.modules.pop(name, None) for name in tuple(sys.modules) if name == 'transformers_modules' or name.startswith('transformers_modules.')]; importlib.invalidate_caches(); [importlib.import_module(name) for name in modules]; print('Verified HF dynamic modules:', ', '.join(modules))\" ;"
-    COMMAND_RUNNER="uv run --no-sync"
-fi
-
 export RAY_DEDUP_LOGS=1
 
 # ---- Sandbox configuration ----
@@ -215,10 +139,7 @@ export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 # ---- Build the run command ----
 export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
-    ${EXTRA_PRE_COMMAND:+${EXTRA_PRE_COMMAND} ;} \
-    ${SUPER_OMNI_COMMAND_SETUP} \
     python -c \"from transformers import AutoConfig, AutoTokenizer; p='${MODEL_PATH}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')\" ; \
-    ${SUPER_OMNI_DYNAMIC_MODULE_CHECK} \
     date ; \
     NRL_WG_USE_RAY_REF=1 \
     NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR} \
@@ -230,18 +151,16 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_CACHE} \
     FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WS_BASE} \
     NEMO_GYM_VENV_DIR=${GYM_VENV_DIR} \
-    ${NEMO_RL_VENV_DIR:+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR}} \
     NRL_VLLM_USE_V1=1 \
     NRL_IGNORE_VERSION_MISMATCH=1 \
-    WANDB_MODE=${WANDB_MODE} \
     VLLM_ATTENTION_BACKEND=FLASH_ATTN \
     NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS} \
     RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
     UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT} \
     PYTHONPATH=${SNAPSHOT_DIR}:\${PYTHONPATH:-} \
-    ${COMMAND_RUNNER} ./${ENTRYPOINT} \
+    python ./examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${CONFIG_PATH} \
-    ++env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
+    env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
     env.nemo_gym.skip_venv_if_present=true \
     policy.model_name=${MODEL_PATH} \
     checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
@@ -250,8 +169,7 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     logger.wandb.name=${WANDB_NAME} \
     logger.wandb.project=${WANDB_PROJ} \
     data.train.data_path=${TRAIN_PATH} \
-    data.validation.data_path=${VAL_PATH} \
-    ${EXTRA_OVERRIDES}"
+    data.validation.data_path=${VAL_PATH}"
 
 if [[ -n "$SIF_DIR" ]]; then
     COMMAND="$COMMAND sif_dir=${SIF_DIR}"
