@@ -149,7 +149,9 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
-    ctrl._master_config = SimpleNamespace(grpo=GRPOConfig.model_construct(max_num_epochs=1))
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
     ctrl._rollout_manager = _OutcomeRolloutManager()
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
     ctrl._dataloader = [
