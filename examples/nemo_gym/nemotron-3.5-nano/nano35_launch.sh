@@ -104,8 +104,11 @@ set -euo pipefail
 # =============================================================================
 # Recipe selection
 # =============================================================================
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
+SCRIPT_DIR="$(cd -L -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -L)"
+# Preserve the logical shared-filesystem path used to invoke the launcher.
+# On HSG, realpath can rewrite /lustre/fsw/... to an /lustre/fs1/... alias that
+# is visible on the login node but unavailable to Pyxis on compute nodes.
+PROJECT_ROOT="$(cd -L -- "${SCRIPT_DIR}/../../.." && pwd -L)"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: bash ${BASH_SOURCE[0]} <swe|rlvr|mopd> [Hydra overrides ...]" >&2
