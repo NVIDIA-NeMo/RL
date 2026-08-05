@@ -1,0 +1,122 @@
+# Deterministic multimodal multi-turn context-compaction smoke for Nemotron Omni.
+#
+# The default is a two-node, colocated synchronous GRPO run. The only NeMo Gym
+# services loaded are the generic vLLM Responses model and the deterministic
+# scripted multimodal agent used to validate context compaction.
+
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 2
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 5
+  max_num_epochs: 1
+  max_num_steps: 2
+  val_period: 100
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  # Sequence-level masking is intentionally unsupported after one logical
+  # rollout expands into multiple physical traces. Monitor TMPE in logs/W&B.
+  seq_logprob_error_threshold: null
+  context_compaction_training:
+    enabled: true
+  async_grpo:
+    enabled: false
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: ${oc.env:NANO_OMNI_MODEL_NAME}
+  is_vlm: true
+  tokenizer:
+    name: ${oc.env:NANO_OMNI_MODEL_NAME}
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 2
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: null
+  make_sequence_length_divisible_by: 8
+  router_replay:
+    enabled: true
+
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      # Enabling parameter-gather overlap caused TMPE to drift after optimizer
+      # and refit cycles in the validated multi-turn configuration.
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+
+  generation:
+    max_new_tokens: 32
+    bad_words: ["<image>", "<img>", "</img>"]
+    vllm_cfg:
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: 8192
+      enforce_eager: true
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      logprobs_mode: raw_logprobs
+      http_server_serving_chat_kwargs:
+        chat_template_content_format: string
+    vllm_kwargs:
+      limit_mm_per_prompt: {image: 8}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: float32
+      enable_chunked_prefill: false
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: 8192
+  train:
+    data_path: ${oc.env:CC_SMOKE_DATA_PATH}
+  validation:
+    data_path: ${oc.env:CC_SMOKE_DATA_PATH}
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    is_trajectory_collection: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/scripted_multimodal_agent/configs/scripted_multimodal_agent_recency_k2_nonzero_advantage.yaml
+
+logger:
+  log_dir: logs/grpo-nemotron-omni-scripted-multiturn-cc
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    entity: null
+    project: null
+    group: null
+    name: null
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
