@@ -161,8 +161,9 @@ def test_batched_moe_shuffle_matches_per_expert(
 
 
 @pytest.mark.parametrize("use_batched", [True, False])
+@pytest.mark.parametrize("is_gated", [True, False])
 def test_process_mxfp8_moe_refit_uses_configured_shuffle(
-    fp8_module, monkeypatch, use_batched
+    fp8_module, monkeypatch, use_batched, is_gated
 ):
     fp8 = fp8_module
     fp8.global_fp8_config = fp8.FP8Config(
@@ -193,7 +194,7 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     moe_kernel = object()
     moe_quant_config = object()
     quant_method = types.SimpleNamespace(
-        moe=types.SimpleNamespace(is_act_and_mul=False),
+        moe=types.SimpleNamespace(is_act_and_mul=is_gated),
         moe_kernel=moe_kernel,
         moe_quant_config=moe_quant_config,
     )
@@ -215,6 +216,16 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
 
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", batched_shuffle)
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", per_expert_shuffle)
+
+    from vllm.model_executor.layers.quantization.utils import flashinfer_utils
+
+    swap_calls = []
+
+    def swap_w13_to_w31(tensor):
+        swap_calls.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(flashinfer_utils, "swap_w13_to_w31", swap_w13_to_w31)
 
     parameter_ids = tuple(
         id(parameter)
@@ -247,7 +258,8 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     assert args[1].data_ptr() == w2_weight.data_ptr()
     assert args[2].data_ptr() == w13_scale_from_checkpoint.data_ptr()
     assert args[3].data_ptr() == w2_scale_from_checkpoint.data_ptr()
-    assert args[4:] == (False, 128)
+    assert args[4:] == (is_gated, 128)
+    assert swap_calls == ([w13_weight, w13_scale_from_checkpoint] if is_gated else [])
 
     parameters = (
         layer.w13_weight,
