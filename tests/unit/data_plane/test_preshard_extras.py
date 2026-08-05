@@ -88,6 +88,32 @@ def test_packing_prep_reads_sequence_packing_basemodel() -> None:
     }
 
 
+def test_packing_prep_forwards_microbatch_order() -> None:
+    worker = object.__new__(TQWorkerMixin)
+    worker.cfg = {
+        "sequence_packing": SequencePackingConfig(
+            train_mb_tokens=512,
+            algorithm="modified_first_fit_decreasing",
+            microbatch_order="largest_first",
+        ),
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "make_sequence_length_divisible_by": 8,
+    }
+    data = MagicMock()
+    packed = object()
+    data.shard_by_batch_size.return_value = ([packed], None)
+
+    assert worker._apply_packing_prep(data) is packed
+    assert data.shard_by_batch_size.call_args.kwargs["sequence_packing_args"] == {
+        "algorithm": "modified_first_fit_decreasing",
+        "input_key": "input_ids",
+        "input_lengths_key": "input_lengths",
+        "sequence_length_pad_multiple": 8,
+        "max_tokens_per_microbatch": 512,
+        "microbatch_order": "largest_first",
+    }
+
+
 def test_packing_prep_reads_dynamic_batching_basemodel() -> None:
     worker = object.__new__(TQWorkerMixin)
     worker.cfg = {

@@ -525,6 +525,13 @@ class SinglePytorchMilestonesConfig(BaseModel, extra="allow"):
 
 SchedulerMilestones = dict[str, list[int]]
 
+# Keep the legacy alias importable, but exclude its standalone shape here:
+# Milestones only have runtime meaning as part of a SequentialLR config list.
+PytorchSchedulerConfig = (
+    SinglePytorchSchedulerConfig
+    | list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
+)
+
 
 class DynamicBatchingConfigDisabled(BaseModel, extra="allow"):
     enabled: Literal[False] = False
@@ -580,12 +587,7 @@ class PolicyConfig(TypedDict):
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
-    scheduler: NotRequired[
-        SinglePytorchSchedulerConfig
-        | list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
-        | SchedulerMilestones
-        | None
-    ]
+    scheduler: NotRequired[PytorchSchedulerConfig | None]
 
     # quantization configs
     quant_cfg: NotRequired[str | None]

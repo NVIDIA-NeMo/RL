@@ -32,6 +32,7 @@ from nemo_rl.models.policy import (
     DynamicBatchingConfigDisabled,
     PolicyConfig,
     PytorchOptimizerConfig,
+    PytorchSchedulerConfig,
     RewardModelConfig,
     RouterReplayConfig,
     RouterReplayConfigDisabled,
@@ -92,6 +93,7 @@ def test_sequence_packing_defaults_are_centralized():
     )
 
     assert config.logprob_mb_tokens is None
+    assert config.microbatch_order is None
     assert config.fuse_loss is False
 
 
@@ -145,12 +147,8 @@ def test_policy_leaf_configs_preserve_extra_fields(config_type, payload):
     assert config.model_dump(exclude_unset=True) == payload
 
 
-def test_scheduler_union_accepts_single_and_sequential_configs():
-    scheduler_adapter = TypeAdapter(
-        SinglePytorchSchedulerConfig
-        | list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
-        | None
-    )
+def test_scheduler_union_matches_runtime_supported_configs():
+    scheduler_adapter = TypeAdapter(PytorchSchedulerConfig | None)
 
     single = scheduler_adapter.validate_python(
         {"name": "torch.optim.lr_scheduler.ConstantLR", "kwargs": {}}
@@ -158,13 +156,18 @@ def test_scheduler_union_accepts_single_and_sequential_configs():
     sequential = scheduler_adapter.validate_python(
         [
             {"name": "torch.optim.lr_scheduler.LinearLR", "kwargs": {}},
+            {"name": "torch.optim.lr_scheduler.ConstantLR", "kwargs": {}},
             {"milestones": [5]},
         ]
     )
 
     assert isinstance(single, SinglePytorchSchedulerConfig)
     assert isinstance(sequential[0], SinglePytorchSchedulerConfig)
-    assert isinstance(sequential[1], SinglePytorchMilestonesConfig)
+    assert isinstance(sequential[1], SinglePytorchSchedulerConfig)
+    assert isinstance(sequential[2], SinglePytorchMilestonesConfig)
+
+    with pytest.raises(ValueError):
+        scheduler_adapter.validate_python({"milestones": [5]})
 
 
 def create_mock_cluster(world_size: int):
