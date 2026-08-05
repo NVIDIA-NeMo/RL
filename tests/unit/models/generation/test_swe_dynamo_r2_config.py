@@ -48,6 +48,8 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry() -> None:
     assert config["env"]["nemo_gym"]["effort_levels"]["low_ub"] == 15000
     assert config["reward_penalties"]["penalize_unwanted_tokens"] is False
     assert config["logger"]["wandb_enabled"] is True
+    assert config["data"]["train"]["data_path"]
+    assert config["data"]["validation"]["data_path"]
 
 
 def test_recipe_and_launcher_have_no_private_or_interpolated_defaults() -> None:
