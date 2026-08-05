@@ -36,7 +36,7 @@ its masked sum is the scalar ELBO the GDPO objective needs.
 """
 
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import torch
 
@@ -312,3 +312,47 @@ class SdmcElboEstimator:
         draw = torch.rand(noisy.shape, generator=generator, device=noisy.device)
         corrupt = is_prompt & (draw < self.cfg.p_mask_prompt)
         return torch.where(corrupt, self.mask_id, noisy), masked
+
+
+def accumulate_elbo_logprobs(
+    estimator: SdmcElboEstimator,
+    *,
+    input_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    seed: Optional[int],
+    score_fn: Any,
+) -> torch.Tensor:
+    """Runs the SDMC forwards and folds them into one per-position tensor.
+
+    This is the whole ELBO evaluation: every quadrature point is scored and its
+    contribution accumulated in place, so the caller receives a tensor with the
+    same ``[batch, seq_len]`` shape an autoregressive logprob pass would return.
+    Callers therefore need no dLLM-specific handling downstream.
+
+    Gradients flow through every forward, so calling this under ``torch.no_grad``
+    yields the old/reference ELBO and calling it in the training step yields the
+    differentiable current ELBO -- with the same ``seed``, against the same masks.
+
+    Args:
+        estimator: The configured SDMC estimator.
+        input_ids: Clean token ids, shape ``[batch, seq_len]``.
+        completion_mask: Positions eligible for masking and scoring, shape
+            ``[batch, seq_len]``.
+        seed: Mask seed. The old, reference, and current ELBOs of one rollout
+            must share it, or their differences measure mask noise rather than
+            the policy update.
+        score_fn: Callable taking ``(masked_input_ids, clean_target_ids)`` and
+            returning position-aligned log probabilities of the clean tokens,
+            shape ``[batch, seq_len]``. Injected so this loop stays independent
+            of the training backend.
+
+    Returns:
+        Per-position ELBO contributions, shape ``[batch, seq_len]``. Its sum over
+        the sequence is the scalar ELBO.
+    """
+    elbo: Optional[torch.Tensor] = None
+    for point in estimator.mask_points(input_ids, completion_mask, seed=seed):
+        contribution = estimator.accumulate(point, score_fn(point.input_ids, input_ids))
+        elbo = contribution if elbo is None else elbo + contribution
+    assert elbo is not None, "the estimator yielded no quadrature points"
+    return elbo

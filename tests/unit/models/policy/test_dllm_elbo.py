@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from nemo_rl.models.policy.dllm import (
+    accumulate_elbo_logprobs,
     DllmConfig,
     SdmcElboEstimator,
     get_quadrature,
@@ -336,3 +337,87 @@ def test_estimator_is_dtype_preserving():
         )
         assert contribution.dtype == torch.bfloat16
         assert math.isfinite(contribution.float().sum().item())
+
+
+def test_accumulate_runs_one_forward_per_quadrature_point():
+    estimator = SdmcElboEstimator(make_cfg(quadrature="gauss-3", mc_samples=2), MASK_ID)
+    input_ids, completion_mask = make_batch()
+    seen = []
+
+    def score_fn(masked_ids, clean_ids):
+        seen.append((masked_ids, clean_ids))
+        return -torch.rand(input_ids.shape)
+
+    out = accumulate_elbo_logprobs(
+        estimator,
+        input_ids=input_ids,
+        completion_mask=completion_mask,
+        seed=3,
+        score_fn=score_fn,
+    )
+    assert len(seen) == estimator.num_forwards == 6
+    assert out.shape == input_ids.shape
+
+
+def test_accumulate_scores_clean_targets_against_masked_inputs():
+    """The model must see the corrupted sequence but be scored on the clean one."""
+    estimator = SdmcElboEstimator(make_cfg(quadrature="gauss-2"), MASK_ID)
+    input_ids, completion_mask = make_batch()
+
+    def score_fn(masked_ids, clean_ids):
+        # Targets are always the untouched sequence ...
+        assert torch.equal(clean_ids, input_ids)
+        # ... while the model input carries mask tokens the clean one lacks.
+        assert (masked_ids == MASK_ID).any()
+        assert not torch.equal(masked_ids, clean_ids)
+        return -torch.rand(input_ids.shape)
+
+    accumulate_elbo_logprobs(
+        estimator,
+        input_ids=input_ids,
+        completion_mask=completion_mask,
+        seed=1,
+        score_fn=score_fn,
+    )
+
+
+def test_accumulate_matches_the_manual_loop():
+    """The helper is exactly the documented accumulate-in-a-loop, nothing more."""
+    cfg = make_cfg(quadrature="gauss-3")
+    input_ids, completion_mask = make_batch()
+
+    def score_fn(masked_ids, clean_ids):
+        # Deterministic in the masked input, so both paths see identical scores.
+        return -(masked_ids == MASK_ID).float()
+
+    helper = accumulate_elbo_logprobs(
+        SdmcElboEstimator(cfg, MASK_ID),
+        input_ids=input_ids,
+        completion_mask=completion_mask,
+        seed=17,
+        score_fn=score_fn,
+    )
+
+    manual_est = SdmcElboEstimator(cfg, MASK_ID)
+    manual = torch.zeros(input_ids.shape)
+    for point in manual_est.mask_points(input_ids, completion_mask, seed=17):
+        manual += manual_est.accumulate(point, score_fn(point.input_ids, input_ids))
+
+    torch.testing.assert_close(helper, manual)
+
+
+def test_accumulate_is_differentiable_through_every_forward():
+    """The training step needs gradients from all N forwards, not just the last."""
+    estimator = SdmcElboEstimator(make_cfg(quadrature="gauss-3"), MASK_ID)
+    input_ids, completion_mask = make_batch()
+    scale = torch.ones(1, requires_grad=True)
+
+    out = accumulate_elbo_logprobs(
+        estimator,
+        input_ids=input_ids,
+        completion_mask=completion_mask,
+        seed=2,
+        score_fn=lambda masked, clean: -torch.rand(input_ids.shape) * scale,
+    )
+    out.sum().backward()
+    assert scale.grad is not None and scale.grad.abs().item() > 0
