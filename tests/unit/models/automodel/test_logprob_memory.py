@@ -31,10 +31,6 @@ def _make_processor(
 ) -> LogprobsPostProcessor:
     return LogprobsPostProcessor(
         cfg={"logprob_chunk_size": chunk_size},
-        device_mesh=None,
-        cp_mesh=None,
-        tp_mesh=None,
-        cp_size=1,
         sampling_params=sampling_params,
     )
 
