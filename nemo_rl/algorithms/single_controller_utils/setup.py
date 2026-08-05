@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, cast
@@ -267,7 +268,7 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
-) -> SingleControllerActorArgs:
+) -> tuple[SingleControllerActorArgs, dict[str, Any]]:
     """Build the full SC actor args driver-side.
 
     Args:
@@ -277,7 +278,8 @@ def setup_single_controller(
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
-        SingleControllerActorArgs ready to be passed to SingleControllerActor.
+        actor_args: Pre-built SC actor args.
+        setup_timing_metrics: Driver-side per-phase timings, logged by the SC actor.
     """
     validate_single_controller_config(master_config)
 
@@ -356,25 +358,47 @@ def setup_single_controller(
     # ==========================
     # Setup Clusters & Workers
     # ==========================
+    setup_start_time = time.perf_counter()
+    setup_timing_metrics: dict[str, Any] = {}
+    gen_backend = generation_config["backend"]
+    gen_init_time_key = f"{gen_backend}_init_time_s"
+
     train_cluster, inference_cluster = _build_clusters(master_config)
     colocated = generation_config["colocated"]["enabled"]
+
+    def _timed_build_generation() -> tuple[Any, float]:
+        t0 = time.perf_counter()
+        gen = _build_generation(inference_cluster, master_config)
+        return gen, time.perf_counter() - t0
+
+    def _timed_build_trainer() -> tuple[Any, float]:
+        t0 = time.perf_counter()
+        p = _build_trainer(train_cluster, master_config, tokenizer, processor)
+        return p, time.perf_counter() - t0
+
     if colocated:
         # Colocated: vLLM prefers a clean GPU at load time, so generation
         # comes up before the policy.
-        generation = _build_generation(inference_cluster, master_config)
-        policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
+        generation, gen_time = _timed_build_generation()
+        policy, policy_time = _timed_build_trainer()
+        setup_timing_metrics[gen_init_time_key] = gen_time
+        setup_timing_metrics["policy_init_time_s"] = policy_time
+        setup_timing_metrics["parallel_init_enabled"] = 0.0
     else:
         # Non-colocated: generation + policy run on disjoint GPUs, so
         # bring them up in parallel.
+        parallel_start_time = time.perf_counter()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            gen_future = executor.submit(
-                _build_generation, inference_cluster, master_config
-            )
-            policy_future = executor.submit(
-                _build_trainer, train_cluster, master_config, tokenizer, processor
-            )
-            generation = gen_future.result()
-            policy = policy_future.result()
+            gen_future = executor.submit(_timed_build_generation)
+            policy_future = executor.submit(_timed_build_trainer)
+            generation, gen_time = gen_future.result()
+            policy, policy_time = policy_future.result()
+        setup_timing_metrics[gen_init_time_key] = gen_time
+        setup_timing_metrics["policy_init_time_s"] = policy_time
+        setup_timing_metrics["parallel_wall_time_s"] = (
+            time.perf_counter() - parallel_start_time
+        )
+        setup_timing_metrics["parallel_init_enabled"] = 1.0
 
     # ==========================
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
@@ -388,6 +412,7 @@ def setup_single_controller(
             if enable_router_replay
             else "int16"
         )
+        t0 = time.perf_counter()
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
             env_configs=master_config.env,
             base_urls=generation.dp_openai_server_base_urls,
@@ -396,6 +421,9 @@ def setup_single_controller(
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
+        setup_timing_metrics["nemo_gym_init_time_s"] = time.perf_counter() - t0
+
+    worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
@@ -403,17 +431,18 @@ def setup_single_controller(
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
 
-    backend = generation_config["backend"]
+    t0 = time.perf_counter()
     weight_synchronizer = create_weight_synchronizer(
         policy=policy,
         generation=generation,
-        generation_backend=backend,
+        gen_backend=gen_backend,
         colocated=colocated,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
     )
     weight_synchronizer.init_communicator()
+    setup_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # ==========================
     # Setup Algorithm + Rollout Wiring
@@ -443,7 +472,16 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
     )
 
-    return SingleControllerActorArgs(
+    # Print setup timing metrics
+    total_setup_time = time.perf_counter() - setup_start_time
+    setup_timing_metrics["total_setup_time_s"] = total_setup_time
+    setup_timing_metrics["other_setup_time_s"] = (
+        total_setup_time - worker_init_complete_time
+    )
+    _print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+
+    # Build actor args and return
+    actor_args = SingleControllerActorArgs(
         gen_handle=generation,
         trainer_handle=policy,
         env_handles=env_handles,
@@ -458,3 +496,25 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
         partition_id=partition_id,
     )
+    return actor_args, setup_timing_metrics
+
+
+def _print_setup_timing_summary(
+    metrics: dict[str, Any], gen_init_time_key: str
+) -> None:
+    """Log-style summary of setup-phase timings; mirrors grpo.py's block."""
+    print("\n▶ Worker Initialization Timing:")
+    gen_time = metrics.get(gen_init_time_key, 0)
+    if gen_time:
+        print(
+            f"  {gen_init_time_key.removesuffix('_init_time_s')} init: {gen_time:.1f}s"
+        )
+    policy_time = metrics.get("policy_init_time_s", 0)
+    if policy_time:
+        print(f"  Policy init: {policy_time:.1f}s")
+    nemo_gym_time = metrics.get("nemo_gym_init_time_s", 0)
+    if nemo_gym_time:
+        print(f"  NeMo-Gym init: {nemo_gym_time:.1f}s")
+    other_time = metrics.get("other_setup_time_s", 0)
+    print(f"  Other setup: {other_time:.1f}s")
+    print(f"  Total setup: {metrics.get('total_setup_time_s', 0):.1f}s", flush=True)

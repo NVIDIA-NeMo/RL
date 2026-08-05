@@ -76,6 +76,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         controller_cls(
             master_config=master_config,
             actor_args=actor_args,
+            setup_timing_metrics={},
         )
 
 
@@ -117,12 +118,58 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     controller_cls(
         master_config=master_config,
         actor_args=actor_args,
+        setup_timing_metrics={},
     )
 
     logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
+
+
+def test_logs_setup_timing_metrics(monkeypatch) -> None:
+    """setup_timing_metrics is forwarded to Logger.log_metrics under timing/setup."""
+    logger = MagicMock()
+    monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 8},
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger={},
+    )
+    setup_metrics = {"vllm_init_time_s": 1.5, "policy_init_time_s": 2.5}
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=FakeWeightSynchronizer(),
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        train_cluster=None,
+        inference_cluster=None,
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+
+    controller_cls(
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=setup_metrics,
+    )
+
+    logger.log_metrics.assert_called_once_with(
+        setup_metrics, step=0, prefix="timing/setup"
+    )
 
 
 @pytest.mark.parametrize(

@@ -249,7 +249,7 @@ class TestSetup:
         mc = _make_master_config(colocated=True)
         tokenizer = MagicMock(pad_token_id=0)
 
-        actor_args = setup_single_controller(mc, tokenizer)
+        actor_args, _ = setup_single_controller(mc, tokenizer)
 
         assert isinstance(actor_args, SingleControllerActorArgs)
         assert (
@@ -289,7 +289,7 @@ class TestSetup:
         mc = _make_master_config(colocated=True)
         mc.policy["router_replay"] = {"enabled": True}
 
-        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.tq_buffer._require_routed_experts is True
 
@@ -298,7 +298,7 @@ class TestSetup:
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
 
-        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         _, call_kwargs = patched_factories["setup_response_data"].call_args
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
@@ -326,7 +326,7 @@ class TestSetup:
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=7)
 
-        actor_args = setup_single_controller(
+        actor_args, _ = setup_single_controller(
             mc, tokenizer, partition_id="custom_partition"
         )
 
@@ -423,7 +423,7 @@ class TestSetup:
             ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
-            actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         mock_spinup.assert_called_once_with(
             env_configs=mc.env,
@@ -436,6 +436,67 @@ class TestSetup:
             use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
+        """Colocated vLLM records vllm+policy+collective+total keys, parallel disabled."""
+        mc = _make_master_config(colocated=True, backend="vllm")
+
+        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for key in (
+            "vllm_init_time_s",
+            "policy_init_time_s",
+            "collective_init_time_s",
+            "total_setup_time_s",
+            "other_setup_time_s",
+        ):
+            assert key in metrics, f"missing {key} in {metrics}"
+            assert metrics[key] >= 0
+        assert metrics["parallel_init_enabled"] == 0.0
+        assert "parallel_wall_time_s" not in metrics
+        # Order-of-phases sanity: worker_init_complete <= total.
+        assert metrics["other_setup_time_s"] >= 0
+
+    def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
+        """Non-colocated vLLM records parallel_wall_time_s and parallel_init_enabled=1.0."""
+        mc = _make_master_config(colocated=False, backend="vllm")
+
+        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert metrics["parallel_init_enabled"] == 1.0
+        assert "parallel_wall_time_s" in metrics
+        assert metrics["parallel_wall_time_s"] >= 0
+        assert "vllm_init_time_s" in metrics
+        assert "policy_init_time_s" in metrics
+
+    def test_setup_timing_uses_sglang_key_for_sglang_backend(self, patched_factories):
+        """Generation-init key follows the backend name (sglang_init_time_s)."""
+        mc = _make_master_config(colocated=True, backend="sglang")
+
+        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert "sglang_init_time_s" in metrics
+        assert "vllm_init_time_s" not in metrics
+
+    def test_setup_timing_includes_nemo_gym_when_enabled(self, patched_factories):
+        """nemo_gym_init_time_s appears when NeMo-Gym is spun up."""
+        mc = _make_master_config(colocated=True, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert "nemo_gym_init_time_s" in metrics
 
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):

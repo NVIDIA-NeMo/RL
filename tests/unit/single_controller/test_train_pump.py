@@ -343,6 +343,7 @@ def test_train_pump_drives_mcore_training_step(
             metric_log_handle=log,
             master_config=master_config,
             actor_args=actor_args,
+            setup_timing_metrics={},
         )
 
         # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.

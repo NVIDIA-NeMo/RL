@@ -77,7 +77,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller,
         "setup_single_controller",
-        lambda *_args: actor_args,
+        lambda *_args: (actor_args, {}),
     )
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,

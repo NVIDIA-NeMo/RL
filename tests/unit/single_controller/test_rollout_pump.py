@@ -353,7 +353,9 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
     )
     ctrl = SingleControllerActor.remote(
-        master_config=master_config, actor_args=actor_args
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics={},
     )
 
     vllm_generation.prepare_for_generation()

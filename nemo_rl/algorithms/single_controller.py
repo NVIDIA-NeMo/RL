@@ -87,12 +87,16 @@ class SingleControllerActor:
         self,
         master_config: MasterConfig,
         actor_args: SingleControllerActorArgs,
+        setup_timing_metrics: dict[str, Any],
     ) -> None:
         """Initialize the SingleController actor.
 
         Args:
             master_config: SC MasterConfig.
             actor_args: Pre-built actor args from setup_single_controller.
+            setup_timing_metrics: Per-phase timings collected on the driver in
+                setup_single_controller; logged here because Logger backends
+                can't be cloudpickled into the actor.
         """
         validate_single_controller_config(master_config)
 
@@ -125,6 +129,7 @@ class SingleControllerActor:
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
         self._logger.log_hyperparams(master_config.model_dump())
+        self._logger.log_metrics(setup_timing_metrics, step=0, prefix="timing/setup")
         self._timer = Timer()
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
