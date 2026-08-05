@@ -111,3 +111,20 @@ def test_loss_config_may_be_an_object_not_a_mapping():
         use_importance_sampling_correction = False
 
     validate_dllm_policy(make_policy(), LossObj())
+
+
+def test_mismatched_microbatch_sizes_are_rejected():
+    """Different microbatch shapes give the two passes different masks."""
+    policy = make_policy(logprob_batch_size=2, train_micro_batch_size=4)
+    with pytest.raises(ValueError, match="must equal"):
+        validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_matching_microbatch_sizes_are_allowed():
+    policy = make_policy(logprob_batch_size=4, train_micro_batch_size=4)
+    validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_microbatch_guard_does_not_apply_without_dllm():
+    policy = make_policy(dllm=False, logprob_batch_size=2, train_micro_batch_size=8)
+    validate_dllm_policy(policy, VALID_LOSS)

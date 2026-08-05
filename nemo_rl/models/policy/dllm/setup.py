@@ -87,6 +87,21 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any) -> None:
                 f"masked positions, which {name} assumes away. Disable it."
             )
 
+    # Masks are drawn from a seeded generator over the microbatch's shape, so
+    # two passes over the same rollout only agree on masks if they use the same
+    # microbatch size. When they differ, the old and current ELBOs are taken at
+    # different masks and their ratio measures noise instead of the update --
+    # silently, since both passes still produce finite, plausible numbers.
+    logprob_bs = policy_cfg.get("logprob_batch_size")
+    train_bs = policy_cfg.get("train_micro_batch_size")
+    if logprob_bs is not None and train_bs is not None and logprob_bs != train_bs:
+        raise ValueError(
+            f"policy.logprob_batch_size ({logprob_bs}) must equal "
+            f"policy.train_micro_batch_size ({train_bs}) when "
+            "policy.dllm.enabled=true, so that the old, reference, and current "
+            "ELBOs of a rollout are estimated at identical masks."
+        )
+
     dtensor_cfg = policy_cfg.get("dtensor_cfg")
     if dtensor_cfg and dtensor_cfg.get("context_parallel_size", 1) > 1:
         raise ValueError(

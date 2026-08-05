@@ -114,6 +114,10 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dllm import (
+    dllm_config_from_policy,
+    validate_dllm_policy,
+)
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
@@ -581,6 +585,7 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
+    validate_dllm_policy(master_config.policy, master_config.loss_fn)
 
     # ==========================
     #          Cluster
@@ -1983,6 +1988,31 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _attach_dllm_mask_seed(
+    target: BatchedDataDict, policy_config: PolicyConfig
+) -> None:
+    """Give the batch a mask seed, so every ELBO of it is taken at the same masks.
+
+    The old, reference, and current policy each estimate the ELBO of this batch
+    separately. Unless all three mask the same positions, their differences
+    measure mask noise rather than the policy update, and the importance ratio
+    is meaningless.
+
+    The seed is derived from the batch contents rather than from a step counter
+    precisely because all three passes see this same batch: they each arrive at
+    the same seed without a counter having to be threaded to each of them, and
+    the value is reproducible across restarts.
+    """
+    if dllm_config_from_policy(policy_config) is None:
+        return
+    input_ids = target["input_ids"]
+    seed = int(input_ids.to(torch.int64).sum().item() % (2**31 - 1))
+    # Carried per sample so that microbatch slicing keeps it aligned with rows.
+    target["dllm_mask_seed"] = torch.full(
+        (input_ids.shape[0],), seed, dtype=torch.int64
+    )
+
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
@@ -2000,6 +2030,7 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _attach_dllm_mask_seed(train_data, policy_config)
     return train_data
 
 
@@ -3043,6 +3074,7 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    _attach_dllm_mask_seed(train_data, master_config.policy)
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
