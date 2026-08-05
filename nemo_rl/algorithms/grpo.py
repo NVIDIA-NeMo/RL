@@ -98,6 +98,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     resolve_routed_experts_dtype_name_for_model,
 )
+from nemo_rl.models.generation.ft_constants import REFIT_RETRY_MAX_ATTEMPTS
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -1368,6 +1369,23 @@ def setup(
         train_world_size = train_cluster.world_size()
         inference_world_size = inference_nodes * inference_gpus_per_node
         world_size = train_world_size + inference_world_size
+        # When the train side runs the RefitWorker split-actor path
+        # (NRL_USE_REFIT_WORKER), only ONE process on the train side participates
+        # in the cross-cluster group (the RefitWorker actor, rank 0). The gen side
+        # must agree on the smaller world so its rank computation matches.
+        uses_refit_worker = bool(getattr(policy, "_use_refit_worker", False))
+        if uses_refit_worker:
+            effective_train_ws = 1
+            effective_world_size = effective_train_ws + inference_world_size
+            print(
+                f"  ⓘ RefitWorker mode: cross-cluster world shrinks "
+                f"{train_world_size}+{inference_world_size}={world_size} → "
+                f"{effective_train_ws}+{inference_world_size}={effective_world_size}",
+                flush=True,
+            )
+        else:
+            effective_train_ws = train_world_size
+            effective_world_size = world_size
 
         # init collective
         if backend == "megatron":
@@ -1377,15 +1395,15 @@ def setup(
             futures_train = policy.init_collective_mcore_generation(
                 ip,
                 port,
-                world_size,
+                effective_world_size,
                 rank_offset=0,
                 refit_backend=refit_backend,
             )
             futures_inference = policy_generation.init_collective(
                 ip,
                 port,
-                world_size,
-                train_world_size=train_world_size,
+                effective_world_size,
+                train_world_size=effective_train_ws,
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
@@ -1401,10 +1419,10 @@ def setup(
             policy_generation.weight_synchronizer.init_communicator()
         else:
             futures_train = policy.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
+                ip, port, effective_world_size, train_world_size=effective_train_ws
             )
             futures_inference = policy_generation.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
+                ip, port, effective_world_size, train_world_size=effective_train_ws
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
@@ -2337,15 +2355,75 @@ def refit_policy_generation(
                 )
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
             else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                # vLLM non-colocated: fault-tolerant broadcast with retry loop.
+                # On broadcast failure, abort the stale NCCL comm and re-sync at
+                # the current gen world size before retrying.
+                broadcast_attempts = 0
+                while True:
+                    broadcast_attempts += 1
+                    try:
+                        futures_train = policy.broadcast_weights_for_collective(
+                            kv_scales=kv_scales
+                        )
+                        futures_inference = (
+                            policy_generation.update_weights_from_collective()
+                        )
+                        # Set an explicit upper bound so a wedged broadcast raises
+                        # a clear GetTimeoutError instead of hanging indefinitely.
+                        ray.get(futures_train, timeout=600)
+                        results = ray.get(futures_inference, timeout=600)
+                        update_success = all(
+                            result for result in results if result is not None
+                        )
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if broadcast_attempts >= REFIT_RETRY_MAX_ATTEMPTS or not hasattr(
+                            policy_generation, "ensure_collective_synced"
+                        ):
+                            raise
+                        print(
+                            f"  ⚠ broadcast failed ({type(e).__name__}: {e}); "
+                            "aborting stale comm and re-syncing at current "
+                            "gen world size before retry",
+                            flush=True,
+                        )
+                        if hasattr(policy, "abort_collective"):
+                            try:
+                                ray.get(policy.abort_collective(), timeout=30)
+                            except Exception as abort_e:  # noqa: BLE001
+                                print(
+                                    f"  ! abort_collective raised "
+                                    f"{type(abort_e).__name__}: {abort_e}",
+                                    flush=True,
+                                )
+                        # Also call reset_collective on the gen side: when a gen
+                        # worker dies mid-broadcast, surviving gen workers are
+                        # wedged in update_weights_from_collective. Forcing
+                        # reset_collective frees them to respond to the fresh
+                        # init_collective on the next attempt. Best-effort,
+                        # bounded — if it wedges, ensure_collective_synced will
+                        # eventually clean up.
+                        if hasattr(policy_generation, "reset_collective"):
+                            try:
+                                reset_futs = policy_generation.reset_collective()
+                                ray.wait(list(reset_futs), timeout=15.0)
+                            except Exception as reset_e:  # noqa: BLE001
+                                print(
+                                    f"  ! gen reset_collective dispatch raised "
+                                    f"{type(reset_e).__name__}: {reset_e}",
+                                    flush=True,
+                                )
+                        # Force ensure_collective_synced to re-init at the
+                        # new world size by clearing the cached value.
+                        if hasattr(policy_generation, "_last_synced_world_size"):
+                            policy_generation._last_synced_world_size = None
+                        policy_generation.ensure_collective_synced(policy)
 
         # check if update is successful
         if not update_success:

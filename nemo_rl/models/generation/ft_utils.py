@@ -18,6 +18,39 @@ from __future__ import annotations
 from typing import Optional
 
 
+def _should_respawn_refit_worker(exc: BaseException) -> bool:
+    """Decide whether to kill+respawn the RefitWorker or reuse it after a failed rendezvous.
+
+    Reuse is safe ONLY for a clean pre-NCCL rendezvous failure: a TCPStore
+    timeout (``DistStoreError`` / ``DistNetworkError``) means no NCCL
+    communicator was ever created so the RefitWorker context is untouched.
+
+    Everything else — ``NCCLError`` (poisoned context), ``RayActorError``
+    (dead actor), or unknown — requires a respawn to get a clean context.
+    """
+    try:
+        from ray.exceptions import RayActorError
+
+        if isinstance(exc, RayActorError):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from torch.distributed import DistNetworkError, DistStoreError
+
+        if isinstance(exc, (DistStoreError, DistNetworkError)):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        blob = f"{type(exc).__name__}: {exc}"
+    except Exception:  # noqa: BLE001
+        return True
+    if "DistStoreError" in blob or "DistNetworkError" in blob:
+        return False
+    return True
+
+
 def decide_collective_sync(
     *,
     alive_gen_ws: int,
@@ -25,6 +58,7 @@ def decide_collective_sync(
     stable_for_s: float,
     effective_train_ws: int,
     last_synced_ws: Optional[int],
+    refit_worker_alive: bool,
     rejoin_debounce_s: float,
     comm_epoch: int = 0,
     last_synced_epoch: int = 0,
@@ -48,7 +82,8 @@ def decide_collective_sync(
     Policy: shrink (target < last) re-inits immediately (the old comm is
     broken — don't wait ~3 min for replacements). Grow (target > last) re-inits
     only once the joinable set == the dispatch set AND has been stable for
-    ``rejoin_debounce_s``. First sync (last is None) forces a re-init. This
+    ``rejoin_debounce_s``. First sync (last is None) or a dead RefitWorker
+    (``refit_worker_alive=False``) forces a re-init. This
     function is the single decision point, which (with the caller updating
     ``_last_synced_world_size`` only on a successful re-init) gives the
     single-initiator / no-double-reinit guarantee.
@@ -62,7 +97,7 @@ def decide_collective_sync(
     # Rendezvous the frozen JOINABLE cohort (not the raw alive set): cold
     # backfills are excluded until warm, so they never sabotage the handshake.
     target_ws = effective_train_ws + joinable_gen_ws
-    if last_synced_ws is None:
+    if last_synced_ws is None or not refit_worker_alive:
         return "reinit", target_ws
     if comm_epoch != last_synced_epoch:
         # A comm member was removed/evicted since our last sync → the live
