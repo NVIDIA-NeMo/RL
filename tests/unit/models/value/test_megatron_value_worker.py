@@ -133,6 +133,7 @@ def _create_value_test_config(
     return {
         "model_name": model_name,
         "tokenizer": {"name": model_name},
+        "seed": 42,
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
         "logprob_batch_size": 2,
