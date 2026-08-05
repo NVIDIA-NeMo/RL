@@ -752,14 +752,16 @@ class RayWorkerGroup:
         new_worker_idx = len(self._workers)
         if dp_shard_idx is None:
             dp_shard_idx = len(self.dp_leader_worker_indices)
-        # Only apply the default bundle_indices for TP rank-0 leaders.
-        # Followers (local_rank > 0) must receive bundle_indices=None so that
-        # configure_worker leaves init_kwargs["bundle_indices"] unset, which
-        # keeps is_model_owner=False and prevents them from trying to
-        # initialise a full vLLM engine (which would fail because
-        # VLLM_RAY_BUNDLE_INDICES would be "[0]" but tensor_parallel_size > 1).
-        if bundle_indices is None and local_rank == 0:
-            bundle_indices = (new_worker_idx, [0])
+        # Leaders (local_rank == 0) must always supply explicit bundle_indices
+        # so configure_worker can compute the correct VLLM_CACHE_ROOT seed and
+        # VLLM_RAY_BUNDLE_INDICES.  Followers (local_rank > 0) must pass None
+        # so configure_worker leaves init_kwargs["bundle_indices"] unset,
+        # which keeps is_model_owner=False and prevents them from trying to
+        # initialise a full vLLM engine.
+        assert not (bundle_indices is None and local_rank == 0), (
+            "spawn_worker_only: bundle_indices must be provided for the leader (local_rank=0). "
+            "Pass the dead shard's bundle indices from dead_bundle_indices."
+        )
 
         # NODE_RANK must be an integer even for followers that have no
         # bundle_indices; fall back to new_worker_idx.

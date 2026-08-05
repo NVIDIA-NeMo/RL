@@ -287,9 +287,7 @@ class GenerationRouter:
             loop = asyncio.get_running_loop()
 
             tp_handles = list(entry.tp_worker_handles) if entry is not None else []
-
             tp_pids = list(entry.tp_worker_pids) if entry is not None else []
-            shard_node_id = entry.node_id if entry is not None else ""
 
             def _kill_actors() -> None:
                 import os
