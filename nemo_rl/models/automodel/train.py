@@ -167,6 +167,11 @@ def prepare_model_forward(
             model_context_factory=nullcontext,
         )
 
+    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
+    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
+    # NeMo-RL computes its own masked losses from the returned logits, so pass an
+    # all-ignore placeholder purely to satisfy that contract and drop it again
+    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
     model_batch["labels"] = torch.full_like(processed_inputs.input_ids, -100)
 
     cp_sharder = ContextParallelSharder(
@@ -533,9 +538,7 @@ class LossPostProcessor:
         self,
         loss_fn: LossFunction,
         cfg: PolicyConfig,
-        device_mesh: Any,
         cp_mesh: Any,
-        tp_mesh: Any,
         cp_size: int,
         dp_size: int,
         enable_seq_packing: bool = False,
@@ -546,9 +549,9 @@ class LossPostProcessor:
         Args:
             loss_fn: Loss function to compute loss
             cfg: Configuration dictionary
-            device_mesh: Full device mesh
-            cp_mesh: Context parallel mesh
-            tp_mesh: Tensor parallel mesh
+            cp_mesh: Context parallel mesh, used only to resolve the CP process
+                group handed to the loss. The sequence layout itself belongs to
+                the per-microbatch ``cp_sharder``.
             cp_size: Context parallel size
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
@@ -556,9 +559,7 @@ class LossPostProcessor:
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
-        self.device_mesh = device_mesh
         self.cp_mesh = cp_mesh
-        self.tp_mesh = tp_mesh
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
@@ -669,10 +670,6 @@ class LogprobsPostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
-        cp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
     ):
@@ -680,18 +677,10 @@ class LogprobsPostProcessor:
 
         Args:
             cfg: Configuration dictionary
-            device_mesh: Full device mesh
-            cp_mesh: Context parallel mesh
-            tp_mesh: Tensor parallel mesh
-            cp_size: Context parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
         """
         self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
-        self.tp_mesh = tp_mesh
-        self.cp_size = cp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
@@ -725,9 +714,10 @@ class LogprobsPostProcessor:
         input_lengths = data_dict["input_lengths"]
 
         if cp_sharder is not None:
-            # ``processed_inputs.input_ids`` is the CP-local (and possibly padded)
-            # shard once the forward context is entered, so the canonical
-            # sequence has to come from the untouched microbatch data.
+            # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
+            # the model-facing tensors so Automodel's in-place buffer sharding
+            # cannot reach the loss-side ones. Shift and gather against that
+            # canonical sequence and let the sharder own the local layout.
             canonical_input_ids = data_dict["input_ids"]
             seq_len = canonical_input_ids.shape[1]
             token_logprobs = get_cp_sharded_next_token_logprobs(
@@ -869,10 +859,7 @@ class TopkLogitsPostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
-        device_mesh: Any,
-        cp_mesh: Any,
         tp_mesh: Any,
-        cp_size: int,
         k: int,
         enable_seq_packing: bool = False,
     ):
@@ -880,18 +867,14 @@ class TopkLogitsPostProcessor:
 
         Args:
             cfg: Configuration dictionary
-            device_mesh: Full device mesh
-            cp_mesh: Context parallel mesh
-            tp_mesh: Tensor parallel mesh
-            cp_size: Context parallel size
+            tp_mesh: Tensor parallel mesh, used for the vocabulary-parallel
+                top-k. The sequence layout belongs to the per-microbatch
+                ``cp_sharder``.
             k: Number of top logits to return
             enable_seq_packing: Whether sequence packing is enabled
         """
         self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
-        self.cp_size = cp_size
         self.k = k
         self.enable_seq_packing = enable_seq_packing
 
@@ -1016,16 +999,22 @@ class FullLogitsPostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
-        device_mesh: Any,
         cp_mesh: Any,
-        tp_mesh: Any,
         cp_size: int,
         enable_seq_packing: bool = False,
     ):
+        """Initialize FullLogitsPostProcessor.
+
+        Args:
+            cfg: Configuration dictionary
+            cp_mesh: Context parallel mesh, used to pick this rank's contiguous
+                IPC window. The sequence layout of the logits themselves belongs
+                to the per-microbatch ``cp_sharder``.
+            cp_size: Context parallel size
+            enable_seq_packing: Whether sequence packing is enabled
+        """
         self.cfg = cfg
-        self.device_mesh = device_mesh
         self.cp_mesh = cp_mesh
-        self.tp_mesh = tp_mesh
         self.cp_size = cp_size
         self.enable_seq_packing = enable_seq_packing
 
