@@ -62,11 +62,9 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Smoke-level threshold; tighten after observing real runs.
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
-        'max(data["train/reward"]) > 0.0'
+uv run tests/check_metrics.py $JSON_METRICS \
+    'median(data["train/gen_kl_error"]) < 1.3' \
+    'max(data["train/reward"]) > 0.0'
 
-    # Clean up checkpoint directory after successful run to save space.
-    rm -rf "$CKPT_DIR"
-fi
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"

@@ -207,6 +207,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
@@ -377,6 +378,7 @@ value:
     train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
 
   max_grad_norm: 1.0
   optimizer: null

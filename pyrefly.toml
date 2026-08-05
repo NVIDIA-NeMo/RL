@@ -97,6 +97,7 @@ project-includes = [
   "nemo_rl/data/datasets/response_datasets/mmpr_tiny.py",
   "nemo_rl/data/datasets/response_datasets/nemogym_dataset.py",
   "nemo_rl/data/datasets/response_datasets/nemotron_cascade2_sft.py",
+  "nemo_rl/data/datasets/response_datasets/numinamath.py",
   "nemo_rl/data/datasets/response_datasets/oai_format_dataset.py",
   "nemo_rl/data/datasets/response_datasets/oasst.py",
   "nemo_rl/data/datasets/response_datasets/openmathinstruct2.py",
