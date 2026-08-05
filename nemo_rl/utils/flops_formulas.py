@@ -467,15 +467,25 @@ def _vocab_and_mtp_flops(config: FLOPSConfig) -> int:
 
 def deepseekv3(config: FLOPSConfig) -> float:
     """Model FLOPs for DeepSeek V3."""
-    attention_layers = config.layers + (config.mtp_num_layers or 0)
-    attention_dims = config.qk_head_dim + config.qk_pos_emb_head_dim + config.v_head_dim
-    causal_pairs = 0.5 * config.enc_seq_len**2
-    attention_flops = (
-        6 * attention_layers * causal_pairs * config.attention_heads * attention_dims
+    bmm1_flops = (
+        0.5
+        * (config.qk_head_dim + config.qk_pos_emb_head_dim)
+        * config.attention_heads
+        * (config.enc_seq_len**2)
     )
+    bmm2_flops = (
+        0.5 * config.v_head_dim * config.attention_heads * (config.enc_seq_len**2)
+    )
+    per_input_attention_flops = 6 * (bmm1_flops + bmm2_flops) * config.layers
+    if config.mtp_num_layers is not None:
+        per_input_attention_flops += (
+            6 * (bmm1_flops + bmm2_flops) * config.mtp_num_layers
+        )
 
     return (
-        attention_flops + _mla_moe_linear_flops(config) + _vocab_and_mtp_flops(config)
+        per_input_attention_flops
+        + _mla_moe_linear_flops(config)
+        + _vocab_and_mtp_flops(config)
     ) * config.gbs
 
 
@@ -518,6 +528,9 @@ def glm_moe_dsa(config: FLOPSConfig) -> float:
         + config.hs * config.dsa_indexer_head_dim
         + config.hs * config.dsa_indexer_n_heads
     )
+    # This formula assumes dsa_indexer_loss_coeff=0.0, for which MCore runs the
+    # indexer under no_grad. Count only its forward matmuls (2 FLOPs per FMA);
+    # enabling indexer loss also requires accounting for the backward pass.
     per_input_indexer_flops = (
         2
         * config.dsa_indexer_compute_layers
