@@ -73,7 +73,12 @@ fi
 
 # Enough steps that the kill lands mid-run and enough refits follow it that a rebuilt
 # communicator has to actually carry weights, not just be constructed.
-MAX_STEPS=${MAX_STEPS:-12}
+#
+# 24, not 12: on GB200 a step takes seconds -- the dp test runs its whole job in about
+# 2.5 minutes, nearly all startup -- so 12 steps finished before the harness had even
+# located a shard to kill (job 5886540). The run must still be going well after the kill,
+# or 'it completed' proves nothing about recovery.
+MAX_STEPS=${MAX_STEPS:-24}
 # The kill must not land before the fleet is up and a refit has already succeeded, so
 # that a failure here means recovery broke rather than startup did.
 KILL_AFTER_STEP=${KILL_AFTER_STEP:-3}
