@@ -172,20 +172,22 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
         refit_batched_moe_shuffle=use_batched,
     )
 
-    w13_weight = torch.zeros(2, 4, 3)
-    w2_weight = torch.zeros(2, 3, 2)
-    w13_scale = torch.zeros(2, 4, 1)
-    w2_scale = torch.zeros(2, 3, 1)
+    w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
+    w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    w13_scale = torch.nn.Parameter(torch.zeros(2, 4, 1), requires_grad=False)
+    w2_scale = torch.nn.Parameter(torch.zeros(2, 3, 1), requires_grad=False)
+    w13_scale_from_checkpoint = torch.ones_like(w13_scale)
+    w2_scale_from_checkpoint = torch.ones_like(w2_scale)
     layer = types.SimpleNamespace(
         w13_weight=w13_weight,
         w2_weight=w2_weight,
         w13_weight_scale=w13_scale,
         w2_weight_scale=w2_scale,
         w13_weight_scale_from_checkpoint=types.SimpleNamespace(
-            data=torch.ones_like(w13_scale)
+            data=w13_scale_from_checkpoint
         ),
         w2_weight_scale_from_checkpoint=types.SimpleNamespace(
-            data=torch.ones_like(w2_scale)
+            data=w2_scale_from_checkpoint
         ),
     )
     quant_method = types.SimpleNamespace(
@@ -199,20 +201,58 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     )
     calls = []
 
-    def batched_shuffle(*_args):
-        calls.append("batched")
+    def batched_shuffle(*args):
+        calls.append(("batched", args))
         return shuffled
 
-    def per_expert_shuffle(*_args):
-        calls.append("per_expert")
+    def per_expert_shuffle(*args):
+        calls.append(("per_expert", args))
         return shuffled
 
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", batched_shuffle)
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", per_expert_shuffle)
 
+    parameter_ids = tuple(
+        id(parameter)
+        for parameter in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+        )
+    )
+    storage_ptrs = tuple(
+        parameter.data_ptr()
+        for parameter in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+        )
+    )
+
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
-    assert calls == ["batched" if use_batched else "per_expert"]
+    assert len(calls) == 1
+    selected_path, args = calls[0]
+    assert selected_path == ("batched" if use_batched else "per_expert")
+    if use_batched:
+        assert args[0] is layer
+        args = args[1:]
+    assert args[0].data_ptr() == w13_weight.data_ptr()
+    assert args[1].data_ptr() == w2_weight.data_ptr()
+    assert args[2].data_ptr() == w13_scale_from_checkpoint.data_ptr()
+    assert args[3].data_ptr() == w2_scale_from_checkpoint.data_ptr()
+    assert args[4:] == (False, 128)
+
+    parameters = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight_scale,
+    )
+    assert tuple(id(parameter) for parameter in parameters) == parameter_ids
+    assert tuple(parameter.data_ptr() for parameter in parameters) == storage_ptrs
     assert torch.equal(layer.w13_weight, shuffled[0])
     assert torch.equal(layer.w2_weight, shuffled[1])
     assert torch.equal(layer.w13_weight_scale, shuffled[2])
