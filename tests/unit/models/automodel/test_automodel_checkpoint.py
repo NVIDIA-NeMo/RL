@@ -708,6 +708,61 @@ class TestSaveCheckpointFunctional:
             # Verify tokenizer.save_pretrained was called
             mock_tokenizer.save_pretrained.assert_called_once_with(tokenizer_path)
 
+    @patch("torch.distributed.barrier")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
+    def test_save_with_tokenizer_skipped_on_non_zero_rank(
+        self,
+        mock_checkpointer_cls,
+        mock_get_rank,
+        mock_is_initialized,
+        mock_barrier,
+        mock_meshes,
+        mock_model,
+    ):
+        """Only rank 0 may write the tokenizer.
+
+        The tokenizer is replicated across ranks and save_pretrained() writes
+        rank-independent filenames, so 32 ranks writing the same path race on the
+        same inode and can hang the job on a hard-mounted NFS share. The model
+        save stays collective and must still run on every rank.
+        """
+        mock_is_initialized.return_value = True
+        mock_get_rank.return_value = 5
+        mock_dp_mesh, mock_tp_mesh = mock_meshes
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+
+        manager = AutomodelCheckpointManager(
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=mock_tp_mesh,
+        )
+        manager.init_checkpointer()
+
+        with TemporaryDirectory() as tmp_dir:
+            weights_path = os.path.join(tmp_dir, "model", "weights")
+            tokenizer_path = os.path.join(tmp_dir, "tokenizer")
+            os.makedirs(tokenizer_path)
+
+            mock_tokenizer = MagicMock()
+
+            manager.save_checkpoint(
+                model=mock_model,
+                weights_path=weights_path,
+                tokenizer=mock_tokenizer,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg={"enabled": True},
+            )
+
+            # Collective model save still happens on this rank.
+            mock_checkpointer.save_model.assert_called_once()
+            # Replicated tokenizer write is skipped off rank 0...
+            mock_tokenizer.save_pretrained.assert_not_called()
+            # ...but the rank still joins the barrier so rank 0 does not hang.
+            mock_barrier.assert_called_once()
+
 
 @pytest.mark.automodel
 class TestSaveLoadIntegration:
