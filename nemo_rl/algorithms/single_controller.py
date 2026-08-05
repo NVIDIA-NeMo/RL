@@ -797,11 +797,18 @@ class SingleControllerActor:
         rebuilt = await asyncio.to_thread(
             self._weight_synchronizer.reconcile_communicator, absent
         )
-        if rebuilt:
-            print(
-                f"  _sync_weights: rebuilt refit communicator, absent={sorted(absent)}",
-                flush=True,
-            )
+        # Log unconditionally, not just on a rebuild.
+        #
+        # Job 5898311 wedged with both policy workers stuck in the refit broadcast and no
+        # rebuild logged, and "no rebuild logged" could not distinguish two causes needing
+        # opposite fixes: reconcile ran BEFORE the death was recorded (absent empty, so
+        # correctly did nothing, and the race is the problem), or it ran after and
+        # reconcile_communicator wrongly returned False. The absent set is the whole
+        # difference and it was not being printed.
+        print(
+            f"  _sync_weights: refit membership absent={sorted(absent)} rebuilt={rebuilt}",
+            flush=True,
+        )
 
     async def _check_env_health(self) -> None:
         """Ask each environment actor that exposes a health check whether it is whole.
