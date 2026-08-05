@@ -910,6 +910,56 @@ class TestApplyPrecisionConfig:
 class TestApplyPerformanceConfig:
     """Tests for _apply_performance_config function."""
 
+    def test_cuda_graph_training_values_are_forwarded(self):
+        """Explicit training CUDA Graph settings propagate to the model config."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            cuda_graph_modules=["attn"],
+            cuda_graph_warmup_steps=1,
+        )
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+                "cuda_graph_modules": ["attn", "mlp"],
+                "cuda_graph_warmup_steps": 3,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.cuda_graph_modules == ["attn", "mlp"]
+        assert model_cfg.cuda_graph_warmup_steps == 3
+
+    def test_omitted_cuda_graph_training_values_preserve_model_config(self):
+        """Omitted training CUDA Graph settings retain Megatron-Core values."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            cuda_graph_modules=["attn"],
+            cuda_graph_warmup_steps=1,
+        )
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.cuda_graph_modules == ["attn"]
+        assert model_cfg.cuda_graph_warmup_steps == 1
+
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
