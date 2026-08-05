@@ -2064,6 +2064,11 @@ def get_distillation_topk_logprobs_from_logits(
         student_logits = student_logits
         parallel_group = None
 
+    # Automodel owns the sequence layout: shard the teacher indices into the
+    # model's local layout and neutralize ``cp_group``/``cp_size`` so the legacy
+    # relayout below (which assumes PyTorch's load-balanced order) stays out of
+    # the way. The gather back to canonical order runs through the sharder once
+    # the student log-probs exist.
     indices_for_logits = teacher_topk_indices
     if cp_sharder is not None:
         cp_group = None
@@ -2080,7 +2085,7 @@ def get_distillation_topk_logprobs_from_logits(
             indices_local = indices_for_logits
             pad_len = 0
 
-            if cp_size > 1 and cp_sharder is None:
+            if cp_size > 1:
                 pad_len = student_logits.shape[1] * cp_size - indices_local.shape[1]
                 if pad_len > 0:
                     indices_local = torch.nn.functional.pad(
@@ -2143,7 +2148,7 @@ def get_distillation_topk_logprobs_from_logits(
                 student_logits,
                 indices_for_logits,
                 tp_group=parallel_group,
-                cp_group=cp_group if cp_sharder is None else None,
+                cp_group=cp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
