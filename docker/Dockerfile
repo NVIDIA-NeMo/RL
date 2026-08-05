@@ -23,7 +23,7 @@
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -106,8 +106,8 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.11.18
-ARG PYTHON_VERSION=3.13.13
+ARG UV_VERSION=0.11.28
+ARG PYTHON_VERSION=3.13.14
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
@@ -127,10 +127,13 @@ FROM base AS hermetic
 
 WORKDIR /opt/nemo-rl
 
-# Variables to control the build of TE. If there are issues with parallelization, consider
-# setting these to 1.
+# Keep TE source builds bounded to the GPUs supported by this image. TE otherwise
+# compiles six CUDA architectures on CUDA 13. The build knobs remain overridable.
 ARG MAX_JOBS
-ARG NVTE_BUILD_THREADS_PER_JOB
+ARG NVTE_BUILD_MAX_JOBS=8
+ARG NVTE_BUILD_THREADS_PER_JOB=2
+ARG NVTE_CUDA_ARCHS=90;100
+ARG NVTE_FRAMEWORK=pytorch
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
 ARG BUILD_CUSTOM_VLLM_URL

@@ -1,0 +1,30 @@
+# SingleController variant of grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml.
+defaults: ./performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml
+
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+
+# SC does not support validation and checkpointing yet.
+grpo:
+  val_period: 0
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+
+# TransferQueue data plane is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+# SC async-RL runtime knobs.
+async_rl:
+  sampler:
+    name: windowed
+    # Matches grpo.async_grpo.max_trajectory_age_steps=1.
+    max_staleness_versions: 1
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: 16
+  max_inflight_prompts: ${grpo.num_prompts_per_step}  # match grpo-llama3.1-8b-instruct-2n8g-async-1off
+  max_buffered_rollouts: 128

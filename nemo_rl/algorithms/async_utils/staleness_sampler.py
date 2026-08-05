@@ -51,7 +51,7 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, NonNegativeInt
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
@@ -259,6 +259,15 @@ class WindowedSampler(BaseSampler):
         )
 
 
+def _gated_required_buffer_capacity(
+    groups_per_step: int,
+    *,
+    gate_window: int,
+) -> int:
+    """Return capacity for one live batch plus each lookahead batch."""
+    return groups_per_step * (gate_window + 1)
+
+
 class _GatedSampler(BaseSampler):
     """Base for policies that admit exactly one dispatch batch per trainer step.
 
@@ -277,7 +286,10 @@ class _GatedSampler(BaseSampler):
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         # One batch of lookahead per version in the window, plus the live batch.
-        return groups_per_step * (self._gate_window + 1)
+        return _gated_required_buffer_capacity(
+            groups_per_step,
+            gate_window=self._gate_window,
+        )
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
@@ -383,7 +395,7 @@ class InOrderSampler(_GatedSampler):
 class WindowedSamplerConfig(BaseModel, extra="allow"):
     name: Literal["windowed"] = "windowed"
     # Max weight-version gap a selected group may have from the trainer.
-    max_staleness_versions: int = 1
+    max_staleness_versions: NonNegativeInt = 1
     # Prefer smallest lag when picking from the in-window set.
     sample_freshest_first: bool = False
 
@@ -391,13 +403,13 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
 class WeightFifoSamplerConfig(BaseModel, extra="allow"):
     name: Literal["weight_fifo"] = "weight_fifo"
     # Lookahead + selectable weight window, in trainer versions.
-    max_staleness_versions: int = 1
+    max_staleness_versions: NonNegativeInt = 1
 
 
 class InOrderSamplerConfig(BaseModel, extra="allow"):
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
-    max_lookahead_versions: int = 1
+    max_lookahead_versions: NonNegativeInt = 1
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
@@ -419,6 +431,24 @@ SamplerConfig = Annotated[
     ],
     Field(discriminator="name"),
 ]
+
+
+def required_buffer_capacity_for_config(
+    cfg: SamplerConfig,
+    groups_per_step: int,
+) -> Optional[int]:
+    """Return a built-in sampler's required capacity without constructing it."""
+    if isinstance(cfg, WeightFifoSamplerConfig):
+        return _gated_required_buffer_capacity(
+            groups_per_step,
+            gate_window=cfg.max_staleness_versions,
+        )
+    if isinstance(cfg, InOrderSamplerConfig):
+        return _gated_required_buffer_capacity(
+            groups_per_step,
+            gate_window=cfg.max_lookahead_versions,
+        )
+    return None
 
 
 def create_sampler(

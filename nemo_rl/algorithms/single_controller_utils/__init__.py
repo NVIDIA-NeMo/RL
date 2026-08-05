@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,11 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    from megatron.bridge import AutoBridge  # noqa: F401
 
-    INSTALLED = True
-except Exception:
-    INSTALLED = False
+"""SingleController utilities: config schema + setup factories."""
 
-print(f"Megatron Bridge {INSTALLED=}")
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    AsyncRLConfig,
+    MasterConfig,
+)
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    setup_single_controller,
+)
+
+__all__ = [
+    "AdvantageConfig",
+    "AsyncRLConfig",
+    "MasterConfig",
+    "SingleControllerActorArgs",
+    "setup_single_controller",
+]

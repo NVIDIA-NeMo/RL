@@ -41,6 +41,7 @@ from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDatas
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
     NemotronCascade2SFTMathDataset,
 )
+from nemo_rl.data.datasets.response_datasets.numinamath import NuminaMath15Dataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -54,7 +55,10 @@ from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDat
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tau_bench_dataset import TauBenchDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
-from nemo_rl.data.datasets.utils import resolve_external_dataset_class
+from nemo_rl.data.datasets.utils import (
+    resolve_external_dataset_class,
+    warn_on_unsupported_dataset_config_keys,
+)
 
 DATASET_REGISTRY = {
     # built-in datasets
@@ -78,6 +82,7 @@ DATASET_REGISTRY = {
     "intent-bench": IntentBenchDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
+    "NuminaMath-1.5": NuminaMath15Dataset,
     "OpenR1-Math-220k": OpenR1Math220KDataset,
     "refcoco": RefCOCODataset,
     "squad": SquadDataset,
@@ -121,6 +126,11 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
             "(ensure it is installed and importable from PYTHONPATH)."
         )
 
+    # Every dataset class accepts **kwargs, so unsupported config keys are
+    # otherwise swallowed silently (e.g. `split_validation_size` on a dataset
+    # that never calls `split_train_validation`).
+    warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
+
     dataset = dataset_class(
         **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
     )
@@ -155,6 +165,7 @@ __all__ = [
     "OasstDataset",
     "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
+    "NuminaMath15Dataset",
     "OpenR1Math220KDataset",
     "RefCOCODataset",
     "ResponseDataset",

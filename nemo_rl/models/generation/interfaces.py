@@ -28,6 +28,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # determined, fall back to int16.
 ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int16
 
+# A routed-expert row whose every top-k slot is this value means "no route was
+# captured for this token"; the Megatron replay install falls back to the model's
+# own router for those rows. Partially-negative rows are rejected as corruption.
+ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL = -1
+
 _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int8: "int8",
     torch.int16: "int16",
@@ -199,6 +204,7 @@ class GenerationConfig(TypedDict):
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
+    bad_words: NotRequired[list[str] | None]
     colocated: NotRequired[ColocationConfig]
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
@@ -306,7 +312,7 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         pass
@@ -340,6 +346,14 @@ class GenerationInterface(ABC):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
+        raise NotImplementedError
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard."""
         raise NotImplementedError
 
     # Optional hook; backends may override to invalidate any reusable caches
