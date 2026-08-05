@@ -1410,9 +1410,8 @@ def setup_model_and_optimizer(
                 # `.llava_model.language_model`; unwrap that layer first so the
                 # generic `.language_model.decoder.layers` walk below finds the
                 # MoE router.
-                if (
-                    getattr(model_module, "llava_model", None) is not None
-                    and hasattr(model_module.llava_model, "language_model")
+                if getattr(model_module, "llava_model", None) is not None and hasattr(
+                    model_module.llava_model, "language_model"
                 ):
                     model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):

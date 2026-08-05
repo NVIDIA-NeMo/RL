@@ -26,7 +26,6 @@ from PIL import Image
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     encode_images_in_examples,
@@ -35,7 +34,7 @@ from nemo_rl.data.multimodal_utils import (
     resolve_to_image,
     uses_image_placeholder,
 )
-
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -194,6 +193,9 @@ def _detect_invalid_tool_call_and_malformed_thinking(
 ########################################
 
 
+# WARNING: A function-call output beginning with HTTP(S) is accepted here and
+# passed to ``resolve_to_image``, which performs an outbound request during
+# postprocessing even when the tool result is not actually an image.
 _IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
 
 
@@ -547,9 +549,9 @@ Depending on your data shape, you may want to change these values."""
         per_turn_images = (
             _index_per_turn_images(
                 nemo_gym_result["response"]["output"],
-                input_messages=nemo_gym_result.get(
-                    "responses_create_params", {}
-                ).get("input"),
+                input_messages=nemo_gym_result.get("responses_create_params", {}).get(
+                    "input"
+                ),
             )
             if processor is not None
             else []

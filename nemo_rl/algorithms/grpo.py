@@ -1982,6 +1982,7 @@ def _preserve_router_replay_routed_experts(
     if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
         target["routed_experts"] = flat_messages["routed_experts"]
 
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,

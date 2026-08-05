@@ -461,10 +461,10 @@ def vlm_hf_data_processor(
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
         get_dim_to_pack_along,
-        get_multimodal_keys_from_processor,
-        uses_image_placeholder,
         get_multimodal_default_settings_from_processor,
+        get_multimodal_keys_from_processor,
         resolve_to_image,
+        uses_image_placeholder,
     )
 
     # depending on the task, format the data differently
