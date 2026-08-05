@@ -10,6 +10,7 @@ VALID_LOSS = {
     "sequence_level_importance_ratios": True,
     "token_level_loss": False,
     "use_importance_sampling_correction": False,
+    "position_aligned_logprobs": True,
 }
 
 
@@ -109,6 +110,7 @@ def test_loss_config_may_be_an_object_not_a_mapping():
         sequence_level_importance_ratios = True
         token_level_loss = False
         use_importance_sampling_correction = False
+        position_aligned_logprobs = True
 
     validate_dllm_policy(make_policy(), LossObj())
 
@@ -128,3 +130,24 @@ def test_matching_microbatch_sizes_are_allowed():
 def test_microbatch_guard_does_not_apply_without_dllm():
     policy = make_policy(dllm=False, logprob_batch_size=2, train_micro_batch_size=8)
     validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_loss_must_not_shift_when_policy_is_position_aligned():
+    """The default loss shift is an off-by-one against dLLM logprobs."""
+    loss = dict(VALID_LOSS, position_aligned_logprobs=False)
+    with pytest.raises(ValueError, match="position_aligned_logprobs"):
+        validate_dllm_policy(make_policy(), loss)
+
+
+def test_loss_must_shift_when_policy_emits_next_token_logprobs():
+    """The mirror case: a shifting policy needs the loss to shift too."""
+    policy = make_policy()
+    policy["dllm"]["shift_targets"] = True
+    with pytest.raises(ValueError, match="position_aligned_logprobs"):
+        validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_consistent_shifting_pair_is_allowed():
+    policy = make_policy()
+    policy["dllm"]["shift_targets"] = True
+    validate_dllm_policy(policy, dict(VALID_LOSS, position_aligned_logprobs=False))

@@ -110,10 +110,10 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any) -> None:
             "but the ELBO masks positions across the whole sequence. Set it to 1."
         )
 
-    _validate_dllm_loss(loss_cfg)
+    _validate_dllm_loss(loss_cfg, dllm_config_from_policy(policy_cfg))
 
 
-def _validate_dllm_loss(loss_cfg: Any) -> None:
+def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
     """Rejects loss settings the ELBO cannot be substituted into."""
 
     def _get(key: str, default: Any) -> Any:
@@ -146,4 +146,18 @@ def _validate_dllm_loss(loss_cfg: Any) -> None:
             "loss_fn.use_importance_sampling_correction=true is not supported "
             "with policy.dllm.enabled=true: denoising rollouts produce no "
             "per-token sampling log probabilities to correct against."
+        )
+    # The policy decides whether its log probabilities are position-aligned; the
+    # loss decides whether to drop a column off every other per-token tensor to
+    # match. Disagreement is an off-by-one at every position that still runs, so
+    # require them to be stated consistently rather than inferring one silently.
+    position_aligned = _get("position_aligned_logprobs", False)
+    if position_aligned == dllm_cfg.shift_targets:
+        raise ValueError(
+            f"loss_fn.position_aligned_logprobs={position_aligned} is "
+            f"inconsistent with policy.dllm.shift_targets="
+            f"{dllm_cfg.shift_targets}. A policy that scores token i at "
+            "position i (shift_targets=false) emits log probabilities as long "
+            "as the sequence, which the loss must not shift "
+            "(position_aligned_logprobs=true), and vice versa."
         )
