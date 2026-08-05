@@ -32,9 +32,8 @@ class SetupTimingMetrics:
     nemo_gym_init_time_s: Optional[float] = None
     collective_init_time_s: Optional[float] = None
 
-    # Non-colocated only.
+    # Non-colocated only. (grpo.py only)
     parallel_wall_time_s: Optional[float] = None
-    # 0.0 = sequential, 1.0 = parallel.
     parallel_init_enabled: Optional[float] = None
 
     # grpo-only phases (non-colocated OPD teachers, sparse refit, checkpoint-engine).
@@ -44,6 +43,7 @@ class SetupTimingMetrics:
     vllm_checkpoint_engine_init_time_s: Optional[float] = None
 
     total_setup_time_s: Optional[float] = None
+    worker_setup_time_s: Optional[float] = None
     other_setup_time_s: Optional[float] = None
 
     # Overflow bucket for dynamic-keyed metrics (e.g. one entry per active
