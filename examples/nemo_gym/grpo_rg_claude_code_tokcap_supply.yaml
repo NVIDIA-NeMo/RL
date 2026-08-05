@@ -271,11 +271,12 @@ env:
     - responses_api_models/vllm_model/configs/vllm_model_supply_prefix.yaml  # prefix supply ON; requires the Gym supplying branch or higher
     # External-harness token-id capture: the harness returns no token ids, so capture them and rebuild.
     # token_capture_dir is node-local (the model server and the reader are colocated on one node).
-    token_id_capture_enabled: true
-    token_id_capture_dir: /tmp/ng_tokcap_smoke
-    # Guard the token read route. It serves raw training tokens on the same app the harness
-    # calls; harmless in a trusted cluster, required once the harness is sandboxed.
-    token_id_capture_read_token: ${oc.env:NG_TOKCAP_READ_TOKEN,changeme}
+    token_id_capture:
+      enabled: true
+      dir: /tmp/ng_tokcap_smoke
+      # The read route is not used here: the trainer and the model server are colocated on one
+      # node, so records are read straight off the store. Set read_token to guard that route once
+      # the harness is sandboxed and has to fetch over HTTP.
 
 logger:
   log_dir: "logs"  # Base directory for all logs
