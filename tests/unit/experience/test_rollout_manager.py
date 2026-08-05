@@ -39,11 +39,16 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl, RolloutManager
+from nemo_rl.experience.rollout_recovery import (
+    RolloutAttemptStatus,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -65,6 +70,74 @@ from tests.unit.test_envs import MultiStepCalcMetadata
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+class _StreamingGymEnv:
+    """Ray-style streaming actor stub that yields results out of order."""
+
+    def __init__(self, results):
+        self._results = results
+        self.run_rollouts = self
+
+    def options(self, *, num_returns):
+        assert num_returns == "streaming"
+        return self
+
+    def remote(self, _inputs, _tokenizer, _timer_prefix):
+        async def _stream():
+            for result in self._results:
+
+                async def _result_ref(value=result):
+                    return value
+
+                yield _result_ref()
+
+        return _stream()
+
+
+def test_nemo_gym_stream_callback_runs_before_group_completion() -> None:
+    def _result(rowidx: int) -> tuple[int, dict, None]:
+        rollout_id = f"rollout-{rowidx}"
+        return (
+            rowidx,
+            {
+                "receipt": {"rollout_id": rollout_id, "manifest": []},
+                "rollout_id": rollout_id,
+                "full_result": {"reward": float(rowidx)},
+                "message_log": [],
+                "input_message_log": [],
+            },
+            None,
+        )
+
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._task_to_env = {"nemo_gym": _StreamingGymEnv([_result(1), _result(0)])}
+    impl._tokenizer = None
+    impl._compute_rollout_metrics = lambda _completions, _agent_name: {}
+    callback_order: list[int] = []
+
+    async def _record(rowidx: int, _completion: Completion) -> None:
+        callback_order.append(rowidx)
+        if rowidx == 1:
+            assert len(callback_order) == 1
+
+    completions, _, _ = _run(
+        impl._run_rollouts(
+            [
+                {"agent_ref": {"name": "agent"}},
+                {"agent_ref": {"name": "agent"}},
+            ],
+            Timer(),
+            "timing/test",
+            on_completion=_record,
+        )
+    )
+
+    assert callback_order == [1, 0]
+    assert [completion.env_extras["ng_rollout_id"] for completion in completions] == [
+        "rollout-0",
+        "rollout-1",
+    ]
 
 
 class _FakeBuffer:
@@ -140,6 +213,7 @@ def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
     mgr._finalizer = None
+    mgr._recovery_ledger = None
     mgr._env_handles = {}
     mgr._weight_version = 0
     return mgr
@@ -901,10 +975,24 @@ class _FakeFinalizer:
         self._dropped = dropped
 
     def finalize_group(
-        self, group_id, rollout_ids, receipts, rewards, *, fallback_weight_version
+        self,
+        group_id,
+        rollout_ids,
+        receipts,
+        rewards,
+        *,
+        fallback_weight_version,
+        canonical_sample_ids=None,
     ):
         self.calls.append(
-            (group_id, rollout_ids, receipts, rewards, fallback_weight_version)
+            (
+                group_id,
+                rollout_ids,
+                receipts,
+                rewards,
+                fallback_weight_version,
+                canonical_sample_ids,
+            )
         )
         return _FakeFinalizedGroup(dropped=self._dropped)
 
@@ -986,49 +1074,102 @@ def _receipt_record(rollout_ids, receipts):
     )
 
 
-def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
+def _make_capture_manager(
+    buf,
+    finalizer,
+    *,
+    on_run=None,
+    num_generations=2,
+    fail_after_completions=None,
+):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._tq_buffer = buf
     mgr._finalizer = finalizer
+    mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
     mgr._weight_version = 7
 
     class _CaptureImpl:
         def __init__(self):
             self.seen_rollout_ids = None
+            self.streamed_recovery_groups = []
 
-        async def run_rollout(self, _sample, *, rollout_ids=None):
+        async def run_rollout(self, _sample, *, rollout_ids=None, on_completion=None):
             self.seen_rollout_ids = rollout_ids
             if on_run is not None:
                 await on_run(_sample)
-            return _receipt_record(
-                rollout_ids, [{"rollout_id": rid} for rid in rollout_ids]
-            )
+            receipts = [
+                {
+                    "rollout_id": rollout_id,
+                    "manifest": [{"staging_key": f"stage-{generation_index}"}],
+                }
+                for generation_index, rollout_id in enumerate(rollout_ids)
+            ]
+            record = _receipt_record(rollout_ids, receipts)
+            for generation_index, completion in enumerate(record.completions):
+                if on_completion is not None:
+                    await on_completion(generation_index, completion)
+                    self.streamed_recovery_groups.append(
+                        mgr.recovery_ledger.get_group(buf._slots[0])
+                    )
+                if fail_after_completions == generation_index + 1:
+                    raise RuntimeError("stream interrupted")
+            return record
 
     mgr._impl = _CaptureImpl()
     return mgr
+
+
+def _capture_sample():
+    return {
+        "idx": 42,
+        "message_log": [],
+        "extra_env_info": {},
+        "task_name": "nemo_gym",
+    }
 
 
 class TestGenerateAndFinalizeFlow:
     def test_mints_ids_finalizes_and_commits(self):
         buf = _FakeCaptureBuffer()
         finalizer = _FakeFinalizer()
-        mgr = _make_capture_manager(buf, finalizer)
+        observed_recovery_groups = []
 
-        _run(mgr.generate_and_push({"prompt": "p"}, target_step=5))
+        async def _observe_dispatched_group(_sample):
+            observed_recovery_groups.append(
+                mgr.recovery_ledger.get_group(buf._slots[0])
+            )
 
-        # Rollout ids were minted from the reserved group id and threaded
-        # end to end: reserve -> impl -> finalizer.
+        mgr = _make_capture_manager(buf, finalizer, on_run=_observe_dispatched_group)
+
+        _run(mgr.generate_and_push(_capture_sample(), target_step=5))
+
+        # Canonical IDs are stable logical siblings. Physical gate IDs carry
+        # an attempt suffix and are threaded reserve -> impl -> finalizer.
         (group_id,) = buf._slots
-        expected_ids = [f"{group_id}_g0", f"{group_id}_g1"]
-        assert buf.reserve_rollout_ids == [expected_ids]
-        assert mgr._impl.seen_rollout_ids == expected_ids
-        (fin_group_id, fin_ids, receipts, rewards, fallback_wv) = finalizer.calls[0]
+        logical_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+        (gate_ids,) = buf.reserve_rollout_ids
+        assert gate_ids is not None
+        assert all(
+            gate_id.startswith(f"{logical_id}_a")
+            for gate_id, logical_id in zip(gate_ids, logical_ids)
+        )
+        assert len(set(gate_ids)) == 2
+        assert mgr._impl.seen_rollout_ids == gate_ids
+        (
+            fin_group_id,
+            fin_ids,
+            receipts,
+            rewards,
+            fallback_wv,
+            canonical_ids,
+        ) = finalizer.calls[0]
         assert fin_group_id == group_id
-        assert fin_ids == expected_ids
-        assert [r["rollout_id"] for r in receipts] == expected_ids
+        assert fin_ids == gate_ids
+        assert canonical_ids == logical_ids
+        assert [r["rollout_id"] for r in receipts] == gate_ids
         assert rewards == [0.5, 0.5]
         assert fallback_wv == 7
         # commit_finalized carried the group's min/max call versions.
@@ -1045,15 +1186,53 @@ class TestGenerateAndFinalizeFlow:
         # The legacy commit path was not used and nothing failed at the gate.
         assert buf.commit_calls == []
         assert mgr._env_handles["nemo_gym"].failed == []
+        (recovery_group,) = observed_recovery_groups
+        assert recovery_group.prompt_id == "42"
+        assert recovery_group.target_step == 5
+        assert recovery_group.logical_rollout_ids == logical_ids
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.DISPATCHED
+            for sibling in recovery_group.siblings
+        )
+        streamed_group = mgr._impl.streamed_recovery_groups[-1]
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+            for sibling in streamed_group.siblings
+        )
+        assert [
+            sibling.current_attempt.staging_keys for sibling in streamed_group.siblings
+        ] == [["stage-0"], ["stage-1"]]
+        assert len(mgr.recovery_ledger) == 0
 
     def test_dropped_group_aborts_slot(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf, _FakeFinalizer(dropped=True))
         with pytest.raises(RuntimeError, match="min_valid_fraction"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push(_capture_sample()))
         assert buf.commit_finalized_calls == []
         assert len(buf.abort_finalized_calls) == 1
         assert len(buf.abort_calls) >= 1
+        assert len(mgr.recovery_ledger) == 0
+
+    def test_dropped_group_preserves_sealed_receipts_when_cleanup_fails(self):
+        class _FailingCleanupBuffer(_FakeCaptureBuffer):
+            async def abort_finalized(self, group_id, *, staging_keys):
+                self.abort_finalized_calls.append((group_id, list(staging_keys)))
+                raise RuntimeError("staging cleanup failed")
+
+        buf = _FailingCleanupBuffer()
+        mgr = _make_capture_manager(buf, _FakeFinalizer(dropped=True))
+
+        with pytest.raises(RuntimeError, match="staging cleanup failed"):
+            _run(mgr.generate_and_push(_capture_sample()))
+
+        (group_id,) = buf.abort_calls
+        recovery_group = mgr.recovery_ledger.get_group(group_id)
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+            for sibling in recovery_group.siblings
+        )
+        assert mgr._env_handles["nemo_gym"].failed == []
 
     def test_failed_dispatch_aborts_and_fails_gate_rollouts(self):
         buf = _FakeCaptureBuffer()
@@ -1063,10 +1242,50 @@ class TestGenerateAndFinalizeFlow:
 
         mgr = _make_capture_manager(buf, _FakeFinalizer(), on_run=_boom)
         with pytest.raises(RuntimeError, match="rollout exploded"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push(_capture_sample()))
         assert buf.commit_finalized_calls == []
         assert len(buf.abort_calls) == 1
         (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[0]
         (group_id,) = [buf.abort_calls[0]]
-        assert failed_ids == [f"{group_id}_g0", f"{group_id}_g1"]
+        assert all(
+            gate_id.startswith(f"{group_id}_g{generation_index}_a")
+            for generation_index, gate_id in enumerate(failed_ids)
+        )
         assert reason == "dispatch_failed"
+        recovery_group = mgr.recovery_ledger.get_group(group_id)
+        assert all(
+            sibling.current_attempt.status == RolloutAttemptStatus.ABANDONED
+            for sibling in recovery_group.siblings
+        )
+
+    def test_stream_failure_preserves_completed_siblings(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(
+            buf,
+            _FakeFinalizer(),
+            num_generations=3,
+            fail_after_completions=2,
+        )
+
+        with pytest.raises(RuntimeError, match="stream interrupted"):
+            _run(mgr.generate_and_push(_capture_sample()))
+
+        (group_id,) = buf.abort_calls
+        recovery_group = mgr.recovery_ledger.get_group(group_id)
+        assert [
+            sibling.current_attempt.status for sibling in recovery_group.siblings
+        ] == [
+            RolloutAttemptStatus.SEALED,
+            RolloutAttemptStatus.SEALED,
+            RolloutAttemptStatus.ABANDONED,
+        ]
+        assert [
+            sibling.current_attempt.staging_keys
+            for sibling in recovery_group.siblings[:2]
+        ] == [["stage-0"], ["stage-1"]]
+        (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[0]
+        assert failed_ids == [
+            recovery_group.siblings[2].current_attempt.gate_rollout_id
+        ]
+        assert reason == "dispatch_failed"
+        assert buf.commit_finalized_calls == []

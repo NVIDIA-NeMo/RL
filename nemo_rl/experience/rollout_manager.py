@@ -15,7 +15,7 @@
 import asyncio
 import copy
 import json
-import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
 import torch
@@ -28,6 +28,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_recovery import (
+    RolloutAttemptStatus,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.rollouts import _tensorize_by_key, calculate_rewards
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -37,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 
 class AsyncRolloutImpl:
@@ -64,19 +69,28 @@ class AsyncRolloutImpl:
         self._policy_generation = policy_generation
 
     async def run_rollout(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             rollout_ids: Unsupported here — token capture is NeMo-Gym only.
+            on_completion: Unsupported here — streamed sibling receipts are
+                available only on the NeMo-Gym path.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
         """
         assert rollout_ids is None, (
             "token capture (rollout_ids) is only supported on the NeMo-Gym path"
+        )
+        assert on_completion is None, (
+            "streamed completion callbacks are only supported on the NeMo-Gym path"
         )
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -424,7 +438,11 @@ class AsyncNemoGymRolloutImpl:
         self._validate_init_params()
 
     async def run_rollout(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -434,6 +452,8 @@ class AsyncNemoGymRolloutImpl:
                 per generation, riding each row's run body as the opaque
                 ``_ng_rollout_id`` key (agents stamp /ng-rollout/<id> from it;
                 zero agent changes).
+            on_completion: Optional async callback invoked as soon as one
+                streamed sibling result has been converted to a completion.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -444,7 +464,10 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_inputs = self._build_inputs(input_sample, rollout_ids=rollout_ids)
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
-            rollout_inputs, timer, timer_prefix
+            rollout_inputs,
+            timer,
+            timer_prefix,
+            on_completion=on_completion,
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -513,7 +536,12 @@ class AsyncNemoGymRolloutImpl:
         return rows
 
     async def _run_rollouts(
-        self, inputs: list[dict], timer: Timer, timer_prefix: str
+        self,
+        inputs: list[dict],
+        timer: Timer,
+        timer_prefix: str,
+        *,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
         nemo_gym_env = self._task_to_env["nemo_gym"]
@@ -521,6 +549,7 @@ class AsyncNemoGymRolloutImpl:
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results: list[dict | None] = [None for _ in inputs]
+            streamed_completions: list[Completion | None] = [None for _ in inputs]
             received_row_indices: set[int] = set()
             env_timing_metrics: dict[str, Any] = {}
             async for result_ref in nemo_gym_env.run_rollouts.options(
@@ -536,10 +565,16 @@ class AsyncNemoGymRolloutImpl:
                     raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
                 received_row_indices.add(rowidx)
                 results[rowidx] = result
+                completion = self._result_to_completion(result)
+                if on_completion is not None:
+                    await on_completion(rowidx, completion)
+                streamed_completions[rowidx] = completion
                 if timing_metrics is not None:
                     env_timing_metrics = timing_metrics
 
-            if any(result is None for result in results):
+            if any(result is None for result in results) or any(
+                completion is None for completion in streamed_completions
+            ):
                 raise RuntimeError(
                     "NeMo-Gym rollout stream ended before all rows arrived"
                 )
@@ -548,9 +583,10 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            # Convert results to completions.
             completions = [
-                self._result_to_completion(result) for result in completed_results
+                completion
+                for completion in streamed_completions
+                if completion is not None
             ]
 
         # Compute rollout metrics.
@@ -721,6 +757,7 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
         finalizer: Optional[Any] = None,
+        recovery_ledger: Optional[RolloutRecoveryLedger] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -728,6 +765,10 @@ class RolloutManager:
         if finalizer is not None:
             assert use_nemo_gym, (
                 "token capture (finalizer) is only supported on the NeMo-Gym path"
+            )
+        if recovery_ledger is not None and finalizer is None:
+            raise ValueError(
+                "rollout recovery ledger is only supported with token capture"
             )
 
         if not use_nemo_gym:
@@ -754,10 +795,22 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._finalizer = finalizer
+        self._recovery_ledger = (
+            recovery_ledger
+            if recovery_ledger is not None
+            else RolloutRecoveryLedger()
+            if finalizer is not None
+            else None
+        )
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
         self._weight_version: int = 0
+
+    @property
+    def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
+        """Return the controller-local token-capture recovery ledger."""
+        return self._recovery_ledger
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -781,12 +834,23 @@ class RolloutManager:
         return await env.gate_metrics.remote()
 
     async def run_rollout(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
+            assert on_completion is None, (
+                "completion callback requires token-capture rollout IDs"
+            )
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
-        return await self._impl.run_rollout(input_sample, rollout_ids=rollout_ids)
+        return await self._impl.run_rollout(
+            input_sample,
+            rollout_ids=rollout_ids,
+            on_completion=on_completion,
+        )
 
     async def generate_and_push(
         self, input_sample: DatumSpec, *, target_step: Optional[int] = None
@@ -827,34 +891,74 @@ class RolloutManager:
     ) -> None:
         """Token-capture dispatch: receipts in, canonical rows via the finalizer.
 
-        Mints the group's rollout ids up front — sample ids and gate-registered
-        rollout ids are the same strings (``{group_id}_g{i}``) — reserves the
-        slot with them so cleanup can name what it owns before a receipt
-        exists, and commits via ``commit_finalized`` with the group's
-        min/max call weight versions.
+        The recovery ledger mints stable canonical sibling IDs plus a distinct
+        physical gate ID for each execution attempt. The buffer records the
+        physical IDs so cleanup can name what it owns before a receipt exists;
+        the finalizer maps those attempts back to stable canonical rows.
         """
+        assert self._recovery_ledger is not None
         start_version = self._weight_version
-        group_id = str(uuid.uuid4())
-        rollout_ids = [
-            f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
-        ]
-        self._tq_buffer.reserve(
-            weight_version=start_version,
+        recovery_group = self._recovery_ledger.reserve_group(
+            prompt_id=str(input_sample["idx"]),
+            prompt_payload=input_sample,
+            expected_generations=self._num_generations_per_prompt,
             target_step=target_step,
-            group_id=group_id,
-            rollout_ids=rollout_ids,
+            start_weight_version=start_version,
         )
+        group_id = recovery_group.group_id
+        logical_rollout_ids = recovery_group.logical_rollout_ids
+        gate_rollout_ids = recovery_group.gate_rollout_ids
+        discard_recovery_group = False
+
+        async def _record_streamed_completion(
+            generation_index: int, completion: Completion
+        ) -> None:
+            env_extras = completion.env_extras
+            if env_extras is None:
+                raise ValueError(
+                    "token-capture completion must contain environment extras"
+                )
+            receipt = env_extras.get("ng_receipt")
+            gate_rollout_id = env_extras.get("ng_rollout_id")
+            if not isinstance(receipt, dict):
+                raise ValueError(
+                    "token-capture completion must contain a receipt mapping"
+                )
+            if not isinstance(gate_rollout_id, str):
+                raise ValueError(
+                    "token-capture completion must contain its gate rollout ID"
+                )
+            self._recovery_ledger.mark_sibling_sealed(
+                group_id,
+                generation_index=generation_index,
+                gate_rollout_id=gate_rollout_id,
+                receipt=receipt,
+                reward=completion.reward,
+            )
+
         try:
-            record = await self.run_rollout(input_sample, rollout_ids=rollout_ids)
+            self._tq_buffer.reserve(
+                weight_version=start_version,
+                target_step=target_step,
+                group_id=group_id,
+                rollout_ids=gate_rollout_ids,
+            )
+            self._recovery_ledger.mark_group_dispatched(group_id)
+            record = await self.run_rollout(
+                input_sample,
+                rollout_ids=gate_rollout_ids,
+                on_completion=_record_streamed_completion,
+            )
             receipts = [c.env_extras.get("ng_receipt") for c in record.completions]
             rewards = [float(c.reward) for c in record.completions]
             finalized = await asyncio.to_thread(
                 self._finalizer.finalize_group,
                 group_id,
-                rollout_ids,
+                gate_rollout_ids,
                 receipts,
                 rewards,
                 fallback_weight_version=start_version,
+                canonical_sample_ids=logical_rollout_ids,
             )
             record.rollout_metrics.update(finalized.metrics)
             if finalized.dropped:
@@ -863,6 +967,9 @@ class RolloutManager:
                 await self._tq_buffer.abort_finalized(
                     group_id, staging_keys=finalized.staging_keys
                 )
+                # Only discard the lineage once cleanup succeeds. If cleanup
+                # fails, retain sealed receipts so recovery can retry it.
+                discard_recovery_group = True
                 raise RuntimeError(
                     f"token capture: group {group_id} dropped "
                     "(min_valid_fraction_per_group)"
@@ -879,13 +986,35 @@ class RolloutManager:
             )
         except BaseException:
             self._tq_buffer.abort(group_id)
-            # Best-effort gate cleanup: no receipt will ever seal these ids.
+            if discard_recovery_group:
+                self._recovery_ledger.discard_group(group_id)
+                gate_ids_to_fail = gate_rollout_ids
+            else:
+                self._recovery_ledger.abandon_group(group_id)
+                recovery_group = self._recovery_ledger.get_group(group_id)
+                gate_ids_to_fail = [
+                    sibling.current_attempt.gate_rollout_id
+                    for sibling in recovery_group.siblings
+                    if sibling.current_attempt.status
+                    not in {
+                        RolloutAttemptStatus.SEALED,
+                        RolloutAttemptStatus.FINALIZED,
+                    }
+                ]
+            # Best-effort gate cleanup for attempts with no reusable receipt.
+            # Sealed siblings must remain intact for partial-group recovery.
             nemo_gym_env = self._env_handles.get("nemo_gym")
-            if nemo_gym_env is not None:
+            if nemo_gym_env is not None and gate_ids_to_fail:
                 try:
                     await nemo_gym_env.fail_rollouts.remote(
-                        rollout_ids, reason="dispatch_failed"
+                        gate_ids_to_fail, reason="dispatch_failed"
                     )
                 except Exception as error:  # noqa: BLE001 — TTL is the backstop
                     print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
             raise
+        else:
+            # Completed groups are recovered through canonical TQ rows plus
+            # replay metadata. Retaining their prompt payload here would grow
+            # controller memory without improving recovery.
+            self._recovery_ledger.mark_group_finalized(group_id)
+            self._recovery_ledger.release_finalized_group(group_id)
