@@ -1255,6 +1255,48 @@ class TestDataPlaneCheckpoint:
 
         asyncio.run(_main())
 
+    def test_restore_rejects_canonical_plus_unfinished_groups_over_capacity(
+        self, tmp_path
+    ):
+        async def _main() -> None:
+            mc = _actor_master_config(
+                tmp_path,
+                buffer_checkpoint=True,
+                data_plane_checkpoint=True,
+                token_capture=True,
+                max_buffered_rollouts=4,
+            )
+            ledger = _unfinished_recovery_ledger(3)
+            manager = _FakeRolloutManager(ledger)
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=_FakeDPClient(),
+                    rollout_manager=manager,
+                    data_plane_checkpoint_metadata={
+                        "rollout_recovery_payload_sha256": "digest"
+                    },
+                ),
+            )
+
+            # Restoring two canonical replay groups has already consumed two
+            # of the four permits. Three unfinished groups cannot also recover.
+            await actor._buffer_capacity.acquire()
+            await actor._buffer_capacity.acquire()
+            with pytest.raises(
+                RuntimeError,
+                match="exceed current buffer capacity",
+            ):
+                await actor._maybe_restore_rollout_recovery(
+                    restored_replay_groups=2
+                )
+            actor._checkpointer.shutdown()
+
+            assert manager.recovered_group_ids == []
+            assert actor._buffer_capacity._value == 2
+
+        asyncio.run(_main())
+
     def test_parallel_restore_failure_releases_uncommitted_permits(self, tmp_path):
         class _FailingRecoveryManager(_FakeRolloutManager):
             async def recover_group(self, group_id: str) -> bool:
@@ -1334,7 +1376,7 @@ class TestDataPlaneCheckpoint:
             token_capture=True,
         )
         ledger = _sealed_recovery_ledger()
-        expected_state = ledger.state_dict()
+        expected_state = ledger.state_dict(staging_partition="rollout_staging")
         staging_keys = sorted(ledger.expected_staging_keys())
         dp_client = _FakeDPClient(staging_sample_ids=staging_keys)
         rollout_manager = _FakeRolloutManager(ledger)

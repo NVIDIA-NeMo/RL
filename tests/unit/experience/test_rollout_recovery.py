@@ -12,6 +12,8 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 
+_STAGING_PARTITION = "rollout_staging"
+
 
 def _prompt() -> dict:
     return {
@@ -151,12 +153,16 @@ def test_state_dict_round_trip_preserves_lineage() -> None:
         receipt=_receipt(gate_rollout_id, 0),
         reward=0.5,
     )
-    state = ledger.state_dict()
+    state = ledger.state_dict(staging_partition=_STAGING_PARTITION)
 
-    restored = RolloutRecoveryLedger.from_state_dict(deepcopy(state))
+    restored = RolloutRecoveryLedger.from_state_dict(
+        deepcopy(state),
+        expected_staging_partition=_STAGING_PARTITION,
+    )
 
     assert state["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
-    assert restored.state_dict() == state
+    assert state["staging_partition"] == _STAGING_PARTITION
+    assert restored.state_dict(staging_partition=_STAGING_PARTITION) == state
     restored_group = restored.get_group(group.group_id)
     sealed_attempt = restored_group.siblings[0].current_attempt
     assert sealed_attempt.status == RolloutAttemptStatus.SEALED
@@ -286,11 +292,14 @@ def test_streamed_seal_rejects_receipt_identity_mismatch() -> None:
 def test_restore_rejects_identity_mismatch() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(ledger)
-    state = ledger.state_dict()
+    state = ledger.state_dict(staging_partition=_STAGING_PARTITION)
     state["groups"][0]["siblings"][0]["logical_rollout_id"] = "wrong"
 
     with pytest.raises(ValueError, match="logical rollout ID mismatch"):
-        RolloutRecoveryLedger.from_state_dict(state)
+        RolloutRecoveryLedger.from_state_dict(
+            state,
+            expected_staging_partition=_STAGING_PARTITION,
+        )
 
 
 def test_restore_rejects_staging_keys_that_disagree_with_receipt() -> None:
@@ -305,13 +314,31 @@ def test_restore_rejects_staging_keys_that_disagree_with_receipt() -> None:
         receipt=_receipt(gate_rollout_id, 0),
         reward=0.5,
     )
-    state = ledger.state_dict()
+    state = ledger.state_dict(staging_partition=_STAGING_PARTITION)
     state["groups"][0]["siblings"][0]["attempts"][0]["staging_keys"] = ["wrong-stage"]
 
     with pytest.raises(ValueError, match="do not match the receipt manifest"):
-        RolloutRecoveryLedger.from_state_dict(state)
+        RolloutRecoveryLedger.from_state_dict(
+            state,
+            expected_staging_partition=_STAGING_PARTITION,
+        )
+
+
+def test_restore_rejects_different_staging_partition() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(ledger)
+    state = ledger.state_dict(staging_partition=_STAGING_PARTITION)
+
+    with pytest.raises(ValueError, match="staging partition does not match"):
+        RolloutRecoveryLedger.from_state_dict(
+            state,
+            expected_staging_partition="different_staging",
+        )
 
 
 def test_restore_rejects_unknown_schema() -> None:
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
-        RolloutRecoveryLedger.from_state_dict({"schema_version": 999, "groups": []})
+        RolloutRecoveryLedger.from_state_dict(
+            {"schema_version": 999, "groups": []},
+            expected_staging_partition=_STAGING_PARTITION,
+        )

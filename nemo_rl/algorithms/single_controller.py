@@ -804,7 +804,9 @@ class SingleControllerActor:
                     raise RuntimeError(
                         "token capture checkpointing requires a rollout recovery ledger"
                     )
-                rollout_recovery_state = recovery_ledger.state_dict()
+                rollout_recovery_state = recovery_ledger.state_dict(
+                    staging_partition=self._master_config.token_capture.staging_partition
+                )
                 if replay_metadata is not None:
                     # A canonical commit and the following ledger release
                     # straddle one event-loop yield. Canonical replay wins if
@@ -814,6 +816,9 @@ class SingleControllerActor:
                     }
                     rollout_recovery_state = {
                         "schema_version": rollout_recovery_state["schema_version"],
+                        "staging_partition": rollout_recovery_state[
+                            "staging_partition"
+                        ],
                         "groups": [
                             group
                             for group in rollout_recovery_state["groups"]
@@ -1151,13 +1156,7 @@ class SingleControllerActor:
                 raise
 
         max_epochs = self._master_config.grpo["max_num_epochs"]
-        token_capture_enabled = bool(
-            getattr(
-                getattr(self._master_config, "token_capture", None),
-                "enabled",
-                False,
-            )
-        )
+        token_capture_enabled = self._master_config.token_capture.enabled
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 dataloader_iterator = iter(self._dataloader)

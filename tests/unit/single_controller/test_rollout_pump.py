@@ -100,7 +100,10 @@ def test_rollout_pump_stamps_target_steps(
         max_inflight_prompts=2,
         diagnostics=False,
     )
-    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+    ctrl._master_config = SimpleNamespace(
+        grpo={"max_num_epochs": 1},
+        token_capture=SimpleNamespace(enabled=False),
+    )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -159,7 +162,10 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             max_inflight_prompts=2,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo={"max_num_epochs": 1},
+            token_capture=SimpleNamespace(enabled=False),
+        )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -231,7 +237,10 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             max_inflight_prompts=1,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo={"max_num_epochs": 1},
+            token_capture=SimpleNamespace(enabled=False),
+        )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -323,6 +332,10 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
         "dispatch-10-group-10",
         "dispatch-11-group-11",
     ]
+    # The two completed groups retain their buffer permits. The additional
+    # end-of-epoch probe must return the pre-acquired batch capacity.
+    assert ctrl._buffer_capacity._value == 2
+    assert ctrl._rollout_slots._value == 2
 
 
 def test_token_capture_waits_for_capacity_before_reserving_next_batch() -> None:

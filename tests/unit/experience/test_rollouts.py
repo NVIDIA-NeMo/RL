@@ -1463,6 +1463,13 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    converted = []
+
+    def _convert(result):
+        converted.append(result["value"])
+        return result["value"]
+
+    manager._result_to_completion = _convert
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(
@@ -1475,6 +1482,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
                 timer_prefix="timing/test",
             )
         )
+
+    assert converted == ["first"]
 
 
 @pytest.mark.nemo_gym

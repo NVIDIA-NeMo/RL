@@ -149,7 +149,10 @@ def _write_recovery_sidecar(checkpoint_path) -> tuple[RolloutRecoveryLedger, str
         start_weight_version=3,
     )
     recovery_path = checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME
-    torch.save(ledger.state_dict(), recovery_path)
+    torch.save(
+        ledger.state_dict(staging_partition="rollout_staging"),
+        recovery_path,
+    )
     return ledger, hashlib.sha256(recovery_path.read_bytes()).hexdigest()
 
 
@@ -621,10 +624,13 @@ class TestNativeTQRecoverySetup:
             last_checkpoint_path=str(checkpoint_path),
             data_plane_checkpoint_metadata=restored_metadata,
             token_capture_enabled=True,
+            expected_staging_partition="rollout_staging",
         )
 
         assert restored_ledger is not None
-        assert restored_ledger.state_dict() == expected_ledger.state_dict()
+        assert restored_ledger.state_dict(
+            staging_partition="rollout_staging"
+        ) == expected_ledger.state_dict(staging_partition="rollout_staging")
 
     def test_rejects_rollout_ledger_payload_digest_mismatch(self, tmp_path):
         checkpoint_path = tmp_path / "step_3"
@@ -639,6 +645,23 @@ class TestNativeTQRecoverySetup:
                     "rollout_recovery_group_count": 1,
                 },
                 token_capture_enabled=True,
+                expected_staging_partition="rollout_staging",
+            )
+
+    def test_rejects_rollout_ledger_staging_partition_mismatch(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir(parents=True)
+        _, digest = _write_recovery_sidecar(checkpoint_path)
+
+        with pytest.raises(ValueError, match="staging partition does not match"):
+            sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+                last_checkpoint_path=str(checkpoint_path),
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_payload_sha256": digest,
+                    "rollout_recovery_group_count": 1,
+                },
+                token_capture_enabled=True,
+                expected_staging_partition="different_staging",
             )
 
     def test_setup_loads_tq_before_creating_single_controller_client(

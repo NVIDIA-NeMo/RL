@@ -908,6 +908,22 @@ class RolloutManager:
             return None
         return await env.gate_metrics.remote()
 
+    async def _fail_gate_rollouts(
+        self,
+        group_id: str,
+        rollout_ids: list[str],
+        *,
+        reason: str,
+    ) -> None:
+        """Best-effort cleanup for physical Gym gate registrations."""
+        nemo_gym_env = self._env_handles.get("nemo_gym")
+        if nemo_gym_env is None or not rollout_ids:
+            return
+        try:
+            await nemo_gym_env.fail_rollouts.remote(rollout_ids, reason=reason)
+        except Exception as error:  # noqa: BLE001 — TTL is the backstop
+            print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -951,7 +967,12 @@ class RolloutManager:
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            target_step: Training step this rollout targets; stamped on the
+                buffer slot for ``StalenessSampler.force_in_order``.
+            recovery_group_id: Existing durable ledger reservation to dispatch.
+                Token-capture callers use this after atomically advancing the
+                dataloader and reserving prompt lineage; it must belong to
+                ``input_sample`` and have the same ``target_step``.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
@@ -1127,14 +1148,11 @@ class RolloutManager:
                 ]
             # Best-effort gate cleanup for attempts with no reusable receipt.
             # Sealed siblings must remain intact for partial-group recovery.
-            nemo_gym_env = self._env_handles.get("nemo_gym")
-            if nemo_gym_env is not None and gate_ids_to_fail:
-                try:
-                    await nemo_gym_env.fail_rollouts.remote(
-                        gate_ids_to_fail, reason="dispatch_failed"
-                    )
-                except Exception as error:  # noqa: BLE001 — TTL is the backstop
-                    print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
+            await self._fail_gate_rollouts(
+                group_id,
+                gate_ids_to_fail,
+                reason="dispatch_failed",
+            )
             raise
         else:
             # Completed groups are recovered through canonical TQ rows plus
@@ -1210,6 +1228,7 @@ class RolloutManager:
                     reward=completion.reward,
                 )
 
+        recovery_group_discarded = False
         try:
             self._tq_buffer.reserve(
                 weight_version=group.start_weight_version,
@@ -1262,6 +1281,12 @@ class RolloutManager:
                     group.group_id, staging_keys=finalized.staging_keys
                 )
                 self._recovery_ledger.discard_group(group.group_id)
+                recovery_group_discarded = True
+                await self._fail_gate_rollouts(
+                    group.group_id,
+                    [attempt.gate_rollout_id for attempt in attempts],
+                    reason="finalizer_dropped",
+                )
                 print(
                     f"rollout recovery dropped group: group={group.group_id}",
                     flush=True,
@@ -1279,6 +1304,8 @@ class RolloutManager:
             )
         except BaseException:
             self._tq_buffer.abort(group.group_id)
+            if recovery_group_discarded:
+                raise
             self._recovery_ledger.abandon_group(group.group_id)
             recovery_group = self._recovery_ledger.get_group(group.group_id)
             gate_ids_to_fail = [
@@ -1290,14 +1317,11 @@ class RolloutManager:
                     RolloutAttemptStatus.FINALIZED,
                 }
             ]
-            nemo_gym_env = self._env_handles.get("nemo_gym")
-            if nemo_gym_env is not None and gate_ids_to_fail:
-                try:
-                    await nemo_gym_env.fail_rollouts.remote(
-                        gate_ids_to_fail, reason="recovery_failed"
-                    )
-                except Exception as error:  # noqa: BLE001 — TTL is the backstop
-                    print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
+            await self._fail_gate_rollouts(
+                group_id,
+                gate_ids_to_fail,
+                reason="recovery_failed",
+            )
             raise
         else:
             self._recovery_ledger.mark_group_finalized(group.group_id)

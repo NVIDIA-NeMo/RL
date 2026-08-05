@@ -53,6 +53,33 @@ _BOOTSTRAP_RUNTIME_CONFIG_FIELDS = frozenset(
 )
 
 
+def _fsync_file(path: Path) -> None:
+    """Flush one completed regular file to its backing filesystem."""
+    with path.open("rb") as file_obj:
+        os.fsync(file_obj.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Flush directory-entry updates such as rename and replace."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _fsync_tree(root: Path) -> None:
+    """Flush every snapshot payload before publishing its commit marker."""
+    for directory, _, filenames in os.walk(root, topdown=False):
+        directory_path = Path(directory)
+        for filename in filenames:
+            file_path = directory_path / filename
+            if not file_path.is_symlink() and file_path.is_file():
+                _fsync_file(file_path)
+        _fsync_directory(directory_path)
+
+
 def _snapshot_sequence(path: Path) -> int:
     match = _SNAPSHOT_RE.fullmatch(path.name)
     if match is None:
@@ -190,7 +217,10 @@ def ensure_bootstrap_anchor(checkpoint_dir: Path, *, fingerprint: str) -> Path:
 
     tmp_path = manifest_path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(expected, sort_keys=True, indent=2) + "\n")
+    _fsync_file(tmp_path)
     os.replace(tmp_path, manifest_path)
+    _fsync_directory(anchor)
+    _fsync_directory(anchor.parent)
     return anchor
 
 
@@ -242,14 +272,21 @@ def commit_snapshot(
     """Atomically publish one validated snapshot and retain recent fallbacks."""
     if keep_latest_k < 1:
         raise ValueError("rollout snapshot retention must keep at least one snapshot")
-    (tmp_path / ROLLOUT_SNAPSHOT_COMMITTED_FILENAME).write_text("committed\n")
+    _fsync_tree(tmp_path)
+    committed_path = tmp_path / ROLLOUT_SNAPSHOT_COMMITTED_FILENAME
+    committed_path.write_text("committed\n")
+    _fsync_file(committed_path)
+    _fsync_directory(tmp_path)
     os.rename(tmp_path, final_path)
 
     root = final_path.parent
+    _fsync_directory(root)
     latest_path = root / ROLLOUT_SNAPSHOT_LATEST_FILENAME
     latest_tmp = latest_path.with_suffix(".tmp")
     latest_tmp.write_text(final_path.name + "\n")
+    _fsync_file(latest_tmp)
     os.replace(latest_tmp, latest_path)
+    _fsync_directory(root)
 
     committed = sorted(
         (
@@ -262,8 +299,11 @@ def commit_snapshot(
         key=_snapshot_sequence,
         reverse=True,
     )
-    for stale in committed[keep_latest_k:]:
+    stale_snapshots = committed[keep_latest_k:]
+    for stale in stale_snapshots:
         shutil.rmtree(stale)
+    if stale_snapshots:
+        _fsync_directory(root)
 
 
 def resolve_latest_snapshot(
