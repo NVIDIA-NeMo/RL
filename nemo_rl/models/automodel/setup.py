@@ -47,6 +47,10 @@ from transformers import (
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.automodel.config import (
     DistributedContext,
     ModelAndOptimizerState,
@@ -187,7 +191,15 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(
+        tokenizer_config
+    )
+    if use_deepseek_v4_tokenizer:
+        print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
@@ -458,9 +470,18 @@ def setup_distributed(
     dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
+    # Automodel overlays EP on the flattened DP x CP x TP mesh; EP is not an
+    # independent world-size dimension. Infer DP only from TP and CP, matching
+    # MeshContext.build and the model-owned context-parallel interface.
+    non_dp_size = tp_size * cp_size
+    if world_size % non_dp_size != 0:
+        raise ValueError(
+            f"World size ({world_size}) must be divisible by TP x CP "
+            f"({tp_size} x {cp_size} = {non_dp_size})."
+        )
+    dp_size = world_size // non_dp_size
+
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
-    model_parallel_size = tp_size * cp_size * ep_size
-    dp_size = world_size // model_parallel_size
     if dp_size % dp_replicate_size != 0:
         raise ValueError(
             f"Data parallel size ({dp_size}) must be divisible by "
@@ -496,7 +517,7 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Build the unified Automodel mesh. EP overlays DP x CP x TP.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(

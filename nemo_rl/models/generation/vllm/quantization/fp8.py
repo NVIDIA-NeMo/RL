@@ -197,11 +197,13 @@ def apply_fp8_patches(self, fp8_config):
                     )
                 )
 
-            # Static scales mode: patch process_weights_after_loading to preserve
-            # k_scale/v_scale for manual updates.
-            func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-            patcher5 = patch(func5_path, process_weights_after_loading_kv)
-            fp8_state.vllm_patches.append(patcher5)
+            # Static scales mode: preserve k_scale/v_scale for manual updates.
+            # DeepSeek V4's MLA cache stores scales inline, so it has no
+            # Parameter-style KV scales for this patch to preserve or refit.
+            if global_fp8_config.kv_cache_dtype != "fp8_ds_mla":
+                func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+                patcher5 = patch(func5_path, process_weights_after_loading_kv)
+                fp8_state.vllm_patches.append(patcher5)
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -230,9 +232,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
-    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
+    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    if kv_cache_dtype not in supported_kv_cache_dtypes:
         raise ValueError(
-            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
+            f"kv_cache_dtype must be one of {supported_kv_cache_dtypes}, but got {kv_cache_dtype}"
         )
 
     # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
