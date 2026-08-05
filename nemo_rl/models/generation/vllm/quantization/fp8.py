@@ -893,10 +893,11 @@ def process_weights_after_loading_moe(self, layer) -> None:
     # but without replace_parameter). Gate on is None, not hasattr, because
     # FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips refit
     # calls (finalize_layerwise_reload) which lack set_current_vllm_config context.
-    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if self.moe_quant_config and self.moe_kernel is None:
+    if self.moe_kernel is None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
         assert self.experts_cls is not None
         self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,

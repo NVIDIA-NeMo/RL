@@ -190,8 +190,12 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
             data=w2_scale_from_checkpoint
         ),
     )
+    moe_kernel = object()
+    moe_quant_config = object()
     quant_method = types.SimpleNamespace(
-        moe=types.SimpleNamespace(is_act_and_mul=False)
+        moe=types.SimpleNamespace(is_act_and_mul=False),
+        moe_kernel=moe_kernel,
+        moe_quant_config=moe_quant_config,
     )
     shuffled = (
         torch.full_like(w13_weight, 1),
@@ -257,6 +261,8 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     assert torch.equal(layer.w2_weight, shuffled[1])
     assert torch.equal(layer.w13_weight_scale, shuffled[2])
     assert torch.equal(layer.w2_weight_scale, shuffled[3])
+    assert quant_method.moe_kernel is moe_kernel
+    assert quant_method.moe_quant_config is moe_quant_config
 
 
 def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
@@ -268,38 +274,44 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         refit_batched_moe_shuffle=True,
     )
 
-    w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
-    w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
-    w13_scale = torch.nn.Parameter(torch.zeros(2, 4, 1), requires_grad=False)
-    w2_scale = torch.nn.Parameter(torch.zeros(2, 3, 1), requires_grad=False)
-    layer = types.SimpleNamespace(
-        w13_weight=w13_weight,
-        w2_weight=w2_weight,
-        w13_weight_scale=w13_scale,
-        w2_weight_scale=w2_scale,
-        w13_weight_scale_from_checkpoint=types.SimpleNamespace(
-            data=torch.ones_like(w13_scale)
-        ),
-        w2_weight_scale_from_checkpoint=types.SimpleNamespace(
-            data=torch.ones_like(w2_scale)
-        ),
-        _expert_routing_tables=lambda: (None, None, None),
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.zeros(2, 4, 1), requires_grad=False
     )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.zeros(2, 3, 1), requires_grad=False
+    )
+    layer.w13_weight_scale.weight_loader = object()
+    layer.w2_weight_scale.weight_loader = object()
+    layer._expert_routing_tables = lambda: (None, None, None)
     moe_config = types.SimpleNamespace(is_act_and_mul=False)
     quant_config = object()
     experts_cls = object()
+    quant_config_calls = []
+
+    def get_quant_config(_layer):
+        quant_config_calls.append(_layer)
+        return quant_config
+
     quant_method = types.SimpleNamespace(
         moe=moe_config,
         moe_kernel=None,
         mxfp8_backend="flashinfer_trtllm",
         experts_cls=experts_cls,
-        get_fused_moe_quant_config=lambda _layer: quant_config,
+        get_fused_moe_quant_config=get_quant_config,
     )
-    shuffled = (w13_weight, w2_weight, w13_scale, w2_scale)
     kernel = object()
     kernel_calls = []
+    shuffle_calls = []
 
-    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", lambda *_args: shuffled)
+    def shuffle(*args):
+        shuffle_calls.append(args)
+        fill = len(shuffle_calls)
+        return tuple(torch.full_like(tensor, fill) for tensor in args[1:5])
+
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", shuffle)
 
     from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 
@@ -310,10 +322,28 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
 
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    runtime_parameters = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight_scale,
+    )
+    parameter_ids = tuple(id(parameter) for parameter in runtime_parameters)
+    storage_ptrs = tuple(parameter.data_ptr() for parameter in runtime_parameters)
+
+    layer.w13_weight_scale_from_checkpoint.data.fill_(2)
+    layer.w2_weight_scale_from_checkpoint.data.fill_(2)
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
     assert quant_method.moe_kernel is kernel
+    assert quant_method.moe_quant_config is quant_config
+    assert quant_config_calls == [layer]
     assert len(kernel_calls) == 1
+    assert len(shuffle_calls) == 2
+    assert tuple(id(parameter) for parameter in runtime_parameters) == parameter_ids
+    assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == storage_ptrs
+    assert all(torch.all(parameter == 2) for parameter in runtime_parameters)
     assert kernel_calls[0] == {
         "moe_quant_config": quant_config,
         "moe_config": moe_config,
