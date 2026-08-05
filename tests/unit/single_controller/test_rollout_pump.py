@@ -100,7 +100,10 @@ def test_rollout_pump_stamps_target_steps(
         max_inflight_prompts=2,
         diagnostics=False,
     )
-    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+    ctrl._master_config = SimpleNamespace(
+        grpo={"max_num_epochs": 1},
+        token_capture=SimpleNamespace(enabled=False),
+    )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -113,6 +116,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._rollout_slots = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
@@ -158,7 +162,10 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             max_inflight_prompts=2,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo={"max_num_epochs": 1},
+            token_capture=SimpleNamespace(enabled=False),
+        )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -176,6 +183,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._rollout_slots = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
@@ -220,14 +228,6 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             return task
 
     real_semaphore = asyncio.Semaphore
-    created_semaphores: list[asyncio.Semaphore] = []
-
-    def _recording_semaphore(value: int) -> asyncio.Semaphore:
-        semaphore = real_semaphore(value)
-        created_semaphores.append(semaphore)
-        return semaphore
-
-    monkeypatch.setattr(asyncio, "Semaphore", _recording_semaphore)
     monkeypatch.setattr(asyncio, "TaskGroup", _CancelBeforeStartTaskGroup)
 
     async def _main() -> None:
@@ -237,7 +237,10 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             max_inflight_prompts=1,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo={"max_num_epochs": 1},
+            token_capture=SimpleNamespace(enabled=False),
+        )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -248,6 +251,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = real_semaphore(1)
+        ctrl._rollout_slots = real_semaphore(1)
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
@@ -257,7 +261,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         await asyncio.sleep(0)
 
         assert ctrl._buffer_capacity._value == 1
-        assert created_semaphores[0]._value == 1
+        assert ctrl._rollout_slots._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
         assert ctrl._rollout_exhausted.is_set()
@@ -291,7 +295,7 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
     ctrl._master_config = SimpleNamespace(
-        grpo={"max_num_epochs": 1},
+        grpo={"max_num_epochs": 1, "num_prompts_per_step": 2},
         token_capture=SimpleNamespace(enabled=True),
     )
     ctrl._rollout_manager = _RecordingRolloutManager()
@@ -311,7 +315,10 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    # Two permits remain available so the pump can probe the exhausted
+    # dataloader after the completed groups retain their two permits.
+    ctrl._buffer_capacity = asyncio.Semaphore(4)
+    ctrl._rollout_slots = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
@@ -325,6 +332,101 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
         "dispatch-10-group-10",
         "dispatch-11-group-11",
     ]
+    # The two completed groups retain their buffer permits. The additional
+    # end-of-epoch probe must return the pre-acquired batch capacity.
+    assert ctrl._buffer_capacity._value == 2
+    assert ctrl._rollout_slots._value == 2
+
+
+def test_token_capture_waits_for_capacity_before_reserving_next_batch() -> None:
+    async def _main() -> None:
+        class _BlockingRolloutManager:
+            def __init__(self) -> None:
+                self.reserved_prompt_ids: list[int] = []
+                self._started = 0
+                self.first_batch_started = asyncio.Event()
+
+            def reserve_prompt_group(
+                self, prompt: Any, *, target_step: int | None = None
+            ) -> str:
+                del target_step
+                prompt_id = prompt["idx"]
+                self.reserved_prompt_ids.append(prompt_id)
+                return f"group-{prompt_id}"
+
+            async def generate_and_push(
+                self,
+                prompt: Any,
+                *,
+                target_step: int | None = None,
+                recovery_group_id: str | None = None,
+            ) -> None:
+                del prompt, target_step, recovery_group_id
+                self._started += 1
+                if self._started == 2:
+                    self.first_batch_started.set()
+                await asyncio.Event().wait()
+
+        manager = _BlockingRolloutManager()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+        ctrl._master_config = SimpleNamespace(
+            grpo={"max_num_epochs": 1, "num_prompts_per_step": 2},
+            token_capture=SimpleNamespace(enabled=True),
+        )
+        ctrl._rollout_manager = manager
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "idx": [10, 11],
+                    "message_log": [
+                        [{"role": "user", "content": "a"}],
+                        [{"role": "user", "content": "b"}],
+                    ],
+                }
+            ),
+            BatchedDataDict(
+                {
+                    "idx": [12, 13],
+                    "message_log": [
+                        [{"role": "user", "content": "c"}],
+                        [{"role": "user", "content": "d"}],
+                    ],
+                }
+            ),
+        ]
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._rollout_slots = asyncio.Semaphore(2)
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        pump_task = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.wait_for(manager.first_batch_started.wait(), timeout=1.0)
+
+        async def _checkpointed_prompt_ids() -> list[int]:
+            async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+                return list(manager.reserved_prompt_ids)
+
+        checkpointed_prompt_ids = await asyncio.wait_for(
+            _checkpointed_prompt_ids(), timeout=1.0
+        )
+        assert checkpointed_prompt_ids == [10, 11]
+        assert ctrl._buffer_capacity._value == 0
+
+        pump_task.cancel()
+        result = (await asyncio.gather(pump_task, return_exceptions=True))[0]
+        assert isinstance(result, asyncio.CancelledError)
+        assert ctrl._buffer_capacity._value == 2
+
+    asyncio.run(_main())
 
 
 @pytest.mark.vllm

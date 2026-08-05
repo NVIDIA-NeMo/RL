@@ -229,8 +229,9 @@ class BlackboxFinalizer:
         dispatch task. ``fallback_weight_version`` stamps a group none of
         whose rollouts produced a valid row (placeholder-only groups still
         need a staleness tag). ``rollout_ids`` are physical gate attempt IDs;
-        ``canonical_sample_ids`` are stable logical sibling IDs. They are the
-        same on the legacy first-attempt path.
+        ``canonical_sample_ids`` are stable logical sibling IDs. Callers that
+        do not need retry-stable identity may omit them, in which case the
+        physical rollout IDs are also used as canonical sample IDs.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards), (
             "rollout_ids, receipts, and rewards must be parallel"

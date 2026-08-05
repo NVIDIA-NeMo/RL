@@ -25,6 +25,8 @@ Covers:
   - dataloader state: train_dataloader.pt written at save, position
     round-trip through a real StatefulDataLoader, dataset-swap guard,
     setup restore wiring + missing-file fresh-position fallback;
+  - lightweight pre-step rollout snapshots, retention, dirty-state skipping,
+    trainer-anchor gating, and required deadline saves;
   - native replay persistence requires both sampler support and TQ checkpointing;
   - setup_single_controller resume-path wiring (get_resume_paths forwarded
     to the trainer factory, save_state loaded from training_info.json).
@@ -39,7 +41,7 @@ import os
 import threading
 from pathlib import Path
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -64,7 +66,13 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointConfig,
     setup_single_controller,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    BOOTSTRAP_DIRNAME,
+    ROLLOUT_SNAPSHOT_COMMITTED_FILENAME,
+    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
@@ -423,9 +431,13 @@ def _actor_master_config(
     checkpoint_must_save_by: Optional[str] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
+    max_inflight_prompts: int = 4,
+    max_buffered_rollouts: int = 4,
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = False,
     token_capture: bool = False,
+    rollout_checkpoint_interval_s: Optional[float] = None,
+    rollout_checkpoint_keep_latest_k: int = 2,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -482,8 +494,12 @@ def _actor_master_config(
         async_rl=AsyncRLConfig(
             sampler=sampler_cfg,
             min_groups_for_streaming_train=1,
-            max_inflight_prompts=4,
-            max_buffered_rollouts=4,
+            max_inflight_prompts=max_inflight_prompts,
+            max_buffered_rollouts=max_buffered_rollouts,
+        ),
+        rollout_checkpointing=RolloutCheckpointConfig(
+            interval_s=rollout_checkpoint_interval_s,
+            keep_latest_k=rollout_checkpoint_keep_latest_k,
         ),
     )
     config.token_capture.enabled = token_capture
@@ -500,6 +516,7 @@ def _make_actor_args(
     last_checkpoint_path: Optional[str] = None,
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
     rollout_manager: Optional[_FakeRolloutManager] = None,
+    bootstrap_fingerprint: Optional[str] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -522,6 +539,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        bootstrap_fingerprint=bootstrap_fingerprint,
     )
 
 
@@ -588,6 +606,27 @@ def _partial_recovery_ledger() -> RolloutRecoveryLedger:
         reward=1.0,
     )
     ledger.abandon_group(group.group_id)
+    return ledger
+
+
+def _unfinished_recovery_ledger(group_count: int) -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    for group_index in range(group_count):
+        group_id = f"recovery-g{group_index}"
+        group = ledger.reserve_group(
+            group_id=group_id,
+            prompt_id=f"prompt-{group_index}",
+            prompt_payload={
+                "idx": group_index,
+                "message_log": [{"role": "user", "content": "solve"}],
+                "extra_env_info": {},
+                "task_name": "nemo_gym",
+            },  # type: ignore[arg-type]
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=0,
+        )
+        ledger.mark_group_dispatched(group.group_id)
     return ledger
 
 
@@ -821,6 +860,262 @@ class TestSaveTrigger:
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
 
+class TestPeriodicRolloutCheckpoint:
+    @staticmethod
+    def _make_periodic_actor(tmp_path, *, keep_latest_k: int = 2):
+        mc = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+            rollout_checkpoint_interval_s=0.1,
+            rollout_checkpoint_keep_latest_k=keep_latest_k,
+        )
+        ledger = _sealed_recovery_ledger()
+        dp_client = _FakeDPClient(
+            staging_sample_ids=sorted(ledger.expected_staging_keys())
+        )
+        trainer = _FakeTrainer()
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                trainer=trainer,
+                dp_client=dp_client,
+                rollout_manager=_FakeRolloutManager(ledger),
+                bootstrap_fingerprint="bootstrap-v1",
+            ),
+        )
+        return actor, trainer, dp_client
+
+    def test_pre_step_snapshot_omits_trainer_payload(self, tmp_path):
+        actor, trainer, dp_client = self._make_periodic_actor(tmp_path)
+
+        assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+        actor._checkpointer.shutdown()
+
+        snapshot = (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+        assert (snapshot / ROLLOUT_SNAPSHOT_COMMITTED_FILENAME).is_file()
+        assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
+        assert (snapshot / "data_plane" / "metadata.json").is_file()
+        assert (snapshot / "train_dataloader.pt").is_file()
+        assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        assert (snapshot / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+        assert (snapshot / "config.yaml").is_file()
+        assert not (snapshot / "policy").exists()
+        assert trainer.save_calls == []
+        assert not any(
+            path.name.startswith("step_")
+            for path in (tmp_path / "checkpoints").iterdir()
+        )
+        assert dp_client.save_calls[0]["checkpoint_dir"].endswith(
+            "bootstrap/rollout_snapshots/tmp_snapshot_000001/data_plane"
+        )
+        manifest = json.loads(
+            (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
+        )
+        assert manifest["base_train_step"] == 0
+        assert manifest["trainer_version"] == 0
+        assert manifest["bootstrap_fingerprint"] == "bootstrap-v1"
+
+    def test_unchanged_state_is_not_saved_twice(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+
+        async def _save_twice() -> tuple[bool, bool]:
+            return (
+                await actor._save_rollout_checkpoint(),
+                await actor._save_rollout_checkpoint(),
+            )
+
+        assert asyncio.run(_save_twice()) == (True, False)
+        actor._checkpointer.shutdown()
+
+        snapshot_root = (
+            tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        )
+        assert sorted(path.name for path in snapshot_root.glob("snapshot_*")) == [
+            "snapshot_000001"
+        ]
+
+    def test_retains_previous_snapshot_when_next_save_fails(self, tmp_path):
+        actor, _, dp_client = self._make_periodic_actor(tmp_path)
+
+        async def _save_then_fail() -> None:
+            assert await actor._save_rollout_checkpoint(force=True)
+            dp_client.save_error = RuntimeError("injected periodic save failure")
+            await actor._save_rollout_checkpoint(force=True)
+
+        with pytest.raises(RuntimeError, match="injected periodic save failure"):
+            asyncio.run(_save_then_fail())
+        actor._checkpointer.shutdown()
+
+        snapshot_root = (
+            tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        )
+        assert (snapshot_root / "snapshot_000001" / "COMMITTED").is_file()
+        assert (snapshot_root / "LATEST").read_text().strip() == "snapshot_000001"
+        assert not (snapshot_root / "snapshot_000002").exists()
+        assert not (snapshot_root / "tmp_snapshot_000002").exists()
+
+    def test_retention_keeps_recent_fallbacks(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path, keep_latest_k=2)
+
+        async def _save_three() -> None:
+            for _ in range(3):
+                assert await actor._save_rollout_checkpoint(force=True)
+
+        asyncio.run(_save_three())
+        actor._checkpointer.shutdown()
+
+        snapshot_root = (
+            tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        )
+        assert sorted(path.name for path in snapshot_root.glob("snapshot_*")) == [
+            "snapshot_000002",
+            "snapshot_000003",
+        ]
+        assert (snapshot_root / "LATEST").read_text().strip() == "snapshot_000003"
+
+    def test_active_train_step_skips_rollout_only_snapshot(self, tmp_path):
+        actor, trainer, dp_client = self._make_periodic_actor(tmp_path)
+        actor._train_step_active = True
+
+        assert not asyncio.run(actor._save_rollout_checkpoint(force=True))
+        actor._checkpointer.shutdown()
+
+        assert trainer.save_calls == []
+        assert dp_client.save_calls == []
+
+    def test_post_step_snapshot_requires_matching_trainer_anchor(
+        self, tmp_path, capsys
+    ):
+        actor, trainer, dp_client = self._make_periodic_actor(tmp_path)
+        actor._train_steps = 1
+        actor._trainer_version = 1
+
+        step_dir = tmp_path / "checkpoints" / "step_1"
+        bootstrap_snapshots = (
+            tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        )
+        (bootstrap_snapshots / "snapshot_000001").mkdir(parents=True)
+
+        async def _save_without_then_with_anchor() -> tuple[bool, bool, bool]:
+            without_anchor = await actor._save_rollout_checkpoint(force=True)
+            without_anchor_again = await actor._save_rollout_checkpoint(force=True)
+            assert dp_client.save_calls == []
+            step_dir.mkdir(parents=True)
+            with_anchor = await actor._save_rollout_checkpoint(force=True)
+            return without_anchor, without_anchor_again, with_anchor
+
+        assert asyncio.run(_save_without_then_with_anchor()) == (False, False, True)
+        actor._checkpointer.shutdown()
+        assert not bootstrap_snapshots.exists()
+        assert (
+            capsys.readouterr().out.count(
+                "rollout checkpoint skipped: matching trainer checkpoint"
+            )
+            == 1
+        )
+
+        snapshot = step_dir / "rollout_snapshots" / "snapshot_000001"
+        manifest = json.loads(
+            (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
+        )
+        assert manifest["base_train_step"] == 1
+        assert manifest["trainer_version"] == 1
+        assert manifest["bootstrap_fingerprint"] is None
+        assert trainer.save_calls == []
+
+    def test_pre_step_deadline_saves_and_requests_clean_stop(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+            rollout_checkpoint_interval_s=0.001,
+            checkpoint_must_save_by="00:00:00:00",
+        )
+        ledger = _sealed_recovery_ledger()
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                dp_client=_FakeDPClient(
+                    staging_sample_ids=sorted(ledger.expected_staging_keys())
+                ),
+                rollout_manager=_FakeRolloutManager(ledger),
+                bootstrap_fingerprint="bootstrap-v1",
+            ),
+        )
+
+        asyncio.run(asyncio.wait_for(actor._rollout_checkpoint_pump(), timeout=5))
+        actor._checkpointer.shutdown()
+
+        assert actor._rollout_checkpoint_stop_requested.is_set()
+        assert (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+            / "COMMITTED"
+        ).is_file()
+
+    def test_pre_step_deadline_retries_unsafe_snapshot_without_consuming_signal(
+        self, tmp_path
+    ):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._master_config.rollout_checkpointing.interval_s = 0.001
+        actor._timeout.last_save_time = 0
+        save = AsyncMock(side_effect=[False, True])
+
+        with patch.object(actor, "_save_rollout_checkpoint", new=save):
+            asyncio.run(asyncio.wait_for(actor._rollout_checkpoint_pump(), timeout=5))
+        actor._checkpointer.shutdown()
+
+        assert save.await_count == 2
+        assert all(call.kwargs == {"force": True} for call in save.await_args_list)
+        assert actor._timeout.last_saved is True
+        assert actor._rollout_checkpoint_stop_requested.is_set()
+
+    def test_train_pump_keeps_deadline_ownership_if_it_claims_during_save(
+        self, tmp_path
+    ):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._master_config.rollout_checkpointing.interval_s = 0.001
+        actor._timeout.last_save_time = 0
+        trainer_claimed = asyncio.Event()
+
+        async def _save_after_trainer_claims(*, force: bool) -> bool:
+            assert force
+            assert actor._timeout.check_save()
+            trainer_claimed.set()
+            return True
+
+        async def _exercise() -> None:
+            with patch.object(
+                actor,
+                "_save_rollout_checkpoint",
+                new=_save_after_trainer_claims,
+            ):
+                task = asyncio.create_task(actor._rollout_checkpoint_pump())
+                await asyncio.wait_for(trainer_claimed.wait(), timeout=5)
+                await asyncio.sleep(0.01)
+                assert not task.done()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(_exercise())
+        actor._checkpointer.shutdown()
+
+        assert actor._timeout.last_saved is True
+        assert not actor._rollout_checkpoint_stop_requested.is_set()
+
+
 class TestDataPlaneCheckpoint:
     def test_restore_replays_fully_sealed_groups_before_pumps(self, tmp_path):
         mc = _actor_master_config(
@@ -879,6 +1174,175 @@ class TestDataPlaneCheckpoint:
         assert manager.recovered_group_ids == ["partial-g0"]
         assert len(ledger) == 0
 
+    def test_restore_recovers_groups_in_parallel_with_bounded_concurrency(
+        self, tmp_path
+    ):
+        class _BlockingRecoveryManager(_FakeRolloutManager):
+            def __init__(self, ledger: RolloutRecoveryLedger) -> None:
+                super().__init__(ledger)
+                self.active = 0
+                self.peak_active = 0
+                self.started_group_ids: list[str] = []
+                self.two_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def recover_group(self, group_id: str) -> bool:
+                self.active += 1
+                self.peak_active = max(self.peak_active, self.active)
+                self.started_group_ids.append(group_id)
+                if self.active == 2:
+                    self.two_started.set()
+                try:
+                    await self.release.wait()
+                    return await super().recover_group(group_id)
+                finally:
+                    self.active -= 1
+
+        async def _main() -> None:
+            mc = _actor_master_config(
+                tmp_path,
+                buffer_checkpoint=True,
+                data_plane_checkpoint=True,
+                token_capture=True,
+                max_inflight_prompts=2,
+                max_buffered_rollouts=4,
+            )
+            ledger = _unfinished_recovery_ledger(3)
+            manager = _BlockingRecoveryManager(ledger)
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=_FakeDPClient(),
+                    rollout_manager=manager,
+                    data_plane_checkpoint_metadata={
+                        "rollout_recovery_payload_sha256": "digest"
+                    },
+                ),
+            )
+
+            recovery_task = asyncio.create_task(
+                actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            )
+            await asyncio.wait_for(manager.two_started.wait(), timeout=1.0)
+
+            async def _wait_for_queued_group_capacity() -> None:
+                while actor._buffer_capacity._value != 1:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(_wait_for_queued_group_capacity(), timeout=1.0)
+
+            assert manager.peak_active == 2
+            assert len(manager.started_group_ids) == 2
+            assert actor._rollout_slots._value == 0
+            # All three durable groups own buffer capacity, including the one
+            # queued behind the prompt-group concurrency limiter.
+            assert actor._buffer_capacity._value == 1
+
+            manager.release.set()
+            await asyncio.wait_for(recovery_task, timeout=1.0)
+            actor._checkpointer.shutdown()
+
+            assert manager.peak_active == 2
+            assert sorted(manager.recovered_group_ids) == [
+                "recovery-g0",
+                "recovery-g1",
+                "recovery-g2",
+            ]
+            assert actor._rollout_slots._value == 2
+            assert actor._inflight_rollouts == 0
+            assert actor._buffer_capacity._value == 1
+            assert len(ledger) == 0
+
+        asyncio.run(_main())
+
+    def test_restore_rejects_canonical_plus_unfinished_groups_over_capacity(
+        self, tmp_path
+    ):
+        async def _main() -> None:
+            mc = _actor_master_config(
+                tmp_path,
+                buffer_checkpoint=True,
+                data_plane_checkpoint=True,
+                token_capture=True,
+                max_buffered_rollouts=4,
+            )
+            ledger = _unfinished_recovery_ledger(3)
+            manager = _FakeRolloutManager(ledger)
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=_FakeDPClient(),
+                    rollout_manager=manager,
+                    data_plane_checkpoint_metadata={
+                        "rollout_recovery_payload_sha256": "digest"
+                    },
+                ),
+            )
+
+            # Restoring two canonical replay groups has already consumed two
+            # of the four permits. Three unfinished groups cannot also recover.
+            await actor._buffer_capacity.acquire()
+            await actor._buffer_capacity.acquire()
+            with pytest.raises(
+                RuntimeError,
+                match="exceed current buffer capacity",
+            ):
+                await actor._maybe_restore_rollout_recovery(
+                    restored_replay_groups=2
+                )
+            actor._checkpointer.shutdown()
+
+            assert manager.recovered_group_ids == []
+            assert actor._buffer_capacity._value == 2
+
+        asyncio.run(_main())
+
+    def test_parallel_restore_failure_releases_uncommitted_permits(self, tmp_path):
+        class _FailingRecoveryManager(_FakeRolloutManager):
+            async def recover_group(self, group_id: str) -> bool:
+                if group_id == "recovery-g0":
+                    await asyncio.sleep(0)
+                    raise RuntimeError("injected recovery failure")
+                await asyncio.sleep(0)
+                return False
+
+        async def _main() -> None:
+            mc = _actor_master_config(
+                tmp_path,
+                buffer_checkpoint=True,
+                data_plane_checkpoint=True,
+                token_capture=True,
+                max_inflight_prompts=2,
+                max_buffered_rollouts=4,
+            )
+            ledger = _unfinished_recovery_ledger(3)
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=_FakeDPClient(),
+                    rollout_manager=_FailingRecoveryManager(ledger),
+                    data_plane_checkpoint_metadata={
+                        "rollout_recovery_payload_sha256": "digest"
+                    },
+                ),
+            )
+
+            with pytest.raises(ExceptionGroup) as exc_info:
+                await asyncio.wait_for(
+                    actor._maybe_restore_rollout_recovery(
+                        restored_replay_groups=0
+                    ),
+                    timeout=1.0,
+                )
+            actor._checkpointer.shutdown()
+
+            assert exc_info.value.subgroup(RuntimeError) is not None
+            assert actor._rollout_slots._value == 2
+            assert actor._inflight_rollouts == 0
+            assert actor._buffer_capacity._value == 4
+
+        asyncio.run(_main())
+
     def test_restore_rejects_missing_staging_rows(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -912,7 +1376,7 @@ class TestDataPlaneCheckpoint:
             token_capture=True,
         )
         ledger = _sealed_recovery_ledger()
-        expected_state = ledger.state_dict()
+        expected_state = ledger.state_dict(staging_partition="rollout_staging")
         staging_keys = sorted(ledger.expected_staging_keys())
         dp_client = _FakeDPClient(staging_sample_ids=staging_keys)
         rollout_manager = _FakeRolloutManager(ledger)

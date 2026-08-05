@@ -173,6 +173,15 @@ checkpointing:
   checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
 
+# SingleController-only frequent TQ + rollout-ledger recovery snapshots.
+# null disables the periodic writer. Snapshots before train step 1 bind to a
+# lightweight bootstrap fingerprint rather than copying the initial model.
+# After step 0, snapshots require a matching durable step_N trainer checkpoint,
+# so interval_s does not replace full-checkpoint triggers such as save_period.
+rollout_checkpointing:
+  interval_s: null
+  keep_latest_k: 2
+
 # Gate-authoritative token capture (token-in/token-out via NeMo-Gym; see
 # docs/design-docs/tq-gym-tokidcap-migration.md). Dormant by default: with
 # enabled=false every legacy codepath behaves exactly as before. Requires the

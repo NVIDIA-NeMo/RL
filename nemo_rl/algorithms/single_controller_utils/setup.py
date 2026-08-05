@@ -55,6 +55,13 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    BOOTSTRAP_DIRNAME,
+    bootstrap_fingerprint,
+    ensure_bootstrap_anchor,
+    resolve_latest_snapshot,
+    validate_bootstrap_anchor,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -105,6 +112,7 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None
+    bootstrap_fingerprint: Optional[str] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -247,6 +255,7 @@ def _maybe_restore_rollout_recovery_ledger(
     last_checkpoint_path: Optional[str],
     data_plane_checkpoint_metadata: Optional[dict[str, Any]],
     token_capture_enabled: bool,
+    expected_staging_partition: str,
 ) -> Optional[RolloutRecoveryLedger]:
     """Load and bind the rollout-recovery sidecar to the restored TQ cut."""
     if last_checkpoint_path is None:
@@ -282,7 +291,10 @@ def _maybe_restore_rollout_recovery_ledger(
             "Rollout-recovery sidecar must contain a state dictionary, "
             f"got {type(state).__name__}"
         )
-    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    ledger = RolloutRecoveryLedger.from_state_dict(
+        state,
+        expected_staging_partition=expected_staging_partition,
+    )
     expected_group_count = data_plane_checkpoint_metadata.get(
         "rollout_recovery_group_count"
     )
@@ -548,6 +560,24 @@ def setup_single_controller(
     # give capture-enabled vLLM workers a venv that carries nemo_gym (the
     # worker hosts Gym's capture core + adapter in-process).
     token_capture_cfg = master_config.token_capture
+    rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    if rollout_checkpoint_cfg.interval_s is not None:
+        if rollout_checkpoint_cfg.interval_s <= 0:
+            raise ValueError("rollout_checkpointing.interval_s must be positive")
+        if rollout_checkpoint_cfg.keep_latest_k < 1:
+            raise ValueError("rollout_checkpointing.keep_latest_k must be at least one")
+        if not master_config.checkpointing["enabled"]:
+            raise ValueError(
+                "rollout checkpointing requires checkpointing.enabled=true"
+            )
+        if not dp_config.get("checkpointing_enabled"):
+            raise ValueError(
+                "rollout checkpointing requires data_plane.checkpointing_enabled=true"
+            )
+        if not token_capture_cfg.enabled:
+            raise ValueError(
+                "rollout checkpointing currently requires token_capture.enabled=true"
+            )
     if token_capture_cfg.enabled:
         if master_config.checkpointing["enabled"] and not dp_config.get(
             "checkpointing_enabled"
@@ -632,13 +662,66 @@ def setup_single_controller(
     # Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     save_state = cast(
-        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
+        Optional[GRPOSaveState],
+        checkpointer.load_training_info(trainer_checkpoint_path),
     )
     if save_state is None:
         save_state = _default_grpo_save_state()
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    weights_path, optimizer_path = checkpointer.get_resume_paths(
+        trainer_checkpoint_path
+    )
+
+    recovery_checkpoint_path = trainer_checkpoint_path
+    bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
+    needs_bootstrap_identity = trainer_checkpoint_path is None and (
+        master_config.rollout_checkpointing.interval_s is not None
+        or bootstrap_anchor.is_dir()
+    )
+    bootstrap_digest = (
+        bootstrap_fingerprint(master_config) if needs_bootstrap_identity else None
+    )
+    if trainer_checkpoint_path is not None:
+        resolved_snapshot = resolve_latest_snapshot(
+            Path(trainer_checkpoint_path),
+            expected_train_step=save_state["current_step"],
+            expected_trainer_version=save_state.get(
+                "trainer_version", save_state["current_step"]
+            ),
+            expected_bootstrap_fingerprint=None,
+        )
+    else:
+        if master_config.rollout_checkpointing.interval_s is not None:
+            assert bootstrap_digest is not None
+            bootstrap_anchor = ensure_bootstrap_anchor(
+                checkpointer.checkpoint_dir,
+                fingerprint=bootstrap_digest,
+            )
+        elif bootstrap_anchor.is_dir():
+            assert bootstrap_digest is not None
+            validate_bootstrap_anchor(
+                bootstrap_anchor,
+                fingerprint=bootstrap_digest,
+            )
+        resolved_snapshot = (
+            resolve_latest_snapshot(
+                bootstrap_anchor,
+                expected_train_step=0,
+                expected_trainer_version=0,
+                expected_bootstrap_fingerprint=bootstrap_digest,
+            )
+            if bootstrap_anchor.is_dir()
+            else None
+        )
+    if resolved_snapshot is not None:
+        recovery_checkpoint_path = str(resolved_snapshot.path)
+        save_state = cast(GRPOSaveState, dict(save_state))
+        save_state["current_epoch"] = resolved_snapshot.manifest.current_epoch
+        print(
+            f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
+            flush=True,
+        )
 
     # ==========================
     # Setup Dataset & Environments
@@ -671,15 +754,20 @@ def setup_single_controller(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
-    if last_checkpoint_path is not None:
+    dataloader_checkpoint_path = recovery_checkpoint_path
+    if dataloader_checkpoint_path is not None:
         dataloader_state_path = os.path.join(
-            last_checkpoint_path, "train_dataloader.pt"
+            dataloader_checkpoint_path, "train_dataloader.pt"
         )
         if os.path.exists(dataloader_state_path):
             print(
                 f"📦 Restoring dataloader state from checkpoint: {dataloader_state_path}"
             )
-            load_dataloader_state(dataloader, last_checkpoint_path, data_config)
+            load_dataloader_state(
+                dataloader,
+                dataloader_checkpoint_path,
+                data_config,
+            )
         else:
             print(
                 f"⚠️ No dataloader state found at {dataloader_state_path}. "
@@ -729,15 +817,16 @@ def setup_single_controller(
     # client is created and before any rollout/train data-plane operation.
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         policy,
-        last_checkpoint_path=last_checkpoint_path,
+        last_checkpoint_path=recovery_checkpoint_path,
         save_state=save_state,
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
     recovery_ledger = _maybe_restore_rollout_recovery_ledger(
-        last_checkpoint_path=last_checkpoint_path,
+        last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         token_capture_enabled=token_capture_cfg.enabled,
+        expected_staging_partition=token_capture_cfg.staging_partition,
     )
 
     # ==========================
@@ -884,6 +973,7 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
         partition_id=partition_id,
         save_state=save_state,
-        last_checkpoint_path=last_checkpoint_path,
+        last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        bootstrap_fingerprint=bootstrap_digest,
     )

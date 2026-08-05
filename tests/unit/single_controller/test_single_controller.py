@@ -22,6 +22,8 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
+from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -80,6 +82,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
 def test_logs_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path,
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
@@ -94,6 +97,17 @@ def test_logs_concrete_weight_synchronizer(
             max_buffered_rollouts=4,
         ),
         logger={},
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 1,
+            "save_optimizer": False,
+            "checkpoint_must_save_by": None,
+        },
+        data_plane={},
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -108,6 +122,10 @@ def test_logs_concrete_weight_synchronizer(
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         train_cluster=None,
         inference_cluster=None,
+        save_state=_default_grpo_save_state(),
+        last_checkpoint_path=None,
+        data_plane_checkpoint_metadata=None,
+        bootstrap_fingerprint=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -259,6 +277,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
