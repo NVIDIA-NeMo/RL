@@ -276,6 +276,13 @@ class SingleControllerActor:
         self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
             self._async_cfg.max_buffered_rollouts
         )
+        # One prompt-group concurrency budget shared by startup recovery and
+        # fresh rollout dispatch. Recovery runs before the normal pumps today,
+        # but sharing the limiter keeps both paths on the same admission
+        # contract and prevents recovery from overwhelming generation workers.
+        self._rollout_slots: asyncio.Semaphore = asyncio.Semaphore(
+            self._async_cfg.max_inflight_prompts
+        )
 
         self._trainer_version: int = actor_args.save_state.get(
             "trainer_version", actor_args.save_state["current_step"]
@@ -596,7 +603,7 @@ class SingleControllerActor:
     async def _maybe_restore_rollout_recovery(
         self, *, restored_replay_groups: int
     ) -> None:
-        """Recover sealed and partial groups before starting either SC pump."""
+        """Recover saved groups with bounded parallelism before SC pumps start."""
         metadata = self._data_plane_checkpoint_metadata or {}
         if "rollout_recovery_payload_sha256" not in metadata:
             return
@@ -618,19 +625,56 @@ class SingleControllerActor:
                 f"capacity={self._async_cfg.max_buffered_rollouts}"
             )
 
-        for group in groups:
-            await self._buffer_capacity.acquire()
+        async def _recover_group(group_id: str) -> None:
+            buffer_permit_owned = False
+            rollout_slot_owned = False
+            counted_inflight = False
             try:
-                committed = await self._rollout_manager.recover_group(group.group_id)
-            except BaseException:
-                self._buffer_capacity.release()
-                raise
-            if not committed:
-                self._buffer_capacity.release()
+                # The capacity guard above guarantees that every restored group
+                # can reconstruct its durable buffer ownership. Acquire that
+                # ownership before competing for generation concurrency.
+                await self._buffer_capacity.acquire()
+                buffer_permit_owned = True
+
+                await self._rollout_slots.acquire()
+                rollout_slot_owned = True
+                await self._rollout_permitted.wait()
+
+                self._inflight_rollouts += 1
+                counted_inflight = True
+                committed = await self._rollout_manager.recover_group(group_id)
+                if committed:
+                    # The recovered canonical replay group retains this permit
+                    # until the train pump consumes or evicts it.
+                    buffer_permit_owned = False
+            finally:
+                if counted_inflight:
+                    self._inflight_rollouts -= 1
+                if rollout_slot_owned:
+                    self._rollout_slots.release()
+                if buffer_permit_owned:
+                    self._buffer_capacity.release()
+
+        recovery_results = await asyncio.gather(
+            *(_recover_group(group.group_id) for group in groups),
+            return_exceptions=True,
+        )
+        recovery_errors = [
+            result
+            for result in recovery_results
+            if isinstance(result, BaseException)
+        ]
+        if recovery_errors:
+            raise BaseExceptionGroup(
+                "one or more restored rollout groups failed recovery",
+                recovery_errors,
+            )
 
         if groups:
             print(
-                f"rollout recovery replay completed: groups={len(groups)}",
+                "rollout recovery replay completed: "
+                f"groups={len(groups)}, "
+                f"max_concurrency={self._async_cfg.max_inflight_prompts}",
                 flush=True,
             )
 
@@ -1028,19 +1072,22 @@ class SingleControllerActor:
         """Continuously dispatch rollout tasks until cancellation.
 
         Per batch:
-          0. await sampler.admit(...) to wait until the batch may dispatch and
+          0. On the token-capture path, acquire capacity for the whole prompt
+             batch before advancing the dataloader and reserving durable
+             lineage. This keeps every checkpointed group capacity-owned.
+          1. await sampler.admit(...) to wait until the batch may dispatch and
              obtain its target_step stamp.
 
         Per prompt:
-          1. Acquire _buffer_capacity slot (backpressure)
-          2. Acquire sem (cap concurrent in-flight rollouts)
+          1. Acquire _buffer_capacity slot unless the token-capture batch
+             already owns it (backpressure)
+          2. Acquire _rollout_slots (cap concurrent in-flight prompt groups)
           3. Wait for _rollout_permitted (paused during weight sync)
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
           5. Decrement _inflight_rollouts
         """
-        sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
 
@@ -1070,7 +1117,7 @@ class SingleControllerActor:
                 raise
             finally:
                 self._inflight_rollouts -= 1
-                sem.release()
+                self._rollout_slots.release()
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -1087,7 +1134,21 @@ class SingleControllerActor:
         ) -> None:
             if not task_started_event.is_set():
                 self._buffer_capacity.release()
-                sem.release()
+                self._rollout_slots.release()
+
+        def _release_buffer_capacity(permits: int) -> None:
+            for _ in range(permits):
+                self._buffer_capacity.release()
+
+        async def _acquire_buffer_capacity(permits: int) -> None:
+            acquired = 0
+            try:
+                for _ in range(permits):
+                    await self._buffer_capacity.acquire()
+                    acquired += 1
+            except BaseException:
+                _release_buffer_capacity(acquired)
+                raise
 
         max_epochs = self._master_config.grpo["max_num_epochs"]
         token_capture_enabled = bool(
@@ -1101,38 +1162,73 @@ class SingleControllerActor:
             while max_epochs is None or self._current_epoch < max_epochs:
                 dataloader_iterator = iter(self._dataloader)
                 while True:
+                    preacquired_capacity = 0
                     if token_capture_enabled:
-                        # Advancing the dataloader and reserving every prompt
-                        # in that batch is one checkpoint mutation. A snapshot
-                        # therefore sees either neither operation or both,
-                        # preventing skipped/duplicated prompts after restart.
-                        async with self._data_plane_checkpoint_barrier.mutation():
-                            try:
-                                prompt_batch = next(dataloader_iterator)
-                            except StopIteration:
-                                self._current_epoch += 1
-                                break
-                            target_step = await self._sampler.admit(
-                                trainer_version_fn=lambda: self._trainer_version
-                            )
-                            prompt_dispatches: list[
-                                tuple[DatumSpec, Optional[str]]
-                            ] = []
-                            for prompt_idx in range(prompt_batch.size):
-                                prompt: DatumSpec = {  # type: ignore
-                                    k: v[prompt_idx] for k, v in prompt_batch.items()
-                                }
-                                recovery_group_id = (
-                                    self._rollout_manager.reserve_prompt_group(
-                                        prompt, target_step=target_step
+                        # Capacity is acquired before the durable reservation,
+                        # but never while holding the checkpoint barrier. A
+                        # snapshot therefore cannot contain more recoverable
+                        # groups than the buffer can reconstruct at startup.
+                        configured_batch_size = self._master_config.grpo[
+                            "num_prompts_per_step"
+                        ]
+                        await _acquire_buffer_capacity(configured_batch_size)
+                        preacquired_capacity = configured_batch_size
+                        end_of_epoch = False
+                        try:
+                            # Advancing the dataloader and reserving every prompt
+                            # in that batch is one checkpoint mutation. A snapshot
+                            # therefore sees either neither operation or both,
+                            # preventing skipped/duplicated prompts after restart.
+                            async with self._data_plane_checkpoint_barrier.mutation():
+                                try:
+                                    prompt_batch = next(dataloader_iterator)
+                                except StopIteration:
+                                    end_of_epoch = True
+                                if not end_of_epoch:
+                                    if prompt_batch.size > preacquired_capacity:
+                                        raise RuntimeError(
+                                            "dataloader batch exceeds its reserved "
+                                            "rollout capacity: "
+                                            f"batch={prompt_batch.size}, "
+                                            f"reserved={preacquired_capacity}"
+                                        )
+                                    unused_capacity = (
+                                        preacquired_capacity - prompt_batch.size
                                     )
-                                )
-                                if recovery_group_id is None:
-                                    raise RuntimeError(
-                                        "token-capture dispatch must reserve "
-                                        "durable prompt-group lineage"
+                                    _release_buffer_capacity(unused_capacity)
+                                    preacquired_capacity = prompt_batch.size
+                                    target_step = await self._sampler.admit(
+                                        trainer_version_fn=lambda: self._trainer_version
                                     )
-                                prompt_dispatches.append((prompt, recovery_group_id))
+                                    prompt_dispatches: list[
+                                        tuple[DatumSpec, Optional[str]]
+                                    ] = []
+                                    for prompt_idx in range(prompt_batch.size):
+                                        prompt: DatumSpec = {  # type: ignore
+                                            k: v[prompt_idx]
+                                            for k, v in prompt_batch.items()
+                                        }
+                                        recovery_group_id = (
+                                            self._rollout_manager.reserve_prompt_group(
+                                                prompt, target_step=target_step
+                                            )
+                                        )
+                                        if recovery_group_id is None:
+                                            raise RuntimeError(
+                                                "token-capture dispatch must reserve "
+                                                "durable prompt-group lineage"
+                                            )
+                                        prompt_dispatches.append(
+                                            (prompt, recovery_group_id)
+                                        )
+                        except BaseException:
+                            _release_buffer_capacity(preacquired_capacity)
+                            raise
+                        if end_of_epoch:
+                            _release_buffer_capacity(preacquired_capacity)
+                            preacquired_capacity = 0
+                            self._current_epoch += 1
+                            break
                     else:
                         try:
                             prompt_batch = next(dataloader_iterator)
@@ -1149,32 +1245,52 @@ class SingleControllerActor:
                             }
                             prompt_dispatches.append((prompt, None))
 
-                    for prompt, recovery_group_id in prompt_dispatches:
-                        # check if buffer is full
-                        await self._buffer_capacity.acquire()
-                        # check if inflight rollouts is full
-                        await sem.acquire()
-                        # wait for rollout to be permitted
-                        await self._rollout_permitted.wait()
+                    pending_preacquired_capacity = preacquired_capacity
+                    try:
+                        for prompt, recovery_group_id in prompt_dispatches:
+                            capacity_acquired_here = False
+                            if not token_capture_enabled:
+                                # Token-capture groups already own capacity from
+                                # their durable batch reservation above.
+                                await self._buffer_capacity.acquire()
+                                capacity_acquired_here = True
+                            rollout_slot_acquired = False
+                            try:
+                                # check if inflight rollouts is full
+                                await self._rollout_slots.acquire()
+                                rollout_slot_acquired = True
+                                # wait for rollout to be permitted
+                                await self._rollout_permitted.wait()
 
-                        task_started_event = asyncio.Event()
-                        # dispatch rollout
-                        task = rollout_tasks.create_task(
-                            _dispatch_one_prompt(
-                                prompt,
-                                target_step,
-                                recovery_group_id,
-                                task_started_event,
+                                task_started_event = asyncio.Event()
+                                # dispatch rollout
+                                task = rollout_tasks.create_task(
+                                    _dispatch_one_prompt(
+                                        prompt,
+                                        target_step,
+                                        recovery_group_id,
+                                        task_started_event,
+                                    )
+                                )
+                            except BaseException:
+                                if rollout_slot_acquired:
+                                    self._rollout_slots.release()
+                                if capacity_acquired_here:
+                                    self._buffer_capacity.release()
+                                raise
+
+                            if token_capture_enabled:
+                                pending_preacquired_capacity -= 1
+                            self._dispatched_rollouts.add(task)
+                            task.add_done_callback(self._dispatched_rollouts.discard)
+                            task.add_done_callback(
+                                partial(
+                                    _release_permits_if_task_not_started,
+                                    task_started_event=task_started_event,
+                                )
                             )
-                        )
-                        self._dispatched_rollouts.add(task)
-                        task.add_done_callback(self._dispatched_rollouts.discard)
-                        task.add_done_callback(
-                            partial(
-                                _release_permits_if_task_not_started,
-                                task_started_event=task_started_event,
-                            )
-                        )
+                    finally:
+                        _release_buffer_capacity(pending_preacquired_capacity)
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)

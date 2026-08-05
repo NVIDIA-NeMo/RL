@@ -163,6 +163,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             f"must be >= async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train})"
         )
+    if (
+        master_config.token_capture.enabled
+        and async_config.max_buffered_rollouts < num_prompts_per_step
+    ):
+        raise ValueError(
+            "token capture requires async_rl.max_buffered_rollouts "
+            f"({async_config.max_buffered_rollouts}) to be >= "
+            f"grpo.num_prompts_per_step ({num_prompts_per_step}) so one "
+            "dataloader batch can own capacity before durable reservation"
+        )
 
     rl_step_samples = (
         num_prompts_per_step * master_config.grpo["num_generations_per_prompt"]

@@ -431,6 +431,8 @@ def _actor_master_config(
     checkpoint_must_save_by: Optional[str] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
+    max_inflight_prompts: int = 4,
+    max_buffered_rollouts: int = 4,
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = False,
     token_capture: bool = False,
@@ -492,8 +494,8 @@ def _actor_master_config(
         async_rl=AsyncRLConfig(
             sampler=sampler_cfg,
             min_groups_for_streaming_train=1,
-            max_inflight_prompts=4,
-            max_buffered_rollouts=4,
+            max_inflight_prompts=max_inflight_prompts,
+            max_buffered_rollouts=max_buffered_rollouts,
         ),
         rollout_checkpointing=RolloutCheckpointConfig(
             interval_s=rollout_checkpoint_interval_s,
@@ -604,6 +606,27 @@ def _partial_recovery_ledger() -> RolloutRecoveryLedger:
         reward=1.0,
     )
     ledger.abandon_group(group.group_id)
+    return ledger
+
+
+def _unfinished_recovery_ledger(group_count: int) -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    for group_index in range(group_count):
+        group_id = f"recovery-g{group_index}"
+        group = ledger.reserve_group(
+            group_id=group_id,
+            prompt_id=f"prompt-{group_index}",
+            prompt_payload={
+                "idx": group_index,
+                "message_log": [{"role": "user", "content": "solve"}],
+                "extra_env_info": {},
+                "task_name": "nemo_gym",
+            },  # type: ignore[arg-type]
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=0,
+        )
+        ledger.mark_group_dispatched(group.group_id)
     return ledger
 
 
@@ -1150,6 +1173,133 @@ class TestDataPlaneCheckpoint:
 
         assert manager.recovered_group_ids == ["partial-g0"]
         assert len(ledger) == 0
+
+    def test_restore_recovers_groups_in_parallel_with_bounded_concurrency(
+        self, tmp_path
+    ):
+        class _BlockingRecoveryManager(_FakeRolloutManager):
+            def __init__(self, ledger: RolloutRecoveryLedger) -> None:
+                super().__init__(ledger)
+                self.active = 0
+                self.peak_active = 0
+                self.started_group_ids: list[str] = []
+                self.two_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def recover_group(self, group_id: str) -> bool:
+                self.active += 1
+                self.peak_active = max(self.peak_active, self.active)
+                self.started_group_ids.append(group_id)
+                if self.active == 2:
+                    self.two_started.set()
+                try:
+                    await self.release.wait()
+                    return await super().recover_group(group_id)
+                finally:
+                    self.active -= 1
+
+        async def _main() -> None:
+            mc = _actor_master_config(
+                tmp_path,
+                buffer_checkpoint=True,
+                data_plane_checkpoint=True,
+                token_capture=True,
+                max_inflight_prompts=2,
+                max_buffered_rollouts=4,
+            )
+            ledger = _unfinished_recovery_ledger(3)
+            manager = _BlockingRecoveryManager(ledger)
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=_FakeDPClient(),
+                    rollout_manager=manager,
+                    data_plane_checkpoint_metadata={
+                        "rollout_recovery_payload_sha256": "digest"
+                    },
+                ),
+            )
+
+            recovery_task = asyncio.create_task(
+                actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            )
+            await asyncio.wait_for(manager.two_started.wait(), timeout=1.0)
+
+            async def _wait_for_queued_group_capacity() -> None:
+                while actor._buffer_capacity._value != 1:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(_wait_for_queued_group_capacity(), timeout=1.0)
+
+            assert manager.peak_active == 2
+            assert len(manager.started_group_ids) == 2
+            assert actor._rollout_slots._value == 0
+            # All three durable groups own buffer capacity, including the one
+            # queued behind the prompt-group concurrency limiter.
+            assert actor._buffer_capacity._value == 1
+
+            manager.release.set()
+            await asyncio.wait_for(recovery_task, timeout=1.0)
+            actor._checkpointer.shutdown()
+
+            assert manager.peak_active == 2
+            assert sorted(manager.recovered_group_ids) == [
+                "recovery-g0",
+                "recovery-g1",
+                "recovery-g2",
+            ]
+            assert actor._rollout_slots._value == 2
+            assert actor._inflight_rollouts == 0
+            assert actor._buffer_capacity._value == 1
+            assert len(ledger) == 0
+
+        asyncio.run(_main())
+
+    def test_parallel_restore_failure_releases_uncommitted_permits(self, tmp_path):
+        class _FailingRecoveryManager(_FakeRolloutManager):
+            async def recover_group(self, group_id: str) -> bool:
+                if group_id == "recovery-g0":
+                    await asyncio.sleep(0)
+                    raise RuntimeError("injected recovery failure")
+                await asyncio.sleep(0)
+                return False
+
+        async def _main() -> None:
+            mc = _actor_master_config(
+                tmp_path,
+                buffer_checkpoint=True,
+                data_plane_checkpoint=True,
+                token_capture=True,
+                max_inflight_prompts=2,
+                max_buffered_rollouts=4,
+            )
+            ledger = _unfinished_recovery_ledger(3)
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=_FakeDPClient(),
+                    rollout_manager=_FailingRecoveryManager(ledger),
+                    data_plane_checkpoint_metadata={
+                        "rollout_recovery_payload_sha256": "digest"
+                    },
+                ),
+            )
+
+            with pytest.raises(ExceptionGroup) as exc_info:
+                await asyncio.wait_for(
+                    actor._maybe_restore_rollout_recovery(
+                        restored_replay_groups=0
+                    ),
+                    timeout=1.0,
+                )
+            actor._checkpointer.shutdown()
+
+            assert exc_info.value.subgroup(RuntimeError) is not None
+            assert actor._rollout_slots._value == 2
+            assert actor._inflight_rollouts == 0
+            assert actor._buffer_capacity._value == 4
+
+        asyncio.run(_main())
 
     def test_restore_rejects_missing_staging_rows(self, tmp_path):
         mc = _actor_master_config(

@@ -56,7 +56,7 @@ test -f "$SNAPSHOT_DIR/rollout_recovery.pt"
 test -f "$SNAPSHOT_DIR/train_dataloader.pt"
 test ! -d "$SNAPSHOT_DIR/policy"
 uv run --no-sync python -c \
-    'import sys, torch; state = torch.load(sys.argv[1], weights_only=False); assert state["groups"], state; print("saved rollout groups=", len(state["groups"]))' \
+    'import sys, torch; state = torch.load(sys.argv[1], weights_only=False); count = len(state["groups"]); assert 0 < count <= 8, state; print("saved rollout groups=", count)' \
     "$SNAPSHOT_DIR/rollout_recovery.pt"
 grep -q "stopping after a durable rollout snapshot" "$PHASE1_LOG"
 
