@@ -92,6 +92,7 @@ class FixedDynamoWorkerPool:
 
         group_index = 0
         engine_slots_by_node: dict[str, int] = {}
+        metadata_refs: list[ray.ObjectRef] = []
         for pg_index, placement_group in enumerate(placement_groups):
             bundle_count = placement_group.bundle_count
             if bundle_count % self._engine_world_size != 0:
@@ -164,9 +165,18 @@ class FixedDynamoWorkerPool:
                 self._workers.append(worker)
                 self._cleanup_reservations.append(reservation_handles[0])
                 self._metadata.append({})
-                metadata = ray.get(worker.metadata.remote())
-                self._metadata[-1] = metadata
+                metadata_refs.append(worker.metadata.remote())
                 group_index += 1
+
+        metadata_error: Exception | None = None
+        for index, metadata_ref in enumerate(metadata_refs):
+            try:
+                self._metadata[index] = dict(ray.get(metadata_ref))
+            except Exception as error:
+                if metadata_error is None:
+                    metadata_error = error
+        if metadata_error is not None:
+            raise metadata_error
 
     def refit_workers(self) -> list[dict[str, Any]]:
         return [dict(item) for item in self._metadata]
@@ -198,24 +208,23 @@ class FixedDynamoWorkerPool:
         return [dict(item) for item in current]
 
     def shutdown(self) -> None:
-        needs_fallback_cleanup = False
-        if self._workers:
-            shutdown_refs = [worker.shutdown.remote() for worker in self._workers]
+        for worker, reservation, metadata in zip(
+            self._workers,
+            self._cleanup_reservations,
+            self._metadata,
+            strict=True,
+        ):
             try:
-                ray.get(shutdown_refs, timeout=30)
+                ray.get(worker.shutdown.remote(), timeout=30)
             except Exception:
-                needs_fallback_cleanup = True
-        if needs_fallback_cleanup:
-            cleanup_refs = [
-                reservation.cleanup_process_group.remote(metadata["process_pid"])
-                for reservation, metadata in zip(
-                    self._cleanup_reservations, self._metadata, strict=True
-                )
-                if "process_pid" in metadata
-            ]
-            if cleanup_refs:
+                process_pid = metadata.get("process_pid")
+                if process_pid is None:
+                    continue
                 try:
-                    ray.get(cleanup_refs, timeout=15)
+                    ray.get(
+                        reservation.cleanup_process_group.remote(process_pid),
+                        timeout=15,
+                    )
                 except Exception:
                     pass
         for worker in self._workers:

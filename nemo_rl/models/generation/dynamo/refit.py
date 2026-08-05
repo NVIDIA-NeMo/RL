@@ -102,7 +102,7 @@ class DynamoRefitChannel:
         workers: Sequence[dict[str, Any] | DynamoWorkerEndpoint],
         *,
         engine_world_size: int,
-        request_timeout_s: float,
+        control_timeout_s: float,
         validate_workers: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
         | None = None,
     ) -> None:
@@ -118,7 +118,7 @@ class DynamoRefitChannel:
         if not self._workers:
             raise ValueError("Dynamo refit requires at least one worker endpoint")
         self._engine_world_size = engine_world_size
-        self._request_timeout_s = request_timeout_s
+        self._control_timeout_s = control_timeout_s
         self._validate_workers = validate_workers
         self._update_info: dict[str, Any] | None = None
 
@@ -127,7 +127,7 @@ class DynamoRefitChannel:
         return DynamoRefitChannel(
             self._workers,
             engine_world_size=self._engine_world_size,
-            request_timeout_s=self._request_timeout_s,
+            control_timeout_s=self._control_timeout_s,
         )
 
     def _validated_workers(self) -> tuple[DynamoWorkerEndpoint, ...]:
@@ -200,7 +200,7 @@ class DynamoRefitChannel:
                         "world_size": world_size,
                     },
                 },
-                timeout_s=self._request_timeout_s,
+                timeout_s=self._control_timeout_s,
             )
             for worker_index, worker in enumerate(workers)
         ]
@@ -214,20 +214,58 @@ class DynamoRefitChannel:
             _update_worker_weights.remote(
                 system_url=worker.system_url,
                 update_info=self._update_info,
-                timeout_s=self._request_timeout_s,
+                timeout_s=self._control_timeout_s,
             )
             for worker in self._validated_workers()
         ]
 
     def flush_cache(self) -> bool:
-        """Flush every worker using only the serialized immutable endpoints."""
-        futures = [
+        """Drain, clear, and resume every worker using immutable endpoints."""
+        pause_futures = [
             _post_worker_route.remote(
                 system_url=worker.system_url,
-                route="flush_cache",
-                payload={},
-                timeout_s=self._request_timeout_s,
+                route="pause_generation",
+                payload={"mode": "wait", "clear_cache": True},
+                timeout_s=self._control_timeout_s,
             )
             for worker in self._workers
         ]
-        return all(ray.get(futures))
+        paused_workers: list[DynamoWorkerEndpoint] = []
+        pause_errors: list[str] = []
+        for worker, future in zip(self._workers, pause_futures, strict=True):
+            try:
+                ray.get(future)
+            except Exception as error:
+                pause_errors.append(f"{worker.system_url}: {error}")
+            else:
+                paused_workers.append(worker)
+
+        resume_futures = [
+            (
+                worker,
+                _post_worker_route.remote(
+                    system_url=worker.system_url,
+                    route="resume_generation",
+                    payload={},
+                    timeout_s=self._control_timeout_s,
+                ),
+            )
+            for worker in paused_workers
+        ]
+        resume_errors: list[str] = []
+        for worker, future in resume_futures:
+            try:
+                ray.get(future)
+            except Exception as error:
+                resume_errors.append(f"{worker.system_url}: {error}")
+
+        if pause_errors or resume_errors:
+            details = []
+            if pause_errors:
+                details.append("pause/clear failed for " + "; ".join(pause_errors))
+            if resume_errors:
+                details.append("resume failed for " + "; ".join(resume_errors))
+            raise RuntimeError(
+                "Dynamo KV cache invalidation failed: " + "; ".join(details)
+            )
+        return True

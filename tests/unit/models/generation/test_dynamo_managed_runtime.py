@@ -63,6 +63,7 @@ def _config(*, tp: int = 1) -> dict:
             "engine": "vllm",
             "startup_timeout_s": 5,
             "request_timeout_s": 30,
+            "control_timeout_s": 10,
             "metrics_include_prefixes": None,
             "metrics_exclude_prefixes": None,
             "worker_args": {
@@ -398,6 +399,86 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
     assert pool._workers == [worker]
     assert pool._cleanup_reservations == [reservation]
     assert pool._metadata == [{}]
+
+
+def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
+    monkeypatch,
+) -> None:
+    reservations = iter(
+        [
+            _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 0}),
+            _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 1}),
+        ]
+    )
+    workers = [
+        _FakeWorker(metadata={"instance_id": "worker-0"}),
+        _FakeWorker(metadata={"instance_id": "worker-1"}),
+    ]
+    workers_to_launch = iter(workers)
+
+    class RemoteFactory:
+        def __init__(self, actor):
+            self.actor = actor
+
+        def remote(self, *args, **kwargs):
+            return self.actor
+
+    class ReservationFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(reservations))
+
+    class WorkerFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(workers_to_launch))
+
+    class Cluster:
+        @staticmethod
+        def get_placement_groups():
+            return [SimpleNamespace(bundle_count=2)]
+
+    pool = FixedDynamoWorkerPool(
+        cluster=Cluster(),
+        config=_config(),
+        namespace="nemo-rl-test",
+        engine_world_size=1,
+        manager_env={},
+        startup_timeout_s=5,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
+        ReservationFactory,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.DynamoVllmWorker",
+        WorkerFactory,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
+        lambda _fqn: "python",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",
+        lambda **kwargs: kwargs,
+    )
+
+    def fake_get(refs, **kwargs):
+        if isinstance(refs, list) and refs and "node_ip" in refs[0]:
+            return refs
+        assert pool._workers == workers
+        return refs
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get", fake_get
+    )
+
+    pool.start()
+
+    assert pool._metadata == [
+        {"instance_id": "worker-0"},
+        {"instance_id": "worker-1"},
+    ]
 
 
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:

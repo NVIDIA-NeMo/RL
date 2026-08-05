@@ -17,6 +17,7 @@
 import asyncio
 import json
 import threading
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -42,6 +43,17 @@ def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
         return [int(token_id) for token_id in value]
     except (TypeError, ValueError) as e:
         raise ValueError(f"{field_name} must contain only integer token IDs.") from e
+
+
+def _coerce_logprob_list(value: Any, field_name: str) -> list[float]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of numeric log probabilities.")
+    logprobs: list[float] = []
+    for index, logprob in enumerate(value):
+        if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
+            raise ValueError(f"{field_name}[{index}] must be numeric.")
+        logprobs.append(float(logprob))
+    return logprobs
 
 
 def _strip_gym_token_metadata(messages: list[Any]) -> list[Any]:
@@ -86,11 +98,15 @@ def _apply_chat_template(
     request_body: dict[str, Any],
     messages: list[Any],
     tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    exclude_tools_when_tool_choice_none: bool,
     add_generation_prompt: bool,
     tokenize: bool,
 ) -> Any:
     tools = request_body.get("tools")
-    if request_body.get("tool_choice") == "none":
+    if (
+        exclude_tools_when_tool_choice_none
+        and request_body.get("tool_choice") == "none"
+    ):
         tools = None
 
     apply_chat_template = type(tokenizer).apply_chat_template
@@ -115,6 +131,7 @@ def _render_prompt_token_ids(
     request_body: dict[str, Any],
     messages: list[Any],
     tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    exclude_tools_when_tool_choice_none: bool,
     add_generation_prompt: bool,
 ) -> list[int]:
     token_ids = _apply_chat_template(
@@ -122,6 +139,7 @@ def _render_prompt_token_ids(
         request_body=request_body,
         messages=messages,
         tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
         add_generation_prompt=add_generation_prompt,
         tokenize=True,
     )
@@ -200,20 +218,51 @@ def _normalize_tool_arguments_for_template(
             )
 
 
-def _validate_engine_data(response_body: dict[str, Any]) -> None:
+def _validate_engine_data(response_body: dict[str, Any]) -> tuple[list[int], list[int]]:
     nvext = response_body.get("nvext")
     engine_data = nvext.get("engine_data") if isinstance(nvext, dict) else None
     if not isinstance(engine_data, dict):
         raise ValueError("Dynamo response did not include nvext.engine_data.")
 
-    _coerce_token_id_list(
+    prompt_token_ids = _coerce_token_id_list(
         engine_data.get("prompt_token_ids"),
         "nvext.engine_data.prompt_token_ids",
     )
-    _coerce_token_id_list(
+    completion_token_ids = _coerce_token_id_list(
         engine_data.get("completion_token_ids"),
         "nvext.engine_data.completion_token_ids",
     )
+    return prompt_token_ids, completion_token_ids
+
+
+def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
+    """Expose Dynamo engine metadata on the message fields consumed by Gym."""
+    prompt_token_ids, generation_token_ids = _validate_engine_data(response_body)
+    choices = response_body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("Dynamo response did not include choices[0].")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise ValueError("Dynamo response choices[0] must be a JSON object.")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise ValueError("Dynamo response choices[0].message must be a JSON object.")
+    logprobs = choice.get("logprobs")
+    if not isinstance(logprobs, dict):
+        raise ValueError("Dynamo response choices[0].logprobs must be a JSON object.")
+    generation_logprobs = _coerce_logprob_list(
+        logprobs.get("token_logprobs"),
+        "choices[0].logprobs.token_logprobs",
+    )
+    if len(generation_logprobs) != len(generation_token_ids):
+        raise ValueError(
+            "Dynamo response returned "
+            f"{len(generation_logprobs)} generation log probabilities for "
+            f"{len(generation_token_ids)} generation token IDs."
+        )
+    message["prompt_token_ids"] = prompt_token_ids
+    message["generation_token_ids"] = generation_token_ids
+    message["generation_log_probs"] = generation_logprobs
 
 
 def prepare_dynamo_chat_completion_request(
@@ -221,6 +270,7 @@ def prepare_dynamo_chat_completion_request(
     *,
     tokenizer: Any,
     tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None,
+    exclude_tools_when_tool_choice_none: bool,
 ) -> dict[str, Any]:
     """Prepare a NeMo-Gym chat-completion request for Dynamo token input."""
     if request_body.get("stream"):
@@ -258,6 +308,7 @@ def prepare_dynamo_chat_completion_request(
         request_body=prepared_body,
         messages=template_messages,
         tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
         add_generation_prompt=add_generation_prompt,
     )
     if required_prefix_token_ids is not None:
@@ -267,6 +318,7 @@ def prepare_dynamo_chat_completion_request(
             request_body=prepared_body,
             messages=template_messages[: assistant_index + 1],
             tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
             add_generation_prompt=False,
         )
         full_prompt_token_ids = replace_prefix_tokens(
@@ -301,23 +353,41 @@ class DynamoTokenWrapperServer:
         dynamo_frontend_base_url: str,
         tokenizer: Any,
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+        exclude_tools_when_tool_choice_none: bool,
         request_timeout_s: Optional[float],
     ) -> None:
         self.dynamo_frontend_base_url = dynamo_frontend_base_url
         self.tokenizer = tokenizer
         self.tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
+        self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.request_timeout_s = request_timeout_s
         self.base_url: Optional[str] = None
         self.server: Any = None
         self.thread: Optional[threading.Thread] = None
+        self._client_session: Any = None
 
     def start(self) -> str:
         """Start the wrapper in a background uvicorn thread."""
+        import aiohttp
         import uvicorn
         from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse
 
-        app = FastAPI()
+        @asynccontextmanager
+        async def lifespan(_: FastAPI):
+            timeout = (
+                aiohttp.ClientTimeout(total=self.request_timeout_s)
+                if self.request_timeout_s is not None
+                else aiohttp.ClientTimeout(total=None)
+            )
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                self._client_session = session
+                try:
+                    yield
+                finally:
+                    self._client_session = None
+
+        app = FastAPI(lifespan=lifespan)
 
         @app.get("/health")
         async def health() -> dict[str, str]:
@@ -344,6 +414,7 @@ class DynamoTokenWrapperServer:
                     request_body,
                     tokenizer=self.tokenizer,
                     tokenizer_chat_template_kwargs=self.tokenizer_chat_template_kwargs,
+                    exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
@@ -354,7 +425,7 @@ class DynamoTokenWrapperServer:
             )
             if 200 <= status_code < 300:
                 try:
-                    _validate_engine_data(response_body)
+                    _inject_gym_token_metadata(response_body)
                 except ValueError as e:
                     return JSONResponse(
                         content={"error": {"message": str(e)}},
@@ -397,28 +468,25 @@ class DynamoTokenWrapperServer:
         if authorization:
             headers["Authorization"] = authorization
 
-        timeout = (
-            aiohttp.ClientTimeout(total=self.request_timeout_s)
-            if self.request_timeout_s is not None
-            else aiohttp.ClientTimeout(total=None)
-        )
+        session = self._client_session
+        if session is None:
+            return 503, {"error": {"message": "Dynamo token wrapper is not ready."}}
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    url,
-                    json=request_body,
-                    headers=headers,
-                ) as response:
-                    response_text = await response.text()
-                    if not response_text:
-                        return response.status, {}
-                    try:
-                        response_body = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        response_body = {"raw": response_text}
-                    if not isinstance(response_body, dict):
-                        response_body = {"response": response_body}
-                    return response.status, response_body
+            async with session.post(
+                url,
+                json=request_body,
+                headers=headers,
+            ) as response:
+                response_text = await response.text()
+                if not response_text:
+                    return response.status, {}
+                try:
+                    response_body = json.loads(response_text)
+                except json.JSONDecodeError:
+                    response_body = {"raw": response_text}
+                if not isinstance(response_body, dict):
+                    response_body = {"response": response_body}
+                return response.status, response_body
         except asyncio.TimeoutError:
             return 504, {"error": {"message": f"Timed out forwarding to {url}."}}
         except aiohttp.ClientError as e:

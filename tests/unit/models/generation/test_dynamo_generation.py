@@ -28,6 +28,7 @@ from nemo_rl.models.generation.dynamo.metrics import (
     DynamoMetricsSampler,
     parse_prometheus_metrics,
 )
+from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.utils.packed_tensor import (
     VLLM_PACKED_BUFFER_SIZE_BYTES,
     VLLM_PACKED_NUM_BUFFERS,
@@ -50,6 +51,7 @@ def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
             "engine": "vllm",
             "startup_timeout_s": 5,
             "request_timeout_s": 30,
+            "control_timeout_s": 10,
             "metrics_include_prefixes": None,
             "metrics_exclude_prefixes": None,
             "worker_args": {
@@ -196,6 +198,25 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     assert requests[0][0].endswith("/v1/completions")
     assert requests[0][1]["max_tokens"] == 2
     assert requests[0][1]["stop"] == ["stop"]
+    assert "return_tokens_as_token_ids" not in requests[0][1]
+
+
+def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    with pytest.raises(ValueError, match="prompt length 5 must be less than"):
+        generation._allowed_new_tokens(5)
+
+
+def test_merged_stop_strings_enforce_dynamo_limit(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    config = _config()
+    config["stop_strings"] = ["a", "b"]
+    generation = DynamoGeneration(cluster=object(), config=config)
+
+    with pytest.raises(ValueError, match="at most 4 stop strings"):
+        generation._merge_stop_strings([["c", "d", "e"]])
 
 
 def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
@@ -233,7 +254,7 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
     _patch_runtime(monkeypatch, workers=workers)
     init_calls = []
     update_calls = []
-    flush_calls = []
+    cache_calls = []
     monkeypatch.setattr(
         refit_module._post_worker_route,
         "remote",
@@ -256,18 +277,65 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
         3,
         5,
     ]
+    assert all(call["timeout_s"] == 10 for call in init_calls)
     assert generation.update_weights_from_collective() == [True, True]
     assert update_calls[0]["update_info"]["packed"] is True
+    assert all(call["timeout_s"] == 10 for call in update_calls)
 
     restored = pickle.loads(pickle.dumps(generation))
     monkeypatch.setattr(
         refit_module._post_worker_route,
         "remote",
-        lambda **kwargs: flush_calls.append(kwargs) or True,
+        lambda **kwargs: cache_calls.append(kwargs) or True,
     )
     assert restored.invalidate_kv_cache()
-    assert [call["route"] for call in flush_calls] == ["flush_cache", "flush_cache"]
+    assert [call["route"] for call in cache_calls] == [
+        "pause_generation",
+        "pause_generation",
+        "resume_generation",
+        "resume_generation",
+    ]
+    assert all(call["timeout_s"] == 10 for call in cache_calls)
+    assert all(
+        call["payload"] == {"mode": "wait", "clear_cache": True}
+        for call in cache_calls[:2]
+    )
     assert restored._managed_runtime is None
+
+
+def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def remote(**kwargs):
+        calls.append(kwargs)
+        return (kwargs["route"], kwargs["system_url"])
+
+    def get(ref):
+        if ref == ("pause_generation", "http://worker-b:4000"):
+            raise RuntimeError("pause refused")
+        return True
+
+    monkeypatch.setattr(refit_module._post_worker_route, "remote", remote)
+    monkeypatch.setattr(refit_module.ray, "get", get)
+    channel = DynamoRefitChannel(
+        [
+            {"instance_id": "a", "system_url": "http://worker-a:4000"},
+            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+        ],
+        engine_world_size=1,
+        control_timeout_s=10,
+    )
+
+    with pytest.raises(RuntimeError, match="pause/clear failed"):
+        channel.flush_cache()
+
+    assert [(call["route"], call["system_url"]) for call in calls] == [
+        ("pause_generation", "http://worker-a:4000"),
+        ("pause_generation", "http://worker-b:4000"),
+        ("resume_generation", "http://worker-a:4000"),
+    ]
 
 
 def test_native_refit_transaction_keeps_cache_mode_external(monkeypatch) -> None:
@@ -327,3 +395,69 @@ def test_completion_parser_rejects_misaligned_logprobs() -> None:
         generation_module._parse_dynamo_completion_response(
             response, request_url="http://dynamo/v1/completions"
         )
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"http_status": 408}, True),
+        ({"http_status": 429}, True),
+        ({"http_status": 503}, True),
+        ({"transport_error": "refused"}, True),
+        ({"json_decode_error": True}, True),
+        ({"http_status": 400}, False),
+        ({"http_status": 404}, False),
+    ],
+)
+def test_completion_retry_predicate(response, expected) -> None:
+    assert generation_module._is_retryable_http_response(response) is expected
+
+
+def test_completion_retry_eventually_succeeds(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    responses = iter(
+        [{"status": "error", "http_status": 503}, _completion_response([8])]
+    )
+    calls = []
+    monkeypatch.setattr(
+        generation_module,
+        "http_post_json",
+        lambda *args: calls.append(args) or next(responses),
+    )
+    monkeypatch.setattr(generation_module.time, "sleep", lambda _: None)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    token_ids, _, _ = generation._post_completion_request(
+        prompt_token_ids=[1],
+        greedy=False,
+        stop_strings=None,
+        max_new_tokens=1,
+    )
+
+    assert token_ids == [8]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("status", [400, 503])
+def test_completion_retry_stops_on_nonretryable_or_exhaustion(
+    monkeypatch, status
+) -> None:
+    _patch_runtime(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        generation_module,
+        "http_post_json",
+        lambda *args: calls.append(args) or {"status": "error", "http_status": status},
+    )
+    monkeypatch.setattr(generation_module.time, "sleep", lambda _: None)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    with pytest.raises(RuntimeError, match=f"HTTP {status}"):
+        generation._post_completion_request(
+            prompt_token_ids=[1],
+            greedy=False,
+            stop_strings=None,
+            max_new_tokens=1,
+        )
+
+    assert len(calls) == (1 if status == 400 else generation_module._HTTP_MAX_ATTEMPTS)

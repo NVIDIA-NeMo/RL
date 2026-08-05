@@ -31,6 +31,17 @@ _MANAGED_FLAGS = {
     "--endpoint",
 }
 
+_CREDENTIAL_FLAGS = {
+    "--access-token",
+    "--api-key",
+    "--apikey",
+    "--auth-token",
+    "--hf-token",
+    "--password",
+    "--secret",
+    "--token",
+}
+
 
 def _normalise_flag(flag: str) -> str:
     flag = flag.split("=", 1)[0].replace("_", "-")
@@ -130,7 +141,7 @@ def build_dynamo_vllm_argv(
         if value is not None:
             builder.add(flag, value, source=f"vllm_cfg.{key}")
 
-    if int(vllm_cfg.get("expert_parallel_size", 1)) > 1:
+    if int(vllm_cfg["expert_parallel_size"]) > 1:
         builder.add(
             "--enable-expert-parallel",
             source="vllm_cfg.expert_parallel_size",
@@ -271,12 +282,11 @@ def build_managed_worker_env(
 
 
 def redact_argv(argv: Sequence[str]) -> list[str]:
-    """Redact values following credential-looking options for safe logging."""
+    """Redact values following explicit credential options for safe logging."""
     redacted = list(argv)
-    sensitive_fragments = ("token", "password", "secret", "api-key", "apikey")
     for idx, token in enumerate(redacted):
-        is_sensitive = token.startswith("--") and any(
-            part in token.lower() for part in sensitive_fragments
+        is_sensitive = token.startswith("--") and (
+            _normalise_flag(token.lower()) in _CREDENTIAL_FLAGS
         )
         if is_sensitive and "=" in token:
             redacted[idx] = token.split("=", 1)[0] + "=<redacted>"

@@ -69,6 +69,12 @@ _VLLM_CFG_INAPPLICABLE = {
     "zmq_refit_server_port",
 }
 
+_VLLM_SINGLE_RANK_ONLY_FIELDS = {
+    "data_parallel_size",
+    "decode_context_parallel_size",
+    "prefill_context_parallel_size",
+}
+
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
     """Structured arguments passed to every managed ``dynamo.vllm`` worker."""
@@ -117,6 +123,7 @@ class DynamoCfg(BaseModel, extra="forbid"):
     engine: Literal["vllm"]
     startup_timeout_s: PositiveFloat
     request_timeout_s: PositiveFloat
+    control_timeout_s: PositiveFloat
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None
@@ -152,7 +159,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                 "backend='dynamo' requires expert_parallel_size to be 1 or "
                 "equal tensor_parallel_size"
             )
-        if self.precision is not None and self.precision.lower() not in {
+        if self.precision.lower() not in {
             "bf16",
             "bfloat16",
         }:
@@ -161,7 +168,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                 "supported by backend='dynamo'; managed weight refit currently "
                 "supports BF16 generation only"
             )
-        if self.kv_cache_dtype not in (None, "auto"):
+        if self.kv_cache_dtype != "auto":
             raise ValueError(
                 f"policy.generation.vllm_cfg.kv_cache_dtype={self.kv_cache_dtype!r} "
                 "is not supported by backend='dynamo'; use 'auto'"
@@ -199,6 +206,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
             | set(_VLLM_CFG_MOVED)
             | _VLLM_CFG_UNSUPPORTED
             | _VLLM_CFG_INAPPLICABLE
+            | _VLLM_SINGLE_RANK_ONLY_FIELDS
         )
         unclassified = {
             key for key in configured_fields if getattr(self, key, None) is not None
@@ -277,4 +285,22 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.vllm_kwargs.quantization is not supported "
                 "when backend='dynamo'"
             )
+        vllm_extra = self.vllm_cfg.model_extra or {}
+        for field in sorted(_VLLM_SINGLE_RANK_ONLY_FIELDS):
+            for source, value in (
+                ("vllm_cfg", vllm_extra.get(field)),
+                ("vllm_kwargs", self.vllm_kwargs.get(field)),
+            ):
+                if value is not None and int(value) != 1:
+                    raise ValueError(
+                        f"policy.generation.{source}.{field} must be 1 when "
+                        "backend='dynamo'; managed refit rank geometry is TP × PP"
+                    )
+        for field in ("stop_strings", "stop_token_ids"):
+            values = extra.get(field)
+            if values is not None and len(values) > 4:
+                raise ValueError(
+                    f"policy.generation.{field} supports at most 4 values when "
+                    "backend='dynamo'"
+                )
         return self

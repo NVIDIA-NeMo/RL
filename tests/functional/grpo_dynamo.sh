@@ -50,6 +50,32 @@ uv run --no-sync coverage run -a \
 grep -F "Performing policy generation refit" "${RUN_LOG}"
 grep -F "Invalidated generation backend KV caches after weight update" "${RUN_LOG}"
 
+refit_count=$(grep -Fc "Performing policy generation refit" "${RUN_LOG}" || true)
+cache_success_count=$(grep -Fc \
+  "Invalidated generation backend KV caches after weight update" \
+  "${RUN_LOG}" || true)
+if [[ "${refit_count}" -eq 0 || "${cache_success_count}" -ne "${refit_count}" ]]; then
+  echo "Expected one successful cache invalidation per refit; refits=${refit_count}, successes=${cache_success_count}" >&2
+  exit 1
+fi
+if grep -Fq \
+  -e "Failed to invalidate generation backend KV caches" \
+  -e "KV cache invalidation not supported or only partially applied" \
+  "${RUN_LOG}"; then
+  echo "The Dynamo run reported a cache invalidation failure" >&2
+  exit 1
+fi
+
+metrics_json=${EXP_DIR}/metrics.json
+uv run --no-sync tests/json_dump_tb_logs.py \
+  "${LOG_DIR}" \
+  --output_path "${metrics_json}"
+if ! jq -e 'any(keys[]; startswith("generation_metrics/"))' \
+  "${metrics_json}" > /dev/null; then
+  echo "No generation_metrics/* TensorBoard tag was recorded" >&2
+  exit 1
+fi
+
 if pgrep -f '[d]ynamo.frontend|[d]ynamo.vllm|[/]opt/dynamo_venv/bin/etcd|[/]opt/dynamo_venv/bin/nats-server'; then
   echo "Managed Dynamo processes remain after GRPO shutdown" >&2
   exit 1

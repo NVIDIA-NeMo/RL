@@ -55,7 +55,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
-    log_generation_metrics_to_wandb,
+    log_generation_metrics,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -408,6 +408,15 @@ def setup(
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
+        if grpo_config.async_grpo.in_flight_weight_updates:
+            raise ValueError(
+                "grpo.async_grpo.in_flight_weight_updates must be false when "
+                "policy.generation.backend='dynamo'; managed Dynamo drains "
+                "rollouts before layerwise weight refit"
+            )
+        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config[
+            "hf_config_overrides"
+        ]
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
 
@@ -2174,9 +2183,7 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
             "expose_http_server"
         )
     elif generation_config["backend"] == "dynamo":
-        should_expose_http_server = generation_config["vllm_cfg"][
-            "expose_http_server"
-        ]
+        should_expose_http_server = generation_config["vllm_cfg"]["expose_http_server"]
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -3654,9 +3661,8 @@ def grpo_train(
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
                 .get("enable_vllm_metrics_logger", False)
-                and master_config.logger["wandb_enabled"]
             ):
-                log_generation_metrics_to_wandb(
+                log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
                     master_config.policy["generation"]["vllm_cfg"][
@@ -5142,9 +5148,8 @@ def async_grpo_train(
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
                 .get("enable_vllm_metrics_logger", False)
-                and master_config.logger["wandb_enabled"]
             ):
-                log_generation_metrics_to_wandb(
+                log_generation_metrics(
                     generation_logger_metrics,
                     step + 1,
                     master_config.policy["generation"]["vllm_cfg"][

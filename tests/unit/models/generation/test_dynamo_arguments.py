@@ -15,6 +15,7 @@
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo.arguments import (
     build_dynamo_frontend_argv,
     build_dynamo_vllm_argv,
@@ -63,6 +64,7 @@ def _dynamo_cfg() -> dict:
         "engine": "vllm",
         "startup_timeout_s": 600,
         "request_timeout_s": 900,
+        "control_timeout_s": 600,
         "metrics_include_prefixes": None,
         "metrics_exclude_prefixes": None,
         "worker_args": {
@@ -123,18 +125,66 @@ def test_config_rejects_unsupported_modes(override, match) -> None:
 
 
 @pytest.mark.parametrize(
-    "vllm_cfg",
+    ("vllm_cfg", "match"),
     [
-        {"tensor_parallel_size": 2, "expert_parallel_size": 3},
-        {"tensor_parallel_size": 1, "precision": "fp8"},
-        {"tensor_parallel_size": 1, "kv_cache_dtype": "fp8"},
+        (
+            {"tensor_parallel_size": 2, "expert_parallel_size": 3},
+            "expert_parallel_size",
+        ),
+        ({"precision": "fp8"}, "precision"),
+        ({"kv_cache_dtype": "fp8"}, "kv_cache_dtype"),
     ],
 )
-def test_config_rejects_unsupported_parallelism_and_precision(vllm_cfg) -> None:
+def test_config_rejects_unsupported_parallelism_and_precision(vllm_cfg, match) -> None:
     config = _config()
     config["vllm_cfg"].update(vllm_cfg)
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match=match):
         DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "data_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+    ],
+)
+@pytest.mark.parametrize("source", ["vllm_cfg", "vllm_kwargs"])
+def test_config_rejects_parallel_dimensions_outside_tp_pp(field, source) -> None:
+    config = _config()
+    config[source][field] = 2
+
+    with pytest.raises(ValidationError, match=f"{source}.{field} must be 1"):
+        DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize("field", ["stop_strings", "stop_token_ids"])
+def test_config_rejects_more_than_four_stop_conditions(field) -> None:
+    config = _config(**{field: list(range(5))})
+
+    with pytest.raises(ValidationError, match=f"{field} supports at most 4"):
+        DynamoConfig.model_validate(config)
+
+
+def test_configure_generation_config_selects_dynamo_load_format() -> None:
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+    training = _config(stop_token_ids=None)
+    evaluation = _config(stop_token_ids=None)
+
+    assert (
+        configure_generation_config(training, Tokenizer())["vllm_cfg"]["load_format"]
+        == "dummy"
+    )
+    assert (
+        configure_generation_config(evaluation, Tokenizer(), is_eval=True)["vllm_cfg"][
+            "load_format"
+        ]
+        == "auto"
+    )
 
 
 def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> None:
@@ -151,7 +201,7 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
         namespace="nemo-rl-1",
         seed=7,
         vllm_cfg=vllm_cfg,
-        vllm_kwargs={"max_num_seqs": 16},
+        vllm_kwargs={"max_num_seqs": 16, "hf_overrides": {"rope_theta": 1e6}},
         dynamo_cfg=cfg,
     )
 
@@ -160,6 +210,7 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
     assert _flag_value(argv, "--dyn-tool-call-parser") == "qwen3_coder"
     assert _flag_value(argv, "--dyn-reasoning-parser") == "nemotron_nano"
     assert _flag_value(argv, "--max-num-seqs") == "16"
+    assert _flag_value(argv, "--hf-overrides") == '{"rope_theta":1000000.0}'
     assert "--enable-expert-parallel" in argv
 
 
@@ -176,7 +227,7 @@ def test_worker_argv_rejects_replaced_and_managed_options() -> None:
             model_name="model",
             namespace="namespace",
             seed=0,
-            vllm_cfg={},
+            vllm_cfg=_config()["vllm_cfg"],
             vllm_kwargs={},
             dynamo_cfg=DynamoCfg.model_validate(config),
         )
@@ -228,7 +279,7 @@ def test_every_worker_config_field_reaches_argv(monkeypatch) -> None:
         model_name="model",
         namespace="namespace",
         seed=0,
-        vllm_cfg={"tensor_parallel_size": 1},
+        vllm_cfg=_config()["vllm_cfg"],
         vllm_kwargs={},
         dynamo_cfg=cfg,
     )
@@ -243,6 +294,9 @@ def test_every_worker_config_field_reaches_argv(monkeypatch) -> None:
 
 def test_redaction_hides_credentials() -> None:
     assert redact_argv(["worker", "--api-key", "secret"])[2] == "<redacted>"
+    assert redact_argv(
+        ["worker", "--max-num-batched-tokens", "8192", "--stop-token-ids", "1,2"]
+    ) == ["worker", "--max-num-batched-tokens", "8192", "--stop-token-ids", "1,2"]
     assert redact_environment({"HF_TOKEN": "secret", "NCCL_DEBUG": "INFO"}) == {
         "HF_TOKEN": "<redacted>",
         "NCCL_DEBUG": "INFO",
