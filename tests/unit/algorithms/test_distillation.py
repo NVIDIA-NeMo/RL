@@ -150,6 +150,9 @@ def mock_components():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "colocated": {
                         "enabled": False,
                     },
@@ -851,6 +854,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "colocated": {
                         "enabled": False,  # Non-colocated
@@ -926,6 +932,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "refit_transport": refit_transport,
                     "refit_cfg": None,
@@ -1110,6 +1119,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "vllm_kwargs": {},
                     "vllm_cfg": {
@@ -1363,6 +1375,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "colocated": {
                         "enabled": False,  # Non-colocated
