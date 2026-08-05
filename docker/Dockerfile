@@ -414,6 +414,22 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
+
+# Patch the installed SGLang. It arrives as a PyPI wheel whose srt/ tree is pure
+# Python, so fixes touching only .py files are applied to the installed package
+# instead of requiring a forked wheel. Runs after every venv exists so each one
+# is patched, and before the fingerprint so that reflects the patched state.
+# Hard-fails unless every install carries every patch. See
+# docker/sglang-patches/README.md. Once a fix is in the pinned SGLang release
+# its patch is deleted and this step no-ops.
+RUN <<"EOF" bash -exu
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    echo "SKIP_SGLANG_BUILD set; no sglang installed, nothing to patch"
+else
+    python docker/sglang-patches/apply_sglang_patches.py
+fi
+EOF
+
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint

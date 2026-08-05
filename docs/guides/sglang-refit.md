@@ -348,7 +348,8 @@ With the Slurm test launcher, propagate the immutable source, model, dataset,
 and cache identities into the 16-node job:
 
 ```bash
-EXTRA_ENV="NRL_IMAGE_REF=$NRL_IMAGE_REF NRL_RUN_ID=$NRL_RUN_ID NEMO_GYM_COMMIT=$NEMO_GYM_COMMIT NRL_MODEL_REVISION=$NRL_MODEL_REVISION NRL_MODEL_PATH=$NRL_MODEL_PATH NRL_DATASET_REVISION=$NRL_DATASET_REVISION NRL_MEGATRON_CHECKPOINT_DIR=$NRL_MEGATRON_CHECKPOINT_DIR" \
+EXTRA_ENV="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NRL_IMAGE_REF=$NRL_IMAGE_REF NRL_RUN_ID=$NRL_RUN_ID NEMO_GYM_COMMIT=$NEMO_GYM_COMMIT NRL_MODEL_REVISION=$NRL_MODEL_REVISION NRL_MODEL_PATH=$NRL_MODEL_PATH NRL_DATASET_REVISION=$NRL_DATASET_REVISION NRL_MEGATRON_CHECKPOINT_DIR=$NRL_MEGATRON_CHECKPOINT_DIR" \
+EXTRA_SCRIPT_ARGS="policy.generation.sglang_cfg.mem_fraction_static=0.6" \
 HF_HOME="$HF_HOME" \
 HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
 CONTAINER="$NRL_IMAGE_REF" \
@@ -358,6 +359,18 @@ PARTITION="<partition>" \
 ./tools/launch \
   tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-async-gym-sglang.sh
 ```
+
+Both extras above are load-bearing on 184 GiB devices and are deliberately not
+in the recipe:
+
+- `mem_fraction_static=0.6`. The recipe ships `0.7`, at which a 30B model on TP2
+  engines fills the device and the refit fails allocating its receive buffer.
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which keeps the allocator
+  from fragmenting across the refit and generation cycle.
+
+Note that a hydra override naming a key absent from the recipe is rejected, as
+the launcher sets `OmegaConf.set_struct(cfg, True)`. New knobs belong in the
+recipe, not in `EXTRA_SCRIPT_ARGS`.
 
 On a cluster whose nodes expose four GPUs, substitute the `32n4g` driver in
 both commands above; it allocates sixteen training nodes and sixteen generation

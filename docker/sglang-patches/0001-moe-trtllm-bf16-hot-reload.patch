@@ -1,0 +1,446 @@
+diff --git a/python/sglang/srt/layers/quantization/base_config.py b/python/sglang/srt/layers/quantization/base_config.py
+index 232568db72..e213dcb0d6 100644
+--- a/python/sglang/srt/layers/quantization/base_config.py
++++ b/python/sglang/srt/layers/quantization/base_config.py
+@@ -42,6 +42,19 @@ class QuantizeMethodBase(ABC):
+         """
+         return
+ 
++    def repack_weights_after_hot_update(self, layer: nn.Module) -> None:
++        """Re-derive kernel weight layouts after an in-place weight update.
++
++        Weight loaders take canonical checkpoint tensors, so they may have to
++        undo a layout that `process_weights_after_loading` applied. The disk and
++        checkpoint-engine update paths re-run `process_weights_after_loading`
++        afterwards, but the tensor / distributed paths call `model.load_weights()`
++        directly and call this instead. Overrides must re-derive only their own
++        layout, and must be a no-op when nothing was undone -- unlike
++        `process_weights_after_loading`, this runs on an already-served model.
++        """
++        return
++
+ 
+ class LinearMethodBase(QuantizeMethodBase):
+     """Base class for different (maybe quantized) linear methods."""
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index e6247fce92..f921c1e310 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -160,6 +160,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         return F.linear(x, layer.weight, bias)
+ 
+ 
++# The two fused expert weights that the flashinfer TRT-LLM BF16 path rewrites
++# into block layout, and the tile geometry it rewrites them with.
++_FUSED_EXPERT_WEIGHT_NAMES = ("w13_weight", "w2_weight")
++_TRTLLM_BF16_EPILOGUE_TILE_M = 128
++_TRTLLM_BF16_BLOCK_K = 128
++
++
++def _fused_expert_weight_name(weight_name: str) -> Optional[str]:
++    """Map a checkpoint-side weight name to the fused expert parameter it loads."""
++    for param_name in _FUSED_EXPERT_WEIGHT_NAMES:
++        if weight_name.endswith(f".experts.{param_name}"):
++            return param_name
++    return None
++
++
+ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+     """MoE method without quantization."""
+ 
+@@ -253,70 +268,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+         if _is_cpu and _is_cpu_amx_available:
+             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+ 
+-        # Reorder rows of W1 for fused gated activation
+-        if self.use_flashinfer_trtllm_moe:
+-            from flashinfer.fused_moe.core import (
+-                _maybe_get_cached_w3_w1_permute_indices,
+-                convert_to_block_layout,
+-                get_w2_permute_indices_with_cache,
+-            )
+-
+-            # w1 and w3 have been swapped, so we don't need do that here
+-            epilogue_tile_m = 128
+-            block_k = 128
+-            old_shape_w13 = layer.w13_weight.data[0].shape
+-            old_shape_w2 = layer.w2_weight.data[0].shape
+-            new_shape_w13 = None
+-            new_shape_w2 = None
+-            for i in range(layer.num_local_experts):
+-                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+-                    self._cache_permute_indices,
+-                    layer.w13_weight.data[i].view(torch.uint8),
+-                    epilogue_tile_m,
+-                )
+-                tmp_weights1 = (
+-                    layer.w13_weight.data[i]
+-                    .clone()
+-                    .view(torch.uint8)[permute_indices.to(layer.w13_weight.data.device)]
+-                    .contiguous()
+-                )
+-
+-                permute_indices = get_w2_permute_indices_with_cache(
+-                    self._cache_permute_indices,
+-                    layer.w2_weight.data[i].view(torch.uint8),
+-                    epilogue_tile_m,
+-                )
+-                tmp_weights2 = (
+-                    layer.w2_weight.data[i]
+-                    .clone()
+-                    .view(torch.uint8)[permute_indices.to(layer.w2_weight.data.device)]
+-                    .contiguous()
+-                )
+-
+-                tmp_weights1 = convert_to_block_layout(
+-                    tmp_weights1.view(torch.uint8), block_k
+-                )
+-                tmp_weights2 = convert_to_block_layout(
+-                    tmp_weights2.view(torch.uint8), block_k
+-                )
+-
+-                new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
+-                new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
+-                layer.w13_weight.data[i] = (
+-                    tmp_weights1.view(torch.bfloat16)
+-                    .contiguous()
+-                    .reshape(old_shape_w13)
+-                )
+-                layer.w2_weight.data[i] = (
+-                    tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
+-                )
+-
+-            layer.w13_weight.data = layer.w13_weight.data.reshape(
+-                layer.num_local_experts, *new_shape_w13
+-            )
+-            layer.w2_weight.data = layer.w2_weight.data.reshape(
+-                layer.num_local_experts, *new_shape_w2
+-            )
++        self._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
+ 
+         if _is_npu:
+             for weight_name in ["w13_weight", "w2_weight"]:
+@@ -328,37 +280,163 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+ 
+         return
+ 
+-    def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+-        self,
+-        layer: torch.nn.Module,
+-        param: torch.nn.Parameter,
+-        weight_name: str,
++    def _maybe_apply_flashinfer_trtllm_bf16_block_layout(
++        self, layer: torch.nn.Module
+     ) -> None:
+-        """Restore canonical BF16 MoE load shapes before hot weight copy.
++        """Rewrite BF16 expert weights into the flashinfer TRT-LLM block layout.
+ 
+-        The flashinfer TRT-LLM BF16 postprocess reshapes expert weights into
+-        block layout. During weight update, checkpoint tensors are in
+-        canonical layout and need a temporary shape restore for copy.
++        Split out of ``process_weights_after_loading`` so that
++        ``repack_weights_after_hot_update`` can re-derive this one layout without
++        re-running the other, non-idempotent post-load transforms in that method.
+         """
+-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
++        if not self.use_flashinfer_trtllm_moe:
+             return
+ 
+-        expected_shape = None
+-        if weight_name.endswith(".experts.w13_weight"):
++        # The cached indices are GPU tensors. Colocated weight offloading
++        # can release their backing memory between reloads, so rebuild them
++        # once per post-processing cycle.
++        self._cache_permute_indices.clear()
++
++        for param_name in _FUSED_EXPERT_WEIGHT_NAMES:
++            self._apply_trtllm_bf16_block_layout(
++                layer, getattr(layer, param_name), param_name
++            )
++
++    def _trtllm_bf16_row_permutation(
++        self, layer: torch.nn.Module, param_name: str, expert_tile: torch.Tensor
++    ) -> torch.Tensor:
++        """flashinfer's row permutation for one expert tile, viewed as uint8."""
++        from flashinfer.fused_moe.core import (
++            _maybe_get_cached_w3_w1_permute_indices,
++            get_w2_permute_indices_with_cache,
++        )
++
++        if param_name == "w13_weight":
++            # w1 and w3 have been swapped, so we don't need do that here
++            return _maybe_get_cached_w3_w1_permute_indices(
++                self._cache_permute_indices,
++                expert_tile,
++                _TRTLLM_BF16_EPILOGUE_TILE_M,
++            )
++        return get_w2_permute_indices_with_cache(
++            self._cache_permute_indices,
++            expert_tile,
++            _TRTLLM_BF16_EPILOGUE_TILE_M,
++        )
++
++    def _apply_trtllm_bf16_block_layout(
++        self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
++    ) -> None:
++        """Canonical -> block layout, in place, for one fused expert weight."""
++        from flashinfer.fused_moe.core import convert_to_block_layout
++
++        canonical_expert_shape = param.data[0].shape
++        blocked_expert_shape = None
++        for i in range(layer.num_local_experts):
++            permute_indices = self._trtllm_bf16_row_permutation(
++                layer, param_name, param.data[i].view(torch.uint8)
++            )
++            tile = (
++                param.data[i]
++                .clone()
++                .view(torch.uint8)[permute_indices.to(param.data.device)]
++                .contiguous()
++            )
++            tile = convert_to_block_layout(tile, _TRTLLM_BF16_BLOCK_K)
++            blocked_expert_shape = tile.view(torch.bfloat16).shape
++            param.data[i] = (
++                tile.view(torch.bfloat16).contiguous().reshape(canonical_expert_shape)
++            )
++
++        param.data = param.data.reshape(layer.num_local_experts, *blocked_expert_shape)
++
++    def _restore_trtllm_bf16_canonical_layout(
++        self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
++    ) -> None:
++        """Block layout -> canonical, in place, for one fused expert weight.
++
++        The exact inverse of ``_apply_trtllm_bf16_block_layout``: the row
++        permutation is a bijection, so ``argsort`` inverts it, and
++        ``convert_to_block_layout``'s ``[M, K] -> [K // block_k, M, block_k]``
++        rewrite is undone by moving the block dim back next to K.
++
++        Inverting the data, rather than only reinterpreting the shape, is what
++        makes a bucketed weight update safe: an update that carries only part of
++        a layer leaves the remaining expert slots holding their real values, so
++        re-deriving the layout afterwards blocks each of them exactly once.
++        """
++        canonical_shape = self._canonical_expert_weight_shape(layer, param_name)
++        blocked_expert_shape = tuple(param.data[0].shape)
++        param.data = param.data.reshape(canonical_shape)
++
++        inverse_indices = None
++        for i in range(layer.num_local_experts):
++            blocked = param.data[i].reshape(blocked_expert_shape).view(torch.uint8)
++            rows = blocked.shape[1]
++            tile = blocked.permute(1, 0, 2).contiguous().reshape(rows, -1)
++            if inverse_indices is None:
++                # flashinfer keys the permutation on the tile shape alone, and
++                # every expert has the same tile shape, so invert it once.
++                permute_indices = self._trtllm_bf16_row_permutation(
++                    layer, param_name, tile
++                )
++                inverse_indices = torch.argsort(permute_indices.to(tile.device))
++            param.data[i] = (
++                tile[inverse_indices]
++                .contiguous()
++                .view(torch.bfloat16)
++                .reshape(canonical_shape[1:])
++            )
++
++    def _canonical_expert_weight_shape(
++        self, layer: torch.nn.Module, param_name: str
++    ) -> Optional[tuple]:
++        """The shape ``create_weights`` allocated for a fused expert weight."""
++        if param_name == "w13_weight":
+             w13_rows = (
+                 2 * layer.intermediate_size_per_partition
+                 if layer.moe_runner_config.is_gated
+                 else layer.intermediate_size_per_partition
+             )
+-            expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
+-        elif weight_name.endswith(".experts.w2_weight"):
+-            expected_shape = (
++            return (layer.num_local_experts, w13_rows, layer.hidden_size)
++        if param_name == "w2_weight":
++            return (
+                 layer.num_local_experts,
+                 layer.hidden_size,
+                 layer.intermediate_size_per_partition,
+             )
++        return None
+ 
+-        if expected_shape is None or tuple(param.data.shape) == expected_shape:
++    def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
++        self,
++        layer: torch.nn.Module,
++        param: torch.nn.Parameter,
++        weight_name: str,
++    ) -> None:
++        """Restore the canonical BF16 MoE load layout before a hot weight copy.
++
++        The flashinfer TRT-LLM BF16 postprocess rewrites expert weights into
++        block layout. Checkpoint tensors are canonical, so the loader needs the
++        parameter back in its load-time layout to copy them in;
++        ``repack_weights_after_hot_update`` re-derives the block layout once the
++        copies are done.
++
++        Gated on the same ``use_flashinfer_trtllm_moe`` flag that gates the
++        rewrite in ``_maybe_apply_flashinfer_trtllm_bf16_block_layout``, so the
++        transform and its inverse cannot drift apart. That flag covers both the
++        routed and the non-routed TRT-LLM backends; keying only off
++        ``is_flashinfer_trtllm_routed()`` left the non-routed backend in block
++        layout during a hot update, and the copy raised (issue #27787).
++        """
++        if not self.use_flashinfer_trtllm_moe:
++            return
++
++        param_name = _fused_expert_weight_name(weight_name)
++        if param_name is None:
++            return
++
++        expected_shape = self._canonical_expert_weight_shape(layer, param_name)
++        if tuple(param.data.shape) == expected_shape:
+             return
+ 
+         expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
+@@ -368,7 +446,42 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+                 f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
+             )
+ 
+-        param.data = param.data.reshape(expected_shape)
++        self._cache_permute_indices.clear()
++        self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
++
++    def repack_weights_after_hot_update(self, layer: torch.nn.Module) -> None:
++        """Re-derive the TRT-LLM block layout the weight loader had to undo.
++
++        ``maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load`` puts the
++        expert weights back in canonical layout so the loader can copy
++        checkpoint tensors in, and nothing else restores them: the update paths
++        that call ``model.load_weights()`` directly never re-run
++        ``process_weights_after_loading``. Without this the parameters keep the
++        canonical layout while the kernel reads BlockMajorK.
++
++        Which weights need re-deriving is decided by shape rather than a dirty
++        flag, so this is a no-op when an update touched no expert weight, and
++        each weight is handled independently -- an update that carries w13 and
++        w2 in separate buckets is still correct.
++        """
++        if not self.use_flashinfer_trtllm_moe:
++            return
++
++        reverted = [
++            name
++            for name in _FUSED_EXPERT_WEIGHT_NAMES
++            if tuple(getattr(layer, name).data.shape)
++            == self._canonical_expert_weight_shape(layer, name)
++        ]
++        if not reverted:
++            # No expert weight was reverted, so the block layout is intact.
++            return
++
++        self._cache_permute_indices.clear()
++        for param_name in reverted:
++            self._apply_trtllm_bf16_block_layout(
++                layer, getattr(layer, param_name), param_name
++            )
+ 
+     def create_moe_runner(
+         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index eff3a5615a..de189484d9 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -124,6 +124,7 @@ from sglang.srt.layers.dp_attention import (
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.moe.topk import TopK
+ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
++from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+ from sglang.srt.layers.sampler import create_sampler
+ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+@@ -2035,6 +2036,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             )
+             logger.error(error_msg)
+             return False, error_msg
++        finally:
++            _repack_weights_after_hot_update(self.model)
+ 
+     def _update_bucketed_weights_from_distributed(
+         self, names, dtypes, shapes, group_name
+@@ -2066,6 +2069,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             )
+             logger.error(error_msg)
+             return False, error_msg
++        finally:
++            _repack_weights_after_hot_update(self.model)
+ 
+     def update_weights_from_tensor(
+         self,
+@@ -2087,15 +2092,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+             for name, tensor in named_tensors
+         ]
+-        if load_format == "direct":
+-            _model_load_weights_direct(self.model, named_tensors)
+-        elif load_format in self.server_args.custom_weight_loader:
+-            custom_loader = dynamic_import(load_format)
+-            custom_loader(self.model, named_tensors)
+-        elif load_format is None:
+-            self.model.load_weights(named_tensors)
+-        else:
+-            raise NotImplementedError(f"Unknown load_format={load_format}")
++        try:
++            if load_format == "direct":
++                _model_load_weights_direct(self.model, named_tensors)
++            elif load_format in self.server_args.custom_weight_loader:
++                custom_loader = dynamic_import(load_format)
++                custom_loader(self.model, named_tensors)
++            elif load_format is None:
++                self.model.load_weights(named_tensors)
++            else:
++                raise NotImplementedError(f"Unknown load_format={load_format}")
++        finally:
++            _repack_weights_after_hot_update(self.model)
+         return True, "Success"
+ 
+     def _update_weights_from_flattened_bucket(
+@@ -2126,7 +2134,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         reconstructed_tensors = bucket.reconstruct_tensors()
+ 
+         # Load the reconstructed tensors using the standard method
+-        self.model.load_weights(reconstructed_tensors)
++        try:
++            self.model.load_weights(reconstructed_tensors)
++        finally:
++            _repack_weights_after_hot_update(self.model)
+ 
+         return True, "Success"
+ 
+@@ -3642,6 +3653,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         return output
+ 
+ 
++def _repack_weights_after_hot_update(model) -> None:
++    """Re-derive kernel weight layouts after an in-place weight update.
++
++    `update_weights_from_disk` re-runs `process_weights_after_loading` for every
++    module through the loader, and the checkpoint-engine IPC path does the same
++    in its post hook. The paths that call `model.load_weights()` directly do
++    neither, so a weight loader that had to undo a kernel layout to accept a
++    canonical checkpoint tensor would leave the parameter in load layout while
++    the kernel still reads the transformed one.
++
++    Callers run this from a `finally`: a load that raises part way through has
++    already had layouts undone, and leaving those parameters in load layout is
++    the exact silent-mismatch this exists to prevent. The weights are then a mix
++    of old and new -- which the caller already reports -- but the layout
++    invariant holds, so the failure stays loud instead of turning into wrong
++    numerics.
++    """
++    for module in model.modules():
++        quant_method = getattr(module, "quant_method", None)
++        if isinstance(quant_method, QuantizeMethodBase):
++            quant_method.repack_weights_after_hot_update(module)
++
++
+ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+     params_dict = dict(model.named_parameters())
+     for name, tensor in named_tensors:

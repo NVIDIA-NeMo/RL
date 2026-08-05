@@ -137,12 +137,19 @@ policy:
       pp_size: 1
       ep_size: 1
       random_seed: 42
-      # Load-bearing for refit, not a performance choice. SGLang resolves "auto"
-      # to "flashinfer_trtllm" on sm100 for bf16 MoE, which rewrites expert
-      # weights into a block layout its weight-update path never undoes: the
-      # first refit bucket then dies with "size of tensor a (64) must match the
-      # size of tensor b (2048) at non-singleton dimension 2".
-      moe_runner_backend: triton
+      # Requires the SGLang fix in docker/sglang-patches. Stock sglang 0.5.12.post1
+      # rewrites bf16 MoE expert weights into a block layout under this backend
+      # and never undoes it on the weight-update path, so the first refit bucket
+      # dies with "size of tensor a (64) must match the size of tensor b (2048)
+      # at non-singleton dimension 2". Set this to "triton" to avoid the block
+      # layout entirely if you are running an image without that patch.
+      #
+      # Pinned rather than left at "auto" so the choice is explicit: "auto" also
+      # resolves here on sm100, but silently, and resolves elsewhere on other
+      # architectures. Measured on GB200 at tp=2, this backend decodes 11-30%
+      # faster than "triton" across batch sizes 1-32, +17% at the ~2 concurrent
+      # requests per engine this recipe produces.
+      moe_runner_backend: flashinfer_trtllm
       max_running_requests: null
       # Leave headroom for in-place weight updates. At 0.8 a 30B model on
       # TP2 engines fills the device (184.27 of 184.31 GiB observed) and
