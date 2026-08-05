@@ -99,6 +99,9 @@ class MegatronGeneration(GenerationInterface):
             # Reuse the existing training policy.
             self._policy = policy
             self._owns_policy = False
+            if self.cfg["mcore_generation_config"]["expose_http_server"]:
+                self._policy.offload_before_refit()
+                self.prepare_for_generation()
             return
 
         # Stand up a dedicated inference-only policy.
@@ -121,13 +124,6 @@ class MegatronGeneration(GenerationInterface):
 
         # Start the persistent inference engine + HTTP server during construction.
         self.prepare_for_generation()
-
-        url_futures = self._policy.worker_group.run_all_workers_single_data(
-            "report_dp_openai_server_base_url"
-        )
-        self.dp_openai_server_base_urls = [
-            url for url in ray.get(url_futures) if url is not None
-        ]
 
     def init_collective(
         self,
@@ -209,6 +205,16 @@ class MegatronGeneration(GenerationInterface):
             "prepare_for_generation", **kwargs
         )
         ray.get(futures)
+        if (
+            not self.dp_openai_server_base_urls
+            and self.cfg["mcore_generation_config"]["expose_http_server"]
+        ):
+            url_futures = self._policy.worker_group.run_all_workers_single_data(
+                "report_dp_openai_server_base_url"
+            )
+            self.dp_openai_server_base_urls = [
+                url for url in ray.get(url_futures) if url is not None
+            ]
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
