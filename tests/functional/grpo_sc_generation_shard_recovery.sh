@@ -243,7 +243,30 @@ ELAPSED=$(( $(date +%s) - KILLED_AT ))
 
 if (( FINISHED == 0 )); then
     echo "[recovery] FAIL: still running ${ELAPSED}s after the kill -- this is a wedge."
+    # Dump stacks BEFORE tearing anything down. The chaos test has done this for a while;
+    # this one did not, and job 5893807 cost a whole cycle to a wedge whose location could
+    # only be guessed at. "0 rollouts in flight" says the pump stopped, not where.
+    if command -v py-spy >/dev/null 2>&1; then
+        SC_PID=$(pgrep -f "ray::SingleControllerActor" | head -1 || true)
+        if [[ -n "${SC_PID:-}" ]]; then
+            echo "[recovery] --- py-spy dump of SingleControllerActor pid=$SC_PID ---"
+            # --locals matters here: whether the pump is parked on _rollout_permitted, on
+            # the _buffer_capacity semaphore, or in the sampler is exactly the question,
+            # and the frame alone does not distinguish them.
+            py-spy dump --pid "$SC_PID" --locals 2>&1 | head -100 || true
+        fi
+        for name in MegatronPolicyWorker VllmAsyncGenerationWorker; do
+            for pid in $(pgrep -f "ray::${name}" | head -2); do
+                echo "[recovery] --- py-spy dump of ${name} pid=${pid} ---"
+                py-spy dump --pid "$pid" 2>&1 | head -40 || true
+            done
+        done
+    else
+        echo "[recovery] py-spy not available; cannot show where it is wedged"
+    fi
     echo "[recovery] watchdog lines:"; grep -E "watchdog|stall|inflight" "$RUN_LOG" | tail -20
+    echo "[recovery] fleet/refit activity:"
+    grep -E "fleet: shard|rebuilt refit communicator|_sync_weights: sync done" "$RUN_LOG" | tail -15
     exit 1
 fi
 
