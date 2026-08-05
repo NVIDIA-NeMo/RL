@@ -149,9 +149,9 @@ policy:
         num_nodes: 2
 data:
   train:
-    data_path: null
+    data_path: data/swe/train.jsonl
   validation:
-    data_path: null
+    data_path: data/swe/validation.jsonl
 env:
   nemo_gym:
     skip_venv_if_present: true

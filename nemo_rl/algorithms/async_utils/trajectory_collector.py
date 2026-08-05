@@ -556,7 +556,6 @@ class AsyncTrajectoryCollector:
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
         async_cfg = self.master_config.grpo.async_grpo
-        backend = self.master_config.policy["generation"]["backend"]
         if async_cfg.recompute_kv_cache_after_weight_updates:
             try:
                 print(
@@ -573,7 +572,10 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-                if backend == "dynamo":
+                if (
+                    "generation" in self.master_config.policy
+                    and self.master_config.policy["generation"]["backend"] == "dynamo"
+                ):
                     raise RuntimeError(
                         "Managed Dynamo KV cache invalidation failed after refit"
                     ) from e
