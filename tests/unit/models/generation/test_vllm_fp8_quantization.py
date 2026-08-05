@@ -341,9 +341,15 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     assert quant_config_calls == [layer]
     assert len(kernel_calls) == 1
     assert len(shuffle_calls) == 2
-    assert tuple(id(parameter) for parameter in runtime_parameters) == parameter_ids
-    assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == storage_ptrs
-    assert all(torch.all(parameter == 2) for parameter in runtime_parameters)
+    refit_parameters = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight_scale,
+    )
+    assert tuple(id(parameter) for parameter in refit_parameters) == parameter_ids
+    assert tuple(parameter.data_ptr() for parameter in refit_parameters) == storage_ptrs
+    assert all(torch.all(parameter == 2) for parameter in refit_parameters)
     assert kernel_calls[0] == {
         "moe_quant_config": quant_config,
         "moe_config": moe_config,
