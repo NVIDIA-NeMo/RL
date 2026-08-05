@@ -39,7 +39,10 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_manager import (
+    AsyncNemoGymRolloutImpl,
+    RolloutManager,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -300,6 +303,69 @@ def test_rollout_manager_raises_without_impl_params():
 
     with pytest.raises(AssertionError, match="generation_config is required"):
         RolloutManager(**common, use_nemo_gym=True)
+
+
+def test_rollout_manager_forwards_mask_env_flagged_samples():
+    """env.should_mask_flagged_samples reaches the NeMo-Gym impl through RolloutManager."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+
+    assert RolloutManager(**common)._impl._mask_env_flagged_samples is True
+    manager = RolloutManager(**common, mask_env_flagged_samples=False)
+    assert manager._impl._mask_env_flagged_samples is False
+
+
+def _nemo_gym_impl(mask_env_flagged_samples):
+    return AsyncNemoGymRolloutImpl(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=100,
+        max_rollout_turns=1,
+        generation_config={
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        mask_env_flagged_samples=mask_env_flagged_samples,
+    )
+
+
+def _mask_gate_result():
+    return {
+        "message_log": [
+            {
+                "role": "assistant",
+                "token_ids": [1, 2],
+                "generation_logprobs": [0.0, 0.0],
+            }
+        ],
+        "full_result": {
+            "reward": 1.0,
+            "instance_config": {"mask_sample": True, "other_key": "kept"},
+        },
+    }
+
+
+def test_result_to_completion_keeps_mask_flag_when_gate_on():
+    completion = _nemo_gym_impl(True)._result_to_completion(_mask_gate_result())
+    assert completion.env_extras["instance_config"]["mask_sample"] is True
+
+
+def test_result_to_completion_drops_mask_flag_when_gate_off():
+    completion = _nemo_gym_impl(False)._result_to_completion(_mask_gate_result())
+    assert "mask_sample" not in completion.env_extras["instance_config"]
+    assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
 # ---------------------------------------------------------------------------
