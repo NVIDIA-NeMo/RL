@@ -896,6 +896,8 @@ class MegatronGenerationRefitMixin:
         self.model = self.move_model(
             self.model, "cuda", move_params=True, move_grads=False
         )
+        # TODO: Optimize away the full synchronization.
+        torch.cuda.synchronize()
 
         # The swap reads the training params as its source;
         # under overlap_param_gather they stay stale after the optimizer step until gathered,
@@ -923,11 +925,12 @@ class MegatronGenerationRefitMixin:
             src_rank_offset=0,
             dst_rank_offset=0,
         )
-
         # Offload training model.
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
+        # TODO: Optimize away the full synchronization.
+        torch.cuda.synchronize()
 
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""

@@ -1494,8 +1494,9 @@ def build_inference_model(
     Returns:
         The inference model module (single element; not DDP-wrapped, no optimizer).
     """
-    # Deep-copy the training config and apply the inference overrides on top.
-    inference_provider = copy.deepcopy(megatron_cfg.model)
+    # Derive the inference provider from the initial snapshot taken by setup_model_and_optimizer.
+    inference_provider = megatron_cfg._initial_model_provider
+    del megatron_cfg._initial_model_provider
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
     _apply_parallelism_config(inference_provider, policy_cfg)
     _apply_moe_config(inference_provider, policy_cfg)
@@ -1701,6 +1702,15 @@ def setup_model_and_optimizer(
         peft = None
 
     megatron_cfg.peft = peft
+
+    # Snapshot the provider before any runtime state is added onto it.
+    generation_cfg = policy_cfg.get("generation")
+    if (
+        generation_cfg is not None
+        and generation_cfg.get("backend") == "megatron"
+        and generation_cfg.get("colocated", {}).get("enabled", False)
+    ):
+        megatron_cfg._initial_model_provider = copy.deepcopy(megatron_cfg.model)
 
     if megatron_cfg.peft is not None:
         pre_peft_hook = _create_peft_pre_wrap_hook(megatron_cfg, state)
