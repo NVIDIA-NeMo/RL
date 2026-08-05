@@ -65,7 +65,10 @@ def filter_multimodal_kwargs_for_model(
         return multimodal_kwargs
     # A forward that cannot consume imgs_sizes also cannot crop the per-image
     # pad_to_max_shape padding, so mixed-resolution batches would feed padded
-    # pixels to the vision encoder and mismatch the placeholder count.
+    # pixels to the vision encoder and mismatch the placeholder count. This is
+    # the AutoModel Nemotron Omni path (nvidia/Nemotron-3-Nano-Omni-30B-A3B-
+    # Reasoning-BF16), whose HF forward takes pixel_values but not imgs_sizes,
+    # unlike the mcore NemotronOmniModel which crops via imgs_sizes.
     imgs_sizes = multimodal_kwargs.get("imgs_sizes")
     if (
         imgs_sizes is not None
