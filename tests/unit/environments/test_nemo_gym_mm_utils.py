@@ -55,6 +55,18 @@ def test_extract_input_images_returns_empty_for_string_content():
     assert _extract_input_images_from_message({"role": "user"}) == []
 
 
+def test_extract_input_images_ignores_text_function_call_output():
+    item = {
+        "type": "function_call_output",
+        "call_id": "c1",
+        "output": '{"ok": true}',
+    }
+    assert _extract_input_images_from_message(item) == []
+
+    item["output"] = "Tool failed to create result.png"
+    assert _extract_input_images_from_message(item) == []
+
+
 def test_index_per_turn_images_bins_images():
     output = [
         _user(_image((2, 2))),
@@ -67,6 +79,16 @@ def test_index_per_turn_images_bins_images():
     assert len(per_turn) == 2
     assert [img.size for img in per_turn[0]] == [(2, 2)]
     assert [img.size for img in per_turn[1]] == [(3, 3), (4, 4)]
+
+
+def test_index_per_turn_images_seeds_first_turn_from_input_messages():
+    input_messages = [_user(_image((2, 2)))]
+    output = [_assistant([1, 2])]
+
+    per_turn = _index_per_turn_images(output, input_messages=input_messages)
+
+    assert len(per_turn) == 1
+    assert [img.size for img in per_turn[0]] == [(2, 2)]
 
 
 def test_index_per_turn_images_text_only_rollout_yields_empty_buckets():

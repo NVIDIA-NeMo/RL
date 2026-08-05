@@ -194,17 +194,33 @@ def _detect_invalid_tool_call_and_malformed_thinking(
 ########################################
 
 
+_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
+
+
+def _looks_like_image_src(src: str) -> bool:
+    """True when ``src`` plausibly points at an image the loader can open.
+
+    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
+    click tool) that are strings but not image URLs. Without this, the
+    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
+    which treats it as a filesystem path and raises ``FileNotFoundError``.
+    """
+    return src.startswith(_IMAGE_SRC_PREFIXES)
+
+
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """Pull PIL images out of a non-assistant Responses-API item.
 
     Handles both content-list items (user / tool messages carrying
     ``input_image``/``image``/``image_url`` parts) and ``function_call_output``
-    items whose ``output`` field is an image data URL.
+    items whose ``output`` field is an image data URL. Tool outputs that are
+    non-image strings (e.g. structured JSON returned by tools like
+    ``click(x, y)``) contribute zero images to the bucket.
     """
     images: list[Image.Image] = []
     if item.get("type") == "function_call_output":
         src = item.get("output")
-        if isinstance(src, str):
+        if isinstance(src, str) and _looks_like_image_src(src):
             images.append(resolve_to_image(src))
         return images
     content = item.get("content") or []
@@ -226,7 +242,10 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     return images
 
 
-def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
+def _index_per_turn_images(
+    output: list[dict],
+    input_messages: list[dict] | None = None,
+) -> list[list[Image.Image]]:
     """Bin server-returned images by the trainable turn that saw them.
 
     Walks the Responses-API items in order and flushes ``pending`` into a
@@ -239,9 +258,19 @@ def _index_per_turn_images(output: list[dict]) -> list[list[Image.Image]]:
     has one entry per trainable turn, aligned with the postprocess loop's
     ``turn_idx`` even when the trainable item's role is not ``assistant``
     (e.g. a reasoning-only response, or a ``function_call``).
+
+    ``input_messages`` is the initial ``responses_create_params.input`` list —
+    images there (e.g. a single-shot user prompt for tool-based envs like
+    circle-click) are consumed by the first trainable turn's tokenized prompt
+    and must land in the first bucket. Agents like ``gym_v_agent`` that keep
+    ``input`` empty and inject observations as ``function_call_output`` items
+    are unaffected — the seed is a no-op when ``input_messages`` is empty.
     """
     per_turn: list[list[Image.Image]] = []
     pending: list[Image.Image] = []
+    for item in input_messages or ():
+        if isinstance(item, dict) and item.get("role") != "assistant":
+            pending.extend(_extract_input_images_from_message(item))
     for item in output:
         if item.get(
             "generation_token_ids"
@@ -515,8 +544,15 @@ Depending on your data shape, you may want to change these values."""
         )
 
         processor = getattr(self, "_processor", None)
-        per_turn_images = _index_per_turn_images(
-            nemo_gym_result["response"]["output"],
+        per_turn_images = (
+            _index_per_turn_images(
+                nemo_gym_result["response"]["output"],
+                input_messages=nemo_gym_result.get(
+                    "responses_create_params", {}
+                ).get("input"),
+            )
+            if processor is not None
+            else []
         )
         turn_idx = 0
 
