@@ -1,13 +1,26 @@
 # Automodel r0.6.0 Upgrade and Context-Parallel Integration
 
 This PR updates NeMo-RL for Automodel r0.6.0 and migrates the DTensor v2
-context-parallel (CP) path to Automodel's model-owned sharding protocol. The comparison is
-based on NeMo-RL commits
-[`72d48e7f`](https://github.com/NVIDIA-NeMo/RL/commit/72d48e7ff0cb8d1076520f89e853f3f53aa97472)
-and
-[`11e14e91`](https://github.com/NVIDIA-NeMo/RL/commit/11e14e91af64f9c4136ab97fa2191a3de5a1af1d).
+context-parallel (CP) path to Automodel's model-owned sharding protocol.
 
-## 1. Automodel API Updates
+## 1. Automodel r0.6.0 Upgrade
+
+### 1.1 Environment Upgrade
+
+Automodel r0.6.0 requires the following dependency updates in `pyproject.toml`; `uv.lock`
+is regenerated accordingly:
+
+| Dependency | Before | After |
+| --- | --- | --- |
+| Base `transformers` range | `>=5.5.0,<5.9.0` | `>=5.5.0,<5.13.0` |
+| Automodel extra | `transformers>=5.5.0,<5.6.0` | `transformers>=5.12.1,<5.13.0` |
+| `megatron-fsdp` | No root constraint | Git constraint at [`455389c4`](https://github.com/yuhezhang-ai/Megatron-LM/commit/455389c480af6b3acdca74c7830c68b3274eb083) |
+
+The Transformers update matches Automodel's `transformers==5.12.1` pin. The
+`megatron-fsdp` constraint mirrors Automodel's Megatron-LM fork and revision so `uv` can
+resolve the transitive URL dependency consistently.
+
+### 1.2 Automodel API Updates
 
 The r0.6.0 upgrade consolidates distributed setup and model loading:
 
@@ -18,37 +31,77 @@ The r0.6.0 upgrade consolidates distributed setup and model loading:
 | FSDP backend | `FSDP2Config(backend="nccl")` | `backend` removed; mesh setup selects NCCL |
 | MoE config import | `components.moe.config` | `components.distributed.config` |
 
-The main upstream change is Automodel
-[#2266](https://github.com/NVIDIA-NeMo/Automodel/pull/2266). This PR also updates moved
-modules and checkpoint helpers, and removes obsolete local shims and compatibility
-workarounds ([#3187](https://github.com/NVIDIA-NeMo/Automodel/pull/3187),
-[#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172),
-[#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289),
-[#1634](https://github.com/NVIDIA-NeMo/Automodel/pull/1634), and
-[#2419](https://github.com/NVIDIA-NeMo/Automodel/pull/2419)).
+The simplified call pattern is shown below. The main upstream change is Automodel
+[#2266](https://github.com/NVIDIA-NeMo/Automodel/pull/2266).
+
+```python
+mesh_context = MeshContext.build(
+    fsdp2_config,
+    ParallelismSizes(tp_size=tp_size, cp_size=cp_size, ep_size=ep_size),
+    world_size=world_size,
+)
+
+distributed_setup = DistributedSetup(
+    mesh_context=mesh_context,
+    strategy_config=fsdp2_config,
+    pipeline_config=None,
+    moe_parallel_config=moe_config if ep_size > 1 else None,
+    activation_checkpointing=activation_checkpointing,
+)
+
+model = model_class.from_pretrained(
+    model_name,
+    distributed_setup=distributed_setup,
+    # Other model arguments remain unchanged.
+)
+```
+
+Other module and checkpoint API changes:
+
+- `BackendConfig` now comes from `components.models.common.utils`
+  ([#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172)).
+- `Checkpointer._should_write_hf_metadata()` became the module-level
+  `_should_write_hf_metadata(config)`, and `save_consolidated` now uses enum semantics.
+  Call `_normalize_save_consolidated()` after updating checkpoint configuration through
+  `setattr` ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)).
+
+The upgrade also removes three compatibility workarounds:
+
+- Use Automodel's exported `NeMoAutoModelForTokenClassification` directly instead of the
+  local NeMo-RL shim ([#1634](https://github.com/NVIDIA-NeMo/Automodel/pull/1634)).
+- Remove the `_restore_loaded_model_dtype()` monkeypatch; Automodel now preserves an
+  explicitly requested FP32 parameter dtype
+  ([#2419](https://github.com/NVIDIA-NeMo/Automodel/pull/2419)).
+- Remove the Gemma 4 KV-sharing `use_cache=True` workaround. This is enabled by the newer
+  Transformers version used with r0.6.0, rather than by an Automodel API change
+  ([Transformers #45312](https://github.com/huggingface/transformers/pull/45312)).
 
 ## 2. CP API Changes and Support Scope
 
-This section covers the Automodel DTensor v2 training path only. Megatron-Core CP is out of
-scope. The pre-refactor support summary uses NeMo-RL
-[`dd39d384`](https://github.com/NVIDIA-NeMo/RL/commit/dd39d384db8727f95069f33327047740d70e19a9)
-as the baseline.
+This section covers the Automodel DTensor v2 training path only.
 
 ### 2.1 Automodel CP API Changes
 
-Automodel [#2937](https://github.com/NVIDIA-NeMo/Automodel/pull/2937) introduced
-`ContextParallelSharder`, making Automodel the single owner of the model's token layout.
+Automodel [#2937](https://github.com/NVIDIA-NeMo/Automodel/pull/2937) unifies CP handling
+across models and attention backends through `ContextParallelSharder`. A basic call is:
 
-| Before | After |
-| --- | --- |
-| NeMo-RL builds `cp_buffers` and `seq_index` | `ContextParallelSharder.shard()` pads and shards the model batch |
-| Workers call `create_context_parallel_ctx()` directly | `shard()` returns the model forward context |
-| Loss code assumes the legacy head-tail layout | `ShardLayout` describes the layout selected for this forward |
-| NeMo-RL manually shards and gathers token tensors | `shard_token_tensor()` and `gather_token_tensor()` reuse the model layout |
+```python
+cp_sharder = ContextParallelSharder(model, device_mesh, batch)
+train_ctx, sharded_batch = cp_sharder.shard(batch)
 
-Automodel now owns layout selection, padding, and attention transport. NeMo-RL retains the
-canonical RL data, loss semantics, TP vocabulary operations, public outputs, and backward
-scaling.
+with train_ctx():
+    output = model(**sharded_batch)
+```
+
+`shard()` selects the model-specific layout, pads and shards the batch, and returns the
+forward context required by the attention backend. Its `ShardLayout` records the global
+position of each local token and the sequence lengths before and after padding. Callers
+therefore consume the actual layout used by the forward instead of assuming how tokens
+were partitioned.
+
+This creates a clear ownership boundary: Automodel manages the CP layout and communication
+for model inputs, while NeMo-RL reuses that layout to compute RL losses and restore public
+outputs such as logprobs and top-k logits.
 
 ### 2.2 Pre-Refactor CP Support
 
