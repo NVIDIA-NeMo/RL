@@ -153,6 +153,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
+ray.init(address="auto")
 actor_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
 actor_env = get_actor_python_env(actor_fqn)
 assert actor_env.startswith("uv run --locked --extra mcore")
