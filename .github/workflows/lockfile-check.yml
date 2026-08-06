@@ -41,6 +41,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
+          version: "0.11.28"
           enable-cache: true
 
       # Building megatron-bridge's metadata provisions its build requirements

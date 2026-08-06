@@ -71,7 +71,7 @@ class PY_EXECUTABLES:
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
     # Use NeMo-Gym dependencies
-    NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
+    NEMO_GYM = f"uv run --locked --extra nemo_gym --group nemo_gym_router --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
@@ -85,6 +85,8 @@ class PY_EXECUTABLES:
 # service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
 # the full layout including Ray's own GCS / worker gRPC ports.
 #
+#   1320-1359    vLLM Router HTTP
+#   1360-1399    vLLM Router Prometheus metrics
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
 #   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
 #                                                 (policy.generation.port_range_low/high)
@@ -111,6 +113,12 @@ DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
 DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800
 DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
+# vLLM Router control-plane ports occupy the reserved gap between Ray's
+# management ports and the master / TCPStore range.
+DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW = 1320
+DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH = 1360
+DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW = 1360
+DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH = 1400
 # Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
 DEFAULT_MASTER_PORT_RANGE_LOW = 1400
 DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
