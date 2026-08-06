@@ -1,0 +1,32 @@
+# Keep attention projections in BF16 and apply the global NVFP4 recipe to MLP
+# linears. Initialization-time settings such as fp4_param belong in fp4_cfg.
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+  nvfp4:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp4_quantization_recipe: "nvfp4"
+
+matchers:
+  attn_qkv_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.linear_qkv"
+    enabled: true
+  attn_proj_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.linear_proj"
+    enabled: true
+  mlp_fc1_nvfp4:
+    config: "nvfp4"
+    type: "glob"
+    pattern: "*.linear_fc1"
+    enabled: true
+  mlp_fc2_nvfp4:
+    config: "nvfp4"
+    type: "glob"
+    pattern: "*.linear_fc2"
+    enabled: true
