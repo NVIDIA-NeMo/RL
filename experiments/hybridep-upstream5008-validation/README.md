@@ -25,17 +25,24 @@ probes `_apply_moe_config` and fails unless the effective value is `True`.
   reference pinned with `@sha256:<64-hex-digest>`.
 - `DEEPEP_WHEEL`: platform wheel built from
   `17cfb817bccec3a9c247013360cc550c2bac441e`.
-- `DEEPEP_COMMIT_FILE` (optional): defaults to `${DEEPEP_WHEEL}.commit` and must
-  contain the exact DeepEP commit above.
+- `DEEPEP_METADATA`: JSON metadata emitted by the wheel build pipeline. It must
+  bind the exact `commit`, `platform`, `architecture`, `wheel`, and `sha256`.
 - `SOURCE_PATH` (optional): defaults to the current repository root.
 - `HF_CACHE` and `OUTPUT_ROOT` (optional): default beneath the platform's
   experiment-specific Lustre output root.
 
-The source must be a clean recursive clone whose `HEAD` exactly matches
+The source and every recursive submodule must be clean, including untracked
+files, and `HEAD` must exactly match
 `fork:sna/hybridep-always-pad-uneven-20260805`. The launchers fail closed on
 the NeMo-RL commit, submodule origins and SHAs, MCore #5008 ancestry, DeepEP
 artifact and import, Python 3.13.14, local GPU model/count, and effective model
-configuration. They write only selected provenance fields and never print
+configuration. A deterministic node-local overlay makes the verified wheel
+precede actor-venv packages through `PYTHONPATH` and `LD_LIBRARY_PATH`. Before
+training, a Ray probe resolves the registered `MegatronPolicyWorker` executable,
+materializes the same MCore actor venv used by `worker_groups.py`, and confirms
+that `deep_ep`, `deep_ep_cpp`, and `hybrid_ep_cpp` all import from the overlay on
+every Ray node. Actor venvs are stored under `OUTPUT_ROOT`, never in the source
+tree. The launchers write only selected provenance fields and never print
 `WANDB_API_KEY`.
 
 ## Preflight and submission
@@ -47,7 +54,7 @@ export ACCOUNT=<fairshare-selected-account>
 export CONTAINER=/lustre/path/to/nemo-rl-nightly.sqsh
 export CONTAINER_SHA256=<sha256>
 export DEEPEP_WHEEL=/lustre/path/to/deep_ep-17cfb817-<platform>.whl
-printf '%s\n' 17cfb817bccec3a9c247013360cc550c2bac441e > "${DEEPEP_WHEEL}.commit"
+export DEEPEP_METADATA=/lustre/path/to/build-generated-deep_ep-metadata.json
 
 TEST_ONLY=1 bash experiments/hybridep-upstream5008-validation/submit-cw-qwen30.sh
 bash experiments/hybridep-upstream5008-validation/submit-cw-qwen30.sh

@@ -22,9 +22,9 @@ topology_env:
   NVLINK_DOMAIN_SIZE: 8
   USE_MNNVL: 0
 runtime_overrides:
-  grpo.max_num_steps: 20
-  checkpointing.enabled: false
-  policy.megatron_cfg.moe_token_dispatcher_type: flex
-  policy.megatron_cfg.moe_flex_dispatcher_backend: hybridep
-  policy.megatron_cfg.moe_hybridep_num_sms: 32
-  policy.sequence_packing.enabled: true
+  - grpo.max_num_steps=20
+  - checkpointing.enabled=false
+  - policy.megatron_cfg.moe_token_dispatcher_type=flex
+  - ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep
+  - ++policy.megatron_cfg.moe_hybridep_num_sms=32
+  - policy.sequence_packing.enabled=true
