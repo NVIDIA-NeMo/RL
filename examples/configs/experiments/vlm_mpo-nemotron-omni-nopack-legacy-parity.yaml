@@ -4,6 +4,9 @@
 # Training and data settings mirror that run. The intentional model delta is
 # the V3 public checkpoint required to exercise the canonical NemotronOmniModel;
 # the legacy V2 checkpoint routes through NemotronVLModel instead.
+#
+# The current MBridge pin does not support unpacked image batches. Retain this
+# control for requalification after NVIDIA-NeMo/RL#3525 is resolved.
 defaults: ../recipes/vlm/vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.yaml
 
 mpo:

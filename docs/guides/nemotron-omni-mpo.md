@@ -91,6 +91,13 @@ microbatch and packs its expanded token rows into a full THD sequence.
 `NemotronOmniModel` inserts media embeddings into that full sequence and then
 selects the context-parallel slice.
 
+Image training currently requires sequence packing. The unpacked path produces
+a dense decoder mask that is not accepted by the pinned Megatron-Bridge media
+insertion implementation, so NeMo-RL rejects that combination early. Follow
+[NeMo-RL #3525](https://github.com/NVIDIA-NeMo/RL/issues/3525) and
+[Megatron-Bridge #5181](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/5181)
+for no-pack enablement.
+
 ## Qualification order
 
 1. Run a short Nano single-image MMPR smoke test with CP=1 and MTP disabled.
