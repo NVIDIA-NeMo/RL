@@ -18,7 +18,7 @@ import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict, cast
 
 import ray
 import torch
@@ -38,10 +38,15 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
+    DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
     _get_free_port_local,
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.vllm_router import VllmRouterConfig, VllmRouterProcess
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -102,6 +107,7 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    vllm_router: NotRequired[VllmRouterConfig]
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
@@ -354,6 +360,7 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        self._vllm_router: VllmRouterProcess | None = None
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -385,19 +392,55 @@ class NemoGym(EnvironmentInterface):
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
+        policy_base_urls = self.cfg["base_urls"]
+        vllm_router_config = self.cfg.get("vllm_router")
+        if vllm_router_config is not None and vllm_router_config.enabled:
+            router_port = _get_free_port_local(
+                DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
+                DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
+            )
+            prometheus_port = _get_free_port_local(
+                DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
+                DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+            )
+            self._vllm_router = VllmRouterProcess(
+                worker_base_urls=self.cfg["base_urls"],
+                host=self.node_ip,
+                port=router_port,
+                prometheus_port=prometheus_port,
+                config=vllm_router_config,
+            )
+            policy_base_urls = [self._vllm_router.openai_base_url]
+
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
-        from omegaconf import DictConfig
+        from omegaconf import DictConfig, OmegaConf
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        # Make a shallow copy so that NeMo-RL-side keys we pop or add below
+        # Make a config copy so that NeMo-RL-side keys we pop or add below
         # do not mutate the caller's config dict (config.env["nemo_gym"]).
-        initial_global_config_dict = dict(
+        initial_global_config_dict = DictConfig(
             self.cfg.get("initial_global_config_dict") or {}
         )
+        if self._vllm_router is not None:
+            initial_global_config_dict = cast(
+                DictConfig,
+                OmegaConf.merge(
+                    initial_global_config_dict,
+                    {
+                        "policy_model": {
+                            "responses_api_models": {
+                                "vllm_model": {
+                                    "session_affinity_header": "X-Session-ID"
+                                }
+                            }
+                        }
+                    },
+                ),
+            )
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
@@ -406,7 +449,7 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict["policy_api_key"] = (
             "dummy_key"  # No key necessary for training.
         )
-        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        initial_global_config_dict["policy_base_url"] = policy_base_urls
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
@@ -452,14 +495,24 @@ Depending on your data shape, you may want to change these values."""
         }
 
         self.rh = RunHelper()
-        self.rh.start(
-            global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
-                / "nemo_gym_env.yaml",
-                initial_global_config_dict=DictConfig(initial_global_config_dict),
-                skip_load_from_cli=True,
+        try:
+            if self._vllm_router is not None:
+                self._vllm_router.start()
+                self._vllm_router.wait_until_ready()
+            self.rh.start(
+                global_config_dict_parser_config=GlobalConfigDictParserConfig(
+                    dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
+                    / "nemo_gym_env.yaml",
+                    initial_global_config_dict=initial_global_config_dict,
+                    skip_load_from_cli=True,
+                )
             )
-        )
+        except Exception:
+            router = self._vllm_router
+            self._vllm_router = None
+            if router is not None:
+                router.stop()
+            raise
 
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
@@ -743,7 +796,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         }
 
     def shutdown(self) -> None:
-        self.rh.shutdown()
+        try:
+            self.rh.shutdown()
+        finally:
+            router = self._vllm_router
+            self._vllm_router = None
+            if router is not None:
+                router.stop()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -879,6 +938,12 @@ def spinup_nemo_gym_actor(
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
+    vllm_router_dict = nemo_gym_dict.pop("vllm_router", None)
+    vllm_router_config = (
+        VllmRouterConfig.model_validate(vllm_router_dict)
+        if vllm_router_dict is not None
+        else VllmRouterConfig()
+    )
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
@@ -898,6 +963,7 @@ def spinup_nemo_gym_actor(
     nemo_gym_cfg = NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
+        vllm_router=vllm_router_config,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         tokenizer_config=tokenizer_config,
