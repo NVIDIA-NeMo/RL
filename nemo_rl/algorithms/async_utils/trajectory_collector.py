@@ -629,6 +629,7 @@ class AsyncTrajectoryCollector:
         input_ids: torch.Tensor,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
+        multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
         """Compute teacher logprobs for non-colocated teachers.
 
@@ -638,6 +639,8 @@ class AsyncTrajectoryCollector:
             input_ids: [B, S] tokenized input tensor
             agent_refs: list of B agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                ``input_ids`` and sliced per teacher
 
         Returns:
             ([B, S] teacher logprobs tensor, total_time_seconds)
@@ -677,6 +680,7 @@ class AsyncTrajectoryCollector:
             twg = self.teacher_worker_groups[group_key]
             sub_input_ids = input_ids[indices]
             sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            row_indices = list(indices)
 
             # Pad batch to multiple of dp_size (required for DP sharding)
             dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
@@ -692,10 +696,15 @@ class AsyncTrajectoryCollector:
                     sub_lengths = torch.cat(
                         [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
                     )
+                row_indices.extend([row_indices[-1]] * pad_count)
 
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
+            if multimodal_data:
+                sub_data.update(
+                    BatchedDataDict(multimodal_data).select_indices(row_indices)
+                )
 
             # Serialize calls per teacher to prevent NCCL collective desync
             t_lock_start = time.time()
@@ -904,6 +913,9 @@ class AsyncTrajectoryCollector:
                     flat_for_teacher["token_ids"],
                     agent_refs,
                     input_lengths=teacher_input_lengths,
+                    multimodal_data=flat_for_teacher.get_multimodal_dict(
+                        as_tensors=False
+                    ),
                 )
                 # Keep the tensor inside the batch so replay-buffer collation can
                 # pad variable-length prompt groups correctly.
