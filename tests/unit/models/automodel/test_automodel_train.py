@@ -1233,6 +1233,7 @@ class TestAutomodelForwardBackward:
         )
 
         # Call automodel_forward_backward in forward_only mode
+        global_valid_chunks_by_idx = {0: torch.tensor(37)}
         results = automodel_forward_backward(
             model=mock_model,
             data_iterator=iter(processed_mbs),
@@ -1243,6 +1244,7 @@ class TestAutomodelForwardBackward:
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),
             global_valid_toks=torch.tensor(batch_size * seq_len * num_microbatches),
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
         )
 
         # Verify results
@@ -1253,6 +1255,10 @@ class TestAutomodelForwardBackward:
 
         # Verify loss function was called num_microbatches times
         assert mock_loss_fn.call_count == num_microbatches
+        assert all(
+            call.kwargs["global_valid_chunks_by_idx"] is global_valid_chunks_by_idx
+            for call in mock_loss_fn.call_args_list
+        )
 
     @patch("nemo_rl.models.automodel.train.prepare_model_forward")
     def test_forward_backward_enters_prepared_and_autocast_contexts(
