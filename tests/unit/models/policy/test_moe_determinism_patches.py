@@ -22,6 +22,7 @@ from nemo_rl.models.policy.workers.moe_determinism_patches import (
     _nrl_dynamic_step_context_bookkeeping,
     _patched_unpermute,
     _unpermute_fixed_order_combine,
+    apply_log_softmax_determinism_patch,
     apply_moe_unpermute_determinism_patch,
     apply_router_replay_inference_patches,
     restore_moe_determinism_patches,
@@ -71,6 +72,28 @@ class TestApplyMoeDeterminismPatches:
         sorted_indices = torch.tensor([0, 0])
         out = _patched_unpermute(permuted, sorted_indices, torch.Size([1, 1]))
         assert torch.allclose(out, torch.tensor([[3.0]]))
+
+    def test_log_softmax_patch_matches_inference_for_tp1(self):
+        from nemo_rl.distributed import model_utils
+
+        original = model_utils._compute_distributed_log_softmax_with_grad
+        logits = torch.randn(2, 5, dtype=torch.float32)
+
+        with patch("torch.distributed.get_world_size", return_value=1):
+            apply_log_softmax_determinism_patch()
+            apply_log_softmax_determinism_patch()
+            actual = model_utils._compute_distributed_log_softmax_with_grad(
+                logits, MagicMock()
+            )
+
+        torch.testing.assert_close(
+            actual,
+            torch.nn.functional.log_softmax(logits, dim=-1),
+            rtol=0,
+            atol=0,
+        )
+        restore_moe_determinism_patches()
+        assert model_utils._compute_distributed_log_softmax_with_grad is original
 
     def test_router_replay_inference_patch_replaces_methods(self):
         pytest.importorskip("megatron")

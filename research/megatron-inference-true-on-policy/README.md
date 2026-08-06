@@ -36,5 +36,11 @@ sbatch --export=PRECISION=bf16  run_qwen30ba3b_zero_kl_precision.sh
 sbatch --export=PRECISION=mxfp8 run_qwen30ba3b_zero_kl_precision.sh
 sbatch --export=PRECISION=bf16,ZERO_TRAIN_GEN_MISMATCH=false run_qwen30ba3b_zero_kl_precision.sh
 sbatch --export=PRECISION=mxfp8,ZERO_TRAIN_GEN_MISMATCH=false run_qwen30ba3b_zero_kl_precision.sh
+
+# Nano3-30B-A3B (1node, 8GPU, TP=1)
+sbatch --export=PRECISION=bf16  run_nanov3_30ba3b_zero_kl_precision.sh
+sbatch --export=PRECISION=mxfp8 run_nanov3_30ba3b_zero_kl_precision.sh
+sbatch --export=PRECISION=bf16,ZERO_TRAIN_GEN_MISMATCH=false run_nanov3_30ba3b_zero_kl_precision.sh
+sbatch --export=PRECISION=mxfp8,ZERO_TRAIN_GEN_MISMATCH=false run_nanov3_30ba3b_zero_kl_precision.sh
 ```
 
