@@ -21,9 +21,11 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.loss import MPOLossConfig, MPOLossFn
 from nemo_rl.algorithms.mpo import (
     MasterConfig,
+    MPOConfig,
     MPOSaveState,
     _configure_pair_safe_packing,
     _update_reward_shift,
+    _validate_stop_after_step,
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig, SequencePackingConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -79,6 +81,21 @@ def test_reward_shift_update_ignores_empty_optimizer_step():
 
     assert save_state.reward_shift == 1.0
     assert save_state.reward_shift_num_updates == 3
+
+
+def test_mpo_stop_after_step_does_not_change_final_step_limit():
+    config = MPOConfig(max_num_steps=100, stop_after_step=50)
+
+    _validate_stop_after_step(config)
+
+    assert config.max_num_steps == 100
+    assert config.stop_after_step == 50
+
+    for invalid_boundary in (0, 101):
+        with pytest.raises(ValueError, match="between 1 and mpo.max_num_steps"):
+            _validate_stop_after_step(
+                MPOConfig(max_num_steps=100, stop_after_step=invalid_boundary)
+            )
 
 
 def test_mpo_configures_pair_safe_sequence_packing():
