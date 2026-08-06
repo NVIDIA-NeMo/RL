@@ -191,6 +191,9 @@ policy: &POLICY_BASE
         temperature: 1.0
         top_p: 1.0
         top_k: null
+        val_temperature: ${.temperature}
+        val_top_p: ${.top_p}
+        val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
         vllm_cfg:

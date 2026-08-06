@@ -14,6 +14,7 @@ grpo:
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
+  val_num_generations_per_prompt: 1
   # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
   stop_at_validation_metric: null
   # Required when stop_at_validation_metric is set.
@@ -226,6 +227,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
