@@ -271,6 +271,46 @@ def test_exit_on_max_steps(mock_dpo_components):
     assert mock_dpo_components["policy"].train.call_count == 12
 
 
+def test_configured_stop_forces_checkpoint_without_shortening_run(
+    mock_dpo_components, capsys
+):
+    cfg = mock_dpo_components["master_config"]
+    cfg.dpo = DPOConfig.model_validate(
+        {
+            **cfg.dpo.model_dump(),
+            "max_num_steps": 100,
+            "max_num_epochs": 10,
+            "stop_after_step": 3,
+        }
+    )
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_dpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/segment_ckpt/tmp_step"
+    dpo_save_state = _initial_dpo_save_state()
+
+    with patch("nemo_rl.algorithms.dpo.torch.save"):
+        dpo_train(
+            mock_dpo_components["policy"],
+            mock_dpo_components["train_dataloader"],
+            mock_dpo_components["val_dataloader"],
+            mock_dpo_components["tokenizer"],
+            mock_dpo_components["loss_fn"],
+            cfg,
+            mock_dpo_components["logger"],
+            checkpointer,
+            dpo_save_state,
+        )
+
+    assert cfg.dpo.max_num_steps == 100
+    assert mock_dpo_components["policy"].train.call_count == 3
+    assert [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list] == [3]
+    assert dpo_save_state.total_steps == 3
+    assert "Configured stop-after step 3 has been reached" in capsys.readouterr().out
+
+
 def test_exit_on_max_epochs(mock_dpo_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number

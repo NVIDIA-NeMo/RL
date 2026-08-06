@@ -13,6 +13,7 @@ RESULTS_NAME="${RESULTS_NAME:-${CHAIN_NAME}}"
 WANDB_NAME="${WANDB_NAME:-${CHAIN_NAME}}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-$(python -c 'import secrets; print("mpo" + secrets.token_hex(3))')}"
 RESULTS_ROOT="${RESULTS_ROOT:-${NEMORL}/results}"
+final_max_steps="${MPO_MAX_NUM_STEPS:-}"
 
 [[ "${CHAIN_SEGMENTS}" =~ ^[1-9][0-9]*$ ]] || {
   echo "CHAIN_SEGMENTS must be a positive integer" >&2
@@ -33,6 +34,14 @@ if [[ -n "${CHAIN_STEP_TARGETS}" ]]; then
     }
     previous_target="${target}"
   done
+
+  last_target="${step_targets[${#step_targets[@]} - 1]}"
+  if [[ -z "${final_max_steps}" ]]; then
+    final_max_steps="${last_target}"
+  elif [[ "${final_max_steps}" != "${last_target}" ]]; then
+    echo "MPO_MAX_NUM_STEPS must equal the final CHAIN_STEP_TARGETS value" >&2
+    exit 2
+  fi
 fi
 [[ ! -e "${RESULTS_ROOT}/${RESULTS_NAME}" ]] || {
   echo "Refusing to start a fresh chain in existing results: ${RESULTS_ROOT}/${RESULTS_NAME}" >&2
@@ -42,9 +51,9 @@ fi
 dependency=""
 job_ids=()
 for ((segment = 1; segment <= CHAIN_SEGMENTS; segment++)); do
-  segment_max_steps="${MPO_MAX_NUM_STEPS:-}"
+  segment_stop_after_step=""
   if [[ "${#step_targets[@]}" -gt 0 ]]; then
-    segment_max_steps="${step_targets[segment - 1]}"
+    segment_stop_after_step="${step_targets[segment - 1]}"
   fi
   output="$(
     NEMORL="${NEMORL}" \
@@ -55,7 +64,8 @@ for ((segment = 1; segment <= CHAIN_SEGMENTS; segment++)); do
     WANDB_NAME="${WANDB_NAME}" \
     WANDB_RUN_ID="${WANDB_RUN_ID}" \
     WANDB_RESUME="allow" \
-    MPO_MAX_NUM_STEPS="${segment_max_steps}" \
+    MPO_MAX_NUM_STEPS="${final_max_steps}" \
+    MPO_STOP_AFTER_STEP="${segment_stop_after_step}" \
     SBATCH_DEPENDENCY="${dependency}" \
     "${SCRIPT_DIR}/vlm_mpo.sh"
   )"
