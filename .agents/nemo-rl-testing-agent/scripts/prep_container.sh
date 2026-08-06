@@ -291,6 +291,14 @@ if [ -n "${NRLTA_ARTIFACT_DIR:-}" ]; then
   mkdir -p "${NRLTA_ARTIFACT_DIR}"
 fi
 
+# The clone URLs go in the record too, so a reader of the report can follow a sha
+# to the commit it names. Which repository each one lives in is not guessable
+# from the report: NeMo-RL is fetched from a fork whenever the integration branch
+# is in play, and a bare sha with no repository behind it is a string nobody can
+# check.
+echo "nemo_rl_url=${NEMO_RL_CLONE_URL:-}"
+echo "mcore_url=${MEGATRON_CLONE_URL:-}"
+echo "bridge_url=${MEGATRON_BRIDGE_CLONE_URL:-}"
 echo "nemo_rl_fetch_ref=${NEMO_RL_FETCH_REF:-<worktree overlay>}"
 echo "nemo_rl_sha_before=${nemo_rl_sha_before}"
 echo "nemo_rl_sha=${nemo_rl_sha:-${nemo_rl_sha_before}}"
