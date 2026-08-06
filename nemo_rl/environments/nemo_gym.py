@@ -362,6 +362,16 @@ class NemoGym(EnvironmentInterface):
             from nemo_rl.algorithms.utils import get_tokenizer
 
             self._processor = get_tokenizer(tokenizer_config, get_processor=True)
+            # _attach_multimodal_data_to_user_message assumes a placeholder-style
+            # processor (imgs_sizes / num_frames reconstruction + pad_to_max_shape
+            # PackedTensor build). A non-placeholder VLM would silently produce
+            # wrong multimodal tensors — fail at actor construction instead.
+            assert uses_image_placeholder(self._processor), (
+                "NemoGym multimodal path assumes a placeholder-style processor "
+                "(see _PLACEHOLDER_STYLE_PROCESSOR_NAMES in nemo_rl/data/multimodal_utils.py); "
+                f"got {type(self._processor).__name__}. Update "
+                "_attach_multimodal_data_to_user_message before enabling."
+            )
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
