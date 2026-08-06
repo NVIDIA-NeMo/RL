@@ -307,6 +307,7 @@ def forward_with_post_processing_fn(
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
@@ -327,6 +328,7 @@ def forward_with_post_processing_fn(
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         sequence_dim: Sequence dimension
 
@@ -386,6 +388,7 @@ def forward_with_post_processing_fn(
             processed_inputs=processed_inputs,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
             sequence_dim=sequence_dim,
         )
     elif isinstance(
@@ -436,6 +439,7 @@ def automodel_forward_backward(
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
     dp_size: int = 1,
@@ -463,6 +467,7 @@ def automodel_forward_backward(
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         sequence_dim: Sequence dimension
         dp_size: Data parallel size
@@ -506,6 +511,7 @@ def automodel_forward_backward(
                 allow_flash_attn_args=allow_flash_attn_args,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
+                global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
             )
@@ -591,6 +597,7 @@ class LossPostProcessor:
         processed_inputs: ProcessedInputs,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute loss from logits.
@@ -601,6 +608,7 @@ class LossPostProcessor:
             processed_inputs: Processed inputs
             global_valid_seqs: Global valid sequence count
             global_valid_toks: Global valid token count
+            global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
             sequence_dim: Sequence dimension
 
         Returns:
@@ -619,6 +627,9 @@ class LossPostProcessor:
         prepare_loss_input_wrapped = partial(
             prepare_loss_input, sampling_params=self.sampling_params
         )
+        extra_loss_kwargs: dict[str, Any] = {}
+        if global_valid_chunks_by_idx:
+            extra_loss_kwargs["global_valid_chunks_by_idx"] = global_valid_chunks_by_idx
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
             loss_fn = SequencePackingLossWrapper(
@@ -632,6 +643,7 @@ class LossPostProcessor:
                 data_dict,
                 global_valid_seqs,
                 global_valid_toks,
+                **extra_loss_kwargs,
             )
         else:
             loss_input, data_dict = prepare_loss_input_wrapped(
@@ -641,6 +653,7 @@ class LossPostProcessor:
                 data=data_dict,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
+                **extra_loss_kwargs,
                 **loss_input,
             )
 

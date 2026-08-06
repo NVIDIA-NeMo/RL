@@ -66,6 +66,7 @@ class SequencePackingLossWrapper:
         data: BatchedDataDict[Any],
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor | None,
+        global_valid_chunks_by_idx: dict[int, torch.Tensor] | None = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -133,10 +134,16 @@ class SequencePackingLossWrapper:
             )
 
             # call loss function
+            extra_loss_kwargs: dict[str, Any] = {}
+            if global_valid_chunks_by_idx:
+                extra_loss_kwargs["global_valid_chunks_by_idx"] = (
+                    global_valid_chunks_by_idx
+                )
             loss, metrics = self.loss_fn(
                 data=unpadded_seq_data,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
+                **extra_loss_kwargs,
                 **loss_input,
             )
 
@@ -207,6 +214,7 @@ class SequencePackingFusionLossWrapper:
         data: BatchedDataDict[Any],
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor | None,
+        global_valid_chunks_by_idx: dict[int, torch.Tensor] | None = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Compute loss for all packed sequences in one forward pass."""
         loss_input, prepared_data = self.prepare_fn(
@@ -220,10 +228,14 @@ class SequencePackingFusionLossWrapper:
             context_parallel_group=self.context_parallel_group,
         )
 
+        extra_loss_kwargs: dict[str, Any] = {}
+        if global_valid_chunks_by_idx:
+            extra_loss_kwargs["global_valid_chunks_by_idx"] = global_valid_chunks_by_idx
         return self.loss_fn(
             data=prepared_data,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            **extra_loss_kwargs,
             **loss_input,
         )
 
@@ -299,6 +311,7 @@ def wrap_loss_fn_with_input_preparation(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    global_valid_chunks_by_idx: dict[int, torch.Tensor] | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
     """Wraps a loss function to handle input preparation for megatron policy worker."""
     # prepare loss input
@@ -312,10 +325,14 @@ def wrap_loss_fn_with_input_preparation(
     )
 
     # call loss function
+    extra_loss_kwargs: dict[str, Any] = {}
+    if global_valid_chunks_by_idx:
+        extra_loss_kwargs["global_valid_chunks_by_idx"] = global_valid_chunks_by_idx
     loss, loss_metrics = loss_fn(
         data=data,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        **extra_loss_kwargs,
         **loss_input,
     )
 

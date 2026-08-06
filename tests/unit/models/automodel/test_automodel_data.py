@@ -1044,6 +1044,46 @@ class TestProcessGlobalBatch:
         # Verify all_reduce was called
         mock_all_reduce.assert_called_once()
 
+    @patch("torch.Tensor.cuda", lambda self: self)
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
+    def test_global_chunk_counts_by_teacher(
+        self, mock_all_reduce, mock_loss_fn, mock_dp_mesh
+    ):
+        sample_mask = torch.tensor([1, 0, 1], dtype=torch.bool)
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(3, 4, dtype=torch.long),
+                "sample_mask": sample_mask,
+                "alignment_0_pair_valid": torch.tensor(
+                    [[1, 1, 0], [1, 1, 1], [1, 0, 0]], dtype=torch.bool
+                ),
+                "alignment_2_pair_valid": torch.tensor(
+                    [[1, 1, 1, 0], [1, 1, 1, 1], [1, 1, 0, 0]],
+                    dtype=torch.bool,
+                ),
+            }
+        )
+        data = MagicMock()
+        data.get_batch.return_value = batch
+
+        def double_counts(values, *args, **kwargs):
+            torch.testing.assert_close(values.cpu(), torch.tensor([2, 8, 3, 5]))
+            values.mul_(2)
+
+        mock_all_reduce.side_effect = double_counts
+
+        result = process_global_batch(
+            data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
+            batch_idx=0,
+            batch_size=3,
+        )
+
+        assert {
+            i: count.item() for i, count in result["global_valid_chunks_by_idx"].items()
+        } == {0: 6, 2: 10}
+
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_with_token_mask(self, mock_all_reduce, mock_loss_fn, mock_dp_mesh):
         # Create test data

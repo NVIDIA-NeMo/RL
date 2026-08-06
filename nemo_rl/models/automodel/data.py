@@ -343,6 +343,8 @@ def process_global_batch(
         - batch: The extracted batch
         - global_valid_seqs: Number of valid sequences across all ranks
         - global_valid_toks: Number of valid tokens across all ranks
+        - global_valid_chunks_by_idx: Number of valid cross-tokenizer alignment
+          chunks for each teacher across all data-parallel ranks
     """
     batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
 
@@ -358,9 +360,32 @@ def process_global_batch(
             batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
         )
 
-    to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    local_valid_chunks_by_idx: dict[int, torch.Tensor] = {}
+    for key, pair_valid in batch.items():
+        if not key.startswith("alignment_") or not key.endswith("_pair_valid"):
+            continue
+        teacher_idx = key.removeprefix("alignment_").removesuffix("_pair_valid")
+        if not teacher_idx.isdigit():
+            continue
+        sample_mask = batch["sample_mask"].to(pair_valid.dtype).unsqueeze(-1)
+        local_valid_chunks_by_idx[int(teacher_idx)] = torch.sum(
+            pair_valid * sample_mask
+        )
+
+    chunk_teacher_indices = sorted(local_valid_chunks_by_idx)
+    to_reduce = torch.stack(
+        [
+            local_valid_seqs,
+            local_valid_toks,
+            *(local_valid_chunks_by_idx[i] for i in chunk_teacher_indices),
+        ]
+    ).cuda()
     torch.distributed.all_reduce(to_reduce, group=dp_group)
     global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+    global_valid_chunks_by_idx = {
+        teacher_idx: to_reduce[offset + 2]
+        for offset, teacher_idx in enumerate(chunk_teacher_indices)
+    }
 
     if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
         assert "token_mask" in batch, (
@@ -371,6 +396,7 @@ def process_global_batch(
         "batch": batch,
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
+        "global_valid_chunks_by_idx": global_valid_chunks_by_idx,
     }
 
 

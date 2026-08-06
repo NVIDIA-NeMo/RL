@@ -481,6 +481,15 @@ class DTensorPolicyWorkerV2Impl(
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                global_valid_chunks_by_idx = gb_result["global_valid_chunks_by_idx"]
+                # Native V6 gathers the full sequence and computes a replicated
+                # chunk numerator on every CP rank. Its denominator therefore
+                # includes the CP copies; FSDP's DP x CP reduction sums them back
+                # to one natural global-batch chunk mean.
+                global_valid_chunks_by_idx = {
+                    i: count * self.cp_size
+                    for i, count in global_valid_chunks_by_idx.items()
+                }
 
                 self.optimizer.zero_grad()
 
@@ -504,6 +513,7 @@ class DTensorPolicyWorkerV2Impl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
+                    global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                     sampling_params=self.sampling_params,
                     sequence_dim=sequence_dim,
                     dp_size=self.dp_size,

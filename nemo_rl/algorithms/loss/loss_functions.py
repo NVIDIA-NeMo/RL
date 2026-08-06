@@ -19,6 +19,7 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 import numpy as np
 import torch
 from pydantic import BaseModel
+from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
@@ -1632,6 +1633,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ``select_teacher`` additionally reports ``selected_teacher``.
     """
 
+    # Group the global normalizers (_dp_global_masked_mean, the v6
+    # global_valid_chunks) reduce over; set per call by __call__. Declared at
+    # class scope so it exists even for instances built without __init__ (the
+    # unit tests construct bare instances to exercise single methods). None =>
+    # the legacy WORLD reduce; see loss_replica_group for why WORLD deadlocks
+    # under pipeline parallelism.
+    _dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
 
@@ -1770,8 +1779,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the (multi-teacher) cross-tokenizer distillation loss.
 
@@ -1783,9 +1794,25 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the raw ``logits`` is kept for the CE term.
+        the raw ``logits`` is kept for the CE term. Production callers provide
+        ``global_valid_chunks_by_idx`` from the full batch before microbatching.
+
+        ``dp_cp_group`` is the group the global normalizers reduce over. It is
+        stashed on the instance rather than threaded through the four levels of
+        per-teacher dispatch below; ``__call__`` is the single entry point and is
+        not re-entrant, so the value is always the one for the call in flight.
+        ``None`` keeps the legacy ``WORLD`` behaviour (single-process tests, and
+        the DTensor path, which has no pipeline axis to deadlock on).
         """
-        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+        self._dp_cp_group = dp_cp_group
+        ce_loss = self._compute_ce(
+            logits,
+            data,
+            global_valid_toks,
+            student_logits_contig=student_logits_contig,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
@@ -1794,6 +1821,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
                 global_valid_toks,
+                global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
             )
@@ -1804,6 +1832,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
                 global_valid_toks,
+                global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
             )
@@ -1814,6 +1843,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
                 global_valid_toks,
+                global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
             )
@@ -1878,6 +1908,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         *,
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """KD term for teacher ``i`` plus its (unsuffixed) metrics.
 
@@ -1897,6 +1928,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 cp_group=cp_group,
             )
 
+        global_valid_chunks = (
+            global_valid_chunks_by_idx[i]
+            if global_valid_chunks_by_idx is not None
+            else None
+        )
+
         kd, v6_metrics = self._compute_prefix_bidir_partition_kl_v3(
             i,
             student_logits_contig,
@@ -1905,6 +1942,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_vocab_size=self.teacher_vocab_sizes[i],
             tp_group=tp_group,
             cp_group=cp_group,
+            global_valid_chunks=global_valid_chunks,
         )
         # Surface the KD value under the shared per-teacher metric key and keep
         # the v6 chunk diagnostics; the dispatcher-level loss keys are dropped
@@ -2082,6 +2120,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         *,
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Weighted sum: ``total_kd = Σ_i weight_i · KD_i``.
 
@@ -2121,6 +2160,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
                 global_valid_toks,
+                global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
             )
@@ -2150,6 +2190,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         *,
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Convex-weighted average of teacher logits, then one direct KL.
 
@@ -2178,6 +2219,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     teacher_full_logits_by_idx,
                     aligns_by_idx,
                     global_valid_toks,
+                    global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                     tp_group=tp_group,
                     cp_group=cp_group,
                 )
@@ -2217,16 +2259,20 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         and the per-teacher KD's collectives then see divergent participation
         (deadlock when one rank's choice fires a collective another's does not).
         All-reduce the masked sum and the mask count over the full group so every
-        rank gets the same score (the WORLD-reduced-denominator convention). The
-        result is detached (it gates selection / weighting and is not
-        back-propagated).
+        rank gets the same score. The result is detached (it gates selection /
+        weighting and is not back-propagated).
+
+        Reduces over ``self._dp_cp_group`` when set. That group is confined to
+        one pipeline stage; ``WORLD`` would deadlock under PP, where only the
+        last stage runs the loss and reaches this collective at all.
         """
-        num = group_all_reduce_sum(
-            (values * mask).sum(), group=torch.distributed.group.WORLD
+        group = (
+            self._dp_cp_group
+            if self._dp_cp_group is not None
+            else torch.distributed.group.WORLD
         )
-        den = group_all_reduce_sum(
-            mask.sum(), group=torch.distributed.group.WORLD
-        ).clamp(min=1.0)
+        num = group_all_reduce_sum((values * mask).sum(), group=group)
+        den = group_all_reduce_sum(mask.sum(), group=group).clamp(min=1.0)
         return num / den
 
     def _select_teacher_kd(
@@ -2239,6 +2285,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         *,
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Use only the teacher with the lowest next-token CE on its own tokens."""
         with torch.no_grad():
@@ -2265,6 +2312,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits_by_idx,
             aligns_by_idx,
             global_valid_toks,
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
             tp_group=tp_group,
             cp_group=cp_group,
         )
@@ -2369,10 +2417,28 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
+        *,
+        student_logits_contig: Optional[torch.Tensor] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> torch.Tensor:
-        """Next-token CE on the student side (TP/CP handled by the helpers)."""
+        """Next-token CE on the student side (TP/CP handled by the helpers).
+
+        DTensor logits carry their own device mesh, so the vocab-parallel
+        log-prob helper resolves TP/CP from it. Megatron returns a *plain*
+        tensor that is vocab-sharded (TP) and, under CP, sequence-sharded, while
+        the microbatch dict still holds the full ``[B, S]`` ids/masks — so both
+        axes are gathered here first, exactly as the v6 KD term does with the
+        same tensors. Both gathers are no-ops at TP=CP=1, leaving the unsharded
+        result byte-identical.
+        """
+        if not isinstance(logits, DTensor) and student_logits_contig is not None:
+            ce_logits = allgather_cp_contiguous_tensor(student_logits_contig, cp_group)
+            ce_logits = vocab_parallel_gather_logits(ce_logits, tp_group=tp_group)
+        else:
+            ce_logits = logits
         per_token_ce = student_next_token_ce(
-            logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
+            ce_logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
         )
         label_mask = ce_label_mask(
             token_mask=data["token_mask"],
@@ -2391,12 +2457,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _rebuild_teacher_full_logits(
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
     ) -> torch.Tensor:
-        """Unpack ``teacher_full_logits_ipc`` to a stacked ``[B, T_t, V_t]`` CUDA tensor.
+        """Unpack ``teacher_full_logits_ipc`` to a ``[B, T_t, V_t]`` CUDA tensor.
 
         The IPC handles point at views the teacher worker stashed in its
         ``_teacher_ipc_buffer``; rebuilding does not allocate new memory
-        on the producer side. Casts to ``float32`` to match the loss math
-        (the producer also writes FP32 via :class:`FullLogitsPostProcessor`).
+        on the producer side. For the common microbatch-size-one case, add the
+        batch dimension as a view instead of copying the full logits with
+        ``torch.stack``. Casts to ``float32`` to match the loss math (the
+        producer also writes FP32 via :class:`FullLogitsPostProcessor`).
         """
         from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
 
@@ -2406,6 +2474,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             rebuild_cuda_tensor_from_ipc(h["logits_ipc"], consumer_device)
             for h in handles
         ]
+        if len(per_sample) == 1:
+            return per_sample[0].unsqueeze(0).float()
         return torch.stack(per_sample, dim=0).float()
 
     @staticmethod
@@ -3430,8 +3500,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         native TP/CP-correct: ``student_logits`` is vocab-gathered across
         ``tp_group`` and sequence-gathered across ``cp_group`` (teacher likewise
         on the sequence) so the arbitrary vocab-column / global-span indexing is
-        materialized full; ``global_valid_chunks`` is WORLD-reduced in-loss. All
-        gathers are no-ops at world size 1 (single-GPU byte-exact).
+        materialized full. Production supplies ``global_valid_chunks`` from the
+        full batch; direct callers retain a WORLD-reduced fallback. All gathers
+        are no-ops at world size 1 (single-GPU byte-exact).
 
         Returns ``(loss, metrics_dict)``.
         """
@@ -4639,19 +4710,28 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # parity) it is a no-op, so ``global_valid_chunks`` collapses to the local
         # ``effective_count`` and the normalization is byte-exact.
         if global_valid_chunks is None:
-            global_valid_chunks = group_all_reduce_sum(
-                torch.tensor(
-                    float(effective_count), device=device, dtype=torch.float32
-                ),
-                group=torch.distributed.group.WORLD,
+            local_count = torch.tensor(
+                float(effective_count), device=device, dtype=torch.float32
             )
-            tp_world = (
-                torch.distributed.get_world_size(tp_group)
-                if tp_group is not None
-                else 1
-            )
-            if tp_world > 1:
-                global_valid_chunks = global_valid_chunks / float(tp_world)
+            if self._dp_cp_group is not None:
+                # DP x CP group: it already excludes the TP replicas (so there is
+                # no TP factor to divide out) and, crucially, it lives inside a
+                # single pipeline stage. A WORLD reduce here deadlocks under PP,
+                # because only the last stage runs the loss and joins it.
+                global_valid_chunks = group_all_reduce_sum(
+                    local_count, group=self._dp_cp_group
+                )
+            else:
+                global_valid_chunks = group_all_reduce_sum(
+                    local_count, group=torch.distributed.group.WORLD
+                )
+                tp_world = (
+                    torch.distributed.get_world_size(tp_group)
+                    if tp_group is not None
+                    else 1
+                )
+                if tp_world > 1:
+                    global_valid_chunks = global_valid_chunks / float(tp_world)
         mismatch_last_loss = mismatch_loss
         mismatch_combined_loss, mismatch_loss = _combine_v3_mismatch_terms(
             mismatch_last_loss,
