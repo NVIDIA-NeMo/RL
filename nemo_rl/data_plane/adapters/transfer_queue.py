@@ -316,37 +316,32 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 # within a nemo-rl version. See schema.py's docstring for the contract.
 
 
-def _assert_promote_1d_contract(td: TensorDict) -> None:
-    """Enforce the PROMOTE_1D_FIELDS contract at the writer boundary.
+def _check_promote_1d_leaf(name: str, v: torch.Tensor) -> None:
+    """Enforce the PROMOTE_1D_FIELDS contract for a single tensor leaf.
 
-    Two failure modes we want to surface early instead of at TQ storage:
+    Two failure modes surface here instead of silently at TQ storage:
       1. A field declared in ``PROMOTE_1D_FIELDS`` arrives as non-1D.
       2. A dense 1D field arrives that is NOT declared in ``PROMOTE_1D_FIELDS``
          (would silently trigger the mooncake_cpu KVStorageManager 1D
          schema/data mismatch bug).
     """
-    for k in td.keys():
-        v = td.get(k)
-        if not isinstance(v, torch.Tensor) or v.is_nested:
-            continue
-        name = str(k)
-        if name in PROMOTE_1D_FIELDS:
-            if v.dim() != 1:
-                raise ValueError(
-                    f"Field {name!r} is declared in PROMOTE_1D_FIELDS but "
-                    f"arrived with shape {tuple(v.shape)} (expected 1D). "
-                    "Either ship it as (N,) at the producer or remove it "
-                    "from nemo_rl/data_plane/schema.py::PROMOTE_1D_FIELDS."
-                )
-        elif v.dim() == 1:
+    if name in PROMOTE_1D_FIELDS:
+        if v.dim() != 1:
             raise ValueError(
-                f"Field {name!r} is dense 1D but not declared in "
-                "PROMOTE_1D_FIELDS — the mooncake_cpu backend would silently "
-                "corrupt its shape. Add it to "
-                "nemo_rl/data_plane/schema.py::PROMOTE_1D_FIELDS, or convert "
-                "the producer to ship nested-jagged (per-token) or dense 2D+ "
-                "(per-sample rank-2)."
+                f"Field {name!r} is declared in PROMOTE_1D_FIELDS but "
+                f"arrived with shape {tuple(v.shape)} (expected 1D). "
+                "Either ship it as (N,) at the producer or remove it "
+                "from nemo_rl/data_plane/schema.py::PROMOTE_1D_FIELDS."
             )
+    elif v.dim() == 1:
+        raise ValueError(
+            f"Field {name!r} is dense 1D but not declared in "
+            "PROMOTE_1D_FIELDS — the mooncake_cpu backend would silently "
+            "corrupt its shape. Add it to "
+            "nemo_rl/data_plane/schema.py::PROMOTE_1D_FIELDS, or convert "
+            "the producer to ship nested-jagged (per-token) or dense 2D+ "
+            "(per-sample rank-2)."
+        )
 
 
 def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
@@ -373,8 +368,10 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     ``NonTensorStack`` / ``NonTensorData`` leaves pass through. Symmetric
     with :func:`_from_wire` — both consult the same schema.
 
-    Assumes :func:`_assert_promote_1d_contract` has already validated the TD
-    — declared fields are 1D, no undeclared 1D fields present.
+    Enforces the contract as it iterates: raises loudly for declared fields
+    that arrived as non-1D and for undeclared dense 1D fields, so shape
+    violations surface at the writer boundary instead of silently
+    corrupting data at TQ storage.
 
     Args:
         td: ``TensorDict`` whose declared 1D tensor leaves should be promoted.
@@ -390,16 +387,14 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     changed = False
     for k in td.keys():
         v = td.get(k)
-        if (
-            str(k) in PROMOTE_1D_FIELDS
-            and isinstance(v, torch.Tensor)
-            and not v.is_nested
-            and v.dim() == 1
-        ):
-            new_dict[str(k)] = v.unsqueeze(-1).contiguous()
-            changed = True
-        else:
-            new_dict[str(k)] = v
+        if isinstance(v, torch.Tensor) and not v.is_nested:
+            name = str(k)
+            _check_promote_1d_leaf(name, v)
+            if name in PROMOTE_1D_FIELDS:
+                new_dict[name] = v.unsqueeze(-1).contiguous()
+                changed = True
+                continue
+        new_dict[str(k)] = v
     if not changed:
         return td
     new_td = TensorDict(new_dict, batch_size=td.batch_size)
@@ -600,10 +595,11 @@ class TQDataPlaneClient(DataPlaneClient):
         # because shard_meta_for_dp reads it directly), but the rest
         # of the tag dict travels through unchanged so consumers can
         # filter on it without fetching data.
-        wire_tags = (
-            list(tq_meta.custom_meta) if tq_meta.custom_meta else [{} for _ in keys]
-        )
-        tags = _strip_wire_shape_tags(wire_tags)
+        #
+        # No adapter-private keys are stamped on the wire — the shape
+        # schema lives in `PROMOTE_1D_FIELDS`, not in `custom_meta` —
+        # so user tags flow through TQ untouched.
+        tags = list(tq_meta.custom_meta) if tq_meta.custom_meta else [{} for _ in keys]
         seqlens: list[int] | None = None
         if tags and any("input_lengths" in t for t in tags):
             seqlens = [int(t.get("input_lengths", 0)) for t in tags]
@@ -671,9 +667,9 @@ class TQDataPlaneClient(DataPlaneClient):
                 fields.detach(),  # type: ignore[missing-argument]
             )
             if self._promote_1d:
-                # Fail loudly at the writer for unregistered 1D fields or
-                # shape-contract violations, rather than at TQ storage.
-                _assert_promote_1d_contract(detached_fields)
+                # `_promote_1d_leaves` also enforces the PROMOTE_1D_FIELDS
+                # contract inline — declared fields must be 1D, no
+                # undeclared 1D fields allowed. Raises before any wire write.
                 detached_fields = _promote_1d_leaves(detached_fields)
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]

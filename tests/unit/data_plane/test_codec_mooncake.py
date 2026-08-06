@@ -54,12 +54,8 @@ def test_promote_1d_leaves_unsqueezes_declared_1d_field() -> None:
     assert out["input_ids"].shape == (n, 3)
 
 
-def test_promote_1d_leaves_skips_undeclared_fields() -> None:
-    """1D fields not declared in PROMOTE_1D_FIELDS pass through unchanged.
-
-    The writer-side guard (`_assert_promote_1d_contract`) raises on this
-    case in production; `_promote_1d_leaves` itself is silent.
-    """
+def test_promote_1d_leaves_raises_on_undeclared_1d_field() -> None:
+    """1D fields not declared in PROMOTE_1D_FIELDS raise at the writer boundary."""
     from tensordict import TensorDict
 
     from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
@@ -68,8 +64,8 @@ def test_promote_1d_leaves_skips_undeclared_fields() -> None:
         {"custom_undeclared": torch.arange(4, dtype=torch.long)},
         batch_size=[4],
     )
-    out = _promote_1d_leaves(td)
-    assert out["custom_undeclared"].shape == (4,)  # unchanged
+    with pytest.raises(ValueError, match="not declared in PROMOTE_1D_FIELDS"):
+        _promote_1d_leaves(td)
 
 
 def test_promote_1d_roundtrip_via_from_wire() -> None:
@@ -146,43 +142,24 @@ def test_from_wire_preserves_genuine_length_one_token_column() -> None:
     assert torch.equal(back["input_ids"], torch.arange(n).unsqueeze(-1))
 
 
-def test_assert_contract_raises_on_undeclared_1d_field() -> None:
-    """Writer-side guard: dense 1D field not in PROMOTE_1D_FIELDS raises."""
+def test_promote_1d_leaves_raises_on_declared_field_wrong_shape() -> None:
+    """Writer-side check: declared field arriving as non-1D raises."""
     from tensordict import TensorDict
 
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _assert_promote_1d_contract,
-    )
-
-    td = TensorDict(
-        {"unregistered_scalar": torch.arange(4, dtype=torch.long)}, batch_size=[4]
-    )
-    with pytest.raises(ValueError, match="not declared in PROMOTE_1D_FIELDS"):
-        _assert_promote_1d_contract(td)
-
-
-def test_assert_contract_raises_on_declared_field_wrong_shape() -> None:
-    """Writer-side guard: declared field arriving as non-1D raises."""
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _assert_promote_1d_contract,
-    )
+    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
 
     td = TensorDict(
         {"input_lengths": torch.arange(4 * 2).reshape(4, 2)}, batch_size=[4]
     )
     with pytest.raises(ValueError, match="declared in PROMOTE_1D_FIELDS"):
-        _assert_promote_1d_contract(td)
+        _promote_1d_leaves(td)
 
 
-def test_assert_contract_accepts_valid_batch() -> None:
-    """Writer-side guard: valid TD (declared 1D, undeclared 2D, nested) passes."""
+def test_promote_1d_leaves_accepts_valid_batch() -> None:
+    """Writer-side check: TD with declared 1D + undeclared 2D + nested passes."""
     from tensordict import TensorDict
 
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _assert_promote_1d_contract,
-    )
+    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
 
     n = 4
     td = TensorDict(
@@ -195,8 +172,11 @@ def test_assert_contract_accepts_valid_batch() -> None:
         },
         batch_size=[n],
     )
-    # Does not raise.
-    _assert_promote_1d_contract(td)
+    # Does not raise; declared field is promoted, others pass through.
+    out = _promote_1d_leaves(td)
+    assert out["input_lengths"].shape == (n, 1)
+    assert out["input_ids"].shape == (n, 3)
+    assert out["logprobs"].is_nested
 
 
 def test_get_samples_single_code_path_across_backends(monkeypatch) -> None:
