@@ -1413,6 +1413,159 @@ class TestApplyPerformanceConfig:
         with pytest.raises(ValueError, match="requires a MoE model"):
             _apply_performance_config(model_cfg, config)
 
+    def test_fp4_configuration(self):
+        """Apply the validated Transformer Engine NVFP4 fields."""
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        model_cfg = SimpleNamespace(fp8=None)
+        config = {
+            "megatron_cfg": {
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_recipe": "nvfp4",
+                    "fp4_param": False,
+                }
+            }
+        }
+
+        apply_te_precision_config(model_cfg, config)
+
+        assert model_cfg.fp4 == "e2m1"
+        assert model_cfg.fp4_recipe == "nvfp4"
+        assert model_cfg.fp4_param is False
+        assert model_cfg.fp8 is None
+
+    def test_fp8_and_fp4_are_mutually_exclusive(self):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        with pytest.raises(ValueError, match="cannot both"):
+            apply_te_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "fp8_cfg": {"enabled": True},
+                        "fp4_cfg": {"enabled": True},
+                    }
+                },
+            )
+
+    def test_fp4_requires_complete_nvfp4_fields(self):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        with pytest.raises(KeyError, match="fp4_cfg"):
+            apply_te_precision_config(
+                SimpleNamespace(),
+                {"megatron_cfg": {"fp4_cfg": {"enabled": True, "fp4": "e2m1"}}},
+            )
+
+    def test_fp4_rejects_unknown_fields(self):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        with pytest.raises(ValueError, match="extra_forbidden"):
+            apply_te_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "fp4_cfg": {"enabled": False, "fp4_recipie": "nvfp4"}
+                    }
+                },
+            )
+
+    def test_fp4_disabled_leaves_precision_unchanged(self):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        model_cfg = SimpleNamespace()
+        apply_te_precision_config(
+            model_cfg, {"megatron_cfg": {"fp4_cfg": {"enabled": False}}}
+        )
+
+        assert not hasattr(model_cfg, "fp4")
+
+    @pytest.mark.parametrize(
+        "policy_update",
+        [
+            {"precision": "float32"},
+            {"megatron_cfg": {"fp4_cfg": {"enabled": False}}},
+            {"megatron_cfg": {"fp4_cfg": {"fp4_recipe": "other"}}},
+            {"megatron_cfg": {"fp4_cfg": {"fp4_param": True}}},
+        ],
+    )
+    def test_nvfp4_pertoken_requires_validated_training_contract(self, policy_update):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_recipe": "nvfp4",
+                    "fp4_param": False,
+                }
+            },
+        }
+        if "precision" in policy_update:
+            config["precision"] = policy_update["precision"]
+        if "megatron_cfg" in policy_update:
+            config["megatron_cfg"]["fp4_cfg"].update(
+                policy_update["megatron_cfg"]["fp4_cfg"]
+            )
+
+        with pytest.raises(ValueError, match="requires policy.precision"):
+            apply_te_precision_config(SimpleNamespace(), config)
+
+    def test_first_and_last_bf16_layers_are_forwarded(self):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        model_cfg = SimpleNamespace()
+        apply_te_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "first_last_layers_bf16": True,
+                    "num_layers_at_start_in_bf16": 2,
+                    "num_layers_at_end_in_bf16": 4,
+                }
+            },
+        )
+
+        assert model_cfg.first_last_layers_bf16 is True
+        assert model_cfg.num_layers_at_start_in_bf16 == 2
+        assert model_cfg.num_layers_at_end_in_bf16 == 4
+
+    def test_te_precision_recipe_matches_attention_and_mlp_modules(self):
+        from pathlib import Path
+
+        from megatron.core.quantization.quant_config import MatchContext
+
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        recipe_path = (
+            Path(__file__).resolve().parents[4]
+            / "examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml"
+        )
+        model_cfg = SimpleNamespace()
+        apply_te_precision_config(
+            model_cfg,
+            {"megatron_cfg": {"te_precision_config_file": str(recipe_path)}},
+        )
+
+        def match(module_path):
+            return model_cfg.quant_recipe.match_to_config_key(
+                MatchContext(module_path=module_path, layer_number=0)
+            )
+
+        assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
+        assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
+        assert match("decoder.layers.0.mlp.linear_fc1") == "nvfp4"
+        assert match("decoder.layers.0.mlp.linear_fc2") == "nvfp4"
+        assert match("decoder.layers.0.input_layernorm") is None
+
     def test_recompute_granularity_full_explicit(self):
         """granularity='full' sets uniform method with 1 layer."""
         from nemo_rl.models.megatron.setup import _apply_performance_config

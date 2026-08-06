@@ -15,6 +15,7 @@ import ast
 import os
 import tempfile
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -223,6 +224,96 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
 
     def get_extra_state(self):
         raise AssertionError("moving a module must not serialize its extra state")
+
+
+def test_nvte_backward_override_is_scoped_to_training(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._nvte_backward_override = "dequantized"
+    monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
+
+    with worker._nvte_backward_override_training_ctx():
+        assert os.environ["NVTE_BACKWARD_OVERRIDE"] == "dequantized"
+
+    assert "NVTE_BACKWARD_OVERRIDE" not in os.environ
+
+
+def test_nvfp4_pertoken_wraps_standard_refit_export():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        }
+    }
+    stream = []
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            shape = (16, 32) if projection != "down_proj" else (32, 32)
+            stream.append(
+                (
+                    f"model.layers.0.mlp.experts.{expert}.{projection}.weight",
+                    torch.randn(*shape),
+                )
+            )
+    worker._iter_params_with_optional_kv_scales_impl = lambda **_kwargs: iter(stream)
+
+    exported = dict(worker._iter_params_with_optional_kv_scales())
+
+    assert "model.layers.0.mlp.experts.w13_weight" in exported
+    assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in exported
+
+
+def _make_fp4_boundary_layer_worker(additional_ignore):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {
+                "enabled": True,
+                "additional_ignore": additional_ignore,
+            },
+        },
+        "megatron_cfg": {
+            "fp4_cfg": {"enabled": True},
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 1,
+            "num_layers_at_end_in_bf16": 1,
+        },
+    }
+    worker.megatron_bridge = SimpleNamespace(
+        transformer_config=SimpleNamespace(num_layers=4)
+    )
+    return worker
+
+
+def test_fp4_boundary_layers_warn_when_rollout_ignore_is_missing():
+    worker = _make_fp4_boundary_layer_worker([])
+
+    with pytest.warns(UserWarning, match=r"layers \[0, 3\]"):
+        worker._warn_fp4_bf16_layer_rollout_ignore_mismatch()
+
+
+def test_fp4_boundary_layers_accept_matching_rollout_ignore():
+    worker = _make_fp4_boundary_layer_worker(
+        ["*.layers.0.mlp.experts*", "*.layers.3.mlp.experts*"]
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        worker._warn_fp4_bf16_layer_rollout_ignore_mismatch()
+
+    assert not caught
 
 
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
