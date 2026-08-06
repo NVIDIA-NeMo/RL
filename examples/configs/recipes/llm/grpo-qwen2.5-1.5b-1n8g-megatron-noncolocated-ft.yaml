@@ -9,7 +9,7 @@ defaults: ../../grpo_math_1B_megatron.yaml
 #   generation: 4 GPUs  (vLLM,     TP=2       DP=2)
 
 grpo:
-  max_num_steps: 20
+  max_num_steps: 30
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
