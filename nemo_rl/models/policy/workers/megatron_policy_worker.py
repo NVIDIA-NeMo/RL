@@ -368,6 +368,7 @@ class MegatronPolicyWorkerImpl(
         init_reference_model: bool = True,
         *,
         worker_sharding_annotations: NamedSharding,
+        skip_weight_load: bool = False,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -489,11 +490,16 @@ class MegatronPolicyWorkerImpl(
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
+        assert not (skip_weight_load and (init_optimizer or init_reference_model)), (
+            "skip_weight_load is only valid for inference-only policies "
+            "(init_optimizer=False, init_reference_model=False)."
+        )
         model_and_optimizer_state = setup_model_and_optimizer(
             config,
             self.megatron_cfg,
             init_optimizer,
             pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
+            load_weights=not skip_weight_load,
         )
 
         self.mcore_state = model_and_optimizer_state.state
