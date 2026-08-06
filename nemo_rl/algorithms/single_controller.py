@@ -61,6 +61,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -855,10 +856,36 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
-        await asyncio.to_thread(
-            self._weight_synchronizer.sync_weights,
-            kv_scales=kv_scales,
-        )
+        # Reconcile once more, immediately before the collective.
+        #
+        # The reconcile above runs before calibration and two to_thread hops; a death
+        # recorded in that gap would otherwise be ignored until the NEXT step, by which
+        # time this broadcast is already hanging on the missing rank. Idempotent, so the
+        # common case is a no-op.
+        await self._reconcile_refit_membership()
+
+        try:
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights,
+                kv_scales=kv_scales,
+            )
+        except RefitAborted as aborted:
+            # A rank stopped participating mid-refit and a worker's watchdog broke the
+            # collective. Everything that survived now holds PARTIAL weights, so nothing
+            # may serve until a refit completes -- mark the fleet stale before retrying.
+            print(
+                f"  _sync_weights: {aborted}; rebuilding and retrying once", flush=True
+            )
+            if self._fleet_monitor is not None:
+                for shard_idx in self._fleet_monitor.serving_shards():
+                    self._fleet_monitor.mark_weights_partial(shard_idx)
+            await self._reconcile_refit_membership()
+            # Once only: a second abort is a real fault, not a membership problem, and
+            # retrying forever would recreate the wedge this exists to remove.
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights,
+                kv_scales=kv_scales,
+            )
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

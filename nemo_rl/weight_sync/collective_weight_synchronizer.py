@@ -59,7 +59,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
+        refit_timeout_s: Optional[float] = None,
     ):
+        # None disarms the abort watchdog in every worker, which is the default and
+        # reproduces the pre-existing behaviour exactly.
+        self._refit_timeout_s = refit_timeout_s
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
@@ -79,9 +83,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         with timer_context:
             futures_train = self._policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales
+                kv_scales=kv_scales, refit_timeout_s=self._refit_timeout_s
             )
-            futures_inference = self._generation.update_weights_from_collective()
+            futures_inference = self._generation.update_weights_from_collective(
+                refit_timeout_s=self._refit_timeout_s
+            )
 
             ray.get(futures_train)
             results = ray.get(futures_inference)

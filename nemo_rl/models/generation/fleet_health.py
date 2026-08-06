@@ -291,6 +291,22 @@ class GenerationFleetMonitor:
             return
         self._transition(shard, ShardState.STALE)
 
+    def mark_weights_partial(self, shard_idx: int) -> None:
+        """An aborted refit left this shard holding a mix of old and new weights.
+
+        STALE rather than DEAD: the process is alive and refits normally, it just must not
+        serve until a refit completes. That is exactly what STALE already means, and
+        because DEAD -> HEALTHY is unreachable and STALE ignores successful probes, the
+        only route back into the serving set is report_refit -- which is the property that
+        makes partial weights safe to hold.
+
+        Absent shards are left alone; they are not serving and their problem is not weights.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        self._transition(shard, ShardState.STALE)
+
     def report_refit(self, shard_idx: int, *, weight_version: int) -> None:
         """A completed refit is the only way back into the serving set."""
         shard = self._shards[shard_idx]

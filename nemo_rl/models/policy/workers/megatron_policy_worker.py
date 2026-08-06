@@ -2173,9 +2173,36 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+    ) -> None:
+        """Broadcast the weights for collective communication.
+
+        A generation rank that dies mid-broadcast leaves this call blocked in NCCL with no
+        timeout and no error -- observed as both policy workers stuck in
+        ``packed_broadcast_producer -> cuda stream synchronize`` while the run sat wedged.
+        The watchdog is the only way out, because the controller cannot reach this actor
+        while its event loop is inside the collective. Disarmed unless refit_timeout_s is
+        set, so the default path is unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(kv_scales=kv_scales)
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
-        """Broadcast the weights for collective communication."""
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),

@@ -288,3 +288,50 @@ class TestMetrics:
         monitor.mark_loaded(0)
         monitor.report_refit(0, weight_version=11)
         assert monitor.as_metrics()["fleet/shard_weight_version/0"] == 11.0
+
+
+class TestPartialWeightsAfterAnAbortedRefit:
+    """An aborted refit leaves survivors holding a mix of old and new weights.
+
+    They must stop serving until a refit completes, but they are alive and must still
+    take part in that refit -- which is precisely STALE, so this reuses it rather than
+    inventing a state.
+    """
+
+    def test_a_serving_shard_stops_serving(self):
+        monitor = _monitor(shard_count=2)
+        assert 0 in monitor.serving_shards()
+
+        monitor.mark_weights_partial(0)
+
+        assert monitor.state_of(0) is ShardState.STALE
+        assert 0 not in monitor.serving_shards(), "partial weights must not serve"
+
+    def test_it_still_counts_as_present_for_the_refit(self):
+        """STALE is deliberately not absent: the process is alive and must be refit."""
+        monitor = _monitor(shard_count=2)
+        monitor.mark_weights_partial(0)
+
+        assert 0 not in monitor.absent_shards()
+
+    def test_only_a_refit_restores_service(self):
+        monitor = _monitor(shard_count=2, healthy_threshold=1)
+        monitor.mark_weights_partial(0)
+        for _ in range(10):
+            monitor.record_probe(0, ok=True)
+        assert monitor.state_of(0) is ShardState.STALE, "probes must not resurrect it"
+
+        monitor.report_refit(0, weight_version=7)
+
+        assert monitor.state_of(0) is ShardState.HEALTHY
+        assert 0 in monitor.serving_shards()
+
+    def test_a_dead_shard_is_left_alone(self):
+        """Its problem is that it is gone, not that its weights are partial."""
+        monitor = _monitor(shard_count=2, unhealthy_threshold=1)
+        _fail(monitor, 0, times=1)
+        assert monitor.state_of(0) is ShardState.DEAD
+
+        monitor.mark_weights_partial(0)
+
+        assert monitor.state_of(0) is ShardState.DEAD
