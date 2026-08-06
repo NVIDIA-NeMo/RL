@@ -1,38 +1,75 @@
 # Nano SWE RL with Gate-Authoritative Token Capture
 
 A reproducible 6-node recipe that runs agentic SWE RL on
-Nemotron-3-Nano-30B-A3B with **exact-token capture**: the vLLM worker stages
-each model call's token delta durably into the TransferQueue data plane, the
-Gym gate serves verified prefix token ids back on every follow-up call
-(token-in), and the trainer consumes rows rebuilt from staged deltas — no
-token echo over HTTP, no re-tokenization of agent history.
+Nemotron-3-Nano-30B-A3B with **exact-token capture** enabled: the vLLM worker
+stages each model call's token delta durably into the TransferQueue data
+plane, the Gym gate serves verified prefix token ids back on every follow-up
+call (token-in), and the trainer consumes rows rebuilt from the staged deltas.
+No token echo over HTTP, no re-tokenization of agent history — the tokens the
+engine sampled are byte-for-byte the tokens the trainer sees.
 
 It builds directly on the [Nano SWE TransferQueue
 recipe](nano-swe-transferqueue.md); read that first for the cluster shape,
-`swe_nano.env` setup, and SingleController constraints. This guide covers only
-what capture adds. Code under test: RL PR #3456 + Gym PR #2278 (plus the
-attribution and canonical-fingerprint fixes staged for #2278).
+`swe_nano.env` setup, and the SingleController constraints. This guide covers
+only what token capture adds.
 
 ## Verified result
 
-Measured across four legacy-vs-capture A/B pairs on 6× GB200 nodes
-(15-step pair: jobs 5845431/5845433; three 12-step pairs: 5860015-22):
+Run on 6 GB200 NVL72 nodes:
 
-| | legacy (token echo) | capture (token-in) |
-|---|---|---|
-| Total step time (3 pairs, steps 1-12) | 7,582 ± 292 s | 7,590 ± 220 s (**+0.1 %**) |
-| exposed_generation | 5,896 ± 291 s | 5,884 ± 229 s (−0.2 %) |
-| HTTP bytes / 15-step run | 69.96 GB | 21.11 GB (**−70 %**) |
-| worker preprocess CPU | 17-19 ks (2 renders/call) | 8-10 ks (1/call) |
-| gate event-loop lag p99 | 22 ms | 4-5 ms |
-| token_in_rate | n/a | **0.9999** |
-| token_mult_prob_error max (3 runs) | 121 / 1.8e9 / 301 | **1.13 / 1.13 / 2.87** |
-| capture staging cost | — | ~39 ms/call (tq_put p50 38 ms; 0.8 % of engine) |
+| | |
+|---|---|
+| Entrypoint | `examples/run_grpo_single_controller.py` |
+| Config | `examples/configs/ultra/nano_swe_teacher_sc.yaml` |
+| Model | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` |
+| Shape | train 4 nodes (TP2·PP2·CP4, EP1) / gen 2 nodes (vLLM TP2 → 4 engines) |
+| Capture flags | `+token_capture.enabled=true` (hydra append), `NG_TIC_FP_CANONICAL=1` |
+| Outcome | 15/15 steps, `token_in_rate ≈ 0.9999`, zero `empty_manifest`, zero `capture_failed`, `valid_seqs = GBS` |
+| Launched via | `swe_nano_sc_capture.sh` (batch) / `swe_nano_sc_capture_interactive.sh` (attach + iterate) |
 
-Wall-clock parity, −70 % bytes, half the worker CPU, and — decisively —
-clean training rows: the legacy path's re-tokenization drift produces
-pathological probability-ratio errors at 20k+-token contexts; exact-token
-rows do not.
+## How it works
+
+Legacy SWE runs recover training tokens by echoing token ids in every model
+response and re-tokenizing the agent's rendered history each turn. Both are
+lossy for a reasoning model — the chat template strips `<think>` content from
+history, and re-tokenizing an assistant turn can split differently than the
+tokens the model actually sampled. Token capture replaces that path:
+
+```
+agent (nv-OpenHands)                     gate (vllm_model, gate mode)
+  /run body carries ng_rollout_id  ───►  registers the rollout, admits calls,
+                                         fingerprints incoming history →
+                                         resolves the parent call → sends the
+                                         parent's exact prefix token ids
+                                              │  required_prefix_token_ids
+                                              ▼
+vLLM worker: splices the prefix verbatim, renders only the new tail,
+  generates, then STAGES the call's token delta (ids + mask + logprobs)
+  to TransferQueue — a synchronous tq_put, durable before the call is
+  acked — and returns token-light CommitCoords on the response
+                                              │  coords (≈4 B/token)
+                                              ▼
+gate ingests coords into its lineage index; when the rollout ends it
+returns a token-free RolloutReceipt (a manifest of call_ids and staging
+keys) on the /run response
+                                              ▼
+finalizer (trainer side): fetches the staged deltas by key, verifies
+digests, rebuilds the exact training row, publishes it, clears staging
+```
+
+The heavy bytes (token arrays, logprobs) move exactly once, worker→TQ,
+node-locally. The gate hop and the `/run` response stay token-light.
+
+The pieces, by repo:
+
+| Component | Where |
+|---|---|
+| Gate mode, prefix serving, lineage | Gym `responses_api_models/vllm_model/app.py` + `nemo_gym/token_id_capture/gate.py` |
+| Rollout attribution (`ng_rollout_id`) | Gym capture middleware + `swe_agents` harness forwarding |
+| Wire schema (deltas, coords, receipts) | Gym `nemo_gym/token_id_capture/staging/records.py` |
+| Worker-side capture + prefix splice | `nemo_rl/models/generation/vllm/vllm_worker_async.py` |
+| Staging sink/source over TransferQueue | `nemo_rl/data_plane/tq_token_sink.py` |
+| Receipt → training row | `nemo_rl/experience/blackbox_finalizer.py` |
 
 ## Quick start
 
@@ -43,74 +80,47 @@ DRY_RUN=0 SC_EXP_NAME=my-capture-run NG_TIC_FP_CANONICAL=1 \
   WALLTIME=3:59:00 bash swe_nano_sc_capture.sh
 ```
 
-Interactive (allocate once, iterate on the driver by hand — see the
-TransferQueue guide for the attach/run-cmd workflow):
+Without `DRY_RUN=0` it prints the resolved driver command and exits, which is
+worth doing once. Interactive mode — allocate once, keep Ray up, run the
+driver by hand, edit, re-run — follows the same attach/run-cmd workflow as
+the TransferQueue recipe:
 
 ```bash
 NG_TIC_FP_CANONICAL=1 bash swe_nano_sc_capture_interactive.sh
 ```
 
-The legacy comparison arm is the plain `swe_nano_sc.sh` /
-`swe_nano_sc_interactive.sh` from the TransferQueue recipe. Batch and
-interactive build byte-for-byte the same driver command.
+The non-capture baseline remains `swe_nano_sc.sh` /
+`swe_nano_sc_interactive.sh`. Batch and interactive build byte-for-byte the
+same driver command.
 
-Two flags matter:
+`WALLTIME` must be a Slurm time string (`3:59:00`). A bare `3h` fails with
+`sbatch: error: Invalid --time specification` printed at the very *end* of
+the launch output — easy to miss. Budget ~1 h 40 of setup (venv rebuild +
+checkpoint load) before the first step.
 
-- `NG_TIC_FP_CANONICAL=1` — canonical text fingerprints in the gate.
-  **Without it token-in silently degrades to ~0**: reasoning models echo
-  history with `<think>` blocks stripped, the gate's fingerprint of the served
-  turn never matches, every call falls back to text mode, and the run develops
-  a +38 % generated-token divergence. With it, `token_in_rate ≈ 0.9999`.
-- `WALLTIME` must be a Slurm time string (`3:59:00`). `3h` fails with
-  `sbatch: error: Invalid --time specification` printed at the very *end* of
-  the launch output — easy to miss. Budget ~1 h 40 of setup (venv rebuild +
-  checkpoint load) before the first step.
+## What the capture launchers add, and why
 
-## What the capture launcher adds, and why
-
-Every line of the capture posture in `swe_nano_sc_capture.sh` exists because
-its absence crashed a run:
+Every line of the capture posture in `swe_nano_sc_capture*.sh` exists because
+its absence broke a run:
 
 | Setting | Without it |
 |---|---|
 | `+token_capture.enabled=true` (hydra append) | Capture never engages. It is a `+` append because no yaml in the nano chain defines the key; a plain override is rejected. |
+| `NG_TIC_FP_CANONICAL=1` | Token-in silently degrades to ~0: reasoning models echo history with `<think>` blocks stripped, the gate's fingerprint of the served turn never matches, and every call falls back to text mode. With it, `token_in_rate ≈ 0.9999`. |
 | `NRL_DRIVER_PYTHONPATH=/opt/nemo-rl/3rdparty/Gym-workspace/Gym` | Driver `ModuleNotFoundError: nemo_gym` — the driver imports the staging record schema, and the baked driver venv has no nemo_gym. |
 | `NRL_DRIVER_PIP_INSTALL=orjson` | Driver `ModuleNotFoundError: orjson` — Gym's `token_id_capture/__init__` eagerly imports the store. |
-| `VllmAsyncGenerationWorker` in `NRL_FORCE_REBUILD_VENVS_LIST` | Worker `ModuleNotFoundError: orjson` — venv caching is spec-unaware and silently reuses the legacy arm's venv (RL #3456 known issue). |
-| capture env set *after* sourcing `swe_nano.env` | `swe_nano.env` exports `NRL_FORCE_REBUILD_VENVS_LIST` unconditionally and clobbers an env-prefix value. |
-
-## How the data flows
-
-```
-agent (nv-OpenHands)                     gate (vllm_model, gate mode)
-  /run body carries ng_rollout_id  ───►  registers rollout, admits calls
-                                          fingerprints history → resolves
-                                          parent → sends exact prefix ids
-                                              │  required_prefix_token_ids
-                                              ▼
-vLLM worker: splices prefix verbatim, renders only the new tail,
-  generates, then STAGES the delta (ids+mask+logprobs) to TransferQueue
-  (synchronous tq_put — durable before the call is acked) and returns
-  token-light CommitCoords on the response
-                                              │  coords (≈4 B/token)
-                                              ▼
-gate ingests coords into lineage; at /run end returns a token-free
-RolloutReceipt (manifest of call_ids + staging keys) to the trainer
-                                              ▼
-finalizer: fetches staged deltas by key, digest-verifies, rebuilds the
-exact training row, clears the staged rows
-```
-
-The heavy bytes (token arrays, logprobs) move exactly once, worker→TQ,
-node-locally. The gate and the `/run` response stay token-light.
+| `VllmAsyncGenerationWorker` in `NRL_FORCE_REBUILD_VENVS_LIST` | Worker `ModuleNotFoundError: orjson` — venv caching is spec-unaware and silently reuses a non-capture worker venv built by an earlier job. |
+| capture env set *after* sourcing `swe_nano.env` | `swe_nano.env` exports `NRL_FORCE_REBUILD_VENVS_LIST` unconditionally and clobbers an env-prefix value — which is why these are dedicated launchers rather than an env prefix on `swe_nano_sc.sh`. |
+| `CALL_TIMING=0` (optional) | Per-call latency JSONL is on by default in these launchers (`NRL_CALL_TIMING_DIR`/`NG_CALL_TIMING_DIR`); set 0 to disable. All probes are env-gated and dormant without the dir. |
 
 ## Verifying capture is really engaged
 
 Config echo is not evidence. Check, in order:
 
-1. **Gate metrics in the SC step output** (grade from the SC worker
-   `.out` under `<job>-logs/ray/session_*/logs/worker-*-<pid>.out` — the
-   driver log's actor-stdout forwarding is not reliable):
+1. **Gate metrics in the SC step output.** Grade from the SC worker `.out`
+   under `<job>-logs/ray/session_*/logs/worker-*-<pid>.out` — the driver
+   log's actor-stdout forwarding is not reliable and can make a healthy run
+   look stalled:
 
    ```
    gate_metrics={'registered': 128.0, 'token_in': 7042.0,
@@ -118,50 +128,36 @@ Config echo is not evidence. Check, in order:
    ```
 
    `token_in / (token_in + fallback_*)` should be ≥ 0.99. A rate near 0 with
-   large `fallback_no_match` means canonical fingerprints are off (see above).
-   `unattributed_calls` > 0 means the harness is not forwarding
-   `ng_rollout_id` (attribution fix missing).
+   large `fallback_no_match` means canonical fingerprints are off (see
+   above). `unattributed_calls` > 0 means the harness is not forwarding
+   `ng_rollout_id` (attribution fix missing from the Gym pin).
 
 2. **No finalize rejections.** `finalize: ... rejected (empty_manifest)` on
-   every rollout means calls are reaching the worker without gate context —
-   the run generates but nothing is trainable.
+   every rollout means calls reach the worker without gate context — the run
+   generates but nothing is trainable.
 
-3. **TQ staging traffic**: `PUT_DATA` on the staging partition per model call
-   (tens of thousands per run), not just per training batch.
+3. **TQ staging traffic**: `PUT_DATA` on the staging partition fires per
+   model call (tens of thousands per run), not just per training batch.
 
 4. **Training equivalence**: `token_mult_prob_error` should sit near 1.0
-   (max ≲ 3). `gen_kl_error` ~0.004 matches the legacy arm.
-
-## Perf instrumentation (optional)
-
-`CALL_TIMING=1` (default in these launchers) sets `NRL_CALL_TIMING_DIR` /
-`NG_CALL_TIMING_DIR` and emits per-call JSONL segments from every server:
-worker engine/preprocess/splice, `tq_put`, gate prepare/ingest, per-path HTTP
-timings, event-loop lag. Aggregate with `swe/aggregate_call_timing.py`.
-`cached_tokens` on each `worker_engine` record reports vLLM prefix-cache hits
-(~94 % of prompt tokens on this workload). All probes are env-gated and
-dormant unless the dir is set.
+   (max ≲ 3), `gen_kl_error` in the same band as a non-capture run (~0.004).
 
 ## Known limits
 
 - **Grade runs from the SC worker `.out` or W&B, never the driver log** —
   Ray's driver-log stdout forwarding dropped entire actors in testing (runs
   looked stalled while training normally).
-- **Receipt-mode W&B rollout metrics are not yet comparable**:
+- **Receipt-mode W&B rollout metrics are not yet comparable to legacy**:
   `gen_tokens_per_sample` counts the carried prompt tail and
-  `truncation_rate` is constant on the capture arm. Compare token counts via
-  the call-timing JSONL (engine `usage`) instead.
-- **`global_valid_toks` runs ~15 % lower on capture** at equal work —
-  masking-semantics difference under investigation; do not quote
-  convergence-per-wallclock until resolved.
-- **Router replay (R3)**: capture stages routed experts as TQ extras beside
-  the token delta (`routed_experts_delta`), keeping the multi-MB arrays off
-  HTTP — but vLLM 0.20.0's engine crashes with
-  `enable_return_routed_experts=true` on this model (`IndexError` in
-  `sample_tokens`); blocked on an engine fix.
+  `truncation_rate` is constant on the capture arm.
 - **Weight-version mixing** across spliced chains at a refit boundary is
-  guarded conservatively; a per-row `weight_version` check in the finalizer
-  is the hardening item.
+  tag-checked per call; a per-row guard in the finalizer is a pending
+  hardening item.
+- **Router replay (R3)**: the capture path stages routed experts beside the
+  token delta (`routed_experts_delta` extras) so the per-token arrays never
+  transit HTTP — but vLLM 0.20.0's engine currently crashes with
+  `enable_return_routed_experts=true` on this model; blocked on an engine
+  fix.
 
 ## Related
 
