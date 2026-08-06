@@ -56,6 +56,16 @@ for test in payload["tests"]:
 PY
 }
 
+raw_status_of() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1]))
+for test in payload["tests"]:
+    if test["name"] == sys.argv[2]:
+        print(test.get("status", "<none>"))
+PY
+}
+
 run record \
   --id mcore-5918-prompt-tokens \
   --test grpo_megatron_generation \
@@ -104,6 +114,47 @@ check "leaves an unrelated failure for investigation" \
 check "ignores a clean pass" \
   "<none>" "$(status_of "${work}/results.json" grpo_megatron_generation_non_colocated)"
 
+# Matching an entry has to move the status too, not just add a comment. `fail`
+# means "this PR broke it", and a break the registry already knows about predates
+# the run that hit it. Leaving the status alone once put three innocent PRs on
+# the hook: the baseline had been taken on a stack carrying the fix, so
+# apply_baseline had nothing to downgrade, and the report said `fail` while the
+# comment directly underneath linked the fix already in review.
+check "downgrades a known failure so no PR is accused of it" \
+  "fail (pre-existing)" "$(raw_status_of "${work}/results.json" grpo_megatron_generation)"
+check "leaves a suspect pass as it found it" \
+  "pass (suspect)" "$(raw_status_of "${work}/results.json" grpo_megatron_generation_async)"
+check "leaves an unmatched failure as a plain fail" \
+  "fail" "$(raw_status_of "${work}/results.json" grpo_megatron_generation_multiturn)"
+
+# first_seen_megatron_pr must not be read as "the PR that caused this". It names
+# the run that first surfaced the break, which is routinely a different repo's
+# problem entirely -- the Bridge break in the live registry was first seen on
+# Megatron-LM#5382 and caused by #5865, merged weeks earlier. Excusing must not
+# depend on it, or the PR unlucky enough to run first gets blamed on every
+# re-run.
+run record \
+  --id mcore-9999-first-seen \
+  --test grpo_megatron_training \
+  --signature "RuntimeError: tensor model parallel group is not initialized" \
+  --diagnosis "Pre-existing on main; surfaced by whichever PR ran first." \
+  --first-seen-megatron-pr 9999 >/dev/null
+
+cat > "${work}/first_seen.json" <<'JSON'
+{
+  "tests": [
+    {
+      "name": "grpo_megatron_training",
+      "status": "fail",
+      "error_signature": "RuntimeError: tensor model parallel group is not initialized"
+    }
+  ]
+}
+JSON
+run annotate --results "${work}/first_seen.json" >/dev/null
+check "excuses the break on the PR that first surfaced it too" \
+  "fail (pre-existing)" "$(raw_status_of "${work}/first_seen.json" grpo_megatron_training)"
+
 # Same signature, a test the entry does not claim: must NOT be excused.
 cat > "${work}/other.json" <<'JSON'
 {
@@ -139,6 +190,8 @@ JSON
 out="$(run annotate --results "${work}/stale.json" --integration "${work}/integration.json")"
 check "flags a recurrence of an already-applied fix instead of excusing it" \
   "mcore-5918-prompt-tokens" "$(status_of "${work}/stale.json" grpo_megatron_generation)"
+check "keeps the fail when the applied fix did not hold" \
+  "fail" "$(raw_status_of "${work}/stale.json" grpo_megatron_generation)"
 if grep -q "STALE" <<<"${out}"; then
   echo "ok: says loudly that the entry is stale"
 else
@@ -177,6 +230,44 @@ run annotate --results "${work}/stale.json" --integration "${work}/integration.j
 run annotate --results "${work}/stale.json" >/dev/null
 check "drops a stale verdict when re-annotated without the manifest" \
   "mcore-5918-prompt-tokens" "$(status_of "${work}/stale.json" grpo_megatron_generation)"
+
+# pending-fix-ref is what stops a raised-but-unmerged Megatron-Bridge fix from
+# having to be remembered as --bridge-ref on every submit for weeks.
+check "says nothing when no fix is pending in a repo" \
+  "" "$(run pending-fix-ref --repo NVIDIA-NeMo/Megatron-Bridge)"
+
+run record \
+  --id bridge-unwrap-model \
+  --test grpo_megatron_generation \
+  --signature "TypeError: isinstance() arg 2 must be a type" \
+  --diagnosis "Bridge passes a factory function to isinstance()." \
+  --repo NVIDIA-NeMo/Megatron-Bridge --fix-pr 5357 --fix-branch mcore-5382-fix >/dev/null
+check "names the branch carrying the one pending fix" \
+  "mcore-5382-fix" "$(run pending-fix-ref --repo NVIDIA-NeMo/Megatron-Bridge)"
+check "does not offer another repo's fix" \
+  "" "$(run pending-fix-ref --repo NVIDIA/Megatron-LM)"
+
+# Two pending fixes cannot both be checked out at one ref. Picking either one
+# silently would test a stack nobody chose, so it has to fail and say so.
+run record \
+  --id bridge-second-break \
+  --test grpo_megatron_training \
+  --signature "ImportError: cannot import name something" \
+  --diagnosis "A second, unrelated Bridge break." \
+  --repo NVIDIA-NeMo/Megatron-Bridge --fix-pr 5400 --fix-branch mcore-6000-fix >/dev/null
+if run pending-fix-ref --repo NVIDIA-NeMo/Megatron-Bridge >/dev/null 2>&1; then
+  echo "FAIL: silently picked one of two pending fixes"
+  failures=$((failures + 1))
+else
+  echo "ok: refuses to choose between two pending fixes"
+fi
+
+python3 - "${REGISTRY}" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1]))
+payload["issues"] = [i for i in payload["issues"] if i["id"] != "bridge-second-break"]
+json.dump(payload, open(sys.argv[1], "w"), indent=2)
+PY
 
 # A merged fix must stop excusing anything: the failure is a regression now.
 python3 - "${REGISTRY}" <<'PY'

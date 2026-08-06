@@ -30,7 +30,9 @@ That does five things, in order:
 2. `known_issues.py refresh` asks GitHub about each registry entry's fix PR and
    retires the merged ones.
 3. `ensure_baseline.sh --force` runs the suite: megatron-core `main` × the
-   integration branch × the Bridge sha NeMo-RL pins.
+   integration branch × the Bridge sha NeMo-RL pins, or an open Bridge fix
+   branch when the registry has one (step 2 is what decides that, by retiring
+   the entries whose fixes merged).
 4. `known_issues.py annotate` labels each failure with what we already know.
 5. `post_tracking_issue.py` renders the tracking issue.
 
