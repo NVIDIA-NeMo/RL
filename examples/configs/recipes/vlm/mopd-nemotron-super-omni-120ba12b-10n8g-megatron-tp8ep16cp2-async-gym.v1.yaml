@@ -73,9 +73,10 @@ policy:
         gpus_per_node: 8
         num_nodes: 1
     vllm_cfg:
-      # vLLM 0.25's piecewise CUDA-graph pools consume roughly 54 GiB per
-      # Super replica before KV-cache allocation and OOM on 180 GiB GPUs.
-      # Eager execution retains enough memory for the image KV cache.
+      # At the inherited 0.8, vLLM 0.25 profiles a 126 GiB KV cache and OOMs
+      # while allocating it. 0.5 yields roughly the 73-80 GiB budget proven by
+      # the successful vLLM 0.20 Super run, with ample 16K-context capacity.
+      gpu_memory_utilization: 0.5
       enforce_eager: true
 
 data:
