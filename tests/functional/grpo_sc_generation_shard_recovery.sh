@@ -93,6 +93,15 @@ ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-20}
 # refit plan. Worth running both, since only the reshard path has to keep a plan and a
 # communicator agreeing about the fleet.
 REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
+# Deadline after which a worker aborts its own refit communicator so the controller can
+# rebuild over the survivors. Enabled here in EVERY variant, not just KILL_DURING_REFIT:
+# a kill at a step boundary can still land in the refit by chance -- that is exactly how
+# job 5898311 wedged -- so leaving it off would let the flaky case stay flaky.
+#
+# 60s against a healthy refit of ~1.9s for this model on GB200. Deliberately far above,
+# because firing early aborts a run that was merely slow, while firing late only means a
+# wedge lasts a little longer before it is broken.
+REFIT_TIMEOUT_S=${REFIT_TIMEOUT_S:-60}
 
 echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
@@ -121,6 +130,7 @@ PYTHONUNBUFFERED=1 uv run python "$PROJECT_ROOT"/examples/run_grpo_single_contro
     logger.monitor_gpus=false \
     ++async_rl.fleet_health.enabled=true \
     ++async_rl.fleet_health.probe_interval_s=5.0 \
+    ++async_rl.fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
     ++async_rl.watchdog.interval_s=30.0 \
     ++async_rl.watchdog.stall_timeout_s=300.0 \
     "$@" \
