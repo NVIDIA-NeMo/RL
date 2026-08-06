@@ -103,6 +103,20 @@ REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
 # wedge lasts a little longer before it is broken.
 REFIT_TIMEOUT_S=${REFIT_TIMEOUT_S:-60}
 
+# KILL_DURING_REFIT: kill while the refit collective is running, rather than at a step
+# boundary.
+#
+# Defined before the run because it decides an env var the workers read. Timing alone
+# cannot reach this window: a refit here takes ~0.10s, and job 5925668 aimed at it and
+# landed in the RPC epilogue -- the run died of an ActorDiedError from a broadcast that
+# had already completed, which is a different bug and left the abort path unexercised.
+# So the harness holds one refit open instead: it creates HOLD_FILE, every generation
+# worker parks at the top of its receive, the victim is killed there, and removing the
+# file lets the survivors walk into a collective the victim will never join.
+KILL_DURING_REFIT=${KILL_DURING_REFIT:-false}
+HOLD_FILE="$EXP_DIR/hold_refit"
+rm -f "$HOLD_FILE"
+
 echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
 # PYTHONUNBUFFERED: the harness detects progress by grepping RUN_LOG, and that only
@@ -111,7 +125,13 @@ echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, 
 # own stdout is a redirected file, so Python block-buffers it. Job 5892910 wrote
 # "train step 3/24" at 10:40:38 and the harness did not see it until 10:48:21, by
 # which time the run had finished and there was nothing left to kill.
-PYTHONUNBUFFERED=1 uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
+#
+# NRL_REFIT_HOLD_FILE is exported in every variant, not just KILL_DURING_REFIT. The file
+# is only ever created by the KILL_DURING_REFIT branch below, and the hook is a single
+# os.path.exists when it is absent, so the other variants are unaffected -- and none of
+# them has to remember to set an env var to stay correct.
+PYTHONUNBUFFERED=1 NRL_REFIT_HOLD_FILE="$HOLD_FILE" \
+uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     --config "$PROJECT_ROOT"/examples/configs/grpo_math_1B_megatron_single_controller.yaml \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
@@ -138,6 +158,9 @@ PYTHONUNBUFFERED=1 uv run python "$PROJECT_ROOT"/examples/run_grpo_single_contro
 TRAIN_PID=$!
 
 cleanup() {
+    # Before anything else: a hold file surviving this run would park the next run's
+    # refits until NRL_REFIT_HOLD_MAX_S, which reads as a hang with no visible cause.
+    rm -f "$HOLD_FILE" 2>/dev/null || true
     kill -9 $TRAIN_PID 2>/dev/null || true
     # vLLM runs the engine in a VLLM::EngineCore child that outlives its parent actor;
     # leaving it behind holds tens of GB and makes the next run fail for the wrong reason.
@@ -146,15 +169,6 @@ cleanup() {
     ray stop --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-
-# KILL_DURING_REFIT: kill while the refit collective is running, rather than at a step
-# boundary. The default kill lands in the refit only by chance (it is ~10% of wall-clock),
-# which is why the same code both passed and wedged on consecutive runs. This makes the
-# scenario the abort watchdog exists for reproducible instead of a coin flip.
-#
-# "refit membership absent=" is printed on every sync immediately before the collective,
-# so it is a reliable start-of-refit trigger.
-KILL_DURING_REFIT=${KILL_DURING_REFIT:-false}
 
 echo "[recovery] pid=$TRAIN_PID, waiting for train step $KILL_AFTER_STEP..."
 for _ in $(seq 1 240); do
@@ -242,17 +256,26 @@ if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     exit 1
 fi
 if [[ "$KILL_DURING_REFIT" == "true" ]]; then
-    # Wait for a refit to begin AFTER the step we were told to kill at, then kill at once.
-    echo "[recovery] waiting for a refit to start (KILL_DURING_REFIT)..."
-    BASELINE=$(grep -c "refit membership absent=" "$RUN_LOG" 2>/dev/null || echo 0)
-    for _ in $(seq 1 600); do
-        NOW=$(grep -c "refit membership absent=" "$RUN_LOG" 2>/dev/null || echo 0)
-        (( NOW > BASELINE )) && break
+    # Arm the hold, then wait for the workers to report that they are parked inside a
+    # refit. Only then is "killed during the refit" a fact rather than a hope.
+    echo "[recovery] arming the refit hold at $HOLD_FILE"
+    : > "$HOLD_FILE"
+    HELD=false
+    for _ in $(seq 1 1200); do
+        grep -q "refit: holding the receive open" "$RUN_LOG" 2>/dev/null && { HELD=true; break; }
         kill -0 $TRAIN_PID 2>/dev/null || {
-            echo "[recovery] FAIL: run ended before a refit started"; tail -40 "$RUN_LOG"; exit 1; }
+            echo "[recovery] FAIL: run ended before a refit could be held"
+            tail -40 "$RUN_LOG"; exit 1; }
         sleep 0.1
     done
-    echo "[recovery] refit started; killing immediately"
+    if [[ "$HELD" != "true" ]]; then
+        echo "[recovery] FAIL: no worker reported holding a refit within 120s."
+        echo "[recovery] The hook reads NRL_REFIT_HOLD_FILE; without it this test cannot"
+        echo "[recovery] reach the mid-refit window at all and would silently test the"
+        echo "[recovery] step-boundary case instead."
+        tail -60 "$RUN_LOG"; exit 1
+    fi
+    echo "[recovery] a refit is held open; killing the victim inside it"
 fi
 
 VICTIM=${GEN_PIDS[0]}
@@ -264,6 +287,10 @@ if kill -0 "$VICTIM" 2>/dev/null; then
     echo "[recovery] FAIL: victim $VICTIM survived SIGKILL; nothing was actually killed"
     exit 1
 fi
+# Release the survivors into a collective the victim will never join. Removed only after
+# the kill is confirmed: dropping it earlier would let them enter the receive alongside a
+# victim that is still alive, and the refit would simply succeed.
+rm -f "$HOLD_FILE"
 KILLED_AT=$(date +%s)
 
 echo "[recovery] waiting up to ${COMPLETION_DEADLINE_S}s for the run to finish..."

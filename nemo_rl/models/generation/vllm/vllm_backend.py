@@ -768,9 +768,11 @@ class VllmInternalWorkerExtension:
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
             RefitAbortWatchdog,
+            hold_refit_for_fault_injection,
         )
 
         with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            hold_refit_for_fault_injection()
             result = self._update_weights_from_collective()
         if guard.fired:
             raise RefitAborted(

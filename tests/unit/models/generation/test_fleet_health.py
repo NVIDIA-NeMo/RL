@@ -335,3 +335,58 @@ class TestPartialWeightsAfterAnAbortedRefit:
         monitor.mark_weights_partial(0)
 
         assert monitor.state_of(0) is ShardState.DEAD
+
+
+class TestConclusiveActorDeath:
+    """Some evidence does not need corroborating.
+
+    The counters exist to separate a slow shard from a dead one, because a probe timeout
+    cannot tell them apart. Ray reporting its actor dead can: the process is gone. Making
+    that wait for unhealthy_threshold more rounds of the same answer only delays the
+    verdict -- and the refit deadline can expire inside the delay, which is how job
+    5925668 aborted a hung refit while still holding the dead shard as SUSPECT, leaving
+    the rebuild an empty absent set to work from.
+    """
+
+    def test_one_report_is_enough(self):
+        monitor = _monitor(shard_count=2, unhealthy_threshold=99)
+
+        monitor.record_actor_death(0, error="ActorDiedError: gone")
+
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_it_becomes_absent_for_the_refit(self):
+        """The whole point: the rebuild reads absent_shards()."""
+        monitor = _monitor(shard_count=2, unhealthy_threshold=99)
+        monitor.record_actor_death(0)
+        assert monitor.absent_shards() == [0]
+
+    def test_a_suspect_shard_is_condemned_without_further_counting(self):
+        """The state job 5925668 actually found the corpse in."""
+        monitor = _monitor(shard_count=2, unhealthy_threshold=3)
+        _fail(monitor, 0, times=1)
+        assert monitor.state_of(0) is ShardState.SUSPECT
+
+        monitor.record_actor_death(0)
+
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_repeating_it_is_idempotent(self):
+        monitor = _monitor(shard_count=2, unhealthy_threshold=99)
+        monitor.record_actor_death(0)
+        monitor.record_actor_death(0)
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_a_retired_shard_is_not_disturbed(self):
+        monitor = _monitor(shard_count=2)
+        monitor.retire(0, reason="test")
+        assert monitor.state_of(0) is ShardState.RETIRED
+
+        monitor.record_actor_death(0)
+
+        assert monitor.state_of(0) is ShardState.RETIRED
+
+    def test_the_error_is_recorded(self):
+        monitor = _monitor(shard_count=2)
+        monitor.record_actor_death(0, error="ActorDiedError: the actor died")
+        assert "ActorDiedError" in monitor.snapshot()[0].last_error

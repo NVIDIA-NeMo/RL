@@ -123,3 +123,44 @@ class RefitAbortWatchdog:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+
+
+def hold_refit_for_fault_injection() -> None:
+    """Block a refit receive while a test holds it open. Inert unless asked.
+
+    Does nothing unless ``NRL_REFIT_HOLD_FILE`` names a path that exists, so a real run
+    pays one ``os.path.exists`` per refit and behaves no differently.
+
+    It exists because "kill a shard during the refit" is otherwise untestable. A refit on
+    the functional test's model takes ~0.10s, and the harness has to notice one started
+    and then find and kill a process: job 5925668 aimed at the collective and landed in
+    the RPC epilogue instead. That is a real failure mode and worth handling, but it is
+    not the one the test claimed to cover, so the abort-and-rebuild path went unexercised
+    while the run still reported a result.
+
+    A file rather than a fixed delay because the harness has to hold *one specific*
+    refit -- the one after the step it kills at. A delay on every refit would slow the
+    whole run for the sake of one moment and still not be aimed at it.
+
+    Bounded by ``NRL_REFIT_HOLD_MAX_S`` so a harness that dies mid-test cannot wedge the
+    worker it was holding.
+    """
+    import os
+
+    hold_file = os.environ.get("NRL_REFIT_HOLD_FILE")
+    if not hold_file or not os.path.exists(hold_file):
+        return
+
+    import time
+
+    deadline = time.monotonic() + float(
+        os.environ.get("NRL_REFIT_HOLD_MAX_S", "120") or 120
+    )
+    print(
+        f"  refit: holding the receive open, waiting for {hold_file} to be removed "
+        "(NRL_REFIT_HOLD_FILE fault-injection hook)",
+        flush=True,
+    )
+    while os.path.exists(hold_file) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    print("  refit: hold released; entering the receive", flush=True)
