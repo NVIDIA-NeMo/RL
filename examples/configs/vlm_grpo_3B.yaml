@@ -46,6 +46,13 @@ data:
 env:
   clevr-cogent:
     num_workers: 8
+    # Optional user-defined reward callables. Each entry requires `name`,
+    # `function`, and exactly one of `module` or `file`. The selected source
+    # must be importable/readable by VLM verification workers on every node.
+    # custom_reward_functions:
+    # - name: custom_reward
+    #   module: my_project.rewards
+    #   function: score_response
     reward_functions:
     - name: format
       weight: 0.2
