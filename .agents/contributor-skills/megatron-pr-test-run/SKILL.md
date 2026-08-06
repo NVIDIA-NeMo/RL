@@ -137,6 +137,15 @@ first if you changed anything in the wiring.
 Budget roughly 1.5–3 h per suite, plus queue time. The `batch` partition MaxTime
 is `04:00:00`; use `batch_long` via `--time` only if a suite genuinely needs it.
 
+Jobs go out under the QOS named by `COG_SLURM_QOS`, which `run_suite.sh` echoes
+back as `QOS=` so a run always records the one it used. cog takes it from the
+environment rather than an argument, so it never appears in the submitted command
+line. Do not submit on the cluster default: it is a far lower scheduling priority
+than the interactive one for an identical request, which on a busy day is the
+difference between starting in seconds and waiting many hours. The interactive
+caps — 4 nodes and 8 jobs per user — fit L1's 1 node and L2's 2, but jobs under it
+are preemptible, so a suite that disappears mid-run is infra, not a result.
+
 **Before the job queues, cog re-syncs the workspace**, and that step dominates
 the wall clock when anything in the repo changed: it hashes ~1500 tracked and
 untracked files and ships them one by one, which over a high-latency link can
@@ -183,6 +192,7 @@ Re-submit (do not report, do not attempt a fix) when the log shows:
 | `NRLTA_PREP_FAIL` | Revision checkout or the megatron import guard failed. |
 | `QOSMinGRES` / "violates accounting policy" | Job asked for less than a whole node. |
 | `srun: error`, `slurmstepd: ... CANCELLED / TIME LIMIT` | Preemption, node failure, or a too-short `--time`. |
+| `PENDING` for hours with `Reason=Priority` and `StartTime=Unknown` | Usually the QOS, not a full cluster. Compare `scontrol show job <id>` against a job that scheduled quickly: an identical request on a lower-priority QOS can sit behind hundreds of jobs with no slot even planned. Fix `COG_SLURM_QOS` and re-submit rather than waiting. |
 | `nemo-gym references a workspace ... not a workspace member` | Ran from the synced workspace instead of `/opt/nemo-rl`. |
 | `status: incomplete` on the last test only | Job hit the time limit mid-test. |
 | `[ERROR] HF_TOKEN is not set` | Tokens file not sourced before submit. |
@@ -231,7 +241,13 @@ Fix attempts and baselines only need the failing tests:
 ```
 
 Use a fresh `--run-name` per attempt (`-a1`, `-a2`, …) so artifacts and logs are
-never overwritten and the ledger can point at each one.
+never overwritten and the ledger can point at each one. `run_suite.sh` refuses a
+name it has already submitted under, so on a resumed sweep — where the attempt
+that spent `-a1` happened in a session you no longer remember — read the error
+and bump the suffix rather than reaching for `--reuse-run-name`. The two runs
+would otherwise be different revisions sharing one artifact directory, and
+`ensure_baseline.sh` parses a run with `cat <slurm_log_dir>/*.out`, which
+concatenates both into a single results JSON with no way to tell them apart.
 
 Local edits under `nemo_rl/`, `tests/`, or `examples/` are only picked up in
 worktree mode: add `--nemo-rl-ref worktree --allow-dirty` to a fix-attempt re-run,
@@ -239,6 +255,15 @@ or the job will test the integration branch and your edit will not be there. A f
 inside Megatron-LM or Megatron-Bridge is different again: it must be pushed to a
 branch and tested by pointing `--mcore-ref` at that branch (see
 [megatron-pr-fix-delivery](../megatron-pr-fix-delivery/SKILL.md)).
+
+Edits to the agent's own scripts travel by a different route again, and it is the
+one that silently does nothing. cog ships the checkout named by
+`NEMO_RL_REPO_PATH`, not the directory you are working in, and both
+`prep_container.sh` and `run_suite_remote.sh` execute from that synced copy. If
+the two are different clones, every edit to either script stops reaching the
+cluster with no error to show for it. Diff those scripts between your working
+checkout and `NEMO_RL_REPO_PATH` before the first submit of a sweep, or point the
+config key at the checkout you actually edit.
 
 ## When a run teaches you something this skill does not say
 

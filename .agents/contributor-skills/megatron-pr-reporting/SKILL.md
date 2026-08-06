@@ -77,6 +77,14 @@ seen any of the logs:
   `Megatron InferenceConfig rename; needs NVIDIA-NeMo/RL#2931 (draft) merged.`
 - **`not run`** — why, and what would unblock it.
 
+When one root cause claims several tests — which is the normal shape when a
+dependency breaks at import — write the explanation once and have each cell
+point at it, rather than repeating a paragraph down every row. Put the shared
+part in the report note under the table and keep the cells to what differs.
+`post_tracking_issue.py` already groups rows by known-issue id and renders each
+diagnosis once below; a table where every row carries the same eighty words is
+one nobody reads, including the author it was written for.
+
 Also flag the checkout caveat here when it applies: if the PR changed
 `setup.py`, `pyproject.toml`, or native sources, the run used the image's
 prebuilt dependencies and extensions (see

@@ -63,6 +63,12 @@ accounts `coreai_dlalgo_llm`, import partition `cpu`. NGC enroot creds exist at
   `cluster.gpus_per_node=2` (the extra GPUs sit idle; this still matches CI's
   2-GPU behaviour).
 - `batch` partition: default + MaxTime checks; use `--time 02:00:00`.
+- QOS: cog has no flag for it and reads `COG_SLURM_QOS` from the environment, so
+  export it before submitting. Left unset, the job lands on the cluster default,
+  a much lower scheduling priority than `interactive` for the same request — one
+  pair of jobs sat pending 14 hours that way while identical `interactive` ones
+  started in seconds. `interactive` allows 4 nodes and 8 jobs per user and is
+  preemptible.
 
 ## Secrets / tokens
 
@@ -94,11 +100,12 @@ for this internal cluster, but do not log it to shared files.
 
 ```bash
 # 0. Sanity: profile resolves to nemo_rl + image = nightly
-cog profile --repo ~/RL --run-name nemo-rl-l1-mcore4 --cluster-name oci-hsg
+export COG_SLURM_QOS=interactive
+cog profile --repo ~/temp/RL --run-name nemo-rl-l1-mcore4 --cluster-name oci-hsg
 
 # 1. One-time per image: import the nightly sqsh (~50 GB, ~60 min on cpu).
 #    Cached afterwards (cache_hit: true returns instantly).
-cog prepare-image --repo ~/RL --cluster-name oci-hsg
+cog prepare-image --repo ~/temp/RL --cluster-name oci-hsg
 
 # 2. Submit the functional test. Run it from the image's /opt/nemo-rl, NOT the
 #    synced workspace. Why: NeMo-RL's uv workspace includes member `nemo-gym`,
@@ -112,7 +119,7 @@ cog prepare-image --repo ~/RL --cluster-name oci-hsg
 #    /opt/nemo-rl for uv to resolve the full workspace). The container rootfs is
 #    a writable ephemeral overlay, so the copy is fine.
 cog submit \
-  --repo ~/RL \
+  --repo ~/temp/RL \
   --cluster-name oci-hsg \
   --run-name nemo-rl-l1-mcore4 \
   --command 'mkdir -p /opt/nemo-rl/tests/functional && cp -rf tests/functional/. /opt/nemo-rl/tests/functional/ && cp -f tests/*.py /opt/nemo-rl/tests/ 2>/dev/null || true; cd /opt/nemo-rl && bash tests/functional/L1_Functional_Tests_Megatron_4.sh' \
@@ -132,7 +139,7 @@ The illegal-memory-access is the **first** sub-test, so the L1 script aborts
 there anyway. To iterate faster, target just that script:
 
 ```bash
-cog submit --repo ~/RL --cluster-name oci-hsg --run-name nemo-rl-mcore-gen \
+cog submit --repo ~/temp/RL --cluster-name oci-hsg --run-name nemo-rl-mcore-gen \
   --command 'cp -rf tests/functional/. /opt/nemo-rl/tests/functional/; cd /opt/nemo-rl && uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh' \
   --gpus 4 --nodes 1 --ntasks-per-node 1 --partition batch --time 01:00:00
 ```
@@ -168,8 +175,8 @@ running, e.g. extend the command with
 persistent allocation (avoids re-queuing each time):
 
 ```bash
-cog session start --repo ~/RL --session-handle nrl-dbg --gpus 4 --time 04:00:00 --partition batch
-cog session exec --session-handle nrl-dbg --repo ~/RL \
+cog session start --repo ~/temp/RL --session-handle nrl-dbg --gpus 4 --time 04:00:00 --partition batch
+cog session exec --session-handle nrl-dbg --repo ~/temp/RL \
   --command 'cp -rf tests/functional/. /opt/nemo-rl/tests/functional/ && cp -rf nemo_rl/. /opt/nemo-rl/nemo_rl/; cd /opt/nemo-rl && bash tests/functional/L1_Functional_Tests_Megatron_4.sh' \
   --wait-timeout 3600
 cog session stop --session-handle nrl-dbg

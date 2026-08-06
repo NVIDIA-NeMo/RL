@@ -28,6 +28,15 @@
 #
 # Usage:
 #   ensure_baseline.sh --suite l1 [--force] [--max-age-hours N] [--print-only]
+#                      [--bridge-ref <ref>]
+#
+#   --bridge-ref <ref>   Passed through to run_suite.sh. Needed while a raised but
+#                        unmerged Megatron-Bridge fix is what stands between the
+#                        suite and a usable baseline: a Bridge fix does not ride the
+#                        NeMo-RL integration branch, so without this the baseline
+#                        keeps recording a break that every PR run has already
+#                        worked around, and attribution silently reads off a stack
+#                        nobody is testing against.
 
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -37,6 +46,7 @@ suite=""
 force=0
 print_only=0
 max_age_hours=24
+bridge_ref=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --force) force=1; shift ;;
     --print-only) print_only=1; shift ;;
     --max-age-hours) max_age_hours="$2"; shift 2 ;;
+    --bridge-ref) bridge_ref="$2"; shift 2 ;;
     *) nrlta_die "unknown argument: $1" ;;
   esac
 done
@@ -88,11 +99,16 @@ run_name="nrlta-baseline-${suite}-$(date -u +%Y%m%d-%H%M)"
 nrlta_log "running ${suite} baseline against ${MEGATRON_BASE_BRANCH} (${main_sha:0:8}) as ${run_name}"
 
 # A baseline is a normal suite run whose revision under test happens to be main.
-"${NRLTA_SCRIPT_DIR}/run_suite.sh" \
-  --suite "${suite}" \
-  --mcore-ref "refs/heads/${MEGATRON_BASE_BRANCH}" \
-  --mcore-sha "${main_sha}" \
-  --run-name "${run_name}" || nrlta_log "baseline run exited non-zero (expected when tests fail)"
+baseline_args=(
+  --suite "${suite}"
+  --mcore-ref "refs/heads/${MEGATRON_BASE_BRANCH}"
+  --mcore-sha "${main_sha}"
+  --run-name "${run_name}"
+)
+[[ -n "${bridge_ref}" ]] && baseline_args+=(--bridge-ref "${bridge_ref}")
+
+"${NRLTA_SCRIPT_DIR}/run_suite.sh" "${baseline_args[@]}" \
+  || nrlta_log "baseline run exited non-zero (expected when tests fail)"
 
 slurm_log_dir="${CLUSTER_RUNS_ROOT}/${run_name}/slurm"
 combined="${STATE_DIR}/runs/${run_name}/combined.log"

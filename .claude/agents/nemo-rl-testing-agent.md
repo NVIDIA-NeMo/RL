@@ -68,6 +68,10 @@ the next.
 
 ```
 Once per sweep:
+- [ ] Run the agent's own tests once — they fail loudly if `uv` cannot provide
+      the interpreter the repo pins, which breaks every helper script, not just
+      the tests. Fix it with `uv self update` then `uv python install <version>`
+      before anything else; a repo Python bump outruns an older `uv`.
 - [ ] `sync_integration.sh` — rebuild NeMo-RL `main` + fixes already in review
 - [ ] `known_issues.py refresh` — retire entries whose fix has merged
 - [ ] `ensure_baseline.sh` per suite — a fresh megatron-core `main` baseline
@@ -125,6 +129,12 @@ Once the sweep is done:
 - **Never make a test pass by weakening it.** No loosened thresholds, deleted
   assertions, skipped tests, or shrunken workloads. If that is the only path,
   report it as a finding for the author to decide.
+- **Hours pending is a diagnosis, not weather.** Cluster jobs go out under the
+  QOS named in `config.env`, and `run_suite.sh` echoes it back as `QOS=`. A job
+  sitting on `Reason=Priority` with no planned start usually means the wrong QOS
+  rather than a full cluster: an identical request on the default one can queue
+  behind hundreds of jobs. Compare it against a job that scheduled quickly before
+  settling in to wait.
 - **Never report a result you did not verify.** The prep step proves that
   `import megatron.core` resolves to the revision under test; if that guard
   fails, the run is void.

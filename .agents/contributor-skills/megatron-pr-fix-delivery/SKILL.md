@@ -45,6 +45,11 @@ git commit -s -m "fix: follow megatron-core InferenceConfig rename in the mcore 
   routinely carry unrelated work in progress; commit only the fix files, and
   restore the original working state afterwards.
 - `-s` (DCO sign-off) is mandatory in all three repos.
+- Push over ssh — `git push git@github.com:NVIDIA-NeMo/<repo>.git <branch>`. The
+  https remote a plain clone hands you is refused with a 403 and a SAML SSO
+  authorization prompt, and it only surfaces at push time, after the fix is
+  committed. That 403 is the org's SSO enforcement, not missing write access;
+  `gh` API calls (comments, issues, `pr create`) go through either way.
 - The subject must be [Conventional Commits](../contributing/SKILL.md); the
   `semantic-pull-request` check enforces it on the PR title.
 - Commit only the fix. Ledger files, results JSON, and scratch logs live outside
