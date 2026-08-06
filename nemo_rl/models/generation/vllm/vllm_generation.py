@@ -1238,6 +1238,28 @@ class VllmGeneration(GenerationInterface):
     def _generate_impl(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
+        # NOTE: This sync path has two known gaps relative to the async FT path
+        # (_async_generate_base / _pick_ready_leader_idx):
+        #
+        # 1. Joining-shard bug: run_all_workers_sharded_data dispatches to ALL
+        #    non-dead workers, including shards with status="joining" that still
+        #    hold load_format=dummy (random) weights. This breaks the on-policy
+        #    assumption in the same way fixed for generate_async.
+        #
+        #    The fix is non-trivial because the data is pre-sharded here:
+        #      dp_size = sharding_annotations.get_axis_size("data_parallel")
+        #      sharded_data = data.shard_by_batch_size(dp_size, ...)
+        #    Each worker then selects its slice via its fixed DP coordinate
+        #    (worker_coords["data_parallel"]). To exclude joining shards you
+        #    would need to (a) compute dp_size from ready-only shards, (b)
+        #    produce that many slices, and (c) remap the surviving workers'
+        #    DP coordinates to sequential indices 0..ready_count-1 so their
+        #    slice lookups stay in bounds. Step (c) requires a dynamic
+        #    sharding-annotation view that does not currently exist.
+        #
+        # 2. Largely untested under fault tolerance: AsyncTrajectoryCollector
+        #    (the production async GRPO path) uses generate_async, not generate().
+        #    This path is exercised in colocated and non-FT tests only.
         from ray.exceptions import RayActorError
 
         while self.worker_group.dp_size > 0:
@@ -1332,6 +1354,59 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
+    def _pick_ready_leader_idx(self) -> int:
+        """Return the leader worker index for the next non-joining DP shard.
+
+        Scans up to ``dp_size`` shards in round-robin order starting from
+        ``current_generate_dp_shard_idx``, skipping any shard whose router
+        status is ``"joining"``.  Joining shards hold ``load_format=dummy``
+        (random) weights and have not yet received a weight broadcast; routing
+        generation to them would produce garbage completions that corrupt the
+        GRPO gradient signal.
+
+        Advances ``current_generate_dp_shard_idx`` to the chosen shard so the
+        subsequent round-robin increment in ``_async_generate_base`` stays
+        correct.
+
+        Falls back to the current index if every shard is joining (full-fleet
+        recovery edge case) and logs a warning.  No router means colocated mode
+        — returns the current shard directly.
+        """
+        dp_size = self.worker_group.dp_size
+        if self._router is None:
+            return self.worker_group.get_dp_leader_worker_idx(
+                self.current_generate_dp_shard_idx
+            )
+        for _skip in range(dp_size):
+            leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+                self.current_generate_dp_shard_idx
+            )
+            entry = next(
+                (
+                    e
+                    for e in self._router._shards.values()
+                    if leader_worker_idx in e.worker_indices
+                ),
+                None,
+            )
+            if entry is None or entry.status != "joining":
+                return leader_worker_idx
+            # This shard has stale dummy weights; advance to the next candidate.
+            self.current_generate_dp_shard_idx = (
+                self.current_generate_dp_shard_idx + 1
+            ) % max(1, dp_size)
+
+        # All dp_size shards are joining — full-fleet recovery edge case.
+        # Dispatch anyway; weights will be stale for this batch only.
+        print(
+            "[vllm_generation] _pick_ready_leader_idx: all shards are joining; "
+            "dispatching to joining shard (weights stale — resolves after next refit)",
+            flush=True,
+        )
+        return self.worker_group.get_dp_leader_worker_idx(
+            self.current_generate_dp_shard_idx
+        )
+
     async def _async_generate_base(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -1383,10 +1458,8 @@ class VllmGeneration(GenerationInterface):
             # called mark_workers_dead and reduced dp_size while this
             # coroutine was holding an index valid under the old dp_size.
             self.current_generate_dp_shard_idx %= self.worker_group.dp_size
-            # Determine the leader worker for the current data parallel shard
-            leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-                self.current_generate_dp_shard_idx
-            )
+            # Pick the next shard that has real weights, skipping joining shards.
+            leader_worker_idx = self._pick_ready_leader_idx()
 
             # Run the async method on the selected leader worker
             worker_gen_proxy = self.worker_group.run_single_worker_single_data(
@@ -1713,6 +1786,25 @@ class VllmGeneration(GenerationInterface):
                     self._router.run_update_weights_from_collective()
                 )
                 if not result.get("success"):
+                    # Gen-side NCCL comms may be poisoned: a shard's internal TP
+                    # worker can wedge (NCCL kernel stuck) while the outer
+                    # VllmAsyncGenerationWorker actor stays alive, so the liveness
+                    # probe returns True and no eviction happens.  Without this
+                    # reset, ensure_collective_synced sees an unchanged world size
+                    # and reuses the poisoned comm → every retry times out.
+                    # reset_collective tears down the aborted comms on the gen
+                    # side; invalidating _last_synced_world_size forces a fresh
+                    # init_collective (and new NCCL comms) on the next attempt.
+                    try:
+                        self.reset_collective()
+                    except Exception as _reset_e:  # noqa: BLE001
+                        print(
+                            f"[update_weights_from_collective] reset_collective after "
+                            f"broadcast failure raised {type(_reset_e).__name__}: "
+                            f"{_reset_e} (non-fatal)",
+                            flush=True,
+                        )
+                    self._last_synced_world_size = None
                     raise RuntimeError(
                         f"update_weights_from_collective failed: {result.get('error', 'unknown')}"
                     )

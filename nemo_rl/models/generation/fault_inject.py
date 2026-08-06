@@ -65,7 +65,6 @@ import time
 from typing import Any, Literal, Optional
 
 FaultMode = Literal["cordon", "actor-kill", "ray-kill"]
-TriggerOn = Literal["time", "during_generation"]
 
 
 class FaultInjector:
@@ -81,7 +80,6 @@ class FaultInjector:
         mode: FaultMode,
         target_shard: str,
         trigger_after_s: float = 60.0,
-        trigger_on: TriggerOn = "time",
         recover_after_s: Optional[float] = None,
         repeat_every_s: Optional[float] = None,
         rotate_target: bool = True,
@@ -95,7 +93,6 @@ class FaultInjector:
         self.mode = mode
         self.target_shard = target_shard
         self.trigger_after_s = trigger_after_s
-        self.trigger_on = trigger_on
         self.recover_after_s = recover_after_s
         self.repeat_every_s = repeat_every_s
         self.rotate_target = rotate_target
@@ -143,7 +140,7 @@ class FaultInjector:
 
             print(
                 f"[fault-inject] cycle={cycle_n}: waiting to fire "
-                f"(trigger_on={self.trigger_on}, delay={delay_before_kill}s) "
+                f"(delay={delay_before_kill}s) "
                 f"mode={self.mode} target={self.target_shard} "
                 f"burst_size={this_cycle_burst}",
                 flush=True,
@@ -225,51 +222,8 @@ class FaultInjector:
     # Trigger logic
     # ------------------------------------------------------------------
 
-    def _wait_for_trigger(self, delay_s: float, phase_timeout_s: float = 1800.0) -> None:
-        """Wait according to trigger_on, then sleep delay_s before firing.
-
-        - ``"time"``: plain sleep(delay_s), same as K8s behaviour.
-        - ``"during_generation"``: block until VllmGeneration._generating is
-          set (generate() is in progress), then sleep delay_s within that window.
-          NOTE: This only works with synchronous (non-async) GRPO. With async
-          GRPO, generate() is called from the AsyncTrajectoryCollector Ray actor
-          (a separate process), so the main process's VllmGeneration._generating
-          event is never set and this trigger will block indefinitely. Use
-          ``"time"`` instead when async_grpo.enabled is true.
-        """
-        if self.trigger_on == "time":
-            time.sleep(delay_s)
-            return
-
-        event_name = "_generating"
-        event = getattr(self._gen, event_name, None)
-        if event is None:
-            print(
-                f"[fault-inject] {event_name} event not found on generation object; "
-                f"falling back to time-based trigger",
-                flush=True,
-            )
-            time.sleep(delay_s)
-            return
-
-        print(
-            f"[fault-inject] waiting for phase '{self.trigger_on}' to start "
-            f"(timeout={phase_timeout_s:.0f}s) ...",
-            flush=True,
-        )
-        fired = event.wait(timeout=phase_timeout_s)
-        if not fired:
-            print(
-                f"[fault-inject] timed out waiting for phase '{self.trigger_on}'; "
-                f"proceeding anyway",
-                flush=True,
-            )
-        else:
-            print(
-                f"[fault-inject] phase '{self.trigger_on}' started; "
-                f"sleeping {delay_s}s then firing",
-                flush=True,
-            )
+    def _wait_for_trigger(self, delay_s: float) -> None:
+        """Sleep delay_s before firing."""
         time.sleep(delay_s)
 
     # ------------------------------------------------------------------
@@ -561,13 +515,11 @@ def maybe_launch_fault_injector(
             int(burst_size_random_max_raw) if burst_size_random_max_raw is not None else None
         )
 
-        trigger_on = entry.get("trigger_on", fi_cfg.get("trigger_on", "time"))
         injector = FaultInjector(
             vllm_gen=vllm_gen,
             mode=mode,
             target_shard=target,
             trigger_after_s=trigger,
-            trigger_on=trigger_on,
             recover_after_s=entry.get("recover_after_s", fi_cfg.get("recover_after_s")),
             repeat_every_s=repeat_every_s,
             rotate_target=rotate_target,
