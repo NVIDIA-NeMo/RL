@@ -177,6 +177,106 @@ class TestWaitForReady:
 
 
 # =============================================================================
+# ensure_rayjob_driver_submitted
+# =============================================================================
+
+
+def _rayjob_obj() -> dict:
+    return {
+        "status": {"rayClusterName": "rc-train-abc12", "jobId": "job-123"},
+        "spec": {"entrypoint": "python train.py"},
+    }
+
+
+def _provisioned_raycluster() -> dict:
+    return {
+        "status": {
+            "conditions": [
+                {"type": "RayClusterProvisioned", "status": "True"},
+            ]
+        }
+    }
+
+
+class TestEnsureRayjobDriverSubmitted:
+    def _ready_rayjob(self, monkeypatch) -> None:
+        monkeypatch.setattr(k8s, "get_rayjob", lambda *_args: _rayjob_obj())
+        monkeypatch.setattr(
+            k8s, "get_raycluster", lambda *_args: _provisioned_raycluster()
+        )
+        monkeypatch.setattr(k8s.time, "sleep", lambda _s: None)
+
+    def test_returns_when_operator_already_submitted(self, monkeypatch) -> None:
+        self._ready_rayjob(monkeypatch)
+        monkeypatch.setattr(
+            k8s,
+            "_http_get_jobs",
+            lambda *_args, **_kwargs: [{"submission_id": "job-123"}],
+        )
+        post = MagicMock()
+        monkeypatch.setattr(k8s, "_http_post_job", post)
+
+        out = k8s.ensure_rayjob_driver_submitted(
+            "rc-train", "ns-a", operator_grace_s=1, poll_s=0
+        )
+
+        assert out == "job-123"
+        post.assert_not_called()
+
+    def test_posts_entrypoint_when_operator_misses_submission(
+        self, monkeypatch
+    ) -> None:
+        self._ready_rayjob(monkeypatch)
+        posted: dict[str, str] = {}
+
+        def _post(dashboard, *, entrypoint, submission_id, **_kwargs):
+            posted["dashboard"] = dashboard
+            posted["entrypoint"] = entrypoint
+            posted["submission_id"] = submission_id
+            return 201, "ok"
+
+        monkeypatch.setattr(k8s, "_http_post_job", _post)
+
+        out = k8s.ensure_rayjob_driver_submitted(
+            "rc-train", "ns-a", operator_grace_s=0, poll_s=0
+        )
+
+        assert out == "job-123"
+        assert posted == {
+            "dashboard": "http://rc-train-abc12-head-svc.ns-a.svc.cluster.local:8265",
+            "entrypoint": "python train.py",
+            "submission_id": "job-123",
+        }
+
+    def test_treats_already_exists_post_as_success(self, monkeypatch) -> None:
+        self._ready_rayjob(monkeypatch)
+        monkeypatch.setattr(
+            k8s,
+            "_http_post_job",
+            lambda *_args, **_kwargs: (400, "job already exists"),
+        )
+
+        out = k8s.ensure_rayjob_driver_submitted(
+            "rc-train", "ns-a", operator_grace_s=0, poll_s=0
+        )
+
+        assert out == "job-123"
+
+    def test_raises_when_direct_post_fails(self, monkeypatch) -> None:
+        self._ready_rayjob(monkeypatch)
+        monkeypatch.setattr(
+            k8s,
+            "_http_post_job",
+            lambda *_args, **_kwargs: (503, "dashboard unavailable"),
+        )
+
+        with pytest.raises(RuntimeError, match="failed to POST"):
+            k8s.ensure_rayjob_driver_submitted(
+                "rc-train", "ns-a", operator_grace_s=0, poll_s=0
+            )
+
+
+# =============================================================================
 # delete_configmap
 # =============================================================================
 
