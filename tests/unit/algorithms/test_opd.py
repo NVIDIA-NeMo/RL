@@ -118,7 +118,7 @@ class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
 
     def __init__(self, fill_value=1.0, dp_size=4):
         super().__init__(fill_value=fill_value, dp_size=dp_size)
-        self.received = None
+        self.received: BatchedDataDict | None = None
 
     def get_logprobs(self, data):
         self.received = data
@@ -175,6 +175,8 @@ def test_compute_teacher_logprobs_selects_multimodal_rows_per_teacher():
         },
     )
 
+    assert math_twg.received is not None
+    assert code_twg.received is not None
     assert _received_row_markers(math_twg.received["pixel_values"]) == [0.0, 2.0]
     assert _received_row_markers(code_twg.received["pixel_values"]) == [None, None]
     assert torch.equal(
@@ -206,6 +208,7 @@ def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
         },
     )
 
+    assert twg.received is not None
     assert twg.received["input_ids"].shape[0] == 4
     assert _received_row_markers(twg.received["pixel_values"]) == [7.0] * 4
     assert torch.equal(twg.received["num_frames"], torch.ones(4, 1, dtype=torch.long))
