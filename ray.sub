@@ -585,9 +585,17 @@ TOPO_PROBE_EOF
 # head script, so the head can gate the driver on sandbox readiness. Arbitrary
 # extra mounts are supported via SANDBOX_EXTRA_MOUNTS (e.g. a shared temp dir).
 SANDBOX_PORTS_DIR=""
+SANDBOX_EXPECTED=0
 if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
   mkdir -p "$SANDBOX_PORTS_DIR"
+  # Multi-node: head runs Ray GCS and the sandbox dies there, so launch/gate on
+  # N-1 workers only. Single-node: the head is the only place to run it.
+  if [[ "$SLURM_JOB_NUM_NODES" -gt 1 ]]; then
+    SANDBOX_EXPECTED=$((SLURM_JOB_NUM_NODES - 1))
+  else
+    SANDBOX_EXPECTED=1
+  fi
 fi
 
 # First we start the head of the ray cluster on one of the physical nodes
@@ -771,13 +779,14 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   # Non-interactive: wait for all workers to connect and, if a sandbox is
   # configured, for every sandbox instance to be ready, then run the driver. Poll
   # both in one loop with separate deadlines, checking the shorter sandbox deadline
-  # first, so a stuck sandbox fails at 10 min instead of only after the 30-min
+  # first, so a stuck sandbox fails at 20 min instead of only after the 30-min
   # worker wait.
   WORKER_DEADLINE=\$((SECONDS + 1800))
-  SANDBOX_DEADLINE=\$((SECONDS + 600))
+  SANDBOX_DEADLINE=\$((SECONDS + 1200))
   workers_ready=0
   # Each sandbox task touches SANDBOX_READY_<hostname> when its port comes up (see
   # the sandbox srun below). With no sandbox configured, count it ready up front.
+  # SANDBOX_EXPECTED is N-1 on multi-node (head excluded) and 1 on single-node.
   if [[ -n "$SANDBOX_PORTS_DIR" ]]; then sandbox_ready=0; else sandbox_ready=1; fi
   while true; do
     if [[ "\$workers_ready" -eq 0 ]]; then
@@ -790,17 +799,17 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     fi
     if [[ "\$sandbox_ready" -eq 0 ]]; then
       ready_count=\$(ls -1 "$SANDBOX_PORTS_DIR"/SANDBOX_READY_* 2>/dev/null | wc -l)
-      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$SLURM_JOB_NUM_NODES nodes..."
-      if [[ "\$ready_count" -ge "$SLURM_JOB_NUM_NODES" ]]; then
+      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$SANDBOX_EXPECTED nodes..."
+      if [[ "\$ready_count" -ge "$SANDBOX_EXPECTED" ]]; then
         sandbox_ready=1
-        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All $SLURM_JOB_NUM_NODES sandbox instances ready."
+        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All $SANDBOX_EXPECTED sandbox instances ready."
       fi
     fi
     if [[ "\$workers_ready" -eq 1 ]] && [[ "\$sandbox_ready" -eq 1 ]]; then
       break
     fi
     if [[ "\$sandbox_ready" -eq 0 ]] && (( SECONDS > SANDBOX_DEADLINE )); then
-      echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$SLURM_JOB_NUM_NODES after 10 min)"
+      echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$SANDBOX_EXPECTED after 20 min)"
       touch "$LOG_DIR/ENDED"
       exit 1
     fi
@@ -995,7 +1004,17 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
   fi
 
-  echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
+  # Multi-node: skip the head (Ray GCS); sandbox dies there and blocks the
+  # readiness gate. Single-node: run on the only allocated node.
+  SANDBOX_SRUN_EXCLUDE=()
+  if [[ "$SLURM_JOB_NUM_NODES" -gt 1 ]]; then
+    SANDBOX_SRUN_EXCLUDE=(--exclude="$head_node")
+  fi
+  if [[ "$SLURM_JOB_NUM_NODES" -gt 1 ]]; then
+    echo "[INFO] Starting sandbox sidecars on $SANDBOX_EXPECTED worker nodes (excluding head $head_node; ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
+  else
+    echo "[INFO] Starting sandbox sidecar on the single allocated node (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
+  fi
   srun --output "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --error "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --container-image="$SANDBOX_CONTAINER" \
@@ -1007,7 +1026,8 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --wait=60 \
     --kill-on-bad-exit=1 \
     --overlap \
-    --nodes="$SLURM_JOB_NUM_NODES" \
+    "${SANDBOX_SRUN_EXCLUDE[@]}" \
+    --nodes="$SANDBOX_EXPECTED" \
     --ntasks-per-node=1 \
     --export="$SANDBOX_EXPORTS" \
     bash -xc '
