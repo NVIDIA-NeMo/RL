@@ -47,7 +47,11 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
@@ -98,9 +102,22 @@ def _build_clusters(
     gpus_per_node = cluster_config["gpus_per_node"]
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
+    # Topology-aware placement: pin each role's bundles to NVLink domains so
+    # EP/TP groups stay within one domain. Without this the SC train cluster
+    # fragments EP across NVLink domains and hybrid-ep falls back to MNNVL
+    # fabric handles (cuMemImportFromShareableHandle), which abort with
+    # "invalid resource handle". Mirrors the async path (grpo.py), which passes
+    # segment_size + node_resource_constraints to RayVirtualCluster; SC used to
+    # omit them (so segment_size defaulted to None → placement disabled).
+    segment_size = cluster_config.get("segment_size")
 
     if colocated:
         # Policy + generation share GPUs — one cluster.
+        node_resource_constraints = None
+        if segment_size is not None:
+            node_resource_constraints, _, _ = prepare_segment_topology(
+                segment_size, num_nodes
+            )
         cluster = RayVirtualCluster(
             name="sc_policy_cluster",
             bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
@@ -109,7 +126,11 @@ def _build_clusters(
             max_colocated_worker_groups=1 if backend == "megatron" else 2,
             port_range_low=port_range_low,
             port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
+        if node_resource_constraints is not None:
+            cluster.get_placement_groups()
         return cluster, cluster
 
     # Non-colocated: split node into train + inference clusters.
@@ -138,6 +159,46 @@ def _build_clusters(
             f"train_nodes must be > 0: {num_nodes} - {inference_nodes} = {train_nodes}"
         )
 
+    # Build topology-aware domain constraints so the train EP group and each
+    # inference instance stay within one NVLink domain (see note above).
+    node_resource_constraints = None
+    inference_node_resource_constraints = None
+    inference_segment_size = None
+    if segment_size is not None:
+        topology = get_ray_cluster_topology()
+        required_nodes = train_nodes + inference_nodes
+        assert len(topology) >= required_nodes, (
+            f"Not enough alive Ray nodes: need {required_nodes} "
+            f"(train={train_nodes} + inference={inference_nodes}), "
+            f"but only {len(topology)} alive"
+        )
+        node_resource_constraints, remaining_node_ids, topology = (
+            prepare_segment_topology(
+                segment_size, train_nodes, topology=topology, role="training"
+            )
+        )
+        # Keep each inference instance (TP*PP GPUs) within one NVLink domain too.
+        if backend == "vllm":
+            vllm_cfg = generation_config.get("vllm_cfg", {})
+            gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                "pipeline_parallel_size", 1
+            )
+        else:  # sglang (only vllm/sglang reach here — megatron asserted out above)
+            sglang_cfg = generation_config.get("sglang_cfg", {})
+            gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+        nodes_per_instance = (
+            gpus_per_instance + inference_gpus_per_node - 1
+        ) // inference_gpus_per_node
+        if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+            remaining_topology = {nid: topology[nid] for nid in remaining_node_ids}
+            inference_node_resource_constraints, _, _ = prepare_segment_topology(
+                nodes_per_instance,
+                inference_nodes,
+                topology=remaining_topology,
+                role="inference",
+            )
+            inference_segment_size = nodes_per_instance
+
     train_cluster = RayVirtualCluster(
         name="sc_train_cluster",
         bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
@@ -146,7 +207,13 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=segment_size,
+        node_resource_constraints=node_resource_constraints,
     )
+    # Eagerly create the train placement groups so training claims its
+    # domain-aligned nodes before the inference cluster grabs them.
+    if node_resource_constraints is not None:
+        train_cluster.get_placement_groups()
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
         bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
@@ -155,6 +222,8 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=inference_segment_size,
+        node_resource_constraints=inference_node_resource_constraints,
     )
     return train_cluster, inference_cluster
 

@@ -35,6 +35,8 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 from functools import partial
 from typing import Any, Optional, Union
@@ -65,6 +67,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
@@ -124,7 +127,21 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
+        # Every other algorithm entrypoint (grpo/sft/dpo/ppo/rm/distillation)
+        # logs the resolved config right after building the logger; without this
+        # the SC path leaves the W&B run's config empty.
+        self._logger.log_hyperparams(master_config.model_dump())
         self._timer = Timer()
+
+        # Always-on train-pump trace target. The SC actor's stdout is NOT
+        # forwarded to ray-driver.log, so step-boundary lines (select/accumulate/
+        # finish_train_step/step-close) are otherwise invisible. Write them to a
+        # known file on shared storage (greppable) in addition to stderr.
+        try:
+            _log_dir = master_config.logger["log_dir"]  # type: ignore[index]
+        except Exception:
+            _log_dir = "."
+        self._sc_train_log_path = os.path.join(_log_dir, "sc_train_pump.log")
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -154,6 +171,13 @@ class SingleControllerActor:
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
+
+        # Count of rollouts dropped because generate_and_push failed (e.g. an
+        # empty NeMo-Gym result from an infra flake or a tool-only generation).
+        # A single failure must not tear down the whole run, so it's dropped and
+        # a replacement prompt is dispatched instead; this counter surfaces how
+        # often that happens (also reported in status()).
+        self._dropped_rollouts: int = 0
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
@@ -220,6 +244,7 @@ class SingleControllerActor:
             "trainer_version": self._trainer_version,
             "train_steps": self._train_steps,
             "inflight_rollouts": self._inflight_rollouts,
+            "dropped_rollouts": self._dropped_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
             "epoch": self._current_epoch,
         }
@@ -242,6 +267,21 @@ class SingleControllerActor:
         return result
 
     # ── the three pumps + the inline advantage stage ───────────────────────
+
+    def _sc_train_log(self, msg: str) -> None:
+        """Always-on train-pump trace → stderr + a file on shared storage.
+
+        The SC actor's stdout is not forwarded to ray-driver.log, so these
+        step-boundary lines would otherwise be invisible. stderr tends to
+        forward; the file (``<log_dir>/sc_train_pump.log``) guarantees capture.
+        """
+        line = f"[SC-TRAIN] {msg}"
+        print(line, file=sys.stderr, flush=True)
+        try:
+            with open(self._sc_train_log_path, "a") as _f:
+                _f.write(line + "\n")
+        except Exception:
+            pass
 
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
@@ -274,9 +314,31 @@ class SingleControllerActor:
                 await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
                 )
+                # On success ownership of the buffer permit transfers to the
+                # train pump, which releases it after consuming the committed
+                # group (sampler.evict / post-train buffer.remove).
+            except Exception as e:
+                # A single rollout failing (e.g. an empty NeMo-Gym result from an
+                # infra flake or a tool-only generation) must NOT tear down the
+                # whole run through the TaskGroup. Drop this prompt and release
+                # its buffer permit so the pump dispatches a replacement from the
+                # dataloader. The train pump only ever selects groups that
+                # actually committed, so a drop just means it waits for the next
+                # successful prompt — no accounting desync. Mirrors the async
+                # collector's broad except (trajectory_collector.py), but per
+                # prompt rather than tearing down the whole collector.
+                self._dropped_rollouts += 1
+                self._buffer_capacity.release()
+                print(
+                    "⚠️  rollout_pump: dropped a failed rollout "
+                    f"(total dropped={self._dropped_rollouts}): "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                return
             except BaseException:
-                # On success ownership transfers to the train pump, which
-                # releases this permit after consuming the committed group.
+                # CancelledError (weight-sync pause / shutdown), KeyboardInterrupt,
+                # SystemExit — must propagate; still free the permit we hold.
                 self._buffer_capacity.release()
                 raise
             finally:
@@ -362,6 +424,17 @@ class SingleControllerActor:
         grpo_cfg = self._master_config.grpo
 
         while self._train_steps < grpo_cfg["max_num_steps"]:
+            # nsys wraps the matched workers with capture-range=cudaProfilerApi,
+            # so without this cudaProfilerStart the .nsys-rep files come out
+            # empty. Mirrors grpo.py's per-step hook; run off the event loop
+            # since start/stop_gpu_profiling is a blocking ray.get fan-out.
+            await asyncio.to_thread(
+                maybe_gpu_profile_step, self._trainer, self._train_steps + 1
+            )
+            await asyncio.to_thread(
+                maybe_gpu_profile_step, self._gen, self._train_steps + 1
+            )
+
             version_during_step = self._trainer_version
             groups_dispatched = 0
             min_sample_version = None
@@ -422,6 +495,13 @@ class SingleControllerActor:
                             await asyncio.sleep(0.005)
                             continue
 
+                        self._sc_train_log(
+                            f"select OK: num_groups={num_groups} "
+                            f"(groups_dispatched so far={groups_dispatched}, "
+                            f"need={grpo_cfg['num_prompts_per_step']}, "
+                            f"min={min_prompt_groups} max={max_prompt_groups}, "
+                            f"trainer_version={self._trainer_version})"
+                        )
                         # Release buffer capacity
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
@@ -504,9 +584,22 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
+                    self._sc_train_log(
+                        f"accumulated group: num_groups={num_groups} "
+                        f"groups_dispatched={groups_dispatched}/"
+                        f"{grpo_cfg['num_prompts_per_step']} "
+                        f"trainer_version={self._trainer_version}"
+                    )
 
+                # Inner loop satisfied num_prompts_per_step → close the step.
+                self._sc_train_log(
+                    f"inner-loop exit → finish_train_step START "
+                    f"(groups_dispatched={groups_dispatched}, "
+                    f"trainer_version={self._trainer_version})"
+                )
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
+                self._sc_train_log("finish_train_step DONE (optimizer step complete)")
 
                 step_metrics = aggregate_step_metrics(result)
                 step_metrics.update(
@@ -516,6 +609,11 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                self._sc_train_log(
+                    f"✅ STEP CLOSED: train_steps={self._train_steps} "
+                    f"trainer_version={self._trainer_version} "
+                    f"(entering weight_sync next)"
+                )
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -530,14 +628,32 @@ class SingleControllerActor:
 
             total_time = timing_metrics.get("total_step_time", 0.0)
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
-            if (
-                total_time > 0
-                and total_num_gpus > 0
-                and "global_valid_toks" in step_metrics
-            ):
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                    step_metrics["global_valid_toks"] / total_time / total_num_gpus
-                )
+            if total_time > 0 and total_num_gpus > 0:
+                if "global_valid_toks" in step_metrics:
+                    timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                        step_metrics["global_valid_toks"] / total_time / total_num_gpus
+                    )
+                # Filtering-independent throughput: total tokens processed this step
+                # (prompt + response over ALL sequences, incl. mask_sample-filtered
+                # ones — they are still generated and forward/backward'd, only
+                # loss-masked). Stable numerator vs. valid_tokens_per_sec_per_gpu,
+                # which the filter shrinks step-to-step (global_valid_seqs 10..32).
+                if "total_num_tokens" in step_metrics:
+                    timing_metrics["total_tokens_per_sec_per_gpu"] = (
+                        step_metrics["total_num_tokens"] / total_time / total_num_gpus
+                    )
+
+            # Throughput → sc_train_pump.log (W&B is often disabled here, and the
+            # stdout print below isn't forwarded to ray-driver.log).
+            self._sc_train_log(
+                f"📈 THROUGHPUT step={self._train_steps}: "
+                f"total_step_time={total_time:.1f}s "
+                f"global_valid_toks={step_metrics.get('global_valid_toks', 'n/a')} "
+                f"total_num_tokens={step_metrics.get('total_num_tokens', 'n/a')} "
+                f"valid_tok/gpu/s={timing_metrics.get('valid_tokens_per_sec_per_gpu', 0.0):.1f} "
+                f"total_tok/gpu/s={timing_metrics.get('total_tokens_per_sec_per_gpu', 0.0):.1f} "
+                f"gpus={total_num_gpus}"
+            )
 
             print("\n⏱️  Timing:")
             print(f"  • Total step time: {total_time:.2f}s")
