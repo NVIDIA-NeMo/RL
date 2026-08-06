@@ -126,6 +126,9 @@ class CheckpointingConfig(TypedDict):
     keep_top_k: NotRequired[int]
     ft_keep_latest_k: NotRequired[int | None]
     ft_save_period: NotRequired[int]
+    # Async GRPO only. Disable to regenerate replay trajectories after resume
+    # instead of serializing a potentially very large buffer.
+    save_replay_buffer: NotRequired[bool]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True

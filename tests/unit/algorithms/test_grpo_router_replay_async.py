@@ -109,6 +109,28 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
         assert "routed_experts" not in train_data
 
 
+def test_build_async_grpo_train_data_accepts_all_text_vlm_replay_batch():
+    flat_messages = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2, 3]]),
+            "generation_logprobs": torch.zeros(1, 3),
+            "token_loss_mask": torch.tensor([[0, 1, 1]]),
+        }
+    )
+    input_lengths = torch.tensor([3])
+    repeated_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0])})
+
+    train_data = _build_async_grpo_train_data(
+        flat_messages,
+        input_lengths,
+        repeated_batch,
+        {**_make_async_master_config().policy, "is_vlm": True},
+    )
+
+    assert train_data["input_ids"].tolist() == [[1, 2, 3]]
+    assert train_data.get_multimodal_dict(as_tensors=False) == {}
+
+
 def test_async_grpo_r3_data_plane_directs_to_single_controller():
     master_config = _make_async_master_config(data_plane={"enabled": True})
 

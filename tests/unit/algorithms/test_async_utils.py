@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,10 +42,12 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     MasterConfig,
     _get_next_nemo_gym_task_index,
+    _should_normalize_sparse_replay_media,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -355,6 +357,67 @@ class TestReplayBufferImplCheckpointing:
                     "last_target_weight_already_generated": 1,
                 }
             )
+
+    def test_local_actor_side_checkpoint_preserves_compact_media_and_resume_metadata(
+        self, tmp_path
+    ):
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        compact_media = (
+            PackedTensor(torch.tensor([[1.0, 2.0]]), dim_to_pack=0)
+            .enable_deduplication()
+            .repeat_interleave(2)
+        )
+        source = ReplayBufferImpl(max_size=10)
+        assert (
+            source.add(
+                {
+                    "batch": {"pixel_values": compact_media},
+                    "rollout_metrics": {},
+                    "_ng_task_index": 7,
+                },
+                weight_version=4,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+        assert (
+            source.add(
+                {
+                    "batch": {"data": "stale"},
+                    "rollout_metrics": {},
+                    "_ng_task_index": 41,
+                },
+                weight_version=0,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+
+        assert source.save_to_path(str(checkpoint_path)) == 2
+
+        restored = ReplayBufferImpl(max_size=10)
+        metadata = restored.load_from_path(
+            str(checkpoint_path),
+            num_prompts_per_step=1,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        # Metadata accounts for every saved task index, including trajectories
+        # discarded during resume cleanup, so an index is never reused.
+        assert metadata == {
+            "num_trajectories": 2,
+            "next_ng_task_index": 42,
+        }
+        assert restored.size() == 1
+        restored_state = restored.state_dict()
+        restored_media = restored_state["trajectories"][0]["batch"]["pixel_values"]
+        assert len(restored_media) == 2
+        assert len(restored_media.tensors) == 1
+        torch.testing.assert_close(
+            restored_media.as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
 
 
 class TestReplayBuffer:
@@ -1006,39 +1069,109 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
-    def test_replay_buffer_checkpoint_with_torch_save(self):
-        """Test that state_dict can be saved and loaded with torch.save/load."""
+    def test_replay_buffer_checkpoint_with_torch_save(self, tmp_path):
+        """Actor-side compact replay checkpoint survives a config flag flip."""
         buffer1 = ReplayBuffer.remote(max_size=10)
 
         trajectory = {
             "batch": {
                 "token_ids": torch.tensor([1, 2, 3]),
                 "rewards": torch.tensor([0.5]),
+                "pixel_values": PackedTensor(torch.tensor([[1.0, 2.0]]), dim_to_pack=0)
+                .enable_deduplication()
+                .repeat_interleave(2),
             },
             "rollout_metrics": {"reward": 1.0, "length": 10},
             "timestamp": 12345.0,
+            "_ng_task_index": 11,
         }
         ray.get(
             buffer1.add.remote(trajectory, weight_version=5, target_weight_version=6)
         )
 
-        state = ray.get(buffer1.state_dict.remote())
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            torch.save(state, f.name)
-            checkpoint_path = f.name
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        assert ray.get(buffer1.save_to_path.remote(str(checkpoint_path))) == 1
 
         ray.kill(buffer1)
 
-        loaded_state = torch.load(checkpoint_path, weights_only=False)
         buffer2 = ReplayBuffer.remote(max_size=10)
-        ray.get(buffer2.load_state_dict.remote(loaded_state))
+        restore_metadata = ray.get(buffer2.load_from_path.remote(str(checkpoint_path)))
 
+        assert restore_metadata == {
+            "num_trajectories": 1,
+            "next_ng_task_index": 12,
+        }
         assert ray.get(buffer2.size.remote()) == 1
         debug_info = ray.get(buffer2.get_debug_info.remote())
         assert debug_info["trajectory_versions"] == [5]
         assert debug_info["target_weight_versions"] == [6]
+        restored_state = ray.get(buffer2.state_dict.remote())
+        restored_media = restored_state["trajectories"][0]["batch"]["pixel_values"]
+        assert restored_media.deduplication_enabled
+        assert len(restored_media) == 2
+        assert len(restored_media.tensors) == 1
+        torch.testing.assert_close(
+            restored_media.as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
 
-        os.unlink(checkpoint_path)
+        restored_sparse_batches = [
+            BatchedDataDict(
+                {
+                    "token_ids": torch.tensor([[1]]),
+                    "pixel_values": restored_media.slice([0]),
+                }
+            ),
+            BatchedDataDict({"token_ids": torch.tensor([[2]])}),
+        ]
+        assert _should_normalize_sparse_replay_media(
+            restored_sparse_batches,
+            deduplicate_multimodal_data=False,
+        )
+        restored_sparse = BatchedDataDict.from_batches(
+            restored_sparse_batches,
+            allow_missing_packed_tensors=True,
+        )
+        assert len(restored_sparse["pixel_values"]) == 2
+        assert restored_sparse["pixel_values"].logical_segment_count == 1
+
+        # The representation is self-describing: after a flag-on checkpoint is
+        # restored by a flag-off run, newly collected legacy media can be
+        # concatenated without expanding the restored physical segment.
+        legacy_media = PackedTensor(torch.tensor([[3.0, 4.0]]), dim_to_pack=0)
+        mixed_after_flag_off = BatchedDataDict.from_batches(
+            [
+                {"pixel_values": restored_media},
+                {"pixel_values": legacy_media},
+            ],
+            allow_missing_packed_tensors=True,
+        )
+        assert len(mixed_after_flag_off["pixel_values"].tensors) == 2
+        torch.testing.assert_close(
+            mixed_after_flag_off["pixel_values"].as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0], [3.0, 4.0]]),
+        )
+
+        # The inverse transition is valid too: legacy checkpoint media is
+        # assigned fresh provenance when combined with new compact media.
+        new_compact_media = (
+            PackedTensor(torch.tensor([[5.0, 6.0]]), dim_to_pack=0)
+            .enable_deduplication()
+            .repeat_interleave(2)
+        )
+        mixed_after_flag_on = BatchedDataDict.from_batches(
+            [
+                {"pixel_values": legacy_media},
+                {"pixel_values": new_compact_media},
+            ],
+            allow_missing_packed_tensors=True,
+        )
+        assert len(mixed_after_flag_on["pixel_values"].tensors) == 2
+        torch.testing.assert_close(
+            mixed_after_flag_on["pixel_values"].as_tensor(),
+            torch.tensor([[3.0, 4.0], [5.0, 6.0], [5.0, 6.0]]),
+        )
+
         ray.kill(buffer2)
 
     def test_resume_deadlock_precondition_detectable(self):
@@ -1158,6 +1291,31 @@ class TestAsyncTrajectoryCollector:
         assert status["data_exhausted"] is True
         assert status["errored"] is False
         assert status["running"] is False
+
+    @pytest.mark.asyncio
+    async def test_drain_payload_metrics_returns_collector_interval(self, monkeypatch):
+        collector = self.create_local_collector()
+        collector.master_config.grpo.debug_payload_metrics = True
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector."
+            "drain_multimodal_payload_metrics",
+            lambda: {
+                "payload_bytes/nemo_gym_return/serialized": 180,
+                "payload_bytes/nemo_gym_return/serialized_mean_per_call": 90,
+                "payload_bytes/nemo_gym_return/physical_media": 30,
+                "payload_bytes/nemo_gym_return/logical_media": 150,
+                "payload_counts/nemo_gym_return/calls": 2,
+                "payload_ratio/nemo_gym_return/physical_to_logical": 0.2,
+            },
+        )
+
+        metrics = await collector.drain_payload_metrics()
+
+        assert metrics["payload_counts/nemo_gym_return/calls"] == 2
+        assert metrics["payload_bytes/nemo_gym_return/serialized_mean_per_call"] == 90
+        assert metrics["payload_bytes/nemo_gym_return/physical_media"] == 30
+        assert metrics["payload_bytes/nemo_gym_return/logical_media"] == 150
+        assert metrics["payload_ratio/nemo_gym_return/physical_to_logical"] == 0.2
 
     def test_collection_loop_marks_errored_on_crash(self):
         """A crash sets errored (not data_exhausted) so driver guards fail fast."""
@@ -1423,7 +1581,8 @@ class TestAsyncTrajectoryCollector:
             def slice(self, start, end):
                 return self
 
-            def repeat_interleave(self, repeats):
+            def repeat_interleave(self, repeats, *, share_immutable_media=False):
+                assert not share_immutable_media
                 return self
 
         class FailingThread:
@@ -1487,6 +1646,7 @@ class TestAsyncTrajectoryCollector:
 
         target_weight = 7
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.master_config.grpo.deduplicate_multimodal_data = True
         collector.running = True
 
         def reserve_target(generation_weight_version):
