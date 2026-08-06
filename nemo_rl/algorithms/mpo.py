@@ -46,6 +46,9 @@ class MPOConfig(DPOConfig):
     quality_average_log_probs: bool = False
     reward_shift_momentum: float = 0.99
     reward_shift: float = 0.0
+    # Optional launcher-only boundary for a time-sliced job. Unlike
+    # max_num_steps, this must not change Megatron's scheduler horizon.
+    stop_after_step: int | None = None
 
 
 class MasterConfig(BaseModel, extra="ignore"):
@@ -106,6 +109,16 @@ def _configure_pair_safe_packing(policy_config: PolicyConfig) -> None:
     # microbatch into full THD input. Keeping one atomic pair per microbatch
     # both preserves chosen/rejected alignment and bounds vision-encoder memory.
     packing_config.setdefault("max_sequences_per_bin", 1)
+
+
+def _validate_stop_after_step(config: MPOConfig) -> None:
+    if config.stop_after_step is None:
+        return
+    if not 0 < config.stop_after_step <= config.max_num_steps:
+        raise ValueError(
+            "mpo.stop_after_step must be between 1 and mpo.max_num_steps; "
+            f"got {config.stop_after_step} and {config.max_num_steps}."
+        )
 
 
 def _make_loss_fn(
@@ -171,6 +184,7 @@ def setup(
     MasterConfig,
 ]:
     """Set up MPO without reintroducing the legacy Omni collapse/expand path."""
+    _validate_stop_after_step(master_config.mpo)
     _configure_pair_safe_packing(master_config.policy)
     result = setup_preference_training(
         master_config,  # type: ignore[arg-type]

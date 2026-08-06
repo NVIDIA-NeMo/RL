@@ -580,6 +580,7 @@ def dpo_train(
     val_at_start = dpo_config.val_at_start
     val_at_end = dpo_config.val_at_end
     max_num_epochs = dpo_config.max_num_epochs
+    stop_after_step = getattr(dpo_config, "stop_after_step", None)
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -601,6 +602,15 @@ def dpo_train(
             val_metrics, validation_timings = validation_result
         else:
             val_metrics, validation_timings = None, None
+
+    if stop_after_step is not None and total_steps >= stop_after_step:
+        checkpointer.shutdown()
+        print(
+            f"Configured stop-after step {stop_after_step} was already reached; "
+            "no additional training is needed",
+            flush=True,
+        )
+        return
 
     policy.prepare_for_training()
 
@@ -637,6 +647,9 @@ def dpo_train(
                 is_last_step = total_steps + 1 >= master_config.dpo.max_num_steps or (
                     current_epoch + 1 == max_num_epochs
                     and current_step + 1 == len(train_dataloader)
+                )
+                reached_configured_stop = (
+                    stop_after_step is not None and total_steps + 1 >= stop_after_step
                 )
 
                 # Run validation if it's a validation step or last step with val_at_end
@@ -684,6 +697,7 @@ def dpo_train(
 
                 should_save_by_step = (
                     is_last_step
+                    or reached_configured_stop
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                     or (
@@ -832,6 +846,14 @@ def dpo_train(
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
+                return
+            if reached_configured_stop:
+                checkpointer.shutdown()
+                print(
+                    f"Configured stop-after step {stop_after_step} has been reached, "
+                    "stopping training early",
+                    flush=True,
+                )
                 return
             if total_steps >= master_config.dpo.max_num_steps:
                 checkpointer.shutdown()

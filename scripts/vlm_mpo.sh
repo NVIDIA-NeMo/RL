@@ -38,6 +38,7 @@ WANDB_RESUME="${WANDB_RESUME:-allow}"
 WANDB_PIN_VERSION="${WANDB_PIN_VERSION-0.28.1}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
 MPO_MAX_NUM_STEPS="${MPO_MAX_NUM_STEPS:-}"
+MPO_STOP_AFTER_STEP="${MPO_STOP_AFTER_STEP:-}"
 MPO_MAX_SAMPLES="${MPO_MAX_SAMPLES:-}"
 MPO_TRAIN_GLOBAL_BATCH_SIZE="${MPO_TRAIN_GLOBAL_BATCH_SIZE:-}"
 MPO_CHECKPOINT_MUST_SAVE_BY="${MPO_CHECKPOINT_MUST_SAVE_BY:-}"
@@ -49,6 +50,13 @@ if [[ -n "${MPO_MAX_NUM_STEPS}" ]]; then
     exit 2
   }
   OPTIONAL_OVERRIDES+=" mpo.max_num_steps=${MPO_MAX_NUM_STEPS}"
+fi
+if [[ -n "${MPO_STOP_AFTER_STEP}" ]]; then
+  [[ "${MPO_STOP_AFTER_STEP}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "MPO_STOP_AFTER_STEP must be a positive integer" >&2
+    exit 2
+  }
+  OPTIONAL_OVERRIDES+=" +mpo.stop_after_step=${MPO_STOP_AFTER_STEP}"
 fi
 if [[ -n "${MPO_MAX_SAMPLES}" ]]; then
   [[ "${MPO_MAX_SAMPLES}" =~ ^[1-9][0-9]*$ ]] || {
