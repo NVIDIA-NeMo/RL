@@ -32,6 +32,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDic
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.generation.fleet_health import (
+    GenerationFleetMonitor,
+    HealthyShardSelector,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -44,6 +48,7 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.membership import RefitMembership
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +261,13 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Used to track the round-robin selection of worker groups for generate_async
+        # when no fleet selector is attached.
         self.current_generate_dp_shard_idx = 0
+
+        # Set by attach_fleet_health when async_rl.fleet_health is enabled. While None,
+        # shard selection stays health-blind, which is the historical behaviour.
+        self.fleet_monitor: Optional[GenerationFleetMonitor] = None
+        self.fleet_selector: Optional[HealthyShardSelector] = None
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -622,6 +633,83 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def set_refit_membership(self, membership: "RefitMembership") -> None:
+        """Record which shards take part in refits from now on.
+
+        Rebuilding the communicator is not enough on its own. Every refit dispatch --
+        ``update_weights_from_collective``, ``nccl_reshard_refit`` -- goes through
+        ``run_all_workers_*``, which walks the whole worker group. Left alone they would
+        keep calling the dead shard's Ray actor after the rebuild and fail the refit with
+        RayActorError, so the run would still die, just differently.
+        """
+        self._refit_membership = membership
+
+    def _refit_leader_workers(self) -> list[Any]:
+        """DP leaders that should receive refit calls, in rank order.
+
+        Falls back to every leader when no membership has been recorded, which is the
+        state for the entire life of a run that never loses a shard.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        workers = self.worker_group.workers
+        membership = getattr(self, "_refit_membership", None)
+        if membership is None:
+            per_shard = len(workers) // self.dp_size
+            return [workers[idx * per_shard] for idx in range(self.dp_size)]
+        leaders = []
+        for shard_idx in membership.shard_prefixes:
+            leader_idx = shard_idx * membership.workers_per_shard
+            if leader_idx >= len(workers):
+                raise RuntimeError(
+                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
+                    f"{len(workers)} workers"
+                )
+            leaders.append(workers[leader_idx])
+        return leaders
+
+    def rebuild_collective(
+        self, membership: "RefitMembership", ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Re-init the collective over the surviving shards only.
+
+        Deliberately not ``init_collective`` with a filter.
+        ``run_all_workers_multiple_data`` walks every worker in the group, so it would
+        dispatch to the shard we are rebuilding *because* it is gone -- and calling into
+        a dead Ray actor is the hang this is meant to end. Here the surviving DP leaders
+        are addressed directly.
+
+        Only leaders are called: each one ``collective_rpc``s into its own TP/PP workers,
+        so one Ray call per shard reaches every rank in it.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_collective"
+        )
+        workers = self.worker_group.workers
+        futures: list[ray.ObjectRef] = []
+        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+            leader_idx = shard_idx * membership.workers_per_shard
+            if leader_idx >= len(workers):
+                raise RuntimeError(
+                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
+                    f"{len(workers)} workers"
+                )
+            futures.append(
+                getattr(workers[leader_idx], method_name).remote(
+                    rank_prefix=rank_prefix,
+                    ip=ip,
+                    port=port,
+                    world_size=membership.world_size,
+                    train_world_size=membership.train_world_size,
+                )
+            )
+        return futures
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -754,51 +842,119 @@ class VllmGeneration(GenerationInterface):
             f"outside this method."
         )
 
-        # Determine the leader worker for the current data parallel shard
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
-        )
+        # Pick the data-parallel shard to serve this request. With a fleet selector
+        # attached, a quarantined shard is skipped; without one this is the historical
+        # health-blind round-robin, so an unconfigured run behaves exactly as before.
+        dp_shard_idx = self._next_dp_shard_idx()
+        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_shard_idx)
 
-        # Run the async method on the selected leader worker
-        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name=method_name,
-            worker_idx=leader_worker_idx,
-            data=data,
-            greedy=greedy,
-        )
+        if self.fleet_selector is not None:
+            self.fleet_selector.acquire(dp_shard_idx)
+        try:
+            async for result in self._generate_on_shard(
+                data=data,
+                method_name=method_name,
+                greedy=greedy,
+                dp_shard_idx=dp_shard_idx,
+                leader_worker_idx=leader_worker_idx,
+            ):
+                yield result
+        finally:
+            if self.fleet_selector is not None:
+                self.fleet_selector.release(dp_shard_idx)
 
-        # Increment the round-robin worker group index
+    def attach_fleet_health(
+        self,
+        monitor: GenerationFleetMonitor,
+        selector: HealthyShardSelector,
+    ) -> None:
+        """Route generation through fleet health from now on.
+
+        Args:
+            monitor: Owns shard eligibility and receives observed failures.
+            selector: Picks among the shards the monitor considers serving.
+        """
+        if monitor.shard_count != self.worker_group.dp_size:
+            raise ValueError(
+                f"fleet monitor tracks {monitor.shard_count} shards but the worker "
+                f"group has {self.worker_group.dp_size} data-parallel shards"
+            )
+        self.fleet_monitor = monitor
+        self.fleet_selector = selector
+
+    def _next_dp_shard_idx(self) -> int:
+        """Return the data-parallel shard that should serve the next request."""
+        if self.fleet_selector is not None:
+            return self.fleet_selector.next_shard()
+
+        shard_idx = self.current_generate_dp_shard_idx
         self.current_generate_dp_shard_idx = (
             self.current_generate_dp_shard_idx + 1
         ) % self.worker_group.dp_size
+        return shard_idx
+
+    async def _generate_on_shard(
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        method_name: str,
+        greedy: bool,
+        dp_shard_idx: int,
+        leader_worker_idx: int,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Run one generation on a chosen shard, reporting its failures to the fleet.
+
+        A dead worker surfaces here as a Ray actor error. Reporting it is what lets the
+        next request skip this shard instead of rediscovering the same corpse, and
+        re-raising it as ``GenerationUnavailable`` is what tells the rollout retry policy
+        the prompt is fine and worth re-dispatching.
+        """
+        # Local import: nemo_rl.experience pulls the rollout stack, which must not
+        # become a load-time dependency of the generation backend.
+        from nemo_rl.experience.failures import GenerationUnavailable
 
         timeout_seconds = float(
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )  # Default 15 minutes
 
         try:
-            sample_result_ref = await anext(worker_gen_proxy)
-        except StopAsyncIteration:
-            raise RuntimeError(
-                f"Worker produced no output for the given sample {data}."
+            worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+                method_name=method_name,
+                worker_idx=leader_worker_idx,
+                data=data,
+                greedy=greedy,
             )
 
-        # Materialize the result from Ray's object store. ``anext`` above
-        # resolves when the worker yields, but the object bytes have not yet
-        # crossed the network to the driver — this is where that happens, and
-        # where a Ray deadlock / unreachable worker would manifest, hence the
-        # timeout.
-        try:
-            sample_result = await asyncio.wait_for(
-                sample_result_ref, timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Timeout waiting for worker results after {timeout_seconds}s. "
-                f"For longer sequences, increase timeout by setting: "
-                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
-                f"{int(timeout_seconds * 2)}"
-            )
+            try:
+                sample_result_ref = await anext(worker_gen_proxy)
+            except StopAsyncIteration:
+                raise RuntimeError(
+                    f"Worker produced no output for the given sample {data}."
+                )
+
+            # Materialize the result from Ray's object store. ``anext`` above
+            # resolves when the worker yields, but the object bytes have not yet
+            # crossed the network to the driver — this is where that happens, and
+            # where a Ray deadlock / unreachable worker would manifest, hence the
+            # timeout.
+            try:
+                sample_result = await asyncio.wait_for(
+                    sample_result_ref, timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: "
+                    f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                    f"{int(timeout_seconds * 2)}"
+                )
+        except ray.exceptions.RayError as error:
+            if self.fleet_monitor is not None:
+                self.fleet_monitor.report_failure(dp_shard_idx, error)
+            raise GenerationUnavailable(
+                f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) "
+                f"is unavailable: {type(error).__name__}: {error}"
+            ) from error
 
         # sample_result is a tuple: (original_idx, BatchedDataDict).
         original_idx, result_batch = sample_result
@@ -956,7 +1112,9 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -968,11 +1126,13 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_from_collective"
         )
 
-        # Use run_all_workers_single_data for methods that don't need data
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        # Addressed per surviving leader rather than via run_all_workers_single_data,
+        # which walks the whole group: after a shard is lost that would call its dead
+        # actor and fail the refit, undoing the rebuild that just happened.
+        futures = [
+            getattr(worker, method_name).remote(refit_timeout_s=refit_timeout_s)
+            for worker in self._refit_leader_workers()
+        ]
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
@@ -1024,14 +1184,59 @@ class VllmGeneration(GenerationInterface):
             if self.cfg["vllm_cfg"]["async_engine"]
             else "prepare_nccl_reshard_refit_info"
         )
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            refit_info=refit_info,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        # Surviving leaders only; see update_weights_from_collective. This one matters
+        # doubly: the plan being distributed is the *regenerated* one, sized for the
+        # surviving fleet, and handing it to a shard that is not in that fleet is
+        # meaningless even if its actor happened to answer.
+        futures = [
+            getattr(worker, method_name).remote(refit_info=refit_info)
+            for worker in self._refit_leader_workers()
+        ]
         ray.get(futures)
 
-    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: "RefitMembership",
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Re-init the bulk-path comm groups over the surviving shards only.
+
+        The bulk groups are sized ``train_ranks_per_stage + inference_world_size``, so
+        losing a shard changes their world size as well as the shared
+        ``model_update_group``'s -- both families have to be rebuilt together or the two
+        disagree about who is present.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_nccl_reshard_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_nccl_reshard_comm_group"
+        )
+        workers = self.worker_group.workers
+        futures: list[ray.ObjectRef] = []
+        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+            leader = workers[shard_idx * membership.workers_per_shard]
+            futures.append(
+                getattr(leader, method_name).remote(
+                    rank_prefix=rank_prefix,
+                    pp_ips=pp_ips,
+                    pp_ports=pp_ports,
+                    pp_size=pp_size,
+                    train_ranks_per_stage=train_ranks_per_stage,
+                    sub_world_size=sub_world_size,
+                )
+            )
+        return futures
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1041,11 +1246,11 @@ class VllmGeneration(GenerationInterface):
             if self.cfg["vllm_cfg"]["async_engine"]
             else "nccl_reshard_refit"
         )
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        return futures
+        # Surviving leaders only; see update_weights_from_collective.
+        return [
+            getattr(worker, method_name).remote(refit_timeout_s=refit_timeout_s)
+            for worker in self._refit_leader_workers()
+        ]
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

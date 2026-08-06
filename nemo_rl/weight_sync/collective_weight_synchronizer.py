@@ -28,6 +28,7 @@ No offload/restore steps are needed since policy and generation run on
 separate GPUs with dedicated memory.
 """
 
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -35,6 +36,7 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.membership import plan_refit_membership
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -57,7 +59,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
+        refit_timeout_s: Optional[float] = None,
     ):
+        # None disarms the abort watchdog in every worker, which is the default and
+        # reproduces the pre-existing behaviour exactly.
+        self._refit_timeout_s = refit_timeout_s
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
@@ -77,9 +83,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         with timer_context:
             futures_train = self._policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales
+                kv_scales=kv_scales, refit_timeout_s=self._refit_timeout_s
             )
-            futures_inference = self._generation.update_weights_from_collective()
+            futures_inference = self._generation.update_weights_from_collective(
+                refit_timeout_s=self._refit_timeout_s
+            )
 
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -120,6 +128,61 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             ip, port, world_size, train_world_size=train_world_size
         )
         ray.get(futures_train + futures_inference)
+
+    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+        """Rebuild the refit communicator over the surviving generation shards.
+
+        ``model_update_group`` spans every train and inference rank and was built once,
+        at setup, over the full fleet. The refit is a broadcast on that group, so a
+        missing rank blocks it forever -- inside NCCL, where it produces no error and no
+        progress while Ray still reports every actor healthy. Rebuilding without the dead
+        ranks is what lets the run continue.
+
+        Safe for the broadcast because rank 0 is a trainer and trainers are never
+        excluded, so the root is stable across a rebuild and each receiver still slices
+        the same byte stream locally.
+
+        Rebuild rather than ``shrink``: the pinned NCCL runtime exports
+        ``ncclCommShrink`` but not ``ncclCommGrow``, so a shrunk world could never take a
+        recovered engine back. One mechanism that works in both directions beats two that
+        each work in one.
+        """
+        if not absent_shards:
+            return False
+
+        dp_size = self._generation.worker_group.dp_size
+        surviving = [idx for idx in range(dp_size) if idx not in set(absent_shards)]
+        membership = plan_refit_membership(
+            surviving_shards=surviving,
+            dp_size=dp_size,
+            total_gen_workers=len(self._generation.worker_group.workers),
+            train_world_size=self._train_cluster.world_size(),
+        )
+
+        # A fresh port every time: the rendezvous store for the previous world may still
+        # be bound, and the cluster hands out a unique port per call for exactly this.
+        ip, port = self._train_cluster.get_master_address_and_port()
+        print(
+            f"  refit: rebuilding communicator without shards {sorted(absent_shards)}; "
+            f"world_size {membership.world_size}, port {port}",
+            flush=True,
+        )
+
+        futures_train = self._policy.init_collective(
+            ip,
+            port,
+            membership.world_size,
+            train_world_size=membership.train_world_size,
+        )
+        # Recorded before dispatching, so nothing downstream can fall back to the old
+        # membership. Rebuilding the communicator is only half of it: the refit dispatch
+        # walks the worker group, so without this it keeps calling the dead shard's actor
+        # and the next sync_weights fails with RayActorError -- the run still dies, just
+        # later and with a less obvious cause.
+        self._generation.set_refit_membership(membership)
+        futures_inference = self._generation.rebuild_collective(membership, ip, port)
+        ray.get(futures_train + futures_inference)
+        return True
 
     def shutdown(self) -> None:
         # The NCCL process group lifecycle is managed by Ray actor teardown.

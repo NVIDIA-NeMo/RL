@@ -1,0 +1,358 @@
+#!/bin/bash
+# SIGKILL one of two vLLM generation shards mid-run and assert the job RECOVERS:
+# training continues to completion on the surviving shard, with the refit communicator
+# rebuilt without the dead ranks.
+#
+# The inverse of grpo_dp_single_controller_chaos.sh. That one asserts a bounded, loud
+# failure -- the P0 containment behaviour. This asserts the P3 behaviour: not stopping
+# cleanly, but carrying on.
+#
+# WHY THIS NEEDS >= 3 GPUs, and why it is a CI test rather than a workstation one.
+# Recovery is only observable when losing a shard still leaves a fleet, so generation
+# needs dp_size >= 2 (2 GPUs at tp=1) plus at least one trainer. On a 2-GPU box the
+# only possible split is 1 trainer + 1 generation shard, and killing that shard leaves
+# nothing to recover onto -- the run can only fail, which tests the P0 path again
+# rather than this one. The script self-skips below that threshold instead of
+# pretending to pass.
+#
+# Usage:
+#   bash tests/functional/grpo_sc_generation_shard_recovery.sh
+#   NUM_GPUS=8 bash tests/functional/grpo_sc_generation_shard_recovery.sh
+#   REFIT_TRANSPORT=nccl_reshard bash tests/functional/grpo_sc_generation_shard_recovery.sh
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+PROJECT_ROOT=$(realpath "$SCRIPT_DIR"/../..)
+git config --global --add safe.directory "$PROJECT_ROOT"
+
+set -eou pipefail
+
+EXP_NAME=$(basename "$0" .sh)
+EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+LOG_DIR=$EXP_DIR/logs
+RUN_LOG=$EXP_DIR/run.log
+JSON_METRICS=$EXP_DIR/metrics.json
+export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+
+rm -rf "$EXP_DIR"
+mkdir -p "$EXP_DIR" "$LOG_DIR"
+cd "$PROJECT_ROOT"
+
+NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --list-gpus | wc -l)}
+GEN_GPUS=${GEN_GPUS:-2}          # two shards at tp=1, so one can die and one remains
+
+# Training ranks, rounded DOWN to a power of two.
+#
+# Megatron asserts global_batch_size % (micro_batch_size * data_parallel_size) == 0
+# (num_microbatches_calculator.py). This config inherits train_global_batch_size=512 and
+# train_micro_batch_size=4 from grpo_math_1B.yaml, and tp=pp=cp=1, so dp is just the
+# training GPU count. Taking every remaining GPU therefore breaks on common host sizes:
+#
+#   3 GPUs -> dp=1   512 %  4 = 0   ok
+#   4 GPUs -> dp=2   512 %  8 = 0   ok
+#   5 GPUs -> dp=3   512 % 12 = 8   assertion failure
+#   8 GPUs -> dp=6   512 % 24 = 8   assertion failure
+#  16 GPUs -> dp=14  512 % 56 = 8   assertion failure
+#
+# 8 is the usual CI runner size, so this test would have died in Megatron setup on exactly
+# the machines where it is the only place the >= 3 GPU scenario can run at all -- and with
+# an assertion that says nothing about shard recovery.
+#
+# 512 and 4 are both powers of two, so any power-of-two dp divides. Rounding down leaves
+# some GPUs idle on hosts that are not GEN_GPUS + 2^k, which is the right trade for a test
+# whose point is surviving a shard loss, not throughput.
+TRAIN_GPUS=1
+while (( TRAIN_GPUS * 2 <= NUM_GPUS - GEN_GPUS )); do TRAIN_GPUS=$((TRAIN_GPUS * 2)); done
+USED_GPUS=$((GEN_GPUS + TRAIN_GPUS))
+
+if (( NUM_GPUS < 3 )); then
+    echo "[recovery] SKIP: needs >= 3 GPUs (2 generation shards + >= 1 trainer), found $NUM_GPUS."
+    echo "[recovery] With one generation shard there is nothing to recover onto, so this"
+    echo "[recovery] scenario cannot be distinguished from the fail-fast path."
+    exit 0
+fi
+
+# Enough steps that the kill lands mid-run and enough refits follow it that a rebuilt
+# communicator has to actually carry weights, not just be constructed.
+#
+# 24, not 12: on GB200 a step takes seconds -- the dp test runs its whole job in about
+# 2.5 minutes, nearly all startup -- so 12 steps finished before the harness had even
+# located a shard to kill (job 5886540). The run must still be going well after the kill,
+# or 'it completed' proves nothing about recovery.
+MAX_STEPS=${MAX_STEPS:-24}
+# The kill must not land before the fleet is up and a refit has already succeeded, so
+# that a failure here means recovery broke rather than startup did.
+KILL_AFTER_STEP=${KILL_AFTER_STEP:-3}
+# Generous: a rebuild plus the next refit, not a hang budget. The pass condition is
+# completion, so this only bounds a wedge.
+COMPLETION_DEADLINE_S=${COMPLETION_DEADLINE_S:-1800}
+# Hard bound on ONE actor-discovery attempt. Generous enough for a healthy connect,
+# short enough that ten failures cannot outlast the run.
+ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-20}
+# Both NCCL transports rebuild, by different routes: the plain collective re-inits one
+# group, nccl_reshard also rebuilds its per-PP-stage bulk groups and regenerates the
+# refit plan. Worth running both, since only the reshard path has to keep a plan and a
+# communicator agreeing about the fleet.
+REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
+# Deadline after which a worker aborts its own refit communicator so the controller can
+# rebuild over the survivors. Enabled here in EVERY variant, not just KILL_DURING_REFIT:
+# a kill at a step boundary can still land in the refit by chance -- that is exactly how
+# job 5898311 wedged -- so leaving it off would let the flaky case stay flaky.
+#
+# 60s against a healthy refit of ~1.9s for this model on GB200. Deliberately far above,
+# because firing early aborts a run that was merely slow, while firing late only means a
+# wedge lasts a little longer before it is broken.
+REFIT_TIMEOUT_S=${REFIT_TIMEOUT_S:-60}
+
+# KILL_DURING_REFIT: kill while the refit collective is running, rather than at a step
+# boundary.
+#
+# Defined before the run because it decides an env var the workers read. Timing alone
+# cannot reach this window: a refit here takes ~0.10s, and job 5925668 aimed at it and
+# landed in the RPC epilogue -- the run died of an ActorDiedError from a broadcast that
+# had already completed, which is a different bug and left the abort path unexercised.
+# So the harness holds one refit open instead: it creates HOLD_FILE, every generation
+# worker parks at the top of its receive, the victim is killed there, and removing the
+# file lets the survivors walk into a collective the victim will never join.
+KILL_DURING_REFIT=${KILL_DURING_REFIT:-false}
+HOLD_FILE="$EXP_DIR/hold_refit"
+rm -f "$HOLD_FILE"
+
+echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
+
+# PYTHONUNBUFFERED: the harness detects progress by grepping RUN_LOG, and that only
+# works if the driver actually writes to it. The actor prints with flush=True, but
+# that just reaches the DRIVER -- Ray forwards actor output there, and the driver's
+# own stdout is a redirected file, so Python block-buffers it. Job 5892910 wrote
+# "train step 3/24" at 10:40:38 and the harness did not see it until 10:48:21, by
+# which time the run had finished and there was nothing left to kill.
+#
+# NRL_REFIT_HOLD_FILE is exported in every variant, not just KILL_DURING_REFIT. The file
+# is only ever created by the KILL_DURING_REFIT branch below, and the hook is a single
+# os.path.exists when it is absent, so the other variants are unaffected -- and none of
+# them has to remember to set an env var to stay correct.
+PYTHONUNBUFFERED=1 NRL_REFIT_HOLD_FILE="$HOLD_FILE" \
+uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
+    --config "$PROJECT_ROOT"/examples/configs/grpo_math_1B_megatron_single_controller.yaml \
+    policy.generation.colocated.enabled=false \
+    policy.generation.colocated.resources.num_nodes=1 \
+    policy.generation.colocated.resources.gpus_per_node="$GEN_GPUS" \
+    policy.generation.vllm_cfg.tensor_parallel_size=1 \
+    policy.generation.vllm_cfg.async_engine=true \
+    policy.generation.refit_transport="$REFIT_TRANSPORT" \
+    cluster.gpus_per_node="$USED_GPUS" \
+    grpo.max_num_steps="$MAX_STEPS" \
+    grpo.val_period=-1 \
+    grpo.val_at_start=false \
+    checkpointing.enabled=false \
+    logger.log_dir="$LOG_DIR" \
+    logger.wandb_enabled=false \
+    logger.tensorboard_enabled=true \
+    logger.monitor_gpus=false \
+    ++async_rl.fleet_health.enabled=true \
+    ++async_rl.fleet_health.probe_interval_s=5.0 \
+    ++async_rl.fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
+    ++async_rl.watchdog.interval_s=30.0 \
+    ++async_rl.watchdog.stall_timeout_s=300.0 \
+    "$@" \
+    > "$RUN_LOG" 2>&1 &
+TRAIN_PID=$!
+
+cleanup() {
+    # Before anything else: a hold file surviving this run would park the next run's
+    # refits until NRL_REFIT_HOLD_MAX_S, which reads as a hang with no visible cause.
+    rm -f "$HOLD_FILE" 2>/dev/null || true
+    kill -9 $TRAIN_PID 2>/dev/null || true
+    # vLLM runs the engine in a VLLM::EngineCore child that outlives its parent actor;
+    # leaving it behind holds tens of GB and makes the next run fail for the wrong reason.
+    pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
+    pkill -9 -f "megatron_policy_worker" 2>/dev/null || true
+    ray stop --force >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "[recovery] pid=$TRAIN_PID, waiting for train step $KILL_AFTER_STEP..."
+for _ in $(seq 1 240); do
+    grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" 2>/dev/null && break
+    kill -0 $TRAIN_PID 2>/dev/null || {
+        echo "[recovery] FAIL: job died before the kill"; tail -60 "$RUN_LOG"; exit 1; }
+    sleep 5
+done
+grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" || {
+    echo "[recovery] FAIL: never reached step $KILL_AFTER_STEP"; tail -60 "$RUN_LOG"; exit 1; }
+
+# Kill exactly one generation shard.
+#
+# Ask Ray which processes its generation actors are, rather than inferring it from process
+# titles. `pgrep -f VllmAsyncGenerationWorker` matched the venv child and the launcher shell
+# as well as the actor -- three hits per shard -- and anchoring on Ray's `ray::` title fixed
+# that on a workstation but found ZERO actors on a GB200 cluster (job 5861743: "expected
+# exactly 2 generation actors, found 0" at train step 3, with generation working). Titles
+# are a runtime implementation detail; the GCS actor table is the runtime's own record.
+#
+# This matters more here than in the chaos test: this one asserts the run COMPLETES, so
+# killing a non-actor leaves both shards serving, the run finishes exactly as it would have
+# anyway, and the test reports a pass having never exercised recovery.
+# Retry: the actors are certainly up by train step 3, but a single query races Ray's
+# GCS write and one empty result would abort a run that is otherwise fine.
+# Each attempt is a full ray.init/shutdown of a few seconds, so this loop is also a
+# multi-second delay -- and on fast hardware the remaining steps can finish inside it.
+# Check the job on every attempt so "the run ended" is reported as itself rather than
+# surfacing later as the far more confusing "expected 2 generation actors, found 0".
+GEN_PIDS=()
+ATTEMPT=0
+for _ in $(seq 1 10); do
+    ATTEMPT=$((ATTEMPT + 1))
+    if ! kill -0 $TRAIN_PID 2>/dev/null; then
+        echo "[recovery] FAIL: the run ended before a shard could be killed."
+        echo "[recovery] It reached step $KILL_AFTER_STEP, then finished or died while the"
+        echo "[recovery] harness was still locating the generation actors. If it completed"
+        echo "[recovery] all $MAX_STEPS steps, raise MAX_STEPS or lower KILL_AFTER_STEP --"
+        echo "[recovery] this hardware runs a step in seconds."
+        echo "[recovery] --- helper stderr from the last attempt (job was still alive) ---"
+        echo "${ACTORS_ERR:-<no attempt completed>}" | tail -25 | sed 's/^/[recovery]   /'
+        echo "[recovery] --- last 60 lines of the training log ---"
+        tail -60 "$RUN_LOG"
+        exit 1
+    fi
+    # Keep stderr. Discarding it is why three rounds of this were undiagnosable: the
+    # helper explains itself there, and the loop was throwing that away.
+    # Print the helper's stderr INLINE, into this log.
+    #
+    # Two previous attempts routed it to $EXP_DIR/actors.err and neither produced a file
+    # that survived to be read. A separate artifact is one more thing that has to be
+    # written, kept, and collected; the harness log is already captured, so put it there.
+    # stdout (the pids) goes to a temp file, stderr into a variable.
+    : > "$EXP_DIR/pids.tmp"
+    ACTORS_ERR=$(timeout "$ACTOR_QUERY_TIMEOUT_S" uv run --no-sync python \
+        "$SCRIPT_DIR/_find_generation_actors.py" 2>&1 >"$EXP_DIR/pids.tmp" || true)
+    mapfile -t GEN_PIDS < <(sort -n < "$EXP_DIR/pids.tmp")
+    if (( ${#GEN_PIDS[@]} != GEN_GPUS )) && [[ -n "$ACTORS_ERR" && $ATTEMPT -le 2 ]]; then
+        # Only the first couple of attempts, or a 10-attempt loop floods the log.
+        echo "[recovery] discovery attempt $ATTEMPT found ${#GEN_PIDS[@]} pid(s); helper said:"
+        echo "$ACTORS_ERR" | tail -25 | sed 's/^/[recovery]   /'
+    fi
+    (( ${#GEN_PIDS[@]} == GEN_GPUS )) && break
+    sleep 3
+done
+
+if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
+    echo "[recovery] FAIL: expected exactly $GEN_GPUS generation actors, found ${#GEN_PIDS[@]}"
+    echo "[recovery] this is a harness problem, not a recovery failure -- killing the wrong"
+    echo "[recovery] process would let the run complete and report a false pass."
+    echo "[recovery] --- helper stderr from the LAST in-loop attempt (job was alive) ---"
+    # This is the one that matters: the diagnostic call below runs after the job has gone,
+    # so it can only ever say "cluster not found".
+    echo "${ACTORS_ERR:-<no attempt completed>}" | tail -25 | sed 's/^/[recovery]   /'
+    echo "[recovery] --- what Ray reports now (job already gone) ---"
+    uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
+    echo "[recovery] --- every process with 'eneration' in its command line ---"
+    # Unfiltered on purpose. The previous diagnostic grepped for "ray::" and so printed
+    # nothing precisely when the ray:: assumption was the thing that was wrong.
+    ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//' | grep -i "eneration" | grep -v grep | head -20
+    echo "[recovery] --- last 60 lines of the training log ---"
+    # Without this the log says only "found 0 actors", which reads as a harness bug even
+    # when the real event is the training job ending. That cost a full debug round.
+    tail -60 "$RUN_LOG"
+    exit 1
+fi
+if [[ "$KILL_DURING_REFIT" == "true" ]]; then
+    # Arm the hold, then wait for the workers to report that they are parked inside a
+    # refit. Only then is "killed during the refit" a fact rather than a hope.
+    echo "[recovery] arming the refit hold at $HOLD_FILE"
+    : > "$HOLD_FILE"
+    HELD=false
+    for _ in $(seq 1 1200); do
+        grep -q "refit: holding the receive open" "$RUN_LOG" 2>/dev/null && { HELD=true; break; }
+        kill -0 $TRAIN_PID 2>/dev/null || {
+            echo "[recovery] FAIL: run ended before a refit could be held"
+            tail -40 "$RUN_LOG"; exit 1; }
+        sleep 0.1
+    done
+    if [[ "$HELD" != "true" ]]; then
+        echo "[recovery] FAIL: no worker reported holding a refit within 120s."
+        echo "[recovery] The hook reads NRL_REFIT_HOLD_FILE; without it this test cannot"
+        echo "[recovery] reach the mid-refit window at all and would silently test the"
+        echo "[recovery] step-boundary case instead."
+        tail -60 "$RUN_LOG"; exit 1
+    fi
+    echo "[recovery] a refit is held open; killing the victim inside it"
+fi
+
+VICTIM=${GEN_PIDS[0]}
+VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
+echo "[recovery] killing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
+kill -9 "$VICTIM"
+sleep 2
+if kill -0 "$VICTIM" 2>/dev/null; then
+    echo "[recovery] FAIL: victim $VICTIM survived SIGKILL; nothing was actually killed"
+    exit 1
+fi
+# Release the survivors into a collective the victim will never join. Removed only after
+# the kill is confirmed: dropping it earlier would let them enter the receive alongside a
+# victim that is still alive, and the refit would simply succeed.
+rm -f "$HOLD_FILE"
+KILLED_AT=$(date +%s)
+
+echo "[recovery] waiting up to ${COMPLETION_DEADLINE_S}s for the run to finish..."
+FINISHED=0
+for _ in $(seq 1 $((COMPLETION_DEADLINE_S / 10))); do
+    if ! kill -0 $TRAIN_PID 2>/dev/null; then FINISHED=1; break; fi
+    sleep 10
+done
+ELAPSED=$(( $(date +%s) - KILLED_AT ))
+
+if (( FINISHED == 0 )); then
+    echo "[recovery] FAIL: still running ${ELAPSED}s after the kill -- this is a wedge."
+    # Dump stacks BEFORE tearing anything down. The chaos test has done this for a while;
+    # this one did not, and job 5893807 cost a whole cycle to a wedge whose location could
+    # only be guessed at. "0 rollouts in flight" says the pump stopped, not where.
+    if command -v py-spy >/dev/null 2>&1; then
+        SC_PID=$(pgrep -f "ray::SingleControllerActor" | head -1 || true)
+        if [[ -n "${SC_PID:-}" ]]; then
+            echo "[recovery] --- py-spy dump of SingleControllerActor pid=$SC_PID ---"
+            # --locals matters here: whether the pump is parked on _rollout_permitted, on
+            # the _buffer_capacity semaphore, or in the sampler is exactly the question,
+            # and the frame alone does not distinguish them.
+            py-spy dump --pid "$SC_PID" --locals 2>&1 | head -100 || true
+        fi
+        for name in MegatronPolicyWorker VllmAsyncGenerationWorker; do
+            for pid in $(pgrep -f "ray::${name}" | head -2); do
+                echo "[recovery] --- py-spy dump of ${name} pid=${pid} ---"
+                py-spy dump --pid "$pid" 2>&1 | head -40 || true
+            done
+        done
+    else
+        echo "[recovery] py-spy not available; cannot show where it is wedged"
+    fi
+    echo "[recovery] watchdog lines:"; grep -E "watchdog|stall|inflight" "$RUN_LOG" | tail -20
+    echo "[recovery] fleet/refit activity:"
+    grep -E "fleet: shard|rebuilt refit communicator|_sync_weights: sync done" "$RUN_LOG" | tail -15
+    exit 1
+fi
+
+wait $TRAIN_PID; EXIT_CODE=$?
+echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
+
+if (( EXIT_CODE != 0 )); then
+    echo "[recovery] FAIL: a surviving shard should have carried the run to completion"
+    grep -E "Error|Traceback|NoSurvivingShards|RayActorError" "$RUN_LOG" | tail -20
+    exit 1
+fi
+
+# Completion alone is not enough: a run that never noticed the death would also exit 0.
+# These pin that the death was seen AND that the communicator was actually rebuilt.
+REBUILD_RE="rebuilding (nccl_reshard )?communicators? without shards"
+if ! grep -Eq "$REBUILD_RE" "$RUN_LOG"; then
+    echo "[recovery] FAIL: job completed but never rebuilt the refit communicator."
+    echo "[recovery] Either the death went unnoticed, or a refit was never needed after it."
+    grep -E "refit|fleet|shard" "$RUN_LOG" | tail -20
+    exit 1
+fi
+echo "[recovery] rebuild observed:"; grep -E "$REBUILD_RE" "$RUN_LOG" | head -3
+
+uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
+uv run tests/check_metrics.py "$JSON_METRICS" \
+    "len(data[\"train/reward\"]) == $MAX_STEPS" \
+    'max(data["train/reward"]) > 0'
+
+echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
