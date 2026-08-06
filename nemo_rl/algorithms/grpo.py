@@ -1737,6 +1737,36 @@ def extract_initial_prompt_messages(
     return initial_prompt_message_logs
 
 
+def get_idx_grouping(
+    repeated_batch,
+) -> list:
+    """Build a composite (task_name_id, idx) grouping key used for both dynamic sampling and advantage estimation.
+
+    Grouping by prompt token sequences is broken for multi-turn
+    environments (e.g. tau-bench) where all tasks share the
+    same initial prompt tokens. Grouping by idx alone is broken
+    for multi-dataset batches where idx values are independent
+    per dataset and can collide. task_name disambiguates both:
+       - single-dataset: all task_names are equal, so grouping
+         reduces to idx alone.
+       - multi-dataset: different task_names get different IDs,
+         preventing cross-dataset idx collisions.
+         task_name is None for processors that don't set it (e.g.
+         math); str() normalises that to "None" so sorting is safe.
+
+    """
+    idx_vals = repeated_batch["idx"]
+    task_names = repeated_batch["task_name"]
+    unique_task_names = sorted(set(str(n) for n in task_names))
+    task_name_to_id = {name: i for i, name in enumerate(unique_task_names)}
+    task_ids = [task_name_to_id[str(n)] for n in task_names]
+    prompt_ids_for_adv = torch.tensor(
+        list(zip(task_ids, idx_vals)),
+        dtype=torch.long,
+    )
+    return prompt_ids_for_adv
+
+
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
 ) -> None:
@@ -2748,6 +2778,9 @@ def grpo_train(
                             master_config.grpo.num_generations_per_prompt
                         )
                     )
+
+                    prompt_ids_for_adv = get_idx_grouping(repeated_batch)
+
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -2929,7 +2962,7 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            prompt_ids_for_adv.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -2943,7 +2976,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            prompt_ids_for_adv,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -2979,6 +3012,12 @@ def grpo_train(
                     if not is_batch_complete:
                         continue
 
+                    # dynamic_sampling filtered and sliced repeated_batch to train_prompts_size,
+                    # which is batch_multiplier× smaller than the batch used to compute
+                    # prompt_ids_for_adv above. Recompute so sizes align with rewards.
+                    if master_config.grpo.use_dynamic_sampling:
+                        prompt_ids_for_adv = get_idx_grouping(repeated_batch)
+
                     gen_step_metrics = {}
                     if hasattr(policy_generation, "get_step_metrics"):
                         gen_step_metrics = policy_generation.get_step_metrics()
@@ -2986,23 +3025,6 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
-                    backfill_missing_routed_experts(repeated_batch["message_log"])
-
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
                     del input_ids
                     del baseline
                     del std
@@ -3345,7 +3367,7 @@ def grpo_train(
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
@@ -3509,7 +3531,7 @@ def grpo_train(
                 reduction_op="sum"
             )  # type: ignore
             # track example with high token mult prob error above 1.05
-            if metrics["token_mult_prob_error"] > 1.05:
+            if metrics.get("token_mult_prob_error", 0.0) > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": repeated_batch["length"],
@@ -3594,7 +3616,7 @@ def grpo_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
+                metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
@@ -4441,26 +4463,9 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
-                    backfill_missing_routed_experts(repeated_batch["message_log"])
-
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
-
                     rewards = repeated_batch["total_reward"]
+
+                    prompt_ids_for_adv = get_idx_grouping(repeated_batch)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -4804,7 +4809,7 @@ def async_grpo_train(
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
@@ -5025,7 +5030,7 @@ def async_grpo_train(
                 * master_config.cluster["gpus_per_node"]
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
+                metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config

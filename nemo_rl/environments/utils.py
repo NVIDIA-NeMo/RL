@@ -53,6 +53,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "nemo_gym": {
         "actor_class_fqn": "nemo_rl.environments.nemo_gym.NemoGym",
     },
+    "tau_bench": {
+        "actor_class_fqn": "nemo_rl.environments.tau_bench_environment.TauBenchEnvironment",
+    },
 }
 
 
@@ -99,6 +102,9 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     # merge the last chunks
     if len(chunks) > num_workers:
         chunks[num_workers - 1 :] = [sum(chunks[num_workers - 1 :], [])]
+
+    if len(chunks) < num_workers:
+        chunks.extend([[] for _ in range(num_workers - len(chunks))])
 
     return chunks
 
