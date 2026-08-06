@@ -109,6 +109,7 @@ project-includes = [
   "nemo_rl/data/datasets/utils.py",
   "nemo_rl/data/interfaces.py",
   "nemo_rl/data/multimodal_utils.py",
+  "nemo_rl/data/megatron_sft_packed.py",
   "nemo_rl/data/packing/__init__.py",
   "nemo_rl/data/processors.py",
   "nemo_rl/data_plane/__init__.py",

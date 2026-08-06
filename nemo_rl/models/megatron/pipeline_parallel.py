@@ -14,7 +14,7 @@
 
 """Pipeline parallel utilities for Megatron models."""
 
-from typing import Any, Optional
+from typing import Any, Optional, TypeAlias, TypeVar, cast
 
 import torch
 from megatron.core.parallel_state import (
@@ -23,6 +23,13 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_world_size,
     is_pipeline_last_stage,
 )
+
+LossMetricPayloadT = TypeVar(
+    "LossMetricPayloadT",
+    dict[str, Any],
+    list[dict[str, Any]],
+)
+LossMetricPayload: TypeAlias = dict[str, Any] | list[dict[str, Any]]
 
 
 def broadcast_obj_from_pp_rank(obj: Any) -> Any:
@@ -76,7 +83,49 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     return obj_list[0]
 
 
-def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) -> list:
+def _materialize_loss_metrics_for_object_broadcast(
+    loss_metrics: LossMetricPayload,
+) -> LossMetricPayload:
+    """Convert tensor metrics to host values before object transport."""
+    if isinstance(loss_metrics, dict):
+        is_flat_dict = True
+        metrics: list[dict[str, Any]] = [loss_metrics]
+    else:
+        is_flat_dict = False
+        metrics = loss_metrics
+    materialized = [dict(metric) for metric in metrics]
+    scalar_groups: dict[
+        tuple[torch.device, torch.dtype],
+        list[tuple[int, str, torch.Tensor]],
+    ] = {}
+
+    for metric_index, metric in enumerate(materialized):
+        for key, value in metric.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.numel() != 1:
+                metric[key] = value.detach().cpu()
+                continue
+            group_key = (value.device, value.dtype)
+            scalar_groups.setdefault(group_key, []).append((metric_index, key, value))
+
+    for entries in scalar_groups.values():
+        host_values = (
+            torch.stack([value.detach().reshape(()) for _, _, value in entries])
+            .cpu()
+            .tolist()
+        )
+        for (metric_index, key, _), host_value in zip(entries, host_values):
+            materialized[metric_index][key] = host_value
+
+    if is_flat_dict:
+        return materialized[0]
+    return materialized
+
+
+def broadcast_loss_metrics_from_last_stage(
+    loss_metrics: Optional[LossMetricPayloadT] = None,
+) -> LossMetricPayloadT:
     """Broadcast loss metrics from the last pipeline stage to all stages.
 
     This utility handles the common pattern where loss computation happens on the last
@@ -88,25 +137,39 @@ def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) 
     Returns:
         List of loss metrics on all ranks
     """
+    if get_pipeline_model_parallel_world_size() == 1:
+        if loss_metrics is None:
+            raise ValueError("Last PP stage must provide loss metrics.")
+        return loss_metrics
+
     pp_group = get_pipeline_model_parallel_group()
     last_rank = get_pipeline_model_parallel_last_rank()
 
     if is_pipeline_last_stage(ignore_virtual=True):
-        metrics_to_broadcast = [loss_metrics]
+        if loss_metrics is None:
+            raise ValueError("Last PP stage must provide loss metrics.")
+        host_metrics = cast(
+            LossMetricPayloadT,
+            _materialize_loss_metrics_for_object_broadcast(loss_metrics),
+        )
+        metrics_to_broadcast = [host_metrics]
         torch.distributed.broadcast_object_list(
             metrics_to_broadcast,
             src=last_rank,
             group=pp_group,
         )
-        return loss_metrics
+        return host_metrics
     else:
-        metrics_to_broadcast = [None]
+        metrics_to_broadcast: list[Optional[LossMetricPayloadT]] = [None]
         torch.distributed.broadcast_object_list(
             metrics_to_broadcast,
             src=last_rank,
             group=pp_group,
         )
-        return metrics_to_broadcast[0]
+        received_metrics = metrics_to_broadcast[0]
+        if received_metrics is None:
+            raise RuntimeError("Pipeline loss metric broadcast returned no metrics.")
+        return received_metrics
 
 
 def broadcast_tensors_from_last_stage(
