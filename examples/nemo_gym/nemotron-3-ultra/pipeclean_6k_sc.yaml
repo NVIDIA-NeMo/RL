@@ -62,11 +62,38 @@ policy:
     aux_layer_indices: null
 
   generation:
+    # ---------------------------------------------------------------------------
+    # Weight refit transport. The inherited default (null) broadcasts every full
+    # parameter tensor from training to all 3840 generation ranks. nccl_reshard
+    # instead moves each parameter shard-to-shard between the two parallelism
+    # layouts over NCCL's M2N reshard, so no rank ever materializes a full
+    # tensor. The bulk path covers the MoE FFN projections, which are 97-98% of
+    # the weights at EP=64.
+    #
+    # Declared here rather than passed with `+` because refit_transport is
+    # NotRequired in VllmConfig; with the key present, REFIT_TRANSPORT=null in
+    # launch_6k_pipeclean_sc.sh falls back to the broadcast path.
+    #
+    # Experimental, and it degrades quietly: if the container lacks the nccl4py
+    # M2N integration, xferdtensor.py logs "nccl.m2n.reshard not found" and uses
+    # a Python implementation instead. Check the first run's logs for that line.
+    #
+    # Config already satisfies every constraint in
+    # docs/design-docs/nccl-reshard-refit.md: non-colocated, Megatron train,
+    # vLLM gen, ETP=1, PP=1 with no custom layout, BF16 end to end, and vLLM
+    # expert_parallel_size == tensor_parallel_size (8).
+    # ---------------------------------------------------------------------------
+    refit_transport: nccl_reshard
+
     vllm_cfg:
       # 0.85 -> 0.80. The NCCL staging buffer for update_weights_from_collective
       # grows with generation rank count; a smaller-scale run OOM'd there at
       # 0.85 with 128 generation ranks after running fine at 32. This recipe has
       # 3840. Costs KV cache, so watch generation throughput.
+      #
+      # This is the pressure refit_transport: nccl_reshard removes, so 0.85 may
+      # be recoverable once a reshard run is confirmed healthy. Left at 0.80
+      # so the two only differ in the transport.
       gpu_memory_utilization: 0.80
 
 # =============================================================================

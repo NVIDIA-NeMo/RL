@@ -49,6 +49,7 @@
 #   CONTEXT_PARALLEL_SIZE=16     # default; raise only if CP=16 still OOMs
 #   STREAM_MIN_GROUPS=256        # async_rl.min_groups_for_streaming_train
 #   NUM_STORAGE_UNITS=64         # data_plane.num_storage_units
+#   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
 #   DRY_RUN=1
 #   NUM_TRAIN_NODES / NUM_GEN_NODES / NUM_GYM_NODES  # override the 6K split
 #
@@ -103,6 +104,11 @@ CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"
 STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-256}"
 NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-64}"
 
+# Shard-to-shard weight refit, on by default in this variant. It is still
+# experimental, so keep the escape hatch one env var away: REFIT_TRANSPORT=null
+# restores the full-tensor broadcast that pipeclean_6k.yaml uses.
+REFIT_TRANSPORT="${REFIT_TRANSPORT:-nccl_reshard}"
+
 # Sensible defaults for short 6K hero / pipeclean allocations when unset.
 export EXP_NAME="${EXP_NAME:-ultra-6k-pipeclean-sc}"
 export WALLTIME="${WALLTIME:-4:00:00}"
@@ -111,4 +117,5 @@ exec bash "${SCRIPT_DIR}/ultra_launch.sh" \
   "policy.megatron_cfg.context_parallel_size=${CONTEXT_PARALLEL_SIZE}" \
   "async_rl.min_groups_for_streaming_train=${STREAM_MIN_GROUPS}" \
   "data_plane.num_storage_units=${NUM_STORAGE_UNITS}" \
+  "policy.generation.refit_transport=${REFIT_TRANSPORT}" \
   "$@"
