@@ -14,8 +14,9 @@
 
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -80,6 +81,77 @@ global_fp8_config: FP8Config = None
 fp8_state: FP8State = FP8State()
 
 fp8_patches_applied = False
+
+
+def _str_to_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _set_fp8_config_env(fp8_config: FP8Config) -> None:
+    """Propagate refit settings to vLLM worker child processes."""
+    os.environ["NRL_FP8_USE_WEIGHT_POW2_SCALE"] = str(
+        int(fp8_config.use_weight_pow2_scale)
+    )
+    os.environ["NRL_FP8_USE_ACTIVATION_POW2_SCALE"] = str(
+        int(fp8_config.use_activation_pow2_scale)
+    )
+    os.environ["NRL_FP8_NUM_FIRST_LAYERS_IN_BF16"] = str(
+        fp8_config.num_first_layers_in_bf16
+    )
+    os.environ["NRL_FP8_NUM_LAST_LAYERS_IN_BF16"] = str(
+        fp8_config.num_last_layers_in_bf16
+    )
+    os.environ["NRL_FP8_MODEL_PARALLEL_SIZE"] = (
+        ""
+        if fp8_config.model_parallel_size is None
+        else str(fp8_config.model_parallel_size)
+    )
+    os.environ["NRL_FP8_KV_CACHE_DTYPE"] = fp8_config.kv_cache_dtype
+    os.environ["NRL_FP8_USE_WEIGHTS"] = str(int(fp8_config.use_fp8_weights))
+    os.environ["NRL_FP8_IS_MX"] = str(int(fp8_config.is_mx))
+
+
+def _resolve_fp8_config(model_runner: Any = None) -> FP8Config:
+    """Resolve FP8 settings in vLLM engine and Ray worker child processes."""
+    global global_fp8_config
+    if global_fp8_config is not None:
+        return global_fp8_config
+
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    runner_fp8_config = getattr(vllm_config, "nrl_fp8_cfg", None)
+    if isinstance(runner_fp8_config, FP8Config):
+        global_fp8_config = runner_fp8_config
+        return global_fp8_config
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    model_parallel_size = getattr(parallel_config, "tensor_parallel_size", None)
+    kv_cache_dtype = getattr(cache_config, "cache_dtype", "auto")
+
+    global_fp8_config = FP8Config(
+        use_weight_pow2_scale=_str_to_bool(
+            os.environ.get("NRL_FP8_USE_WEIGHT_POW2_SCALE")
+        ),
+        use_activation_pow2_scale=_str_to_bool(
+            os.environ.get("NRL_FP8_USE_ACTIVATION_POW2_SCALE")
+        ),
+        num_first_layers_in_bf16=int(
+            os.environ.get("NRL_FP8_NUM_FIRST_LAYERS_IN_BF16", "0")
+        ),
+        num_last_layers_in_bf16=int(
+            os.environ.get("NRL_FP8_NUM_LAST_LAYERS_IN_BF16", "0")
+        ),
+        model_parallel_size=int(
+            os.environ.get("NRL_FP8_MODEL_PARALLEL_SIZE") or model_parallel_size or 1
+        ),
+        kv_cache_dtype=os.environ.get("NRL_FP8_KV_CACHE_DTYPE", kv_cache_dtype),
+        use_fp8_weights=_str_to_bool(os.environ.get("NRL_FP8_USE_WEIGHTS"), True),
+        is_mx=_str_to_bool(os.environ.get("NRL_FP8_IS_MX")),
+    )
+    return global_fp8_config
+
 
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
@@ -215,6 +287,13 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
+def ensure_fp8_patches_applied(model_runner: Any = None) -> None:
+    """Install FP8 vLLM monkey patches in the current worker process."""
+    if fp8_patches_applied:
+        return
+    apply_fp8_patches(None, _resolve_fp8_config(model_runner))
+
+
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
@@ -284,10 +363,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "pow2_activation_scaling_factors", False
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
+    _set_fp8_config_env(global_fp8_config)
 
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        # Leave VLLM_USE_DEEP_GEMM_E8M0 unset so vLLM can select the scale
+        # format required by the GPU architecture. Blackwell requires UE8M0;
+        # Hopper can continue using vLLM's non-E8M0 path.
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -304,7 +386,15 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
-        fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+        # Preserve model-specific checkpoint metadata such as DeepSeek V4's
+        # scale_fmt="ue8m0" while keeping NeMo-RL's shared FP8 settings
+        # authoritative for keys that overlap.
+        disk_quantization_config = getattr(config, "quantization_config", None) or {}
+        fp8_block_quant_kwargs = {
+            **disk_quantization_config,
+            **FP8_BLOCK_QUANT_KWARGS,
+        }
+
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
             model = AutoModel.from_config(config)
@@ -439,34 +529,83 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names_list in packed_modules_mapping.items()
-        for original_name in original_names_list
-    }
-    if module_path[-1] in reversed_mapping.keys():
-        module_path[-1] = reversed_mapping[module_path[-1]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
+def _get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
+    packed_modules_mapping = dict(getattr(model, "packed_modules_mapping", {}) or {})
+    if type(model).__name__.lower() == "deepseekv4forcausallm":
+        # vLLM's DeepSeek V4 loader fuses these checkpoint modules without
+        # exposing a packed_modules_mapping for refit's FP8 module lookup.
+        packed_modules_mapping.update(
+            {
+                "attn.fused_wqa_wkv": ["attn.wq_a", "attn.wkv"],
+                "compressor.fused_wkv_wgate": [
+                    "compressor.wkv",
+                    "compressor.wgate",
+                ],
+                "shared_experts.gate_up_proj": [
+                    "shared_experts.w1",
+                    "shared_experts.w3",
+                ],
+                "shared_experts.down_proj": ["shared_experts.w2"],
+            }
+        )
+    return packed_modules_mapping
 
+
+def _replace_packed_module_suffix(
+    module_path: list[str], packed_modules_mapping: dict[str, list[str]]
+) -> list[str]:
+    for fused_name, original_names in packed_modules_mapping.items():
+        fused_parts = fused_name.split(".")
+        for original_name in original_names:
+            original_parts = original_name.split(".")
+            if module_path[-len(original_parts) :] == original_parts:
+                return module_path[: -len(original_parts)] + fused_parts
+    return module_path
+
+
+def _apply_hf_to_vllm_mapping(
+    model: torch.nn.Module, module_path: list[str]
+) -> list[str]:
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is None:
+        return module_path
+
+    orig_to_new_prefix = getattr(mapper, "orig_to_new_prefix", {}) or {}
+    if module_path and module_path[0] in orig_to_new_prefix:
+        module_path[0] = orig_to_new_prefix[module_path[0]]
+
+    orig_to_new_substr = getattr(mapper, "orig_to_new_substr", {}) or {}
+    return [orig_to_new_substr.get(part, part) for part in module_path]
+
+
+def _candidate_module_paths(model: torch.nn.Module, name: str) -> list[list[str]]:
+    candidate_names = [name]
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    map_name = getattr(mapper, "_map_name", None)
+    if map_name is not None:
+        mapped_name = map_name(name)
+        if mapped_name != name:
+            candidate_names.append(mapped_name)
+
+    packed_modules_mapping = _get_packed_modules_mapping(model)
+    module_paths = []
+    for candidate_name in candidate_names:
+        path_parts = candidate_name.split(".")
+        if len(path_parts) < 2:
+            continue
+        module_path = _replace_packed_module_suffix(
+            path_parts[:-1], packed_modules_mapping
+        )
+        module_path = _apply_hf_to_vllm_mapping(model, module_path)
+        module_paths.append(module_path)
+        if module_path[0] != "model" and hasattr(model, "model"):
+            module_paths.append(["model", *module_path])
+    return module_paths
+
+
+def _resolve_module_path(
+    model: torch.nn.Module, module_path: list[str]
+) -> torch.nn.Module | None:
     current_module = model
     try:
         # Traverse the model hierarchy
@@ -494,13 +633,24 @@ def _get_module_from_param_name(model, name: str):
                 current_module = current_module[int(part)]
             else:
                 current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+    except (AttributeError, IndexError, ValueError):
+        return None
     # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
     # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
     if isinstance(current_module, MoERunner):
         return current_module.routed_experts
     return current_module
+
+
+def _get_module_from_param_name(
+    model: torch.nn.Module, name: str
+) -> torch.nn.Module | None:
+    for module_path in _candidate_module_paths(model, name):
+        module = _resolve_module_path(model, module_path)
+        if module is not None:
+            return module
+    print(f"Warning: Could not find module for parameter '{name}'.")
+    return None
 
 
 def _is_fp8_weight(name, model):
@@ -542,8 +692,309 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
+def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
+    if type(model).__name__.lower() == "deepseekv4forcausallm":
+        return True
+    config = getattr(model, "config", None)
+    model_type = str(getattr(config, "model_type", "")).lower()
+    architectures = getattr(config, "architectures", []) or []
+    return "deepseek_v4" in model_type or any(
+        "deepseekv4" in str(architecture).lower() for architecture in architectures
+    )
+
+
+def _format_tensor_for_weight_load_debug(tensor: object) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return repr(type(tensor))
+    return f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}"
+
+
+def _get_param_module_name(param_name: str) -> str | None:
+    for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
+        if param_name.endswith(suffix):
+            return param_name[: -len(suffix)]
+    return None
+
+
+def _get_deepseek_v4_bmm_tp_rank(*objects: object) -> int:
+    for obj in objects:
+        tp_rank = getattr(obj, "tp_rank", None)
+        if tp_rank is not None:
+            return int(tp_rank)
+    # Import lazily because distributed state is unavailable in CPU-only tests.
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return int(get_tensor_model_parallel_rank())
+    except Exception:
+        return 0
+
+
+def _copy_deepseek_v4_bmm_weight(
+    layer: torch.nn.Module,
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+) -> bool:
+    if param.data.ndim != 3 or loaded_weight.ndim != 2:
+        return False
+
+    num_groups, rows_per_group, hidden_size = param.data.shape
+    local_rows = num_groups * rows_per_group
+    tp_rank = _get_deepseek_v4_bmm_tp_rank(param, layer.weight, layer)
+    start = tp_rank * local_rows
+    if loaded_weight.shape[0] < start + local_rows:
+        return False
+    if loaded_weight.shape[1] != hidden_size:
+        return False
+
+    local_weight = loaded_weight.narrow(0, start, local_rows)
+    param.data.copy_(local_weight.view(num_groups, rows_per_group, hidden_size))
+    return True
+
+
+def _copy_deepseek_v4_bmm_scale(
+    layer: torch.nn.Module,
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+) -> bool:
+    if loaded_weight.ndim != 2:
+        return False
+    weight = getattr(layer, "weight", None)
+    if weight is None or weight.data.ndim != 3:
+        return False
+
+    num_groups, rows_per_group, hidden_size = weight.data.shape
+    block_m, block_n = tuple(layer.weight_block_size)
+    local_scale_rows = (num_groups * rows_per_group + block_m - 1) // block_m
+    tp_rank = _get_deepseek_v4_bmm_tp_rank(param, weight, layer)
+    start = tp_rank * local_scale_rows
+    if loaded_weight.shape[0] < start + local_scale_rows:
+        return False
+
+    local_scale = loaded_weight.narrow(0, start, local_scale_rows)
+    if local_scale.shape == param.data.shape:
+        param.data.copy_(local_scale)
+        return True
+    if hidden_size % block_n != 0 or rows_per_group % block_m != 0:
+        return False
+
+    scale_groups = local_scale.view(
+        num_groups,
+        rows_per_group // block_m,
+        hidden_size // block_n,
+    )
+    # Import lazily because DeepGEMM is an optional vLLM runtime dependency.
+    from vllm.utils.deep_gemm import transform_sf_into_required_layout
+
+    scale_groups = transform_sf_into_required_layout(
+        sf=scale_groups,
+        mn=rows_per_group,
+        k=hidden_size,
+        recipe=(1, block_m, block_n),
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+    if scale_groups.shape != param.data.shape:
+        return False
+    param.data.copy_(scale_groups)
+    return True
+
+
+def _try_load_deepseek_v4_bmm_param(
+    module_map: dict[str, torch.nn.Module],
+    param_name: str,
+    param: torch.nn.Parameter,
+    loaded_weight: object,
+) -> bool:
+    if not isinstance(loaded_weight, torch.Tensor):
+        return False
+    module_name = _get_param_module_name(param_name)
+    if module_name is None:
+        return False
+    layer = module_map.get(module_name)
+    if not getattr(layer, "is_bmm", False):
+        return False
+    if param_name.endswith(".weight"):
+        return _copy_deepseek_v4_bmm_weight(layer, param, loaded_weight)
+    if param_name.endswith((".weight_scale", ".weight_scale_inv")):
+        return _copy_deepseek_v4_bmm_scale(layer, param, loaded_weight)
+    return False
+
+
+def _get_moe_module_name(param_name: str) -> str | None:
+    for suffix in (
+        ".w13_weight_scale_inv",
+        ".w2_weight_scale_inv",
+        ".w13_weight_scale",
+        ".w2_weight_scale",
+    ):
+        if param_name.endswith(suffix):
+            return param_name[: -len(suffix)]
+    return None
+
+
+def _get_routed_experts_module(
+    module_map: dict[str, torch.nn.Module], module_name: str
+) -> RoutedExperts | None:
+    layer = module_map.get(module_name)
+    if isinstance(layer, MoERunner):
+        layer = layer.routed_experts
+    return layer if isinstance(layer, RoutedExperts) else None
+
+
+def _get_moe_tp_size_and_rank(layer: RoutedExperts) -> tuple[int, int]:
+    moe_config = layer.moe_config
+    parallel_config = getattr(moe_config, "moe_parallel_config", None)
+    tp_size = getattr(moe_config, "tp_size", None)
+    tp_rank = getattr(moe_config, "tp_rank", None)
+    if tp_size is None:
+        tp_size = getattr(parallel_config, "tp_size", 1)
+    if tp_rank is None:
+        tp_rank = getattr(parallel_config, "tp_rank", 0)
+    return int(tp_size), int(tp_rank)
+
+
+def _try_load_deepseek_v4_moe_block_scale(
+    module_map: dict[str, torch.nn.Module],
+    param_name: str,
+    param: torch.nn.Parameter,
+    loaded_weight: object,
+    weight_name: str | None,
+    shard_id: str | None,
+    expert_id: int | None,
+) -> bool | None:
+    if not isinstance(loaded_weight, torch.Tensor):
+        return None
+    if loaded_weight.ndim != 2 or param.data.ndim != 3:
+        return None
+    if weight_name is None or shard_id is None or expert_id is None:
+        return None
+
+    module_name = _get_moe_module_name(param_name)
+    if module_name is None:
+        return None
+    layer = _get_routed_experts_module(module_map, module_name)
+    if layer is None:
+        return None
+
+    local_expert_id = layer._map_global_expert_id_to_local_expert_id(expert_id)
+    if local_expert_id == -1:
+        return False
+
+    expert_data = param.data[local_expert_id]
+    loaded_weight = loaded_weight.to(device=expert_data.device)
+    tp_size, tp_rank = _get_moe_tp_size_and_rank(layer)
+
+    def tp_shard(scale: torch.Tensor, dim: int) -> torch.Tensor:
+        if tp_size <= 1:
+            return scale
+        full_size = scale.shape[dim]
+        if full_size % tp_size != 0:
+            raise ValueError(
+                "DeepSeek V4 MoE scale refit cannot TP-shard "
+                f"dim={dim} size={full_size} across tp_size={tp_size} "
+                f"for {param_name}"
+            )
+        shard_size = full_size // tp_size
+        return scale.narrow(dim, tp_rank * shard_size, shard_size)
+
+    if "w13_weight_scale" in param_name:
+        if shard_id not in ("w1", "w3"):
+            return None
+        per_projection_rows = expert_data.shape[0] // 2
+        if loaded_weight.shape[0] != per_projection_rows:
+            loaded_weight = tp_shard(loaded_weight, dim=0)
+        if loaded_weight.shape != (per_projection_rows, expert_data.shape[1]):
+            raise ValueError(
+                "DeepSeek V4 MoE w13 scale refit shape mismatch: "
+                f"param={tuple(expert_data.shape)}, "
+                f"loaded={tuple(loaded_weight.shape)}, shard_id={shard_id}"
+            )
+        row_offset = 0 if shard_id == "w1" else per_projection_rows
+        expert_data.narrow(0, row_offset, per_projection_rows).copy_(loaded_weight)
+        return True
+
+    if "w2_weight_scale" in param_name:
+        if shard_id != "w2":
+            return None
+        if loaded_weight.shape != expert_data.shape:
+            loaded_weight = tp_shard(loaded_weight, dim=1)
+        if loaded_weight.shape != expert_data.shape:
+            raise ValueError(
+                "DeepSeek V4 MoE w2 scale refit shape mismatch: "
+                f"param={tuple(expert_data.shape)}, "
+                f"loaded={tuple(loaded_weight.shape)}"
+            )
+        expert_data.copy_(loaded_weight)
+        return True
+    return None
+
+
+def _wrap_deepseek_v4_weight_loaders_for_refit(
+    model: torch.nn.Module,
+) -> list[tuple[torch.nn.Parameter, Any]]:
+    original_weight_loaders: list[tuple[torch.nn.Parameter, Any]] = []
+    module_map = dict(model.named_modules())
+    for param_name, param in model.named_parameters():
+        weight_loader = getattr(param, "weight_loader", None)
+        if weight_loader is None:
+            continue
+
+        def refit_weight_loader(
+            *args: Any,
+            _param_name: str = param_name,
+            _param: torch.nn.Parameter = param,
+            _weight_loader: Any = weight_loader,
+            **kwargs: Any,
+        ) -> Any:
+            loaded_weight = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
+            weight_name = args[2] if len(args) > 2 else kwargs.get("weight_name")
+            shard_id = args[3] if len(args) > 3 else kwargs.get("shard_id")
+            expert_id = args[4] if len(args) > 4 else kwargs.get("expert_id")
+            return_success = (
+                args[5] if len(args) > 5 else kwargs.get("return_success", False)
+            )
+            try:
+                moe_scale_result = _try_load_deepseek_v4_moe_block_scale(
+                    module_map=module_map,
+                    param_name=_param_name,
+                    param=_param,
+                    loaded_weight=loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                if moe_scale_result is not None:
+                    return moe_scale_result if return_success else None
+                if _try_load_deepseek_v4_bmm_param(
+                    module_map, _param_name, _param, loaded_weight
+                ):
+                    return True if return_success else None
+                return _weight_loader(*args, **kwargs)
+            except Exception:
+                print(
+                    "NeMo-RL FP8 refit failed while loading vLLM parameter "
+                    f"{_param_name}: "
+                    f"param {_format_tensor_for_weight_load_debug(_param)}, "
+                    f"loaded {_format_tensor_for_weight_load_debug(loaded_weight)}"
+                )
+                raise
+
+        original_weight_loaders.append((param, weight_loader))
+        setattr(param, "weight_loader", refit_weight_loader)
+    return original_weight_loaders
+
+
+def _restore_weight_loaders(
+    original_weight_loaders: list[tuple[torch.nn.Parameter, Any]],
+) -> None:
+    for param, weight_loader in original_weight_loaders:
+        setattr(param, "weight_loader", weight_loader)
+
+
 def load_weights(weights, model_runner):
-    global global_fp8_config
+    ensure_fp8_patches_applied(model_runner)
+    fp8_config = _resolve_fp8_config(model_runner)
     weights_quantized = []
     model = model_runner.model
 
@@ -587,21 +1038,30 @@ def load_weights(weights, model_runner):
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+                fp8_config=fp8_config,
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if global_fp8_config.is_mx:
+        if fp8_config.is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    if not _is_deepseek_v4_model(model):
+        model.load_weights(weights_quantized)
+        return
+
+    original_weight_loaders = _wrap_deepseek_v4_weight_loaders_for_refit(model)
+    try:
+        model.load_weights(weights_quantized)
+    finally:
+        _restore_weight_loaders(original_weight_loaders)
 
 
 def cast_tensor_to_fp8_blockwise(
     data_hp,
     weight_block_size,
+    fp8_config: FP8Config | None = None,
 ):
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
@@ -646,8 +1106,9 @@ def cast_tensor_to_fp8_blockwise(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
-    global global_fp8_config
-    if global_fp8_config.use_weight_pow2_scale:
+    if fp8_config is None:
+        fp8_config = _resolve_fp8_config()
+    if fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
         exponent = torch.clamp(exponent, min=-127, max=127) + 127
@@ -781,6 +1242,99 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
     return entries
 
 
+def _assign_param_data(param, value: torch.Tensor) -> None:
+    """Update tensor data while preserving the Parameter and its weight loader."""
+    if param.data.shape == value.shape and param.data.dtype == value.dtype:
+        if param.data.data_ptr() != value.data_ptr():
+            param.data.copy_(value)
+    else:
+        param.data = value
+
+
+def _iter_refit_e8m0_fp8_linears(
+    model: torch.nn.Module,
+) -> Iterator[torch.nn.Module]:
+    # Import lazily because DeepGEMM is an optional vLLM runtime dependency.
+    from vllm.utils.deep_gemm import should_use_deepgemm_for_fp8_linear
+
+    for layer in model.modules():
+        if not isinstance(layer, LinearBase) or getattr(layer, "is_bmm", False):
+            continue
+        weight = getattr(layer, "weight", None)
+        orig_dtype = getattr(layer, "orig_dtype", None)
+        if (
+            getattr(layer, "weight_block_size", None) is None
+            or weight is None
+            or weight.data.ndim != 2
+            or orig_dtype is None
+        ):
+            continue
+        if should_use_deepgemm_for_fp8_linear(orig_dtype, tuple(weight.shape)):
+            yield layer
+
+
+def _reset_e8m0_fp8_linear_scales_for_refit(model: torch.nn.Module) -> None:
+    for layer in _iter_refit_e8m0_fp8_linears(model):
+        block_m, block_n = tuple(layer.weight_block_size)
+        rows = (layer.weight.shape[0] + block_m - 1) // block_m
+        cols = (layer.weight.shape[1] + block_n - 1) // block_n
+        for scale_name in ("weight_scale_inv", "weight_scale"):
+            scale = getattr(layer, scale_name, None)
+            if scale is None:
+                continue
+            raw_shape = (rows, cols)
+            if scale.data.shape == raw_shape and scale.data.dtype == torch.float32:
+                continue
+            scale.data = torch.empty(
+                raw_shape, dtype=torch.float32, device=scale.data.device
+            )
+
+
+def _reset_e8m0_fp8_moe_scales_for_refit(model: torch.nn.Module) -> None:
+    for layer in model.modules():
+        if not isinstance(layer, RoutedExperts):
+            continue
+        block = getattr(layer, "weight_block_size", None) or [128, 128]
+        block_m, block_n = int(block[0]), int(block[1])
+        for prefix, weight in (
+            ("w13", getattr(layer, "w13_weight", None)),
+            ("w2", getattr(layer, "w2_weight", None)),
+        ):
+            if weight is None or weight.data.ndim != 3:
+                continue
+            num_experts, output_dim, input_dim = weight.data.shape
+            raw_shape = (
+                num_experts,
+                (output_dim + block_m - 1) // block_m,
+                (input_dim + block_n - 1) // block_n,
+            )
+            for scale_suffix in ("weight_scale_inv", "weight_scale"):
+                scale = getattr(layer, f"{prefix}_{scale_suffix}", None)
+                if scale is None:
+                    continue
+                if scale.data.shape == raw_shape and scale.data.dtype == torch.float32:
+                    continue
+                scale.data = torch.empty(
+                    raw_shape,
+                    dtype=torch.float32,
+                    device=scale.data.device,
+                )
+
+
+def prepare_fp8_model_for_refit(model_runner: Any) -> None:
+    """Restore refit-loadable scales before a streamed FP8 weight update."""
+    ensure_fp8_patches_applied(model_runner)
+    # Import lazily because DeepGEMM is an optional vLLM runtime dependency.
+    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+    if not is_deep_gemm_e8m0_used():
+        return
+    model = model_runner.model
+    _reset_e8m0_fp8_linear_scales_for_refit(model)
+    if _is_deepseek_v4_model(model):
+        _reset_e8m0_fp8_moe_scales_for_refit(model)
+
+
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
 # Patches this method to not create new torch.nn.Parameter for layer weights
 # to maintain weight loaders.
@@ -795,25 +1349,37 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         should_use_deepgemm_for_fp8_linear,
     )
 
+    is_bmm = getattr(layer, "is_bmm", False)
+    if is_bmm and layer.weight.data.ndim == 3:
+        # The DSv4 refit loader writes BMM weights and scales directly into
+        # DeepGEMM's runtime layout.
+        return
+
     # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
     # requantize the weight and input to the specific scale
     # at the same time.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight.shape
+        layer.orig_dtype, tuple(layer.weight.shape)
     )
     if should_use_deepgemm:
-        # vLLM 0.25 keeps the block scale under weight_scale_inv (see
-        # Fp8BlockScaledMMLinearKernel/DeepGemm process_weights_after_loading).
+        bmm_batch_size = getattr(layer, "bmm_batch_size", 0)
+        scale_param = getattr(layer, "weight_scale", None)
+        if scale_param is None:
+            scale_param = layer.weight_scale_inv
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
             wq=layer.weight.data,
-            ws=layer.weight_scale_inv.data,
+            ws=scale_param.data,
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
+            is_bmm=is_bmm,
+            bmm_batch_size=bmm_batch_size,
         )
-        # This is the only part we change from the original function.
-        # Instead of creating new torch.nn.Parameter, we update the data in place.
-        layer.weight.data.copy_(dg_weight)
-        layer.weight_scale_inv.data.copy_(dg_weight_scale)
+        _assign_param_data(layer.weight, dg_weight)
+        _assign_param_data(scale_param, dg_weight_scale)
+        for scale_name in ("weight_scale", "weight_scale_inv"):
+            mirrored_scale = getattr(layer, scale_name, None)
+            if mirrored_scale is not None and mirrored_scale is not scale_param:
+                _assign_param_data(mirrored_scale, dg_weight_scale)
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -1096,11 +1662,10 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    # Use .copy_() to preserve weight_loader attribute on Parameters.
-    layer.w13_weight.copy_(w13)
-    layer.w2_weight.copy_(w2)
-    getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-    getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    _assign_param_data(layer.w13_weight, w13)
+    _assign_param_data(layer.w2_weight, w2)
+    _assign_param_data(getattr(layer, f"w13_{self.weight_scale_name}"), w13_scale)
+    _assign_param_data(getattr(layer, f"w2_{self.weight_scale_name}"), w2_scale)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
     # but without replace_parameter). Gate on is None, not hasattr, because
