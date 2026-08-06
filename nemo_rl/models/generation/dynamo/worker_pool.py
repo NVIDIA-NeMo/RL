@@ -161,6 +161,7 @@ class FixedDynamoWorkerPool:
                     manager_env=self._manager_env,
                     startup_timeout_s=self._startup_timeout_s,
                     seed=pg_index * 1024 + group_index,
+                    cleanup_reservation=reservation_handles[0],
                 )
                 self._workers.append(worker)
                 self._cleanup_reservations.append(reservation_handles[0])
@@ -208,21 +209,17 @@ class FixedDynamoWorkerPool:
         return [dict(item) for item in current]
 
     def shutdown(self) -> None:
-        for worker, reservation, metadata in zip(
+        for worker, reservation in zip(
             self._workers,
             self._cleanup_reservations,
-            self._metadata,
             strict=True,
         ):
             try:
                 ray.get(worker.shutdown.remote(), timeout=30)
             except Exception:
-                process_pid = metadata.get("process_pid")
-                if process_pid is None:
-                    continue
                 try:
                     ray.get(
-                        reservation.cleanup_process_group.remote(process_pid),
+                        reservation.cleanup_process_group.remote(),
                         timeout=15,
                     )
                 except Exception:

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 from pydantic import ValidationError
 
@@ -139,6 +141,34 @@ def test_config_rejects_unsupported_parallelism_and_precision(vllm_cfg, match) -
     config = _config()
     config["vllm_cfg"].update(vllm_cfg)
     with pytest.raises(ValidationError, match=match):
+        DynamoConfig.model_validate(config)
+
+
+def test_config_classifies_managed_logprobs_and_runtime_fields() -> None:
+    config = _config()
+    config["vllm_cfg"].update(
+        {
+            "logprobs_mode": "processed_logprobs",
+            "use_deep_gemm": False,
+            "num_first_layers_in_bf16": 0,
+            "num_last_layers_in_bf16": 0,
+        }
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DynamoConfig.model_validate(config)
+    assert caught == []
+
+    config["vllm_cfg"]["logprobs_mode"] = "raw_logprobs"
+    with pytest.raises(ValidationError, match="processed_logprobs"):
+        DynamoConfig.model_validate(config)
+
+
+def test_config_warns_only_for_active_unsupported_fields() -> None:
+    config = _config()
+    config["vllm_cfg"]["skip_tokenizer_init"] = True
+
+    with pytest.warns(UserWarning, match="skip_tokenizer_init"):
         DynamoConfig.model_validate(config)
 
 

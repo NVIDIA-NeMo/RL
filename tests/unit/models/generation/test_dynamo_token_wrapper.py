@@ -476,13 +476,14 @@ def test_prepare_dynamo_chat_completion_request_rejects_multiple_choices() -> No
         )
 
 
-def test_validate_engine_data_requires_prompt_and_completion_tokens() -> None:
+def test_validate_engine_data_requires_prompt_completion_and_logprobs() -> None:
     _validate_engine_data(
         {
             "nvext": {
                 "engine_data": {
                     "prompt_token_ids": [1, 2],
                     "completion_token_ids": [3],
+                    "completion_logprobs": [-0.25],
                 }
             }
         }
@@ -491,9 +492,38 @@ def test_validate_engine_data_requires_prompt_and_completion_tokens() -> None:
     with pytest.raises(ValueError, match="engine_data"):
         _validate_engine_data({"nvext": {}})
     with pytest.raises(ValueError, match="prompt_token_ids"):
-        _validate_engine_data({"nvext": {"engine_data": {"completion_token_ids": []}}})
+        _validate_engine_data(
+            {
+                "nvext": {
+                    "engine_data": {
+                        "completion_token_ids": [],
+                        "completion_logprobs": [],
+                    }
+                }
+            }
+        )
     with pytest.raises(ValueError, match="completion_token_ids"):
-        _validate_engine_data({"nvext": {"engine_data": {"prompt_token_ids": []}}})
+        _validate_engine_data(
+            {
+                "nvext": {
+                    "engine_data": {
+                        "prompt_token_ids": [],
+                        "completion_logprobs": [],
+                    }
+                }
+            }
+        )
+    with pytest.raises(ValueError, match="completion_logprobs"):
+        _validate_engine_data(
+            {
+                "nvext": {
+                    "engine_data": {
+                        "prompt_token_ids": [],
+                        "completion_token_ids": [],
+                    }
+                }
+            }
+        )
 
 
 def test_inject_gym_token_metadata_validates_and_populates_message() -> None:
@@ -501,13 +531,14 @@ def test_inject_gym_token_metadata_validates_and_populates_message() -> None:
         "choices": [
             {
                 "message": {"role": "assistant", "content": "answer"},
-                "logprobs": {"token_logprobs": [-0.25, -0.5]},
+                "logprobs": None,
             }
         ],
         "nvext": {
             "engine_data": {
                 "prompt_token_ids": [1, 2, 3],
                 "completion_token_ids": [4, 5],
+                "completion_logprobs": [-0.25, -0.5],
             }
         },
     }
@@ -522,7 +553,7 @@ def test_inject_gym_token_metadata_validates_and_populates_message() -> None:
         "generation_log_probs": [-0.25, -0.5],
     }
 
-    response["choices"][0]["logprobs"]["token_logprobs"] = [-0.25]
+    response["nvext"]["engine_data"]["completion_logprobs"] = [-0.25]
     with pytest.raises(ValueError, match="1 generation log probabilities for 2"):
         _inject_gym_token_metadata(response)
 

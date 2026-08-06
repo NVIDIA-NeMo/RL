@@ -246,7 +246,8 @@ class DynamoGeneration(GenerationInterface):
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        return True
+        """Invalidate cached rollout state after synchronous generation."""
+        return self.invalidate_kv_cache()
 
     def get_logger_metrics(self) -> dict[str, Any]:
         """Return per-worker Dynamo metric timelines for generation logging."""

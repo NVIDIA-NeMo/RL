@@ -49,14 +49,16 @@ cache mode determines where it runs.
 
 `BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
 It contains only `ai-dynamo[vllm]==1.3.0.post1`, its pinned vLLM 0.23.0, etcd,
-and NATS. NeMo-RL's normal Ray and engine environments are unchanged.
+and NATS. NeMo-RL's normal Ray and engine environments are unchanged; the
+standard NeMo-RL vLLM environment currently uses vLLM 0.25.1.
 
 vLLM 0.23.0 predates PR #44814, which fixes layerwise reload accounting for
 composed loaders. The installer asserts the exact vLLM version, checks and
 applies the backport, and records upstream merge commit
 `c9e5bf813530fb9ce06024e075da0f520b0718c8` in
 `/opt/dynamo_venv/VLLM_BACKPORTS`. Remove the backport only after Dynamo pins a
-vLLM release containing that fix.
+vLLM release containing that fix. At that point delete the patch, application
+logic, marker assertion, and backport text rather than rebasing the patch.
 
 See [Managed Dynamo generation on Slurm](../guides/dynamo-generation.md) for
 build, configuration, and launch instructions.

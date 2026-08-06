@@ -47,6 +47,9 @@ from nemo_rl.utils.packed_tensor import (
 class DynamoGpuReservation:  # pragma: no cover
     """Hold one placement-group GPU while a sibling actor owns the engine."""
 
+    def __init__(self) -> None:
+        self._process_pid: int | None = None
+
     def metadata(self) -> dict[str, Any]:
         gpu_ids = [int(float(gpu_id)) for gpu_id in ray.get_gpu_ids()]
         if len(gpu_ids) != 1:
@@ -55,17 +58,32 @@ class DynamoGpuReservation:  # pragma: no cover
             )
         return {"node_ip": _get_node_ip_local(), "gpu_id": gpu_ids[0]}
 
-    def cleanup_process_group(self, pid: int) -> bool:
+    def register_process_group(self, pid: int) -> bool:
+        """Record the colocated worker process group for failure cleanup."""
+        if self._process_pid not in (None, pid):
+            raise RuntimeError(
+                "Dynamo GPU reservation already owns process group "
+                f"{self._process_pid}; cannot register {pid}."
+            )
+        self._process_pid = pid
+        return True
+
+    def cleanup_process_group(self) -> bool:
         """Best-effort cleanup if the subprocess-owning actor died first."""
+        pid = self._process_pid
+        if pid is None:
+            return True
         try:
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
+            self._process_pid = None
             return True
         time.sleep(2)
         try:
             os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        self._process_pid = None
         return True
 
 
@@ -85,6 +103,7 @@ class DynamoVllmWorker:  # pragma: no cover
         manager_env: dict[str, str],
         startup_timeout_s: float,
         seed: int,
+        cleanup_reservation: ray.actor.ActorHandle,
     ) -> None:
         self._group_name = group_name
         self._node_ip = _get_node_ip_local()
@@ -149,6 +168,9 @@ class DynamoVllmWorker:  # pragma: no cover
         try:
             self._process = subprocess.Popen(
                 command, env=worker_env, start_new_session=True
+            )
+            ray.get(
+                cleanup_reservation.register_process_group.remote(self._process.pid)
             )
             self._wait_for_system_port(startup_timeout_s)
         except Exception:

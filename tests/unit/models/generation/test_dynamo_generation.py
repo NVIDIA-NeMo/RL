@@ -15,6 +15,7 @@
 import asyncio
 import pickle
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -207,6 +208,15 @@ def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="prompt length 5 must be less than"):
         generation._allowed_new_tokens(5)
+
+
+def test_finish_generation_invalidates_sync_rollout_cache(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation.invalidate_kv_cache = MagicMock(return_value=True)
+
+    assert generation.finish_generation()
+    generation.invalidate_kv_cache.assert_called_once_with()
 
 
 def test_merged_stop_strings_enforce_dynamo_limit(monkeypatch) -> None:
