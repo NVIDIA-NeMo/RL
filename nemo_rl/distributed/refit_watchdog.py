@@ -37,8 +37,9 @@ exactly as before, down to not starting a thread.
 """
 
 import threading
+from collections.abc import Sequence
 from types import TracebackType
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Union
 
 
 class _Abortable(Protocol):
@@ -54,7 +55,7 @@ class RefitAborted(RuntimeError):
 
 
 class RefitAbortWatchdog:
-    """Abort ``group`` if the guarded block outlives ``timeout_s``.
+    """Abort the given group(s) if the guarded block outlives ``timeout_s``.
 
     Use as a context manager around the collective::
 
@@ -63,12 +64,29 @@ class RefitAbortWatchdog:
         if guard.fired:
             raise RefitAborted(...)
 
+    A sequence may be passed instead of one group, and the nccl_reshard transport needs
+    that: it moves weights over per-PP-stage bulk groups and then broadcasts the
+    remainder over the shared ``model_update_group``, so a hang can be in either family
+    and nothing at this level can tell which. Aborting all of them costs nothing --
+    ``abort()`` is idempotent and safe on a group that never built a communicator -- and
+    the recovery rebuilds every family regardless.
+
     ``timeout_s`` of ``None`` or ``<= 0`` disarms it entirely: no thread is started and
     ``fired`` stays False, so the default configuration is bit-for-bit the old behaviour.
     """
 
-    def __init__(self, group: Optional[_Abortable], timeout_s: Optional[float]) -> None:
-        self._group = group
+    def __init__(
+        self,
+        group: Optional[Union[_Abortable, Sequence[Optional[_Abortable]]]],
+        timeout_s: Optional[float],
+    ) -> None:
+        if group is None:
+            groups: list[_Abortable] = []
+        elif isinstance(group, Sequence):
+            groups = [g for g in group if g is not None]
+        else:
+            groups = [group]
+        self._groups = groups
         self._timeout_s = timeout_s
         self._done = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -77,9 +95,7 @@ class RefitAbortWatchdog:
     @property
     def armed(self) -> bool:
         return (
-            self._group is not None
-            and self._timeout_s is not None
-            and self._timeout_s > 0
+            bool(self._groups) and self._timeout_s is not None and self._timeout_s > 0
         )
 
     @property
@@ -95,14 +111,18 @@ class RefitAbortWatchdog:
         if self._done.wait(self._timeout_s):
             return
         self._fired = True
-        try:
-            assert self._group is not None
-            self._group.abort()
-        except Exception:  # noqa: BLE001
-            # A failed abort leaves the caller blocked, which is the situation we were
-            # already in; swallowing keeps the watchdog thread from dying silently mid-way
-            # and is strictly no worse than not having tried.
-            pass
+        for group in self._groups:
+            try:
+                group.abort()
+            except Exception:  # noqa: BLE001
+                # A failed abort leaves the caller blocked, which is the situation we
+                # were already in; swallowing keeps the watchdog thread from dying
+                # silently mid-way and is strictly no worse than not having tried.
+                #
+                # Per group, not around the loop: with several families the blocked one
+                # may not be the one that raised, and giving up on the rest would leave
+                # the caller hung on a group that would have aborted cleanly.
+                pass
 
     def __enter__(self) -> "RefitAbortWatchdog":
         if self.armed:

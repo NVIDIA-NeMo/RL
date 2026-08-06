@@ -115,6 +115,7 @@ def create_weight_synchronizer(
                 generation=generation,
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
+                refit_timeout_s=refit_timeout_s,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (

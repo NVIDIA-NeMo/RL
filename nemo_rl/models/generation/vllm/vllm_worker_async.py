@@ -1418,7 +1418,9 @@ class VllmAsyncGenerationWorkerImpl(
             "prepare_nccl_reshard_refit_info", args=(refit_info,)
         )
 
-    async def nccl_reshard_refit_async(self) -> bool:
+    async def nccl_reshard_refit_async(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Async version of nccl_reshard_refit."""
         try:
             assert self.llm is not None, (
@@ -1426,7 +1428,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             result_or_coro = await self.llm.collective_rpc(
-                "nccl_reshard_refit", args=tuple()
+                "nccl_reshard_refit", args=(refit_timeout_s,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1442,6 +1444,11 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 return False
             return True
+        except RefitAborted:
+            # Propagate, do not fold into `return False`. It is the controller's signal
+            # to rebuild over the survivors and retry; reported as a generic failure it
+            # would just end the run, which is the wedge this exists to replace.
+            raise
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
             import traceback

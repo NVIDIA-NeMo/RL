@@ -1022,8 +1022,16 @@ class VllmInternalWorkerExtension:
 
         return mapping
 
-    def nccl_reshard_refit(self) -> bool:
-        """Receive weights from training workers via xferdtensor.
+    def nccl_reshard_refit(self, refit_timeout_s: float | None = None) -> bool:
+        """Receive weights from training workers via xferdtensor, under a deadline.
+
+        Guarded like the collective receive: a peer dying mid-refit blocks this in NCCL
+        forever, and the buffers hold PARTIAL weights once aborted, so the caller must
+        not serve from this engine until a later refit completes.
+
+        Both communicator families are handed to the watchdog -- the per-PP-stage bulk
+        groups and the shared model_update_group -- because the transfer uses them in
+        sequence and a hang can be in either.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
         built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
@@ -1032,6 +1040,28 @@ class VllmInternalWorkerExtension:
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
         slice back into the live merged param.
         """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+            hold_refit_for_fault_injection,
+        )
+
+        groups = [
+            *getattr(self, "pp_comm_groups", {}).values(),
+            self.model_update_group,
+        ]
+        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+            hold_refit_for_fault_injection()
+            result = self._nccl_reshard_refit()
+        if guard.fired:
+            raise RefitAborted(
+                f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
+                "aborted; this engine now holds partial weights and must not serve "
+                "until refit"
+            )
+        return result
+
+    def _nccl_reshard_refit(self) -> bool:
         import os
         from collections import OrderedDict
 

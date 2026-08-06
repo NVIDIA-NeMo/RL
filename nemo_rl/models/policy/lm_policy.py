@@ -1121,11 +1121,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results[0]
 
-    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+    def nccl_reshard_refit(
+        self, kv_scales=None, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
         futures = self.worker_group.run_all_workers_single_data(
             "nccl_reshard_refit",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
         )
         return futures
 

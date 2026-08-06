@@ -1234,7 +1234,9 @@ class VllmGeneration(GenerationInterface):
             )
         return futures
 
-    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1246,7 +1248,7 @@ class VllmGeneration(GenerationInterface):
         )
         # Surviving leaders only; see update_weights_from_collective.
         return [
-            getattr(worker, method_name).remote()
+            getattr(worker, method_name).remote(refit_timeout_s=refit_timeout_s)
             for worker in self._refit_leader_workers()
         ]
 
