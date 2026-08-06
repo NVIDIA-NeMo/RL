@@ -74,7 +74,7 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
       chat_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
     ```
 
-By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.), you can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
+By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [NuminaMath-1.5](../../nemo_rl/data/datasets/response_datasets/numinamath.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.), you can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
@@ -159,7 +159,8 @@ The class must be importable — install it as a package or add its
 parent directory to `PYTHONPATH` before launching training.
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
-[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+This works for any dataset class that calls `split_train_validation` in its `__init__` — which today includes most built-in datasets, among them [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), and [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py).
+A dataset class that does not call it ignores `split_validation_size`; the dataset dispatcher emits a warning in that case, so a misconfigured run is not silent.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
 ```python
 # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation

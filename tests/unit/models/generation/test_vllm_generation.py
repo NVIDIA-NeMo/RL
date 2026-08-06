@@ -38,6 +38,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    VllmGenerationWorkerImpl,
+    _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -138,6 +140,52 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 
+def test_context_capped_max_new_tokens():
+    assert (
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=8192,
+            input_length=3058,
+            max_model_len=8192,
+        )
+        == 5134
+    )
+    assert (
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=256,
+            input_length=3058,
+            max_model_len=8192,
+        )
+        == 256
+    )
+    with pytest.raises(ValueError, match="exhausts the model context"):
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=8192,
+            input_length=8192,
+            max_model_len=8192,
+        )
+
+
+def test_sampling_params_preserve_bad_words():
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {
+        "top_k": None,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 128,
+        "stop_token_ids": None,
+        "bad_words": ["<image>", "<img>"],
+        "ignore_eos": False,
+    }
+    worker.SamplingParams = lambda **kwargs: kwargs
+
+    sampling_params = worker._build_sampling_params(
+        greedy=False,
+        stop_strings=None,
+    )
+
+    assert sampling_params["bad_words"] == ["<image>", "<img>"]
+
+
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
     def raise_if_called():
         raise AssertionError("CUDA capability should not be queried")
@@ -193,9 +241,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
-        "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
+        "vllm.renderers",
         "vllm.tool_parsers",
         "vllm.v1",
         "vllm.v1.engine",
@@ -218,7 +266,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.registry = "registry"
 
-    class OpenAIServingRender:
+    class OnlineRenderer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
@@ -230,7 +278,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class OpenAIServingTokenization:
+    class ServingTokenization:
         instances = []
 
         def __init__(self, **kwargs):
@@ -274,12 +322,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         TokenizeResponse=type("TokenizeResponse", (), {}),
     )
     make_module(
-        "vllm.entrypoints.serve.render.serving",
-        OpenAIServingRender=OpenAIServingRender,
+        "vllm.renderers.online_renderer",
+        OnlineRenderer=OnlineRenderer,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
-        OpenAIServingTokenization=OpenAIServingTokenization,
+        ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
@@ -1671,8 +1719,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     "annotations": None,
                     "audio": None,
                     "function_call": None,
-                    "tool_calls": [],
-                    "reasoning_content": None,
+                    # vLLM 0.25 omits tool_calls when empty and dropped
+                    # reasoning_content in favor of reasoning.
                     "reasoning": None,
                 },
                 "logprobs": {
@@ -1688,6 +1736,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 "finish_reason": "length",
                 "stop_reason": None,
                 "token_ids": None,
+                "routed_experts": None,
             }
         ],
         "service_tier": None,
@@ -1700,13 +1749,18 @@ def test_vllm_http_server(cluster, tokenizer):
         },
         "prompt_logprobs": None,
         "prompt_token_ids": None,
+        "prompt_text": None,
         "kv_transfer_params": None,
+        "metrics": None,
     }
 
     def _standardize(d: dict) -> dict:
         d = deepcopy(d)
         d.pop("id")
         d.pop("created")
+        # vLLM 0.25 populates system_fingerprint with the version + build hash
+        # (e.g. "vllm-0.25.1-<hash>"), which is wheel-specific.
+        d.pop("system_fingerprint", None)
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
@@ -2900,7 +2954,14 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
 
 @pytest.mark.mcore
-@pytest.mark.timeout(120)
+# Raised 120 -> 240 for vLLM 0.25. Measured call time for this test: 103.80s on
+# 0.20 (PR #3308, job 90163013717) and 113.10s on 0.25 (this branch, job
+# 89878378208) -- ~9s / +9% slower, which cut the headroom under the old 120s
+# budget from 16.2s to 6.9s. That is less than normal run-to-run variance on a
+# shared runner, so the test began failing intermittently on wall clock rather
+# than on any assertion. The budget was already marginal before this bump; 240s
+# restores a real margin instead of tracking the regression down to the second.
+@pytest.mark.timeout(240)
 def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     """Test vLLM generation with Megatron pipeline parallel training."""
 

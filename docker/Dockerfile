@@ -23,7 +23,7 @@
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -106,8 +106,8 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.11.18
-ARG PYTHON_VERSION=3.13.13
+ARG UV_VERSION=0.11.28
+ARG PYTHON_VERSION=3.13.14
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}

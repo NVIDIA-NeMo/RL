@@ -16,6 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -56,6 +57,21 @@ def _initial_dpo_save_state() -> DPOSaveState:
     return DPOSaveState(
         epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
+
+
+def _get_dpo_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> DPOSaveState:
+    if loaded_state is None:
+        return _initial_dpo_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(DPOSaveState)}
+    state_values = vars(_initial_dpo_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return DPOSaveState(**state_values)
 
 
 class DPOConfig(BaseModel, extra="allow"):
@@ -176,17 +192,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known DPOSaveState fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        # Backcompat: checkpoints saved before total_valid_tokens was added.
-        loaded_state.setdefault("total_valid_tokens", 0)
-        known_fields = {f.name for f in fields(DPOSaveState)}
-        dpo_save_state = DPOSaveState(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        dpo_save_state = _initial_dpo_save_state()
+    dpo_save_state = _get_dpo_save_state(loaded_state)
 
     # ==========================
     #           Data

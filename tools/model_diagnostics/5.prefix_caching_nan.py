@@ -38,8 +38,21 @@ parser.add_argument("--model", type=str, default=MODEL)
 parser.add_argument("--tp", type=int, default=TP)
 args = parser.parse_args()
 
+try:
+    from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+except ImportError:
+    # Standalone `uv run --no-project --with "vllm==X"` bisect, which
+    # docs/adding-new-models.md documents for this script: nemo_rl is not
+    # importable there, and the patch is unnecessary anyway because that env
+    # resolves openai fresh and already has NamespaceTool. The patch exists
+    # only because this repo pins openai==2.6.1.
+    pass
+else:
+    # Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+    ensure_vllm_source_compat()
+
 import vllm
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams  # noqa: E402
 
 print(f"vLLM version: {vllm.__version__}")
 

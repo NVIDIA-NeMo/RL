@@ -87,7 +87,8 @@ def model_forward(
     Args:
         model: The model to run forward pass on
         data_dict: Dictionary containing batch data
-        input_ids_cp_sharded: Context-parallel sharded input token IDs
+        input_ids_cp_sharded: Model-forward token IDs. Usually CP-sharded; models
+            that insert media before CP selection receive the full packed THD row.
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)

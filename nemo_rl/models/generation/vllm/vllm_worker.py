@@ -64,6 +64,19 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 logger = logging.getLogger(__name__)
 
 
+def _context_capped_max_new_tokens(
+    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
+) -> int:
+    """Cap generation so the training prompt and response fit the context."""
+    remaining_context = max_model_len - input_length
+    if remaining_context <= 0:
+        raise ValueError(
+            "Cannot generate from an input whose training length exhausts the "
+            f"model context: input_length={input_length}, max_model_len={max_model_len}."
+        )
+    return min(configured_max_new_tokens, remaining_context)
+
+
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
@@ -184,6 +197,14 @@ class BaseVllmGenerationWorker:
                 # The engine spans several nodes. Each engine's rank-0 process is
                 # on a different node, so every such engine can use node-local
                 # slot 0 without colliding.
+                #
+                # These engines are also the ones exposed to the vLLM 0.25
+                # TCPStore/MessageQueue collision within a single engine's window
+                # (see _patch_vllm_ray_executor_v2_tcpstore_port in patches.py).
+                # That is fixed by offsetting the TCPStore search, deliberately
+                # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
+                # kernel-ephemeral ports, which is the TOCTOU contention this port
+                # layout exists to avoid (#2380, #3103).
                 engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
@@ -568,9 +589,12 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
-            logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
+
+        logprobs_mode = self.cfg["vllm_cfg"].get("logprobs_mode")
+        if logprobs_mode is not None:
+            llm_kwargs["logprobs_mode"] = logprobs_mode
 
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
@@ -629,6 +653,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            bad_words=self.cfg.get("bad_words"),
             ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
@@ -643,6 +668,49 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    @staticmethod
+    def _spec_decode_max_tokens(
+        base_max_tokens: int,
+        input_len: int,
+        max_model_len: int,
+        spec_lookahead: int,
+    ) -> int:
+        """Clamp max_tokens so speculative decoding never reads past max_model_len.
+
+        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
+        at least `spec_lookahead + 1` tokens before the boundary.
+        """
+        return max(
+            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
+        )
+
+    @classmethod
+    def _request_max_new_tokens(
+        cls,
+        *,
+        configured_max_new_tokens: int,
+        input_length: int,
+        max_model_len: int,
+        cap_to_context: bool,
+        spec_lookahead: int,
+    ) -> int:
+        """Apply context and speculative-decoding limits to one request."""
+        max_new_tokens = configured_max_new_tokens
+        if cap_to_context:
+            max_new_tokens = _context_capped_max_new_tokens(
+                configured_max_new_tokens=max_new_tokens,
+                input_length=input_length,
+                max_model_len=max_model_len,
+            )
+        if spec_lookahead > 0:
+            max_new_tokens = cls._spec_decode_max_tokens(
+                max_new_tokens,
+                input_length,
+                max_model_len,
+                spec_lookahead,
+            )
+        return max_new_tokens
 
     @staticmethod
     def _patch_vllm_nsight_config() -> None:
@@ -802,24 +870,54 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
-        sampling_params = self._build_sampling_params(
-            greedy=greedy,
-            stop_strings=stop_strings,
-        )
 
+        # vLLM Eagle3 spec decode hits a CUDA illegal memory access when a
+        # request's total length reaches max_model_len (the drafter looks ahead
+        # past the boundary). Clamp per-request max_tokens so speculative
+        # requests stop short of the boundary by the drafter lookahead.
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+        spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Convert inputs to vLLM format
-        prompts = format_prompt_for_vllm_generation(data)
-
-        # Generate outputs
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
+        cap_to_context = bool(self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"))
+        if cap_to_context or spec_lookahead > 0:
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            configured_max_new_tokens = int(self.cfg["max_new_tokens"])
+            per_request_max_new_tokens = []
+            for input_length in input_lengths.tolist():
+                per_request_max_new_tokens.append(
+                    self._request_max_new_tokens(
+                        configured_max_new_tokens=configured_max_new_tokens,
+                        input_length=int(input_length),
+                        max_model_len=max_model_len,
+                        cap_to_context=cap_to_context,
+                        spec_lookahead=spec_lookahead,
+                    )
+                )
+
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=max_new_tokens,
+                )
+                for max_new_tokens in per_request_max_new_tokens
+            ]
+        else:
+            sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=stop_strings,
+            )
+
+        # Convert inputs to vLLM format and generate outputs.
+        prompts = format_prompt_for_vllm_generation(data)
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
