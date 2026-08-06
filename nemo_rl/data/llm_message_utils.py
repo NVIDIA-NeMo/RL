@@ -378,9 +378,7 @@ def batched_message_log_to_flat_message(
             filled_packed_values = cast(
                 list[PackedTensor],
                 [
-                    PackedTensor.empty_like(packed_template)
-                    if value is None
-                    else value
+                    PackedTensor.empty_like(packed_template) if value is None else value
                     for value in values
                 ],
             )

@@ -790,9 +790,7 @@ def test_batched_message_log_to_flat_message_with_image_free_sample(
         {"role": "user", "token_ids": torch.tensor([3, 4])}
     ]
     batch_logs = (
-        [image_log, image_free_log]
-        if image_first
-        else [image_free_log, image_log]
+        [image_log, image_free_log] if image_first else [image_free_log, image_log]
     )
 
     batched, _ = batched_message_log_to_flat_message(batch_logs)
