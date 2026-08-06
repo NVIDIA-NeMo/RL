@@ -323,6 +323,13 @@ class DTensorPolicyWorkerV2Impl(
             },
         )
 
+        # The KL reference policy must be snapshotted from the BASE (model_name)
+        # weights, not from a resume checkpoint: it has to stay the initial policy
+        # for the whole run and be identical across restarts (#2955). When both a
+        # reference model and a resume checkpoint are requested, defer the
+        # checkpoint load until after the snapshot below.
+        defer_checkpoint_load = init_reference_model and bool(weights_path)
+
         # Set up model and optimizer
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
@@ -332,8 +339,8 @@ class DTensorPolicyWorkerV2Impl(
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
+            weights_path=None if defer_checkpoint_load else weights_path,
+            optimizer_path=None if defer_checkpoint_load else optimizer_path,
         )
 
         # Set instance attributes from model and optimizer state (tuple unpacking)
@@ -354,6 +361,17 @@ class DTensorPolicyWorkerV2Impl(
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
+
+        if defer_checkpoint_load:
+            # Same call setup_model_and_optimizer would have made; issued here so the
+            # reference snapshot above sees the base weights (v1 worker ordering).
+            self.checkpoint_manager.load_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
