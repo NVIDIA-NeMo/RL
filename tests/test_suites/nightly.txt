@@ -49,6 +49,10 @@ tests/test_suites/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.sh
 
+# Functional Nemotron-Omni 30B-A3B VLM GRPO runs (Megatron)
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.sh
+
 # Functional Qwen3.5-35B VLM GRPO run
 # The AutoModel variant is re-enabled with the vLLM 0.25.1 bump (no longer hits
 # https://github.com/vllm-project/vllm/issues/36237). The Megatron variant still
