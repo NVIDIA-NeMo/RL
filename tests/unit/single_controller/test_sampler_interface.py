@@ -25,15 +25,21 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    ArealAdmissionSampler,
+    ArealAdmissionSamplerConfig,
     InOrderSampler,
     InOrderSamplerConfig,
     PromptGroupSampler,
+    SamplerConfig,
     WeightFifoSampler,
+    WeightFifoSamplerConfig,
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
+    required_buffer_capacity_for_config,
 )
 from nemo_rl.data_plane import KVBatchMeta
 
@@ -90,6 +96,11 @@ class TestBuiltinsImplementInterface:
         "sampler",
         [
             WindowedSampler(FakeBuffer(), max_staleness_versions=1),
+            ArealAdmissionSampler(
+                FakeBuffer(),
+                max_staleness_versions=1,
+                evict_stale_samples=False,
+            ),
             WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
             InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
         ],
@@ -119,6 +130,33 @@ class TestAdmission:
         # Now dispatch_index=0, trainer=0, window=0 -> 0 >= 0 blocks forever.
         with pytest.raises(asyncio.TimeoutError):
             _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 0), timeout=0.05))
+
+    def test_areal_opens_one_more_batch_after_trainer_advances(self):
+        trainer_version = 0
+        s = ArealAdmissionSampler(
+            FakeBuffer(),
+            max_staleness_versions=1,
+            evict_stale_samples=False,
+        )
+
+        # eta=1 admits the live batch and one lookahead batch without stamping.
+        assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) is None
+        assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) is None
+        with pytest.raises(asyncio.TimeoutError):
+            _run(
+                asyncio.wait_for(
+                    s.admit(trainer_version_fn=lambda: trainer_version), timeout=0.05
+                )
+            )
+
+        trainer_version = 1
+        assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) is None
+        with pytest.raises(asyncio.TimeoutError):
+            _run(
+                asyncio.wait_for(
+                    s.admit(trainer_version_fn=lambda: trainer_version), timeout=0.05
+                )
+            )
 
 
 class TestInOrderEvictMatchesSelect:
@@ -173,6 +211,41 @@ class TestFactory:
         )
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
+
+    def test_areal_config_builds_areal_admission(self):
+        s = create_sampler(
+            FakeBuffer(),
+            ArealAdmissionSamplerConfig(
+                max_staleness_versions=3,
+                evict_stale_samples=True,
+            ),
+        )
+        assert isinstance(s, ArealAdmissionSampler)
+        assert s.max_staleness_versions == 3
+        assert s.evict_stale_samples is True
+
+
+class TestArealConfig:
+    def test_discriminated_union_parses_areal_and_defaults_to_no_eviction(self):
+        cfg = TypeAdapter(SamplerConfig).validate_python(
+            {
+                "name": "areal_admission",
+                "max_staleness_versions": 2,
+            }
+        )
+
+        assert isinstance(cfg, ArealAdmissionSamplerConfig)
+        assert cfg.evict_stale_samples is False
+
+    def test_negative_staleness_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ArealAdmissionSamplerConfig(max_staleness_versions=-1)
+
+    def test_required_capacity_covers_live_and_lookahead_batches(self):
+        cfg = ArealAdmissionSamplerConfig(max_staleness_versions=2)
+        assert required_buffer_capacity_for_config(cfg, groups_per_step=4) == 12
+        sampler = create_sampler(FakeBuffer(), cfg)
+        assert sampler.required_buffer_capacity(groups_per_step=4) == 12
 
 
 class TestCustomFqnSampler:
@@ -265,6 +338,110 @@ class TestWeightFifoSelect:
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         ) == (None, 0)
+
+
+class TestArealSelect:
+    def test_mixes_ready_weight_versions_in_buffer_order(self):
+        buf = FakeBuffer()
+        buf.add("old", weight=1)
+        buf.add("current", weight=3)
+        buf.add("middle", weight=2)
+        buf.add("future", weight=4)
+        s = ArealAdmissionSampler(
+            buf,
+            max_staleness_versions=1,
+            evict_stale_samples=False,
+        )
+
+        meta, n = _run(
+            s.select(current_train_weight=3, min_prompt_groups=3, max_prompt_groups=3)
+        )
+
+        assert n == 3
+        assert meta is not None
+        assert meta.sample_ids == ["old_g0", "current_g0", "middle_g0"]
+        assert buf.start_weight_list == [4]
+
+    def test_no_eviction_keeps_late_straggler_selectable(self):
+        buf = FakeBuffer()
+        buf.add("late", weight=0)
+        s = ArealAdmissionSampler(
+            buf,
+            max_staleness_versions=1,
+            evict_stale_samples=False,
+        )
+
+        assert _run(s.evict(current_train_weight=5)) == 0
+        meta, n = _run(
+            s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
+        )
+
+        assert n == 1
+        assert meta is not None
+        assert meta.sample_ids == ["late_g0"]
+        assert buf.remove_calls == [([0], False)]
+
+    def test_hard_window_selects_only_in_window_groups(self):
+        buf = FakeBuffer()
+        buf.add("stale", weight=1)
+        buf.add("edge", weight=3)
+        buf.add("current", weight=5)
+        s = ArealAdmissionSampler(
+            buf,
+            max_staleness_versions=2,
+            evict_stale_samples=True,
+        )
+
+        meta, n = _run(
+            s.select(current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2)
+        )
+
+        assert n == 2
+        assert meta is not None
+        assert meta.sample_ids == ["edge_g0", "current_g0"]
+        assert buf.start_weight_list == [1]
+
+    def test_hard_window_evicts_ready_stale_groups_from_data_plane(self):
+        buf = FakeBuffer()
+        buf.add("stale", weight=1)
+        buf.add("edge", weight=3)
+        s = ArealAdmissionSampler(
+            buf,
+            max_staleness_versions=2,
+            evict_stale_samples=True,
+        )
+
+        removed = _run(s.evict(current_train_weight=5))
+
+        assert removed == 1
+        assert buf.start_weight_list == [3]
+        assert buf.remove_calls == [([0], True)]
+
+    def test_hard_window_does_not_evict_unready_stale_group(self):
+        buf = FakeBuffer()
+        buf.add("stale", weight=0, ready=False)
+        s = ArealAdmissionSampler(
+            buf,
+            max_staleness_versions=1,
+            evict_stale_samples=True,
+        )
+
+        assert _run(s.evict(current_train_weight=5)) == 0
+        assert buf.start_weight_list == [0]
+        assert buf.remove_calls == []
+
+        # Once the concurrent commit marks the same slot ready, the next
+        # eviction pass removes it and clears its DataPlane row.
+        buf.meta_list[0] = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=["stale_g0"],
+            tags=[{"weight_version": 0, "group_id": "stale"}],
+        )
+        buf.ready_list[0] = True
+        assert _run(s.evict(current_train_weight=5)) == 1
+        assert buf.start_weight_list == []
+        assert buf.remove_calls == [([0], True)]
 
 
 class TestInOrderSelect:
