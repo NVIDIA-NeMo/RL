@@ -25,6 +25,10 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
+    # None until init_collective builds it. Declared so a rebuild can release the
+    # previous group without probing for the attribute's existence.
+    model_update_group: Optional[Any] = None
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> None:
@@ -37,6 +41,12 @@ class AbstractPolicyWorker:
             train_world_size: Number of training workers (used in inference cluster)
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        # Rebuilding is the recovery path for a dead generation rank, so this runs more
+        # than once per job. Without the release, each rebuild would strand the previous
+        # NCCL communicator and its TCPStore for the life of the worker.
+        if self.model_update_group is not None:
+            self.model_update_group.abort()
 
         self.model_update_group = StatelessProcessGroup(
             master_address=ip, port=port, rank=self.rank, world_size=world_size

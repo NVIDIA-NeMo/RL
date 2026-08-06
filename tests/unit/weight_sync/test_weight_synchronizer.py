@@ -65,6 +65,11 @@ def _mock_generation(**overrides):
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
+    # Real numbers, not MagicMocks: the collective synchronizer records the membership it
+    # built over so a later reconcile can tell "unchanged" from "a shard left or came
+    # back", and that arithmetic needs an actual shard count.
+    gen.worker_group.dp_size = 2
+    gen.worker_group.workers = [MagicMock(), MagicMock()]
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen

@@ -25,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, cast
 
+import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -45,14 +47,28 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_manager import (
+    RolloutManager,
+    RolloutRetryPolicy,
+    RolloutTimeouts,
+)
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.models.generation.fleet_health import (
+    FleetHealthPolicy,
+    GenerationFleetMonitor,
+    HealthyShardSelector,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
+from nemo_rl.models.generation.policy_router import PolicyRouterActor
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -86,6 +102,12 @@ class SingleControllerActorArgs:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
+    # None when async_rl.fleet_health is disabled; the SingleController drives the
+    # probe loop when it is present.
+    fleet_monitor: Optional[GenerationFleetMonitor] = None
+    # None unless async_rl.policy_router is enabled; the SingleController pushes the
+    # serving backend set to it.
+    policy_router: Any = None
 
 
 def _build_clusters(
@@ -261,6 +283,96 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
 
 
+def _maybe_attach_fleet_health(
+    generation: Any, master_config: MasterConfig
+) -> Optional[GenerationFleetMonitor]:
+    """Route generation through fleet health, when it is enabled and supported.
+
+    Returns:
+        The monitor the SingleController should drive, or None when fleet health is
+        disabled or the backend does not support it.
+    """
+    fleet_config = master_config.async_rl.fleet_health
+    if not fleet_config.enabled:
+        return None
+    if not hasattr(generation, "attach_fleet_health"):
+        # Loud rather than silent: asking for fleet health and not getting it would
+        # otherwise look like it was working.
+        raise NotImplementedError(
+            "async_rl.fleet_health.enabled=true is only supported for the vllm "
+            f"generation backend; got {type(generation).__name__}"
+        )
+
+    monitor = GenerationFleetMonitor(
+        shard_count=generation.worker_group.dp_size,
+        policy=FleetHealthPolicy(
+            unhealthy_threshold=fleet_config.unhealthy_threshold,
+            healthy_threshold=fleet_config.healthy_threshold,
+            max_restart_attempts_per_shard=fleet_config.max_restart_attempts_per_shard,
+            min_healthy_shards=fleet_config.min_healthy_shards,
+        ),
+        base_urls=list(generation.dp_openai_server_base_urls or []) or None,
+    )
+    generation.attach_fleet_health(monitor, HealthyShardSelector(monitor=monitor))
+    return monitor
+
+
+def _maybe_start_policy_router(generation: Any, master_config: MasterConfig) -> Any:
+    """Start the NeMo-Gym-facing router, if enabled.
+
+    Returns:
+        The router actor handle, or None when the router is disabled.
+    """
+    router_config = master_config.async_rl.policy_router
+    if not router_config.enabled:
+        return None
+
+    backend_urls = [url for url in (generation.dp_openai_server_base_urls or []) if url]
+    if not backend_urls:
+        raise ValueError(
+            "async_rl.policy_router.enabled=true requires generation backends that "
+            "expose OpenAI-compatible servers; none were reported. This needs the vllm "
+            "backend with async_engine and expose_http_server enabled."
+        )
+
+    # Reserved once and passed in, so Ray recreating a restarted actor rebinds the same
+    # address. NeMo-Gym holds this URL for the life of the run and never re-resolves it.
+    port = _get_free_port_local(
+        router_config.port_range_low, router_config.port_range_high
+    )
+    router = PolicyRouterActor.options(  # type: ignore[attr-defined]
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=False
+        )
+    ).remote(
+        backend_urls=backend_urls,
+        host=_get_node_ip_local(),
+        port=port,
+        backend_timeout_s=router_config.backend_timeout_s,
+        no_healthy_backend_status=router_config.no_healthy_backend_status,
+        served_model_name=master_config.policy["generation"]["model_name"],
+    )
+    # Resolve the URL now so the driver fails here rather than inside Gym if the actor
+    # could not start.
+    base_url = ray.get(router.base_url.remote())
+    print(f"📡 Policy router fronting {len(backend_urls)} backend(s) at {base_url}")
+    return router
+
+
+def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
+    """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
+    failure_config = master_config.async_rl.rollout_failure
+    return RolloutRetryPolicy(
+        max_infra_attempts=failure_config.max_attempts_per_prompt,
+        max_data_attempts=failure_config.max_data_attempts_per_prompt,
+        backoff_base_s=failure_config.backoff_base_s,
+        max_backoff_s=failure_config.max_backoff_s,
+        skip_on_data_exhausted=failure_config.on_data_exhausted == "skip",
+        max_skipped_prompts=failure_config.max_skipped_prompts,
+        max_gym_row_attempts=failure_config.max_gym_row_attempts,
+    )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -379,6 +491,8 @@ def setup_single_controller(
     # ==========================
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
     # ==========================
+    policy_router = _maybe_start_policy_router(generation, master_config)
+
     if use_nemo_gym:
         # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
         # overlaps model loading instead of running serially afterward.
@@ -390,12 +504,22 @@ def setup_single_controller(
         )
         env_handles["nemo_gym"] = spinup_nemo_gym_actor(
             env_configs=master_config.env,
-            base_urls=generation.dp_openai_server_base_urls,
+            # The whole point of the router: Gym holds one NeMo-RL-owned URL and
+            # never has to fail over, which is the thing it cannot do.
+            base_urls=(
+                [ray.get(policy_router.base_url.remote())]
+                if policy_router is not None
+                else generation.dp_openai_server_base_urls
+            ),
             model_name=generation_config["model_name"],
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
+
+    # Attach fleet health before any rollout runs, so the very first request is
+    # already health-aware.
+    fleet_monitor = _maybe_attach_fleet_health(generation, master_config)
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
@@ -412,6 +536,8 @@ def setup_single_controller(
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        # Only armed when configured; None leaves the refit path unchanged.
+        refit_timeout_s=master_config.async_rl.fleet_health.refit_timeout_s,
     )
     weight_synchronizer.init_communicator()
 
@@ -441,6 +567,12 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         tq_buffer=tq_buffer,
+        timeouts=RolloutTimeouts(
+            rollout_s=master_config.async_rl.rollout_timeout_s,
+            generation_s=master_config.async_rl.generation_timeout_s,
+            env_s=master_config.async_rl.env_timeout_s,
+        ),
+        retry_policy=_build_retry_policy(master_config),
     )
 
     return SingleControllerActorArgs(
@@ -457,4 +589,6 @@ def setup_single_controller(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
+        fleet_monitor=fleet_monitor,
+        policy_router=policy_router,
     )
