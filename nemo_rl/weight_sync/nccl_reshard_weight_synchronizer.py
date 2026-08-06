@@ -76,11 +76,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
+        refit_timeout_s: Optional[float] = None,
     ):
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        self._refit_timeout_s = refit_timeout_s
         self._stale = True
 
     def _train_parallelism(self) -> dict[str, int]:
@@ -114,8 +116,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             # Shard-to-shard reshard: train sends its TP/EP-local shards, gen
             # receives directly into its own (different) layout.  kv_scales ride
             # the misc packed-broadcast for FP8 KV cache.
-            futures_train = self._policy.nccl_reshard_refit(kv_scales=kv_scales)
-            futures_inference = self._generation.nccl_reshard_refit()
+            futures_train = self._policy.nccl_reshard_refit(
+                kv_scales=kv_scales, refit_timeout_s=self._refit_timeout_s
+            )
+            futures_inference = self._generation.nccl_reshard_refit(
+                refit_timeout_s=self._refit_timeout_s
+            )
 
             ray.get(futures_train)
             results = ray.get(futures_inference)

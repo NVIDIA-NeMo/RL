@@ -118,9 +118,9 @@ class TestThreadHygiene:
 
 
 class TestEveryRefitEntrypointAcceptsTheDeadline:
-    """Both refit entrypoints must take refit_timeout_s, or the run dies at the first sync.
+    """EVERY refit entrypoint must take refit_timeout_s, or the run dies at the first sync.
 
-    This exists because only one of them did. ``update_weights_from_collective`` got the
+    This exists because one of them did not. ``update_weights_from_collective`` got the
     parameter; ``update_weights_from_collective_async`` did not -- and the async engine is
     what the recovery test actually uses, so the very first refit failed with
     ``TypeError: got an unexpected keyword argument 'refit_timeout_s'`` from inside Ray's
@@ -129,6 +129,11 @@ class TestEveryRefitEntrypointAcceptsTheDeadline:
     No behavioural test caught it: the call crosses a Ray actor boundary, where the
     signature is checked at dispatch rather than by any import, and the fakes in these
     suites do not model that. A signature assertion is cheap and covers exactly the gap.
+
+    Parametrized over BOTH transports because the same omission then repeated itself: the
+    nccl_reshard path was plumbed nowhere at all, so ``recovery-reshard`` ran with no
+    deadline and would have wedged on a mid-refit death exactly as before -- while
+    passing, because its kill lands at a step boundary.
     """
 
     @pytest.mark.parametrize(
@@ -139,9 +144,29 @@ class TestEveryRefitEntrypointAcceptsTheDeadline:
                 "VllmAsyncGenerationWorker",
                 "update_weights_from_collective_async",
             ),
+            (
+                "nemo_rl.models.generation.vllm.vllm_worker_async",
+                "VllmAsyncGenerationWorker",
+                "nccl_reshard_refit_async",
+            ),
+            (
+                "nemo_rl.models.generation.vllm.vllm_generation",
+                "VllmGeneration",
+                "nccl_reshard_refit",
+            ),
+            (
+                "nemo_rl.models.policy.lm_policy",
+                "Policy",
+                "nccl_reshard_refit",
+            ),
+            (
+                "nemo_rl.models.policy.lm_policy",
+                "Policy",
+                "broadcast_weights_for_collective",
+            ),
         ],
     )
-    def test_async_worker_entrypoint(self, module, cls, method):
+    def test_entrypoint_accepts_the_deadline(self, module, cls, method):
         import importlib
         import inspect
 
@@ -150,6 +175,35 @@ class TestEveryRefitEntrypointAcceptsTheDeadline:
         assert "refit_timeout_s" in inspect.signature(fn).parameters, (
             f"{cls}.{method} must accept refit_timeout_s; the controller passes it on "
             "every refit and Ray rejects the call otherwise"
+        )
+
+    def test_the_reshard_synchronizer_takes_it_too(self):
+        """The factory constructs it by keyword; a missing parameter is a TypeError at setup.
+
+        It was simply not passed -- the factory built the reshard synchronizer without it
+        while passing it to the collective one two branches below, so the whole abort
+        mechanism was absent on that transport with nothing to indicate it.
+        """
+        import inspect
+
+        from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+            NcclReshardWeightSynchronizer,
+        )
+
+        params = inspect.signature(NcclReshardWeightSynchronizer.__init__).parameters
+        assert "refit_timeout_s" in params
+        assert params["refit_timeout_s"].default is None
+
+    def test_the_factory_forwards_it_to_both_transports(self):
+        """A parameter the factory accepts and drops is worse than one it never had."""
+        import inspect
+
+        from nemo_rl.weight_sync import factory
+
+        source = inspect.getsource(factory)
+        assert source.count("refit_timeout_s=refit_timeout_s") >= 2, (
+            "both CollectiveWeightSynchronizer and NcclReshardWeightSynchronizer must "
+            "be constructed with the deadline"
         )
 
     def test_the_two_entrypoints_agree(self):
@@ -167,3 +221,48 @@ class TestEveryRefitEntrypointAcceptsTheDeadline:
         assert async_sig.parameters["refit_timeout_s"].default is None, (
             "must default to None so an unconfigured run is unchanged"
         )
+
+
+class TestMultipleGroups:
+    """The nccl_reshard transport blocks in one of two communicator families.
+
+    Bulk weights move over per-PP-stage groups, then the remainder broadcasts over the
+    shared model_update_group. Nothing at the watchdog's level can tell which one a hang
+    is in, so it aborts all of them.
+    """
+
+    def test_every_group_is_aborted(self):
+        groups = [_FakeGroup(), _FakeGroup(), _FakeGroup()]
+        with RefitAbortWatchdog(groups, 0.05) as guard:
+            time.sleep(0.4)
+        assert guard.fired is True
+        assert [g.abort_calls for g in groups] == [1, 1, 1]
+
+    def test_one_failing_abort_does_not_strand_the_others(self):
+        """The group that raises may not be the one the caller is blocked in.
+
+        Giving up on the rest would leave it hung on a group that would have released.
+        """
+        groups = [_FakeGroup(fail=True), _FakeGroup(), _FakeGroup()]
+        with RefitAbortWatchdog(groups, 0.05) as guard:
+            time.sleep(0.4)
+        assert guard.fired is True
+        assert [g.abort_calls for g in groups] == [1, 1, 1]
+
+    def test_none_entries_are_ignored(self):
+        """A worker with no PP group passes None in the list rather than branching."""
+        real = _FakeGroup()
+        with RefitAbortWatchdog([None, real], 0.05) as guard:
+            time.sleep(0.4)
+        assert guard.fired is True
+        assert real.abort_calls == 1
+
+    def test_a_list_of_nothing_stays_disarmed(self):
+        with RefitAbortWatchdog([None, None], 0.05) as guard:
+            assert not guard.armed
+        assert guard.fired is False
+
+    def test_an_empty_list_stays_disarmed(self):
+        with RefitAbortWatchdog([], 0.05) as guard:
+            assert not guard.armed
+        assert guard.fired is False

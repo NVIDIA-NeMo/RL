@@ -272,3 +272,54 @@ class TestRefitDispatchExcludesTheDeadShard:
         gen.nccl_reshard_refit()
 
         assert [w.idx for w in workers if w.calls] == [0, 1, 2]
+
+
+class TestTheRefitDeadlineReachesThisTransport:
+    """The abort machinery was wired to the collective path only.
+
+    factory.py passed refit_timeout_s to CollectiveWeightSynchronizer and constructed
+    NcclReshardWeightSynchronizer without it, so this transport ran with no deadline at
+    all: a shard dying inside a reshard refit wedged exactly as before the watchdog
+    existed. Nothing indicated it -- the recovery-reshard test kills at a step boundary,
+    so it passed via the between-refits path and never touched the missing machinery.
+    """
+
+    def test_both_sides_are_given_the_deadline(self):
+        sync, gen, workers, _, _ = _reshard(dp_size=2)
+        sync._refit_timeout_s = 60.0
+        sync.init_communicator()
+        for w in workers:
+            w.calls.clear()
+        train_kwargs = {}
+        sync._policy.nccl_reshard_refit = lambda **k: (
+            train_kwargs.update(k) or ["train-f"]
+        )
+
+        sync.sync_weights()
+
+        assert train_kwargs.get("refit_timeout_s") == 60.0, (
+            "the producer side must be able to abort its own transfer"
+        )
+        refits = [c for w in workers for c in w.calls if c[0] == "nccl_reshard_refit"]
+        assert refits, "no generation worker was asked to refit"
+        for _name, kwargs in refits:
+            assert kwargs.get("refit_timeout_s") == 60.0
+
+    def test_an_unset_deadline_still_reaches_both_sides_as_none(self):
+        """Default-off must mean None arrives, not that the argument is absent.
+
+        Ray validates at dispatch, so an entrypoint that never receives the keyword is
+        indistinguishable here from one that cannot accept it -- until a real run.
+        """
+        sync, gen, workers, _, _ = _reshard(dp_size=2)
+        sync.init_communicator()
+        for w in workers:
+            w.calls.clear()
+        sync._policy.nccl_reshard_refit = lambda **k: ["train-f"]
+
+        sync.sync_weights()
+
+        refits = [c for w in workers for c in w.calls if c[0] == "nccl_reshard_refit"]
+        assert refits, "no generation worker was asked to refit"
+        for _name, kwargs in refits:
+            assert kwargs.get("refit_timeout_s", "MISSING") is None

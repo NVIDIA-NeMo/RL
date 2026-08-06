@@ -24,6 +24,7 @@ import torch
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
@@ -1235,14 +1236,16 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """Forward refit info to vLLM backend workers."""
         self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))
 
-    def nccl_reshard_refit(self) -> bool:
+    def nccl_reshard_refit(self, refit_timeout_s: Optional[float] = None) -> bool:
         """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
             )
 
-            result_or_coro = self.llm.collective_rpc("nccl_reshard_refit", args=tuple())
+            result_or_coro = self.llm.collective_rpc(
+                "nccl_reshard_refit", args=(refit_timeout_s,)
+            )
             worker_result = result_or_coro[0]
 
             if not worker_result:
@@ -1251,6 +1254,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
                 return False
             return True
+        except RefitAborted:
+            # Propagate, do not fold into `return False`; see the async variant.
+            raise
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}")
             import traceback
