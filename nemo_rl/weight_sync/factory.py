@@ -40,6 +40,7 @@ def create_weight_synchronizer(
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
     refit_buffer_size_gb: Optional[float | int] = None,
+    refit_timeout_s: Optional[float] = None,
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
@@ -125,6 +126,7 @@ def create_weight_synchronizer(
             generation=generation,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            refit_timeout_s=refit_timeout_s,
         )
 
     if generation_backend == SGLANG_BACKEND:
