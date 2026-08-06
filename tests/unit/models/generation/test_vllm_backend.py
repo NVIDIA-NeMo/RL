@@ -981,6 +981,51 @@ def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_weight_update_lifecycle_prepares_fp8_once_before_stream(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_config = object()
+    ext.device = object()
+    call_order = []
+
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(
+        fp8,
+        "prepare_fp8_model_for_refit",
+        lambda runner: call_order.append(("prepare", runner)),
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_args: call_order.append(("post_load", None)),
+    )
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append(
+        ("mtp", None)
+    )
+    ext._maybe_process_fp8_kv_cache = lambda: call_order.append(("kv", None))
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        call_order.append(("stream", None))
+        finalize()
+
+    assert call_order == [
+        ("prepare", ext.model_runner),
+        ("stream", None),
+        ("post_load", None),
+        ("mtp", None),
+        ("kv", None),
+    ]
+
+
+@pytest.mark.vllm
 def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 

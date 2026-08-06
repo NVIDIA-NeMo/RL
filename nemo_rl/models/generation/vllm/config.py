@@ -71,6 +71,15 @@ class VllmSpecificArgs(TypedDict):
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
+    # Round refit-generated FP8 block weight scales to powers of two. The
+    # recommended default is false; UE8M0 DeepGEMM checkpoints may enable it.
+    pow2_weight_scaling_factors: NotRequired[bool]
+    # Round dynamic FP8 activation scales to powers of two. The recommended
+    # default is false because this changes rollout numerics.
+    pow2_activation_scaling_factors: NotRequired[bool]
+    # Enable vLLM's DeepGEMM FP8 kernels when supported by the GPU. The
+    # recommended default is false.
+    use_deep_gemm: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]

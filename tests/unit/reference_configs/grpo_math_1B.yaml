@@ -421,6 +421,8 @@ policy:
       enforce_eager: False
       use_tqdm: true # Set to false to suppress vLLM generation progress bars. Only applies when async_engine is false
       use_deep_gemm: False
+      pow2_weight_scaling_factors: False
+      pow2_activation_scaling_factors: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
