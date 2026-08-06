@@ -115,3 +115,55 @@ class TestThreadHygiene:
                 pass
         assert threading.active_count() <= before + 1
         assert group.abort_calls == 0
+
+
+class TestEveryRefitEntrypointAcceptsTheDeadline:
+    """Both refit entrypoints must take refit_timeout_s, or the run dies at the first sync.
+
+    This exists because only one of them did. ``update_weights_from_collective`` got the
+    parameter; ``update_weights_from_collective_async`` did not -- and the async engine is
+    what the recovery test actually uses, so the very first refit failed with
+    ``TypeError: got an unexpected keyword argument 'refit_timeout_s'`` from inside Ray's
+    argument validation.
+
+    No behavioural test caught it: the call crosses a Ray actor boundary, where the
+    signature is checked at dispatch rather than by any import, and the fakes in these
+    suites do not model that. A signature assertion is cheap and covers exactly the gap.
+    """
+
+    @pytest.mark.parametrize(
+        ("module", "cls", "method"),
+        [
+            (
+                "nemo_rl.models.generation.vllm.vllm_worker_async",
+                "VllmAsyncGenerationWorker",
+                "update_weights_from_collective_async",
+            ),
+        ],
+    )
+    def test_async_worker_entrypoint(self, module, cls, method):
+        import importlib
+        import inspect
+
+        mod = importlib.import_module(module)
+        fn = getattr(getattr(mod, cls), method)
+        assert "refit_timeout_s" in inspect.signature(fn).parameters, (
+            f"{cls}.{method} must accept refit_timeout_s; the controller passes it on "
+            "every refit and Ray rejects the call otherwise"
+        )
+
+    def test_the_two_entrypoints_agree(self):
+        """The sync and async paths are chosen by config, so they must stay interchangeable."""
+        import inspect
+
+        from nemo_rl.models.generation.vllm.vllm_worker_async import (
+            VllmAsyncGenerationWorker,
+        )
+
+        async_sig = inspect.signature(
+            VllmAsyncGenerationWorker.update_weights_from_collective_async
+        )
+        assert "refit_timeout_s" in async_sig.parameters
+        assert async_sig.parameters["refit_timeout_s"].default is None, (
+            "must default to None so an unconfigured run is unchanged"
+        )
