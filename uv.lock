@@ -118,7 +118,7 @@ overrides = [
     { name = "timm", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.16" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
 excludes = ["nvidia-cutlass-dsl-libs-base"]
@@ -187,12 +187,12 @@ version = "10.16.1.11"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
+version = "2.16.1+c9877be"
 requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
+version = "2.16.1+c9877be"
 requires-dist = ["torch", "transformer-engine"]
 
 [[package]]
@@ -8193,8 +8193,8 @@ dependencies = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15#42b840051647eef89761a16dfdff87e82bb253ab" }
+version = "2.16.1+c9877be"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.16#c9877beb87ad7e711e1869dd0b5062167ede447a" }
 dependencies = [
     { name = "importlib-metadata" },
     { name = "packaging" },
