@@ -415,6 +415,17 @@ def stream_weights_via_ipc_zmq_impl(
     buffer_b: torch.Tensor | None = None
     current_buffer: torch.Tensor | None = None
 
+    def release_staging_buffers() -> None:
+        """Release acyclic IPC buffers without scanning the worker object graph."""
+        nonlocal buffer_a, buffer_b, current_buffer
+
+        had_buffers = buffer_a is not None or buffer_b is not None
+        current_buffer = None
+        buffer_a = None
+        buffer_b = None
+        if had_buffers:
+            torch.cuda.empty_cache()
+
     used_bytes = 0
     param_names = []
     await_recv = False
@@ -432,9 +443,48 @@ def stream_weights_via_ipc_zmq_impl(
                 current_buffer = buffer_a
 
             aligned_size = calculate_aligned_size(tensor.nbytes)
-            assert aligned_size <= buffer_size_bytes, (
-                f"Parameter {name} too large for buffer: {aligned_size} > {buffer_size_bytes}"
-            )
+
+            # A parameter larger than a single staging buffer cannot be packed
+            # at all. Ship it on its own in a buffer sized to fit rather than
+            # failing the refit. The staging buffers are sized from *free
+            # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
+            # for ping-pong) with no floor at the largest parameter, so a big
+            # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
+            # is 1.73 GiB against a 1.65 GiB buffer. This mirrors the HTTP
+            # streaming path, which already gives an oversized parameter a
+            # bucket of its own instead of raising.
+            if aligned_size > buffer_size_bytes:
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    current_buffer = (
+                        buffer_b if current_buffer is buffer_a else buffer_a
+                    )
+                    used_bytes, param_names = 0, []
+
+                oversized_buffer = torch.empty(
+                    aligned_size,
+                    device=current_buffer.device,
+                    dtype=torch.uint8,
+                    requires_grad=False,
+                )
+                try:
+                    packed_bytes = pack_tensor(oversized_buffer, tensor, 0)
+                    send_buffer_group_overlap(
+                        oversized_buffer, [name], packed_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    # Unlike the ping-pong pair, this buffer is not kept alive
+                    # across the next send, so its ACK must be consumed here
+                    # before it is freed.
+                    zmq_socket.recv()
+                    await_recv = False
+                finally:
+                    del oversized_buffer
+                    torch.cuda.empty_cache()
+                continue
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
@@ -462,8 +512,13 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Final synchronization and completion signal
+        # The receiver synchronizes and drops every IPC view before ACKing a
+        # group, so the final data ACK is the staging buffers' safe lifetime
+        # boundary. Reclaim them before asking the receiver to run its final
+        # post-load conversion, which can otherwise retain both large buffers
+        # for the whole conversion and amplify a single-rank tail.
         torch.cuda.current_stream().synchronize()
+        release_staging_buffers()
         zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
         zmq_socket.recv()
 
@@ -488,15 +543,10 @@ def stream_weights_via_ipc_zmq_impl(
         ) from e
 
     finally:
-        # Clean up buffers in finally block to ensure cleanup even on exceptions
-        if buffer_a is not None:
-            del buffer_a
-        if buffer_b is not None:
-            del buffer_b
-
-        # Force garbage collection and clear CUDA cache
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Tensor references are acyclic and deterministic; a full gc.collect()
+        # scans the entire model object graph and can become a multi-second
+        # rank straggler without releasing anything that refcounting cannot.
+        release_staging_buffers()
 
 
 def rebuild_cuda_tensor_from_ipc(

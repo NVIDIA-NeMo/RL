@@ -21,7 +21,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
-from nemo_rl.models.generation.vllm.config import VllmRefitConfig
+from nemo_rl.models.generation.vllm.config import VllmSparseRefitConfig
 
 NamedTensor = tuple[str, torch.Tensor]
 TensorBatch = list[NamedTensor]
@@ -209,7 +209,7 @@ class DeltaCompressionTracker:
 
     def __init__(
         self,
-        config: VllmRefitConfig,
+        config: VllmSparseRefitConfig,
     ) -> None:
         self.refit_config = config
         delta_config = config.delta_compression

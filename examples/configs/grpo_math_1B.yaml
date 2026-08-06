@@ -8,12 +8,17 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -50,7 +55,7 @@ grpo:
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -115,6 +120,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
   hf_config_overrides: {} 
   train_global_batch_size: 512
   train_micro_batch_size: 4
@@ -300,6 +306,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
@@ -339,8 +346,20 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
-    refit_transport: null  # Set to "vllm_s3_sparse" or "vllm_zmq_sparse" for remote sparse-delta refit.
-    refit_cfg: null  # Optional tuning and storage settings for remote sparse-delta refit.
+    # null = topology default (IPC colocated, NCCL non-colocated).
+    # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
+    refit_transport: null
+    # Keep real-quant export tensors on CPU by default. Set false only for
+    # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
+    real_quant_export_cpu_offload: true
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        backend_name: UCX
+        backend_init_params: null
+        release_after_refit: false
+        shard_expert_weights: false
     mcore_generation_config:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
@@ -363,6 +382,7 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -451,6 +471,8 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"

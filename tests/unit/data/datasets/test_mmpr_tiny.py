@@ -128,7 +128,7 @@ class TestMMPRTinyDataset:
             MMPRTinyDataset(download_dir="")
 
 
-def _make_stub_nemotron_processor():
+def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
     """Build a minimal stub whose class name is NemotronNanoVLV2Processor.
 
     The stub implements just enough of the AutoProcessor interface for
@@ -164,10 +164,13 @@ def _make_stub_nemotron_processor():
 
         def __call__(self, text=None, images=None, **kwargs):
             self.captured_call_text = text
-            return {
+            result = {
                 "input_ids": fake_input_ids,
-                "pixel_values": torch.randn(1, 3, 224, 224),
+                "pixel_values": torch.randn(num_tiles, 3, 224, 224),
             }
+            if include_imgs_sizes:
+                result["imgs_sizes"] = torch.tensor([[224, 224]] * num_tiles)
+            return result
 
     return NemotronNanoVLV2Processor()
 
@@ -233,6 +236,37 @@ class TestVLMProcessorMMPRTiny:
         assert "vllm_images" in result
         assert len(result["vllm_images"]) == 1
         assert result["task_name"] == "mmpr-tiny"
+        user_message = result["message_log"][0]
+        assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
+
+    def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        processor = _make_stub_nemotron_processor(include_imgs_sizes=False, num_tiles=3)
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path],
+                "question": _RAW_QUESTION,
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        user_message = result["message_log"][0]
+        assert torch.equal(
+            user_message["imgs_sizes"].as_tensor(),
+            torch.tensor([[224, 224], [224, 224], [224, 224]]),
+        )
+        assert torch.equal(
+            user_message["num_frames"].as_tensor(), torch.ones(3, dtype=torch.long)
+        )
 
     def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
         self, tiny_image_path

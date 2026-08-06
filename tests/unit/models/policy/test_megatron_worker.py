@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -45,12 +46,282 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_model_owned_packing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    class ModelOwnedPackingModel:
+        model_owns_packing = True
+
+    assert _model_self_packs_for_cp(ModelOwnedPackingModel())
+
+
+def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_mtp_loss_mask,
+    )
+
+    class ModelOwnedPackingModel:
+        model_owns_mtp_loss_mask_packing = True
+
+    assert _model_self_packs_mtp_loss_mask(ModelOwnedPackingModel())
+    assert not _model_self_packs_mtp_loss_mask(object())
+
+
+def test_regular_model_does_not_delegate_packing():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    assert not _model_self_packs_for_cp(object())
+
+
+def test_model_cp_slicing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_slices_context_parallel_inputs,
+    )
+
+    class ModelSlicesContextParallelInputs:
+        model_slices_context_parallel_inputs = True
+
+    assert _model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
+    assert not _model_slices_context_parallel_inputs(object())
+
+
+def test_model_cp_slicing_rejects_transfer_queue_setup():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model_slices_context_parallel_inputs = True
+
+    with pytest.raises(
+        NotImplementedError, match="TransferQueue/SingleController does not yet support"
+    ):
+        worker.setup_data_plane(MagicMock())
+
+
+def test_refit_size_estimate_preserves_integral_buffer_dtype():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _estimate_refit_tensor_size_in_bytes,
+    )
+
+    param = torch.zeros(3, dtype=torch.int64)
+
+    assert (
+        _estimate_refit_tensor_size_in_bytes(
+            param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+        )
+        == 3 * 8 * 2 * 4
+    )
+
+
+def test_refit_size_estimate_casts_floating_weight_to_export_dtype():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _estimate_refit_tensor_size_in_bytes,
+    )
+
+    param = torch.zeros(3, dtype=torch.float32)
+
+    assert (
+        _estimate_refit_tensor_size_in_bytes(
+            param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+        )
+        == 3 * 2 * 2 * 4
+    )
+
+
+def test_qwen3vl_type_fallback_still_delegates_packing():
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    assert _model_self_packs_for_cp(Qwen3VLModel.__new__(Qwen3VLModel))
+
+
 class _FakeTrainableModel:
     def __init__(self):
         self.train_called = False
+        self.eval_called = False
 
     def train(self):
         self.train_called = True
+
+    def eval(self):
+        self.eval_called = True
+
+
+class _ModelWithNonSerializableExtraState(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.register_buffer("scale", torch.ones(1))
+
+    def get_extra_state(self):
+        raise AssertionError("moving a module must not serialize its extra state")
+
+
+def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
+    """Async checkpoint tensor references must be released before GPU offload."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+    worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker.move_model = lambda model, device, move_params, move_grads: (
+        events.append("move_model") or model
+    )
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            events.append("wake_allocator")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda *args, **kwargs: events.append("memory_allocated") or 0,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda *args, **kwargs: events.append("memory_reserved") or 0,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert events[0] == "finalize_async_save"
+    assert events.index("finalize_async_save") < events.index("move_model")
+
+
+def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
+    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker.move_model = lambda model, device: events.append("move_model") or model
+    worker.offload_before_refit = lambda: events.append("offload_before_refit")
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            events.append("wake_allocator")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda *args, **kwargs: events.append("memory_allocated") or 0,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda *args, **kwargs: events.append("memory_reserved") or 0,
+    )
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_after_refit(worker)
+
+    assert events[0] == "finalize_async_save"
+    assert events.index("finalize_async_save") < events.index("move_model")
+
+
+@pytest.mark.parametrize("cache_active", [True, False])
+def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
+    monkeypatch, cache_active
+):
+    """Only an active unsafe NVRx cache should terminate the persistent writer."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {"generation": {"colocated": {"enabled": True}}}
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                async_save=True,
+                async_strategy="nvrx",
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=False,
+            )
+        )
+    )
+    worker._async_checkpoint_cuda_cache_active = cache_active
+    events = []
+
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append(("finalize", kwargs["terminate"])),
+    )
+
+    class _Writer:
+        @classmethod
+        def cleanup_tensor_caches(cls):
+            events.append(("cleanup_tensor_caches", None))
+
+    monkeypatch.setattr(
+        worker_module,
+        "get_async_strategy",
+        lambda strategy: (strategy, {"FileSystemWriterAsync": _Writer}),
+    )
+    monkeypatch.setattr(
+        worker_module.gc, "collect", lambda: events.append(("gc_collect", None))
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "ipc_collect",
+        lambda: events.append(("ipc_collect", None)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: events.append(("empty_cache", None)),
+    )
+
+    worker_module.MegatronPolicyWorkerImpl.finalize_async_save(worker)
+
+    assert events[0] == ("finalize", cache_active)
+    if cache_active:
+        assert events[1:] == [
+            ("cleanup_tensor_caches", None),
+            ("gc_collect", None),
+            ("ipc_collect", None),
+            ("empty_cache", None),
+        ]
+        assert worker._async_checkpoint_cuda_cache_active is False
+    else:
+        assert events == [("finalize", False)]
+
+
+def test_megatron_move_model_does_not_serialize_extra_state():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _ModelWithNonSerializableExtraState()
+
+    moved_model = MegatronPolicyWorkerImpl.move_model(worker, model, "cpu")
+
+    assert moved_model is model
+    assert model.weight.device.type == "cpu"
+    assert model.scale.device.type == "cpu"
 
 
 def test_megatron_prepare_for_training_restores_optimizer():
@@ -154,7 +425,13 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
 
 
-def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
+@pytest.mark.parametrize(
+    ("kwargs", "expected_param_sync"),
+    [({}, False), ({"param_sync": True}, True)],
+)
+def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
+    kwargs: dict[str, bool], expected_param_sync: bool
+) -> None:
     source_path = (
         Path(__file__).parents[4]
         / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
@@ -204,12 +481,53 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
         param_sync
     )
 
-    worker._disable_forward_pre_hook_until_next_train_step()
+    worker._disable_forward_pre_hook_until_next_train_step(**kwargs)
 
-    assert disable_calls == [False]
+    assert disable_calls == [expected_param_sync]
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+def test_prepare_for_generation_disables_param_gather_hook_before_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    events = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(flash_decode=True),
+        eval=lambda: events.append("eval"),
+    )
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {"mcore_generation_config": {"cuda_graph_impl": "none"}}
+    }
+    worker.model = model
+    worker.is_generation_colocated = True
+    worker.should_disable_forward_pre_hook = True
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_to_cuda") or model
+    )
+    worker._forward_pre_hook_enabled = lambda: True
+    worker._disable_forward_pre_hook_until_next_train_step = (
+        lambda *, param_sync=False: events.append(("disable_hook", param_sync))
+    )
+    worker._inference_engine_initialized = True
+    worker._wake = lambda: events.append("wake_engine")
+
+    monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: model)
+
+    worker.prepare_for_generation()
+
+    assert events == [
+        "move_to_cuda",
+        ("disable_hook", True),
+        "eval",
+        "wake_engine",
+    ]
+    assert model.config.flash_decode is False
 
 
 def create_megatron_test_config(
@@ -1368,6 +1686,9 @@ def test_megatron_checkpoint_save_kill_and_restore(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
             )
+            # save_checkpoint() may use MCore's async save path.  Complete the
+            # write before inspecting the checkpoint or terminating its workers.
+            policy1.finalize_async_save()
 
             # Verify checkpoint was created
             assert os.path.exists(checkpoint_dir), "Checkpoint directory not created"

@@ -59,6 +59,7 @@ def validate_vllm_remote_sparse_refit(
     vllm_cfg = config["vllm_cfg"]
     refit_config = normalize_vllm_refit_config(config)
     assert refit_config is not None
+    sparse_config = refit_config.sparse
     if (
         colocated
         or not megatron_enabled
@@ -72,10 +73,11 @@ def validate_vllm_remote_sparse_refit(
             "vLLM, and an unquantized rollout."
         )
     if transport == "vllm_s3_sparse" and not (
-        refit_config.storage.s3_bucket and refit_config.storage.s3_bucket.strip()
+        sparse_config.storage.s3_bucket and sparse_config.storage.s3_bucket.strip()
     ):
         raise ValueError(
-            "vllm_s3_sparse requires policy.generation.refit_cfg.storage.s3_bucket."
+            "vllm_s3_sparse requires "
+            "policy.generation.refit_cfg.sparse.storage.s3_bucket."
         )
     return _REMOTE_SPARSE_TRANSPORTS[transport]
 

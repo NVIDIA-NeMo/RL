@@ -71,8 +71,10 @@ def _valid_config() -> dict:
     return {
         "refit_transport": "vllm_s3_sparse",
         "refit_cfg": {
-            "delta_compression": {"encoding": "overwrite"},
-            "storage": {"s3_bucket": "bucket"},
+            "sparse": {
+                "delta_compression": {"encoding": "overwrite"},
+                "storage": {"s3_bucket": "bucket"},
+            }
         },
         "vllm_cfg": {"precision": "bfloat16", "kv_cache_dtype": "auto"},
     }
@@ -87,8 +89,10 @@ def test_validate_remote_sparse_refit_accepts_supported_scope():
         == "s3"
     )
     assert config["refit_cfg"] == VllmRefitConfig(
-        delta_compression={"encoding": "overwrite"},
-        storage={"s3_bucket": "bucket"},
+        sparse={
+            "delta_compression": {"encoding": "overwrite"},
+            "storage": {"s3_bucket": "bucket"},
+        }
     )
 
 
@@ -98,7 +102,7 @@ def test_validate_remote_sparse_refit_accepts_supported_scope():
         ({"refit_transport": "unknown"}, {}),
         ({}, {"colocated": True}),
         ({}, {"megatron_enabled": False}),
-        ({"refit_cfg": {"storage": {"s3_bucket": None}}}, {}),
+        ({"refit_cfg": {"sparse": {"storage": {"s3_bucket": None}}}}, {}),
         ({"quant_cfg": "fp8"}, {}),
         ({"vllm_cfg": {"precision": "fp8", "kv_cache_dtype": "auto"}}, {}),
         (

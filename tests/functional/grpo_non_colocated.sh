@@ -7,7 +7,7 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
-EXP_NAME=$(basename $0 .sh)
+EXP_NAME=${EXP_NAME:-$(basename $0 .sh)}
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
@@ -41,4 +41,3 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
-

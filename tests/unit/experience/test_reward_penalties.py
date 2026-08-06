@@ -17,11 +17,15 @@ import sys
 import pytest
 import torch
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollouts import (
     _extract_mask_sample_flags,
+    _postprocess_single_nemo_gym_group,
     apply_reward_penalties,
     resolve_reward_penalty_config,
+    should_mask_flagged_samples,
 )
+from nemo_rl.utils.timer import Timer
 
 # ---- Helpers to build minimal result dicts ----
 
@@ -79,6 +83,7 @@ def _msg(role, token_ids, **extra):
 class _FakeTokenizer:
     def __init__(self, eos_token_id=2, token_map=None):
         self.eos_token_id = eos_token_id
+        self.pad_token_id = 0
         self.token_map = token_map or {"<think>": [12], "</think>": [13]}
 
     def encode(self, text, add_special_tokens=False):
@@ -102,6 +107,66 @@ class TestExtractMaskSampleFlags:
         assert torch.equal(
             mask_sample, torch.tensor([True, False, False, False, False])
         )
+
+
+class TestShouldMaskFlaggedSamples:
+    def test_reads_env_should_mask_flagged_samples(self):
+        assert should_mask_flagged_samples({}) is True
+        assert (
+            should_mask_flagged_samples({"should_mask_flagged_samples": None}) is True
+        )
+        assert (
+            should_mask_flagged_samples({"should_mask_flagged_samples": True}) is True
+        )
+        assert (
+            should_mask_flagged_samples({"should_mask_flagged_samples": False}) is False
+        )
+
+
+class _FakeGeneration:
+    cfg = {"max_total_sequence_length": 100}
+
+
+def _gate_result(mask_sample):
+    return {
+        "full_result": {
+            "reward": 1.0,
+            "response": {"output": []},
+            "instance_config": {"mask_sample": mask_sample},
+        },
+        "message_log": [
+            {"role": "user", "token_ids": torch.tensor([3, 4])},
+            {"role": "assistant", "token_ids": torch.tensor([1, 2])},
+        ],
+        "input_message_log": [{"role": "user", "token_ids": torch.tensor([3, 4])}],
+    }
+
+
+class TestMaskEnvFlaggedSamplesBatchedGate:
+    """The batched NeMo-Gym postprocess gate at _postprocess_single_nemo_gym_group."""
+
+    def _final_batch(self, mask_env_flagged_samples):
+        results = [_gate_result(True), _gate_result(False)]
+        nemo_gym_rows = [{"agent_ref": {"name": "agent"}} for _ in results]
+        rollout_result = _postprocess_single_nemo_gym_group(
+            nemo_gym_rows=nemo_gym_rows,
+            results=results,
+            timer=Timer(),
+            timer_prefix="timing/test",
+            policy_generation=_FakeGeneration(),
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+            tokenizer=_FakeTokenizer(),
+            log_full_result_tables=False,
+            mask_env_flagged_samples=mask_env_flagged_samples,
+        )
+        return rollout_result.final_batch
+
+    def test_gate_on_carries_mask_sample(self):
+        final_batch = self._final_batch(True)
+        assert torch.equal(final_batch["mask_sample"], torch.tensor([True, False]))
+
+    def test_gate_off_omits_mask_sample(self):
+        assert "mask_sample" not in self._final_batch(False)
 
 
 # =====================================================================

@@ -1,0 +1,49 @@
+# SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml.
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
+
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
+
+# SC does not support validation and checkpointing yet.
+grpo:
+  val_period: 0
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
+
+# TransferQueue data plane is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+# SC async-RL runtime knobs.
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  # Preserve sync-mode cache invalidation after every weight update.
+  recompute_kv_cache_after_weight_updates: true
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  # In-order with zero lookahead requires one prompt batch of capacity.
+  max_buffered_rollouts: 32
+
+policy:
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    scheduler:
+      lr_warmup_iters: 50
+  generation:
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        # 4 GPUs for inference; remaining 4 GPUs on the node go to training.
+        gpus_per_node: 4
+        num_nodes: 1
