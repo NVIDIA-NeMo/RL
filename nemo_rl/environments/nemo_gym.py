@@ -35,7 +35,6 @@ from nemo_rl.data.multimodal_utils import (
     resolve_to_image,
     uses_image_placeholder,
 )
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -46,7 +45,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # Kept local (not imported from models.generation) so the gym actor stays free of
 # generation-module imports. Must cover every name resolve_routed_experts_dtype
@@ -1037,11 +1036,9 @@ def spinup_nemo_gym_actor(
         initial_global_config_dict=nemo_gym_dict,
     )
 
-    nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
-    if nemo_gym_py_exec.startswith("uv"):
-        nemo_gym_py_exec = create_local_venv_on_each_node(
-            nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
-        )
+    nemo_gym_runtime_env = make_actor_runtime_env(
+        "nemo_rl.environments.nemo_gym.NemoGym"
+    )
 
     nemo_gym_opts: dict[str, Any] = {}
     if nemo_gym_dict.get("num_gpu_nodes", 0):
@@ -1049,14 +1046,7 @@ def spinup_nemo_gym_actor(
             node_id=ray.get_runtime_context().get_node_id(),
             soft=True,
         )
-    nemo_gym_opts["runtime_env"] = {
-        "py_executable": nemo_gym_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": nemo_gym_py_exec,
-            "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-        },
-    }
+    nemo_gym_opts["runtime_env"] = nemo_gym_runtime_env
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
     ray.get(actor._spinup.remote())

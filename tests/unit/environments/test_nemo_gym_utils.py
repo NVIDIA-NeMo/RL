@@ -17,6 +17,8 @@ These run in the default L0 suite. Keep this module free of heavy imports
 (e.g. vllm) so the fast detector tests are not gated behind the nemo_gym extra.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
@@ -24,6 +26,7 @@ from nemo_rl.environments.nemo_gym import (
     _detect_invalid_tool_call_and_malformed_thinking,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    spinup_nemo_gym_actor,
 )
 
 
@@ -97,3 +100,45 @@ def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
     assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"
+
+
+def test_spinup_nemo_gym_actor_uses_venv_directory_in_runtime_env(monkeypatch):
+    venv_dir = "/opt/ray_venvs/nemo_rl.environments.nemo_gym.NemoGym"
+    runtime_env = {
+        "py_executable": f"{venv_dir}/bin/python",
+        "env_vars": {
+            "VIRTUAL_ENV": venv_dir,
+            "UV_PROJECT_ENVIRONMENT": venv_dir,
+        },
+    }
+    make_runtime_env = MagicMock(return_value=runtime_env)
+    actor = MagicMock()
+    spinup_ref = object()
+    actor._spinup.remote.return_value = spinup_ref
+    nemo_gym_cls = MagicMock()
+    nemo_gym_cls.options.return_value.remote.return_value = actor
+    ray_get = MagicMock()
+
+    monkeypatch.setattr(nemo_gym_mod, "make_actor_runtime_env", make_runtime_env)
+    monkeypatch.setattr(nemo_gym_mod, "NemoGym", nemo_gym_cls)
+    monkeypatch.setattr(nemo_gym_mod.ray, "get", ray_get)
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_uv_cache_dir", lambda: None)
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_venv_dir", lambda: None)
+
+    result = spinup_nemo_gym_actor(
+        env_configs={"nemo_gym": {"config_paths": ["circle_count.yaml"]}},
+        base_urls=["http://policy/v1"],
+        model_name="policy",
+        enable_router_replay=False,
+        routed_experts_dtype="int8",
+        use_fastokens=False,
+    )
+
+    assert result is actor
+    make_runtime_env.assert_called_once_with(
+        "nemo_rl.environments.nemo_gym.NemoGym"
+    )
+    assert nemo_gym_cls.options.call_args.kwargs["runtime_env"] == runtime_env
+    assert runtime_env["env_vars"]["VIRTUAL_ENV"] == venv_dir
+    assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == venv_dir
+    ray_get.assert_called_once_with(spinup_ref)
