@@ -39,6 +39,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
 )
+from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -322,18 +323,20 @@ def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
 
 
 def _promote_1d_leaves(td: TensorDict) -> TensorDict:
-    """Unsqueeze 1D tensor leaves to ``(N, 1)`` — mooncake_cpu KV-path workaround.
+    """Unsqueeze declared 1D scalar leaves to ``(N, 1)`` — mooncake_cpu workaround.
 
-    Works around TQ's ``KVStorageManager`` 1D schema/data mismatch;
-    :func:`_from_wire` squeezes the trailing 1 back on read. Symmetric
-    with `_from_wire` — callers gate on ``self._promote_1d``.
-    ``NonTensorStack`` / ``NonTensorData`` leaves pass through.
+    Consults :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS` — the
+    authoritative user-level declaration of which fields are per-sample 1D
+    scalars. Works around TQ's ``KVStorageManager`` 1D schema/data mismatch;
+    :func:`_from_wire` squeezes the trailing 1 back on read using the same
+    schema. Callers gate on ``self._promote_1d``. ``NonTensorStack`` /
+    ``NonTensorData`` leaves pass through.
 
     Args:
-        td: ``TensorDict`` whose 1D tensor leaves should be promoted.
+        td: ``TensorDict`` whose declared 1D tensor leaves should be promoted.
 
     Returns:
-        ``TensorDict`` with 1D tensor leaves unsqueezed to ``(N, 1)``;
+        ``TensorDict`` with declared 1D tensor leaves unsqueezed to ``(N, 1)``;
         all other leaves pass through unchanged.
     """
     # td.keys() (top-level) includes NonTensorData / NonTensorStack leaves.
@@ -343,7 +346,12 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     changed = False
     for k in td.keys():
         v = td.get(k)
-        if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+        if (
+            str(k) in PROMOTE_1D_FIELDS
+            and isinstance(v, torch.Tensor)
+            and not v.is_nested
+            and v.dim() == 1
+        ):
             new_dict[str(k)] = v.unsqueeze(-1).contiguous()
             changed = True
         else:
@@ -356,7 +364,12 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
+    """Inverse of `_promote_1d_leaves`: squeeze declared 1D fields back to (N,).
+
+    Consults :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`; only fields
+    present in the schema get their trailing singleton dropped so genuine
+    dense ``(N, 1)`` per-token columns retain their rank.
+    """
     # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
     # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
     new_dict: dict[str, Any] = {}
@@ -364,7 +377,8 @@ def _from_wire(td: TensorDict) -> TensorDict:
     for k in td.keys():
         v = td.get(k)
         if (
-            isinstance(v, torch.Tensor)
+            str(k) in PROMOTE_1D_FIELDS
+            and isinstance(v, torch.Tensor)
             and not v.is_nested
             and v.dim() >= 2
             and v.shape[-1] == 1

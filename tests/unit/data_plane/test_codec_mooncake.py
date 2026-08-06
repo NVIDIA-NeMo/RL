@@ -44,10 +44,10 @@ def test_promote_1d_leaves_unsqueezes_1d() -> None:
 
     n = 8
     t = torch.arange(n, dtype=torch.float32)
-    td = TensorDict({"reward": t}, batch_size=[n])
+    td = TensorDict({"input_lengths": t}, batch_size=[n])
 
     out = _promote_1d_leaves(td)
-    assert out["reward"].shape == (n, 1), (
+    assert out["input_lengths"].shape == (n, 1), (
         f"Expected wire shape ({n}, 1) but got {tuple(out['reward'].shape)}."
     )
 
@@ -63,14 +63,14 @@ def test_promote_1d_roundtrip_via_from_wire() -> None:
 
     n = 6
     original = torch.arange(n, dtype=torch.float32)
-    td = TensorDict({"reward": original}, batch_size=[n])
+    td = TensorDict({"input_lengths": original}, batch_size=[n])
 
     wire = _promote_1d_leaves(td)
-    assert wire["reward"].shape == (n, 1)
+    assert wire["input_lengths"].shape == (n, 1)
 
     back = _from_wire(wire)
-    assert back["reward"].shape == (n,)
-    assert torch.equal(back["reward"], original)
+    assert back["input_lengths"].shape == (n,)
+    assert torch.equal(back["input_lengths"], original)
 
 
 # ── P2: pack_per_token_field — tolerates SP padding ──────────────────────────

@@ -63,6 +63,22 @@ DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
 
+# Per-sample 1D scalar fields. The TQ adapter promotes these to (N, 1) on
+# write to work around TQ's KVStorageManager 1D schema/data mismatch on the
+# mooncake_cpu backend, and squeezes them back on read. Authoritative
+# user-level schema — no per-row wire metadata is carried; both writer and
+# reader consult this set by field name.
+#
+# Delete this set (and the promotion logic in adapters/transfer_queue.py)
+# when upstream TQ fixes KVStorageManager.extract_field_schema for 1D fields.
+PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
+    {
+        "input_lengths",
+        "total_reward",
+        "sample_mask",
+    }
+)
+
 
 def fields_with_optional_routed_experts(
     fields: Sequence[str],
