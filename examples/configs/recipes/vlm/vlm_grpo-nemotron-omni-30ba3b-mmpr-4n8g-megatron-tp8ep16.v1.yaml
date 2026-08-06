@@ -4,7 +4,6 @@ grpo:
   overlong_filtering: true
   zero_variance_prompt_filtering: false
   deduplicate_multimodal_data: true
-  debug_payload_metrics: false
 loss_fn:
   ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
