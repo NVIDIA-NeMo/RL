@@ -299,7 +299,12 @@ PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). It 
 | `critic/explained_var` | Explained variance: $1 - \text{Var}(R - V) / \text{Var}(R)$. Higher is better; values near 1.0 indicate the critic accurately predicts returns. |
 | `max_seq_mult_prob_error` | Maximum sequence-level multiplicative probability error between generation and training logprobs before optional masking. |
 | `mean_seq_mult_prob_error` | Mean sequence-level multiplicative probability error before optional masking. |
+| `min_seq_mult_prob_error` | Minimum sequence-level multiplicative probability error before optional masking. |
+| `max_seq_mult_prob_error_after_mask` | Maximum sequence-level multiplicative probability error among sequences retained after optional masking. |
+| `mean_seq_mult_prob_error_after_mask` | Mean sequence-level multiplicative probability error among sequences retained after optional masking. |
+| `min_seq_mult_prob_error_after_mask` | Minimum sequence-level multiplicative probability error among sequences retained after optional masking. |
 | `num_masked_seqs_by_logprob_error` | Number of sequences excluded by `ppo.seq_logprob_error_threshold`. |
+| `masked_correct_pct` | Fraction of sequences excluded by `ppo.seq_logprob_error_threshold` that received a reward of 1. |
 
 ## Evaluate the Trained Model
 

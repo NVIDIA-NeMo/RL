@@ -28,6 +28,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -900,7 +901,7 @@ def _run_mock_ppo_train(
             "policy_training_start_step": policy_training_start_step,
             "ppo_epochs": ppo_epochs,
             "reward_scaling": {"enabled": False},
-            "reward_shaping": {"enabled": False},
+            "reward_shaping": RewardShapingConfig(enabled=False),
             "seq_logprob_error_threshold": seq_logprob_error_threshold,
             "val_at_start": False,
             "val_at_end": False,
@@ -1290,6 +1291,40 @@ def _run_noncolocated_setup(monkeypatch, config):
     )
 
 
+@pytest.mark.parametrize(
+    ("refit_transport", "error_match"),
+    [
+        (
+            "vllm_s3_sparse",
+            "Remote sparse refit is currently supported only by GRPO",
+        ),
+        (
+            "nixl",
+            "PPO refits over the default collective path.*Set "
+            "policy.generation.refit_transport=null",
+        ),
+    ],
+)
+def test_ppo_rejects_explicit_vllm_refit_transport_before_cluster_creation(
+    monkeypatch,
+    refit_transport,
+    error_match,
+):
+    """PPO uses its default collective refit path for both cluster layouts."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["refit_transport"] = refit_transport
+
+    with pytest.raises(ValueError, match=error_match):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_noncolocated_sglang_is_rejected_before_cluster_creation(monkeypatch):
     """SGLang has no cross-cluster refit path, so setup must reject it early."""
     from unittest.mock import MagicMock
@@ -1345,6 +1380,29 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         match=(
             "policy.generation.colocated.resources.gpus_per_node must be explicitly set"
         ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_rejects_multiple_nodes_single_node(monkeypatch):
+    """A single-node split cannot allocate multiple rollout nodes."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=1,
+        total_gpus_per_node=8,
+        inference_nodes=2,
+        inference_gpus_per_node=2,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="policy.generation.colocated.resources.num_nodes must be 1 or set to null",
     ):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
 
@@ -1423,6 +1481,29 @@ def test_noncolocated_inference_requires_full_node_gpus_multi_node(monkeypatch):
             "policy.generation.colocated.resources.gpus_per_node must be "
             "explicitly set and equal to cluster.gpus_per_node"
         ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_must_leave_training_nodes_multi_node(monkeypatch):
+    """A multi-node split must leave at least one node for policy and value."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=2,
+        total_gpus_per_node=8,
+        inference_nodes=2,
+        inference_gpus_per_node=8,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Non-colocated PPO requires both training and inference resources",
     ):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
 
@@ -1613,6 +1694,8 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
         total_gpus_per_node=8,
         inference_gpus_per_node=2,
     )
+    config.cluster["master_port_range_low"] = 1400
+    config.cluster["master_port_range_high"] = 1999
     (
         result,
         cluster_calls,
@@ -1631,8 +1714,12 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     ]
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [6]
     assert train_cluster.kwargs["max_colocated_worker_groups"] == 2
+    assert train_cluster.kwargs["port_range_low"] == 1400
+    assert train_cluster.kwargs["port_range_high"] == 1999
     assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [2]
     assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
+    assert inference_cluster.kwargs["port_range_low"] == 1400
+    assert inference_cluster.kwargs["port_range_high"] == 1999
     assert policy_factory.call_args.kwargs["cluster"] is train_cluster
     assert value_factory.call_args.kwargs["cluster"] is train_cluster
     assert generation_factory.call_args.kwargs["cluster"] is inference_cluster

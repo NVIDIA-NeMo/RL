@@ -283,10 +283,10 @@ def setup(
             )
         if refit_transport is not None:
             raise ValueError(
-                "Checkpoint-engine refit requires non-colocated generation, but "
-                "PPO currently requires colocated generation. Non-colocated PPO "
-                "support is tracked in "
-                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+                f"policy.generation.refit_transport={refit_transport!r} is not yet "
+                "supported by PPO (colocated or non-colocated); PPO refits over the "
+                "default collective path. Set policy.generation.refit_transport=null. "
+                "Tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:

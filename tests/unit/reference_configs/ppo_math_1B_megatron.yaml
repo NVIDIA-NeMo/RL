@@ -431,3 +431,6 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null
