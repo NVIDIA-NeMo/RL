@@ -41,6 +41,7 @@ from typing import Any, Optional, Union
 
 import ray
 import torch
+from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -65,6 +66,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -748,6 +750,14 @@ class SingleControllerActor:
                     self._ray_get(worker_group.workers[worker_idx].is_alive.remote()),
                     timeout=fleet_cfg.probe_timeout_s,
                 )
+            except RayActorError as error:
+                # Conclusive, unlike a timeout: Ray only reports this once the actor
+                # process is actually gone. Counting it as one more ambiguous failure
+                # would delay the verdict by unhealthy_threshold intervals for no gain,
+                # and the refit deadline can expire inside that delay.
+                self._fleet_monitor.record_actor_death(
+                    shard_idx, error=f"{type(error).__name__}: {error}"
+                )
             except (Exception, asyncio.TimeoutError) as error:
                 self._fleet_monitor.record_probe(
                     shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
@@ -782,15 +792,19 @@ class SingleControllerActor:
         )
         self._pushed_membership_epoch = epoch
 
-    async def _reconcile_refit_membership(self) -> None:
+    async def _reconcile_refit_membership(self) -> bool:
         """Ask the weight transport to match the live fleet before the refit runs.
 
         A no-op without fleet health: with no monitor there is no notion of a shard being
         gone, so the transport keeps the membership it was built with -- which is the
         pre-existing behaviour, and why this is inert by default.
+
+        Returns whether the communicator was actually rebuilt. The recovery path needs
+        that answer: after an abort the old communicator is gone, so "nothing to
+        reconcile" means there is nothing to retry with either.
         """
         if self._fleet_monitor is None:
-            return
+            return False
         absent = self._fleet_monitor.absent_shards()
         # to_thread like every other call that reaches the workers: this can rebuild
         # communicators via blocking Ray calls, and running it on the loop would freeze
@@ -810,6 +824,79 @@ class SingleControllerActor:
             f"  _sync_weights: refit membership absent={sorted(absent)} rebuilt={rebuilt}",
             flush=True,
         )
+        return rebuilt
+
+    async def _recover_from_failed_refit(self, failure: BaseException) -> None:
+        """Drop whatever stopped participating, rebuild the communicator, allow a retry.
+
+        Two failures arrive here and they are not the same event:
+
+        ``RefitAborted`` -- a rank went silent *inside* the collective and a worker's
+        watchdog broke it. Every engine that was receiving is left holding a mix of old
+        and new weights, so none of them may serve until a refit completes.
+
+        ``RayActorError`` -- the collective finished and a shard died in the epilogue,
+        before its RPC returned. Nothing is partial; the survivors have complete weights.
+        Left uncaught this killed a run whose data transfer had *already succeeded*.
+
+        Both need the same repair, because both leave a communicator that no longer
+        matches the fleet, and in the abort case no communicator at all.
+
+        The probe here is the point. Waiting for the health monitor to reach its own
+        conclusion is what failed before: its verdict is paced by probe rounds while this
+        is an event, so the abort arrived first and the rebuild saw an empty absent set
+        and did nothing. Asking now, on this thread, turns a race into a lookup.
+        """
+        print(f"  _sync_weights: {failure}; rebuilding and retrying once", flush=True)
+        if self._fleet_monitor is None:
+            # Without fleet health there is no notion of a shard being gone and nothing
+            # to rebuild against. Failing here is the pre-existing behaviour.
+            raise failure
+
+        # 1. Establish who is actually gone, now, rather than on the probe's clock.
+        await self._probe_generation_fleet()
+
+        # 2. Only an abort leaves partial weights behind. Marking survivors stale after
+        #    a completed broadcast would pull a healthy fleet out of service over a
+        #    transfer that succeeded.
+        if isinstance(failure, RefitAborted):
+            for shard_idx in self._fleet_monitor.serving_shards():
+                self._fleet_monitor.mark_weights_partial(shard_idx)
+
+        # 3. Rebuild without the dead.
+        rebuilt = await self._reconcile_refit_membership()
+        if not rebuilt:
+            # Nothing was identified as absent, so there is no smaller membership to
+            # rebuild over. Retrying would either die on the aborted communicator or --
+            # worse -- rebuild over the full fleet and hang on the same silent rank,
+            # which is the wedge this whole path exists to remove. Fail attributably.
+            raise RuntimeError(
+                "refit failed and no generation shard could be identified as absent, so "
+                "the communicator cannot be safely rebuilt; the run cannot continue. A "
+                "rank that is alive but not participating would produce this."
+            ) from failure
+
+    def _promote_refit_shards(self) -> None:
+        """Return shards holding current weights to the serving set.
+
+        The exit from STALE, and the reason marking partial weights is safe rather than
+        terminal. An aborted refit leaves every engine that was receiving with a mix of
+        old and new weights, so they are pulled out of service -- but nothing else moves
+        a shard out of STALE, so without this the recovery would succeed and then leave
+        the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
+        failure than the one being recovered from, and reached only on the recovery path.
+
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
+        it is failing probes for its own reasons and promoting it here would reset the
+        failure count that is supposed to condemn it.
+        """
+        if self._fleet_monitor is None:
+            return
+        for health in self._fleet_monitor.snapshot():
+            if health.state is ShardState.STALE:
+                self._fleet_monitor.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
 
     async def _check_env_health(self) -> None:
         """Ask each environment actor that exposes a health check whether it is whole.
@@ -883,23 +970,17 @@ class SingleControllerActor:
                 self._weight_synchronizer.sync_weights,
                 kv_scales=kv_scales,
             )
-        except RefitAborted as aborted:
-            # A rank stopped participating mid-refit and a worker's watchdog broke the
-            # collective. Everything that survived now holds PARTIAL weights, so nothing
-            # may serve until a refit completes -- mark the fleet stale before retrying.
-            print(
-                f"  _sync_weights: {aborted}; rebuilding and retrying once", flush=True
-            )
-            if self._fleet_monitor is not None:
-                for shard_idx in self._fleet_monitor.serving_shards():
-                    self._fleet_monitor.mark_weights_partial(shard_idx)
-            await self._reconcile_refit_membership()
-            # Once only: a second abort is a real fault, not a membership problem, and
+        except (RefitAborted, RayActorError) as failure:
+            await self._recover_from_failed_refit(failure)
+            # Once only: a second failure is a real fault, not a membership problem, and
             # retrying forever would recreate the wedge this exists to remove.
             await asyncio.to_thread(
                 self._weight_synchronizer.sync_weights,
                 kv_scales=kv_scales,
             )
+        # A completed refit is what makes an engine's weights current, so this is where a
+        # shard pulled out of service for holding partial ones earns its way back.
+        self._promote_refit_shards()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

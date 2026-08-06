@@ -264,6 +264,33 @@ class GenerationFleetMonitor:
         elif shard.state is ShardState.HEALTHY:
             self._transition(shard, ShardState.SUSPECT)
 
+    def record_actor_death(self, shard_idx: int, error: str = "") -> None:
+        """Record proof that a shard's process is gone. DEAD at once, no counting.
+
+        The counters in :meth:`record_probe` exist to tell a slow shard from a dead one,
+        because a probe timeout cannot distinguish them. Some evidence carries no such
+        ambiguity: Ray reporting its actor dead means the process is gone, full stop, and
+        making that wait for ``unhealthy_threshold`` more rounds of the same answer only
+        delays the conclusion.
+
+        The delay was not academic. Detection took ``probe_interval_s *
+        unhealthy_threshold``, which the refit deadline could expire inside -- so a refit
+        hung on a dead rank aborted while the monitor still had that rank SUSPECT, and
+        the rebuild the abort exists to trigger had an empty absent set to work from.
+        Job 5925668.
+
+        Ignores shards that are already absent, so a repeat report is idempotent, and
+        RETIRED is never disturbed.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        if error:
+            shard.last_error = error
+        shard.consecutive_probe_successes = 0
+        shard.consecutive_probe_failures = self._policy.unhealthy_threshold
+        self._transition(shard, ShardState.DEAD)
+
     def report_failure(self, shard_idx: int, error: BaseException) -> None:
         """Record a failure observed by a routing adapter rather than by a probe.
 

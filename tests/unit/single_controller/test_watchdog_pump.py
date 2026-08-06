@@ -275,6 +275,43 @@ class TestGenerationFleetProbe:
         assert monitor.state_of(1) is ShardState.DEAD
         assert monitor.serving_shards() == [0]
 
+    def test_a_dead_actor_is_conclusive_on_the_first_round(self):
+        """A RayActorError is proof, not another ambiguous data point.
+
+        A probe timeout cannot tell a slow shard from a dead one, which is what the
+        counters are for. Ray reporting the actor dead can, so waiting for
+        unhealthy_threshold rounds only delays the verdict -- and the refit deadline can
+        expire inside that delay, which is exactly how job 5925668 aborted a hung refit
+        while the corpse was still SUSPECT. A threshold of 99 makes counting impossible.
+        """
+        monitor = GenerationFleetMonitor(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(_run_probe_ticks(ctrl, 2))
+        assert monitor.state_of(1) is ShardState.DEAD
+        assert monitor.absent_shards() == [1]
+
+    def test_a_timeout_is_still_counted_rather_than_trusted(self):
+        """The other half: an ambiguous failure must keep its benefit of the doubt.
+
+        A shard busy inside a refit stops answering probes without being dead. Treating
+        that like proof of death would condemn a healthy fleet on one slow round.
+        """
+        monitor = GenerationFleetMonitor(
+            shard_count=1, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True])
+        ctrl._async_cfg.fleet_health.probe_timeout_s = 0.001
+        ctrl._gen.worker_group.workers = [
+            SimpleNamespace(
+                is_alive=SimpleNamespace(remote=lambda: asyncio.sleep(10.0))
+            )
+        ]
+        asyncio.run(_run_probe_ticks(ctrl, 3))
+        assert monitor.state_of(0) is ShardState.SUSPECT
+        assert monitor.absent_shards() == []
+
     def test_fleet_state_is_published(self):
         monitor = GenerationFleetMonitor(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
