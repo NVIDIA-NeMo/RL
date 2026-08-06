@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
@@ -39,9 +40,11 @@ class FakeTokenizer:
 
     Tokenization is character-level with a fixed pad token at id 0.
     Texts longer than ``max_length`` are truncated; shorter texts are
-    padded to ``max_length``. Returns the dict shape HF tokenizers
-    produce (``input_ids``, ``attention_mask``) when called with
-    ``return_tensors="pt"``.
+    padded to ``max_length``. Returns the dict shape HF fast tokenizers
+    produce (``input_ids``, ``attention_mask``, and ``offset_mapping`` when
+    ``return_offsets_mapping=True``) when called with ``return_tensors="pt"``.
+    Character-level tokenization makes offsets trivial: content token ``k``
+    covers ``(k, k+1)``; padding covers ``(0, 0)``.
     """
 
     eos_token = "<eos>"
@@ -53,25 +56,40 @@ class FakeTokenizer:
         self.pad_token = "<pad>"
         self._prefix = prefix
 
-    def __call__(self, texts, padding, truncation, max_length, return_tensors):
+    def __call__(
+        self,
+        texts,
+        padding,
+        truncation,
+        max_length,
+        return_tensors,
+        return_offsets_mapping=False,
+    ):
         assert padding == "max_length"
         assert truncation is True
         assert return_tensors == "pt"
         all_ids = []
         all_mask = []
+        all_offsets = []
         for t in texts:
             ids = [2 + (ord(c) % (self.vocab_size - 2)) for c in t][:max_length]
             mask = [1] * len(ids)
+            offsets = [(k, k + 1) for k in range(len(ids))]
             if len(ids) < max_length:
                 pad_n = max_length - len(ids)
                 ids = ids + [self.pad_token_id] * pad_n
                 mask = mask + [0] * pad_n
+                offsets = offsets + [(0, 0)] * pad_n
             all_ids.append(ids)
             all_mask.append(mask)
-        return {
+            all_offsets.append(offsets)
+        out = {
             "input_ids": torch.tensor(all_ids, dtype=torch.long),
             "attention_mask": torch.tensor(all_mask, dtype=torch.long),
         }
+        if return_offsets_mapping:
+            out["offset_mapping"] = torch.tensor(all_offsets, dtype=torch.long)
+        return out
 
     def convert_ids_to_tokens(self, ids):
         # Prefix the tokenizer name into each token id so two FakeTokenizer
@@ -288,3 +306,123 @@ class TestCollatorReadsMessageLog:
         )
         # The collator tokenizes message_log[0]["content"].
         assert int(out["input_lengths"][0]) == len("alt-text")
+
+
+# ---------------------------------------------------------------------------
+# Chat mode — char-level fake tokenizer with a chat template.
+# ---------------------------------------------------------------------------
+
+
+class FakeChatTokenizer:
+    """Char-level tokenizer with a chat template (one token per char).
+
+    ``apply_chat_template`` wraps each message in per-role scaffold markers so
+    the student and teacher render the *same* content in *different* full-string
+    coordinates. Token i == char i, so offsets are ``(i, i+1)`` and positions
+    map directly to chars — which makes the assistant-span asserts readable.
+    """
+
+    is_fast = True
+
+    def __init__(self, scaffold: dict) -> None:
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.pad_token = "<pad>"
+        self.eos_token = "<eos>"
+        self.padding_side = "right"
+        self.bos_token_id = None
+        self.unk_token_id = None
+        self.sep_token_id = None
+        self.cls_token_id = None
+        self.mask_token_id = None
+        self.all_special_ids = [0, 1]
+        self._scaffold = scaffold
+
+    def apply_chat_template(self, messages, tokenize=False):
+        parts = []
+        for m in messages:
+            pre, suf = self._scaffold.get(m["role"], ("", ""))
+            parts.append(pre + m["content"] + suf)
+        return "".join(parts)
+
+    def __call__(
+        self,
+        text,
+        truncation=False,
+        max_length=None,
+        add_special_tokens=True,
+        return_offsets_mapping=False,
+    ):
+        chars = list(text)
+        if max_length is not None:
+            chars = chars[:max_length]
+        out = {"input_ids": [ord(c) for c in chars]}
+        if return_offsets_mapping:
+            out["offset_mapping"] = [(k, k + 1) for k in range(len(chars))]
+        return out
+
+    def convert_ids_to_tokens(self, ids):
+        return [chr(int(i)) for i in ids]
+
+
+def _chat_aligner(student_tok, teacher_tok) -> TokenAligner:
+    aligner = TokenAligner.__new__(TokenAligner)
+    aligner.student_tokenizer = student_tok
+    aligner.teacher_tokenizer = teacher_tok
+    aligner.alignment_method = "offset_cluster_decode_fix"
+    return aligner
+
+
+class TestCollatorChatMode:
+    def test_chat_aligns_only_assistant_content(self):
+        # Same content, different scaffold => different full-string coordinates.
+        student_tok = FakeChatTokenizer(
+            {"user": ("[U]", ""), "assistant": ("[A]", "[E]")}
+        )
+        teacher_tok = FakeChatTokenizer(
+            {"user": ("<usr>", ""), "assistant": ("<asst>", "<end>")}
+        )
+        aligner = _chat_aligner(student_tok, teacher_tok)
+        collator = CrossTokenizerCollator(
+            student_tokenizer=student_tok,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[aligner],
+            ctx_length_student=64,
+            ctx_length_teachers=[64],
+            mode="chat",
+        )
+        datum = {
+            "loss_multiplier": 1.0,
+            "idx": 0,
+            "message_log": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Hello world"},
+            ],
+        }
+        out = collator([datum])
+
+        # student render "[U]hi[A]Hello world[E]" -> assistant content chars [8,19)
+        tok_mask = out["token_mask"][0].tolist()
+        assert [p for p, v in enumerate(tok_mask) if v == 1] == list(range(8, 19))
+
+        # Alignment covers assistant content + the EOT token (char 19), scaffold
+        # stays unaligned (chunk_id == -1).
+        assert int(out["alignment_0_num_chunks"][0]) > 0
+        s_chunk = out["alignment_0_student_chunk_id"][0].tolist()
+        assert all(s_chunk[p] != -1 for p in range(8, 20)), s_chunk
+        assert all(s_chunk[p] == -1 for p in list(range(0, 8)) + [20, 21]), s_chunk
+
+    def test_native_thinking_alignment_not_implemented(self):
+        tok = FakeChatTokenizer({"assistant": ("", "")})
+        aligner = _chat_aligner(tok, tok)
+        with pytest.raises(NotImplementedError):
+            CrossTokenizerCollator(
+                student_tokenizer=tok,
+                teacher_tokenizers=[tok],
+                aligners=[aligner],
+                ctx_length_student=32,
+                ctx_length_teachers=[32],
+                mode="chat",
+                include_thinking_in_loss=True,
+                native_thinking_alignment=True,
+            )

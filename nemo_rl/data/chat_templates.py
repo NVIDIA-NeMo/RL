@@ -21,3 +21,30 @@ class COMMON_CHAT_TEMPLATES:
     passthrough_prompt_response = (
         "{% for message in messages %}{{ message['content'] }}{% endfor %}"
     )
+
+
+def find_rendered_message_content_span(
+    text: str,
+    content: str,
+    cursor: int = 0,
+) -> tuple[int, int, str] | None:
+    """Find a message's content span in chat-template-rendered ``text``.
+
+    Some chat templates apply Jinja ``trim`` / ``rstrip`` to message content, so
+    the exact ``content`` string may not appear verbatim in ``text``. Search for
+    the exact content first, then whitespace-trimmed variants, starting at
+    ``cursor``. Returns ``(start, end, matched_variant)`` or ``None``.
+    """
+    if not content:
+        return None
+
+    candidates = (content, content.rstrip(), content.lstrip(), content.strip())
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        pos = text.find(candidate, cursor)
+        if pos >= 0:
+            return pos, pos + len(candidate), candidate
+    return None
