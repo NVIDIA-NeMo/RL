@@ -1,0 +1,45 @@
+defaults: performance/grpo-qwen3-30ba3b-4n4g.yaml
+grpo:
+  max_num_steps: 2
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+policy:
+  train_global_batch_size: 16
+  logprob_batch_size: 1
+  generation:
+    nvfp4_pertoken_rollout:
+      enabled: true
+      additional_ignore:
+      - '*.layers.0.mlp.experts*'
+      - '*.layers.1.mlp.experts*'
+      - '*.layers.44.mlp.experts*'
+      - '*.layers.45.mlp.experts*'
+      - '*.layers.46.mlp.experts*'
+      - '*.layers.47.mlp.experts*'
+    vllm_kwargs:
+      moe_backend: auto
+  megatron_cfg:
+    moe_router_dtype: fp32
+    optimizer:
+      use_precision_aware_optimizer: false
+    fp4_cfg:
+      enabled: true
+      fp4: e2m1
+      fp4_recipe: nvfp4
+      fp4_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
+    te_precision_config_file: examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml
+    env_vars:
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
+      NVTE_NVFP4_DISABLE_RHT: '1'
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
+      NVTE_BACKWARD_OVERRIDE: dequantized
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
