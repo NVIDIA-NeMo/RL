@@ -26,6 +26,9 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_LOW,
     _get_free_consecutive_ports_local,
 )
+from nemo_rl.models.generation.sglang.checkpoint_engine import (
+    SGLangCheckpointEngineMixin,
+)
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
@@ -34,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 @ray.remote  # pragma: no cover
-class SGLangGenerationWorker:
+class SGLangGenerationWorker(SGLangCheckpointEngineMixin):
     def __init__(
         self,
         gpus_per_node: int,

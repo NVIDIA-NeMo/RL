@@ -168,6 +168,43 @@ class SGLangGeneration(GenerationInterface):
             for j in range(len(self.engines))
         ]
 
+    def get_rollout_engine_urls(self) -> list[str]:
+        """Resolve node-0 engine HTTP base URLs once on the driver."""
+        return ray.get([e.get_base_url.remote() for e in self.rollout_engines])
+
+    def run_checkpoint_engine_method(
+        self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
+    ) -> list[ray.ObjectRef]:
+        """Run a checkpoint-engine method on every logical SGLang engine."""
+        if self.nodes_per_engine != 1:
+            raise NotImplementedError(
+                "SGLang checkpoint-engine refit currently requires each logical "
+                "engine to fit on one node."
+            )
+
+        refs = []
+        for engine, rollout_rank_start in zip(
+            self.engines, self.engine_gpu_offsets, strict=True
+        ):
+            args = method_args
+            if checkpoint_method == "init_checkpoint_engine":
+                args = (*method_args, rollout_rank_start)
+            refs.append(getattr(engine, checkpoint_method).remote(*args))
+        return refs
+
+    def init_checkpoint_engine_process_groups(
+        self,
+        *,
+        train_world_size: int,
+        rollout_world_size: int,
+        metadata: list[Any],
+    ) -> list[ray.ObjectRef]:
+        """Connect every rank-local receiver to its policy peer."""
+        args = (train_world_size, rollout_world_size, metadata)
+        return self.run_checkpoint_engine_method(
+            "init_checkpoint_engine_process_group", args
+        )
+
     def _start_engines(
         self, port_cursors: dict[int, int] | None = None
     ) -> tuple[list, dict[int, int]]:
