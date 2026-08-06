@@ -1279,7 +1279,18 @@ def _get_pack_sequence_parameters_for_megatron(
     pp_size = megatron_cfg["pipeline_model_parallel_size"]
     cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
+    fp4_cfg = megatron_cfg.get("fp4_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
+    # MasterConfig validation materializes the nested FP4 settings as an
+    # Fp4Config model, while lower-level callers may still pass a plain dict.
+    use_fp4 = (
+        fp4_cfg.get("enabled", False) if isinstance(fp4_cfg, dict) else fp4_cfg.enabled
+    )
+    if use_fp8 and use_fp4:
+        raise ValueError(
+            "megatron_cfg.fp8_cfg and fp4_cfg cannot both have enabled: true "
+            "(Megatron does not allow fp8 and fp4 together)."
+        )
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
     minimum_pad_factor = 1
@@ -1311,6 +1322,9 @@ def _get_pack_sequence_parameters_for_megatron(
             divisor = max(divisor, 32)
         else:
             divisor = max(divisor, 16)
+    if use_fp4:
+        # NVFP4 block-scaled GEMMs require the conservative TE block alignment.
+        divisor = max(divisor, 128)
     if (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
         and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
