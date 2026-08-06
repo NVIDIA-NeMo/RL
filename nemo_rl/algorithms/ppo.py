@@ -74,6 +74,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -177,12 +178,12 @@ class PPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     val_period: int
-    val_batch_size: int
+    val_batch_size: int | None
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
-    max_val_samples: int
+    max_val_samples: int | None
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     overlong_filtering: bool
@@ -196,6 +197,9 @@ class PPOConfig(TypedDict):
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
     ppo_epochs: int
+    # Number of critic optimizer updates per rollout batch. null preserves the
+    # legacy behavior by following ppo_epochs.
+    critic_train_epochs: NotRequired[int | None]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -222,6 +226,16 @@ class PPOSaveState(TypedDict):
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
+
+
+def _resolve_critic_train_epochs(ppo_config: PPOConfig) -> int:
+    """Resolve the explicit critic update count or the legacy coupled value."""
+    configured_epochs = ppo_config.get("critic_train_epochs")
+    return (
+        ppo_config["ppo_epochs"]
+        if configured_epochs is None
+        else configured_epochs
+    )
 
 
 def _default_ppo_save_state() -> PPOSaveState:
@@ -288,6 +302,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
+    Any,
     ValueInterface,
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
@@ -302,9 +317,10 @@ def setup(
     """Main entry point for running PPO algorithm.
 
     Returns:
-        tuple of (policy, policy_generation, value_model, clusters,
+        tuple of (policy, policy_generation, nemo_gym_actor, value_model, clusters,
         dataloader, val_dataloader, loss_fn, value_loss_fn, logger,
-        checkpointer, ppo_save_state, master_config).
+        checkpointer, ppo_save_state, master_config). ``nemo_gym_actor`` is None
+        unless NeMo-Gym is enabled.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -699,13 +715,15 @@ def setup(
         model_component="value",
     )
 
-    # train_iters is the total scheduler-tick budget. Each Megatron worker
-    # ticks once per train() call (matching upstream main's per-rollout
-    # convention), and PPO calls each worker's train() `ppo_epochs` times
-    # per outer step. So total ticks = (outer steps) * ppo_epochs.
-    # Scale train_iters accordingly so the configured warmup/decay horizon
-    # matches the actual scheduler-step count.
+    # Each Megatron worker advances its scheduler once per train() call. Actor
+    # and critic can have different update frequencies, so give each model its
+    # own scheduler-tick budget.
     ppo_epochs = ppo_config["ppo_epochs"]
+    critic_train_epochs = _resolve_critic_train_epochs(ppo_config)
+    if ppo_epochs < 1:
+        raise ValueError("ppo.ppo_epochs must be at least 1")
+    if critic_train_epochs < 1:
+        raise ValueError("ppo.critic_train_epochs must be null or at least 1")
     async_config = ppo_config.get("async_ppo")
     if async_config is not None and async_config.enabled:
         outer_training_steps = ppo_config["max_num_steps"]
@@ -714,13 +732,14 @@ def setup(
             ppo_config["max_num_steps"],
             ppo_config["max_num_epochs"] * len(dataloader),
         )
-    total_train_iters = outer_training_steps * ppo_epochs
+    policy_train_iters = outer_training_steps * ppo_epochs
+    value_train_iters = outer_training_steps * critic_train_epochs
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = total_train_iters
+        value_config["megatron_cfg"]["train_iters"] = value_train_iters
 
     # Define initialization functions that will be used in all paths
     def init_policy():
@@ -876,6 +895,25 @@ def setup(
             flush=True,
         )
 
+    nemo_gym_actor = None
+    if _should_use_nemo_gym(master_config):
+        assert backend == "vllm", (
+            f"NeMo-Gym requires the vLLM generation backend; got {backend!r}."
+        )
+        assert policy_generation is not None
+        t0 = time.perf_counter()
+        nemo_gym_actor = spinup_nemo_gym_actor(
+            env_configs=env_configs,
+            base_urls=policy_generation.dp_openai_server_base_urls,
+            model_name=generation_config["model_name"],
+            enable_router_replay=False,
+            routed_experts_dtype="int16",
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        )
+        worker_init_timing_metrics["nemo_gym_init_time_s"] = (
+            time.perf_counter() - t0
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -947,6 +985,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         value_model,
         (train_cluster, inference_cluster),
         dataloader,
@@ -1135,6 +1174,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     critic_metrics: dict[str, Any] = {
         "critic/grad_norm": value_results["grad_norm"].numpy(),
         "critic/loss": value_results["loss"].numpy(),
+        "critic/vf_loss": value_results["loss"].numpy(),
     }
     for key, value in value_mb_metrics.items():
         metric_name = f"critic/{key}"
@@ -1156,6 +1196,143 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     residual_var = residual_sq_mean - (returns_mean - values_mean) ** 2
     critic_metrics["critic/explained_var"] = 1.0 - residual_var / max(returns_var, 1e-8)
     return critic_metrics
+
+
+def _compute_actor_metrics(
+    train_results: dict[str, Any],
+    reference_policy_kl_penalty: float,
+) -> dict[str, Any]:
+    """Aggregate policy-model optimizer and PPO metrics under ``actor/``."""
+    actor_metrics: dict[str, Any] = {
+        "actor/total_loss": train_results["loss"].numpy(),
+        "actor/grad_norm": train_results["grad_norm"].numpy(),
+        "actor/ref_kl_coef": reference_policy_kl_penalty,
+    }
+    metric_names = {
+        "loss": "total_loss",
+        "approx_entropy": "entropy",
+        "kl_penalty": "ref_kl",
+    }
+    for key, value in train_results.get("all_mb_metrics", {}).items():
+        metric_name = f"actor/{metric_names.get(key, key)}"
+        if key == "loss":
+            continue
+        if key in {
+            "lr",
+            "wd",
+            "global_valid_seqs",
+            "global_valid_toks",
+            "grad_norm",
+        }:
+            actor_metrics[metric_name] = np.mean(value).item()
+        elif key in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+            valid_values = [x for x in value if not np.isinf(x)]
+            actor_metrics[metric_name] = (
+                np.min(valid_values).item() if valid_values else -1.0
+            )
+        elif key in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+            valid_values = [x for x in value if not np.isinf(x)]
+            actor_metrics[metric_name] = (
+                np.max(valid_values).item() if valid_values else -1.0
+            )
+        elif isinstance(value, (np.ndarray, list)):
+            actor_metrics[metric_name] = np.sum(value).item()
+        else:
+            raise ValueError(f"Unsupported policy-model metric: {key}")
+    return actor_metrics
+
+
+def _masked_distribution_metrics(
+    name: str,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, float]:
+    """Compute stable scalar summaries over valid response-token positions."""
+    selected = torch.masked_select(values.detach().float(), mask.bool())
+    if selected.numel() == 0:
+        return {
+            f"{name}/mean": 0.0,
+            f"{name}/std": 0.0,
+            f"{name}/min": 0.0,
+            f"{name}/p05": 0.0,
+            f"{name}/p50": 0.0,
+            f"{name}/p95": 0.0,
+            f"{name}/max": 0.0,
+        }
+
+    quantiles = torch.quantile(
+        selected,
+        torch.tensor([0.05, 0.5, 0.95], device=selected.device),
+    )
+    return {
+        f"{name}/mean": selected.mean().item(),
+        f"{name}/std": selected.std(unbiased=False).item(),
+        f"{name}/min": selected.min().item(),
+        f"{name}/p05": quantiles[0].item(),
+        f"{name}/p50": quantiles[1].item(),
+        f"{name}/p95": quantiles[2].item(),
+        f"{name}/max": selected.max().item(),
+    }
+
+
+def _compute_rollout_critic_metrics(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    mask: torch.Tensor,
+) -> dict[str, float]:
+    """Summarize the critic predictions and GAE targets before PPO updates."""
+    if "values" not in train_data or "returns" not in train_data:
+        return {}
+
+    values = train_data["values"].detach().float()
+    returns = train_data["returns"].detach().float()
+    raw_advantages = returns - values
+    valid = mask.bool()
+
+    metrics = {
+        **_masked_distribution_metrics(
+            "critic/pre_update_values", values, valid
+        ),
+        **_masked_distribution_metrics(
+            "critic/return_targets", returns, valid
+        ),
+        **_masked_distribution_metrics(
+            "critic/raw_advantages", raw_advantages, valid
+        ),
+    }
+
+    selected_values = values[valid]
+    selected_returns = returns[valid]
+    residual = selected_values - selected_returns
+    return_var = selected_returns.var(unbiased=False)
+    residual_var = residual.var(unbiased=False)
+    metrics.update(
+        {
+            "critic/pre_update_bias": residual.mean().item(),
+            "critic/pre_update_mae": residual.abs().mean().item(),
+            "critic/pre_update_rmse": residual.square().mean().sqrt().item(),
+            "critic/pre_update_explained_var": (
+                1.0 - residual_var / return_var.clamp_min(1e-8)
+            ).item(),
+        }
+    )
+
+    first_indices = valid.float().argmax(dim=1)
+    last_indices = valid.shape[1] - 1 - valid.fliplr().float().argmax(dim=1)
+    valid_samples = valid.any(dim=1)
+    batch_indices = torch.arange(valid.shape[0], device=valid.device)[valid_samples]
+    first_values = values[batch_indices, first_indices[valid_samples]]
+    last_values = values[batch_indices, last_indices[valid_samples]]
+    terminal_targets = returns[batch_indices, last_indices[valid_samples]]
+    metrics.update(
+        {
+            "critic/first_response_token_value_mean": first_values.mean().item(),
+            "critic/last_response_token_value_mean": last_values.mean().item(),
+            "critic/last_response_token_mae": (
+                last_values - terminal_targets
+            ).abs().mean().item(),
+        }
+    )
+    return metrics
 
 
 # ===============================================================================
@@ -1221,6 +1398,7 @@ def ppo_train(
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config.ppo["max_num_epochs"]
     ppo_epochs = master_config.ppo["ppo_epochs"]
+    critic_train_epochs = _resolve_critic_train_epochs(master_config.ppo)
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -1572,18 +1750,22 @@ def ppo_train(
                     if returns is not None:
                         train_data["returns"] = returns
 
-                # PPO: Multiple training steps per rollout
+                metrics.update(
+                    _compute_rollout_critic_metrics(train_data, advantage_mask)
+                )
+
+                # Critic and actor update frequencies are independent. The
+                # critic runs first so all actor updates use the same rollout
+                # batch after the requested number of value updates.
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
-                for step in range(ppo_epochs):
+                value_results = None
+                for critic_epoch in range(critic_train_epochs):
                     print(
-                        f"▶ Step {step + 1}/{ppo_epochs}...",
+                        f"▶ Critic update {critic_epoch + 1}/{critic_train_epochs}...",
                         flush=True,
                     )
-
-                    # Train value model first (critic before actor, matching veRL).
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
-
                     with timer.time("value_training"):
                         print("▶ Training value...", flush=True)
                         value_results = value_model.train(
@@ -1594,17 +1776,22 @@ def ppo_train(
 
                         value_model.finish_training()
 
-                    train_results = None
-                    if total_steps >= policy_training_start_step:
-                        if (
-                            total_steps == policy_training_start_step
-                            and policy_training_start_step > 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
-                                f"Starting policy training.",
-                                flush=True,
-                            )
+                train_results = None
+                if total_steps >= policy_training_start_step:
+                    if (
+                        total_steps == policy_training_start_step
+                        and policy_training_start_step > 0
+                    ):
+                        print(
+                            f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
+                            f"Starting policy training.",
+                            flush=True,
+                        )
+                    for actor_epoch in range(ppo_epochs):
+                        print(
+                            f"▶ Actor update {actor_epoch + 1}/{ppo_epochs}...",
+                            flush=True,
+                        )
                         print("▶ Preparing for training...", flush=True)
                         with timer.time("training_prep"):
                             policy.prepare_for_training()
@@ -1617,17 +1804,17 @@ def ppo_train(
                                 loss_fn,
                                 timer=timer,
                             )
-                            if step < ppo_epochs - 1:
+                            if actor_epoch < ppo_epochs - 1:
                                 policy.offload_to_cpu()
 
-                    if train_results is not None:
-                        print(
-                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
-                        )
-                    if value_results is not None:
-                        print(
-                            f"    • Value loss: {value_results['loss'].mean().item():.4f}"
-                        )
+                if train_results is not None:
+                    print(
+                        f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
+                    )
+                if value_results is not None:
+                    print(
+                        f"    • Value loss: {value_results['loss'].mean().item():.4f}"
+                    )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -1690,18 +1877,14 @@ def ppo_train(
                 flat_advantages = train_data["advantages"]
                 del flat_messages
 
-                response_advantages = torch.masked_select(
-                    flat_advantages, advantage_mask.bool()
-                )
-
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 if train_results is not None:
-                    metrics = {
-                        **metrics,
-                        "loss": train_results["loss"].numpy(),
-                        "grad_norm": train_results["grad_norm"].numpy(),
-                    }
-                    metrics.update(train_results["all_mb_metrics"])
+                    metrics.update(
+                        _compute_actor_metrics(
+                            train_results,
+                            master_config.loss_fn.reference_policy_kl_penalty,
+                        )
+                    )
                     if "moe_metrics" in train_results:
                         metrics.update(
                             {
@@ -1713,23 +1896,23 @@ def ppo_train(
                 # Extract critic metrics from value training results
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
+                metrics["actor/update_applied"] = float(train_results is not None)
+                metrics["critic/update_applied"] = float(value_results is not None)
+                metrics["actor/num_updates"] = (
+                    float(ppo_epochs) if train_results is not None else 0.0
+                )
+                metrics["critic/num_updates"] = float(critic_train_epochs)
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
                         "mean_prompt_length": repeated_batch["length"].numpy(),
                         "total_num_tokens": input_lengths.numpy(),
-                        "advantages/mean": torch.mean(response_advantages)
-                        .detach()
-                        .item()
-                        if response_advantages.numel() > 0
-                        else 0.0,
-                        "advantages/max": torch.max(response_advantages).detach().item()
-                        if response_advantages.numel() > 0
-                        else 0.0,
-                        "advantages/min": torch.min(response_advantages).detach().item()
-                        if response_advantages.numel() > 0
-                        else 0.0,
                     }
+                )
+                metrics.update(
+                    _masked_distribution_metrics(
+                        "advantages", flat_advantages, advantage_mask
+                    )
                 )
 
                 gen_step_metrics = {}
@@ -1738,19 +1921,7 @@ def ppo_train(
                 metrics.update(gen_step_metrics)
 
                 for k, v in metrics.items():
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
-                        valid_values = [x for x in v if not np.isinf(x)]
-                        metrics[k] = (
-                            np.min(valid_values).item() if valid_values else -1.0
-                        )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
-                        valid_values = [x for x in v if not np.isinf(x)]
-                        metrics[k] = (
-                            np.max(valid_values).item() if valid_values else -1.0
-                        )
-                    elif k in {
-                        "lr",
-                        "wd",
+                    if k in {
                         "reward",
                         "global_valid_seqs",
                         "global_valid_toks",
@@ -1895,10 +2066,17 @@ def ppo_train(
 
             print("\n📊 Training Results:")
             if train_results is not None:
-                print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
-                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
+                print(f"  • Actor Total Loss: {metrics.get('actor/total_loss', 'N/A')}")
+                print(f"  • Actor PG Loss: {metrics.get('actor/pg_loss', 'N/A')}")
+                print(f"  • Actor Grad Norm: {metrics.get('actor/grad_norm', 'N/A')}")
+                print(f"  • Actor LR: {metrics.get('actor/lr', 'N/A')}")
+                print(f"  • Actor PPO KL: {metrics.get('actor/ppo_kl', 'N/A')}")
+                print(
+                    f"  • Actor PG Clip Frac: "
+                    f"{metrics.get('actor/pg_clipfrac', 'N/A')}"
+                )
             if value_results is not None:
-                print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
+                print(f"  • Critic VF Loss: {metrics.get('critic/vf_loss', 'N/A')}")
                 print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
                 if "critic/lr" in metrics:
                     print(f"  • Critic LR: {metrics['critic/lr']:.2e}")
@@ -2095,8 +2273,6 @@ def async_ppo_train(
     if master_config.ppo["ppo_epochs"] < 1:
         raise ValueError("ppo.ppo_epochs must be at least 1")
     # Keep launcher restrictions here as defensive checks for direct callers.
-    if master_config.env.get("should_use_nemo_gym"):
-        raise NotImplementedError("NeMo Gym rollout is not supported for async PPO")
     if master_config.ppo["use_dynamic_sampling"]:
         raise NotImplementedError("Dynamic sampling is not supported for async PPO")
     if master_config.ppo["reward_scaling"]["enabled"]:
@@ -2147,6 +2323,7 @@ def async_ppo_train(
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
     max_num_steps = master_config.ppo["max_num_steps"]
     ppo_epochs = master_config.ppo["ppo_epochs"]
+    critic_train_epochs = _resolve_critic_train_epochs(master_config.ppo)
     val_period = master_config.ppo["val_period"]
     val_at_start = master_config.ppo["val_at_start"]
     val_at_end = master_config.ppo["val_at_end"]
@@ -2618,18 +2795,21 @@ def async_ppo_train(
                     if returns is not None:
                         train_data["returns"] = returns
 
-                # ---- 7. ppo_epochs inner loop (critic, then actor) ----
-                # Each epoch: value on GPU -> train -> off. Then, once past critic
-                # warmup, policy on GPU -> train -> off (except the last epoch,
-                # which leaves the policy on GPU for the refit broadcast below).
+                metrics.update(
+                    _compute_rollout_critic_metrics(train_data, advantage_mask)
+                )
+
+                # ---- 7. Independent critic and actor update loops ----
                 # During warmup (step < policy_training_start_step) the policy is
                 # frozen: it is never loaded/trained here, exactly as in sync
                 # ppo_train, so train_results stays None for the step.
                 is_policy_training_step = step >= policy_training_start_step
                 train_results = None
                 value_results = None
-                for epoch in range(ppo_epochs):
-                    print(f"▶ PPO epoch {epoch + 1}/{ppo_epochs}...")
+                for critic_epoch in range(critic_train_epochs):
+                    print(
+                        f"▶ Critic update {critic_epoch + 1}/{critic_train_epochs}..."
+                    )
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
                     with timer.time("value_training"):
@@ -2640,24 +2820,25 @@ def async_ppo_train(
                         )
                         value_model.finish_training()
 
-                    if is_policy_training_step:
-                        if (
-                            step == policy_training_start_step
-                            and policy_training_start_step > 0
-                            and epoch == 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
-                                "steps). Starting policy training.",
-                                flush=True,
-                            )
+                if is_policy_training_step:
+                    if (
+                        step == policy_training_start_step
+                        and policy_training_start_step > 0
+                    ):
+                        print(
+                            f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                            "steps). Starting policy training.",
+                            flush=True,
+                        )
+                    for actor_epoch in range(ppo_epochs):
+                        print(f"▶ Actor update {actor_epoch + 1}/{ppo_epochs}...")
                         with timer.time("training_prep"):
                             policy.prepare_for_training()
                         with timer.time("policy_training"):
                             train_results = policy.train(
                                 train_data, loss_fn, timer=timer
                             )
-                            if epoch < ppo_epochs - 1:
+                            if actor_epoch < ppo_epochs - 1:
                                 policy.offload_to_cpu()
 
                 # ---- 8. Refit once after all PPO epochs ----
@@ -2746,33 +2927,28 @@ def async_ppo_train(
                 flat_advantages = train_data["advantages"]
                 flat_messages_content = flat_messages.get("content", [])
                 del flat_messages
-                response_advantages = torch.masked_select(
-                    flat_advantages, advantage_mask.bool()
-                )
 
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
                         "mean_prompt_length": repeated_batch["length"].numpy(),
                         "total_num_tokens": input_lengths.numpy(),
-                        "advantages/mean": torch.mean(response_advantages)
-                        .detach()
-                        .item()
-                        if response_advantages.numel() > 0
-                        else 0.0,
-                        "advantages/max": torch.max(response_advantages).detach().item()
-                        if response_advantages.numel() > 0
-                        else 0.0,
-                        "advantages/min": torch.min(response_advantages).detach().item()
-                        if response_advantages.numel() > 0
-                        else 0.0,
                     }
+                )
+                metrics.update(
+                    _masked_distribution_metrics(
+                        "advantages", flat_advantages, advantage_mask
+                    )
                 )
                 # Policy metrics are absent during critic warmup (train_results is
                 # None because the policy was not trained this step).
                 if train_results is not None:
-                    metrics["loss"] = train_results["loss"].numpy()
-                    metrics["grad_norm"] = train_results["grad_norm"].numpy()
+                    metrics.update(
+                        _compute_actor_metrics(
+                            train_results,
+                            master_config.loss_fn.reference_policy_kl_penalty,
+                        )
+                    )
                     if "moe_metrics" in train_results:
                         metrics.update(
                             {
@@ -2780,24 +2956,17 @@ def async_ppo_train(
                                 for k, v in train_results["moe_metrics"].items()
                             }
                         )
-                    metrics.update(train_results["all_mb_metrics"])
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
+                metrics["actor/update_applied"] = float(train_results is not None)
+                metrics["critic/update_applied"] = float(value_results is not None)
+                metrics["actor/num_updates"] = (
+                    float(ppo_epochs) if train_results is not None else 0.0
+                )
+                metrics["critic/num_updates"] = float(critic_train_epochs)
 
                 for k, v in metrics.items():
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
-                        valid_values = [x for x in v if not np.isinf(x)]
-                        metrics[k] = (
-                            np.min(valid_values).item() if valid_values else -1.0
-                        )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
-                        valid_values = [x for x in v if not np.isinf(x)]
-                        metrics[k] = (
-                            np.max(valid_values).item() if valid_values else -1.0
-                        )
-                    elif k in {
-                        "lr",
-                        "wd",
+                    if k in {
                         "reward",
                         "global_valid_seqs",
                         "global_valid_toks",
@@ -2969,9 +3138,12 @@ def async_ppo_train(
             del train_data
 
             print("\n📊 Training Results:")
-            if "loss" in metrics:
-                print(f"  • Loss: {metrics['loss']:.4f}")
-                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
+            if "actor/total_loss" in metrics:
+                print(f"  • Actor Total Loss: {metrics['actor/total_loss']:.4f}")
+                print(
+                    f"  • Generation KL Error: "
+                    f"{metrics.get('actor/gen_kl_error', 'N/A')}"
+                )
             else:
                 print("  • (critic warmup: policy not trained this step)")
             if "critic/loss" in metrics:
@@ -3086,20 +3258,43 @@ def validate(
 
             additional_metrics_to_report = dict()
 
-            rollout_fn = (
-                run_async_multi_turn_rollout
-                if _should_use_async_rollouts(master_config)
-                else run_multi_turn_rollout
-            )
-            val_batch, gen_metrics = rollout_fn(
-                policy_generation=policy_generation,
-                input_batch=val_batch,
-                tokenizer=tokenizer,
-                task_to_env=val_task_to_env,
-                max_seq_len=master_config.policy["max_total_sequence_length"],
-                max_rollout_turns=master_config.ppo["max_rollout_turns"],
-                greedy=False,
-            )
+            # NeMo-Gym owns prompt construction and the complete agent rollout.
+            # Its dataset message_log is only an empty compatibility placeholder,
+            # so it must be dispatched before the generic async rollout path.
+            if _should_use_nemo_gym(master_config):
+                generation_config = master_config.policy["generation"]
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    generation_config=generation_config,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger["wandb_enabled"],
+                        wandb_config=master_config.logger["wandb"],
+                    ),
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                additional_metrics_to_report = gen_metrics
+            else:
+                rollout_fn = (
+                    run_async_multi_turn_rollout
+                    if _should_use_async_rollouts(master_config)
+                    else run_multi_turn_rollout
+                )
+                val_batch, gen_metrics = rollout_fn(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    max_rollout_turns=master_config.ppo["max_rollout_turns"],
+                    greedy=False,
+                )
 
             total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])

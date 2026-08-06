@@ -827,7 +827,9 @@ class AsyncTrajectoryCollector:
                 ),
                 max_rollout_turns=None,
                 greedy=False,
-                reward_penalty_config=self.master_config.reward_penalties,
+                reward_penalty_config=getattr(
+                    self.master_config, "reward_penalties", None
+                ),
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
             ):
                 task_index = rollout_result.task_index

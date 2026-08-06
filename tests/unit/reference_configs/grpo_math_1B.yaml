@@ -80,6 +80,7 @@ loss_fn:
   # Async GRPO requires importance sampling correction enabled
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
+  use_direct_rollout_ratio: false
   # "tis"          – clamp IS weights to [min, max], where min defaults to 0
   # "icepop"       – zero out tokens with IS weight outside [min, max]
   # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction

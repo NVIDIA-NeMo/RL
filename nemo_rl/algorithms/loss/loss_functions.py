@@ -136,6 +136,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Async GRPO requires importance sampling correction enabled
     # Set to true when async_grpo.enabled is true
     use_importance_sampling_correction: bool = False
+    # SAO-style direct importance sampling. The policy-gradient weight is
+    # computed directly as pi_current / pi_rollout and tokens outside the
+    # configured ICE-POP bounds are removed from the gradient.
+    use_direct_rollout_ratio: bool = False
     # --- Truncated importance sampling ---
     # Type of truncated importance sampling:
     #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
@@ -242,6 +246,7 @@ class ClippedPGLossFn(LossFunction):
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
         self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
+        self.use_direct_rollout_ratio = cfg.use_direct_rollout_ratio
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
         self.truncated_importance_sampling_ratio = (
@@ -266,6 +271,34 @@ class ClippedPGLossFn(LossFunction):
             )
 
         self.use_cispo = cfg.use_cispo
+        if self.use_direct_rollout_ratio:
+            assert self.use_importance_sampling_correction, (
+                "use_direct_rollout_ratio requires "
+                "use_importance_sampling_correction=True"
+            )
+            assert self.truncated_importance_sampling_type == "icepop", (
+                "use_direct_rollout_ratio requires "
+                "truncated_importance_sampling_type='icepop'"
+            )
+            assert not self.disable_ppo_ratio, (
+                "use_direct_rollout_ratio is incompatible with disable_ppo_ratio"
+            )
+            assert not self.force_on_policy_ratio, (
+                "use_direct_rollout_ratio is incompatible with force_on_policy_ratio"
+            )
+            assert not self.sequence_level_importance_ratios, (
+                "use_direct_rollout_ratio requires token-level importance ratios"
+            )
+            assert not self.use_cispo, (
+                "use_direct_rollout_ratio is incompatible with use_cispo"
+            )
+            assert self.ratio_clip_c is None, (
+                "use_direct_rollout_ratio is incompatible with dual clipping; "
+                "set ratio_clip_c=null"
+            )
+            assert self.loss_type == LossType.TOKEN_LEVEL, (
+                "use_direct_rollout_ratio requires token_level_loss=True"
+            )
         if self.use_cispo:
             assert not self.disable_ppo_ratio, (
                 "use_cispo is incompatible with disable_ppo_ratio; "
@@ -334,10 +367,15 @@ class ClippedPGLossFn(LossFunction):
         self.metric_normalizations: dict[str, MetricNormalizer] = {
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
+            "pg_loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
+            "ref_kl_loss": grad_normalizer,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
+            "pg_clipfrac": MetricNormalizer.TOKENS,
+            "pg_clipfrac_lower": MetricNormalizer.TOKENS,
+            "ppo_kl": MetricNormalizer.TOKENS,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
             "gen_kl_error": MetricNormalizer.TOKENS,
             "policy_kl_error": MetricNormalizer.TOKENS,
@@ -383,7 +421,9 @@ class ClippedPGLossFn(LossFunction):
         advantages = data["advantages"][:, 1:]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
         prev_logprobs = (
-            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+            None
+            if self.force_on_policy_ratio or self.use_direct_rollout_ratio
+            else data["prev_logprobs"][:, 1:]
         )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
@@ -396,7 +436,7 @@ class ClippedPGLossFn(LossFunction):
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
-        if self.force_on_policy_ratio:
+        if self.force_on_policy_ratio or self.use_direct_rollout_ratio:
             prev_logprobs = curr_logprobs.detach()
 
         # token_mult_prob_error
@@ -515,7 +555,19 @@ class ClippedPGLossFn(LossFunction):
             kl = torch.tensor(0.0)
 
         # Calculate clipped loss function if ppo ratio is enabled.
-        if self.force_on_policy_ratio:
+        if self.use_direct_rollout_ratio:
+            # SAO DIS: use rollout probabilities directly, with no old-policy
+            # ratio. The detached ratio is a policy-gradient weight; its
+            # gradient is carried only by log pi_current below.
+            ratios = torch.exp(curr_logprobs - generation_logprobs)
+            ratios = torch.nan_to_num(ratios, nan=0.0, posinf=0.0, neginf=0.0)
+            token_kept_mask = (
+                ratios > self.truncated_importance_sampling_ratio_min
+            ) & (ratios < self.truncated_importance_sampling_ratio)
+            ratios_clamped = torch.where(
+                token_kept_mask, ratios, torch.zeros_like(ratios)
+            )
+        elif self.force_on_policy_ratio:
             # Force ratio to 1.0 for truly on-policy behavior
             # Use curr_logprobs twice so ratio=1 but gradients still flow
             log_ratios = curr_logprobs - curr_logprobs.detach()
@@ -540,20 +592,45 @@ class ClippedPGLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        if self.use_cispo:
+        pg_clipfrac = torch.tensor(0.0, device=mask.device)
+        pg_clipfrac_lower = torch.tensor(0.0, device=mask.device)
+        if self.use_direct_rollout_ratio:
             clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
+            pg_clipfrac = masked_mean(
+                (~token_kept_mask).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+        elif self.use_cispo:
+            clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
+            pg_clipfrac = masked_mean(
+                (ratios != ratios_clamped).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
         else:
             loss1 = -advantages * ratios
             loss2 = -advantages * ratios_clamped
 
             # Determine which value to use for clipping (max for pessimistic estimate)
             clip_loss = torch.max(loss1, loss2)
+            if not self.disable_ppo_ratio:
+                pg_clipfrac = masked_mean(
+                    (loss2 > loss1).float(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
             assert self.ratio_clip_c > 1, (
                 f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
             )
             loss3 = -advantages * self.ratio_clip_c
+            pg_clipfrac_lower = masked_mean(
+                ((clip_loss > loss3) & (advantages < 0)).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
             clip_loss = torch.where(
                 advantages < 0, torch.min(clip_loss, loss3), clip_loss
             )
@@ -563,7 +640,10 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
-        if self.sequence_level_importance_ratios:
+        if self.use_direct_rollout_ratio:
+            actor_importance_weights = ratios_clamped.detach()
+            _is_filter_metrics = {"is_oob_ratio": pg_clipfrac.item()}
+        elif self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
@@ -591,7 +671,10 @@ class ClippedPGLossFn(LossFunction):
         # whose importance weight falls outside the truncation bounds. Each microbatch
         # contributes its out-of-bounds count divided by the *global* valid token/seq
         # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
-        if self.truncated_importance_sampling_ratio is not None:
+        if (
+            self.truncated_importance_sampling_ratio is not None
+            and not self.use_direct_rollout_ratio
+        ):
             if self.truncated_importance_sampling_type == "tis":
                 tis_min = self.truncated_importance_sampling_ratio_min
                 if tis_min is None:
@@ -666,9 +749,13 @@ class ClippedPGLossFn(LossFunction):
                     f"Invalid truncated importance sampling type: {self.truncated_importance_sampling_type}"
                 )
 
-        actor_importance_weights = actor_importance_weights_expanded
-        del actor_importance_weights_expanded
-        if self.use_importance_sampling_correction:
+        if not self.use_direct_rollout_ratio:
+            actor_importance_weights = actor_importance_weights_expanded
+            del actor_importance_weights_expanded
+        if self.use_direct_rollout_ratio:
+            # The direct rollout ratio is already part of clip_loss.
+            importance_weights_to_use = torch.ones_like(curr_logprobs)
+        elif self.use_importance_sampling_correction:
             importance_weights_to_use = actor_importance_weights
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
@@ -732,6 +819,21 @@ class ClippedPGLossFn(LossFunction):
 
         loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
+            ppo_reference_logprobs = (
+                generation_logprobs
+                if self.use_direct_rollout_ratio
+                else prev_logprobs
+            )
+            negative_approx_kl = torch.clamp(
+                curr_logprobs - ppo_reference_logprobs,
+                min=-20.0,
+                max=20.0,
+            )
+            ppo_kl = masked_mean(
+                -negative_approx_kl,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
             probs_ratio = masked_mean(
                 ratios.detach(),
                 mask,
@@ -762,28 +864,32 @@ class ClippedPGLossFn(LossFunction):
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
-        return (
-            loss,
-            {
-                "loss": loss.item(),
-                "probs_ratio": probs_ratio,
-                "probs_ratio_clamped": probs_ratio_clamped,
-                "probs_ratio_min": probs_ratio_min,
-                "probs_ratio_max": probs_ratio_max,
-                "probs_ratio_clamped_min": probs_ratio_clamped_min,
-                "probs_ratio_clamped_max": probs_ratio_clamped_max,
-                "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
-                "token_mult_prob_error": mult_prob_error,
-                "gen_kl_error": gen_kl_error,
-                "policy_kl_error": policy_kl_error,
-                "js_divergence_error": js_divergence_error,
-                "sampling_importance_ratio": sample_importance_ratio.item(),
-                "num_valid_samples": sample_mask.sum().item(),
-                "approx_entropy": seq_entropy_approx.item(),
-                **_is_filter_metrics,
-                "positive_nll_loss": nll_loss.item(),
-            },
-        )
+        metrics = {
+            "loss": loss.item(),
+            "pg_loss": actor_loss.item(),
+            "pg_clipfrac": pg_clipfrac.item(),
+            "pg_clipfrac_lower": pg_clipfrac_lower.item(),
+            "ppo_kl": ppo_kl,
+            "probs_ratio": probs_ratio,
+            "probs_ratio_clamped": probs_ratio_clamped,
+            "probs_ratio_min": probs_ratio_min,
+            "probs_ratio_max": probs_ratio_max,
+            "probs_ratio_clamped_min": probs_ratio_clamped_min,
+            "probs_ratio_clamped_max": probs_ratio_clamped_max,
+            "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+            "ref_kl_loss": kl.item(),
+            "token_mult_prob_error": mult_prob_error,
+            "gen_kl_error": gen_kl_error,
+            "policy_kl_error": policy_kl_error,
+            "js_divergence_error": js_divergence_error,
+            "sampling_importance_ratio": sample_importance_ratio.item(),
+            "num_valid_samples": sample_mask.sum().item(),
+            "approx_entropy": seq_entropy_approx.item(),
+            **_is_filter_metrics,
+        }
+        if self.positive_example_nll_weight > 0:
+            metrics["positive_nll_loss"] = nll_loss.item()
+        return loss, metrics
 
 
 class NLLLossFn(LossFunction):

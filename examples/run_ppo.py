@@ -100,6 +100,7 @@ def main() -> None:
     (
         policy,
         policy_generation,
+        _nemo_gym,  # None on this path (NeMo-Gym has its own entry: run_ppo_nemo_gym.py)
         value_model,
         cluster,
         dataloader,
