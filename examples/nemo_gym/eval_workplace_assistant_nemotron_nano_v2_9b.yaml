@@ -1,0 +1,70 @@
+defaults: ../configs/evals/eval.yaml
+
+eval:
+  metric: "mean_reward"
+  num_tests_per_prompt: 1
+  save_path: "results/eval-workplace-assistant-nemotron-nano-v2-9b"
+
+generation:
+  max_new_tokens: 8192
+  model_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+  top_k: null
+  num_prompts_per_step: 32
+  vllm_cfg:
+    async_engine: true
+    expose_http_server: true
+    enable_vllm_metrics_logger: true
+    vllm_metrics_logger_interval: 0.5
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.8
+    max_model_len: 8192
+    skip_tokenizer_init: false
+    http_server_serving_chat_kwargs:
+      enable_auto_tools: true
+      tool_parser: nemotron_json
+  vllm_kwargs:
+    compilation_config:
+      backend: eager
+    mamba_ssm_cache_dtype: "float32"
+
+tokenizer:
+  name: ${generation.model_name}
+
+data:
+  max_input_seq_length: null
+  dataset_name: "NemoGymDataset"
+  # The checked-in example split makes this recipe runnable after submodule init.
+  # Override with resources_servers/workplace_assistant/data/validation.jsonl
+  # after downloading the full validation artifact through NeMo Gym.
+  data_path: "3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/example.jsonl"
+  processor: "nemo_gym_data_processor"
+  env_name: "nemo_gym"
+  repeat: 1
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+
+logger:
+  log_dir: "logs/eval-workplace-assistant-nemotron-nano-v2-9b"
+  wandb_enabled: true
+  wandb:
+    project: "nemo-rl-eval"
+    name: "workplace-assistant-nemotron-nano-v2-9b"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

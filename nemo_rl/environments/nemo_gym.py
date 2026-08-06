@@ -605,12 +605,21 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 ########################################
 
 
-def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config.policy["generation"]
+def setup_nemo_gym_generation_config(generation_config: dict[str, Any]) -> None:
+    """Configure a generation backend for NeMo Gym HTTP rollouts."""
+    backend = generation_config.get("backend")
+    if backend == "vllm":
+        backend_config = generation_config["vllm_cfg"]
+    elif backend == "megatron":
+        backend_config = generation_config["mcore_generation_config"]
+    else:
+        raise ValueError(
+            "NeMo Gym HTTP rollouts require backend=vllm or backend=megatron"
+        )
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    # Gym calls the rollout engine through its OpenAI-compatible HTTP server.
+    backend_config["async_engine"] = True
+    backend_config["expose_http_server"] = True
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
@@ -698,3 +707,8 @@ def spinup_nemo_gym_actor(
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
     ray.get(actor._spinup.remote())
     return actor
+
+
+def setup_nemo_gym_config(config, tokenizer) -> None:
+    """Configure a training config for NeMo Gym rollouts."""
+    setup_nemo_gym_generation_config(config.policy["generation"])
