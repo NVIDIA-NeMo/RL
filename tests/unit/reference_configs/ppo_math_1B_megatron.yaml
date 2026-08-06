@@ -21,6 +21,7 @@ ppo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+  calculate_advantages_on_gpu: false
 
   reward_shaping:
     enabled: true
@@ -31,6 +32,10 @@ ppo:
 
   adv_estimator:
     name: "gae"
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+    reward_weights: null
+    minus_baseline: true
     gae_lambda: 0.95
     gae_gamma: 1
     normalize_advantages: true

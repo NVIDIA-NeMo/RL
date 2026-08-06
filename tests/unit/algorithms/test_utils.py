@@ -14,11 +14,13 @@
 
 import math
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
+from nemo_rl.algorithms.grpo import GRPOConfig, MasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -274,7 +276,7 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results, metrics, timing_metrics, master_config, master_config.grpo
     )
 
     # Validate key throughput metrics
@@ -316,6 +318,30 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     assert "Floating Point Utilization" in out
 
 
+def test_performance_metrics_accepts_typed_ppo_config():
+    master_config = _base_master_config(colocated=True)
+    ppo_config = PPOConfig(
+        num_prompts_per_step=4,
+        num_generations_per_prompt=3,
+    )
+
+    perf = print_performance_metrics(
+        {},
+        {"total_num_tokens": 120.0},
+        {
+            "policy_and_reference_logprobs": 1.0,
+            "policy_training": 1.0,
+            "total_step_time": 2.0,
+            "generation": 1.0,
+        },
+        master_config,
+        ppo_config,
+    )
+
+    # 4 prompts * 3 generations / 2 seconds / 16 GPUs.
+    assert math.isclose(perf["samples_per_sec_per_gpu"], 0.375, rel_tol=1e-6)
+
+
 def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
     """train_elapsed_seconds in train_results overrides policy_training timing for TFLOPS."""
     master_config = _base_master_config(colocated=True)
@@ -343,7 +369,7 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results, metrics, timing_metrics, master_config, master_config.grpo
     )
 
     assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
@@ -353,9 +379,21 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
 
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
-    master_config = _base_master_config(colocated=False)
-    master_config.grpo.async_grpo = AsyncGRPOConfig(
-        enabled=True, max_trajectory_age_steps=1
+    # The shared metrics helper must not assume the master config has a GRPO
+    # section. Async mode is already represented by exposed_generation timing.
+    master_config = SimpleNamespace(
+        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        policy={
+            "generation": {
+                "colocated": {
+                    "enabled": False,
+                    "resources": {"num_nodes": 1, "gpus_per_node": 8},
+                }
+            }
+        },
+    )
+    algorithm_config = GRPOConfig.model_construct(
+        num_prompts_per_step=8, num_generations_per_prompt=10
     )
 
     timing_metrics = {
@@ -375,7 +413,7 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results, metrics, timing_metrics, master_config, algorithm_config
     )
 
     # Throughput checks
@@ -427,7 +465,7 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results, metrics, timing_metrics, master_config, master_config.grpo
     )
 
     # Core metrics exist
@@ -459,7 +497,9 @@ def test_empty_per_worker_token_counts_skips_imbalance(capsys):
         "per_worker_token_counts": {},
     }
 
-    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+    perf = print_performance_metrics(
+        {}, metrics, timing_metrics, master_config, master_config.grpo
+    )
 
     assert "average_token_imbalance" not in perf
 

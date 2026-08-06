@@ -42,7 +42,7 @@ from nemo_rl.algorithms.utils import (
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
-    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
+    """Configuration for GRPO- and PPO-compatible advantage estimators."""
 
     name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
@@ -52,6 +52,15 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # PPO GAE/raw-reward specific
+    gae_lambda: float = 0.95
+    gae_gamma: float = 1.0
+    normalize_advantages: bool = True
+    # VAPO decoupled GAE (None = standard GAE, no decoupling)
+    gae_lambda_value: float | None = None
+    gae_lambda_policy: float | None = None
+    # Length-adaptive lambda_policy = 1 - 1/(alpha * length). 0 = disabled.
+    length_adaptive_alpha: float = 0.0
 
 
 class GRPOAdvantageEstimator:
@@ -273,8 +282,10 @@ class RawRewardAdvantageEstimator:
     No value model, no baselines. Optionally normalizes across the batch.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.normalize_advantages = estimator_config["normalize_advantages"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.normalize_advantages = estimator_config.normalize_advantages
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute advantages as raw rewards expanded to token-level shape.
@@ -326,17 +337,19 @@ class GeneralizedAdvantageEstimator:
         normalize_advantages: If True, normalize advantages globally across batch
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.gae_lambda = estimator_config["gae_lambda"]
-        self.gae_gamma = estimator_config["gae_gamma"]
-        self.normalize_advantages = estimator_config["normalize_advantages"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.gae_lambda = estimator_config.gae_lambda
+        self.gae_gamma = estimator_config.gae_gamma
+        self.normalize_advantages = estimator_config.normalize_advantages
 
         # VAPO decoupled GAE: separate λ for value returns vs policy advantages.
         # None for both = standard GAE (use gae_lambda everywhere, no decoupling).
-        self.gae_lambda_value = estimator_config["gae_lambda_value"]
-        self.gae_lambda_policy = estimator_config["gae_lambda_policy"]
+        self.gae_lambda_value = estimator_config.gae_lambda_value
+        self.gae_lambda_policy = estimator_config.gae_lambda_policy
         # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled (use fixed λ).
-        self.length_adaptive_alpha = estimator_config["length_adaptive_alpha"]
+        self.length_adaptive_alpha = estimator_config.length_adaptive_alpha
 
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty

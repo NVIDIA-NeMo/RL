@@ -16,14 +16,18 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
 )
+from nemo_rl.algorithms.grpo import RewardScalingConfig
 from nemo_rl.algorithms.loss.loss_functions import (
     ClippedPGLossConfig,
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.ppo import PPOConfig, _get_ppo_save_state
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -52,22 +56,18 @@ def _make_gae_config(
     gae_lambda_value: float | None = None,
     gae_lambda_policy: float | None = None,
     **overrides,
-) -> dict:
-    """Build an estimator_config dict with all GAE-required keys populated.
-
-    ``GeneralizedAdvantageEstimator.__init__`` requires every field to be
-    present (no hidden ``.get()`` defaults). VAPO fields default to ``None``
-    (standard GAE, no decoupling) and can be overridden via kwargs.
-    """
-    return {
-        "gae_lambda": gae_lambda,
-        "gae_gamma": gae_gamma,
-        "normalize_advantages": normalize_advantages,
-        "length_adaptive_alpha": length_adaptive_alpha,
-        "gae_lambda_value": gae_lambda_value,
-        "gae_lambda_policy": gae_lambda_policy,
+) -> AdvEstimatorConfig:
+    """Build a typed GAE estimator config with optional overrides."""
+    return AdvEstimatorConfig(
+        name="gae",
+        gae_lambda=gae_lambda,
+        gae_gamma=gae_gamma,
+        normalize_advantages=normalize_advantages,
+        length_adaptive_alpha=length_adaptive_alpha,
+        gae_lambda_value=gae_lambda_value,
+        gae_lambda_policy=gae_lambda_policy,
         **overrides,
-    }
+    )
 
 
 # ============================================================================
@@ -380,7 +380,7 @@ def test_raw_reward_basic_broadcast_and_masking():
     masked-out trailing pads — the downstream loss masking is responsible
     for zeroing those out). ``returns`` is None since there is no value head.
     """
-    estimator_config = {"normalize_advantages": False}
+    estimator_config = AdvEstimatorConfig(name="raw_reward", normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = RawRewardAdvantageEstimator(estimator_config, loss_config)
 
@@ -627,19 +627,12 @@ def test_create_advantage_estimator_gae():
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
-    # adv_estimator dict needs every GAE-required key (no hidden .get() defaults
-    # in the estimator __init__); loss_fn must be a real ClippedPGLossConfig
-    # because the estimator accesses .use_kl_in_reward / .reference_policy_kl_*
-    # as attributes, not dict keys.
     master_config = SimpleNamespace(
-        ppo={
-            "adv_estimator": {
-                "name": "gae",
-                **_make_gae_config(
-                    gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
-                ),
-            },
-        },
+        ppo=PPOConfig(
+            adv_estimator=_make_gae_config(
+                gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
+            )
+        ),
         loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
@@ -655,10 +648,12 @@ def test_create_advantage_estimator_raw_reward():
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={
-            "adv_estimator": {"name": "raw_reward", "normalize_advantages": True},
-        },
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        ppo=PPOConfig(
+            adv_estimator=AdvEstimatorConfig(
+                name="raw_reward", normalize_advantages=True
+            )
+        ),
+        loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
     estimator = _create_advantage_estimator(master_config)
@@ -672,24 +667,72 @@ def test_create_advantage_estimator_rejects_unsupported_name():
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={"adv_estimator": {"name": "grpo"}},
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        ppo=PPOConfig(adv_estimator=AdvEstimatorConfig(name="grpo")),
+        loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
     with pytest.raises(ValueError, match="only supports 'gae' or 'raw_reward'"):
         _create_advantage_estimator(master_config)
 
 
-def test_create_advantage_estimator_requires_adv_estimator_key():
-    """No more silent default — missing `adv_estimator` should KeyError."""
+def test_create_advantage_estimator_uses_schema_default():
+    """PPOConfig centralizes the default GAE estimator."""
     from types import SimpleNamespace
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={},
-        loss_fn={},
+        ppo=PPOConfig(),
+        loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
-    with pytest.raises(KeyError):
-        _create_advantage_estimator(master_config)
+    estimator = _create_advantage_estimator(master_config)
+    assert isinstance(estimator, GeneralizedAdvantageEstimator)
+
+
+def test_ppo_config_builds_nested_base_models():
+    config = PPOConfig.model_validate(
+        {
+            "reward_shaping": {"enabled": False},
+            "adv_estimator": {
+                "name": "raw_reward",
+                "normalize_advantages": False,
+            },
+        }
+    )
+
+    assert isinstance(config.reward_shaping, RewardShapingConfig)
+    assert isinstance(config.adv_estimator, AdvEstimatorConfig)
+    assert config.adv_estimator.name == "raw_reward"
+
+
+def test_ppo_config_nested_defaults_are_populated_and_not_shared():
+    first = PPOConfig()
+    second = PPOConfig()
+
+    assert isinstance(first.reward_shaping, RewardShapingConfig)
+    assert isinstance(first.reward_scaling, RewardScalingConfig)
+    assert isinstance(first.adv_estimator, AdvEstimatorConfig)
+    assert first.reward_shaping.enabled is True
+    assert first.reward_scaling.target_min == -1.0
+    assert first.adv_estimator.name == "gae"
+    assert first.adv_estimator.gae_lambda == 0.95
+    assert first.reward_shaping is not second.reward_shaping
+    assert first.reward_scaling is not second.reward_scaling
+    assert first.adv_estimator is not second.adv_estimator
+
+
+def test_get_ppo_save_state_preserves_legacy_checkpoint_compatibility():
+    state = _get_ppo_save_state(
+        {
+            "current_step": 7,
+            "total_steps": 11,
+            "unknown_legacy_field": "ignored",
+        }
+    )
+
+    assert state.current_step == 7
+    assert state.total_steps == 11
+    assert state.consumed_samples == 0
+    assert state.total_valid_tokens == 0
+    assert not hasattr(state, "unknown_legacy_field")
