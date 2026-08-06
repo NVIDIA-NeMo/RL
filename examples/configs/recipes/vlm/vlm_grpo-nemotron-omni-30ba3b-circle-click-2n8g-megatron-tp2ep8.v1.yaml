@@ -1,298 +1,105 @@
 defaults: ../../vlm_grpo_3B_megatron.yaml
-
 grpo:
-  num_prompts_per_step: 1                # smoke: minimal loop
-  num_generations_per_prompt: 16         # gbs = 1 * 16 = 16
+  num_prompts_per_step: 1
   num_val_generations_per_prompt: 1
-  # Circle-Click is a single tool-call environment; horizon_cap is 1 and the
-  # simple_agent breaks after one function_call → verify.
-  max_rollout_turns: 1
-  max_num_epochs: 1
   max_num_steps: 100
-  normalize_rewards: true
-  use_leave_one_out_baseline: true
   val_period: 500
-  val_at_start: false
-  val_at_end: false
   overlong_filtering: true
-  advantage_clip_low: null
-  advantage_clip_high: null
   max_val_samples: null
   val_batch_size: null
-  seed: 42
-  async_grpo:
-    enabled: false                       # sync
-    max_trajectory_age_steps: 1
-
-  batch_multiplier: 1
-  use_dynamic_sampling: False
-  reward_shaping:
-    enabled: False
-  reward_scaling:
-    enabled: False
-
   seq_logprob_error_threshold: 2
-  invalid_tool_call_advantage: null
-  malformed_thinking_advantage: null
-
 loss_fn:
   reference_policy_kl_penalty: 0
-  reference_policy_kl_type: k3
   kl_input_clamp_value: null
   kl_output_clamp_value: null
-  ratio_clip_min: 0.2
   ratio_clip_max: 0.28
-  ratio_clip_c: null
-  use_on_policy_kl_approximation: True
-  use_importance_sampling_correction: True
-  sequence_level_importance_ratios: False
-  token_level_loss: True
-  truncated_importance_sampling_ratio: null
-
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
 checkpointing:
   enabled: false
-  checkpoint_dir: "results/grpo-nemotron-omni-30ba3b-gymv-circle-click"
-  metric_name: "val:total_reward/mean"
-  higher_is_better: true
+  checkpoint_dir: results/grpo-nemotron-omni-30ba3b-gymv-circle-click
+  metric_name: val:total_reward/mean
   keep_top_k: 1000000
-  save_period: 10
-  checkpoint_must_save_by: "00:03:40:00"
-  save_optimizer: true
-
+  checkpoint_must_save_by: 00:03:40:00
 policy:
-  model_name: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
-  is_vlm: true                           # required by the multimodal grpo entrypoint
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
   tokenizer:
-    name: ${policy.model_name}
-    # Nano-Omni-Reasoning uses a native <think> block; keep it open and
-    # preserve prior reasoning across turns (single-turn here, but harmless).
     chat_template_kwargs:
       enable_thinking: true
       truncate_history_thinking: false
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
-  train_micro_batch_size: 1
-  generation_batch_size: 64              # HF backend only
+  generation_batch_size: 64
   logprob_batch_size: 1
   max_total_sequence_length: 8192
-  precision: "bfloat16"
   logprob_chunk_size: 2048
-
-  dtensor_cfg:
-    _v2: true
-    enabled: false
-    cpu_offload: False
-    sequence_parallel: false
-    activation_checkpointing: false
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    custom_parallel_plan: null
-
   megatron_cfg:
-    enabled: true
-    checkpoint:
-      async_save: true
-    empty_unused_memory_level: 1
     activation_checkpointing: true
-    bias_activation_fusion: False
-    # 8-GPU policy node: TP=2, EP=8, PP=1, CP=2.
+    bias_activation_fusion: false
     tensor_model_parallel_size: 2
-    expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
-    pipeline_model_parallel_size: 1
-    num_layers_in_first_pipeline_stage: null
-    num_layers_in_last_pipeline_stage: null
     context_parallel_size: 2
-    pipeline_dtype: ${policy.precision}
-    sequence_parallel: true             # only pays off with tp + cp
-    freeze_moe_router: true
-    moe_router_dtype: "fp32"
-    moe_router_load_balancing_type: "none"
-    moe_router_bias_update_rate: 1e-3
-    moe_permute_fusion: true
-    moe_enable_deepep: false
-    moe_token_dispatcher_type: "alltoall"
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.001
     moe_aux_loss_coeff: 0.0
     moe_router_enable_expert_bias: true
-    apply_rope_fusion: True
-    defer_fp32_logits: True
-    track_moe_metrics: True
-    moe_per_layer_logging: True
-    moe_shared_expert_overlap: false
-    gradient_accumulation_fusion: false
-    use_fused_weighted_squared_relu: false
-    # RADIO CPE eval mode: keeps vision-tower positional embeddings in eval
-    # mode during rollout/train (required for the frozen vision path to
-    # produce stable features).
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
     radio_force_cpe_eval_mode: true
-    # Empty the CUDA cache before the vLLM refit broadcast so the packed
-    # staging tensor doesn't OOM against Adam m/v that materialize at the
-    # end of iter 1.
     clear_memory_caches_before_refit: true
-
     optimizer:
-      optimizer: "adam"
-      lr: 3e-6
-      min_lr: 3e-6
+      lr: 3.0e-06
+      min_lr: 3.0e-06
       weight_decay: 0.0
-      bf16: true
-      fp16: false
-      params_dtype: "float32"
-      adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1e-8
-      sgd_momentum: 0.9
-      clip_grad: ${policy.max_grad_norm}
-      use_distributed_optimizer: true
-      use_precision_aware_optimizer: true
-      # Offload Adam m/v to CPU during logprob + refit. The 30B policy on
-      # 8 GPUs with TP=2/EP=8/CP=2 pushes the Megatron worker to ~68 GiB of
-      # live PyTorch tensors even with activation_checkpointing on; adding
-      # the packed staging tensor for broadcast_weights_for_collective at
-      # step 2 OOMs. Offloading Adam frees ~30 GiB per rank at some perf
-      # cost, which is the right tradeoff for a 2n8g smoke.
       optimizer_cpu_offload: true
       optimizer_offload_fraction: 1.0
-
     scheduler:
-      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      weight_decay_incr_style: "constant"
-      lr_decay_style: "constant"
       lr_decay_iters: null
-      # Flat LR throughout: skip warmup. Combined with lr_decay_style="constant"
-      # and min_lr == lr above, this pins the LR at 3e-6 from step 0 onward.
       lr_warmup_iters: 0
-      lr_warmup_init: 3.0e-7
-
+      lr_warmup_init: 3.0e-07
     distributed_data_parallel_config:
-      grad_reduce_in_fp32: false
-      # Nemotron-Omni carries a sound_encoder / sound_projection tower that
-      # never sees an audio input in gym-v. Those params live in the DDP
-      # bucket with requires_grad=True but never receive a backward hook, so
-      # MCore's async grad-reduce path trips the golden-count assertion at
-      # param_and_grad_buffer.py:272 on iter 2's zero_grad_buffer(). Disable
-      # the overlap paths until the sound tower is actually frozen via a
-      # nemo-rl pre_wrap_hook (mirror of freeze_moe_router). This is a real
-      # perf cost — remove once the freeze path is wired.
-      overlap_grad_reduce: false
       overlap_param_gather: false
       average_in_collective: false
-      use_custom_fsdp: false
-      data_parallel_sharding_strategy: "optim_grads_params"
-
-    env_vars: null
-
-  draft:
-    enabled: false
-    model_name: null
-    loss_weight: 0.1
-    num_layers: null
-    aux_layer_indices: null
-
-  dynamic_batching:
-    enabled: False
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    sequence_length_round: 64
-
   sequence_packing:
-    enabled: True
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
-
-  # Base recipe ties this to dtensor_cfg.tensor_parallel_size; we're on
-  # megatron, so pin to a value that divides the megatron TP layout.
+    enabled: true
   make_sequence_length_divisible_by: 32
-  max_grad_norm: 1.0
-
-  optimizer: null                        # remove default FSDP optimizer
+  optimizer: null
   scheduler: null
-
-  offload_optimizer_for_logprob: False
-
   generation:
-    port_range_low: 3000
-    port_range_high: 4999
-    backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}   # single-turn; whole budget available
-    temperature: 1.0
-    top_p: 1.0
-    top_k: null
-    stop_token_ids: null
-    stop_strings: null
-    # Nano-Omni-Reasoning bad_words: only the vision-side text tokens are
-    # safe (in-vocab). The audio-delimiter tokens (<so_embedding>,
-    # <so_start>, <so_end>) sit past the LM's text-logit width and cause
-    # vLLM out-of-bounds writes in bad_words masking. Even the vision tags
-    # currently diverge sampling vs. the reference adlr-super-v3-omni-nemorl
-    # branch — leave the list empty for parity.
+    max_new_tokens: ${policy.max_total_sequence_length}
     bad_words: []
     mcore_generation_config:
-      max_model_len: ${policy.max_total_sequence_length}
-      transformer_impl: "inference_optimized"
-      cuda_graph_impl: "local"
-      inference_cuda_graph_scope: "block"
+      transformer_impl: inference_optimized
       activation_checkpointing: false
-      mamba_inference_ssm_states_dtype: "float32"
-      inference_moe_token_dispatcher_type: "nccl"
-      inference_grouped_gemm_backend: "vllm"
+      mamba_inference_ssm_states_dtype: float32
+      inference_moe_token_dispatcher_type: nccl
+      inference_grouped_gemm_backend: vllm
       moe_router_num_groups: null
       moe_router_group_topk: null
       pipeline_model_parallel_size: 1
       expert_tensor_parallel_size: 1
       expert_model_parallel_size: 8
-      sequence_parallel: True
+      sequence_parallel: true
       context_parallel_size: 1
       tensor_model_parallel_size: 2
       buffer_size_gb: 20
       num_cuda_graphs: -1
-      block_size_tokens: 256
-      use_cuda_graphs_for_non_decode_steps: true
-      enable_chunked_prefill: true
       max_tokens: ${policy.max_total_sequence_length}
-      kv_cache_management_mode: "persist"
-      materialize_only_last_token_logits: true
-      num_speculative_tokens: 0
-      refit_backend: "nvshmem"
       async_engine: true
       expose_http_server: true
       enable_prefix_caching: true
       parsers:
-        - deepseek-r1-reasoning
-        - qwen3-coder-tool
+      - deepseek-r1-reasoning
+      - qwen3-coder-tool
     vllm_cfg:
       async_engine: true
-      kv_cache_dtype: auto
-      precision: ${policy.precision}
-      # Full 8-GPU vLLM node.
       tensor_parallel_size: 8
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
-      # 0.6 leaves ~30 GiB headroom for the weight-refit broadcast from
-      # Megatron. 0.8 (the smoke default) OOMs at step-2's
-      # broadcast_weights_for_collective on this recipe because the packed
-      # staging tensor + policy-side Adam m/v both materialize just before
-      # the vLLM copy, and clear_memory_caches_before_refit only reclaims
-      # cached fragments, not live tensors.
-      gpu_memory_utilization: 0.6
-      max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: true                # skip CUDA-graph capture
-      use_deep_gemm: False
-      num_last_layers_in_bf16: 0
-      num_first_layers_in_bf16: 0
-      # Nano-Omni + prefix caching crashes vLLM's mm cache (mm_hash miss).
-      # Belt-and-suspenders: also disabled via mm_processor_cache_gb=0 below.
+      enforce_eager: true
       enable_prefix_caching: false
-      # VLMs need the tokenizer initialized (multimodal grpo entrypoint asserts).
-      skip_tokenizer_init: false
       expose_http_server: true
       reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
-      # Nano-Omni chat template expects string content, not the OpenAI
-      # {type: text, text: ...} list. Keeps the NeMo-Gym prompt-token prefix
-      # invariant across multi-turn rollouts (single-turn here, still needed
-      # for cache correctness).
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
@@ -301,92 +108,53 @@ policy:
         default_chat_template_kwargs:
           enable_thinking: true
           truncate_history_thinking: false
-
     vllm_kwargs:
-      # Circle-Click is single-turn: one image in the prompt, no
-      # per-turn observation echoes.
-      limit_mm_per_prompt: {"image": 1}
-      # Disable vLLM's mm processor cache — the mm-cache desync crash on
-      # Nano-Omni is the load-bearing fix. Must sit in vllm_kwargs, not
-      # vllm_cfg.
-      mm_processor_cache_gb: 0
+      limit_mm_per_prompt:
+        image: 1
       max_num_batched_tokens: 16384
-      # Nano-Omni's mamba backbone needs SSM cache in fp32 (accuracy).
-      mamba_ssm_cache_dtype: "float32"
+      mamba_ssm_cache_dtype: float32
       compilation_config:
         backend: eager
-
     colocated:
-      # Non-colocated: one dedicated vLLM node, the other node runs Megatron
-      # training. Total cluster nodes = 2 (see `cluster.num_nodes` below);
-      # generation takes `resources.num_nodes` of those, training gets the
-      # remainder. See nemo_rl/algorithms/grpo.py:setup for the split.
       enabled: false
       resources:
         gpus_per_node: 8
         num_nodes: 1
-
 data:
   max_input_seq_length: null
-  shuffle: False
-  num_workers: 1
-  use_multiple_dataloader: false
-
+  shuffle: false
   train:
     data_path: /path/to/train_dataset.jsonl
   validation:
     data_path: /path/to/eval_dataset.jsonl
   default:
     dataset_name: NemoGymDataset
-    env_name: "nemo_gym"
+    env_name: nemo_gym
     prompt_file: null
-    system_prompt_file: null
-    processor: "nemo_gym_data_processor"
-
+    processor: nemo_gym_data_processor
 env:
   should_use_nemo_gym: true
-  # true: skip expensive train_data_step*.jsonl; false: write full jsonl.
   should_log_nemo_gym_responses: true
   nemo_gym:
     is_trajectory_collection: false
     port_range_low: 5000
     port_range_high: 5999
-    # Load the Circle-Click resources server config. The
-    # vllm_model_for_training entry is required for the policy-model side of
-    # every gym-v run.
     config_paths:
-      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-      - resources_servers/circle_click/configs/circle_click.yaml
-    # Agent-side horizon. Outer group name matches the training manifest's
-    # `agent_ref.name`; inner `simple_agent` key matches the entry in
-    # circle_click.yaml. Keep max_steps == grpo.max_rollout_turns.
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/circle_click/configs/circle_click.yaml
     circle_click_simple_agent:
       responses_api_agents:
         simple_agent:
           max_steps: 1
-
 logger:
-  log_dir: "logs/grpo-nemotron-omni-30ba3b-gymv-circle-click"
-  num_val_samples_to_print: 0
+  log_dir: logs/grpo-nemotron-omni-30ba3b-gymv-circle-click
   wandb_enabled: true
-  tensorboard_enabled: true
-  mlflow_enabled: false
-  monitor_gpus: false
-  swanlab_enabled: false
   wandb:
-    project: "grpo-nemotron-omni-gymv"
-    name: "grpo-nemotron-omni-30ba3b-gymv-circle-click"
-    log_nemo_gym_full_result_tables: false
-  tensorboard: {}
+    project: grpo-nemotron-omni-gymv
+    name: grpo-nemotron-omni-30ba3b-gymv-circle-click
   mlflow:
-    experiment_name: "grpo-nemotron-omni-gymv"
-    run_name: "grpo-nemotron-omni-30ba3b-gymv-circle-click"
-  gpu_monitoring:
-    collection_interval: 10
-    flush_interval: 10
-
+    experiment_name: grpo-nemotron-omni-gymv
+    run_name: grpo-nemotron-omni-30ba3b-gymv-circle-click
 cluster:
   gpus_per_node: 8
   num_nodes: 2
-  master_port_range_low: 1400
-  master_port_range_high: 1999
