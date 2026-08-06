@@ -63,6 +63,42 @@ DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
 
+# Per-sample 1D scalar fields. The TQ adapter promotes these to (N, 1) on write
+# to work around TQ v0.1.9's KVStorageManager 1D schema/data mismatch on the
+# mooncake_cpu backend, and squeezes them back on read. Authoritative
+# user-level schema — the adapter carries NO per-row wire metadata for shape
+# recovery; both writer and reader consult this set by field name.
+#
+# Contract:
+#   - Any field listed here must be shipped as (N,) at put_samples time.
+#     Shipping a listed field with a different shape raises at the writer.
+#   - Any dense 1D field NOT listed here would silently hit the mooncake
+#     schema/data mismatch bug at storage; the writer raises to surface
+#     unregistered 1D producers early.
+#   - Per-token fields (nested-jagged) and dense 2D+ fields are unaffected —
+#     they neither belong here nor are checked.
+#
+# Sibling of TOKEN_ALIGNED_FIELDS in nemo_rl/data_plane/column_io.py, which
+# declares which fields are per-token nested. Everything not in either set
+# is expected to be dense 2D+ per-sample.
+#
+# Extension:
+#   - New in-tree 1D fields: add here.
+#   - Do NOT add a per-client register(...) API — that would break payload
+#     consistency the moment two processes disagreed about their registered
+#     set. Runtime extension, if ever needed, must go through a cross-process
+#     authoritative registry (see docs/design-docs/tq-data-schema.md).
+#
+# Delete this set (and the promotion logic in adapters/transfer_queue.py)
+# when upstream TQ fixes KVStorageManager.extract_field_schema for 1D fields.
+PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
+    {
+        "input_lengths",
+        "total_reward",
+        "sample_mask",
+    }
+)
+
 
 def fields_with_optional_routed_experts(
     fields: Sequence[str],
