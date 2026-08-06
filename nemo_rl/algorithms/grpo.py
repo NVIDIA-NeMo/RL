@@ -3008,7 +3008,7 @@ def grpo_train(
                     # dynamic_sampling filtered and sliced repeated_batch to train_prompts_size,
                     # which is batch_multiplier× smaller than the batch used to compute
                     # prompt_ids_for_adv above. Recompute so sizes align with rewards.
-                    if master_config.grpo["use_dynamic_sampling"]:
+                    if master_config.grpo.use_dynamic_sampling:
                         prompt_ids_for_adv = get_idx_grouping(repeated_batch)
 
                     gen_step_metrics = {}
