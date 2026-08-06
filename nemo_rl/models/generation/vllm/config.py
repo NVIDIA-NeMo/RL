@@ -24,6 +24,9 @@ from pydantic import (
 )
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    NvFp4PerTokenRolloutConfig,
+)
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -173,6 +176,10 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
+    # Mutually exclusive with quant_cfg/real_quant below. Defaults and validation
+    # live in NvFp4PerTokenRolloutConfig.
+    nvfp4_pertoken_rollout: NotRequired[NvFp4PerTokenRolloutConfig]
     # Null uses the topology default (IPC colocated, NCCL non-colocated).
     # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
@@ -259,8 +266,88 @@ def materialize_vllm_video_config(
     video_media_io_kwargs["num_frames"] = video_config.num_frames
 
 
+def parse_nvfp4_pertoken_rollout(
+    config: VllmConfig,
+) -> NvFp4PerTokenRolloutConfig | None:
+    """Parse the optional per-token rollout block under its strict schema."""
+    raw = config.get("nvfp4_pertoken_rollout")
+    if raw is None:
+        return None
+    parsed = NvFp4PerTokenRolloutConfig.model_validate(raw)
+    return parsed if parsed.enabled else None
+
+
+def validate_nvfp4_pertoken_generation(
+    config: VllmConfig, *, is_eval: bool
+) -> NvFp4PerTokenRolloutConfig | None:
+    """Reject topology and rollout combinations unsupported by per-token NVFP4."""
+    rollout = parse_nvfp4_pertoken_rollout(config)
+    if rollout is None:
+        return None
+    if is_eval:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support standalone evaluation"
+        )
+    if config.get("quant_cfg") is not None or config.get("real_quant"):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout is mutually exclusive with "
+            "generation.quant_cfg and generation.real_quant"
+        )
+    if config.get("refit_transport") is not None:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires refit_transport=null"
+        )
+    colocated = config.get("colocated") or {}
+    vllm_cfg = config["vllm_cfg"]
+    if not colocated.get("enabled"):
+        raise ValueError("generation.nvfp4_pertoken_rollout requires colocated rollout")
+    if vllm_cfg.get("async_engine"):
+        raise ValueError("generation.nvfp4_pertoken_rollout requires synchronous vLLM")
+    if vllm_cfg.get("tensor_parallel_size") != 1:
+        raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM TP=1")
+    if vllm_cfg.get("pipeline_parallel_size") != 1:
+        raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM PP=1")
+    if vllm_cfg.get("expert_parallel_size") != 1:
+        raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM EP=1")
+    if vllm_cfg.get("kv_cache_dtype") != "auto":
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires kv_cache_dtype=auto"
+        )
+    if vllm_cfg.get("precision") != "bfloat16":
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires vLLM precision=bfloat16"
+        )
+    speculative_config = (config.get("vllm_kwargs") or {}).get("speculative_config")
+    if speculative_config and not (
+        isinstance(speculative_config, dict)
+        and speculative_config.get("num_speculative_tokens") == 0
+    ):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support speculative decoding"
+        )
+    return rollout
+
+
+def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
+    """Limit the feature to the Qwen3 all-MoE layout validated end to end."""
+    architectures = getattr(hf_config, "architectures", []) or []
+    decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", None)
+    mlp_only_layers = getattr(hf_config, "mlp_only_layers", None) or []
+    if (
+        "Qwen3MoeForCausalLM" not in architectures
+        or decoder_sparse_step != 1
+        or mlp_only_layers
+    ):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout currently supports only the "
+            "validated Qwen3 all-MoE layout (Qwen3MoeForCausalLM, "
+            "decoder_sparse_step=1, no mlp_only_layers)."
+        )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
+    rollout = parse_nvfp4_pertoken_rollout(config)
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
         raise ValueError(
             "policy.generation.checkpoint_engine was replaced by "
@@ -268,6 +355,10 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             "policy.generation.refit_cfg.nixl."
         )
     transport = config.get("refit_transport")
+    if rollout is not None and transport is not None:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires refit_transport=null"
+        )
     if transport is None:
         return None
     if transport == "nccl_reshard":

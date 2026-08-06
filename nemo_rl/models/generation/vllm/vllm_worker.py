@@ -45,7 +45,9 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
+    validate_nvfp4_pertoken_model,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -207,6 +209,27 @@ def _log_effective_quantization_ignore_patterns(
         "ignore", []
     )
     print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
+
+def _configure_nvfp4_pertoken_engine_kwargs(
+    cfg: VllmConfig, llm_kwargs: dict[str, Any]
+) -> None:
+    """Configure per-token NVFP4 on the standard vLLM worker when enabled."""
+    validated_config = parse_nvfp4_pertoken_rollout(cfg)
+    if validated_config is None:
+        return
+
+    # This module subclasses vLLM types and is intentionally imported only in
+    # the vLLM worker environment, not by Megatron training workers.
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_vllm import (
+        configure_nvfp4_pertoken_engine_kwargs,
+    )
+
+    configure_nvfp4_pertoken_engine_kwargs(
+        llm_kwargs,
+        validated_config.resolved_ignore(),
+        explicit_engine_kwargs=cfg.get("vllm_kwargs") or {},
+    )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -606,6 +629,8 @@ class BaseVllmGenerationWorker:
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )
+        if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+            validate_nvfp4_pertoken_model(hf_config)
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -676,8 +701,14 @@ class BaseVllmGenerationWorker:
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
 
+        default_worker_extension_cls = (
+            "nemo_rl.models.generation.vllm.vllm_backend."
+            "VllmInternalWorkerExtensionWithCheckpointEngine"
+            if checkpoint_engine_config is not None
+            else "nemo_rl.models.generation.vllm.vllm_backend."
+            "VllmInternalWorkerExtension"
+        )
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
-
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -694,13 +725,6 @@ class BaseVllmGenerationWorker:
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
-            worker_extension_cls=(
-                "nemo_rl.models.generation.vllm.vllm_backend."
-                "VllmInternalWorkerExtensionWithCheckpointEngine"
-                if checkpoint_engine_config is not None
-                else "nemo_rl.models.generation.vllm.vllm_backend."
-                "VllmInternalWorkerExtension"
-            ),
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
@@ -717,9 +741,9 @@ class BaseVllmGenerationWorker:
                 sampling_style=video_config.sampling_style,
                 temporal_patch_size=video_config.temporal_patch_size,
             )
-
+        _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
+        llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
-
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
