@@ -45,6 +45,32 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
+import os as _os
+import sys as _sys
+
+# Opt-in per-rank hang tracer for the TQ/SC training collectives. Off by default
+# (zero cost); enable with ``NRL_SC_DEBUG=1``. Each call writes one *flushed*
+# stderr line, so when a collective wedges, every rank's last printed stage
+# pinpoints where it blocked — and any replica-group rank (e.g. a CP sibling)
+# that never printed the stage is one that failed to enter the collective.
+_SC_DBG = _os.environ.get("NRL_SC_DEBUG", "") not in ("", "0", "false", "False")
+
+
+def _sc_dbg(stage: str, **kw: Any) -> None:
+    if not _SC_DBG:
+        return
+    try:
+        r = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        r = -1
+    _sys.stderr.write(
+        f"[SC-DBG][{stage}][rank={r}] "
+        + " ".join(f"{k}={v}" for k, v in kw.items())
+        + "\n"
+    )
+    _sys.stderr.flush()
+
+
 if TYPE_CHECKING:
     from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
     from nemo_rl.data_plane.interfaces import DataPlaneClient
@@ -70,6 +96,7 @@ def _broadcast_batched_data_dict(
     # before NCCL broadcast.
     backend = torch.distributed.get_backend(group)
     bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
+    _sc_dbg("bcast.enter", is_leader=is_leader, gsize=group.size(), backend=backend)
 
     if is_leader:
         assert data is not None, "leader must provide non-None data"
@@ -85,9 +112,11 @@ def _broadcast_batched_data_dict(
     else:
         payload = [None]
 
+    _sc_dbg("bcast.descriptor_start", is_leader=is_leader)
     torch.distributed.broadcast_object_list(payload, src=src, group=group)
     descriptor = payload[0]
     assert descriptor is not None
+    _sc_dbg("bcast.descriptor_done", n_entries=len(descriptor))
 
     # pyrefly: ignore  # bad-assignment
     out: BatchedDataDict[Any] = data if is_leader else BatchedDataDict()
@@ -105,6 +134,7 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
+            _sc_dbg("bcast.tensor", key=key, shape=tuple(tensor.shape))
             torch.distributed.broadcast(tensor, src=src, group=group)
             # Restore non-leader tensors to the leader's source device
             # so downstream code sees the same layout pre-broadcast.
@@ -116,6 +146,7 @@ def _broadcast_batched_data_dict(
         else:
             if not is_leader:
                 out[key] = entry[2]
+    _sc_dbg("bcast.done", n_entries=len(descriptor))
     return out
 
 
@@ -176,6 +207,7 @@ class TQWorkerMixin:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
 
+    @wrap_with_nvtx_name("policy_worker/tq_fetch")
     def _fetch(
         self,
         meta: "KVBatchMeta",
@@ -229,6 +261,13 @@ class TQWorkerMixin:
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
+            _sc_dbg(
+                "fetch.enter",
+                task=meta.task_name,
+                gsize=replica_group.size(),
+                is_leader=is_leader,
+                n_ids=len(meta.sample_ids),
+            )
             if is_leader:
                 td = self._require_dp_client().get_samples(
                     sample_ids=meta.sample_ids,
@@ -350,8 +389,34 @@ class TQWorkerMixin:
             data.micro_batch_lengths = extra[MICRO_BATCH_LENGTHS]
             if ELEM_COUNTS_PER_GB in extra:
                 data.elem_counts_per_gb = extra[ELEM_COUNTS_PER_GB]
+            _mbl = extra[MICRO_BATCH_LENGTHS]
+            # Driver shipped packing metadata → every rank shares this exact
+            # microbatch count/shape → per-microbatch collectives stay in lockstep.
+            _sc_dbg(
+                "pack.trust_driver",
+                task=meta.task_name,
+                n_mb=(len(_mbl) if _mbl is not None else None),
+                mb_lengths=_mbl,
+            )
             return data
-        return self._apply_packing_prep(data)
+        # No driver metadata → this rank re-packs on its *own* local data. If
+        # the driver used batch_size=None (SC streaming path) it may not have
+        # emitted balanced metadata, so ranks can derive DIFFERENT microbatch
+        # counts here → Megatron's per-microbatch collectives desync → hang.
+        _sc_dbg(
+            "pack.local_repack",
+            task=meta.task_name,
+            reason="driver_metadata_absent",
+        )
+        out = self._apply_packing_prep(data)
+        _mbl2 = getattr(out, "micro_batch_lengths", None)
+        _sc_dbg(
+            "pack.local_repack_done",
+            task=meta.task_name,
+            n_mb=(len(_mbl2) if _mbl2 is not None else None),
+            mb_lengths=_mbl2,
+        )
+        return out
 
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
@@ -401,6 +466,7 @@ class TQWorkerMixin:
 
         write_columns(self._require_dp_client(), meta, fields)
 
+    @wrap_with_nvtx_name("policy_worker/tq_write_back")
     def _write_back_result_field(
         self,
         meta: "KVBatchMeta",
@@ -562,9 +628,16 @@ class TQWorkerMixin:
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        _iid = data.get("input_ids") if hasattr(data, "get") else None
+        _sc_dbg(
+            "train_mb.forward_start",
+            n_ids=len(meta.sample_ids),
+            in_shape=(tuple(_iid.shape) if _iid is not None else None),
+        )
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
+        _sc_dbg("train_mb.forward_done", n_ids=len(meta.sample_ids))
 
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")
     def finish_train_step_presharded(self) -> dict[str, Any]:

@@ -29,6 +29,7 @@ no key minting). Workers fetch their slice from TQ via
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -528,6 +529,18 @@ class TQPolicy(Policy):
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+            )
+        # Debug (NRL_SC_DEBUG=1): expose the per-DP-rank shard shape so an empty
+        # or lopsided shard — which would desync the downstream forward/backward
+        # collectives across ranks — is visible right before dispatch.
+        if os.environ.get("NRL_SC_DEBUG", "") not in ("", "0", "false", "False"):
+            print(
+                "[SC-DBG][train_mb.shard] "
+                f"dp_world={self.sharding_annotations.get_axis_size('data_parallel')} "
+                f"n_shards={len(dp_metas)} "
+                f"shard_seqcounts={[len(m.sequence_lengths or []) for m in dp_metas]} "
+                f"shard_tokens={[sum(m.sequence_lengths or []) for m in dp_metas]}",
+                flush=True,
             )
 
         if self.flops_tracker is not None:

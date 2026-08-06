@@ -659,6 +659,30 @@ class MegatronPolicyWorkerImpl(
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
+                # Debug (NRL_SC_DEBUG=1): per-rank microbatch count entering the
+                # forward/backward loop. Megatron runs one collective set per
+                # microbatch in lockstep across all model-parallel ranks, so if
+                # this count DIFFERS across ranks the loop deadlocks. This is the
+                # definitive check for the SC batch_size=None variable-bin-count
+                # hypothesis — compare num_microbatches across ranks in the logs.
+                if os.environ.get("NRL_SC_DEBUG", "") not in (
+                    "",
+                    "0",
+                    "false",
+                    "False",
+                ):
+                    _r = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else -1
+                    )
+                    print(
+                        f"[SC-DBG][mcore.num_microbatches][rank={_r}] "
+                        f"num_microbatches={int(num_microbatches)} "
+                        f"seq_length={seq_length} padded_seq_length={padded_seq_length} "
+                        f"micro_batch_size={micro_batch_size} eval_mode={eval_mode}",
+                        flush=True,
+                    )
 
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
@@ -2021,6 +2045,7 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -2043,6 +2068,7 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
