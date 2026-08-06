@@ -4051,6 +4051,7 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
                 "transformer_impl": "inference_optimized",
             }
         },
+        "router_replay": {"enabled": True},
     }
 
     with (
@@ -4060,8 +4061,8 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
         ) as apply_mamba_patch,
         patch(
             "nemo_rl.models.policy.workers.moe_determinism_patches."
-            "apply_moe_unpermute_determinism_patch"
-        ),
+            "apply_moe_determinism_patches"
+        ) as apply_moe_patches,
         patch(
             "nemo_rl.models.policy.workers.patches.apply_te_gemm_cublas_pinned_patch"
         ),
@@ -4073,3 +4074,4 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
         == "transformer_engine"
     )
     apply_mamba_patch.assert_called_once_with()
+    apply_moe_patches.assert_called_once_with()

@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
@@ -37,9 +35,11 @@ _UNPERMUTE_ORIG: Optional[Callable[..., torch.Tensor]] = None
 _TOKEN_DISPATCHER_UNPERMUTE_ORIG: Optional[Callable[..., torch.Tensor]] = None
 _DYNAMIC_STEP_BOOKKEEPING_ORIG: Optional[Callable[..., Dict[str, Any]]] = None
 _ASYNC_BOOKKEEP_ORIG: Optional[Callable[..., Any]] = None
+_DISTRIBUTED_LOG_SOFTMAX_ORIG: Optional[Callable[..., torch.Tensor]] = None
 
 _MOE_UNPERMUTE_PATCHED = False
 _ROUTER_REPLAY_INFERENCE_PATCHED = False
+_LOG_SOFTMAX_PATCHED = False
 
 
 def _nrl_log_unpermute_path(path: str) -> None:
@@ -237,6 +237,44 @@ async def _nrl_async_bookkeep(
     return await _ASYNC_BOOKKEEP_ORIG(self, step_result, context_state, step_time)
 
 
+def _nrl_inference_compatible_log_softmax(
+    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Use Megatron inference's log-softmax operation when TP is one."""
+    if torch.distributed.get_world_size(group) == 1:
+        return torch.nn.functional.log_softmax(vocab_parallel_logits, dim=-1)
+
+    assert _DISTRIBUTED_LOG_SOFTMAX_ORIG is not None
+    return _DISTRIBUTED_LOG_SOFTMAX_ORIG(vocab_parallel_logits, group)
+
+
+def apply_log_softmax_determinism_patch() -> None:
+    """Match TP=1 train/logprob normalization to Megatron inference.
+
+    Dynamic inference computes generated-token log probabilities with
+    ``F.log_softmax(logits.float())`` over full-vocabulary logits. NeMo-RL's
+    logprob path already casts logits to fp32, so replacing its algebraically
+    equivalent max/exp/sum/log decomposition removes a numerical mismatch.
+    """
+    global _DISTRIBUTED_LOG_SOFTMAX_ORIG, _LOG_SOFTMAX_PATCHED
+    if _LOG_SOFTMAX_PATCHED:
+        return
+
+    from nemo_rl.distributed import model_utils
+
+    _DISTRIBUTED_LOG_SOFTMAX_ORIG = (
+        model_utils._compute_distributed_log_softmax_with_grad
+    )
+    model_utils._compute_distributed_log_softmax_with_grad = (
+        _nrl_inference_compatible_log_softmax
+    )
+    _LOG_SOFTMAX_PATCHED = True
+    print(
+        "[moe_determinism_patches] patched TP=1 train/logprob computation "
+        "to use inference-compatible fp32 F.log_softmax."
+    )
+
+
 def apply_moe_unpermute_determinism_patch() -> None:
     """Patch MoE unpermute and the token dispatcher's cached import."""
     global _UNPERMUTE_ORIG, _TOKEN_DISPATCHER_UNPERMUTE_ORIG, _MOE_UNPERMUTE_PATCHED
@@ -297,16 +335,18 @@ def apply_router_replay_inference_patches() -> None:
     )
 
 
-def apply_moe_determinism_patches(*, router_replay: bool = False) -> None:
-    """Apply all requested MoE determinism / router-replay runtime patches."""
+def apply_moe_determinism_patches() -> None:
+    """Apply all MoE train/generation determinism patches."""
     apply_moe_unpermute_determinism_patch()
-    if router_replay:
-        apply_router_replay_inference_patches()
+    apply_router_replay_inference_patches()
+    apply_log_softmax_determinism_patch()
 
 
 def restore_moe_determinism_patches() -> None:
     """Restore Megatron entry points patched by this module (for tests)."""
-    global _MOE_UNPERMUTE_PATCHED, _ROUTER_REPLAY_INFERENCE_PATCHED
+    global _LOG_SOFTMAX_PATCHED
+    global _MOE_UNPERMUTE_PATCHED
+    global _ROUTER_REPLAY_INFERENCE_PATCHED
 
     if _MOE_UNPERMUTE_PATCHED and _UNPERMUTE_ORIG is not None:
         import megatron.core.transformer.moe.moe_utils as moe_utils
@@ -330,5 +370,13 @@ def restore_moe_determinism_patches() -> None:
         if _ASYNC_BOOKKEEP_ORIG is not None:
             DynamicInferenceEngine.async_bookkeep = _ASYNC_BOOKKEEP_ORIG
         _ROUTER_REPLAY_INFERENCE_PATCHED = False
+
+    if _LOG_SOFTMAX_PATCHED and _DISTRIBUTED_LOG_SOFTMAX_ORIG is not None:
+        from nemo_rl.distributed import model_utils
+
+        model_utils._compute_distributed_log_softmax_with_grad = (
+            _DISTRIBUTED_LOG_SOFTMAX_ORIG
+        )
+        _LOG_SOFTMAX_PATCHED = False
 
     _NRL_UNPERMUTE_PATH_SEEN.clear()
