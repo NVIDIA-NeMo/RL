@@ -1112,7 +1112,9 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1128,7 +1130,7 @@ class VllmGeneration(GenerationInterface):
         # which walks the whole group: after a shard is lost that would call its dead
         # actor and fail the refit, undoing the rebuild that just happened.
         futures = [
-            getattr(worker, method_name).remote()
+            getattr(worker, method_name).remote(refit_timeout_s=refit_timeout_s)
             for worker in self._refit_leader_workers()
         ]
 

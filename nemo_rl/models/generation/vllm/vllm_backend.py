@@ -756,8 +756,30 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
-        """Update the model weights from collective communication."""
+    def update_weights_from_collective(
+        self, refit_timeout_s: float | None = None
+    ) -> bool:
+        """Update the model weights from collective communication.
+
+        Guarded for the same reason as the producer side: if a peer rank dies mid-refit
+        this blocks in NCCL forever. Note the buffers hold PARTIAL weights once aborted,
+        so the caller must not serve from this engine until a later refit completes.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            result = self._update_weights_from_collective()
+        if guard.fired:
+            raise RefitAborted(
+                f"refit receive exceeded {refit_timeout_s}s and was aborted; "
+                "this engine now holds partial weights and must not serve until refit"
+            )
+        return result
+
+    def _update_weights_from_collective(self) -> bool:
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
