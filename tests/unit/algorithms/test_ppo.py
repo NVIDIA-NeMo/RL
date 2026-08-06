@@ -881,8 +881,16 @@ def _run_mock_ppo_train(
     monkeypatch.setattr(ppo_mod, "batched_message_log_to_flat_message", fake_flatten)
     monkeypatch.setattr(
         ppo_mod,
-        "extract_initial_prompt_messages",
-        lambda message_logs, _lengths: message_logs,
+        "get_idx_grouping",
+        lambda batch: torch.zeros(batch.size, dtype=torch.long).unsqueeze(-1),
+    )
+    monkeypatch.setattr(
+        ppo_mod,
+        "_apply_ppo_seq_logprob_error_masking",
+        lambda train_data, rewards, threshold: (
+            train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1),
+            {"num_masked_seqs_by_logprob_error": 0},
+        ),
     )
     monkeypatch.setattr(
         ppo_mod,

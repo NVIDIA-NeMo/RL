@@ -1704,6 +1704,39 @@ def scale_rewards(
     return repeated_batch
 
 
+def extract_initial_prompt_messages(
+    message_logs: list,
+    original_prompt_lengths: torch.Tensor,
+) -> list:
+    """Extract the original prompt messages from message logs using token length.
+
+    This function correctly identifies original prompt messages even when the prompt
+    contains assistant messages (e.g., multi-turn conversation history).
+
+    Args:
+        message_logs: List of message logs, where each log is a list of messages.
+        original_prompt_lengths: Tensor of original prompt token lengths per sample.
+
+    Returns:
+        List of message logs containing only the original prompt messages.
+    """
+    initial_prompt_message_logs = []
+    for i, message_log in enumerate(message_logs):
+        initial_prompt_log = []
+        cumulative_length = 0
+        target_length = original_prompt_lengths[i].item()
+
+        for message in message_log:
+            if cumulative_length >= target_length:
+                break
+            initial_prompt_log.append(message)
+            cumulative_length += len(message["token_ids"])
+
+        initial_prompt_message_logs.append(initial_prompt_log)
+
+    return initial_prompt_message_logs
+
+
 def get_idx_grouping(
     repeated_batch,
 ) -> list:
@@ -1732,33 +1765,6 @@ def get_idx_grouping(
         dtype=torch.long,
     )
     return prompt_ids_for_adv
-
-
-def extract_initial_prompt_messages(
-    message_logs: list[LLMMessageLogType | VLMMessageLogType],
-    prompt_lengths: torch.Tensor,
-) -> list[LLMMessageLogType | VLMMessageLogType]:
-    """Extract the initial prompt messages from each message log by token count.
-
-    Args:
-        message_logs: Batch of full conversation message logs (prompt + responses).
-        prompt_lengths: Per-sample prompt token counts.
-
-    Returns:
-        List of message lists containing only the prompt-portion messages.
-    """
-    result: list[LLMMessageLogType | VLMMessageLogType] = []
-    for message_log, prompt_len in zip(message_logs, prompt_lengths.tolist()):
-        prompt_len = int(prompt_len)
-        prompt_msgs: LLMMessageLogType = []
-        cumulative = 0
-        for msg in message_log:
-            if cumulative >= prompt_len:
-                break
-            prompt_msgs.append(msg)
-            cumulative += len(cast(torch.Tensor, msg["token_ids"]))
-        result.append(prompt_msgs)
-    return result
 
 
 def add_grpo_token_loss_masks_and_generation_logprobs(

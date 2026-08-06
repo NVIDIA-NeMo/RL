@@ -1469,12 +1469,15 @@ def ppo_train(
 
                     policy.finish_inference()
 
-                advantage_mask, seq_logprob_error_metrics = (
-                    _apply_ppo_seq_logprob_error_masking(
-                        train_data,
-                        rewards,
-                        master_config.ppo.get("seq_logprob_error_threshold"),
-                    )
+                (
+                    advantage_mask,
+                    seq_logprob_error_metrics,
+                ) = _apply_ppo_seq_logprob_error_masking(
+                    train_data=train_data,
+                    rewards=rewards,
+                    seq_logprob_error_threshold=master_config.ppo[
+                        "seq_logprob_error_threshold"
+                    ],
                 )
 
                 # Build prompt IDs for advantage estimation (groups responses from
