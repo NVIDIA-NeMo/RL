@@ -34,6 +34,8 @@ the other functions append environment assignments and argv entries:
 ```bash
 source "$PROJECT_ROOT/tools/external_gym_vllm/pool_config.sh"
 EXTERNAL_VLLM_POOLS=""
+export GPUS_PER_NODE=4
+NUM_EXTERNAL_SERVICE_NODES=2
 
 register_external_vllm_pool SAFETY \
   --display-name "Safety judge" \
@@ -43,6 +45,7 @@ register_external_vllm_pool SAFETY \
   --replicas 2 \
   --tensor-parallel-size 4 \
   --lb-port 9215 \
+  --served-model-name "$SAFETY_GYM_MODEL_NAME" \
   --url-placeholder __SAFETY_BASE_URL__ \
   --shared-path "$SAFETY_REASONING_PARSER"
 
@@ -65,7 +68,7 @@ The generated fields are:
 
 | Variable | Required | Default | Purpose |
 |---|---:|---|---|
-| `POOL_MODEL` | yes | — | `/lustre` checkpoint path or Hugging Face model ID. |
+| `POOL_MODEL` | yes | — | Checkpoint path under `EXTERNAL_VLLM_SHARED_ROOT` or Hugging Face model ID. |
 | `POOL_CONTAINER` | yes | — | Container used by this pool's replicas. |
 | `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM, Ray, and NeMo RL's compatibility patch. |
 | `POOL_REPLICAS` | yes | — | Number of independent DP=1 servers. |
@@ -74,10 +77,10 @@ The generated fields are:
 | `POOL_URL_PLACEHOLDER` | yes | — | Token in `COMMAND` replaced by this pool's `/v1` URL. |
 | `POOL_GROUP_ID` | no | `inline-<pool>-<job-id>` | Registry namespace; set with `--group-id` only when an explicit stable namespace is needed. |
 | `POOL_DISPLAY_NAME` | no | pool name | Human-readable log label. |
-| `POOL_SERVED_MODEL_NAME` | no | `model` | OpenAI API model name. |
+| `POOL_SERVED_MODEL_NAME` | no | `model` | OpenAI API model name. Must equal the calling Gym server's `model` field because Gym overwrites the request model. |
 | `POOL_VLLM_PORT` | no | `8000` | Backend HTTP port; replicas use disjoint private clusters. |
 | `POOL_STARTUP_TIMEOUT` | no | `3600` | Seconds allowed for startup. |
-| `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths that must be visible through the `/lustre` mount. |
+| `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths under `EXTERNAL_VLLM_SHARED_ROOT` that the pool container must access. |
 | `POOL_ENV_VARS` | no | empty | Newline-separated `NAME=value` assignments applied before vLLM starts. |
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
@@ -93,7 +96,9 @@ configs and paths containing spaces without `eval`. The wrapper itself supplies 
 `--distributed-executor-backend ray`, `--port`, and `--served-model-name`.
 Everything model-specific—including attention, reasoning/tool parsers, expert
 parallelism, MoE backend, cache settings, and loader settings—belongs in the
-launcher's pool definition.
+launcher's pool definition. A pool's reasoning-parser setting must also agree
+with the consuming Gym server's `uses_reasoning_parser` setting; in particular,
+do not pass `--reasoning-parser` when Gym explicitly disables it.
 
 ## Global contract
 
@@ -112,10 +117,12 @@ Optional globals:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GPUS_PER_NODE` | `4` | GPUs claimed per node. |
+| `GPUS_PER_NODE` | `4` | GPUs claimed per node. Set this before registering pools; it sizes hetgroup 1 and is exported to `ray.sub`, so it must match the physical GPUs per node for both components. |
+| `NUM_EXTERNAL_SERVICE_NODES` | empty | Expected hetgroup 1 node count. Pass it to `validate_external_vllm_submission` to fail before `sbatch` on a topology mismatch; validation warns and skips this check when unset. |
 | `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`. |
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
+| `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |
 
 The number of nodes in hetgroup 1 must equal:
 
@@ -124,8 +131,9 @@ sum(POOL_REPLICAS * POOL_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE)
 ```
 
 Every TP value must be divisible by `GPUS_PER_NODE`. The wrapper records the
-actual split in `$BASE_LOG_DIR/<job-id>-logs/node-allocation.txt` and writes
-each resolved URL to `<pool-name-lowercase>_url` in the same directory.
+actual split in `$BASE_LOG_DIR/<job-id>[-<restart-count>]-logs/node-allocation.txt`
+and writes each resolved URL to `<pool-name-lowercase>_url` in the same
+directory.
 
 ### Private-cluster port layout
 

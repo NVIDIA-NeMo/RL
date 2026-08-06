@@ -112,6 +112,31 @@ class NcclExtension(WorkerExtension):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
 
+    def _finalize_weight_update(self) -> None:
+        """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
+        # WorkerExtension gained this shared path after refit lifecycle hooks.
+        # Retain the fallback while NeMo-RL supports older TRT-LLM releases.
+        finalize_weight_update = getattr(
+            WorkerExtension, "finalize_weight_update", None
+        )
+        if finalize_weight_update is not None:
+            finalize_weight_update(self)
+            return
+
+        model_engine = self.engine.model_engine
+        _call_model_loader_hook_if_available(
+            model_engine.model_loader, "finalize_update_weights"
+        )
+        for module in model_engine.model.modules():
+            if hasattr(module, "process_weights_after_loading") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.process_weights_after_loading()
+            if hasattr(module, "post_load_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.post_load_weights()
+
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
@@ -169,18 +194,7 @@ class NcclExtension(WorkerExtension):
                     src=0,
                     post_unpack_func=load_model_weight_func,
                 )
-                _call_model_loader_hook_if_available(
-                    model_engine.model_loader, "finalize_update_weights"
-                )
-                for module in model.modules():
-                    if hasattr(module, "process_weights_after_loading") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.process_weights_after_loading()
-                    if hasattr(module, "post_load_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.post_load_weights()
+                self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
 
                 self.engine.reset_prefix_cache()
@@ -281,18 +295,7 @@ class NcclExtension(WorkerExtension):
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            _call_model_loader_hook_if_available(
-                model_engine.model_loader, "finalize_update_weights"
-            )
-            for module in model.modules():
-                if hasattr(module, "process_weights_after_loading") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.process_weights_after_loading()
-                if hasattr(module, "post_load_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.post_load_weights()
+            self._finalize_weight_update()
             torch.cuda.current_stream().synchronize()
             self.engine.reset_prefix_cache()
             gc.collect()

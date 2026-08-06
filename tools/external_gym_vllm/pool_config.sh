@@ -246,6 +246,8 @@ validate_external_vllm_submission() {
       echo "ERROR: NUM_EXTERNAL_SERVICE_NODES=${expected_nodes}, expected ${EXTERNAL_VLLM_NUM_NODES} from registered pools" >&2
       return 2
     fi
+  else
+    echo "WARNING: NUM_EXTERNAL_SERVICE_NODES is unset; skipping external hetgroup node-count validation" >&2
   fi
 
   read -r -a pools <<< "${EXTERNAL_VLLM_POOLS}"
