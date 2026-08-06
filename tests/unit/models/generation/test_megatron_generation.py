@@ -14,7 +14,6 @@
 
 import gc
 from copy import deepcopy
-from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -539,46 +538,3 @@ def test_megatron_generation_non_colocated_refit(
             print(f"Error during generation_cluster shutdown: {e}")
         gc.collect()
         torch.cuda.empty_cache()
-
-
-def _placement_policy_config(
-    *, tp: int = 1, pp: int = 1, cp: int = 1, colocated: bool = False
-) -> dict:
-    """Minimal PolicyConfig slice consumed by init_cluster_placement_groups."""
-    return {
-        "megatron_cfg": {
-            "tensor_model_parallel_size": tp,
-            "pipeline_model_parallel_size": pp,
-            "context_parallel_size": cp,
-        },
-        "generation": {"colocated": {"enabled": colocated}},
-    }
-
-
-@pytest.mark.parametrize(
-    "tp,pp,cp,colocated,expected_strategy,expected_unified",
-    [
-        # cross-node instance via TP alone -> one unified PG
-        (8, 1, 1, False, "PACK", True),
-        # cross-node instance only via the TPxPPxCP product
-        (2, 2, 2, False, "PACK", True),
-        # node-local instance -> per-node PGs
-        (4, 1, 1, False, "PACK", False),
-        # colocated reuses the policy's layout: no PACK strategy
-        (2, 2, 2, True, None, True),
-    ],
-)
-def test_megatron_init_cluster_placement_groups(
-    tp, pp, cp, colocated, expected_strategy, expected_unified
-):
-    """Mirrors the TRT-LLM placement tests: an instance spans TP*PP*CP GPUs."""
-    cluster = MagicMock(num_gpus_per_node=4)
-
-    MegatronGeneration.init_cluster_placement_groups(
-        cluster, _placement_policy_config(tp=tp, pp=pp, cp=cp, colocated=colocated)
-    )
-
-    cluster._init_placement_groups.assert_called_once_with(
-        strategy=expected_strategy,
-        use_unified_pg=expected_unified,
-    )

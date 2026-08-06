@@ -831,14 +831,11 @@ def setup(
                 # For SGLang: gpus_per_server already includes all parallelism
                 #   dimensions (TP, DP-attention, PP are internal subdivisions),
                 #   so we use it directly without multiplying by pp_size.
-                # For Megatron: inference reuses the training megatron_cfg
-                #   parallelism, so an instance spans TP * PP * CP GPUs.
+                # For Megatron: the NVLink-domain span of the parallelism the
+                #   generation workers actually run with.
                 if generation_config["backend"] == "megatron":
-                    megatron_cfg = policy_config["megatron_cfg"]
-                    gpus_per_instance = (
-                        megatron_cfg["tensor_model_parallel_size"]
-                        * megatron_cfg["pipeline_model_parallel_size"]
-                        * megatron_cfg["context_parallel_size"]
+                    gpus_per_instance = MegatronGeneration.nvlink_domain_span(
+                        policy_config
                     )
                 elif generation_config["backend"] == "vllm":
                     vllm_cfg = generation_config.get("vllm_cfg", {})
