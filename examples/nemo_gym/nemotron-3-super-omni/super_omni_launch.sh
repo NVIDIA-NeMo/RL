@@ -21,7 +21,7 @@ export MODEL_PATH="${MODEL_PATH:-/path/to/nemotron-super-omni-hf-checkpoint}"
 export TRAIN_PATH="${TRAIN_PATH:-/path/to/super-omni-gym-train.jsonl}"
 export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 export CONTAINER="${CONTAINER:-/path/to/nemo-rl.sqsh}"
-export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/path/to/nemo-skills-sandbox.sqsh}"
+export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/path/to/cache/nemo-rl-super-omni}"
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-your_slurm_account}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
@@ -60,8 +60,7 @@ fi
 
 # Fail on the placeholders above rather than deep inside mkdir/sbatch.
 unset_placeholders=()
-for var in MODEL_PATH TRAIN_PATH VAL_PATH CONTAINER SANDBOX_CONTAINER \
-           PERSISTENT_CACHE SLURM_ACCOUNT; do
+for var in MODEL_PATH TRAIN_PATH VAL_PATH CONTAINER PERSISTENT_CACHE SLURM_ACCOUNT; do
     case "${!var}" in
         /path/to/*|your_slurm_account) unset_placeholders+=("${var}") ;;
     esac

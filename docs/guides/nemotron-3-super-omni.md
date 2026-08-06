@@ -127,10 +127,21 @@ Generate or provide NeMo-Gym `circle_count_simple_agent` rows with one
 MODEL_PATH=/path/to/nemotron-super-omni-hf \
 TRAIN_PATH=/path/to/circle_count_train.jsonl \
 CONTAINER=/path/to/nemo-rl-super-omni.sqsh \
-SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
 PERSISTENT_CACHE=/shared/cache/nemo-rl-super-omni \
 SLURM_ACCOUNT=your_account \
 WANDB_API_KEY=... \
+bash examples/nemo_gym/nemotron-3-super-omni/run_mopd_circle_count.sh
+```
+
+`SANDBOX_CONTAINER` is optional and only needed by Gym resources that launch a
+NeMo-Skills sandbox; `circle_count_simple_agent` does not.
+
+Before the full run, use the four-node, three-step exact-stack smoke:
+
+```bash
+EXP_NAME=mopd-super-omni-circle-smoke \
+CONFIG_PATH=examples/configs/recipes/vlm/mopd-nemotron-super-omni-120ba12b-4n8g-smoke.v1.yaml \
+SBATCH_NUM_NODES=4 \
 bash examples/nemo_gym/nemotron-3-super-omni/run_mopd_circle_count.sh
 ```
 
