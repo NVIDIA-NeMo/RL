@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import torch
 
 from nemo_rl.data.collate_fn import preference_collate_fn
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import PreferenceDatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -29,7 +31,7 @@ def test_preference_collate_fn():
 
     # Create test data with varying sequence lengths
     data_batch = [
-        DatumSpec(
+        PreferenceDatumSpec(
             message_log_chosen=[
                 {
                     "role": "user",
@@ -60,7 +62,7 @@ def test_preference_collate_fn():
             idx=0,
             task_name="test_task",
         ),
-        DatumSpec(
+        PreferenceDatumSpec(
             message_log_chosen=[
                 {
                     "role": "user",
@@ -107,6 +109,8 @@ def test_preference_collate_fn():
     assert "input_lengths" in train_data
     assert "token_mask" in train_data
     assert "sample_mask" in train_data
+    assert "pair_index" in train_data
+    assert "is_chosen" in train_data
 
     # Verify batch size is doubled (chosen + rejected for each example)
     assert train_data["input_ids"].shape[0] == 4  # 2 examples * 2 (chosen + rejected)
@@ -137,6 +141,10 @@ def test_preference_collate_fn():
         0.0,
     ]  # loss_multiplier repeated for chosen/rejected
     assert torch.equal(train_data["sample_mask"], torch.tensor(expected_sample_mask))
+    assert torch.equal(train_data["pair_index"], torch.tensor([0, 0, 1, 1]))
+    assert torch.equal(
+        train_data["is_chosen"], torch.tensor([True, False, True, False])
+    )
 
     # Verify message content is preserved
     # First example chosen
@@ -149,3 +157,66 @@ def test_preference_collate_fn():
     assert torch.equal(
         train_data["input_ids"][1][3:5], torch.tensor([8, 9])
     )  # assistant
+
+
+def test_preference_collate_fn_preserves_media_in_mixed_batches():
+    """Missing media rows remain aligned regardless of their batch position."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.pad_token_id = 0
+
+    def make_datum(idx: int, with_image: bool) -> PreferenceDatumSpec:
+        def make_branch(token: int, pixel_value: float) -> list[dict[str, Any]]:
+            user_message: dict[str, Any] = {
+                "role": "user",
+                "content": "Look" if with_image else "Read",
+                "token_ids": torch.tensor([token]),
+            }
+            if with_image:
+                user_message["pixel_values"] = PackedTensor(
+                    torch.full((1, 3, 2, 2), pixel_value),
+                    dim_to_pack=0,
+                )
+            return [
+                user_message,
+                {
+                    "role": "assistant",
+                    "content": "Done",
+                    "token_ids": torch.tensor([token + 1]),
+                },
+            ]
+
+        return PreferenceDatumSpec(
+            message_log_chosen=make_branch(2 * idx + 1, 1.0),
+            message_log_rejected=make_branch(2 * idx + 3, 2.0),
+            length_chosen=2,
+            length_rejected=2,
+            loss_multiplier=1.0,
+            idx=idx,
+            task_name="mixed_media",
+        )
+
+    text_datum = make_datum(0, with_image=False)
+    image_datum = make_datum(1, with_image=True)
+
+    for data_batch, expected_missing_rows in (
+        ([text_datum, image_datum], (0, 1)),
+        ([image_datum, text_datum], (2, 3)),
+    ):
+        train_data = preference_collate_fn(
+            data_batch,
+            mock_tokenizer,
+            make_sequence_length_divisible_by=1,
+            add_loss_mask=False,
+        )
+
+        pixel_values = train_data["pixel_values"]
+        assert isinstance(pixel_values, PackedTensor)
+        assert len(pixel_values) == 4
+        assert (
+            tuple(
+                index
+                for index, tensor in enumerate(pixel_values.tensors)
+                if tensor is None
+            )
+            == expected_missing_rows
+        )

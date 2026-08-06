@@ -183,6 +183,23 @@ class TestProcessMicrobatch:
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
 
+    def test_process_microbatch_rejects_unpacked_nemotron_omni_images(self):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        with pytest.raises(
+            NotImplementedError,
+            match=r"Megatron-Bridge#5181",
+        ):
+            process_microbatch(
+                {
+                    "input_ids": torch.tensor([[1, 2, 3]]),
+                    "pixel_values": torch.zeros(1, 3, 16, 16),
+                },
+                pack_sequences=False,
+                model_slices_context_parallel_inputs=True,
+                straggler_timer=MagicMock(),
+            )
+
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_repairs_routed_experts_padding_without_packing(
         self, mock_get_masks

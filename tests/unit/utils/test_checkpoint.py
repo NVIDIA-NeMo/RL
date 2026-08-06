@@ -553,6 +553,31 @@ def test_get_resume_paths_propagates_megatron_load_failure(
         CheckpointManager.get_resume_paths(checkpoint_path)
 
 
+@pytest.mark.parametrize("model_component", ["policy", "value"])
+def test_get_resume_paths_torch_dist_megatron_optimizer(
+    checkpoint_dir, model_component
+):
+    """Modern MCore manifests optimizer shards through run_config.yaml."""
+    checkpoint_path = checkpoint_dir / "step_1"
+    expected_weights_path = checkpoint_path / model_component / "weights"
+    iteration_path = expected_weights_path / "iter_0000000"
+    iteration_path.mkdir(parents=True)
+    with open(iteration_path / "run_config.yaml", "w") as f:
+        yaml.safe_dump({"checkpoint": {"save_optim": True}}, f)
+
+    expected_optimizer_path = checkpoint_path / model_component / "optimizer"
+    assert not expected_optimizer_path.exists()
+    assert not (iteration_path / "common.pt").exists()
+
+    weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path,
+        model_component=model_component,
+    )
+
+    assert weights_path == expected_weights_path
+    assert optimizer_path == expected_optimizer_path
+
+
 def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_dir):
     """Test that get_best_checkpoint_path returns None when no checkpoints exist."""
     result = checkpoint_manager.get_best_checkpoint_path()
