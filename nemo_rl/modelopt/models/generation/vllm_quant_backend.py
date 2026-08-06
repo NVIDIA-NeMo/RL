@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import types
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -23,6 +24,12 @@ import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
+from nemo_rl.modelopt.calibration_artifact import load_nvfp4_calibration
+from nemo_rl.modelopt.models.generation.nvfp4_refit import (
+    NVFP4Calibration,
+    NVFP4RefitMode,
+    serialize_bf16_nvfp4_group,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
@@ -33,6 +40,11 @@ from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
     WeightUpdateFinalizer,
     WeightUpdateTransport,
+)
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
 )
 
 _FUSED_MODELOPT_MOE_SUFFIXES = {
@@ -45,6 +57,131 @@ _FUSED_MODELOPT_MOE_SUFFIXES = {
     ".experts.w13_input_scale": "w13_input_scale",
     ".experts.w2_input_scale": "w2_input_scale",
 }
+_ROUTED_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.+\.experts)\.(?P<expert>\d+)\."
+    r"(?P<projection>gate|up|down)_proj\.weight$"
+)
+_GROUPED_ROUTED_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.+\.experts)\."
+    r"(?P<projection>gate|up|down)_proj\.weight$"
+)
+_UNSUPPORTED_BF16_NVFP4_SUFFIXES = (
+    "q_proj.weight",
+    "k_proj.weight",
+    "v_proj.weight",
+    "o_proj.weight",
+    "qkv_proj.weight",
+    "gate_proj.weight",
+    "up_proj.weight",
+    "down_proj.weight",
+)
+
+
+def _vllm_calibration_provenance(model_config: Any) -> tuple[str, str]:
+    """Return the model identity used to validate a calibration artifact."""
+    model_id = model_config.model
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("vLLM model config requires a non-empty model id")
+
+    configured_revision = model_config.revision
+    if not isinstance(configured_revision, str) or not configured_revision:
+        raise ValueError(
+            "BF16 W4A4 calibration requires an explicit model revision in "
+            "the vLLM model config"
+        )
+
+    resolved_revision = getattr(model_config.hf_config, "_commit_hash", None)
+    if isinstance(resolved_revision, str) and resolved_revision:
+        return model_id, resolved_revision
+    return model_id, configured_revision
+
+
+def _nvfp4_mode(quant_config: dict[str, Any]) -> NVFP4RefitMode:
+    quant_algo = str(quant_config.get("quant_algo", "")).upper()
+    if quant_algo == "NVFP4":
+        return "w4a4"
+    if quant_algo == "W4A16_NVFP4":
+        return "w4a16"
+    raise ValueError(
+        "BF16 NCCL refit supports only ModelOpt NVFP4 or W4A16_NVFP4, "
+        f"got quant_algo={quant_algo!r}"
+    )
+
+
+def _classify_bf16_routed_experts(
+    state_dict_info: dict[str, Any],
+    *,
+    ignore_patterns: list[str],
+) -> frozenset[str]:
+    """Validate and return the routed-expert BF16 weights to quantize."""
+    routed: set[str] = set()
+    unsupported: set[str] = set()
+
+    for name, (shape, dtype) in state_dict_info.items():
+        if (
+            dtype != torch.bfloat16
+            or len(shape) != 2
+            or not name.endswith(".weight")
+            or matches_quant_ignore_pattern(name, ignore_patterns)
+        ):
+            continue
+        match = _ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+        if match is not None:
+            routed.add(name)
+            continue
+        if name.endswith(_UNSUPPORTED_BF16_NVFP4_SUFFIXES):
+            unsupported.add(name)
+
+    if unsupported:
+        raise ValueError(
+            "BF16-to-NVFP4 NCCL refit currently supports routed experts only; "
+            "exclude unsupported QKVO/dense projection scope with "
+            f"real_quant_ignore: {sorted(unsupported)}"
+        )
+
+    projections_by_expert: dict[tuple[str, int], set[str]] = {}
+    for name in routed:
+        match = _ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+        assert match is not None
+        key = (match.group("prefix"), int(match.group("expert")))
+        projections_by_expert.setdefault(key, set()).add(match.group("projection"))
+    incomplete = {
+        key: sorted({"gate", "up", "down"} - projections)
+        for key, projections in projections_by_expert.items()
+        if projections != {"gate", "up", "down"}
+    }
+    if incomplete:
+        raise ValueError(
+            "BF16-to-NVFP4 NCCL refit requires complete routed-expert "
+            f"gate/up/down families; missing projections: {incomplete}"
+        )
+    return frozenset(routed)
+
+
+def _local_refit_shape(param_info: dict[str, Any]) -> tuple[int, ...]:
+    """Return the destination-local BF16 shape described by refit metadata."""
+    mesh = param_info["dst_mesh_info"]
+    mesh_tensor = getattr(mesh, "mesh", None)
+    placements = param_info["dst_placements"]
+    if mesh_tensor is None or len(placements) != mesh_tensor.ndim:
+        raise ValueError(
+            f"Invalid destination mesh metadata for {param_info['name']!r}"
+        )
+
+    local_shape = list(param_info["global_shape"])
+    for mesh_dim, placement in enumerate(placements):
+        shard_dim = getattr(placement, "dim", None)
+        if shard_dim is None:
+            continue
+        shard_count = int(mesh_tensor.shape[mesh_dim])
+        if local_shape[shard_dim] % shard_count != 0:
+            raise ValueError(
+                f"BF16-to-NVFP4 destination shape for {param_info['name']!r} "
+                f"is not divisible by mesh shard count {shard_count}: "
+                f"{tuple(local_shape)}"
+            )
+        local_shape[shard_dim] //= shard_count
+    return tuple(local_shape)
 
 
 def _match_fused_modelopt_moe_weight(name: str) -> tuple[str, str] | None:
@@ -436,6 +573,11 @@ if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     _nrl_w13_num_shards_by_prefix: dict[str, int]
     _nrl_modelopt_reload_roots: tuple[torch.nn.Module, ...] | None = None
+    _nrl_bf16_nvfp4_names: frozenset[str]
+    _nrl_bf16_nvfp4_mode: NVFP4RefitMode
+    _nrl_bf16_nvfp4_calibration: NVFP4Calibration | None
+    _nrl_bf16_nvfp4_group_members: dict[str, tuple[str, ...]]
+    _nrl_bf16_nvfp4_staging: dict[str, dict[str, torch.Tensor]]
 
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
@@ -480,6 +622,8 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         def finalize() -> None:
             try:
                 with torch.device(self.device):
+                    if transport == "nccl_reshard":
+                        self._require_complete_bf16_nvfp4_groups()
                     _require_complete_modelopt_layerwise_reload(model)
                     for reload_root in reload_roots:
                         finalize_layerwise_reload(reload_root, self.model_config)
@@ -507,9 +651,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 f"ModelOpt real-quant refit rejected: {error}"
             ) from error
         except Exception as error:
-            if transport == "collective":
+            if transport in {"collective", "nccl_reshard"}:
                 raise RuntimeError(
-                    "ModelOpt real-quant collective refit failed"
+                    f"ModelOpt real-quant {transport} refit failed"
                 ) from error
             raise
 
@@ -527,24 +671,231 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         super().prepare_refit_info(state_dict_info)
         if not self._is_real_quant_model():
             return
-        self._get_modelopt_reload_roots()
+
         quant_config = (
             self.model_runner.vllm_config.model_config.hf_config.quantization_config
         )
-        self._nrl_w13_num_shards_by_prefix = _w13_num_shards_from_state_dict_info(
+        ignore_patterns = quant_config.get("ignore", []) or []
+        self._nrl_bf16_nvfp4_names = _classify_bf16_routed_experts(
             state_dict_info,
-            require_input_scales=(
-                str(quant_config.get("quant_algo", "")).upper() == "NVFP4"
-            ),
+            ignore_patterns=ignore_patterns,
         )
+        self._nrl_bf16_nvfp4_calibration = None
+        self._nrl_bf16_nvfp4_group_members = {}
+        self._nrl_bf16_nvfp4_staging = {}
+
+        if self._nrl_bf16_nvfp4_names:
+            self._nrl_bf16_nvfp4_mode = _nvfp4_mode(quant_config)
+            self._nrl_w13_num_shards_by_prefix = {}
+            if self._nrl_bf16_nvfp4_mode == "w4a4":
+                calibration_path = os.environ.get("VLLM_MODELOPT_CALIBRATION_PATH")
+                if not calibration_path:
+                    raise ValueError(
+                        "BF16 W4A4 NCCL refit requires VLLM_MODELOPT_CALIBRATION_PATH"
+                    )
+                quant_cfg = os.environ.get("VLLM_MODELOPT_CALIBRATION_QUANT_CFG")
+                if not quant_cfg:
+                    raise ValueError(
+                        "BF16 W4A4 NCCL refit requires "
+                        "VLLM_MODELOPT_CALIBRATION_QUANT_CFG"
+                    )
+                model_config = self.model_runner.vllm_config.model_config
+                model_id, model_revision = _vllm_calibration_provenance(model_config)
+                self._nrl_bf16_nvfp4_calibration = load_nvfp4_calibration(
+                    calibration_path,
+                    model_id=model_id,
+                    model_revision=model_revision,
+                    quant_cfg=quant_cfg,
+                    expected_projection_names=self._nrl_bf16_nvfp4_names,
+                )
+        else:
+            self._nrl_w13_num_shards_by_prefix = _w13_num_shards_from_state_dict_info(
+                state_dict_info,
+                require_input_scales=(
+                    str(quant_config.get("quant_algo", "")).upper() == "NVFP4"
+                ),
+            )
+
+        self._get_modelopt_reload_roots()
         if (
-            self._nrl_w13_num_shards_by_prefix
-            and self.model_runner.vllm_config.parallel_config.enable_expert_parallel
-        ):
+            self._nrl_w13_num_shards_by_prefix or self._nrl_bf16_nvfp4_names
+        ) and self.model_runner.vllm_config.parallel_config.enable_expert_parallel:
             raise RuntimeError(
                 "Fused ModelOpt MoE refits require all experts local; "
                 "vLLM expert parallelism is unsupported"
             )
+
+    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+        """Replace routed-expert destinations with BF16 receive scratch specs."""
+        base_map = super().build_hf_to_local_param_map(refit_info)
+        if not self._is_real_quant_model() or not self._nrl_bf16_nvfp4_names:
+            return base_map
+
+        grouped_by_prefix: dict[str, dict[str, str]] = {}
+        param_info_by_name: dict[str, dict[str, Any]] = {}
+        covered_names: set[str] = set()
+        for layer_name in refit_info["layer_names"]:
+            for param_info in refit_info["per_layer_params"][layer_name]:
+                name = str(param_info["name"])
+                match = _GROUPED_ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+                if match is None:
+                    continue
+                prefix = match.group("prefix")
+                original_names = {
+                    f"{prefix}.{expert_id}.{match.group('projection')}_proj.weight"
+                    for expert_id in range(int(param_info["global_shape"][0]))
+                }
+                if not original_names.intersection(self._nrl_bf16_nvfp4_names):
+                    continue
+                if not original_names.issubset(self._nrl_bf16_nvfp4_names):
+                    missing = sorted(
+                        original_names.difference(self._nrl_bf16_nvfp4_names)
+                    )
+                    raise ValueError(
+                        f"NVFP4 routed-expert metadata for {name!r} is incomplete: "
+                        f"missing {missing}"
+                    )
+                projection = match.group("projection")
+                projections = grouped_by_prefix.setdefault(prefix, {})
+                if projection in projections:
+                    raise ValueError(
+                        f"Duplicate NVFP4 routed-expert metadata for {name!r}"
+                    )
+                projections[projection] = name
+                param_info_by_name[name] = param_info
+                covered_names.update(original_names)
+
+        uncovered_names = sorted(self._nrl_bf16_nvfp4_names.difference(covered_names))
+        if uncovered_names:
+            raise ValueError(
+                "NVFP4 routed-expert weights are missing grouped NCCL metadata: "
+                f"{uncovered_names}"
+            )
+
+        group_members: dict[str, tuple[str, ...]] = {}
+        for prefix, projections in grouped_by_prefix.items():
+            if set(projections) != {"gate", "up", "down"}:
+                raise ValueError(
+                    f"NVFP4 routed-expert metadata for {prefix!r} requires "
+                    f"gate/up/down, got {sorted(projections)}"
+                )
+            group_members[f"{prefix}.w13"] = (
+                projections["gate"],
+                projections["up"],
+            )
+            group_members[f"{prefix}.w2"] = (projections["down"],)
+        self._nrl_bf16_nvfp4_group_members = group_members
+        self._nrl_bf16_nvfp4_staging = {}
+
+        specs = dict(base_map.specs)
+        for name, param_info in param_info_by_name.items():
+            base_spec = specs.get(name)
+            if base_spec is None:
+                raise ValueError(
+                    f"NVFP4 routed-expert weight {name!r} has no vLLM target"
+                )
+            match = _GROUPED_ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+            assert match is not None
+            completion_key = (
+                f"{match.group('prefix')}.w2"
+                if match.group("projection") == "down"
+                else f"{match.group('prefix')}.w13"
+            )
+            local_shape = _local_refit_shape(param_info)
+            if len(local_shape) != 3 or local_shape[-1] % 16 != 0:
+                raise ValueError(
+                    f"NVFP4 routed-expert scratch for {name!r} must be [E, M, K] "
+                    f"with K divisible by 16, got {local_shape}"
+                )
+
+            def pre(
+                _base: torch.Tensor,
+                *,
+                shape: tuple[int, ...] = local_shape,
+            ) -> RefitCtx:
+                return RefitCtx(
+                    buf=torch.empty(
+                        shape,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                )
+
+            def post(
+                ctx: RefitCtx,
+                *,
+                group_key: str = completion_key,
+                grouped_name: str = name,
+            ) -> None:
+                self._stage_bf16_nvfp4_group(
+                    completion_key=group_key,
+                    grouped_name=grouped_name,
+                    weight=ctx.buf,
+                )
+
+            specs[name] = LocalParamSpec(base=base_spec.base, pre=pre, post=post)
+        return HFToLocalParamMap(specs=specs)
+
+    def _stage_bf16_nvfp4_group(
+        self,
+        *,
+        completion_key: str,
+        grouped_name: str,
+        weight: torch.Tensor,
+    ) -> None:
+        """Serialize and load one complete grouped routed-expert family."""
+        expected_names = self._nrl_bf16_nvfp4_group_members.get(completion_key)
+        if expected_names is None or grouped_name not in expected_names:
+            raise RuntimeError(
+                f"Unknown NVFP4 completion group {completion_key!r} "
+                f"for {grouped_name!r}"
+            )
+        staged = self._nrl_bf16_nvfp4_staging.setdefault(completion_key, {})
+        if grouped_name in staged:
+            raise RuntimeError(f"Duplicate NVFP4 grouped tensor {grouped_name!r}")
+        staged[grouped_name] = weight
+        if set(staged) != set(expected_names):
+            return
+
+        expert_counts = {tensor.shape[0] for tensor in staged.values()}
+        if len(expert_counts) != 1:
+            raise ValueError(
+                f"NVFP4 completion group {completion_key!r} has inconsistent "
+                f"expert counts {sorted(expert_counts)}"
+            )
+        expert_count = expert_counts.pop()
+        serialized: list[tuple[str, torch.Tensor]] = []
+        for expert_id in range(expert_count):
+            tensors: dict[str, torch.Tensor] = {}
+            for name in expected_names:
+                match = _GROUPED_ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+                assert match is not None
+                projection = match.group("projection")
+                expert_name = (
+                    f"{match.group('prefix')}.{expert_id}.{projection}_proj.weight"
+                )
+                tensors[expert_name] = staged[name][expert_id]
+            serialized.extend(
+                serialize_bf16_nvfp4_group(
+                    tensors,
+                    mode=self._nrl_bf16_nvfp4_mode,
+                    calibration=self._nrl_bf16_nvfp4_calibration,
+                )
+            )
+
+        self._nrl_bf16_nvfp4_staging.pop(completion_key)
+        self._load_weights(serialized)
+
+    def _require_complete_bf16_nvfp4_groups(self) -> None:
+        staging = getattr(self, "_nrl_bf16_nvfp4_staging", {})
+        if not staging:
+            return
+        group_members = getattr(self, "_nrl_bf16_nvfp4_group_members", {})
+        incomplete = {
+            group: sorted(set(group_members.get(group, ())).difference(staged))
+            for group, staged in staging.items()
+        }
+        raise RuntimeError(f"Incomplete NVFP4 NCCL receive groups: {incomplete}")
 
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):

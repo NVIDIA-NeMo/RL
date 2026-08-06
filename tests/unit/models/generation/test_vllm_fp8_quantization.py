@@ -15,6 +15,7 @@
 import types
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.vllm
 
@@ -78,6 +79,30 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
+
+
+def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    def flattened_quantize(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = tensor.numel() // tensor.shape[-1]
+        return (
+            torch.zeros(rows, tensor.shape[-1], dtype=torch.float8_e4m3fn),
+            torch.zeros(rows * tensor.shape[-1] // 32, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", flattened_quantize)
+
+    value, scale = fp8.quantize_mxfp8_weight(weight)
+
+    assert value.shape == weight.shape
+    assert scale.shape == (2, 3, 1)
+    assert torch.all(scale == 1)
 
 
 @pytest.mark.parametrize(
