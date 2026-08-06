@@ -575,9 +575,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # because shard_meta_for_dp reads it directly), but the rest
         # of the tag dict travels through unchanged so consumers can
         # filter on it without fetching data.
-        tags = (
-            list(tq_meta.custom_meta) if tq_meta.custom_meta else [{} for _ in keys]
-        )
+        tags = list(tq_meta.custom_meta) if tq_meta.custom_meta else [{} for _ in keys]
         seqlens: list[int] | None = None
         if tags and any("input_lengths" in t for t in tags):
             seqlens = [int(t.get("input_lengths", 0)) for t in tags]
