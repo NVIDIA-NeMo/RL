@@ -40,6 +40,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
 )
+from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -308,77 +309,6 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-_PROMOTED_1D_TAG_PREFIX = "__nemo_rl_promoted_1d__:"
-_WIRE_SHAPE_VERSION_TAG = "__nemo_rl_wire_shape_version__"
-_WIRE_SHAPE_VERSION = 1
-
-
-def _add_wire_shape_tags(
-    tags: list[dict[str, Any]], td: TensorDict
-) -> list[dict[str, Any]]:
-    """Record which tensor fields the Mooncake workaround will promote.
-
-    TQ metadata is durable and visible to readers in other processes, unlike
-    client-local state. The version marker distinguishes new unpromoted fields
-    from legacy rows; promoted fields get an additional boolean marker.
-    """
-    field_markers: dict[str, int | bool] = {
-        _WIRE_SHAPE_VERSION_TAG: _WIRE_SHAPE_VERSION
-    }
-    for k in td.keys():
-        value = td.get(k)
-        if isinstance(value, torch.Tensor) and not value.is_nested and value.dim() == 1:
-            field_markers[f"{_PROMOTED_1D_TAG_PREFIX}{k}"] = True
-    return [{**tag, **field_markers} for tag in tags]
-
-
-def _promoted_1d_fields_from_tags(
-    tags: list[dict[str, Any]], field_names: list[str]
-) -> set[str] | None:
-    """Recover promoted fields, or ``None`` for legacy unmarked rows.
-
-    Every selected tensor field must have the same marker on every row. Mixed
-    metadata means rows were written by incompatible codecs; fail instead of
-    silently returning tensors with the wrong rank.
-    """
-    versions = [tag.get(_WIRE_SHAPE_VERSION_TAG) for tag in tags]
-    if not any(version is not None for version in versions):
-        return None
-    if not versions or any(version != _WIRE_SHAPE_VERSION for version in versions):
-        raise RuntimeError(
-            "Inconsistent Mooncake shape metadata: expected wire-shape "
-            f"version {_WIRE_SHAPE_VERSION} on every sample."
-        )
-
-    promoted: set[str] = set()
-    for field in field_names:
-        marker = f"{_PROMOTED_1D_TAG_PREFIX}{field}"
-        values = [tag.get(marker) for tag in tags]
-        if any(value is not None for value in values) and any(
-            value is not True for value in values
-        ):
-            raise RuntimeError(
-                "Inconsistent Mooncake shape metadata for "
-                f"field {field!r}: expected the promotion marker on every sample."
-            )
-        if values and values[0] is True:
-            promoted.add(field)
-    return promoted
-
-
-def _strip_wire_shape_tags(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove adapter-private shape metadata from user-visible tags."""
-    return [
-        {
-            key: value
-            for key, value in tag.items()
-            if key != _WIRE_SHAPE_VERSION_TAG
-            and not key.startswith(_PROMOTED_1D_TAG_PREFIX)
-        }
-        for tag in tags
-    ]
-
-
 def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
     """Guard against silent leaf drops through TensorDict constructor rebuild.
 
@@ -395,19 +325,23 @@ def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
 
 
 def _promote_1d_leaves(td: TensorDict) -> TensorDict:
-    """Unsqueeze 1D tensor leaves to ``(N, 1)`` — mooncake_cpu KV-path workaround.
+    """Promote declared scalar leaves to ``(N, 1)`` for Mooncake.
 
-    Works around TQ's ``KVStorageManager`` 1D schema/data mismatch;
-    :func:`_from_wire` squeezes the trailing 1 back on read. Symmetric
-    with `_from_wire` — callers gate on ``self._promote_1d``.
-    ``NonTensorStack`` / ``NonTensorData`` leaves pass through.
+    The authoritative field list lives in
+    :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`. Declared fields must
+    arrive as dense ``(N,)`` tensors. Any other dense 1D tensor is rejected so
+    it cannot silently encounter TQ v0.1.9's schema/data mismatch.
+    ``NonTensorStack`` and ``NonTensorData`` leaves pass through.
 
     Args:
-        td: ``TensorDict`` whose 1D tensor leaves should be promoted.
+        td: TensorDict to validate and encode for the Mooncake wire format.
 
     Returns:
-        ``TensorDict`` with 1D tensor leaves unsqueezed to ``(N, 1)``;
-        all other leaves pass through unchanged.
+        TensorDict with declared scalar leaves promoted to ``(N, 1)``.
+
+    Raises:
+        ValueError: If a declared field is not a dense 1D tensor, or an
+            undeclared field is a dense 1D tensor.
     """
     # td.keys() (top-level) includes NonTensorData / NonTensorStack leaves.
     # keys(include_nested=True, leaves_only=True) enumerates tensor leaves
@@ -416,9 +350,23 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     changed = False
     for k in td.keys():
         v = td.get(k)
-        if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+        field_name = str(k)
+        if field_name in PROMOTE_1D_FIELDS:
+            if not isinstance(v, torch.Tensor) or v.is_nested or v.dim() != 1:
+                shape = tuple(v.shape) if isinstance(v, torch.Tensor) else None
+                raise ValueError(
+                    f"Mooncake scalar field {field_name!r} must be a dense "
+                    f"1D tensor with shape (N,), got {type(v).__name__} "
+                    f"with shape {shape}."
+                )
             new_dict[str(k)] = v.unsqueeze(-1).contiguous()
             changed = True
+        elif isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+            raise ValueError(
+                f"Mooncake field {field_name!r} is a dense 1D tensor but is "
+                "not declared in data_plane.schema.PROMOTE_1D_FIELDS. Add "
+                "the field to the schema if it is a per-sample scalar."
+            )
         else:
             new_dict[str(k)] = v
     if not changed:
@@ -428,18 +376,15 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     return new_td
 
 
-def _from_wire(
-    td: TensorDict, promoted_1d_fields: set[str] | None = None
-) -> TensorDict:
+def _from_wire(td: TensorDict) -> TensorDict:
     """Normalize TQ reads and invert :func:`_promote_1d_leaves` when needed.
 
     Both TQ v0.1.9 storage managers reconstruct every non-scalar field as a
     nested tensor, including fields whose rows all have the same shape.
     Densify those uniform nested tensors first so regular batched inputs retain
     their dense representation. Truly ragged fields remain nested. Finally,
-    squeeze only singleton dimensions known to have been introduced by
-    :func:`_promote_1d_leaves`. ``None`` retains the old shape-only behavior
-    for checkpoints written before shape tags existed.
+    squeeze only singleton dimensions declared in
+    :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`.
     """
     # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
     # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
@@ -447,22 +392,30 @@ def _from_wire(
     changed = False
     for k in td.keys():
         v = td.get(k)
+        field_name = str(k)
         if isinstance(v, torch.Tensor) and v.is_nested:
             rows = list(v.unbind())
             if rows and all(row.shape == rows[0].shape for row in rows[1:]):
                 v = torch.stack(rows)
                 changed = True
-        if (
-            isinstance(v, torch.Tensor)
-            and not v.is_nested
-            and v.dim() >= 2
-            and v.shape[-1] == 1
-            and (promoted_1d_fields is None or str(k) in promoted_1d_fields)
-        ):
-            new_dict[str(k)] = v.squeeze(-1).contiguous()
-            changed = True
+        if field_name in PROMOTE_1D_FIELDS:
+            if not isinstance(v, torch.Tensor) or v.is_nested:
+                raise ValueError(
+                    f"Mooncake scalar field {field_name!r} could not be "
+                    "restored as a dense tensor."
+                )
+            if v.dim() == 1:
+                new_dict[field_name] = v
+            elif v.dim() == 2 and v.shape[-1] == 1:
+                new_dict[field_name] = v.squeeze(-1).contiguous()
+                changed = True
+            else:
+                raise ValueError(
+                    f"Mooncake scalar field {field_name!r} must decode as "
+                    f"(N,) or (N, 1), got shape {tuple(v.shape)}."
+                )
         else:
-            new_dict[str(k)] = v
+            new_dict[field_name] = v
     if not changed:
         return td
     new_td = TensorDict(new_dict, batch_size=td.batch_size)
@@ -622,10 +575,9 @@ class TQDataPlaneClient(DataPlaneClient):
         # because shard_meta_for_dp reads it directly), but the rest
         # of the tag dict travels through unchanged so consumers can
         # filter on it without fetching data.
-        wire_tags = (
+        tags = (
             list(tq_meta.custom_meta) if tq_meta.custom_meta else [{} for _ in keys]
         )
-        tags = _strip_wire_shape_tags(wire_tags)
         seqlens: list[int] | None = None
         if tags and any("input_lengths" in t for t in tags):
             seqlens = [int(t.get("input_lengths", 0)) for t in tags]
@@ -679,8 +631,6 @@ class TQDataPlaneClient(DataPlaneClient):
         user_tags = (
             [{} for _ in sample_ids] if tags is None else [dict(tag) for tag in tags]
         )
-        wire_tags = user_tags
-
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
@@ -694,7 +644,6 @@ class TQDataPlaneClient(DataPlaneClient):
                 fields.detach(),  # type: ignore[missing-argument]
             )
             if self._promote_1d:
-                wire_tags = _add_wire_shape_tags(wire_tags, detached_fields)
                 detached_fields = _promote_1d_leaves(detached_fields)
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]
@@ -704,7 +653,7 @@ class TQDataPlaneClient(DataPlaneClient):
             keys=list(sample_ids),
             partition_id=partition_id,
             fields=wire_fields,
-            tags=wire_tags,
+            tags=user_tags,
         )
 
         return KVBatchMeta(
@@ -723,32 +672,12 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not sample_ids:
             return TensorDict({}, batch_size=(0,))
-        if not self._promote_1d:
-            td = tq.kv_batch_get(
-                keys=list(sample_ids),
-                partition_id=partition_id,
-                select_fields=select_fields,
-            )
-            return _from_wire(td, promoted_1d_fields=set())
-
-        # Inline TQ's public kv_batch_get flow so the adapter can also inspect
-        # the durable per-row shape markers carried by BatchMeta.custom_meta.
-        client = tq.get_client()
-        tq_meta = client.kv_retrieve_meta(
-            keys=list(sample_ids), partition_id=partition_id, create=False
+        td = tq.kv_batch_get(
+            keys=list(sample_ids),
+            partition_id=partition_id,
+            select_fields=select_fields,
         )
-        if tq_meta.size == 0:
-            raise ValueError("keys or partition were not found!")
-        tq_meta = tq_meta.select_fields(list(select_fields))
-        if not tq_meta.is_ready:
-            raise ValueError("Some fields are not ready in all the requested keys!")
-        td = client.get_data(tq_meta)
-        tensor_fields = [
-            str(k) for k in td.keys() if isinstance(td.get(k), torch.Tensor)
-        ]
-        wire_tags = list(tq_meta.custom_meta) if tq_meta.custom_meta else []
-        promoted_1d_fields = _promoted_1d_fields_from_tags(wire_tags, tensor_fields)
-        return _from_wire(td, promoted_1d_fields)
+        return _from_wire(td)
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None
