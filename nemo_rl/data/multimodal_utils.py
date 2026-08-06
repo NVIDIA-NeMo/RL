@@ -377,6 +377,38 @@ class PackedTensor:
         ]
         return self
 
+    def to_dtype(self, dtype: torch.dtype) -> "PackedTensor":
+        """Return a dtype-converted value without expanding logical segments.
+
+        Dtype conversion creates new physical tensor values, so deduplicated
+        inputs receive new provenance. The logical row-to-segment mapping is
+        preserved exactly.
+        """
+        if all(item is None or item.dtype == dtype for item in self.tensors):
+            return self
+
+        return PackedTensor(
+            [
+                item.to(dtype=dtype) if item is not None else None
+                for item in self.tensors
+            ],
+            self.dim_to_pack,
+            pad_to_max_shape=self.pad_to_max_shape,
+            _row_offsets=(
+                list(self._row_offsets) if self._row_offsets is not None else None
+            ),
+            _segment_indices=(
+                list(self._segment_indices)
+                if self._segment_indices is not None
+                else None
+            ),
+            _segment_provenance=(
+                [uuid.uuid4().bytes for _ in self.tensors]
+                if self._segment_provenance is not None
+                else None
+            ),
+        )
+
     def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedTensor":
         idx = indices.tolist() if isinstance(indices, torch.Tensor) else indices
         if not self.deduplication_enabled and self._row_offsets is None:

@@ -123,6 +123,8 @@ class DynamicBatchingArgs(TypedDict):
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
+    _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values"})
+
     # keys that are model specific, but not part of the PackedTensor
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
         "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
@@ -137,9 +139,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self.elem_counts_per_gb = None
 
     def get_multimodal_dict(
-        self, as_tensors: bool = False, device: Optional[torch.device] = None
+        self,
+        as_tensors: bool = False,
+        device: Optional[torch.device] = None,
+        pixel_dtype: Optional[torch.dtype] = None,
     ) -> dict[str, Any]:
-        """Return a regular dict of tensors or packed multimodal data items."""
+        """Return a regular dict of tensors or packed multimodal data items.
+
+        ``pixel_dtype`` converts pixel tensors without materializing repeated
+        logical segments. This is used to reduce policy-bound Ray payloads.
+        """
         if as_tensors:
             for value_key, metadata_key in _COUPLED_MULTIMODAL_KEYS:
                 value = self.data.get(value_key)
@@ -161,6 +170,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         multimodal_dict = {}
         for k, v in self.data.items():
             if isinstance(v, PackedTensor):
+                if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
+                    v = v.to_dtype(pixel_dtype)
                 multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
             elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
                 multimodal_dict[k] = v

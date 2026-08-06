@@ -2076,7 +2076,9 @@ def _build_async_grpo_train_data(
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
-    extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
+    extra_multimodal_data = flat_messages.get_multimodal_dict(
+        as_tensors=False, pixel_dtype=torch.bfloat16
+    )
     train_data.update(extra_multimodal_data)
     return train_data
 
@@ -2889,7 +2891,9 @@ def grpo_train(
                                 }
                             )
                             calibration_data.update(
-                                calib_flat.get_multimodal_dict(as_tensors=False)
+                                calib_flat.get_multimodal_dict(
+                                    as_tensors=False, pixel_dtype=torch.bfloat16
+                                )
                             )
                             calibration_data.to("cpu")
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
@@ -3163,7 +3167,7 @@ def grpo_train(
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
-                        as_tensors=False
+                        as_tensors=False, pixel_dtype=torch.bfloat16
                     )
                     train_data.update(extra_multimodal_data)
                     print_multimodal_payload_metrics(

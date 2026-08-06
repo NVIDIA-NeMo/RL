@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils import multimodal_payload_metrics
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -147,6 +148,28 @@ def test_payload_metrics_measure_physical_and_logical_dedup_savings():
     assert on["payload_bytes/on/logical_media"] == 4 * one_tensor_bytes
     assert on["payload_bytes/on/estimated_saved"] == 3 * one_tensor_bytes
     assert on["payload_bytes/on/serialized"] < off["payload_bytes/off/serialized"]
+
+
+def test_payload_metrics_measure_bf16_policy_transport_savings():
+    pixels = PackedTensor(torch.ones(4, 3, 16, 16, dtype=torch.float32), dim_to_pack=0)
+    batch = BatchedDataDict({"pixel_values": pixels})
+    bf16_payload = batch.get_multimodal_dict(
+        as_tensors=False, pixel_dtype=torch.bfloat16
+    )
+
+    fp32_metrics = collect_multimodal_payload_metrics(batch, "fp32", enabled=True)
+    bf16_metrics = collect_multimodal_payload_metrics(
+        bf16_payload, "bf16", enabled=True
+    )
+
+    assert (
+        bf16_metrics["payload_bytes/bf16/physical_media"] * 2
+        == fp32_metrics["payload_bytes/fp32/physical_media"]
+    )
+    assert (
+        bf16_metrics["payload_bytes/bf16/serialized"]
+        < fp32_metrics["payload_bytes/fp32/serialized"]
+    )
 
 
 def test_payload_metrics_serialize_exact_positional_argument_tuple(monkeypatch):

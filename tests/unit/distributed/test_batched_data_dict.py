@@ -826,6 +826,39 @@ def test_get_multimodal_dict_mixed_content_and_device_move():
     ].device.type == ("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def test_get_multimodal_dict_casts_only_pixels_without_materializing_dedup():
+    pixels = PackedTensor(
+        [torch.randn(2, 3, 8, 8, dtype=torch.float32)], dim_to_pack=0
+    ).enable_deduplication()
+    pixels = pixels.repeat_interleave(4)
+    image_sizes = PackedTensor(
+        [torch.tensor([[8, 8]], dtype=torch.int64)], dim_to_pack=0
+    ).enable_deduplication()
+    image_sizes = image_sizes.repeat_interleave(4)
+    original_provenance = list(pixels._segment_provenance)
+    batch = BatchedDataDict({"pixel_values": pixels, "imgs_sizes": image_sizes})
+
+    multimodal = batch.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
+    cast_pixels = multimodal["pixel_values"]
+
+    assert isinstance(cast_pixels, PackedTensor)
+    assert len(cast_pixels) == 4
+    assert len(cast_pixels.tensors) == 1
+    assert cast_pixels.logical_segment_count == 4
+    assert cast_pixels.tensors[0].dtype == torch.bfloat16
+    assert pixels.tensors[0].dtype == torch.float32
+    assert cast_pixels._row_offsets == pixels._row_offsets
+    assert cast_pixels._segment_indices == pixels._segment_indices
+    assert cast_pixels._segment_provenance != original_provenance
+    assert multimodal["imgs_sizes"] is image_sizes
+
+    materialized = batch.get_multimodal_dict(
+        as_tensors=True, pixel_dtype=torch.bfloat16
+    )
+    assert materialized["pixel_values"].dtype == torch.bfloat16
+    assert materialized["pixel_values"].shape[0] == 8
+
+
 def test_from_batches_pads_3d_tensors_along_sequence_dim():
     """from_batches should pad 3D tensors along the sequence dimension before stacking."""
 
