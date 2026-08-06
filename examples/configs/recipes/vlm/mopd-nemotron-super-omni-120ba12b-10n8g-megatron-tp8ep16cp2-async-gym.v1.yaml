@@ -129,3 +129,4 @@ logger:
   wandb:
     project: mopd-nemotron-super-omni
     name: mopd-nemotron-super-omni-circle-count
+    log_nemo_gym_full_result_tables: true
