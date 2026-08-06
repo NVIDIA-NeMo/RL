@@ -1,7 +1,5 @@
 # Full GLM-5.2 131K recipe on 72 H100 nodes: 64 nodes for
 # TP2/PP8/CP32/EP64 training and 8 nodes for non-colocated vLLM generation.
-# Inherit directly from the GRPO exemplar so this recipe is self-contained
-# rather than depending on the GLM-5.2 8K recipe chain.
 defaults: ../../grpo_math_1B.yaml
 
 grpo:
@@ -10,9 +8,8 @@ grpo:
   max_num_steps: 100
   val_period: -1
   reward_shaping:
-    # Match the long-context DAPOMath17K recipes: reserve 2K tokens for the
-    # prompt and allow the response to consume the rest of the 131K window.
-    max_response_length: 129024
+    # Cap rollout responses at 2K while retaining 131K model capacity.
+    max_response_length: 2000
   skip_reference_policy_logprobs_calculation: true
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -21,7 +18,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
 policy:
-  model_name: zai-org/GLM-5.2
+  model_name: /lustre/fsw/portfolios/llmservice/users/slikhite/models/GLM-5.2
   hf_config_overrides:
     qk_rope_head_dim: 64
   train_global_batch_size: 8
@@ -85,7 +82,7 @@ policy:
   optimizer: null
   scheduler: null
   generation:
-    max_new_tokens: 129024
+    max_new_tokens: 2000
     vllm_cfg:
       precision: bfloat16
       tensor_parallel_size: 8
