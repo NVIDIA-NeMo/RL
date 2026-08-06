@@ -47,7 +47,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
-    model_dump_chat_response_with_routed_experts,
+    model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -763,7 +763,9 @@ class VllmAsyncGenerationWorkerImpl(
 
             elif isinstance(generator, ChatCompletionResponse):
                 return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
+                    content=model_dump_chat_response_with_dynamic_message_fields(
+                        generator
+                    )
                 )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")

@@ -414,7 +414,9 @@ def attach_token_information_to_chat_response_choices(
     return response
 
 
-def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
+def model_dump_chat_response_with_dynamic_message_fields(
+    response: Any,
+) -> dict[str, Any]:
     """Dump a vLLM OpenAI chat response while preserving dynamic message fields."""
     response_dict = response.model_dump()
     for choice, choice_dict in zip(

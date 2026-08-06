@@ -33,7 +33,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_token_information_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
-    model_dump_chat_response_with_routed_experts,
+    model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -601,7 +601,7 @@ def test_attach_token_information_to_chat_response_choices():
     )
 
     attach_token_information_to_chat_response_choices(response, final_res)
-    response_dict = model_dump_chat_response_with_routed_experts(response)
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
 
     assert response_dict["choices"][0]["message"]["prompt_token_ids"] == [
         101,
@@ -709,13 +709,29 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
         attach_token_information_to_chat_response_choices(response, final_res)
 
 
-def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
-    routed_experts = [[[1]], [[2]]]
+def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        prompt_routed_experts=torch.tensor(
+            [[[10]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[201],
+                logprobs=[{201: SimpleNamespace(logprob=-0.1)}],
+                routed_experts=torch.tensor(
+                    [[[20]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
 
     class Response:
         choices = [
             SimpleNamespace(
-                message=SimpleNamespace(routed_experts=routed_experts),
+                index=0,
+                message=SimpleNamespace(),
             )
         ]
 
@@ -731,9 +747,20 @@ def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
                 ]
             }
 
-    response_dict = model_dump_chat_response_with_routed_experts(Response())
+    response = Response()
+    attach_token_information_to_chat_response_choices(response, final_res)
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+    )
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
 
-    assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
+    message = response_dict["choices"][0]["message"]
+    assert message["routed_experts"] == response.choices[0].message.routed_experts
+    assert message["prompt_token_ids"] == [101, 102]
+    assert message["generation_token_ids"] == [201]
+    assert message["generation_log_probs"] == [-0.1]
 
 
 @pytest.mark.vllm
