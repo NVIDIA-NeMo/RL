@@ -584,9 +584,19 @@ class VllmGeneration(GenerationInterface):
         return step_metrics
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        rank_offset: int = 0,
     ) -> list[ray.ObjectRef]:
-        """Initialize the collective communication."""
+        """Initialize the collective communication.
+
+        ``rank_offset`` shifts the rank prefixes so multiple generation groups
+        can join one broadcast world (see multi_group.MultiVllmGeneration).
+        """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
@@ -604,7 +614,9 @@ class VllmGeneration(GenerationInterface):
                 "Data parallel size is zero, cannot initialize collective."
             )
         workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        rank_prefix_list = [
+            rank_offset + r for r in range(0, total_workers, workers_per_group)
+        ]
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(

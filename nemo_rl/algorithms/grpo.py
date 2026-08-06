@@ -109,6 +109,10 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_vllm_refit_config,
 )
+from nemo_rl.models.generation.vllm.multi_group import (
+    MultiVllmGeneration,
+    build_group_configs,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -599,6 +603,24 @@ def setup(
     )
     nemo_gym_actor = None
 
+    use_server_groups = bool(generation_config.get("server_groups"))
+    if use_server_groups:
+        assert generation_config["backend"] == "vllm", (
+            "policy.generation.server_groups requires the vLLM backend"
+        )
+        assert enable_nemo_gym, (
+            "policy.generation.server_groups is only supported with NeMo Gym"
+        )
+        assert not colocated_inference, (
+            "policy.generation.server_groups requires colocated.enabled=false"
+        )
+        assert generation_config.get("refit_transport") is None, (
+            "policy.generation.server_groups requires refit_transport=null"
+        )
+        assert cluster_config.get("segment_size") is None, (
+            "policy.generation.server_groups does not support cluster.segment_size"
+        )
+
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo Gym actor against the given generation server URLs."""
         t0 = time.perf_counter()
@@ -888,32 +910,65 @@ def setup(
             flush=True,
         )
 
-        # Create inference cluster with topology constraints so TP groups
-        # stay within NVLink domains. Eagerly initialize PGs when constraints
-        # are set so inference claims domain-aligned nodes first.
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
-            segment_size=inference_segment_size,
-            node_resource_constraints=inference_node_resource_constraints,
-        )
-        if inference_node_resource_constraints is not None:
-            {
-                "vllm": VllmGeneration,
-                "trtllm": TrtllmGeneration,
-            }[generation_config["backend"]].init_cluster_placement_groups(
-                inference_cluster,
-                generation_config,
+        if use_server_groups:
+            server_groups = generation_config["server_groups"]
+            assert (
+                sum(g["gpus"] for g in server_groups)
+                == inference_nodes * inference_gpus_per_node
+            ), (
+                f"server_groups GPUs {[g['gpus'] for g in server_groups]} must sum to "
+                f"the inference budget {inference_nodes}x{inference_gpus_per_node} "
+                "(policy.generation.colocated.resources)"
             )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+            inference_clusters: dict[str, RayVirtualCluster] = {}
+            for group in server_groups:
+                group_name, group_gpus = group["name"], group["gpus"]
+                assert group_gpus <= inference_gpus_per_node, (
+                    f"server_group '{group_name}': groups must fit in one node "
+                    f"({group_gpus} > {inference_gpus_per_node})"
+                )
+                inference_clusters[group_name] = RayVirtualCluster(
+                    name=f"grpo_inference_{group_name}",
+                    bundle_ct_per_node_list=[group_gpus],
+                    use_gpus=True,
+                    num_gpus_per_node=group_gpus,
+                    max_colocated_worker_groups=1,
+                    port_range_low=cluster_config.get("master_port_range_low"),
+                    port_range_high=cluster_config.get("master_port_range_high"),
+                )
+                print(
+                    f"  ✓ Ray inference cluster for server group '{group_name}' "
+                    f"initialized with {group_gpus} GPUs",
+                    flush=True,
+                )
+            inference_cluster = None
+        else:
+            # Create inference cluster with topology constraints so TP groups
+            # stay within NVLink domains. Eagerly initialize PGs when constraints
+            # are set so inference claims domain-aligned nodes first.
+            inference_cluster = RayVirtualCluster(
+                name="grpo_inference_cluster",
+                bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+                use_gpus=True,
+                num_gpus_per_node=inference_gpus_per_node,
+                max_colocated_worker_groups=1,
+                port_range_low=cluster_config.get("master_port_range_low"),
+                port_range_high=cluster_config.get("master_port_range_high"),
+                segment_size=inference_segment_size,
+                node_resource_constraints=inference_node_resource_constraints,
+            )
+            if inference_node_resource_constraints is not None:
+                {
+                    "vllm": VllmGeneration,
+                    "trtllm": TrtllmGeneration,
+                }[generation_config["backend"]].init_cluster_placement_groups(
+                    inference_cluster,
+                    generation_config,
+                )
+            print(
+                f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
+                flush=True,
+            )
 
     # Reserve topology-aware teacher placement groups before NeMo Gym starts
     # opportunistically placing its GPU-backed services. Worker creation and
@@ -1195,11 +1250,19 @@ def setup(
                 "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
                 flush=True,
             )
-            deferred_vllm = VllmGeneration(
-                cluster=inference_cluster,
-                config=generation_config,
-                defer_model_load=True,
-            )
+            group_configs = build_group_configs(generation_config)
+            if group_configs is not None:
+                deferred_vllm = MultiVllmGeneration(
+                    inference_clusters,
+                    group_configs,
+                    defer_model_load=True,
+                )
+            else:
+                deferred_vllm = VllmGeneration(
+                    cluster=inference_cluster,
+                    config=generation_config,
+                    defer_model_load=True,
+                )
             print(
                 f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
                 f"{deferred_vllm.dp_openai_server_base_urls}",
