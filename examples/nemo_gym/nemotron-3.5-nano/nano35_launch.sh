@@ -65,6 +65,8 @@ set -euo pipefail
 #   TEACHER_TP=4, TEACHER_CP=4              MOPD teacher parallelism
 #   TEACHER_EP=16, TEACHER_PP=1
 #   NRL_TEACHER_PATH=$MODEL_PATH             MOPD teacher checkpoint
+#   MOPD_TEACHER_KEY=_teachers.general       Config key to override with the
+#                                            MOPD teacher checkpoint
 #   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray
 #   EXTERNAL_VLLM_SEGMENT_SIZE=             Segment size for the external
 #                                          service hetgroup; legacy
@@ -268,7 +270,7 @@ case "${RECIPE}" in
     NUM_GEN_NODES="${NUM_GEN_NODES:-60}"
     NUM_GYM_NODES="${NUM_GYM_NODES:-0}"
     NUM_EXTERNAL_SERVICE_NODES=0
-    SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
+    SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
     GENRM_BASE_URL=""
     GENRM_MODEL=""
     GENRM_API_MODEL_NAME=""
@@ -513,6 +515,7 @@ NUM_TEACHER_NODES=0
 MOPD_OVERRIDES=""
 if [[ "${RECIPE}" == "mopd" ]]; then
   NRL_TEACHER_PATH="${NRL_TEACHER_PATH:-${MODEL_PATH}}"
+  MOPD_TEACHER_KEY="${MOPD_TEACHER_KEY:-_teachers.general}"
   NUM_NODES_PER_TEACHER="${NUM_NODES_PER_TEACHER:-4}"
   TEACHER_TP="${TEACHER_TP:-4}"
   TEACHER_CP="${TEACHER_CP:-4}"
@@ -520,7 +523,7 @@ if [[ "${RECIPE}" == "mopd" ]]; then
   TEACHER_PP="${TEACHER_PP:-1}"
   NUM_TEACHER_NODES="${NUM_NODES_PER_TEACHER}"
 
-  MOPD_OVERRIDES="_teachers.general=${NRL_TEACHER_PATH} \
+  MOPD_OVERRIDES="${MOPD_TEACHER_KEY}=${NRL_TEACHER_PATH} \
 on_policy_distillation.non_colocated_teachers.default_teacher_cfg.tensor_model_parallel_size=${TEACHER_TP} \
 on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size=${TEACHER_CP} \
 on_policy_distillation.non_colocated_teachers.default_teacher_cfg.pipeline_model_parallel_size=${TEACHER_PP} \
@@ -575,6 +578,11 @@ fi
 if (( NUM_RAY_NODES % SEGMENT_SIZE != 0 )); then
   echo "ERROR: NeMo RL nodes=${NUM_RAY_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
   echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Teachers=${NUM_TEACHER_NODES} + Gym=${NUM_GYM_NODES} = ${NUM_RAY_NODES}" >&2
+  exit 1
+fi
+if (( NUM_TRAIN_NODES % SEGMENT_SIZE != 0 )); then
+  echo "ERROR: Training nodes=${NUM_TRAIN_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
+  echo "  NeMo RL applies segment topology to the training role, not only to the full allocation." >&2
   exit 1
 fi
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then

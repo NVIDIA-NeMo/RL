@@ -322,12 +322,12 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      # The auto-selected FlashInfer TRT-LLM MoE backend rejects the
+      # shard_dim=0 expert layout used by NeMo RL weight refits. Keep the
+      # refit-compatible backend used by the validated Nano 3.5 RLVR recipe.
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
-      # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can
-      # exceed available slots. 256 matches the Ultra GB200 serving reference
-      # (Gym nemotron_3_ultra_dev_nemorl_gb200.yaml).
-      max_num_seqs: 256
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
         cudagraph_mode: PIECEWISE
