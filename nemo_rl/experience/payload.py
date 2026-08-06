@@ -73,7 +73,18 @@ def record_to_train_batch(
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
+    # Honor the environment's per-sample mask flag, mirroring the legacy path's
+    # _apply_mask_sample_filter (nemo_rl/algorithms/grpo.py) + _extract_mask_sample_flags
+    # (nemo_rl/experience/rollouts.py). The env (e.g. NeMo-Gym SWE) flags a sample via
+    # instance_config.mask_sample when it must be dropped from the gradient — a failed
+    # runtime setup, eval timeout, or otherwise invalid instance. The async-RL TQ path
+    # has no other mask_sample step, so zero those rows' sample_mask here; otherwise
+    # every row stays valid and the trainer applies gradient to samples it should skip.
     sample_mask = torch.ones(n, dtype=torch.float32)
+    for i, c in enumerate(completions):
+        instance_config = (c.env_extras or {}).get("instance_config") or {}
+        if instance_config.get("mask_sample", False):
+            sample_mask[i] = 0.0
 
     return BatchedDataDict[Any](
         {
