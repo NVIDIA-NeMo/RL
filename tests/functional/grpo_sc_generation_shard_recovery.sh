@@ -137,6 +137,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# KILL_DURING_REFIT: kill while the refit collective is running, rather than at a step
+# boundary. The default kill lands in the refit only by chance (it is ~10% of wall-clock),
+# which is why the same code both passed and wedged on consecutive runs. This makes the
+# scenario the abort watchdog exists for reproducible instead of a coin flip.
+#
+# "refit membership absent=" is printed on every sync immediately before the collective,
+# so it is a reliable start-of-refit trigger.
+KILL_DURING_REFIT=${KILL_DURING_REFIT:-false}
+
 echo "[recovery] pid=$TRAIN_PID, waiting for train step $KILL_AFTER_STEP..."
 for _ in $(seq 1 240); do
     grep -q "train step ${KILL_AFTER_STEP}/" "$RUN_LOG" 2>/dev/null && break
@@ -222,6 +231,20 @@ if (( ${#GEN_PIDS[@]} != GEN_GPUS )); then
     tail -60 "$RUN_LOG"
     exit 1
 fi
+if [[ "$KILL_DURING_REFIT" == "true" ]]; then
+    # Wait for a refit to begin AFTER the step we were told to kill at, then kill at once.
+    echo "[recovery] waiting for a refit to start (KILL_DURING_REFIT)..."
+    BASELINE=$(grep -c "refit membership absent=" "$RUN_LOG" 2>/dev/null || echo 0)
+    for _ in $(seq 1 600); do
+        NOW=$(grep -c "refit membership absent=" "$RUN_LOG" 2>/dev/null || echo 0)
+        (( NOW > BASELINE )) && break
+        kill -0 $TRAIN_PID 2>/dev/null || {
+            echo "[recovery] FAIL: run ended before a refit started"; tail -40 "$RUN_LOG"; exit 1; }
+        sleep 0.1
+    done
+    echo "[recovery] refit started; killing immediately"
+fi
+
 VICTIM=${GEN_PIDS[0]}
 VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
 echo "[recovery] killing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
