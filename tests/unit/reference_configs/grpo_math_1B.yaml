@@ -15,6 +15,10 @@ grpo:
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -33,6 +37,7 @@ grpo:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
@@ -40,6 +45,8 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  skip_reference_policy_logprobs_calculation: false
+  calculate_advantages_on_gpu: false
   seq_logprob_error_threshold: null
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null
@@ -297,6 +304,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
@@ -370,6 +378,7 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
