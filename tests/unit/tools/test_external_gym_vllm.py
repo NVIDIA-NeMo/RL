@@ -601,6 +601,16 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "external-vllm-lb-preflight" not in source
     assert "if ! ready=$(" in source
     assert 'env \\\n  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    assert 'if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then' in source
+    assert (
+        'LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-${SLURM_RESTART_COUNT}-logs"'
+        in source
+    )
+    assert 'rm -f "${pool_log_dirs[${pool}]}"/head_ip_*' in source
+    assert (
+        'echo "[${REPLICA_ID}] ERROR: vLLM exited with status ${vllm_status}"' in source
+    )
+    assert "if (( vllm_status == 0 )); then" in source
 
 
 def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
@@ -799,9 +809,25 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
         capture_output=True,
         text=True,
     )
+    missing_node_count = subprocess.run(
+        [
+            "bash",
+            "-c",
+            program.replace(
+                "validate_external_vllm_submission 'run __TEST_URL__' 2",
+                "validate_external_vllm_submission 'run __TEST_URL__'",
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
 
     assert valid.returncode == 0, valid.stderr
     assert wrong_nodes.returncode == 2
     assert "expected 2 from registered pools" in wrong_nodes.stderr
     assert missing_placeholder.returncode == 2
     assert "submission command is missing __TEST_URL__" in missing_placeholder.stderr
+    assert missing_node_count.returncode == 0, missing_node_count.stderr
+    assert (
+        "skipping external hetgroup node-count validation" in missing_node_count.stderr
+    )

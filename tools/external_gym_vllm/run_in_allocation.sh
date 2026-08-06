@@ -236,7 +236,12 @@ if (( ${#external_nodes[@]} != total_external_nodes )); then
   exit 1
 fi
 
-LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-logs"
+# Must match ray.sub's LOG_DIR: ENDED is the teardown channel between them.
+if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then
+  LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-${SLURM_RESTART_COUNT}-logs"
+else
+  LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-logs"
+fi
 mkdir -p "${LOG_DIR}"
 rm_args=()
 for pool in "${pool_names[@]}"; do
@@ -252,6 +257,9 @@ for pool in "${pool_names[@]}"; do
   )
 done
 rm -f "${rm_args[@]}"
+for pool in "${pool_names[@]}"; do
+  rm -f "${pool_log_dirs[${pool}]}"/head_ip_*
+done
 
 {
   for pool in "${pool_names[@]}"; do
@@ -449,7 +457,16 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
 
   registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_HTTP_PORT}"
   echo "[${REPLICA_ID}] Registered healthy backend ${HEAD_IP}:${VLLM_HTTP_PORT}"
-  wait "${VLLM_PID}"
+  if wait "${VLLM_PID}"; then
+    vllm_status=0
+  else
+    vllm_status=$?
+  fi
+  echo "[${REPLICA_ID}] ERROR: vLLM exited with status ${vllm_status}" >&2
+  if (( vllm_status == 0 )); then
+    exit 1
+  fi
+  exit "${vllm_status}"
 else
   for _ in $(seq 1 120); do
     [[ -s "${HEAD_IP_FILE}" ]] && break
