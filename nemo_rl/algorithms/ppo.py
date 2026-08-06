@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import traceback
@@ -169,6 +170,8 @@ class AdvEstimatorConfig(TypedDict):
     gae_lambda_policy: NotRequired[Optional[float]]
     # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
     length_adaptive_alpha: NotRequired[float]
+    # CompactionRL correction across independently packed trajectory segments.
+    cross_trajectory: NotRequired[bool]
 
 
 class PPOConfig(TypedDict):
@@ -478,6 +481,23 @@ def setup(
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
     value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
+
+    if ppo_config["adv_estimator"].get("cross_trajectory"):
+        assert ppo_config["adv_estimator"]["name"] == "gae", (
+            "cross_trajectory requires the GAE advantage estimator"
+        )
+        assert ppo_config["async_ppo"].enabled, (
+            "cross_trajectory currently supports async PPO only"
+        )
+        assert ppo_config["num_generations_per_prompt"] == 1, (
+            "cross_trajectory currently requires num_generations_per_prompt=1"
+        )
+        assert master_config.env["should_use_nemo_gym"], (
+            "cross_trajectory currently supports NeMo-Gym rollouts only"
+        )
+        assert loss_config.token_level_loss, (
+            "CompactionRL requires token_level_loss=true"
+        )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -1333,6 +1353,29 @@ def _compute_rollout_critic_metrics(
         }
     )
     return metrics
+
+
+def _pad_compaction_train_batch(
+    train_data: BatchedDataDict,
+    *,
+    policy_dp_size: int,
+    policy_mbs: int,
+    value_dp_size: int,
+    value_mbs: int,
+) -> tuple[BatchedDataDict, int]:
+    """Mask-pad a variable segment batch for actor and critic sharding."""
+    batch_multiple = math.lcm(
+        policy_dp_size * policy_mbs,
+        value_dp_size * value_mbs,
+    )
+    padding = (-train_data.size) % batch_multiple
+    if padding == 0:
+        return train_data, 0
+
+    indices = list(range(train_data.size)) + [train_data.size - 1] * padding
+    padded = train_data.select_indices(indices)
+    padded["sample_mask"][-padding:] = 0
+    return padded, padding
 
 
 # ===============================================================================
@@ -2648,7 +2691,27 @@ def async_ppo_train(
                     master_config.ppo["num_prompts_per_step"]
                     * master_config.ppo["num_generations_per_prompt"]
                 )
-                if repeated_batch.size != expected_batch_size:
+                cross_trajectory = master_config.ppo["adv_estimator"].get(
+                    "cross_trajectory"
+                )
+                if cross_trajectory:
+                    if "trajectory_id" not in repeated_batch:
+                        raise RuntimeError(
+                            "Cross-trajectory GAE requires trajectory_id metadata"
+                        )
+                    logical_trajectory_count = len(
+                        set(repeated_batch["trajectory_id"])
+                    )
+                    if logical_trajectory_count != expected_batch_size:
+                        raise RuntimeError(
+                            "Unexpected logical trajectory count: got "
+                            f"{logical_trajectory_count}, expected {expected_batch_size}"
+                        )
+                    metrics["compaction/logical_trajectories"] = (
+                        logical_trajectory_count
+                    )
+                    metrics["compaction/training_segments"] = repeated_batch.size
+                elif repeated_batch.size != expected_batch_size:
                     raise RuntimeError(
                         f"Unexpected training batch size: got {repeated_batch.size}, "
                         f"expected {expected_batch_size}"
@@ -2704,6 +2767,15 @@ def async_ppo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if cross_trajectory:
+                        train_data.update(
+                            {
+                                "trajectory_id": repeated_batch["trajectory_id"],
+                                "segment_index": repeated_batch["segment_index"],
+                                "segment_type": repeated_batch["segment_type"],
+                                "is_final_segment": repeated_batch["is_final_segment"],
+                            }
+                        )
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False
                     )
@@ -2785,6 +2857,40 @@ def async_ppo_train(
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
+                    if cross_trajectory:
+                        (
+                            policy_segment_discounts,
+                            value_segment_discounts,
+                            policy_gae_lambdas,
+                        ) = adv_estimator.build_cross_trajectory_discounts(
+                            mask=advantage_mask,
+                            trajectory_ids=train_data["trajectory_id"],
+                            segment_indices=train_data["segment_index"],
+                        )
+                        adv_kwargs.update(
+                            {
+                                "policy_segment_discounts": policy_segment_discounts,
+                                "value_segment_discounts": value_segment_discounts,
+                                "policy_gae_lambdas": policy_gae_lambdas,
+                            }
+                        )
+                        valid_segment_discounts = policy_segment_discounts[
+                            train_data["sample_mask"].bool()
+                        ]
+                        if valid_segment_discounts.numel() > 0:
+                            metrics.update(
+                                {
+                                    "compaction/cross_gae_discount_mean": (
+                                        valid_segment_discounts.mean().item()
+                                    ),
+                                    "compaction/cross_gae_discount_min": (
+                                        valid_segment_discounts.min().item()
+                                    ),
+                                    "compaction/trajectory_lambda_mean": (
+                                        policy_gae_lambdas.mean().item()
+                                    ),
+                                }
+                            )
                     result = adv_estimator.compute_advantage(**adv_kwargs)
                     if isinstance(result, tuple):
                         advantages, returns = result
@@ -2804,6 +2910,19 @@ def async_ppo_train(
                 # frozen: it is never loaded/trained here, exactly as in sync
                 # ppo_train, so train_results stays None for the step.
                 is_policy_training_step = step >= policy_training_start_step
+                dynamic_gbs = None
+                if cross_trajectory:
+                    train_data, padding = _pad_compaction_train_batch(
+                        train_data,
+                        policy_dp_size=policy.data_parallel_size,
+                        policy_mbs=master_config.policy["train_micro_batch_size"],
+                        value_dp_size=value_model.sharding_annotations.get_axis_size(
+                            "data_parallel"
+                        ),
+                        value_mbs=master_config.value["train_micro_batch_size"],
+                    )
+                    dynamic_gbs = train_data.size
+                    metrics["compaction/padded_training_segments"] = padding
                 train_results = None
                 value_results = None
                 for critic_epoch in range(critic_train_epochs):
@@ -2817,6 +2936,7 @@ def async_ppo_train(
                             train_data,
                             value_loss_fn,
                             timer=timer,
+                            gbs=dynamic_gbs,
                         )
                         value_model.finish_training()
 
@@ -2836,7 +2956,10 @@ def async_ppo_train(
                             policy.prepare_for_training()
                         with timer.time("policy_training"):
                             train_results = policy.train(
-                                train_data, loss_fn, timer=timer
+                                train_data,
+                                loss_fn,
+                                timer=timer,
+                                gbs=dynamic_gbs,
                             )
                             if actor_epoch < ppo_epochs - 1:
                                 policy.offload_to_cpu()
@@ -3096,21 +3219,29 @@ def async_ppo_train(
                         )
 
             # ---- Logging ----
+            logged_train_data = (
+                train_data.select_indices(list(range(repeated_batch.size)))
+                if cross_trajectory and train_data.size != repeated_batch.size
+                else train_data
+            )
             log_data = {
                 "content": flat_messages_content,
                 "rewards": rewards.tolist(),
                 "input_lengths": input_lengths.tolist(),
-                "token_ids": train_data["input_ids"].tolist(),
-                "token_loss_mask": train_data["token_mask"].tolist(),
-                "sample_loss_mask": train_data["sample_mask"].tolist(),
-                "advantages": train_data["advantages"].tolist(),
-                "generation_logprobs": train_data["generation_logprobs"].tolist(),
-                "prev_logprobs": train_data["prev_logprobs"].tolist(),
+                "token_ids": logged_train_data["input_ids"].tolist(),
+                "token_loss_mask": logged_train_data["token_mask"].tolist(),
+                "sample_loss_mask": logged_train_data["sample_mask"].tolist(),
+                "advantages": logged_train_data["advantages"].tolist(),
+                "generation_logprobs": logged_train_data[
+                    "generation_logprobs"
+                ].tolist(),
+                "prev_logprobs": logged_train_data["prev_logprobs"].tolist(),
             }
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
             del log_data
+            del logged_train_data
             del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -3280,6 +3411,11 @@ def validate(
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
                 additional_metrics_to_report = gen_metrics
+                if "is_final_segment" in val_batch:
+                    final_segment_indices = (
+                        val_batch["is_final_segment"].nonzero(as_tuple=False).flatten()
+                    )
+                    val_batch = val_batch.select_indices(final_segment_indices)
             else:
                 rollout_fn = (
                     run_async_multi_turn_rollout

@@ -1459,7 +1459,7 @@ class _CompletedNemoGymGroup:
 
     group_index: int
     rows: list[dict]
-    results: list[dict]
+    results: list[dict | list[dict]]
 
 
 class _NemoGymStreamAccumulator:
@@ -2512,7 +2512,7 @@ def run_nemo_gym_rollout_sync(
 
 def _postprocess_single_nemo_gym_group(
     nemo_gym_rows: list[dict],
-    results: list[dict],
+    results: list[dict | list[dict]],
     timer: Timer,
     timer_prefix: str,
     policy_generation: GenerationInterface,
@@ -2524,8 +2524,22 @@ def _postprocess_single_nemo_gym_group(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    flat_results: list[dict] = []
+    source_row_indices: list[int] = []
+    for source_row_index, row_result in enumerate(results):
+        row_results = row_result if isinstance(row_result, list) else [row_result]
+        flat_results.extend(row_results)
+        source_row_indices.extend([source_row_index] * len(row_results))
+    results = flat_results
+    expanded_nemo_gym_rows = [
+        nemo_gym_rows[source_row_index]
+        for source_row_index in source_row_indices
+    ]
+
     # Length-based reward shaping for low-effort prompts
-    shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
+    shaping = _apply_effort_shaping(
+        results, expanded_nemo_gym_rows, effort_config
+    )
     length_rewards_low = shaping.length_rewards_low
     rewards_low = shaping.rewards_low
     low_lengths = shaping.low_lengths
@@ -2639,9 +2653,8 @@ def _postprocess_single_nemo_gym_group(
     # from a multi-turn agent), so trace each result back via source_rowidx.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for i, result in enumerate(results):
-            src_idx = result.get("source_rowidx", i)
-            agent_ref = nemo_gym_rows[src_idx]["agent_ref"]
+        for nemo_gym_row, result in zip(expanded_nemo_gym_rows, results):
+            agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
             result["agent_ref"] = agent_ref
@@ -2689,21 +2702,20 @@ def _postprocess_single_nemo_gym_group(
     )
     input_ids = batched_flat["token_ids"]
 
-    # Build per-result loss multiplier = parent row mask * per-element mask (for padded
-    # slots from multi-turn agents). If no expansion happened, source_rowidx is the
-    # identity and per_element_lm defaults to 1.0, so this preserves the original shape.
-    parent_lm = input_batch["loss_multiplier"]
-    source_rowidxs = torch.tensor(
-        [r.get("source_rowidx", i) for i, r in enumerate(results)],
+    source_row_indices_tensor = torch.tensor(
+        source_row_indices,
         dtype=torch.long,
-        device=parent_lm.device,
+        device=input_batch["loss_multiplier"].device,
     )
-    per_element_lm = torch.tensor(
-        [float(r.get("loss_multiplier", 1.0)) for r in results],
-        dtype=parent_lm.dtype,
-        device=parent_lm.device,
+    per_segment_loss_multiplier = torch.tensor(
+        [result["loss_multiplier"] for result in results],
+        dtype=input_batch["loss_multiplier"].dtype,
+        device=input_batch["loss_multiplier"].device,
     )
-    expanded_loss_multiplier = parent_lm[source_rowidxs] * per_element_lm
+    expanded_loss_multiplier = (
+        input_batch["loss_multiplier"][source_row_indices_tensor]
+        * per_segment_loss_multiplier
+    )
 
     final_batch = BatchedDataDict[DatumSpec](
         {
@@ -2748,6 +2760,76 @@ def _postprocess_single_nemo_gym_group(
             for chain_hash in chain_hashes
         ), "chain_hash must be a non-empty string on every result when any result sets it"
         final_batch["chain_hash"] = chain_hashes
+
+    trajectory_ids = [result.get("trajectory_id") for result in results]
+    if any(trajectory_id is not None for trajectory_id in trajectory_ids):
+        if not all(
+            isinstance(trajectory_id, str) and trajectory_id
+            for trajectory_id in trajectory_ids
+        ):
+            raise ValueError(
+                "Every expanded segment must provide a non-empty trajectory_id"
+            )
+        segment_indices = [result.get("segment_index") for result in results]
+        segment_types = [result.get("segment_type") for result in results]
+        final_segment_flags = [result.get("is_final_segment") for result in results]
+        if not all(isinstance(index, int) for index in segment_indices):
+            raise ValueError(
+                "Every expanded segment must provide an integer segment_index"
+            )
+        if not all(
+            segment_type in {"execution", "summary"}
+            for segment_type in segment_types
+        ):
+            raise ValueError(
+                "Every expanded segment must have segment_type execution or summary"
+            )
+        if not all(isinstance(flag, bool) for flag in final_segment_flags):
+            raise ValueError(
+                "Every expanded segment must provide a boolean is_final_segment"
+            )
+        final_batch.update(
+            {
+                "trajectory_id": trajectory_ids,
+                "segment_index": torch.tensor(segment_indices, dtype=torch.long),
+                "segment_type": segment_types,
+                "is_final_segment": torch.tensor(
+                    final_segment_flags, dtype=torch.bool
+                ),
+            }
+        )
+
+        trajectory_to_segments: dict[str, list[int]] = defaultdict(list)
+        for index, trajectory_id in enumerate(trajectory_ids):
+            trajectory_to_segments[trajectory_id].append(index)
+        compaction_counts = [
+            sum(segment_types[index] == "summary" for index in indices)
+            for indices in trajectory_to_segments.values()
+        ]
+        summary_token_counts = [
+            all_sample_metrics[index]["assistant_tokens"]
+            for index, segment_type in enumerate(segment_types)
+            if segment_type == "summary"
+        ]
+        execution_token_counts = [
+            all_sample_metrics[index]["assistant_tokens"]
+            for index, segment_type in enumerate(segment_types)
+            if segment_type == "execution"
+        ]
+        rollout_metrics.update(
+            {
+                "compaction/count_mean": sum(compaction_counts)
+                / len(compaction_counts),
+                "compaction/trigger_rate": sum(count > 0 for count in compaction_counts)
+                / len(compaction_counts),
+                "compaction/segments_per_trajectory": len(results)
+                / len(compaction_counts),
+                "compaction/summary_tokens_mean": sum(summary_token_counts)
+                / max(len(summary_token_counts), 1),
+                "compaction/execution_tokens_mean": sum(execution_token_counts)
+                / max(len(execution_token_counts), 1),
+            }
+        )
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(

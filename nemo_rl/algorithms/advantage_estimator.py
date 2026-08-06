@@ -516,6 +516,9 @@ class GeneralizedAdvantageEstimator:
         values,
         reference_logprobs=None,
         logprobs=None,
+        policy_segment_discounts=None,
+        value_segment_discounts=None,
+        policy_gae_lambdas=None,
         **kwargs,
     ):
         """Compute GAE advantages with temporal bootstrapping.
@@ -538,7 +541,11 @@ class GeneralizedAdvantageEstimator:
         )
 
         lam_value = self._resolve_lambda_value()
-        lam_policy = self._resolve_lambda_policy(mask)
+        lam_policy = (
+            policy_gae_lambdas
+            if policy_gae_lambdas is not None
+            else self._resolve_lambda_policy(mask)
+        )
 
         # If lambdas differ, compute GAE twice (decoupled); otherwise once.
         need_decouple = (
@@ -547,7 +554,7 @@ class GeneralizedAdvantageEstimator:
             or self.length_adaptive_alpha > 0
         )
         if need_decouple:
-            _, returns = self._compute_gae(
+            value_advantages, returns = self._compute_gae(
                 token_level_rewards,
                 values,
                 mask,
@@ -565,12 +572,88 @@ class GeneralizedAdvantageEstimator:
                 values,
                 mask,
             )
+            value_advantages = advantages
+
+        if policy_segment_discounts is not None:
+            if value_segment_discounts is None:
+                raise ValueError(
+                    "value_segment_discounts is required with policy_segment_discounts"
+                )
+            advantages = advantages * policy_segment_discounts.unsqueeze(1)
+            value_advantages = value_advantages * value_segment_discounts.unsqueeze(1)
+            returns = value_advantages + values
 
         # Whiten advantages (optional) and zero out masked positions (always)
         if self.normalize_advantages:
             advantages = self._reward_whiten(advantages, mask)
         advantages = torch.masked_fill(advantages, ~(mask.bool()), 0)
         return advantages, returns
+
+    def build_cross_trajectory_discounts(
+        self,
+        mask: torch.Tensor,
+        trajectory_ids: list[str],
+        segment_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build CompactionRL discount factors for independently packed segments."""
+        batch_size = mask.shape[0]
+        if len(trajectory_ids) != batch_size or segment_indices.shape[0] != batch_size:
+            raise ValueError("Segment metadata must match the GAE batch size")
+
+        resolved_policy_lambda = self._resolve_lambda_policy(mask)
+        if not torch.is_tensor(resolved_policy_lambda):
+            policy_lambdas = torch.full(
+                (batch_size,),
+                float(resolved_policy_lambda),
+                device=mask.device,
+                dtype=mask.dtype,
+            )
+        else:
+            policy_lambdas = resolved_policy_lambda.to(
+                device=mask.device, dtype=mask.dtype
+            )
+        value_lambda = torch.full(
+            (batch_size,),
+            float(self._resolve_lambda_value()),
+            device=mask.device,
+            dtype=mask.dtype,
+        )
+        policy_discounts = torch.ones_like(policy_lambdas)
+        value_discounts = torch.ones_like(value_lambda)
+        optimized_tokens = mask.sum(dim=1).long()
+
+        trajectory_to_rows: dict[str, list[int]] = {}
+        for row, trajectory_id in enumerate(trajectory_ids):
+            trajectory_to_rows.setdefault(trajectory_id, []).append(row)
+
+        for trajectory_id, rows in trajectory_to_rows.items():
+            ordered_rows = sorted(rows, key=lambda row: int(segment_indices[row]))
+            ordered_indices = [int(segment_indices[row]) for row in ordered_rows]
+            if ordered_indices != list(range(len(ordered_rows))):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has non-contiguous segment indices "
+                    f"{ordered_indices}"
+                )
+
+            if self.length_adaptive_alpha > 0:
+                trajectory_tokens = sum(int(optimized_tokens[row]) for row in rows)
+                trajectory_lambda = 1.0 - 1.0 / max(
+                    self.length_adaptive_alpha * trajectory_tokens,
+                    1.0,
+                )
+                policy_lambdas[rows] = min(max(trajectory_lambda, 0.0), 1.0)
+
+            later_tokens = 0
+            for row in reversed(ordered_rows):
+                policy_discounts[row] = (
+                    self.gae_gamma * policy_lambdas[row]
+                ) ** later_tokens
+                value_discounts[row] = (
+                    self.gae_gamma * value_lambda[row]
+                ) ** later_tokens
+                later_tokens += int(optimized_tokens[row])
+
+        return policy_discounts, value_discounts, policy_lambdas
 
     def _compute_gae(
         self,
