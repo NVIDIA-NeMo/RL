@@ -1065,7 +1065,23 @@ class AsyncTrajectoryCollector:
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:
                         raise ValueError(f"Unexpected prompt group index {group_index}")
-                    if rollout_result.final_batch.size != num_generations:
+                    cross_trajectory = use_nemo_gym and self.algorithm_config[
+                        "adv_estimator"
+                    ].get("cross_trajectory")
+                    if cross_trajectory:
+                        trajectory_ids = rollout_result.final_batch.get("trajectory_id")
+                        logical_trajectory_count = (
+                            len(set(trajectory_ids))
+                            if isinstance(trajectory_ids, list)
+                            else 0
+                        )
+                        if logical_trajectory_count != num_generations:
+                            raise ValueError(
+                                f"Prompt group {group_index} contains "
+                                f"{logical_trajectory_count} logical trajectories; "
+                                f"expected {num_generations}"
+                            )
+                    elif rollout_result.final_batch.size != num_generations:
                         raise ValueError(
                             f"Prompt group {group_index} contains "
                             f"{rollout_result.final_batch.size} rollouts; expected "

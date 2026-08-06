@@ -111,6 +111,8 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Replace dataset agent_ref.name at dispatch time without rewriting JSONL data.
+    agent_name_override: NotRequired[str]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -208,6 +210,7 @@ class NemoGym(EnvironmentInterface):
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
+        initial_global_config_dict.pop("agent_name_override", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -285,6 +288,17 @@ Depending on your data shape, you may want to change these values."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
 
+        agent_name_override = self.cfg.get("agent_name_override")
+        if agent_name_override:
+            nemo_gym_examples = [
+                row
+                | {
+                    "agent_ref": row["agent_ref"]
+                    | {"name": agent_name_override}
+                }
+                for row in nemo_gym_examples
+            ]
+
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
@@ -312,11 +326,24 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+                result_items = (
+                    nemo_gym_result
+                    if isinstance(nemo_gym_result, list)
+                    else [nemo_gym_result]
                 )
-                if _has_nan_generation_logprobs(nemo_rl_result):
+                processed_items = [
+                    self._postprocess_nemo_gym_to_nemo_rl_result(item, tokenizer)
+                    for item in result_items
+                ]
+                if any(
+                    _has_nan_generation_logprobs(item) for item in processed_items
+                ):
                     raise RuntimeError("Generation logprobs contain NaN")
+                nemo_rl_result = (
+                    processed_items
+                    if isinstance(nemo_gym_result, list)
+                    else processed_items[0]
+                )
 
             num_results += 1
             timing_metrics = None
@@ -508,6 +535,11 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
+            "loss_multiplier": float(nemo_gym_result.get("loss_multiplier", 1.0)),
+            "trajectory_id": nemo_gym_result.get("trajectory_id"),
+            "segment_index": nemo_gym_result.get("segment_index"),
+            "segment_type": nemo_gym_result.get("segment_type"),
+            "is_final_segment": nemo_gym_result.get("is_final_segment"),
         }
 
     def shutdown(self) -> None:
@@ -645,6 +677,7 @@ def spinup_nemo_gym_actor(
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+    agent_name_override = nemo_gym_dict.pop("agent_name_override", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -663,6 +696,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        agent_name_override=agent_name_override,
         initial_global_config_dict=nemo_gym_dict,
     )
 
