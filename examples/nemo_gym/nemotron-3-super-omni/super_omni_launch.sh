@@ -36,7 +36,7 @@ CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super
 ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_grpo_nemo_gym.py}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 SBATCH_NUM_NODES="${SBATCH_NUM_NODES:-$(awk '/^cluster:/{f=1} f && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")}"
-EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
+EXTRA_MOUNTS="${EXTRA_MOUNTS:-/scratch:/scratch,/lustre:/lustre}"
 EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:-}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
