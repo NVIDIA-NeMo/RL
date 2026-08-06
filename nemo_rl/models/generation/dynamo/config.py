@@ -57,15 +57,19 @@ _VLLM_CFG_UNSUPPORTED = {
     "use_deep_gemm",
 }
 
+_VLLM_CFG_MANAGED_RUNTIME = {
+    "enable_vllm_metrics_logger",
+    "expose_http_server",
+    "logprobs_mode",
+    "vllm_metrics_logger_interval",
+}
+
 _VLLM_CFG_INAPPLICABLE = {
     "async_engine",
     "enable_return_routed_experts",
-    "enable_vllm_metrics_logger",
-    "expose_http_server",
     "http_refit_api_key_env_var",
     "http_refit_server_port",
     "use_tqdm",
-    "vllm_metrics_logger_interval",
     "zmq_refit_server_port",
 }
 
@@ -187,6 +191,13 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                 "mixed BF16/FP8 generation is not supported by backend='dynamo'; "
                 "use backend='vllm'"
             )
+        logprobs_mode = extra.get("logprobs_mode")
+        if logprobs_mode not in (None, "processed_logprobs"):
+            raise ValueError(
+                "policy.generation.vllm_cfg.logprobs_mode must be "
+                "'processed_logprobs' when backend='dynamo'; the managed "
+                "--enable-rl option selects processed rollout log probabilities"
+            )
 
         configured_fields = self.model_fields_set | set(extra)
         for key, replacement in _VLLM_CFG_MOVED.items():
@@ -196,6 +207,8 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                     f"Dynamo backend; set {replacement} instead"
                 )
         for key in sorted(_VLLM_CFG_UNSUPPORTED & configured_fields):
+            if not extra.get(key):
+                continue
             warnings.warn(
                 f"policy.generation.vllm_cfg.{key} is ignored by backend='dynamo'",
                 stacklevel=2,
@@ -205,6 +218,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
             | _VLLM_CFG_STRUCTURAL
             | set(_VLLM_CFG_MOVED)
             | _VLLM_CFG_UNSUPPORTED
+            | _VLLM_CFG_MANAGED_RUNTIME
             | _VLLM_CFG_INAPPLICABLE
             | _VLLM_SINGLE_RANK_ONLY_FIELDS
         )

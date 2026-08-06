@@ -26,9 +26,10 @@ docker buildx build \
 
 The opt-in layer installs `ai-dynamo[vllm]==1.3.0.post1` in isolated Python
 3.12 under `/opt/dynamo_venv`, along with etcd v3.5.21 and NATS Server v2.11.6.
-It does not replace NeMo RL's normal Ray or vLLM dependencies. For a local
-source checkout, the same environment can be installed under
-`venvs/dynamo`:
+It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
+NeMo RL vLLM environment currently uses vLLM 0.25.1, while this isolated
+Dynamo environment uses Dynamo's vLLM 0.23.0 pin. For a local source checkout,
+the same environment can be installed under `venvs/dynamo`:
 
 ```bash
 bash docker/dynamo/install.sh
@@ -37,6 +38,14 @@ bash docker/dynamo/install.sh
 Set `NEMO_RL_DYNAMO_VENV_DIR` to choose another location. The installer checks
 that Dynamo resolved vLLM 0.23.0, applies the vLLM PR #44814 backport only after
 `git apply --check`, and writes the upstream marker to `VLLM_BACKPORTS`.
+
+Treat the isolated dependency pin and backport as one update. A Dynamo upgrade
+must update `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`, the
+version and marker assertions in `docker/dynamo/install.sh` and
+`tests/functional/grpo_dynamo.sh`, and the version text in this guide and the
+design document. If the new Dynamo vLLM pin contains PR #44814, delete the
+patch file, patch-application block, marker assertion, and explanatory
+backport text. Do not rebase the patch onto the newer vLLM release.
 
 ## Configure Dynamo
 
@@ -67,13 +76,14 @@ equal to TP. Parser settings belong under `dynamo_cfg.worker_args`; inherited
 vLLM HTTP-parser settings are rejected with the corresponding Dynamo field.
 Service ports and the namespace are runtime-owned rather than public config.
 
-`vllm_cfg` settings are handled in four explicit classes:
+`vllm_cfg` settings are handled in five explicit classes:
 
 | Class | Behavior | Examples |
 | --- | --- | --- |
 | Translated | Forwarded to `dynamo.vllm` | TP, PP, EP, dtype, model length |
 | Moved | Startup error naming the Dynamo replacement | tool and reasoning parsers, HTTP serving chat kwargs |
-| Unsupported | Warning, or an error when it requests unsupported low precision | tokenizer skipping, MX and mixed BF16/FP8 helpers |
+| Unsupported | Warning when active, or an error when it requests unsupported low precision | tokenizer skipping, MX and mixed BF16/FP8 helpers |
+| Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | HTTP-wrapper enablement, metrics sampling, processed rollout logprobs |
 | Inapplicable | Ignored because the managed path owns that behavior | async mode, progress bars, NeMo RL HTTP/ZMQ refit ports |
 
 The NCCL sender also selects vLLM's peer protocol: the policy publishes both

@@ -18,9 +18,14 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_rl.models.generation.dynamo.dynamo_worker import (
+    DynamoGpuReservation,
+    DynamoVllmWorker,
+)
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
@@ -109,8 +114,10 @@ def _config(*, tp: int = 1) -> dict:
 class _RemoteMethod:
     def __init__(self, result):
         self._result = result
+        self.calls = []
 
     def remote(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
         return self._result
 
 
@@ -124,6 +131,7 @@ class _FakeWorker:
 class _FakeReservation:
     def __init__(self, metadata=None):
         self.metadata = _RemoteMethod(metadata or {})
+        self.register_process_group = _RemoteMethod(True)
         self.cleanup_process_group = _RemoteMethod(True)
 
 
@@ -166,6 +174,39 @@ def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
 def test_runtime_rejects_multinode_engine_group_before_spawning() -> None:
     with pytest.raises(ValueError, match="fit on one node"):
         ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=8))
+
+
+def test_managed_service_and_frontend_environments_are_runtime_owned(
+    monkeypatch,
+) -> None:
+    config = _config()
+    config["dynamo_cfg"]["frontend_args"].update(
+        {
+            "tokenizer": "fastokens",
+            "tokenizer_cache": True,
+            "tokenizer_cache_bytes": 4096,
+        }
+    )
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    runtime._manager_env = {
+        "DYN_NAMESPACE": "managed",
+        "DYN_DISCOVERY_BACKEND": "etcd",
+    }
+    monkeypatch.setenv("DYN_NAMESPACE", "stale")
+    monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
+    monkeypatch.setenv("NCCL_DEBUG", "INFO")
+
+    service_env = runtime._service_env()
+    assert service_env["DYN_NAMESPACE"] == "managed"
+    assert service_env["DYN_DISCOVERY_BACKEND"] == "etcd"
+    assert "DYN_STALE_SETTING" not in service_env
+    assert service_env["NCCL_DEBUG"] == "INFO"
+    assert service_env["ALLOW_NONE_AUTHENTICATION"] == "yes"
+
+    frontend_env = runtime._frontend_env()
+    assert frontend_env["DYN_TOKENIZER"] == "fastokens"
+    assert frontend_env["DYN_TOKENIZER_CACHE"] == "1"
+    assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"
 
 
 def test_node_local_port_bands_are_deterministic() -> None:
@@ -280,6 +321,80 @@ def test_stop_process_escalates_its_process_group(monkeypatch) -> None:
     assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
 
 
+def test_reservation_records_and_cleans_registered_process_group(monkeypatch) -> None:
+    reservation_cls = DynamoGpuReservation.__ray_metadata__.modified_class
+    reservation = reservation_cls()
+    signals = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.os.killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.time.sleep", lambda _: None
+    )
+
+    assert reservation.register_process_group(4321)
+    assert reservation.cleanup_process_group()
+    assert reservation.cleanup_process_group()
+    assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+
+
+def test_worker_registers_process_group_immediately_after_launch(monkeypatch) -> None:
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def bind(self, address):
+            return None
+
+    process = SimpleNamespace(pid=4321)
+    reservation = _FakeReservation()
+    worker_cls = DynamoVllmWorker.__ray_metadata__.modified_class
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker._get_node_ip_local",
+        lambda: "10.0.0.1",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.socket.socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_python",
+        lambda: "/opt/dynamo_venv/bin/python",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_venv_dir",
+        lambda: Path("/opt/dynamo_venv"),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.ray.get", lambda ref: ref
+    )
+    monkeypatch.setattr(worker_cls, "_validate_argv", MagicMock())
+    monkeypatch.setattr(worker_cls, "_wait_for_system_port", MagicMock())
+
+    worker_cls(
+        _config(),
+        namespace="nemo-rl-test",
+        group_name="worker-0",
+        cuda_devices=[0],
+        system_port=4000,
+        vllm_port=7000,
+        manager_env={},
+        startup_timeout_s=5,
+        seed=0,
+        cleanup_reservation=reservation,
+    )
+
+    assert reservation.register_process_group.calls == [((4321,), {})]
+
+
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
     runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
     runtime._frontend_process = object()
@@ -314,24 +429,54 @@ def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
 
 def test_fixed_pool_detects_worker_membership_change(monkeypatch) -> None:
     expected = [{"instance_id": "worker-0", "system_url": "http://10.0.0.1:4000"}]
+    reservation_metadata = {"node_ip": "10.0.0.1", "gpu_id": 0}
+    reservation = _FakeReservation(metadata=reservation_metadata)
     pool = object.__new__(FixedDynamoWorkerPool)
     pool._workers = [_FakeWorker(metadata={"instance_id": "changed"})]
-    pool._reservations = []
-    pool._cleanup_reservations = []
-    pool._reservation_metadata = []
+    pool._reservations = [reservation]
+    pool._cleanup_reservations = [reservation]
+    pool._reservation_metadata = [reservation_metadata]
 
     def fake_get(refs, **kwargs):
         if refs == [True]:
             return [True]
-        if refs == []:
-            return []
+        if refs == [reservation_metadata]:
+            return [reservation_metadata]
         return [{"instance_id": "changed"}]
 
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.ray.get", fake_get
     )
-    with pytest.raises(RuntimeError, match="membership changed"):
+    with pytest.raises(RuntimeError, match="worker membership changed"):
         pool.validate(expected)
+
+
+def test_fixed_pool_detects_reservation_membership_change(monkeypatch) -> None:
+    expected_worker = {
+        "instance_id": "worker-0",
+        "system_url": "http://10.0.0.1:4000",
+    }
+    expected_reservation = {"node_ip": "10.0.0.1", "gpu_id": 0}
+    changed_reservation = {"node_ip": "10.0.0.2", "gpu_id": 0}
+    reservation = _FakeReservation(metadata=changed_reservation)
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._workers = [_FakeWorker(metadata=expected_worker)]
+    pool._reservations = [reservation]
+    pool._cleanup_reservations = [reservation]
+    pool._reservation_metadata = [expected_reservation]
+
+    def fake_get(refs, **kwargs):
+        if refs == [True]:
+            return [True]
+        if refs == [changed_reservation]:
+            return [changed_reservation]
+        return [expected_worker]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get", fake_get
+    )
+    with pytest.raises(RuntimeError, match="GPU reservation membership changed"):
+        pool.validate([expected_worker])
 
 
 def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
@@ -404,17 +549,17 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
 def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     monkeypatch,
 ) -> None:
-    reservations = iter(
-        [
-            _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 0}),
-            _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 1}),
-        ]
-    )
+    reservation_objects = [
+        _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 0}),
+        _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 1}),
+    ]
+    reservations = iter(reservation_objects)
     workers = [
         _FakeWorker(metadata={"instance_id": "worker-0"}),
         _FakeWorker(metadata={"instance_id": "worker-1"}),
     ]
     workers_to_launch = iter(workers)
+    launch_kwargs = []
 
     class RemoteFactory:
         def __init__(self, actor):
@@ -431,7 +576,14 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     class WorkerFactory:
         @staticmethod
         def options(**kwargs):
-            return RemoteFactory(next(workers_to_launch))
+            worker = next(workers_to_launch)
+
+            class CapturingRemoteFactory(RemoteFactory):
+                def remote(self, *args, **kwargs):
+                    launch_kwargs.append(kwargs)
+                    return super().remote(*args, **kwargs)
+
+            return CapturingRemoteFactory(worker)
 
     class Cluster:
         @staticmethod
@@ -479,6 +631,11 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         {"instance_id": "worker-0"},
         {"instance_id": "worker-1"},
     ]
+    assert [kwargs["system_port"] for kwargs in launch_kwargs] == [4000, 4001]
+    assert [kwargs["vllm_port"] for kwargs in launch_kwargs] == [7000, 7100]
+    assert [kwargs["cleanup_reservation"] for kwargs in launch_kwargs] == (
+        reservation_objects
+    )
 
 
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:
@@ -503,6 +660,35 @@ def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> N
     assert killed == [worker, reservation]
     assert pool._workers == []
     assert pool._reservations == []
+
+
+def test_fixed_pool_shutdown_uses_registered_pid_when_worker_dies(monkeypatch) -> None:
+    worker = _FakeWorker()
+    reservation = _FakeReservation()
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._workers = [worker]
+    pool._reservations = [reservation]
+    pool._cleanup_reservations = [reservation]
+    pool._reservation_metadata = []
+    pool._metadata = [{}]
+    shutdown_ref = worker.shutdown.remote()
+
+    def fake_get(ref, **kwargs):
+        if ref == shutdown_ref:
+            raise RuntimeError("worker died")
+        return True
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get", fake_get
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.kill",
+        lambda actor, **kwargs: None,
+    )
+
+    pool.shutdown()
+
+    assert reservation.cleanup_process_group.calls == [((), {})]
 
 
 def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> None:

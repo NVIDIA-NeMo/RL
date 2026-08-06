@@ -464,9 +464,9 @@ def setup(
                 "policy.generation.backend='dynamo'; managed Dynamo drains "
                 "rollouts before layerwise weight refit"
             )
-        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config[
-            "hf_config_overrides"
-        ]
+        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+            policy_config.get("hf_config_overrides") or {}
+        )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
@@ -1441,7 +1441,7 @@ def setup(
                 policy_generation.dp_openai_server_base_urls,
                 generation_config["model_name"],
             )
-            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
     elif backend == "dynamo":
         # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
@@ -1458,10 +1458,8 @@ def setup(
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_dynamo,
-            generation_name="Dynamo",
-            init_time_key="dynamo_init_time_s",
             colocated_inference=False,
-            worker_init_timing_metrics=worker_init_timing_metrics,
+            setup_timing_metrics=setup_timing_metrics,
         )
 
         if enable_nemo_gym:
@@ -4360,13 +4358,11 @@ def async_grpo_train(
         processor=processor,
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
+    defer_collection_until_refit = backend == "dynamo"
+    if not defer_collection_until_refit:
+        trajectory_collector.start_collection.remote(dataloader)
+        trajectory_collector.set_weight_version.remote(weight_version)
+        print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
@@ -4402,6 +4398,13 @@ def async_grpo_train(
 
             traceback.print_exc()
             return
+
+    if defer_collection_until_refit:
+        # Dynamo workers start with dummy weights. Publish the initial weight
+        # version before allowing any request to reach the freshly refit fleet.
+        ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+        trajectory_collector.start_collection.remote(dataloader)
+        print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 

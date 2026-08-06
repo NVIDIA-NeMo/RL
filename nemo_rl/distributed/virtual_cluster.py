@@ -87,10 +87,10 @@ class PY_EXECUTABLES:
 #
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
-#   3000-3999    NeMo RL generation HTTP servers (Dynamo frontend/token wrapper)
-#   4000-4099    Dynamo worker system endpoints  (node-local engine index)
-#   4100-4999    Other generation HTTP servers + SGLang engine NCCL/dist_init
-#                                                 (policy.generation.port_range_low/high)
+#   3000-4999    Shared NeMo RL generation band  (policy.generation.port_range_low/high)
+#     3000-3999  Dynamo frontend/token-wrapper HTTP endpoints
+#     4000-4099  Dynamo worker system endpoints  (node-local engine index)
+#     4100-4999  Other generation HTTP servers + SGLang engine NCCL/dist_init
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
 #                                                 one fixed port per run — NeMo-Gym holds the

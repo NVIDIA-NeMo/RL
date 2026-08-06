@@ -70,6 +70,9 @@ metrics_json=${EXP_DIR}/metrics.json
 uv run --no-sync tests/json_dump_tb_logs.py \
   "${LOG_DIR}" \
   --output_path "${metrics_json}"
+uv run --no-sync tests/check_metrics.py \
+  "${metrics_json}" \
+  'max(data["train/token_mult_prob_error"]) < 1.05'
 if ! jq -e 'any(keys[]; startswith("generation_metrics/"))' \
   "${metrics_json}" > /dev/null; then
   echo "No generation_metrics/* TensorBoard tag was recorded" >&2

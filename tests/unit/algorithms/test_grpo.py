@@ -950,25 +950,33 @@ class StubAsyncTrajectoryCollector:
     Actor methods expose MagicMocks with a ``remote`` attribute.
     """
 
-    def __init__(self, health_side_effect=None):
+    def __init__(self, events=None, health_side_effect=None):
+        self._events = events
         self.check_health = MagicMock()
         self.check_health.remote = MagicMock(
             return_value=None, side_effect=health_side_effect
         )
 
+    def _remote_method(self, event):
+        mock = MagicMock()
+
+        def remote(*args, **kwargs):
+            if self._events is not None:
+                self._events.append(event)
+            return MagicMock()
+
+        mock.remote = MagicMock(side_effect=remote)
+        return mock
+
     @property
     def start_collection(self):
         """Start collection - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())  # Returns a fake ObjectRef
-        return mock
+        return self._remote_method("start_collection")
 
     @property
     def set_weight_version(self):
         """Set weight version - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
-        return mock
+        return self._remote_method("set_weight_version")
 
     @property
     def pause(self):
@@ -1047,6 +1055,8 @@ def mock_async_grpo_infrastructure(
     mock_rollout_metrics,
     seq_logprob_error_result=None,
     collector_health_side_effect=None,
+    collector_events=None,
+    refit_side_effect=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -1064,7 +1074,8 @@ def mock_async_grpo_infrastructure(
         mock_rollout_metrics=mock_rollout_metrics,
     )
     stub_collector = StubAsyncTrajectoryCollector(
-        health_side_effect=collector_health_side_effect
+        events=collector_events,
+        health_side_effect=collector_health_side_effect,
     )
 
     # Patch venv creation
@@ -1128,7 +1139,11 @@ def mock_async_grpo_infrastructure(
 
     # Patch refit and validate functions
     stack.enter_context(
-        patch("nemo_rl.algorithms.grpo.refit_policy_generation", return_value=None)
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            side_effect=refit_side_effect,
+            return_value=None,
+        )
     )
     stack.enter_context(
         patch("nemo_rl.algorithms.grpo.validate", return_value=({}, {}))
@@ -1306,6 +1321,47 @@ def test_should_use_async_rollouts_selects_backend_specific_config(
     master_config.policy = {"generation": generation_config}
 
     assert _should_use_async_rollouts(master_config) is expected
+
+
+def test_dynamo_initial_refit_completes_before_async_collection_starts(
+    mock_grpo_components,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["backend"] = "dynamo"
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    events = []
+
+    def record_refit(*args, **kwargs):
+        events.append("refit")
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        rollout_metrics,
+        collector_events=events,
+        refit_side_effect=record_refit,
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert events[:3] == ["refit", "set_weight_version", "start_collection"]
 
 
 def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
@@ -2147,6 +2203,17 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
         == (master_config.policy["hf_config_overrides"])
     )
 
+    del master_config.policy["generation"]["vllm_kwargs"]
+    del master_config.policy["hf_config_overrides"]
+    with pytest.raises(ValueError, match="must be false"):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
+
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     mock_grpo_components,
@@ -2482,6 +2549,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": None,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
         "colocated": {
             "enabled": True,
             "resources": {"gpus_per_node": None, "num_nodes": None},

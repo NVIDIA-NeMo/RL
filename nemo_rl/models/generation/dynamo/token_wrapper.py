@@ -189,10 +189,10 @@ def _normalize_tool_arguments_for_template(
 
     OpenAI chat messages carry ``function.arguments`` as a JSON string, while
     the Nemotron template iterates those arguments as a mapping. Dynamo does
-    not need to re-render the preserved model prefix, but the boundary-marker
-    render still traverses older assistant turns. Normalize only that
-    diagnostic copy; the request forwarded to Dynamo retains its original
-    OpenAI payload.
+    not need to re-render the preserved model prefix, but the template-prefix
+    render still traverses older assistant turns. Normalize only the local
+    template copy; the request forwarded to Dynamo retains its original OpenAI
+    payload.
     """
     for message in messages[:before_index]:
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -218,7 +218,9 @@ def _normalize_tool_arguments_for_template(
             )
 
 
-def _validate_engine_data(response_body: dict[str, Any]) -> tuple[list[int], list[int]]:
+def _validate_engine_data(
+    response_body: dict[str, Any],
+) -> tuple[list[int], list[int], list[float]]:
     nvext = response_body.get("nvext")
     engine_data = nvext.get("engine_data") if isinstance(nvext, dict) else None
     if not isinstance(engine_data, dict):
@@ -232,12 +234,26 @@ def _validate_engine_data(response_body: dict[str, Any]) -> tuple[list[int], lis
         engine_data.get("completion_token_ids"),
         "nvext.engine_data.completion_token_ids",
     )
-    return prompt_token_ids, completion_token_ids
+    completion_logprobs = _coerce_logprob_list(
+        engine_data.get("completion_logprobs"),
+        "nvext.engine_data.completion_logprobs",
+    )
+    if len(completion_logprobs) != len(completion_token_ids):
+        raise ValueError(
+            "Dynamo response returned "
+            f"{len(completion_logprobs)} generation log probabilities for "
+            f"{len(completion_token_ids)} generation token IDs."
+        )
+    return prompt_token_ids, completion_token_ids, completion_logprobs
 
 
 def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
     """Expose Dynamo engine metadata on the message fields consumed by Gym."""
-    prompt_token_ids, generation_token_ids = _validate_engine_data(response_body)
+    (
+        prompt_token_ids,
+        generation_token_ids,
+        generation_logprobs,
+    ) = _validate_engine_data(response_body)
     choices = response_body.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError("Dynamo response did not include choices[0].")
@@ -247,19 +263,6 @@ def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
     message = choice.get("message")
     if not isinstance(message, dict):
         raise ValueError("Dynamo response choices[0].message must be a JSON object.")
-    logprobs = choice.get("logprobs")
-    if not isinstance(logprobs, dict):
-        raise ValueError("Dynamo response choices[0].logprobs must be a JSON object.")
-    generation_logprobs = _coerce_logprob_list(
-        logprobs.get("token_logprobs"),
-        "choices[0].logprobs.token_logprobs",
-    )
-    if len(generation_logprobs) != len(generation_token_ids):
-        raise ValueError(
-            "Dynamo response returned "
-            f"{len(generation_logprobs)} generation log probabilities for "
-            f"{len(generation_token_ids)} generation token IDs."
-        )
     message["prompt_token_ids"] = prompt_token_ids
     message["generation_token_ids"] = generation_token_ids
     message["generation_log_probs"] = generation_logprobs
