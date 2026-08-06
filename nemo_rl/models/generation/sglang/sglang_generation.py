@@ -122,6 +122,17 @@ class SGLangGeneration(GenerationInterface):
         if init_handles:
             ray.get(init_handles)
 
+    @property
+    def cfg(self) -> SGLangConfig:
+        """Full generation config, matching the ``GenerationInterface`` contract.
+
+        ``sglang_cfg`` already is that config, so alias it rather than keep a
+        second reference. Backend-agnostic callers such as
+        ``nemo_rl.weight_sync.factory.create_weight_synchronizer`` read
+        ``generation.cfg`` regardless of backend.
+        """
+        return self.sglang_cfg
+
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
     # ------------------------------------------------------------------
