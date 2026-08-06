@@ -72,6 +72,12 @@ VICTIM_STATE=${VICTIM_STATE:-idle}
 # How long to wait for the worker to be observed in that state. Generous because `serving`
 # is a narrow window -- generate_async was only ~2% of samples, against ~34% for idle.
 VICTIM_WAIT_S=${VICTIM_WAIT_S:-300}
+# Separate budget for finding the actors at all, before any state is considered.
+# Generation takes a while to come up, and conflating the two made 'no actors' and
+# 'actors never reached the state' indistinguishable in the log.
+ACTOR_WAIT_S=${ACTOR_WAIT_S:-300}
+# Hard bound on ONE discovery attempt; see the recovery test for why.
+ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-20}
 # GPUs this test pins itself to, independent of how many the host has. One shard of
 # generation and one trainer: killing the shard leaves the fleet empty, which is the
 # scenario -- a bounded failure with nothing to fall back to. Defined once because the
@@ -84,7 +90,13 @@ mkdir -p "$EXP_DIR" "$LOG_DIR"
 cd "$PROJECT_ROOT"
 
 # Enough steps that the run is still going when the kill lands.
-uv run "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
+# PYTHONUNBUFFERED: the harness detects progress by grepping RUN_LOG, and that only
+# works if the driver actually writes to it. The actor prints with flush=True, but
+# that just reaches the DRIVER -- Ray forwards actor output there, and the driver's
+# own stdout is a redirected file, so Python block-buffers it. Job 5892910 wrote
+# "train step 3/24" at 10:40:38 and the harness did not see it until 10:48:21, by
+# which time the run had finished and there was nothing left to kill.
+PYTHONUNBUFFERED=1 uv run "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
@@ -155,46 +167,111 @@ for _ in $(seq 1 120); do
 done
 grep -q "train step 1/" "$RUN_LOG" || { echo "[chaos] FAIL: never reached a train step"; tail -40 "$RUN_LOG"; exit 1; }
 
-# A Ray generation ACTOR, optionally with a `<actor-name>:` infix, and with the method
-# suffix that says what it is doing. Anchored at both ends so the venv child process and
-# the launcher shell -- which both contain the class name -- cannot match.
+# Which processes are the generation actors? Ask Ray, not ps.
+#
+# Anchored `ray::` title matching worked on a workstation and found ZERO actors on a GB200
+# cluster (job 5861743) -- both chaos variants reported "job died before the kill" because
+# the poll below never matched anything, and the run simply finished. Titles are a runtime
+# implementation detail; the GCS actor table is authoritative.
+#
+# The STATE (idle vs serving) still comes from the title, because Ray only exposes the
+# running method through the dashboard state API and init_ray disables the dashboard. So:
+# discover actors authoritatively, then refine by title when titles are available, and say
+# plainly when they are not rather than silently killing an arbitrary one.
 ACTOR_RE='^ray::([A-Za-z0-9_.:-]+:)?[A-Za-z_]*GenerationWorker'
 case "$VICTIM_STATE" in
     idle)    STATE_RE="${ACTOR_RE}\$" ;;
     serving) STATE_RE="${ACTOR_RE}\.generate_async\$" ;;
-    *) echo "[chaos] FAIL: VICTIM_STATE must be 'idle' or 'serving', got '$VICTIM_STATE'"; exit 1 ;;
+    any)     STATE_RE="" ;;
+    *) echo "[chaos] FAIL: VICTIM_STATE must be idle, serving or any; got '$VICTIM_STATE'"; exit 1 ;;
 esac
 
-# Poll faster than a generate_async call lasts, or the narrow `serving` window is missed.
-echo "[chaos] waiting up to ${VICTIM_WAIT_S}s for a generation worker in state '$VICTIM_STATE'..."
+# Discover the actors ONCE, then poll their titles.
+#
+# Not once per 0.2s tick: each helper call is a full ray.init/shutdown of about three
+# seconds, so polling it at tick rate would make VICTIM_WAIT_S=300 mean roughly 60 checks
+# instead of 1500, and burn the budget on Ray handshakes rather than on watching for the
+# state. The actor SET is stable once generation is up; only the STATE changes.
+echo "[chaos] discovering generation actors (up to ${ACTOR_WAIT_S}s)..."
+ACTORS=()
+ATTEMPT=0
+for _ in $(seq 1 $((ACTOR_WAIT_S / 3))); do
+    kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before any actor appeared"; break; }
+    # Keep stderr -- see the recovery test for why discarding it cost three rounds.
+    # stderr inline, into this log -- a separate artifact twice failed to survive to be
+    # read. stdout (the pids) to a temp file, stderr to a variable.
+    : > "$EXP_DIR/pids.tmp"
+    ACTORS_ERR=$(timeout "$ACTOR_QUERY_TIMEOUT_S" uv run --no-sync python \
+        "$SCRIPT_DIR/_find_generation_actors.py" 2>&1 >"$EXP_DIR/pids.tmp" || true)
+    mapfile -t ACTORS < <(sort -n < "$EXP_DIR/pids.tmp")
+    ATTEMPT=$((ATTEMPT + 1))
+    if (( ${#ACTORS[@]} == 0 )) && [[ -n "$ACTORS_ERR" && $ATTEMPT -le 2 ]]; then
+        echo "[chaos] discovery attempt $ATTEMPT found no actors; helper said:"
+        echo "$ACTORS_ERR" | tail -25 | sed 's/^/[chaos]   /'
+    fi
+    (( ${#ACTORS[@]} > 0 )) && break
+    sleep 3
+done
+
+if (( ${#ACTORS[@]} == 0 )); then
+    echo "[chaos] FAIL: no generation actors found in ${ACTOR_WAIT_S}s"
+    echo "[chaos] --- helper stderr from the LAST in-loop attempt (job was alive) ---"
+    echo "${ACTORS_ERR:-<no attempt completed>}" | tail -25 | sed 's/^/[chaos]   /'
+    echo "[chaos] --- what Ray reports now (job may already be gone) ---"
+    uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
+    echo "[chaos] --- every process with 'eneration' in its command line ---"
+    ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//' | grep -i "eneration" | grep -v grep | head -20
+    echo "[chaos] --- last 60 lines of the training log ---"
+    # "job died before any actor appeared" is ambiguous between a crash and simply
+    # finishing all the steps, and those need opposite fixes. The log settles it.
+    tail -60 "$RUN_LOG"
+    exit 1
+fi
+echo "[chaos] generation actors: ${ACTORS[*]}"
+
+echo "[chaos] waiting up to ${VICTIM_WAIT_S}s for one in state '$VICTIM_STATE'..."
 VICTIM=""
+TITLES_SEEN=0
 for _ in $(seq 1 $((VICTIM_WAIT_S * 5))); do
-    kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before the kill"; tail -40 "$RUN_LOG"; exit 1; }
-    while read -r pid title; do
-        if [[ "$title" =~ $STATE_RE ]]; then VICTIM=$pid; VICTIM_CMD=$title; break; fi
-    done < <(ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//')
-    [[ -n "$VICTIM" ]] && break
+    kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before the kill"; break; }
+    for pid in "${ACTORS[@]}"; do
+        [[ -z "$pid" ]] && continue
+        title=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed -E 's/ +$//')
+        [[ "$title" =~ ^ray:: ]] && TITLES_SEEN=1
+        if [[ -z "$STATE_RE" || "$title" =~ $STATE_RE ]]; then
+            VICTIM=$pid; VICTIM_CMD=$title; break 2
+        fi
+    done
     sleep 0.2
 done
+
 if [[ -z "$VICTIM" ]]; then
     echo "[chaos] FAIL: no generation actor reached state '$VICTIM_STATE' in ${VICTIM_WAIT_S}s"
-    echo "[chaos] actors seen now:"
-    ps -eo pid=,args= | sed -E 's/^ *//' | grep -E "$ACTOR_RE" | head -10
+    echo "[chaos] --- what Ray reports ---"
+    uv run --no-sync python "$SCRIPT_DIR/_find_generation_actors.py" || true
+    if (( TITLES_SEEN == 0 )); then
+        echo "[chaos] No actor ever presented a 'ray::' process title, so idle-vs-serving"
+        echo "[chaos] cannot be distinguished on this platform. Re-run with VICTIM_STATE=any"
+        echo "[chaos] to kill a generation actor without pinning the state -- the test still"
+        echo "[chaos] asserts a bounded, attributable failure, it just stops distinguishing"
+        echo "[chaos] the detection path from the in-flight-RPC path."
+    fi
+    echo "[chaos] --- every process with 'eneration' in its command line ---"
+    # Unfiltered: the previous diagnostic grepped 'ray::' and so printed nothing exactly
+    # when the ray:: assumption was itself the problem.
+    ps -eo pid=,args= 2>/dev/null | sed -E 's/^ *//' | grep -i "eneration" | grep -v grep | head -20
     exit 1
 fi
 
-# Re-read the title immediately before killing. Ray can retitle the actor between the scan
-# and the kill; the window is sub-millisecond, but a state change here would silently turn
-# this back into the coin flip the whole exercise removes, so check rather than assume.
 NOW_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
-if [[ ! "$NOW_CMD" =~ $STATE_RE ]]; then
+if [[ -n "$STATE_RE" && ! "$NOW_CMD" =~ $STATE_RE ]]; then
     echo "[chaos] FAIL: pid $VICTIM left state '$VICTIM_STATE' before the kill"
     echo "[chaos]   was: $VICTIM_CMD"
     echo "[chaos]   now: $NOW_CMD"
     exit 1
 fi
-echo "[chaos] killing generation worker pid=$VICTIM in state '$VICTIM_STATE'"
-echo "[chaos]   cmdline: $NOW_CMD"
+echo "[chaos] killing generation actor pid=$VICTIM in state '$VICTIM_STATE'"
+echo "[chaos]   cmdline: ${NOW_CMD:-<unavailable>}"
 kill -9 "$VICTIM"
 KILLED_AT=$(date +%s)
 sleep 2
