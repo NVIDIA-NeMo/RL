@@ -1,0 +1,30 @@
+---
+cluster: oci-hsg
+ssh_host: oci-hsg-cs-001-vscode-02
+user: sna
+remote_cwd: null
+remote_cwd_env: SOURCE_PATH
+account: null
+account_env: ACCOUNT
+partition: batch
+nodes: 4
+gpus_per_node: 4
+segment_size: 4
+time_limit: "04:00:00"
+container_image: null
+container_image_env: CONTAINER
+recipe: examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml
+output_root: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-upstream5008-validation/oci-gb200
+expected_gpu_model: GB200
+topology_env:
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 16
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
+  NVLINK_DOMAIN_SIZE: 72
+  USE_MNNVL: 1
+runtime_overrides:
+  grpo.max_num_steps: 20
+  checkpointing.enabled: false
+  policy.megatron_cfg.moe_token_dispatcher_type: flex
+  policy.megatron_cfg.moe_flex_dispatcher_backend: hybridep
+  policy.megatron_cfg.moe_hybridep_num_sms: 32
+  policy.sequence_packing.enabled: true
