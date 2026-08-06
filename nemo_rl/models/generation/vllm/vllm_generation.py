@@ -32,6 +32,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDic
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.generation.fleet_health import (
+    GenerationFleetMonitor,
+    HealthyShardSelector,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -256,7 +260,13 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Used to track the round-robin selection of worker groups for generate_async
+        # when no fleet selector is attached.
         self.current_generate_dp_shard_idx = 0
+
+        # Set by attach_fleet_health when async_rl.fleet_health is enabled. While None,
+        # shard selection stays health-blind, which is the historical behaviour.
+        self.fleet_monitor: Optional[GenerationFleetMonitor] = None
+        self.fleet_selector: Optional[HealthyShardSelector] = None
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -754,51 +764,119 @@ class VllmGeneration(GenerationInterface):
             f"outside this method."
         )
 
-        # Determine the leader worker for the current data parallel shard
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
-        )
+        # Pick the data-parallel shard to serve this request. With a fleet selector
+        # attached, a quarantined shard is skipped; without one this is the historical
+        # health-blind round-robin, so an unconfigured run behaves exactly as before.
+        dp_shard_idx = self._next_dp_shard_idx()
+        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_shard_idx)
 
-        # Run the async method on the selected leader worker
-        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name=method_name,
-            worker_idx=leader_worker_idx,
-            data=data,
-            greedy=greedy,
-        )
+        if self.fleet_selector is not None:
+            self.fleet_selector.acquire(dp_shard_idx)
+        try:
+            async for result in self._generate_on_shard(
+                data=data,
+                method_name=method_name,
+                greedy=greedy,
+                dp_shard_idx=dp_shard_idx,
+                leader_worker_idx=leader_worker_idx,
+            ):
+                yield result
+        finally:
+            if self.fleet_selector is not None:
+                self.fleet_selector.release(dp_shard_idx)
 
-        # Increment the round-robin worker group index
+    def attach_fleet_health(
+        self,
+        monitor: GenerationFleetMonitor,
+        selector: HealthyShardSelector,
+    ) -> None:
+        """Route generation through fleet health from now on.
+
+        Args:
+            monitor: Owns shard eligibility and receives observed failures.
+            selector: Picks among the shards the monitor considers serving.
+        """
+        if monitor.shard_count != self.worker_group.dp_size:
+            raise ValueError(
+                f"fleet monitor tracks {monitor.shard_count} shards but the worker "
+                f"group has {self.worker_group.dp_size} data-parallel shards"
+            )
+        self.fleet_monitor = monitor
+        self.fleet_selector = selector
+
+    def _next_dp_shard_idx(self) -> int:
+        """Return the data-parallel shard that should serve the next request."""
+        if self.fleet_selector is not None:
+            return self.fleet_selector.next_shard()
+
+        shard_idx = self.current_generate_dp_shard_idx
         self.current_generate_dp_shard_idx = (
             self.current_generate_dp_shard_idx + 1
         ) % self.worker_group.dp_size
+        return shard_idx
+
+    async def _generate_on_shard(
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        method_name: str,
+        greedy: bool,
+        dp_shard_idx: int,
+        leader_worker_idx: int,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Run one generation on a chosen shard, reporting its failures to the fleet.
+
+        A dead worker surfaces here as a Ray actor error. Reporting it is what lets the
+        next request skip this shard instead of rediscovering the same corpse, and
+        re-raising it as ``GenerationUnavailable`` is what tells the rollout retry policy
+        the prompt is fine and worth re-dispatching.
+        """
+        # Local import: nemo_rl.experience pulls the rollout stack, which must not
+        # become a load-time dependency of the generation backend.
+        from nemo_rl.experience.failures import GenerationUnavailable
 
         timeout_seconds = float(
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )  # Default 15 minutes
 
         try:
-            sample_result_ref = await anext(worker_gen_proxy)
-        except StopAsyncIteration:
-            raise RuntimeError(
-                f"Worker produced no output for the given sample {data}."
+            worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+                method_name=method_name,
+                worker_idx=leader_worker_idx,
+                data=data,
+                greedy=greedy,
             )
 
-        # Materialize the result from Ray's object store. ``anext`` above
-        # resolves when the worker yields, but the object bytes have not yet
-        # crossed the network to the driver — this is where that happens, and
-        # where a Ray deadlock / unreachable worker would manifest, hence the
-        # timeout.
-        try:
-            sample_result = await asyncio.wait_for(
-                sample_result_ref, timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Timeout waiting for worker results after {timeout_seconds}s. "
-                f"For longer sequences, increase timeout by setting: "
-                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
-                f"{int(timeout_seconds * 2)}"
-            )
+            try:
+                sample_result_ref = await anext(worker_gen_proxy)
+            except StopAsyncIteration:
+                raise RuntimeError(
+                    f"Worker produced no output for the given sample {data}."
+                )
+
+            # Materialize the result from Ray's object store. ``anext`` above
+            # resolves when the worker yields, but the object bytes have not yet
+            # crossed the network to the driver — this is where that happens, and
+            # where a Ray deadlock / unreachable worker would manifest, hence the
+            # timeout.
+            try:
+                sample_result = await asyncio.wait_for(
+                    sample_result_ref, timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: "
+                    f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                    f"{int(timeout_seconds * 2)}"
+                )
+        except ray.exceptions.RayError as error:
+            if self.fleet_monitor is not None:
+                self.fleet_monitor.report_failure(dp_shard_idx, error)
+            raise GenerationUnavailable(
+                f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) "
+                f"is unavailable: {type(error).__name__}: {error}"
+            ) from error
 
         # sample_result is a tuple: (original_idx, BatchedDataDict).
         original_idx, result_batch = sample_result
