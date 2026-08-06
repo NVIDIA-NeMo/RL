@@ -85,6 +85,9 @@ class SingleControllerActor:
                         unhealthy environments, which are the failures that
                         otherwise produce no signal at all
 
+    Plus _fleet_probe_pump when fleet health is enabled, which probes generation
+    shard liveness on its own, much shorter clock.
+
     All other actors are passive — they expose methods and wait to be called.
     """
 
@@ -205,11 +208,24 @@ class SingleControllerActor:
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._watchdog_pump())
-        tasks = (rollout_task, train_task, watchdog_task)
+        tasks = [rollout_task, train_task, watchdog_task]
+        # Only with fleet health on. Created unconditionally it would be a timer firing
+        # every probe_interval_s for every run that does not use the feature, which is
+        # the default.
+        probe_task = (
+            asyncio.create_task(self._fleet_probe_pump())
+            if self._fleet_monitor is not None
+            else None
+        )
+        if probe_task is not None:
+            tasks.append(probe_task)
         try:
             done, _ = await asyncio.wait(
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
+            if probe_task is not None and probe_task in done:
+                # Loops forever like the watchdog, so finishing at all means it raised.
+                await probe_task
             if watchdog_task in done:
                 # The watchdog loops forever, so finishing at all means it raised --
                 # a stall or an unhealthy environment. Surface that ahead of the
@@ -631,10 +647,6 @@ class SingleControllerActor:
                 last_progress_at = now
             idle_s = now - last_progress_at
 
-            # Probe before publishing so the metrics describe this tick, not the last.
-            await self._probe_generation_fleet()
-            await self._push_router_membership()
-
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
             metrics["rollout/idle_s"] = idle_s
@@ -664,6 +676,31 @@ class SingleControllerActor:
                     raise RolloutStall(message)
                 print(f"WARNING: rollout stall -- {message}", flush=True)
 
+    async def _fleet_probe_pump(self) -> None:
+        """Probe the generation fleet on its own clock.
+
+        Separate from the watchdog because the two cadences answer different questions.
+        The watchdog publishes counters and notices a stalled run, which is a
+        minutes-scale concern; liveness detection is the input to every recovery
+        decision and has to be seconds-scale.
+
+        Sharing the watchdog's loop made ``probe_interval_s`` decorative -- probes ran at
+        ``watchdog.interval_s`` and nothing read the configured value. With the shipped
+        defaults that put detection at ``30s * unhealthy_threshold``, i.e. 60-90s, which
+        is *longer* than the refit deadline: by the time a hung refit aborted, the monitor
+        still had the dead shard as SUSPECT, so the rebuild that abort exists to trigger
+        saw an empty absent set and did nothing. Arithmetic, not a race -- it could never
+        have worked. Job 5925668.
+        """
+        interval_s = self._async_cfg.fleet_health.probe_interval_s
+        while True:
+            await asyncio.sleep(interval_s)
+            await self._probe_generation_fleet()
+            # Pushed here rather than on the watchdog's clock so a membership change
+            # reaches the router at detection speed. Epoch-gated, so an unchanged
+            # serving set costs nothing.
+            await self._push_router_membership()
+
     async def _probe_generation_fleet(self) -> None:
         """Ask every serving generation shard whether it is still alive.
 
@@ -676,13 +713,20 @@ class SingleControllerActor:
         Only serving shards are probed: a quarantined shard answering again says nothing
         about whether its weights are current, and the monitor ignores such probes
         anyway.
+
+        Shards are probed concurrently. Sequentially, a tick costs up to
+        ``probe_timeout_s`` per shard, so a fleet of four would take 8s to complete a
+        round the config promises every 5s -- and config validation only checks
+        ``probe_timeout_s < probe_interval_s``, which silently assumes one probe per
+        tick. Concurrent, a round is bounded by ``probe_timeout_s`` at any fleet size.
         """
         if self._fleet_monitor is None:
             return
 
         fleet_cfg = self._async_cfg.fleet_health
         worker_group = self._gen.worker_group
-        for shard_idx in self._fleet_monitor.serving_shards():
+
+        async def probe(shard_idx: int) -> None:
             worker_idx = worker_group.get_dp_leader_worker_idx(shard_idx)
             try:
                 await asyncio.wait_for(
@@ -695,6 +739,10 @@ class SingleControllerActor:
                 )
             else:
                 self._fleet_monitor.record_probe(shard_idx, ok=True)
+
+        await asyncio.gather(
+            *(probe(idx) for idx in self._fleet_monitor.serving_shards())
+        )
 
     async def _push_router_membership(self) -> None:
         """Tell the NeMo-Gym router which backends are currently serving.

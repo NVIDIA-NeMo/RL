@@ -60,6 +60,8 @@ def _make_controller(
     env_handles=None,
     train_steps: int = 0,
     max_num_steps: int = 100,
+    watchdog_interval_s: float = 0.001,
+    probe_interval_s: float = 0.001,
 ):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -67,12 +69,14 @@ def _make_controller(
         watchdog=SimpleNamespace(
             # Tiny tick so the loop runs immediately; the stall threshold is what the
             # tests actually vary.
-            interval_s=0.001,
+            interval_s=watchdog_interval_s,
             stall_timeout_s=stall_timeout_s,
             stall_action=stall_action,
             gym_subprocess_check=gym_subprocess_check,
         ),
-        fleet_health=SimpleNamespace(probe_timeout_s=1.0),
+        fleet_health=SimpleNamespace(
+            probe_timeout_s=1.0, probe_interval_s=probe_interval_s
+        ),
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_steps=max_num_steps)
@@ -89,10 +93,10 @@ def _make_controller(
     return ctrl
 
 
-async def _run_ticks(ctrl, ticks: int):
-    """Run the watchdog for a bounded number of ticks, then cancel it."""
-    task = asyncio.ensure_future(ctrl._watchdog_pump())
-    # Each tick sleeps interval_s (1ms); give it room for `ticks` of them.
+async def _run_pump(pump, ticks: int):
+    """Run one pump coroutine for a bounded number of ticks, then cancel it."""
+    task = asyncio.ensure_future(pump)
+    # Each tick sleeps its interval (1ms); give it room for `ticks` of them.
     await asyncio.sleep(0.005 * ticks)
     task.cancel()
     try:
@@ -100,6 +104,16 @@ async def _run_ticks(ctrl, ticks: int):
     except asyncio.CancelledError:
         pass
     return task
+
+
+async def _run_ticks(ctrl, ticks: int):
+    """Run the watchdog for a bounded number of ticks, then cancel it."""
+    return await _run_pump(ctrl._watchdog_pump(), ticks)
+
+
+async def _run_probe_ticks(ctrl, ticks: int):
+    """Run the fleet probe pump for a bounded number of ticks, then cancel it."""
+    return await _run_pump(ctrl._fleet_probe_pump(), ticks)
 
 
 class TestStallDetection:
@@ -222,9 +236,9 @@ class TestGenerationFleetProbe:
     """
 
     @staticmethod
-    def _with_fleet(monitor, *, worker_alive):
+    def _with_fleet(monitor, *, worker_alive, **kwargs):
         ctrl = _make_controller(
-            stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0
+            stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
         ctrl._fleet_monitor = monitor
         ctrl._gen = SimpleNamespace(
@@ -249,7 +263,7 @@ class TestGenerationFleetProbe:
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, True])
-        asyncio.run(_run_ticks(ctrl, 3))
+        asyncio.run(_run_probe_ticks(ctrl, 3))
         assert monitor.serving_shards() == [0, 1]
 
     def test_a_dead_worker_is_quarantined_by_the_probe(self):
@@ -257,7 +271,7 @@ class TestGenerationFleetProbe:
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, False])
-        asyncio.run(_run_ticks(ctrl, 3))
+        asyncio.run(_run_probe_ticks(ctrl, 3))
         assert monitor.state_of(1) is ShardState.DEAD
         assert monitor.serving_shards() == [0]
 
@@ -266,7 +280,13 @@ class TestGenerationFleetProbe:
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, False])
-        asyncio.run(_run_ticks(ctrl, 3))
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            # The watchdog still owns publishing; it reports whatever the probe found.
+            await _run_ticks(ctrl, 2)
+
+        asyncio.run(_main())
         published = ctrl._logger.metrics[-1]
         assert published["fleet/shards/dead"] == 1.0
         assert published["fleet/serving_shards"] == 1.0
@@ -278,8 +298,13 @@ class TestGenerationFleetProbe:
             policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
         )
         ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            await ctrl._watchdog_pump()
+
         with pytest.raises(GenerationFleetExhausted):
-            asyncio.run(ctrl._watchdog_pump())
+            asyncio.run(_main())
 
     def test_no_monitor_means_no_probing(self):
         """Fleet health off must leave the watchdog exactly as it was."""
@@ -288,6 +313,86 @@ class TestGenerationFleetProbe:
         )
         ctrl._gen = SimpleNamespace()  # would AttributeError if probed
         asyncio.run(_run_ticks(ctrl, 3))
+
+    def test_the_watchdog_no_longer_probes(self):
+        """The probe must not ride the watchdog's clock.
+
+        Sharing it made probe_interval_s decorative: probes ran at watchdog.interval_s,
+        so with the shipped defaults detection took unhealthy_threshold * 30s = 60-90s
+        rather than the ~15s the config documents. That is longer than the refit
+        deadline, so a refit hung on a dead rank always aborted before the monitor knew
+        which rank to drop, and the rebuild the abort exists to trigger saw an empty
+        absent set. Job 5925668.
+
+        The watchdog ticks fast here *on purpose*: a slow interval would make this pass
+        because the loop never ran, which is no evidence at all.
+        """
+        monitor = GenerationFleetMonitor(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = self._with_fleet(
+            monitor, worker_alive=[True, False], watchdog_interval_s=0.001
+        )
+        asyncio.run(_run_ticks(ctrl, 5))
+        # The watchdog demonstrably ran -- it published -- and still did not probe.
+        assert ctrl._logger.metrics, (
+            "the watchdog never ticked; the test proves nothing"
+        )
+        assert monitor.state_of(1) is ShardState.HEALTHY
+
+    def test_the_probe_runs_on_its_own_interval(self):
+        """The other half: a slow watchdog must not slow detection down."""
+        monitor = GenerationFleetMonitor(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = self._with_fleet(
+            monitor,
+            worker_alive=[True, False],
+            watchdog_interval_s=30.0,
+            probe_interval_s=0.001,
+        )
+        asyncio.run(_run_probe_ticks(ctrl, 3))
+        assert monitor.state_of(1) is ShardState.DEAD
+
+    def test_shards_are_probed_concurrently(self):
+        """A round must cost one probe_timeout_s, not one per shard.
+
+        Sequentially, a fleet larger than probe_interval_s / probe_timeout_s could never
+        complete a round within its own interval -- and the config validator only checks
+        those two against each other, silently assuming a single probe per tick.
+        """
+        monitor = GenerationFleetMonitor(
+            shard_count=4, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        started = asyncio.Event()
+        concurrent = 0
+        peak = 0
+
+        async def _slow():
+            nonlocal concurrent, peak
+            concurrent += 1
+            peak = max(peak, concurrent)
+            started.set()
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                concurrent -= 1
+
+        ctrl = self._with_fleet(monitor, worker_alive=[True] * 4)
+        ctrl._gen.worker_group.workers = [
+            SimpleNamespace(is_alive=SimpleNamespace(remote=lambda: _slow()))
+            for _ in range(4)
+        ]
+
+        async def _main():
+            task = asyncio.ensure_future(ctrl._probe_generation_fleet())
+            await started.wait()
+            await asyncio.sleep(0.01)
+            observed = peak
+            await task
+            return observed
+
+        assert asyncio.run(_main()) == 4
 
 
 class TestEnvHealthCheck:
