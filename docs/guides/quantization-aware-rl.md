@@ -1,21 +1,22 @@
 # Quantization-Aware RL (QARL)
 
-Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit. By default, vLLM generation uses fake-quantized modules. For NVFP4 W4A4 and W4A16 rollout experiments, NeMo RL can instead stream packed real-quant ModelOpt NVFP4 weights and scales into vLLM.
+Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit. This guide also documents the experimental Transformer Engine (TE) NVFP4 path, which does not use ModelOpt QAT state.
 
 ## Overview
 
 In a standard NeMo RL loop, model weights are trained in full precision and refitted into vLLM for generation. QARL applies quantization-aware modules so that both the policy forward pass and rollout generation exercise quantized weights and, depending on the recipe, quantized activations. The policy backward pass remains in full precision, using the straight-through estimator to propagate gradients through the quantization nodes.
 
-There are two vLLM rollout modes:
+There are three vLLM rollout modes:
 
 - **Fake-quant rollout**: vLLM receives folded full-precision weights and runs fake-quantized layers. This is the default when `policy.generation.quant_cfg` is set.
 - **Real-quant rollout**: vLLM is initialized with ModelOpt NVFP4 kernels and receives packed NVFP4 weights plus scale tensors during every refit. Enable this with `policy.generation.real_quant: true`. W4A16 keeps activations in their native dtype; W4A4 additionally streams calibrated activation scales and uses an activation-quantizing vLLM kernel. The Megatron policy worker exports the payload through Megatron-Bridge.
+- **TE NVFP4 with per-token rollout**: TE applies NVFP4 during Megatron policy training. The standard policy worker packs expert weights during refit, and the standard vLLM worker derives activation scales per token for fused-MoE generation. Enable this with `policy.generation.nvfp4_pertoken_rollout.enabled: true`; ModelOpt `quant_cfg` is not used.
 
 See [Verified Configurations](#verified-configurations) for the workflow + recipe combinations that have been empirically validated, and [Supported Quantization Formats](#supported-quantization-formats) for the full set of available formats. Results are recipe- and model-specific: the generic W4A4 `NVFP4_DEFAULT_CFG` has known GRPO convergence issues, while the routed-expert Qwen3 W4A4 real-quant recipe below completed the documented single-seed campaign.
 
 ## Verified Configurations
 
-The following workflow + quantization recipe combinations have been validated end-to-end (Megatron training + NVFP4-quantized vLLM generation + held-out validation):
+The following workflow + quantization recipe combinations have been validated end to end. Rows marked as smoke tests validate training and refit execution but do not make a convergence claim.
 
 | Workflow | Quantization | Recipe | Status | Example Config |
 |---|---|---|---|---|
@@ -27,6 +28,7 @@ The following workflow + quantization recipe combinations have been validated en
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | ✅ Converges | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml` |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml` with `policy.generation.real_quant: true` and the model-specific `policy.generation.real_quant_ignore` list in the example | ✅ Converges tested on hybrid MoE/Mamba | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
 | QA-GRPO real quantization rollout | W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | ✅ Completed one 300-step Qwen3-30B-A3B MoE run | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml` |
+| TE-GRPO per-token rollout | W4A4 | `examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml` with `policy.generation.nvfp4_pertoken_rollout.enabled: true` | ✅ Two-step GB200 smoke test | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml` |
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
@@ -127,6 +129,46 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+## Transformer Engine NVFP4 with Per-Token Rollout
+
+The experimental `nvfp4_pertoken_rollout` path is an alternative to the
+ModelOpt QAT flow described below. Transformer Engine applies NVFP4 during
+Megatron training, while the standard Megatron policy worker quantizes the
+gathered expert weights during each colocated refit. The standard vLLM worker
+then loads the packed NVFP4 weights and uses dynamic per-token activation
+scales for fused-MoE generation. It does not require `policy.quant_cfg` or a
+separate NeMo RL worker type.
+
+Start from the validated smoke recipe:
+
+```text
+examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml
+```
+
+The rollout block is intentionally small and strictly validated:
+
+```yaml
+policy:
+  generation:
+    nvfp4_pertoken_rollout:
+      enabled: true
+      additional_ignore:
+        - "*.layers.0.mlp.experts*"
+```
+
+`additional_ignore` may contain only complete expert-layer patterns. Use it to
+mirror layers that the training recipe keeps in BF16. The current validated
+scope is colocated synchronous vLLM on GB200, with TP=PP=EP=1 per vLLM
+engine, `precision=bfloat16`, `kv_cache_dtype=auto`, no speculative decoding,
+and the Qwen3 all-MoE layout. `quant_cfg`, `real_quant`, explicit
+`refit_transport`, dense or hybrid MLP layouts, and standalone evaluation are
+rejected during setup. The policy side must use BF16 master precision with
+E2M1 NVFP4 and `fp4_param=false`, as in the example recipe.
+
+See [TE NVFP4 Training with Per-Token vLLM Rollout](../design-docs/te-nvfp4-per-token-rollout.md)
+for the component boundaries, refit representation, numerical contracts, and
+design alternatives.
 
 ## Real-Quant NVFP4 Rollout (W4A4 and W4A16)
 
