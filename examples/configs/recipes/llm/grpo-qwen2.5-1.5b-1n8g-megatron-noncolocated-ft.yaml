@@ -1,0 +1,53 @@
+defaults: ../../grpo_math_1B_megatron.yaml
+
+# Fault-tolerant generation smoke test: non-colocated vLLM (TP=2, 2 DP shards)
+# with async GRPO. Injects a single ray-kill on dp-0 after 60s, asserts that
+# the replacement shard (dp-2) reaches "ready" before training completes.
+#
+# Resource layout (1 node, 8 GPUs):
+#   training : 4 GPUs  (Megatron, TP=1 PP=1 DP=4)
+#   generation: 4 GPUs  (vLLM,     TP=2       DP=2)
+
+grpo:
+  max_num_steps: 20
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+
+loss_fn:
+  use_importance_sampling_correction: true  # required for async GRPO
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen2.5-1.5b-1n8g-megatron-noncolocated-ft
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 2
+    fault_tolerance:
+      enabled: true
+      auto_recover: true
+    fault_inject:
+      enabled: true
+      mode: ray-kill
+      target_shard: dp-0
+      trigger_after_s: 60
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+logger:
+  log_dir: logs/grpo-qwen2.5-1.5b-1n8g-megatron-noncolocated-ft
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen2.5-1.5b-1n8g-megatron-noncolocated-ft
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

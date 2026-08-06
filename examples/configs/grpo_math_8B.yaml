@@ -57,11 +57,8 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
     fault_tolerance:
-      # Fault-tolerant disaggregated generation (non-colocated only).
-      # Enables automatic recovery when a vLLM DP shard crashes or becomes
-      # unresponsive. Has no effect when colocated.enabled is true.
       enabled: false
-      auto_recover: true  # No-op when enabled is false. Automatically spawn a replacement shard on failure.
+      auto_recover: true
 
 cluster:
   gpus_per_node: 8

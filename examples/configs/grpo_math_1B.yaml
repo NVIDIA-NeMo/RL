@@ -401,11 +401,8 @@ policy:
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}
     fault_tolerance:
-      # Fault-tolerant disaggregated generation (non-colocated only).
-      # Enables automatic recovery when a vLLM DP shard crashes or becomes
-      # unresponsive. Has no effect when colocated.enabled is true.
       enabled: false
-      auto_recover: true  # No-op when enabled is false. Automatically spawn a replacement shard on failure.
+      auto_recover: true
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources
