@@ -1,7 +1,7 @@
 defaults: ../../grpo_math_1B.yaml
 
 # Native DeepSeek V4 feature baseline on Automodel r0.6.0. This intentionally
-# excludes the legacy Automodel fork's fake-quant and performance patches.
+# excludes the legacy Automodel fork's training-side fake-quant patches.
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
@@ -110,6 +110,8 @@ policy:
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
+      use_deep_gemm: true
+      pow2_weight_scaling_factors: true
       tensor_parallel_size: 8
       expert_parallel_size: 1
       enable_expert_parallel: true
