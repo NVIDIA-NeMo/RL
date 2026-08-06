@@ -65,6 +65,19 @@ set -euo pipefail
 #   WANDB_API_KEY=                         Weights & Biases API key
 #   WANDB_PROJ=nemotron-3-ultra            W&B project
 #   WANDB_ENTITY=                          W&B entity
+#   NRL_NSYS_WORKER_PATTERNS=              Nsys: fnmatch patterns of worker names
+#                                          to profile, e.g. "*policy*,*vllm*"
+#   NRL_NSYS_PROFILE_STEP_RANGE=           Nsys: 1-indexed "start:stop" train
+#                                          steps to capture, e.g. "2:3"
+#   NRL_NSYS_EXTRA_OPTIONS=                Nsys: JSON of extra nsys CLI flags
+#   NSYS_LD_LIBRARY_PATH=                  Nsys: prepended to the container's
+#                                          LD_LIBRARY_PATH in the driver env.
+#                                          Required to profile Megatron workers
+#                                          (libtransformer_engine.so load error
+#                                          otherwise) — see docs/nsys-profiling.md
+#   RAY_LOG_SYNC_FREQUENCY=                Seconds between /tmp/ray -> Lustre log
+#                                          syncs; must be set for .nsys-rep files
+#                                          to survive the job
 #
 # Hydra overrides are forwarded verbatim as positional arguments:
 #   bash ultra_launch.sh policy.megatron_cfg.optimizer.lr=1e-6 grpo.val_period=50
@@ -698,6 +711,17 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
+${NRL_SC_DEBUG:+NRL_SC_DEBUG=${NRL_SC_DEBUG}} \
+${TORCH_NCCL_DUMP_ON_TIMEOUT:+TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT}} \
+${TORCH_NCCL_TRACE_BUFFER_SIZE:+TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE}} \
+${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:+TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC}} \
+${PYTHONFAULTHANDLER:+PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER}} \
+${WANDB_API_KEY:+WANDB_API_KEY=${WANDB_API_KEY}} \
+${WANDB_ENTITY:+WANDB_ENTITY=${WANDB_ENTITY}} \
+${NRL_NSYS_WORKER_PATTERNS:+NRL_NSYS_WORKER_PATTERNS='${NRL_NSYS_WORKER_PATTERNS}'} \
+${NRL_NSYS_PROFILE_STEP_RANGE:+NRL_NSYS_PROFILE_STEP_RANGE='${NRL_NSYS_PROFILE_STEP_RANGE}'} \
+${NRL_NSYS_EXTRA_OPTIONS:+NRL_NSYS_EXTRA_OPTIONS='${NRL_NSYS_EXTRA_OPTIONS}'} \
+${NSYS_LD_LIBRARY_PATH:+LD_LIBRARY_PATH='${NSYS_LD_LIBRARY_PATH}':\$LD_LIBRARY_PATH} \
 uv run ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
