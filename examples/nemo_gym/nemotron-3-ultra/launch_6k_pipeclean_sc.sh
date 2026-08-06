@@ -14,21 +14,31 @@
 # limitations under the License.
 
 # =============================================================================
-# launch_6k_pipeclean.sh
+# launch_6k_pipeclean_sc.sh
 #
-# Thin wrapper around ultra_launch.sh for the 6K-GPU (1536-node) Ultra
-# pipeclean recipe. Sets the validated node split and config path, then
-# forwards to the launcher.
+# SingleController variant of launch_6k_pipeclean.sh: same 6K-GPU Ultra
+# pipeclean, driven by run_grpo_single_controller.py with streaming
+# forward/backward and the TransferQueue data plane.
 #
-# Shape (GB200 NVL72, 4 GPUs/node → 6144 GPUs):
+# Shape (GB200 NVL72, 4 GPUs/node → 6144 GPUs), unchanged from the legacy
+# pipeclean so the two are comparable:
 #   Training 512 / vLLM 960 / Gym 64
 #
-# Usage — the site block below supplies model, data, container and Slurm
-# defaults for the GB200 cluster this recipe was validated on, so a bare
-# invocation works there:
+# Smaller-scale SC runs at a 4:1 generation-to-training ratio were still
+# generation-bound, spending 71-73% of the step in exposed_generation. If this
+# split starves, shift nodes with NUM_TRAIN_NODES / NUM_GEN_NODES /
+# NUM_GYM_NODES (the total must stay a multiple of SEGMENT_SIZE=16).
 #
-#   WANDB_API_KEY=$WANDB_API_KEY \
-#   bash examples/nemo_gym/nemotron-3-ultra/launch_6k_pipeclean.sh
+# NO CHECKPOINTING. The SC path raises if checkpointing.enabled is true, so the
+# run cannot resume across the wall clock and Slurm singleton buys nothing
+# here. Size NRL_MAX_STEPS to fit one allocation.
+#
+# Usage — the site block below supplies model, data, container and Slurm
+# defaults for the GB200 cluster this recipe was validated on, identical to
+# launch_6k_pipeclean.sh, so the two runs differ only in the SC wiring:
+#
+#   WANDB_API_KEY=$WANDB_API_KEY NRL_MAX_STEPS=10 \
+#   bash examples/nemo_gym/nemotron-3-ultra/launch_6k_pipeclean_sc.sh
 #
 # On any other cluster, export the site variables yourself (they are all
 # ${VAR:-default} and every one of them wins over the default).
@@ -37,6 +47,8 @@
 #   NRL_MAX_STEPS=4              # short pipeclean
 #   WALLTIME=4:00:00
 #   CONTEXT_PARALLEL_SIZE=16     # default; raise only if CP=16 still OOMs
+#   STREAM_MIN_GROUPS=256        # async_rl.min_groups_for_streaming_train
+#   NUM_STORAGE_UNITS=64         # data_plane.num_storage_units
 #   DRY_RUN=1
 #   NUM_TRAIN_NODES / NUM_GEN_NODES / NUM_GYM_NODES  # override the 6K split
 #
@@ -47,18 +59,19 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 
 # Default config — callers may still override CONFIG_PATH explicitly.
-export CONFIG_PATH="${CONFIG_PATH:-${SCRIPT_DIR}/pipeclean_6k.yaml}"
+export CONFIG_PATH="${CONFIG_PATH:-${SCRIPT_DIR}/pipeclean_6k_sc.yaml}"
+
+# The SC driver. data_plane.enabled=true (set in the config) is mandatory for it.
+export TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/run_grpo_single_controller.py}"
 
 # =============================================================================
-# Site defaults
+# Site defaults — identical to launch_6k_pipeclean.sh
 # =============================================================================
-# Paths on the GB200 cluster where this recipe was validated: the checkpoint,
-# blend and judges the 6K runs used, so a bare invocation reproduces them.
-# Export any of these to point elsewhere.
+# Kept byte-identical to the baseline wrapper on purpose: the SC comparison is
+# only meaningful if both runs read the same checkpoint, blend and judges.
 # =============================================================================
 export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/jiaqiz/models/ultra_stage2sft_step300}"
 export TRAIN_PATH="${TRAIN_PATH:-/lustre/fsw/portfolios/llmservice/users/jiaqiz/data/gym/rl-data-tools/blends/curriculum_v35_inescapable-sawfly.train.efforts0p15_qamathcode.jsonl}"
-# The reference runs validate on the training blend; there is no separate split.
 export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/images/high_stripe/rl.nightly.sqsh}"
@@ -74,10 +87,9 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservi
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_sw_pre}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # A 6K allocation may additionally need SLURM_QOS, SLURM_RESERVATION and
-# EXCLUDE_NODES. They are left unset because a reservation you do not hold
-# makes sbatch fail outright; see ultra_launch.sh for the variable names.
+# EXCLUDE_NODES; see launch_6k_pipeclean.sh.
 
-# 6K node split (~33% train / ~63% gen / ~4% gym). Callers may override.
+# 6K node split, identical to the legacy pipeclean. Callers may override.
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-512}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-960}"
 export NUM_GYM_NODES="${NUM_GYM_NODES:-64}"
@@ -85,10 +97,18 @@ export NUM_GYM_NODES="${NUM_GYM_NODES:-64}"
 # CP=16 is baked into pipeclean_6k.yaml; allow an override for memory experiments.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"
 
+# The two SC knobs worth sweeping without editing the config. Lowering
+# STREAM_MIN_GROUPS starts the optimizer step earlier on partial cohorts;
+# NUM_STORAGE_UNITS is the untuned one at this data volume.
+STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-256}"
+NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-64}"
+
 # Sensible defaults for short 6K hero / pipeclean allocations when unset.
-export EXP_NAME="${EXP_NAME:-ultra-6k-pipeclean}"
+export EXP_NAME="${EXP_NAME:-ultra-6k-pipeclean-sc}"
 export WALLTIME="${WALLTIME:-4:00:00}"
 
 exec bash "${SCRIPT_DIR}/ultra_launch.sh" \
   "policy.megatron_cfg.context_parallel_size=${CONTEXT_PARALLEL_SIZE}" \
+  "async_rl.min_groups_for_streaming_train=${STREAM_MIN_GROUPS}" \
+  "data_plane.num_storage_units=${NUM_STORAGE_UNITS}" \
   "$@"

@@ -2,13 +2,12 @@
 # Nemotron 3 Ultra — 6K-GPU pipeclean (1536 nodes × 4 GPUs, 128K context)
 # =============================================================================
 # Scale validation / pipeclean recipe for GRPO on 1536 GB200 NVL72 nodes
-# (6144 GPUs). Ported from the internal ultra-v3-posttraining 6k-pipecleaning
-# recipe (`grpo_ultra_1536n4g_bf16.yaml` + `launch_ultra_1536n.sh`) onto the
-# public Ultra YAML schema used by `ultra_launch.sh`.
+# (6144 GPUs), on the Ultra YAML schema used by `ultra_launch.sh`.
 #
 # Cluster shape (1536 nodes × 4 GPUs = 6144 GPUs):
 #   Training 512 / vLLM 960 / Gym 64. Override via NUM_TRAIN_NODES, etc.
-#   Ratio matches the 768n internal recipe (~33% train / ~63% gen / ~4% gym).
+#   Ratio (~33% train / ~63% gen / ~4% gym) is carried over from the validated
+#   768-node shape.
 #
 # Training parallelism: TP=8, EP=64, CP=16, PP=1, SP=true.
 #   CP=16 (vs CP=8 on the 256n Student RLVR stages) is required at 128K
