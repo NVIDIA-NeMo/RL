@@ -1,0 +1,131 @@
+# Super Omni image MOPD over the public NeMo-Gym circle-count environment.
+#
+# This recipe is intentionally a small overlay on the validated MTP-disabled
+# Super Omni GRPO recipe. It adds one non-colocated Super teacher node and
+# switches the advantage/loss to MOPD while retaining main's packed CP=2 image
+# path. The default teacher equals the student checkpoint, so the first-step
+# valid-token advantage mean should be near zero; override the teacher mapping
+# with a stronger Omni checkpoint for real distillation.
+#
+# Resources (10 nodes x 8 GPUs):
+#   1 generation node + 1 teacher node + 8 policy nodes.
+#
+# Required overrides:
+#   policy.model_name=/path/to/super_omni_hf
+#   data.train.data_path=/path/to/circle_count.jsonl
+#   data.validation.data_path=/path/to/circle_count.jsonl
+
+defaults: vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+checkpointing:
+  checkpoint_dir: results/mopd-nemotron-super-omni-circle-count
+  metric_name: null
+  keep_top_k: 1
+  save_period: 10
+
+cluster:
+  num_nodes: 10
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_epochs: 5
+  max_num_steps: 200
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  seq_logprob_error_threshold: 2
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    # Quiesce generation before refit so encoder-cache invalidation is ordered
+    # after the weight update and before any post-refit image request.
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+  adv_estimator:
+    name: opd
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  disable_ppo_ratio: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: icepop
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.2
+  sequence_level_importance_ratios: false
+  token_level_loss: false
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+policy:
+  train_global_batch_size: 64
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    # Inherited: TP=8, EP=16, CP=2, sequence packing enabled, MTP disabled.
+    mtp_num_layers: 0
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  train:
+    data_path: /path/to/circle_count_train.jsonl
+  validation:
+    data_path: /path/to/circle_count_train.jsonl
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/circle_count/configs/circle_count.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          max_input_tokens: ${policy.max_total_sequence_length}
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+
+on_policy_distillation:
+  enabled: true
+  teacher_model_by_agent_name:
+    circle_count_simple_agent: ${policy.model_name}
+  default_teacher_alias: circle_count_simple_agent
+  strict_agent_name_match: true
+  deduplicate_shared_teacher_checkpoints: true
+  non_colocated_teachers:
+    enabled: true
+    default_teacher_cfg:
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8
+      context_parallel_size: 1
+      num_nodes: 1
+      gpus_per_node: 8
+      precision: bf16
+      micro_batch_size: 1
+      moe_shared_expert_overlap: false
+
+logger:
+  log_dir: logs/mopd-nemotron-super-omni-circle-count
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: mopd-nemotron-super-omni
+    name: mopd-nemotron-super-omni-circle-count
