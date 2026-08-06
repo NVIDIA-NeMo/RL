@@ -27,6 +27,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    _token_capture_metrics,
     NemoGym,
     NemoGymConfig,
     build_reward_component_columns,
@@ -521,3 +522,78 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+class TestTokenCaptureMetrics:
+    """The numbers that make silent training loss visible.
+
+    The failure they exist to catch is a rollout that looks healthy -- green
+    run, moving reward -- while most of its calls were quarantined because the
+    chat template dropped earlier reasoning and the prompts stopped chaining.
+    """
+
+    def test_summarizes_a_healthy_batch(self):
+        per_rollout = [
+            {
+                "delivered_fraction": 1.0,
+                "quarantined_fraction": 0.0,
+                "n_calls": 4,
+                "chains": 1,
+            },
+            {
+                "delivered_fraction": 1.0,
+                "quarantined_fraction": 0.0,
+                "n_calls": 6,
+                "chains": 1,
+            },
+        ]
+        got = _token_capture_metrics(per_rollout, rebuilt=2, unbuilt=0)
+        assert got["token_capture/rebuilt_fraction"] == 1.0
+        assert got["token_capture/delivered_fraction_mean"] == 1.0
+        assert got["token_capture/calls_per_rollout_mean"] == 5.0
+        assert got["token_capture/masked_rollouts"] == 0.0
+
+    def test_surfaces_partial_delivery(self):
+        """A reasoning model whose history is stripped: the chain breaks, most of
+        the rollout is quarantined, and the run would otherwise look fine."""
+        per_rollout = [
+            {
+                "delivered_fraction": 0.2,
+                "quarantined_fraction": 0.75,
+                "n_calls": 8,
+                "chains": 4,
+            },
+            {
+                "delivered_fraction": 0.25,
+                "quarantined_fraction": 0.7,
+                "n_calls": 8,
+                "chains": 3,
+            },
+        ]
+        got = _token_capture_metrics(per_rollout, rebuilt=2, unbuilt=0)
+        assert got["token_capture/delivered_fraction_mean"] < 0.3
+        assert got["token_capture/quarantined_fraction_mean"] > 0.7
+        assert got["token_capture/chains_per_rollout_mean"] == 3.5
+
+    def test_counts_masked_incomplete_and_unbuilt(self):
+        per_rollout = [
+            {
+                "capture_incomplete": True,
+                "empty_generation_calls": 1,
+                "parent_link_fallbacks": {"parent_digest_mismatch": 2},
+            },
+            {"empty_generation_calls": 2, "parent_link_fallbacks": {}},
+        ]
+        # The mask verdict is counted from the build, not read out of the metrics dict, because
+        # Gym now puts it at the top of the rollout record and leaves only reasons in the dict.
+        got = _token_capture_metrics(per_rollout, rebuilt=1, unbuilt=1, masked=1)
+        assert got["token_capture/masked_rollouts"] == 1.0
+        assert got["token_capture/incomplete_rollouts"] == 1.0
+        assert got["token_capture/empty_generation_calls"] == 3.0
+        # Fallback reasons are counted per reason, then summed across the batch.
+        assert got["token_capture/parent_link_fallbacks"] == 2.0
+        assert got["token_capture/rollouts_unbuilt"] == 1.0
+        assert got["token_capture/rebuilt_fraction"] == 0.5
+
+    def test_emits_nothing_when_capture_is_off(self):
+        assert _token_capture_metrics([], rebuilt=0, unbuilt=0) == {}
