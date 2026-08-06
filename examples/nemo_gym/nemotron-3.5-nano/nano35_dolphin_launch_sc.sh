@@ -11,7 +11,8 @@ set -euo pipefail
 #
 # Shape (GB200, 4 GPUs/node -> 256 GPUs), unchanged from the baseline so the
 # two runs are comparable:
-#   16 train + 32 generation + 16 gym = 64 nodes
+#   8 train + 40 generation + 16 gym = 64 nodes  (5:1 generation-to-training)
+# GenRM adds 4 nodes from its own allocation, so the campaign footprint is 68.
 #
 # This is a thin wrapper over nano35_dolphin_launch.sh, which already carries
 # every site default (model, blend, judges, container, mounts, caches, Slurm).
@@ -33,9 +34,9 @@ set -euo pipefail
 #
 # Optional:
 #   NRL_MAX_STEPS=10             # short pipeclean
-#   STREAM_MIN_GROUPS=64         # async_rl.min_groups_for_streaming_train
+#   STREAM_MIN_GROUPS=32         # async_rl.min_groups_for_streaming_train
 #   MAX_LOOKAHEAD_VERSIONS=1     # async_rl.sampler.max_lookahead_versions
-#   NUM_STORAGE_UNITS=16         # data_plane.num_storage_units
+#   NUM_STORAGE_UNITS=8          # data_plane.num_storage_units
 #   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
 #
 # Extra positional args are forwarded as Hydra overrides, after ours, so they win.
@@ -50,7 +51,7 @@ export TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/run_grpo_single_controll
 
 # Distinct from the baseline's EXP_NAME so this starts a new W&B run, run dir
 # and singleton job name rather than colliding with the async-1 baseline.
-export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc-tp4_cp4_ep16_pp1_gpp16_pps256_gbs4096}"
+export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc-tp4_cp4_ep16_pp1_gpp16_pps128_gbs2048}"
 
 # The SC knobs worth sweeping without editing the config.
 #
@@ -59,8 +60,8 @@ export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc
 # MAX_LOOKAHEAD_VERSIONS is the off-policyness ceiling; raising it also raises
 # the two capacity floors below, which validate_sampler_buffer_capacity
 # enforces (max_buffered_rollouts >= num_prompts_per_step * (lookahead + 1)).
-STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-64}"
-NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-16}"
+STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-32}"
+NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-8}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-1}"
 
 # Shard-to-shard weight refit, on by default in this variant. It is still
@@ -68,7 +69,8 @@ MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-1}"
 # restores the full-tensor broadcast that rlvr_dolphin.yaml uses.
 REFIT_TRANSPORT="${REFIT_TRANSPORT:-nccl_reshard}"
 
-_BUFFER_CAPACITY=$(( 256 * (MAX_LOOKAHEAD_VERSIONS + 1) ))
+_NUM_PROMPTS_PER_STEP="${_NUM_PROMPTS_PER_STEP:-128}"
+_BUFFER_CAPACITY=$(( _NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1) ))
 
 echo "================================================================"
 echo "  Nemotron 3.5 Nano — RLVR SingleController (honest-dolphin)"
@@ -76,7 +78,7 @@ echo "================================================================"
 echo "  Entrypoint : ${TRAIN_ENTRYPOINT}"
 echo "  Config     : ${CONFIG_PATH}"
 echo "  Refit      : ${REFIT_TRANSPORT}"
-echo "  Streaming  : min ${STREAM_MIN_GROUPS} of 256 groups per dispatch"
+echo "  Streaming  : min ${STREAM_MIN_GROUPS} of ${_NUM_PROMPTS_PER_STEP} groups per dispatch"
 echo "  Lookahead  : ${MAX_LOOKAHEAD_VERSIONS} (buffer ${_BUFFER_CAPACITY} groups)"
 echo "  TQ units   : ${NUM_STORAGE_UNITS}"
 echo "================================================================"

@@ -17,8 +17,12 @@
 # top-6 + 1 shared, 32 heads / 2 KV, mamba n_groups=8, MTP 1 layer, vocab 131072.
 #
 # Node budget (GB200, 4 GPU/node), sbatch --nodes=64:
-#   16 train + 32 generation  -> cluster.num_nodes = 48
+#   8 train + 40 generation   -> cluster.num_nodes = 48
 #   16 gym                    -> env.nemo_gym.num_gpu_nodes = 16
+#
+# A 5:1 generation-to-training split. GenRM is served from a SEPARATE
+# allocation (2 replicas x 2 nodes = 4 nodes), so the campaign footprint is 68
+# nodes even though this job asks for 64.
 # =============================================================================
 defaults: ../nemotron-3-ultra/student_rlvr1.yaml
 
@@ -41,10 +45,10 @@ checkpointing:
   save_optimizer: true
 
 grpo:
-  # Stability setting: halve the prompt groups while retaining 16 generations
-  # per prompt. This yields 4096 samples/step and an async replay-buffer
-  # capacity of 512 groups instead of 1024.
-  num_prompts_per_step: 256
+  # Stability setting: cut the prompt groups while retaining 16 generations per
+  # prompt. This yields 2048 samples/step and an async replay-buffer capacity
+  # of 256 groups.
+  num_prompts_per_step: 128
   # Validation is effectively off in the reference; genrm cohort envs are
   # train-only and would hang under eval.
   val_period: 10000000
@@ -62,8 +66,11 @@ grpo:
 policy:
   model_name: /lustre/fsw/portfolios/llmservice/users/venkats/training_actual_0603/nano_n3_post/checkpoints/nano-3.5-sft-v10-closethink-unmask-orig6k-from-midtrain-100B-lc-lr2e-5/eval/iter_0006000/hf
 
-  # Must equal num_prompts_per_step * num_generations_per_prompt: 256 * 16.
-  train_global_batch_size: 4096
+  # Must equal num_prompts_per_step * num_generations_per_prompt: 128 * 16.
+  # Over DP=2 (32 training GPUs / TP4 x CP4 x PP1) this is 1024 sequences per
+  # data-parallel rank — the same per-rank load as the 16-node / GBS 4096 shape
+  # this replaces, so per-GPU memory pressure is unchanged.
+  train_global_batch_size: 2048
 
   # Ultra base is 49152. Reference nano runs 73728.
   max_total_sequence_length: 73728
@@ -101,8 +108,9 @@ policy:
       # collective, so MegatronPolicyWorker rank=0/22 aborted with it.
       # 0.80 frees ~9 GiB per GPU against a 3.69 GiB staging buffer.
       # The 40-node smoke run refit fine at 0.85 because it had 32 generation
-      # ranks; at 128 ranks the collective's buffer is larger. Costs some KV
-      # cache, so slightly lower generation throughput.
+      # ranks; the buffer grows with that count. This shape has 160, more than
+      # the 128 that OOM'd, so 0.80 is a floor to watch rather than a settled
+      # value. Costs some KV cache, so slightly lower generation throughput.
       gpu_memory_utilization: 0.80
       # nano_v3 reasoning parser + qwen3_coder tool parser are inherited and are
       # correct for this checkpoint: its chat template emits <think> and the
@@ -117,7 +125,8 @@ policy:
       enabled: false
       resources:
         gpus_per_node: 4
-        num_nodes: 32
+        # Overridden by the launch script via NUM_GEN_NODES.
+        num_nodes: 40
 
 # -----------------------------------------------------------------------------
 # Data — the launcher overrides these; defaults point at the reference blend.

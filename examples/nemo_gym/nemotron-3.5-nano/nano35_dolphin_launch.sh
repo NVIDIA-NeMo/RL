@@ -66,7 +66,7 @@ unset GENRM_MODEL
 # EXP_NAME drives the W&B run name, the singleton job name, and the checkpoint
 # and log dirs — so changing it starts a *new* run rather than resuming.
 # -----------------------------------------------------------------------------
-export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-async1-tp4_cp4_ep16_pp1_gpp16_pps512_gbs8192}"
+export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-async1-tp4_cp4_ep16_pp1_gpp16_pps128_gbs2048}"
 export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_dolphin.yaml}"
 
 # -----------------------------------------------------------------------------
@@ -215,8 +215,10 @@ export RESULTS_DIR="${RESULTS_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai
 
 # -----------------------------------------------------------------------------
 # SLURM
-# Job shape matches the reference: 16 train + 32 gen + 16 gym = 64 GB200 nodes
-# (4 GPUs each). SEGMENT_SIZE=2 is the nano value; ultra defaults to 16.
+# Job shape: 8 train + 40 gen + 16 gym = 64 GB200 nodes (4 GPUs each), a 5:1
+# generation-to-training split. GenRM runs in its own allocation (2 replicas x
+# 2 nodes), so the campaign footprint is 68 nodes.
+# SEGMENT_SIZE=2 is the nano value; ultra defaults to 16.
 # Partition `batch` caps at 4 h (batch_long is 7 d), so WALLTIME is 4 h and
 # CHECKPOINTING_SAVE_BY keeps the reference's 25-minute teardown margin.
 # -----------------------------------------------------------------------------
@@ -227,8 +229,8 @@ export WALLTIME="${WALLTIME:-4:00:00}"
 # Match the launcher's 60-minute idle-GPU reaper exemption.
 export JOB_REAPER_EXEMPT_IDLE_MINS="${JOB_REAPER_EXEMPT_IDLE_MINS:-60}"
 export CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-00:03:35:00}"
-export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-16}"
-export NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
+export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-8}"
+export NUM_GEN_NODES="${NUM_GEN_NODES:-40}"
 export NUM_GYM_NODES="${NUM_GYM_NODES:-16}"
 export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 
