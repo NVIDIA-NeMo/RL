@@ -67,6 +67,17 @@ self-consistent: it is the combination NeMo-RL ships and CI expects. Use
 `--bridge-ref <sha|ref>` to test a specific Bridge, or `--bridge-ref image` to
 keep whatever the image carries (only useful for reproducing an old run).
 
+One case overrides that default on its own. When the registry holds an open
+Bridge fix with a `fix_branch`, `run_suite.sh` checks that branch out instead
+and logs `carrying unmerged Megatron-Bridge fix '<branch>'`. The pinned Bridge
+necessarily lags megatron-core `main` by however long it has been since NeMo-RL
+bumped the submodule, so an mcore change to an API Bridge uses breaks every test
+at import until the Bridge-side fix merges *and* NeMo-RL advances the pin — a
+window of weeks, during which the default pin makes each sweep re-report a break
+that is already fixed in review. Read the `BRIDGE_REF=` line rather than
+assuming: if it names a branch, the run is not on the shipped combination, and
+that belongs in the report note.
+
 ## Which NeMo-RL is under test
 
 The third leg is pinned the same way, and by default it is **not** plain `main`.

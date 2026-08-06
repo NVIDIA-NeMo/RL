@@ -43,9 +43,22 @@ uv run --script .agents/nemo-rl-testing-agent/scripts/known_issues.py annotate \
 Each failure comes back in one of three states.
 
 **`known`** — already diagnosed, with its fix linked. The entry's diagnosis is
-written into the test's comment for you. Do not investigate; do not open another
-fix branch. If the fix has been sitting in review, chasing the reviewer is the
-useful action, not re-debugging the bug.
+written into the test's comment for you, and the status drops to
+`fail (pre-existing)`, because an entry only ever exists for a break the PR did
+not cause. Do not investigate; do not open another fix branch. If the fix has
+been sitting in review, chasing the reviewer is the useful action, not
+re-debugging the bug.
+
+That downgrade is also why you must not record a break the PR *did* cause. The
+registry is cross-PR memory: an entry excuses this failure on every future run,
+including the one where it is somebody's fault. Report those against the author
+instead.
+
+Do not lean on `apply_baseline.py` to do that downgrade. It only fires when the
+cached baseline failed the same test, and the baseline runs on a stack that
+carries pending fixes — so the moment a fix exists, the baseline goes green and
+stops covering for anybody. That combination once had three innocent PRs
+reported as `fail` with a link to the fix printed directly underneath.
 
 **`STALE`** — the registry claims a fix **and that fix is already applied to the
 branch this run tested**, yet the test failed anyway. This is a genuine finding.
@@ -198,12 +211,25 @@ uv run --script .agents/nemo-rl-testing-agent/scripts/known_issues.py record \
   --id <stable-slug> --test <test name> \
   --signature "<error_signature verbatim from the results JSON>" \
   --diagnosis "One or two sentences a PR author can act on." \
-  --repo NVIDIA-NeMo/RL --fix-pr <n>          # omit --fix-pr if there is no fix
+  --repo NVIDIA-NeMo/RL --fix-pr <n> \        # omit --fix-pr if there is no fix
+  --fix-branch <branch> \                     # required for a Bridge or mcore fix
+  --first-seen-megatron-pr <N>
 ```
 
 Copy the signature verbatim; `normalize()` strips the run-specific parts. Never
 hand-write one containing a measured value — `median(...) < 1.1 (measured 3.37)`
 will not match the same bug measuring 2.01 next week.
+
+`--first-seen-megatron-pr` records which run surfaced the break, for tracing it
+back later. It is not a culprit: the break is usually older than that PR and
+often in another repository, so nothing reads it as blame.
+
+`--fix-branch` is load-bearing. It is what carries a **Megatron-Bridge or
+Megatron-LM** fix into subsequent runs at all: a
+NeMo-RL fix rides the integration branch, but a fix in another repository is
+checked out inside the container, and `run_suite.sh` looks the branch up here to
+decide. Omit it and the fix exists in review while every run keeps reproducing
+the bug it fixes — for as long as review takes.
 
 The registry entry is about the bug. If the investigation also taught you
 something about *how to investigate* — a place this skill sent you that was

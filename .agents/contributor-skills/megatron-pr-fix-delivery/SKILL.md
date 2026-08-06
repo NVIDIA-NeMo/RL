@@ -118,9 +118,11 @@ uv run --script .agents/nemo-rl-testing-agent/scripts/known_issues.py record \
 
 The first makes later runs recognise the failure instead of re-debugging it. The
 second puts the fix on the integration branch, so later runs do not hit the
-failure at all. Only NeMo-RL fixes ride the integration branch; a Megatron-Bridge
-or Megatron-LM fix still needs `--bridge-ref` / `--mcore-ref` on the run that
-depends on it, so make the registry entry say so.
+failure at all. Only NeMo-RL fixes ride the integration branch. A Megatron-Bridge
+or Megatron-LM fix is checked out inside the container instead, and the registry
+entry is the only thing that knows which branch that is — so record it with
+`--fix-branch`, and `run_suite.sh` will carry it until the fix merges. Leave it
+off and the branch you just pushed changes nothing about the next run.
 
 `sync_integration.sh` only picks up branches named `mcore-*-fix` whose PR is
 open, which is why the naming convention matters. If it reports

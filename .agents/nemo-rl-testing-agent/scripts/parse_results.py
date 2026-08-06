@@ -51,7 +51,8 @@ TEST_SKIP_RE = re.compile(
 PREP_FIELD_RE = re.compile(
     r"^(mcore_fetch_ref|mcore_sha|mcore_sha_before|mcore_subject|megatron_core_file"
     r"|bridge_fetch_ref|bridge_sha"
-    r"|nemo_rl_fetch_ref|nemo_rl_sha|nemo_rl_env_sha|nemo_rl_mode)=(.*)$"
+    r"|nemo_rl_fetch_ref|nemo_rl_sha|nemo_rl_env_sha|nemo_rl_mode"
+    r"|nemo_rl_url|mcore_url|bridge_url)=(.*)$"
 )
 
 # Ordered by how specific the signal is; the first pattern that matches when

@@ -45,6 +45,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Sibling script, imported for the provenance table so the two renderings cannot
+# drift apart. Safe to import: it declares no dependencies of its own and does
+# nothing at module scope. `uv run --script` sets sys.path[0] to this directory,
+# but a plain `python3 path/to/script.py` from elsewhere does too, so no path
+# fixing is needed.
+import post_report
+
 MARKER = "<!-- nrlta-watchdog -->"
 TITLE = "NeMo-RL vs megatron-core `main`: current functional-test breakage"
 FAILING = {"fail", "fail (pre-existing)", "incomplete", "pass (suspect)"}
@@ -72,6 +79,30 @@ def short(sha: str) -> str:
     return sha[:8] if sha else "unknown"
 
 
+def render_stack_section(results: dict[str, Any], meta: dict[str, str]) -> list[str]:
+    """The same provenance table the PR comments carry.
+
+    Shared rather than reimplemented because the two must not drift: this issue
+    and a PR comment can describe the same run, and the reader comparing them is
+    doing so precisely because something looks inconsistent. The old hand-rolled
+    version asserted a bare Bridge sha with no ref, which stopped being true the
+    moment runs could carry an unmerged Bridge fix branch in place of the pin.
+    """
+    if results.get("prep"):
+        return post_report.render_stack([results], heading="### Stack under test")
+
+    # A results payload with no prep block predates that record, so fall back to
+    # what the meta file carries rather than showing nothing.
+    return [
+        "### Stack under test",
+        "",
+        f"- megatron-core: `main` @ `{short(meta.get('MCORE_SHA', ''))}`",
+        f"- Megatron-Bridge: `{short(meta.get('BRIDGE_SHA', ''))}`",
+        f"- NeMo-RL: `main` plus the pending fixes below @ `{short(meta.get('NEMO_RL_SHA', ''))}`",
+        "",
+    ]
+
+
 def render(
     suite: str,
     results: dict[str, Any],
@@ -93,12 +124,7 @@ def render(
         "that is **not** caused by any particular Megatron-LM pull request, so that "
         "labeled PRs do not each have to rediscover it.",
         "",
-        "### Stack under test",
-        "",
-        f"- megatron-core: `main` @ `{short(meta.get('MCORE_SHA', ''))}`",
-        f"- Megatron-Bridge: `{short(meta.get('BRIDGE_SHA', ''))}`",
-        f"- NeMo-RL: `main` plus the pending fixes below @ `{short(meta.get('NEMO_RL_SHA', ''))}`",
-        "",
+        *render_stack_section(results, meta),
     ]
 
     applied = manifest.get("applied", [])

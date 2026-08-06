@@ -35,10 +35,18 @@ Two things keep it from becoming a source of wrong answers:
   ``annotate`` says so loudly instead of quietly labelling it known -- the entry
   is stale, or this is a different bug wearing the same signature.
 
+An entry does two things beyond naming the bug. It downgrades the failure out of
+`fail`, because an entry exists only for a break the revision under test did not
+cause. And, for a fix in a repo the integration branch cannot carry, it tells
+later runs which branch to check out, so a Bridge fix in review stops having to
+be remembered by hand on every submit.
+
 Usage:
     uv run --script known_issues.py annotate --results r.json [--integration m.json]
     uv run --script known_issues.py record --id <slug> --test <name> \
-        --signature "<error line>" --diagnosis "..." --repo owner/name --fix-pr 3363
+        --signature "<error line>" --diagnosis "..." --repo owner/name --fix-pr 3363 \
+        [--fix-branch <branch>] [--first-seen-megatron-pr <n>]
+    uv run --script known_issues.py pending-fix-ref --repo owner/name
     uv run --script known_issues.py refresh
     uv run --script known_issues.py list
 """
@@ -199,6 +207,26 @@ def cmd_annotate(args: argparse.Namespace) -> int:
 
         test["known_issue"] = issue.get("id")
         test["comment"] = build_comment(issue)
+
+        # An entry only ever describes a break that is *not* the fault of the
+        # revision under test -- triage records one after deciding the PR did not
+        # cause it, and a break the PR did cause is reported against the author
+        # rather than filed as cross-PR memory. So a match has to move the status
+        # as well as the comment, since `fail` means "this PR broke it". Leaving
+        # it alone once put three innocent PRs on the hook: the baseline had been
+        # taken on a stack carrying the fix, so `apply_baseline` had nothing to
+        # downgrade, and the report read `fail` with a link to the fix printed
+        # directly underneath.
+        #
+        # Note this deliberately does not consult first_seen_megatron_pr. That
+        # field records which PR's run first surfaced the break, which is not the
+        # same as which PR caused it and is usually not even the same repository
+        # -- the Bridge break below was first seen on Megatron-LM#5382 and caused
+        # by #5865, long merged. Reading it as the culprit would blame whichever
+        # PR had the bad luck to run first.
+        if test.get("status") == "fail":
+            test["status"] = "fail (pre-existing)"
+
         issue["last_seen_utc"] = now_utc()
         matched += 1
         fix = f"{issue.get('repo')}#{fix_pr}" if fix_pr else "no fix raised yet"
@@ -332,6 +360,46 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pending_fix_ref(args: argparse.Namespace) -> int:
+    """The branch a run must check out to carry an unmerged fix in one repo.
+
+    A NeMo-RL fix reaches later runs on its own: sync_integration.sh cherry-picks
+    every open `mcore-*-fix` PR onto the integration branch. A fix in
+    Megatron-Bridge or Megatron-LM cannot ride along, because the branch is a
+    NeMo-RL branch and those commits live in another repository -- they are
+    checked out inside the container instead. Without this lookup the operator has
+    to remember to pass `--bridge-ref` on every submit, and the sweep that forgets
+    reports a break that is already fixed in review as though the PR under test
+    caused it.
+
+    Prints one branch name, or nothing when no such fix is pending. Two pending
+    fixes in one repo cannot be combined into a single ref, so that is an error
+    rather than a silent pick.
+    """
+    registry = load(registry_path(args.registry))
+    branches = sorted(
+        {
+            issue["fix_branch"]
+            for issue in registry.get("issues", [])
+            if issue.get("state") in (None, "open")
+            and issue.get("repo") == args.repo
+            and issue.get("fix_branch")
+        }
+    )
+    if not branches:
+        return 0
+    if len(branches) > 1:
+        print(
+            f"known_issues: {len(branches)} unmerged fixes pending in {args.repo} "
+            f"({', '.join(branches)}); they cannot be carried by one ref. Merge one, "
+            "or pass the ref explicitly.",
+            file=sys.stderr,
+        )
+        return 1
+    print(branches[0])
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--registry", type=Path, help="Override $KNOWN_ISSUES_FILE.")
@@ -347,6 +415,15 @@ def main() -> int:
         help="integration.json manifest, so an already-applied fix is not credited twice.",
     )
     annotate.set_defaults(func=cmd_annotate)
+
+    pending = sub.add_parser(
+        "pending-fix-ref",
+        help="Print the branch carrying an unmerged fix for one repo, if any.",
+    )
+    pending.add_argument(
+        "--repo", required=True, help="Repo the fix lands in, owner/name."
+    )
+    pending.set_defaults(func=cmd_pending_fix_ref)
 
     record = sub.add_parser("record", help="Add or update an entry.")
     record.add_argument(

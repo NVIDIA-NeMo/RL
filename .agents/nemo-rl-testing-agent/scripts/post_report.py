@@ -128,6 +128,131 @@ def render_pending_fixes(manifest_path: Path | None) -> list[str]:
     ]
 
 
+def slug_of(url: str) -> str:
+    """owner/name out of a clone URL, in either of the forms we clone with."""
+    match = re.search(r"(?:github\.com[:/])([^/]+/[^/]+?)(?:\.git)?/?$", url or "")
+    return match.group(1) if match else ""
+
+
+def commit_link(sha: str, url: str) -> str:
+    short = sha[:8] if re.fullmatch(r"[0-9a-f]{40}", sha or "") else sha
+    slug = slug_of(url)
+    if not short:
+        return "?"
+    if not slug:
+        return f"`{short}`"
+    return f"[`{short}`](https://github.com/{slug}/commit/{sha})"
+
+
+def describe_ref(ref: str, url: str) -> str:
+    """What the ref means, not just what it is called.
+
+    A reader who has to decode `refs/pull/5382/head` or tell a 40-character
+    Bridge sha apart from a branch name is being asked to reconstruct the run,
+    which is the job this table exists to do for them.
+    """
+    if not ref or ref.startswith("<"):
+        return ref or "?"
+    pull = re.fullmatch(r"refs/pull/(\d+)/head", ref)
+    if pull:
+        slug = slug_of(url)
+        number = pull.group(1)
+        link = (
+            f"[#{number}](https://github.com/{slug}/pull/{number})"
+            if slug
+            else f"#{number}"
+        )
+        return f"{link} head"
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        return "the sha NeMo-RL pins"
+    return f"`{ref.removeprefix('refs/heads/')}`"
+
+
+def describe_bridge_ref(ref: str) -> str:
+    """Whether the Bridge under test is the one NeMo-RL ships, or a substitute.
+
+    Only a sha is the pin. Anything else is an override -- normally a fix branch
+    the harness carried because the fix is still in review -- and that changes
+    what a green table means: the suite passed against a Bridge that nobody can
+    `pip install` yet. Saying only the branch name leaves the reader to infer it.
+    """
+    if re.fullmatch(r"[0-9a-f]{40}", ref or ""):
+        return "the sha NeMo-RL pins"
+    if not ref or ref.startswith("<"):
+        return "whatever the container image carries"
+    return f"`{ref}` — an override, **not** the Bridge NeMo-RL pins"
+
+
+def render_stack(
+    payloads: list[dict[str, Any]], heading: str = "**Exactly what was tested**"
+) -> list[str]:
+    """Exactly which three revisions produced the table below.
+
+    Every one of them is a choice the harness made rather than an obvious
+    default: megatron-core is the PR's head, Megatron-Bridge is either NeMo-RL's
+    pin or an unmerged fix branch checked out in its place, and NeMo-RL is
+    normally a fork branch of `main` plus fixes still in review. A reader who
+    cannot see that cannot tell what a green table is a statement about, and the
+    shas were previously retyped by hand into `--meta`, where the refs were lost
+    and a typo looked exactly like a result.
+    """
+    prep: dict[str, str] = {}
+    baseline: dict[str, str] = {}
+    for payload in payloads:
+        prep = prep or (payload.get("prep") or {})
+        baseline = baseline or (payload.get("baseline") or {})
+    if not prep:
+        return []
+
+    rows = [
+        (
+            "megatron-core",
+            describe_ref(prep.get("mcore_fetch_ref", ""), prep.get("mcore_url", "")),
+            commit_link(prep.get("mcore_sha", ""), prep.get("mcore_url", "")),
+        ),
+        (
+            "Megatron-Bridge",
+            describe_bridge_ref(prep.get("bridge_fetch_ref", "")),
+            commit_link(prep.get("bridge_sha", ""), prep.get("bridge_url", "")),
+        ),
+        (
+            "NeMo-RL",
+            describe_ref(
+                prep.get("nemo_rl_fetch_ref", ""), prep.get("nemo_rl_url", "")
+            ),
+            commit_link(prep.get("nemo_rl_sha", ""), prep.get("nemo_rl_url", "")),
+        ),
+    ]
+    lines = [
+        heading,
+        "",
+        "| Component | Ref | Commit |",
+        "| --- | --- | --- |",
+    ]
+    lines += [f"| {name} | {ref} | {sha} |" for name, ref, sha in rows]
+    if baseline.get("mcore_sha"):
+        lines += [
+            "",
+            "Compared against a baseline of the same suite on megatron-core `main` at "
+            + commit_link(baseline["mcore_sha"], prep.get("mcore_url", ""))
+            + ".",
+        ]
+    lines += [""]
+    return lines
+
+
+# Superseded by the stack table, which says the same thing with the ref that
+# gives each sha its meaning. Kept out of the header rather than rejected at the
+# CLI so that an older invocation still renders, just without the duplication.
+STACK_META_KEYS = {
+    "mcore_sha",
+    "bridge_sha",
+    "nemo_rl_sha",
+    "base_sha",
+    "baseline_main_sha",
+}
+
+
 def render(
     state: str,
     results_files: list[Path],
@@ -136,8 +261,12 @@ def render(
     integration: Path | None = None,
 ) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    payloads = [json.loads(path.read_text()) for path in results_files]
+    stack = render_stack(payloads)
     meta_bits = [
-        f"{key.replace('_', ' ')}: `{value}`" for key, value in meta.items() if value
+        f"{key.replace('_', ' ')}: `{value}`"
+        for key, value in meta.items()
+        if value and not (stack and key in STACK_META_KEYS)
     ]
     meta_bits.append(f"updated {stamp}")
 
@@ -147,6 +276,7 @@ def render(
         "",
         " · ".join(meta_bits),
         "",
+        *stack,
         *render_pending_fixes(integration),
     ]
 
@@ -163,8 +293,7 @@ def render(
         lines += ["", note or "See the run log for details."]
     else:
         rows: list[tuple[str, str, str]] = []
-        for path in results_files:
-            payload: dict[str, Any] = json.loads(path.read_text())
+        for payload in payloads:
             for test in payload.get("tests", []):
                 status = test.get("status", "unknown")
                 icon = STATUS_ICONS.get(status, "")

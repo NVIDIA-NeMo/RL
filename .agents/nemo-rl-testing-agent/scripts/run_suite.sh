@@ -171,6 +171,24 @@ else
   fi
 fi
 
+# One thing outranks the pin below: a Megatron-Bridge fix this agent has already
+# raised and that is still in review. A NeMo-RL fix reaches later runs on its own
+# because sync_integration.sh cherry-picks it onto the integration branch, but a
+# Bridge commit cannot ride a NeMo-RL branch, so it would otherwise have to be
+# remembered as --bridge-ref on every single submit. Forgetting it does not
+# produce a missing result, it produces a confidently wrong one: the break shows
+# up against whichever PR happens to be under test, weeks after it was diagnosed
+# and fixed. The registry knows the branch, so ask it rather than the operator.
+if [[ -z "${bridge_ref}" ]]; then
+  pending_bridge_ref="$(uv run --script "${NRLTA_SCRIPT_DIR}/known_issues.py" \
+    pending-fix-ref --repo "${MEGATRON_BRIDGE_REPO}")" || nrlta_die \
+    "could not decide which Megatron-Bridge fix to carry; pass --bridge-ref explicitly"
+  if [[ -n "${pending_bridge_ref}" ]]; then
+    bridge_ref="${pending_bridge_ref}"
+    nrlta_log "carrying unmerged Megatron-Bridge fix '${bridge_ref}' (known-issues registry)"
+  fi
+fi
+
 # Default the Bridge pin to the one the NeMo-RL *under test* points at, which is
 # the combination NeMo-RL ships. Pairing a current megatron-core with a Bridge
 # from anywhere else breaks every test deep inside Bridge and reads as the

@@ -101,12 +101,21 @@ uv run --script .agents/nemo-rl-testing-agent/scripts/post_report.py \
   --results ~/.nemo-rl-testing-agent/pr-5700/l1.results.json \
   --results ~/.nemo-rl-testing-agent/pr-5700/l2.results.json \
   --integration ~/.nemo-rl-testing-agent/integration.json \
-  --meta megatron-lm=<HEAD_SHA> --meta merged-with-main=<BASE_SHA> \
   --meta cluster=oci-hsg --meta image=nvcr.io/nvidian/nemo-rl:nightly
 ```
 
 Results files render in the order given, so pass L1 before L2. Add `--dry-run`
 to review the markdown first — always do this before the first post on a PR.
+
+Do not pass revisions as `--meta`. The report builds an **Exactly what was
+tested** table out of the `prep` block the run recorded, naming the ref *and*
+the commit for megatron-core, Megatron-Bridge and NeMo-RL, each linked to the
+repository it was actually fetched from. Ref and commit have to travel together:
+a bare sha cannot distinguish the Bridge NeMo-RL pins from a fix branch carried
+in its place, and a NeMo-RL sha links nowhere useful unless the reader knows it
+came from a fork. Hand-typed shas were also a silent source of error — nothing
+checked them against the run, so a stale copy-paste read exactly like a result.
+`--meta` is for what the run does not record, such as the cluster and image.
 
 **Always pass `--integration`.** Runs carry NeMo-RL fixes that are raised but not
 merged, so a green table means "green with those applied", and a reader entitled
