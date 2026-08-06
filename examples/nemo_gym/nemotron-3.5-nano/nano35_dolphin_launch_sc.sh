@@ -35,7 +35,8 @@ set -euo pipefail
 # Optional:
 #   NRL_MAX_STEPS=10             # short pipeclean
 #   STREAM_MIN_GROUPS=32         # async_rl.min_groups_for_streaming_train
-#   MAX_LOOKAHEAD_VERSIONS=1     # async_rl.sampler.max_lookahead_versions
+#   MAX_LOOKAHEAD_VERSIONS=4     # async_rl.sampler.max_lookahead_versions
+#                                # 1 restores parity with the async-1 baseline
 #   NUM_STORAGE_UNITS=8          # data_plane.num_storage_units
 #   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
 #
@@ -62,7 +63,7 @@ export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc
 # enforces (max_buffered_rollouts >= num_prompts_per_step * (lookahead + 1)).
 STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-32}"
 NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-8}"
-MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-1}"
+MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-4}"
 
 # Shard-to-shard weight refit, on by default in this variant. It is still
 # experimental, so keep the escape hatch one env var away: REFIT_TRANSPORT=null

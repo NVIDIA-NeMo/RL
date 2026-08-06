@@ -118,17 +118,20 @@ async_rl:
   # cohort at most this many optimizer steps before the step that trains on it,
   # so the reported `lag` settles there once generation is the bottleneck.
   #
-  # 1 mirrors the baseline's grpo.async_grpo.max_trajectory_age_steps=1, which
-  # is what makes this run comparable to it. Raising it buys deeper
-  # generation/training overlap at the cost of policy freshness; the loss
-  # already compensates via truncated importance sampling (inherited
+  # 4 buys deep generation/training overlap at the cost of policy freshness,
+  # matching the 6K Ultra SC recipe. Note this is NOT the baseline's
+  # grpo.async_grpo.max_trajectory_age_steps=1, so the two runs are no longer
+  # iso-off-policy: a quality difference between them is confounded with the
+  # staleness difference, and only throughput is cleanly comparable.
+  #
+  # The loss compensates via truncated importance sampling (inherited
   # use_importance_sampling_correction with truncated_importance_sampling_ratio
-  # 5), but watch token_mult_prob_error and is_oob_ratio if you do — if they
-  # climb, the correction is covering too large a policy gap. Raising this also
-  # requires raising max_inflight_prompts and max_buffered_rollouts below.
+  # 5), but watch token_mult_prob_error and is_oob_ratio — if they climb, the
+  # correction is being asked to cover too large a policy gap. Drop to 1 (which
+  # does mirror the baseline) if training destabilizes.
   sampler:
     name: in_order
-    max_lookahead_versions: 1
+    max_lookahead_versions: 4
 
   recompute_kv_cache_after_weight_updates: false
 
@@ -138,15 +141,15 @@ async_rl:
   # validated smaller-scale streaming runs used to get 2-3 chunks per step.
   min_groups_for_streaming_train: 32
 
-  # Let the current cohort and the one lookahead cohort generate concurrently:
-  # num_prompts_per_step * (max_lookahead_versions + 1) = 128 * 2.
-  max_inflight_prompts: 256
+  # Let the current cohort and all four lookahead cohorts generate
+  # concurrently: num_prompts_per_step * (max_lookahead_versions + 1) = 128 * 5.
+  max_inflight_prompts: 640
 
   # Hard floor, not a preference: validate_sampler_buffer_capacity raises if
-  # this is below num_prompts_per_step * (max_lookahead_versions + 1) = 256,
+  # this is below num_prompts_per_step * (max_lookahead_versions + 1) = 640,
   # because the rollout pump would deadlock waiting for buffer slots. It scales
   # with the lookahead, so raising one raises both.
-  max_buffered_rollouts: 256
+  max_buffered_rollouts: 640
 
   diagnostics: false
 
@@ -163,10 +166,11 @@ data_plane:
   impl: transfer_queue
   backend: "simple"
   storage_capacity: 1000000
-  # UNVALIDATED AT THIS SHAPE. The smaller-scale reference uses 2 for 512
-  # rows/step at 73728 tokens; this recipe pushes 2048 rows/step at the same
-  # sequence length, and the lookahead of 1 keeps up to 256 groups (4096 rows)
-  # resident at once. 8 is proportional to the per-step volume, not measured —
+  # UNVALIDATED AT THIS SHAPE. This recipe pushes 2048 rows/step at 73728
+  # tokens, and the lookahead of 4 keeps up to 640 groups (10240 rows) resident
+  # at once. 8 is what the 6K recipe's 64 scales to, and per-step volume and
+  # peak resident volume happen to agree on that number; it is also generous,
+  # since 6K rows are 131072 tokens against our 73728. Not measured, though —
   # raise it first if the TQ storage actors bottleneck or OOM.
   num_storage_units: 8
   claim_meta_poll_interval_s: 0.5
