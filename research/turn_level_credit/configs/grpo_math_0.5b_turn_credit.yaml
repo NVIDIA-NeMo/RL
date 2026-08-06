@@ -1,0 +1,57 @@
+defaults: "../../../examples/configs/grpo_math_1B.yaml"
+
+# This block is owned and validated by the research entrypoint. It is kept
+# outside the core GRPO schema while the feature incubates under research/.
+turn_credit:
+  enabled: true
+  source: environment
+  environment_mode: immediate
+  discount: 1.0
+  macro_weight: 1.0
+  turn_weight: 0.2
+  raw_reward_atol: 1.0e-6
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_steps: 1
+  max_num_epochs: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-0.5B-Instruct"
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  generation:
+    max_new_tokens: 256
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.5
+
+env:
+  math:
+    num_workers: 1
+
+logger:
+  log_dir: "logs/turn-level-credit"
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 1
+
+data_plane:
+  enabled: false

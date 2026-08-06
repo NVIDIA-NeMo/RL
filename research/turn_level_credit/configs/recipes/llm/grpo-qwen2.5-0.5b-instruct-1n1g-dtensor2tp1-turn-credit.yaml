@@ -1,0 +1,10 @@
+defaults:
+  - ../../grpo_math_0.5b_turn_credit.yaml
+
+grpo:
+  max_num_steps: 10
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-qwen2.5-0.5b-turn-credit"
+  save_period: 10

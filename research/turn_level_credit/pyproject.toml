@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nemo-rl-turn-level-credit"
+version = "0.1.0"
+description = "Research implementation of turn-level credit assignment for NeMo RL"
+readme = "README.md"
+requires-python = ">=3.13.14,<3.14"
+dependencies = ["nemo-rl"]
+
+[dependency-groups]
+test = ["pytest>=7.0.0", "pytest-cov", "pytest-timeout"]
+
+[tool.uv.sources]
+nemo-rl = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["turn_level_credit"]
+
+[tool.pytest.ini_options]
+addopts = "--durations=15 -rA -x"
+testpaths = ["tests"]
+python_files = "test_*.py"
