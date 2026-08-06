@@ -15,7 +15,7 @@
 """Producer-side payload helpers for the async-RL TQ path."""
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -65,7 +66,10 @@ def record_to_train_batch(
     # add_grpo_token_loss_masks_and_generation_logprobs would be too late.
     backfill_missing_routed_experts(message_logs)
 
-    prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
+    prompt_message_logs = cast(
+        list[LLMMessageLogType],
+        extract_initial_prompt_messages(message_logs, prompt_lengths),
+    )
     prompt_flat, _ = batched_message_log_to_flat_message(
         prompt_message_logs,
         pad_value_dict=dict(pad_value_dict),  # type: ignore

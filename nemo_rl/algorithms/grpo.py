@@ -1749,7 +1749,7 @@ def extract_initial_prompt_messages(
     result: list[LLMMessageLogType | VLMMessageLogType] = []
     for message_log, prompt_len in zip(message_logs, prompt_lengths.tolist()):
         prompt_len = int(prompt_len)
-        prompt_msgs: LLMMessageLogType | VLMMessageLogType = []
+        prompt_msgs: LLMMessageLogType = []
         cumulative = 0
         for msg in message_log:
             if cumulative >= prompt_len:

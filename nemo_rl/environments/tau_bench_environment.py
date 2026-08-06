@@ -175,8 +175,10 @@ class TauBenchWorker:
             # Build a mock litellm.completion that returns random customer-like text.
             # Applied as a scoped patch only around tau-bench's reset/step calls so
             # other litellm users in the same worker process are not affected.
-            _latency = mock_user_latency_s
-            _stop_prob = mock_stop_prob
+            assert mock_user_latency_s is not None
+            assert mock_stop_prob is not None
+            _latency: float = mock_user_latency_s
+            _stop_prob: float = mock_stop_prob
             _responses = [
                 "I need help with a recent order.",
                 "Can you look into this for me?",
@@ -314,7 +316,8 @@ class TauBenchWorker:
         tau_reward rather than blending with 0.0.
         """
         if self._mock_judge:
-            time.sleep(self._mock_judge_latency_s)
+            if self._mock_judge_latency_s is not None:
+                time.sleep(self._mock_judge_latency_s)
             return random.random()
 
         import litellm
@@ -649,7 +652,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
     def step(
         self,
         message_log_batch: List[LLMMessageLogType],
-        metadata_batch: List[TauBenchEnvMetadata],
+        metadata: List[TauBenchEnvMetadata],
     ) -> EnvironmentReturn[TauBenchEnvMetadata]:
         """Run one environment step for each sample in the batch.
 
@@ -659,7 +662,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
         Args:
             message_log_batch: Full conversation histories; only the last message
                                (the most recent assistant turn) is used.
-            metadata_batch: Per-episode state, including task_index and episode_id.
+            metadata: Per-episode state, including task_index and episode_id.
 
         Returns:
             EnvironmentReturn with tool results or user responses as observations.
@@ -668,7 +671,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
         message_batch = [ml[-1]["content"] for ml in message_log_batch]
 
         chunked_messages = chunk_list_to_workers(message_batch, self._num_workers)
-        chunked_metadata = chunk_list_to_workers(metadata_batch, self._num_workers)
+        chunked_metadata = chunk_list_to_workers(metadata, self._num_workers)
 
         futures = [
             self._workers[i].execute.remote(
@@ -691,7 +694,8 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
             rewards_list.extend(rew)
             new_metadata.extend(meta)
 
-        next_stop_strings = [["</tool_call>"]] * len(message_log_batch)
+        stop: list[str] | None = ["</tool_call>"]
+        next_stop_strings: list[list[str] | None] = [stop] * len(message_log_batch)
 
         return EnvironmentReturn(
             observations=observations,
