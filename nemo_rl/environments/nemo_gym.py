@@ -630,6 +630,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     "with enable_return_routed_experts."
                 )
 
+            # The next prompt prefill supplies the real route for the previous
+            # turn's final token, whose decode route was padded.
+            if routed_experts is not None and seen_token_ids:
+                previous_routes = nemo_rl_message_log[-1].get("routed_experts")
+                if isinstance(previous_routes, torch.Tensor):
+                    previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
+
             prompt_start = len(seen_token_ids)
             prompt_end = len(prompt_token_ids)
             generation_start = prompt_end
