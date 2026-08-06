@@ -33,7 +33,65 @@ Legacy SWE runs recover training tokens by echoing token ids in every model
 response and re-tokenizing the agent's rendered history each turn. Both are
 lossy for a reasoning model — the chat template strips `<think>` content from
 history, and re-tokenizing an assistant turn can split differently than the
-tokens the model actually sampled. Token capture replaces that path:
+tokens the model actually sampled. Token capture replaces that path.
+
+### Anatomy of one rollout
+
+The call flow for a single SWE rollout, end to end:
+
+1. **Dispatch.** The `SingleControllerActor`'s rollout pump pulls a prompt
+   group from the dataset and hands it to the NemoGym environment actor,
+   which POSTs `/run` to the `swe_agents_train` Gym server. The run body
+   carries a fresh `ng_rollout_id`; the gate **registers** the rollout
+   (control plane) before any model call happens.
+2. **Sandbox + agent.** The SWE harness materializes the SWE-bench instance
+   in a sandbox and starts the OpenHands agent. The rollout id is snapshotted
+   into the agent's config so every LLM request it makes can be attributed
+   back to this rollout (`metadata.ng_rollout_id` on the request body).
+3. **Agent turn loop.** Each turn, OpenHands POSTs `/v1/chat/completions`
+   with the *full rendered history* to the policy model server, which runs
+   in **gate mode**:
+   - the gate admits the call (rejects unregistered rollouts), fingerprints
+     the incoming history, and resolves which previously served call this
+     one continues (its *parent*) in the lineage index;
+   - on a match it attaches the parent's **exact cumulative token ids**
+     (`required_prefix_token_ids`) plus a capture context
+     (`rollout_id`, `call_id`, `parent_call_id`, `prev_len`), and forwards
+     the request to a vLLM engine (rollout→engine affinity keeps a
+     rollout's calls on the engine holding its KV cache);
+   - no match (a true root, or a rewritten/condensed history) starts a new
+     chain — a fallback, never an error.
+4. **Generate + stage.** The vLLM worker splices the supplied prefix
+   verbatim, renders only the new tail through the chat template, and
+   generates. Before acknowledging the call it **stages the call's token
+   delta** — `rendered_prompt[prev_len:] + generated` ids, a loss mask
+   (0.0 on carried prompt, 1.0 on generated), and per-token logprobs — to
+   the TransferQueue staging partition (synchronous `tq_put`: bytes are
+   durable before the response leaves the worker). The response back to the
+   gate carries only text plus token-light `CommitCoords` (~4 B/token).
+5. **Commit.** The gate ingests the coords into its lineage index (this
+   *is* the authoritative commit — the next turn's parent resolution
+   depends on it), strips them, and returns a plain OpenAI-shaped
+   completion to the agent. Steps 3-5 repeat for every tool call the agent
+   makes (tool execution happens agent-side between turns).
+6. **Verify + seal.** When the agent finishes, the harness runs the
+   SWE-bench verifier to score the patch (reward 0/1). The `/run` response
+   returns the reward plus a **token-free `RolloutReceipt`**: the ordered
+   manifest of committed calls (call ids, staging keys, digests, weight
+   versions) and a `terminal_call_id` naming the chain that is the
+   training row.
+7. **Finalize.** Trainer-side, the `BlackboxFinalizer` fetches the staged
+   deltas the manifest names from TQ, re-verifies each (digest, lengths,
+   mask shape, weight-version tags), linearizes the terminal chain into one
+   exact token row, and publishes it to the training partition — a rejected
+   rollout becomes a masked placeholder so the GRPO group keeps its shape.
+   Staged rows are cleared after publish.
+8. **Train.** Once a global batch of rows is buffered, the SC takes an
+   optimizer step and syncs weights to the engines; the bumped
+   `weight_version` is stamped on subsequent calls so refit boundaries are
+   visible in the data.
+
+The token path in that flow, compressed:
 
 ```
 agent (nv-OpenHands)                     gate (vllm_model, gate mode)
