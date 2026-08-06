@@ -16,7 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import numpy as np
 import torch
@@ -30,6 +30,13 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
+
+
+class PerformanceMetricsConfig(Protocol):
+    """Algorithm config fields required by performance metric reporting."""
+
+    num_prompts_per_step: int
+    num_generations_per_prompt: int
 
 
 def get_gdpo_reward_component_keys(batch) -> list[str]:
@@ -520,9 +527,10 @@ def print_performance_metrics(
     train_results: dict[str, float],
     metrics: dict[str, Any],
     timing_metrics: dict[str, float],
-    master_config: dict,
+    master_config: Any,
+    algorithm_config: PerformanceMetricsConfig,
 ) -> dict[str, float]:
-    """Print performance metrics for GRPO."""
+    """Print performance metrics for policy-optimization algorithms."""
 
     # =====================================================
     # Generate Token Imbalance Visualization
@@ -740,11 +748,7 @@ def print_performance_metrics(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
-    if (
-        "exposed_generation" in timing_metrics
-        and master_config.grpo.async_grpo.enabled
-        and not colocated_inference
-    ):
+    if "exposed_generation" in timing_metrics and not colocated_inference:
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -764,16 +768,10 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    # Detect which algorithm config key is being used
-    grpo_config = getattr(master_config, "grpo", None)
-    algo_config = grpo_config or getattr(master_config, "ppo", None) or {}
-    if isinstance(algo_config, dict):
-        num_prompts_per_step = algo_config.get("num_prompts_per_step", 1)
-        num_generations_per_prompt = algo_config.get("num_generations_per_prompt", 1)
-    else:
-        num_prompts_per_step = algo_config.num_prompts_per_step
-        num_generations_per_prompt = algo_config.num_generations_per_prompt
-    number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
+    number_of_samples_per_step = (
+        algorithm_config.num_prompts_per_step
+        * algorithm_config.num_generations_per_prompt
+    )
 
     if colocated_inference:
         training_num_gpus = total_num_gpus

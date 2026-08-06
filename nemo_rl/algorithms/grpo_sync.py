@@ -1342,7 +1342,11 @@ def grpo_train_sync(
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
-                train_results, metrics, timing_metrics, master_config
+                train_results,
+                metrics,
+                timing_metrics,
+                master_config,
+                master_config.grpo,
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")

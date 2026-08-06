@@ -39,6 +39,12 @@ grpo:
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    gae_lambda: 0.95
+    gae_gamma: 1.0
+    normalize_advantages: true
+    gae_lambda_value: null
+    gae_lambda_policy: null
+    length_adaptive_alpha: 0.0
   reward_scaling:
     enabled: false
     source_min: 0.0
