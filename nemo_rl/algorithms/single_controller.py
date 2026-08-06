@@ -2069,6 +2069,14 @@ class SingleControllerActor:
             if self._is_ppo:
                 returns = torch.zeros_like(mask)
 
+        adv_result = self._advantage_estimator.compute_advantage(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            repeated_batch=repeated_batch,
+            **kwargs,
+        )
+        advantages = adv_result.advantages
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(

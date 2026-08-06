@@ -3423,7 +3423,7 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    train_data["advantages"] = adv_estimator.compute_advantage(
+                    adv_result = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
@@ -3431,6 +3431,7 @@ def grpo_train(
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
+                    train_data["advantages"] = adv_result.advantages
                     del prompt_ids_for_adv
 
                     # Log rewards and advantages information
@@ -5032,7 +5033,7 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    train_data["advantages"] = adv_estimator.compute_advantage(
+                    adv_result = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
@@ -5049,11 +5050,9 @@ def async_grpo_train(
                         generation_logprobs=train_data["generation_logprobs"],
                         sample_mask=train_data["sample_mask"],
                     )
-                    if (
-                        hasattr(adv_estimator, "last_metrics")
-                        and adv_estimator.last_metrics
-                    ):
-                        rollout_metrics.update(adv_estimator.last_metrics)
+                    train_data["advantages"] = adv_result.advantages
+                    if adv_result.metrics:
+                        rollout_metrics.update(adv_result.metrics)
                     del prompt_ids_for_adv
 
                     # Log advantages stats

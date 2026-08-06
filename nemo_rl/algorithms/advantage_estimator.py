@@ -28,7 +28,8 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Protocol, runtime_checkable
 
 import torch
 from pydantic import BaseModel
@@ -41,6 +42,38 @@ from nemo_rl.algorithms.utils import (
     masked_mean,
     masked_var,
 )
+
+
+@dataclass
+class AdvantageResult:
+    """What every advantage estimator returns.
+
+    ``returns`` is ``None`` for estimators that have no value target (everything
+    except GAE and the raw-reward estimator), and ``metrics`` carries anything the
+    estimator wants logged, so callers no longer read it off the instance.
+    """
+
+    advantages: torch.Tensor
+    returns: torch.Tensor | None = None
+    metrics: dict[str, float] = field(default_factory=dict)
+
+
+@runtime_checkable
+class AdvantageEstimator(Protocol):
+    """The contract the algorithm loops rely on.
+
+    Declared as a ``Protocol`` rather than a base class so that estimators living
+    outside ``nemo_rl`` satisfy it structurally, without having to import from
+    here.
+    """
+
+    def compute_advantage(
+        self,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        **kwargs: object,
+    ) -> AdvantageResult: ...
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
@@ -111,7 +144,7 @@ class GRPOAdvantageEstimator:
                 std.unsqueeze(-1)[non_zero_std_mask] + epsilon
             )
 
-        return advantages.expand(mask.shape)
+        return AdvantageResult(advantages.expand(mask.shape))
 
 
 class GDPOAdvantageEstimator:
@@ -203,7 +236,7 @@ class GDPOAdvantageEstimator:
         else:
             advantages = advantages - advantages.mean()
 
-        return advantages.expand(mask.shape)
+        return AdvantageResult(advantages.expand(mask.shape))
 
 
 class ReinforcePlusPlusAdvantageEstimator:
@@ -281,7 +314,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         adv_rstd = adv_var.clamp(min=1e-8).rsqrt()
         adv = (adv - adv_mean) * adv_rstd
 
-        return adv
+        return AdvantageResult(adv)
 
 
 class RawRewardAdvantageEstimator:
@@ -313,7 +346,7 @@ class RawRewardAdvantageEstimator:
             adv_rstd = adv_var.clamp(min=1e-8).rsqrt()
             adv = (adv - adv_mean) * adv_rstd
 
-        return adv, None
+        return AdvantageResult(adv)
 
 
 class GeneralizedAdvantageEstimator:
@@ -511,7 +544,7 @@ class GeneralizedAdvantageEstimator:
         if self.normalize_advantages:
             advantages = self._reward_whiten(advantages, mask)
         advantages = torch.masked_fill(advantages, ~(mask.bool()), 0)
-        return advantages, returns
+        return AdvantageResult(advantages, returns)
 
     def _compute_gae(
         self,
@@ -589,7 +622,9 @@ class OPDAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
-        self.last_metrics: dict[str, float] = {}
+        # Configs are accepted for a uniform constructor signature; this
+        # estimator derives everything it needs from compute_advantage's kwargs.
+        del estimator_config, loss_config
 
     def compute_advantage(
         self,
@@ -623,13 +658,15 @@ class OPDAdvantageEstimator:
         # Apply mask
         advantages = distill_advantages * mask
 
-        # Metrics
-        self._compute_metrics(distill_advantages, advantages, mask)
+        return AdvantageResult(
+            advantages,
+            metrics=self._compute_metrics(distill_advantages, advantages, mask),
+        )
 
-        return advantages
-
-    def _compute_metrics(self, distill_advantages, advantages, mask):
-        """Compute OPD logging metrics and store in self.last_metrics."""
+    def _compute_metrics(
+        self, distill_advantages, advantages, mask
+    ) -> dict[str, float]:
+        """Compute OPD logging metrics."""
         valid_bool = mask.bool()
         distill_valid = torch.masked_select(distill_advantages, valid_bool)
         adv_valid = torch.masked_select(advantages, valid_bool)
@@ -638,7 +675,7 @@ class OPDAdvantageEstimator:
         adv_mean = adv_valid.mean().item() if adv_valid.numel() > 0 else 0.0
         adv_std = adv_valid.std().item() if adv_valid.numel() > 1 else 0.0
 
-        self.last_metrics = {
+        return {
             "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
             "on_policy_distillation/adv_mean": adv_mean,
             "on_policy_distillation/adv_std": adv_std,
