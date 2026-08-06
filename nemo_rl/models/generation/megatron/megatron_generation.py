@@ -67,6 +67,7 @@ class MegatronGeneration(GenerationInterface):
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
+        skip_weight_load: bool = False,
     ):
         """Initialize a MegatronGeneration instance.
 
@@ -80,12 +81,16 @@ class MegatronGeneration(GenerationInterface):
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
+            skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
 
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
+        )
+        assert not (skip_weight_load and policy is not None), (
+            "skip_weight_load only applies to the dedicated inference policy."
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
@@ -120,6 +125,7 @@ class MegatronGeneration(GenerationInterface):
             init_optimizer=False,
             init_reference_model=False,
             weights_path=weights_path,
+            skip_weight_load=skip_weight_load,
         )
 
         # Start the persistent inference engine + HTTP server during construction.
