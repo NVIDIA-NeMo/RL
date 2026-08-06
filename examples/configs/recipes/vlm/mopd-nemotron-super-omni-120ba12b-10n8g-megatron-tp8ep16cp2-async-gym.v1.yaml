@@ -78,6 +78,10 @@ policy:
       # the successful vLLM 0.20 Super run, with ample 16K-context capacity.
       gpu_memory_utilization: 0.5
       enforce_eager: true
+    vllm_kwargs:
+      # vLLM 0.25 auto-selects FlashInfer TRTLLM, whose blocked expert layout
+      # cannot accept the HF-shaped tensors used by collective refit.
+      moe_backend: triton
 
 data:
   train:
