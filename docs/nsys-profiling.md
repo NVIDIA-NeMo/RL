@@ -45,6 +45,28 @@ Common additions:
 - `cuda-memory-usage`: track host/device memory allocations (`"true"`).
 - `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
 
+> [!WARNING]
+> **`capture-range-end=stop-shutdown` kills the profiled workers.** Nsight's docs
+> state the session "will be shutdown" at the capture range end, and a signal is
+> sent to the target app (see `--kill`). In practice every profiled worker dies
+> the moment the range closes, so the run ends at the profiled step. The upside
+> is that reports are finalized *there* rather than at process exit, so they
+> survive even if the job is later cancelled.
+>
+> Pick deliberately:
+> - `stop` (the built-in default) — workers keep running; reports are written at
+>   process exit, and are **lost** if the job is killed or crashes first.
+> - `stop-shutdown` — reports guaranteed at the capture range, run ends there.
+>   Right choice for a one-shot profiling job, wrong choice if the run must
+>   continue afterwards.
+>
+> **`gpu-metrics-device` is not supported on all GPUs.** Where it is not (e.g.
+> GB200), nsys rejects the flag with `Illegal --gpu-metrics-devices usage. None
+> of the installed GPUs are supported`, Ray's nsight plugin fails its validation
+> and raises `RuntimeEnvSetupError`. That kills only the actors whose
+> runtime-env agent rejected it, so you silently lose *some* workers' traces
+> rather than getting a clean failure.
+
 Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
 payload raises at startup so misconfiguration surfaces immediately.
 
@@ -116,7 +138,7 @@ When profiling is enabled, it generates the following logs and files:
    trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```
-For TensorRT-LLM, the meaningful generation profiles are the per-internal-GPU-worker files (`trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`), one per GPU (replicas × TP). If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
+For TensorRT-LLM, the meaningful generation profiles are the per-internal-GPU-worker files (`trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`), one per GPU (replicas × TP). If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is rewritten **on disk** (`nemo_rl/models/generation/vllm/patches.py::_patch_vllm_ray_nsight_config`) to use `capture-range=cudaProfilerApi` (deferred capture). It has to be a source patch rather than an in-memory monkeypatch: vLLM configures its Ray executor inside a spawned `EngineCore` subprocess, which does not inherit a class rebind from the worker actor. Without the override, vLLM's built-in config traces `cuda,cudnn,cublas` from process start for the whole run, which skews ranks enough to trip the NCCL watchdog (a 600s `_ALLGATHER_BASE` timeout) and abort the generation workers. This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 
