@@ -14,7 +14,7 @@
 """Unit tests for the mooncake_cpu-specific wire workarounds.
 
 Covers:
-  P1 — `promote_1d` round-trip: writer unsqueezes 1D → (N,1), reader squeezes back.
+  P1 — schema-declared 1D scalar round-trip through the Mooncake workaround.
   P2 — pack_per_token_field: tolerates SP padding wider than max(lengths).
 
 No Ray, no GPU, no transfer_queue required.
@@ -45,11 +45,12 @@ def test_promote_1d_leaves_unsqueezes_1d() -> None:
 
     n = 8
     t = torch.arange(n, dtype=torch.float32)
-    td = TensorDict({"reward": t}, batch_size=[n])
+    td = TensorDict({"input_lengths": t}, batch_size=[n])
 
     out = _promote_1d_leaves(td)
-    assert out["reward"].shape == (n, 1), (
-        f"Expected wire shape ({n}, 1) but got {tuple(out['reward'].shape)}."
+    assert out["input_lengths"].shape == (n, 1), (
+        "Expected input_lengths to use the Mooncake wire shape "
+        f"({n}, 1), got {tuple(out['input_lengths'].shape)}."
     )
 
 
@@ -64,14 +65,14 @@ def test_promote_1d_roundtrip_via_from_wire() -> None:
 
     n = 6
     original = torch.arange(n, dtype=torch.float32)
-    td = TensorDict({"reward": original}, batch_size=[n])
+    td = TensorDict({"input_lengths": original}, batch_size=[n])
 
     wire = _promote_1d_leaves(td)
-    assert wire["reward"].shape == (n, 1)
+    assert wire["input_lengths"].shape == (n, 1)
 
     back = _from_wire(wire)
-    assert back["reward"].shape == (n,)
-    assert torch.equal(back["reward"], original)
+    assert back["input_lengths"].shape == (n,)
+    assert torch.equal(back["input_lengths"], original)
 
 
 def test_from_wire_densifies_uniform_nested_rows() -> None:
@@ -80,17 +81,17 @@ def test_from_wire_densifies_uniform_nested_rows() -> None:
 
     from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
 
-    rows = [torch.tensor([i], dtype=torch.float32) for i in range(4)]
+    rows = [torch.tensor([i, i + 1], dtype=torch.float32) for i in range(4)]
     wire = TensorDict(
-        {"reward": torch.nested.as_nested_tensor(rows, layout=torch.jagged)},
+        {"input_ids": torch.nested.as_nested_tensor(rows, layout=torch.jagged)},
         batch_size=[len(rows)],
     )
 
     back = _from_wire(wire)
 
-    assert not back["reward"].is_nested
-    assert back["reward"].shape == (len(rows),)
-    assert torch.equal(back["reward"], torch.arange(len(rows), dtype=torch.float32))
+    assert not back["input_ids"].is_nested
+    assert back["input_ids"].shape == (len(rows), 2)
+    assert torch.equal(back["input_ids"], torch.stack(rows))
 
 
 def test_from_wire_preserves_genuine_length_one_token_column() -> None:
@@ -102,7 +103,7 @@ def test_from_wire_preserves_genuine_length_one_token_column() -> None:
     n = 4
     wire = TensorDict(
         {
-            "reward": torch.nested.as_nested_tensor(
+            "total_reward": torch.nested.as_nested_tensor(
                 [torch.tensor([float(i)]) for i in range(n)], layout=torch.jagged
             ),
             "input_ids": torch.nested.as_nested_tensor(
@@ -112,92 +113,91 @@ def test_from_wire_preserves_genuine_length_one_token_column() -> None:
         batch_size=[n],
     )
 
-    back = _from_wire(wire, promoted_1d_fields={"reward"})
+    back = _from_wire(wire)
 
-    assert back["reward"].shape == (n,)
+    assert back["total_reward"].shape == (n,)
     assert back["input_ids"].shape == (n, 1)
     assert torch.equal(back["input_ids"], torch.arange(n).unsqueeze(-1))
 
 
-def test_wire_shape_tags_roundtrip_promoted_field_names() -> None:
-    """Durable tags distinguish scalar and length-one tensor columns."""
+def test_from_wire_rejects_invalid_declared_field_shape() -> None:
+    """A corrupted scalar wire shape fails at the data-plane boundary."""
     from tensordict import TensorDict
 
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _add_wire_shape_tags,
-        _promoted_1d_fields_from_tags,
-        _strip_wire_shape_tags,
-    )
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+
+    wire = TensorDict({"input_lengths": torch.ones(3, 2)}, batch_size=[3])
+
+    with pytest.raises(ValueError, match=r"input_lengths.*\(N, 1\)"):
+        _from_wire(wire)
+
+
+def test_promote_1d_leaves_rejects_undeclared_1d_field() -> None:
+    """New scalar fields must be added to the authoritative schema."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
+
+    fields = TensorDict({"new_scalar": torch.arange(3)}, batch_size=[3])
+
+    with pytest.raises(ValueError, match="not declared.*PROMOTE_1D_FIELDS"):
+        _promote_1d_leaves(fields)
+
+
+def test_promote_1d_leaves_rejects_invalid_declared_field_shape() -> None:
+    """A schema-declared scalar cannot silently change its user-level rank."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
+
+    fields = TensorDict({"input_lengths": torch.ones(3, 2)}, batch_size=[3])
+
+    with pytest.raises(ValueError, match=r"input_lengths.*shape \(N,\)"):
+        _promote_1d_leaves(fields)
+
+
+def test_put_samples_uses_schema_without_private_shape_tags(monkeypatch) -> None:
+    """Mooncake promotion changes tensors but not user-provided TQ tags."""
+    from tensordict import TensorDict
+
+    import nemo_rl.data_plane.adapters.transfer_queue as tq_adapter
 
     n = 3
-    fields = TensorDict(
+    original_fields = TensorDict(
         {
-            "reward": torch.arange(n, dtype=torch.float32),
+            "input_lengths": torch.arange(n),
             "input_ids": torch.arange(n).unsqueeze(-1),
         },
         batch_size=[n],
     )
     user_tags = [{"weight_version": 7} for _ in range(n)]
 
-    wire_tags = _add_wire_shape_tags(user_tags, fields)
+    def fake_kv_batch_put(
+        *,
+        keys: list[str],
+        partition_id: str,
+        fields: TensorDict,
+        tags: list[dict[str, object]],
+    ) -> None:
+        assert keys == ["a", "b", "c"]
+        assert partition_id == "train"
+        assert fields["input_lengths"].shape == (n, 1)
+        assert fields["input_ids"].shape == (n, 1)
+        assert tags == user_tags
 
-    assert _promoted_1d_fields_from_tags(wire_tags, ["reward", "input_ids"]) == {
-        "reward"
-    }
-    assert _strip_wire_shape_tags(wire_tags) == user_tags
-    assert all(
-        not any(key.startswith("__nemo_rl_promoted_1d__:") for key in tag)
-        for tag in user_tags
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", fake_kv_batch_put)
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._promote_1d = True
+
+    meta = client.put_samples(
+        ["a", "b", "c"], "train", fields=original_fields, tags=user_tags
     )
 
-
-def test_wire_shape_tags_legacy_rows_have_no_promotion_provenance() -> None:
-    """Rows written before wire-shape tags use the legacy decode path."""
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _promoted_1d_fields_from_tags,
-    )
-
-    assert _promoted_1d_fields_from_tags([], ["reward"]) is None
+    assert meta.tags == user_tags
 
 
-def test_wire_shape_tags_reject_mixed_codec_versions() -> None:
-    """A batch cannot safely mix tagged and legacy rows."""
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _WIRE_SHAPE_VERSION_TAG,
-        _add_wire_shape_tags,
-        _promoted_1d_fields_from_tags,
-    )
-
-    fields = TensorDict({"input_ids": torch.arange(4).reshape(2, 2)}, batch_size=[2])
-    wire_tags = _add_wire_shape_tags([{}, {}], fields)
-    wire_tags[1].pop(_WIRE_SHAPE_VERSION_TAG)
-
-    with pytest.raises(RuntimeError, match="wire-shape version"):
-        _promoted_1d_fields_from_tags(wire_tags, ["input_ids"])
-
-
-def test_wire_shape_tags_reject_partial_promotion_marker() -> None:
-    """All rows must agree that a field was promoted from one dimension."""
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _PROMOTED_1D_TAG_PREFIX,
-        _add_wire_shape_tags,
-        _promoted_1d_fields_from_tags,
-    )
-
-    fields = TensorDict({"reward": torch.arange(2)}, batch_size=[2])
-    wire_tags = _add_wire_shape_tags([{}, {}], fields)
-    wire_tags[1].pop(f"{_PROMOTED_1D_TAG_PREFIX}reward")
-
-    with pytest.raises(RuntimeError, match="promotion marker"):
-        _promoted_1d_fields_from_tags(wire_tags, ["reward"])
-
-
-def test_get_samples_uses_persisted_shape_tags(monkeypatch) -> None:
-    """The Mooncake adapter restores ranks using TQ's durable row metadata."""
+def test_get_samples_uses_static_shape_schema(monkeypatch) -> None:
+    """The Mooncake adapter restores scalar ranks without row metadata."""
     from tensordict import TensorDict
 
     import nemo_rl.data_plane.adapters.transfer_queue as tq_adapter
@@ -205,16 +205,15 @@ def test_get_samples_uses_persisted_shape_tags(monkeypatch) -> None:
     n = 3
     original = TensorDict(
         {
-            "reward": torch.arange(n, dtype=torch.float32),
+            "total_reward": torch.arange(n, dtype=torch.float32),
             "input_ids": torch.arange(n).unsqueeze(-1),
         },
         batch_size=[n],
     )
-    wire_tags = tq_adapter._add_wire_shape_tags([{} for _ in range(n)], original)
     wire_data = TensorDict(
         {
-            "reward": torch.nested.as_nested_tensor(
-                [row for row in original["reward"].unsqueeze(-1)],
+            "total_reward": torch.nested.as_nested_tensor(
+                [row for row in original["total_reward"].unsqueeze(-1)],
                 layout=torch.jagged,
             ),
             "input_ids": torch.nested.as_nested_tensor(
@@ -224,37 +223,25 @@ def test_get_samples_uses_persisted_shape_tags(monkeypatch) -> None:
         batch_size=[n],
     )
 
-    class FakeMeta:
-        size = n
-        is_ready = True
-        custom_meta = wire_tags
+    def fake_kv_batch_get(
+        *, keys: list[str], partition_id: str, select_fields: list[str]
+    ) -> TensorDict:
+        assert keys == ["a", "b", "c"]
+        assert partition_id == "train"
+        assert select_fields == ["total_reward", "input_ids"]
+        return wire_data
 
-        def select_fields(self, fields):
-            assert fields == ["reward", "input_ids"]
-            return self
-
-    class FakeClient:
-        def kv_retrieve_meta(self, *, keys, partition_id, create):
-            assert keys == ["a", "b", "c"]
-            assert partition_id == "train"
-            assert create is False
-            return FakeMeta()
-
-        def get_data(self, meta):
-            assert isinstance(meta, FakeMeta)
-            return wire_data
-
-    monkeypatch.setattr(
-        tq_adapter.tq, "get_client", lambda: FakeClient(), raising=False
-    )
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._promote_1d = True
 
-    restored = client.get_samples(["a", "b", "c"], "train", ["reward", "input_ids"])
+    restored = client.get_samples(
+        ["a", "b", "c"], "train", ["total_reward", "input_ids"]
+    )
 
-    assert restored["reward"].shape == (n,)
+    assert restored["total_reward"].shape == (n,)
     assert restored["input_ids"].shape == (n, 1)
-    assert torch.equal(restored["reward"], original["reward"])
+    assert torch.equal(restored["total_reward"], original["total_reward"])
     assert torch.equal(restored["input_ids"], original["input_ids"])
 
 

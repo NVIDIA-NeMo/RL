@@ -240,11 +240,11 @@ def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     this for mooncake_cpu; simple passes the tensor through unchanged.
     """
     n = 6
-    reward = torch.arange(n, dtype=torch.float32)
+    total_reward = torch.arange(n, dtype=torch.float32)
 
     tq_client_backends.register_partition(
         partition_id="smoke-1d",
-        fields=["reward"],
+        fields=["total_reward"],
         num_samples=n,
         consumer_tasks=["read"],
     )
@@ -252,21 +252,21 @@ def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     tq_client_backends.put_samples(
         sample_ids=keys,
         partition_id="smoke-1d",
-        fields=TensorDict({"reward": reward}, batch_size=[n]),
+        fields=TensorDict({"total_reward": total_reward}, batch_size=[n]),
     )
 
     meta = tq_client_backends.claim_meta(
         partition_id="smoke-1d",
         task_name="read",
-        required_fields=["reward"],
+        required_fields=["total_reward"],
         batch_size=n,
         timeout_s=30.0,
     )
     data = tq_client_backends.get_data(meta)
 
-    assert data["reward"].shape == reward.shape, (
-        f"Expected shape {tuple(reward.shape)} for 1D field, "
-        f"got {tuple(data['reward'].shape)}. "
+    assert data["total_reward"].shape == total_reward.shape, (
+        f"Expected shape {tuple(total_reward.shape)} for 1D field, "
+        f"got {tuple(data['total_reward'].shape)}. "
         "TQ must not unsqueeze 1D tensors silently (R-C2)."
     )
 
