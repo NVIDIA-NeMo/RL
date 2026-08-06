@@ -39,7 +39,11 @@
 #                        that requires a clean tree unless --allow-dirty is given.
 #   --allow-dirty        Permit `--nemo-rl-ref worktree` with uncommitted changes,
 #                        recording the diff alongside the run.
-#   --run-name <name>    cog run name (default nrlta-<suite>-<utc-stamp>).
+#   --run-name <name>    cog run name (default nrlta-<suite>-<utc-stamp>). Must be
+#                        unique per submission; re-using one is refused unless
+#                        --reuse-run-name is passed.
+#   --reuse-run-name     Submit under a run name that has already been used,
+#                        knowingly overwriting its artifacts.
 #   --tests "a b"        Run only these sub-tests (used by the fix loop).
 #   --time HH:MM:SS      Override the suite's Slurm time limit.
 #   --dry-run            Print the cog invocation without submitting.
@@ -58,6 +62,7 @@ bridge_ref=""
 nemo_rl_ref=""
 allow_dirty=0
 run_name=""
+reuse_run_name=0
 only_tests=""
 time_limit=""
 dry_run=0
@@ -71,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --nemo-rl-ref) nemo_rl_ref="$2"; shift 2 ;;
     --allow-dirty) allow_dirty=1; shift ;;
     --run-name) run_name="$2"; shift 2 ;;
+    --reuse-run-name) reuse_run_name=1; shift ;;
     --tests) only_tests="$2"; shift 2 ;;
     --time) time_limit="$2"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
@@ -82,17 +88,6 @@ done
 [[ -n "${mcore_ref}" ]] || nrlta_die "--mcore-ref is required"
 nrlta_require MEGATRON_CLONE_URL COG_CLUSTER COG_PARTITION GPUS_PER_NODE \
   CONTAINER_ROOT CONTAINER_MCORE_DIR CLUSTER_ARTIFACTS_ROOT NEMO_RL_REPO_PATH STATE_DIR
-
-# Default the Bridge pin to whatever this NeMo-RL checkout points at. Pairing a
-# current megatron-core with the image's older Bridge breaks every test at import.
-if [[ -z "${bridge_ref}" ]]; then
-  bridge_ref="$(git -C "${NEMO_RL_REPO_PATH}" rev-parse "HEAD:${BRIDGE_SUBMODULE_PATH}" 2>/dev/null || true)"
-  [[ -n "${bridge_ref}" ]] || nrlta_die \
-    "could not read the Megatron-Bridge pin at ${BRIDGE_SUBMODULE_PATH} from ${NEMO_RL_REPO_PATH}; pass --bridge-ref explicitly"
-fi
-if [[ "${bridge_ref}" == "image" ]]; then
-  bridge_ref=""
-fi
 
 case "${suite}" in
   l1)
@@ -118,6 +113,21 @@ run_name="${run_name:-nrlta-${suite}-$(date -u +%Y%m%d-%H%M%S)}"
 artifact_dir="${CLUSTER_ARTIFACTS_ROOT}/${run_name}"
 local_run_dir="${STATE_DIR}/runs/${run_name}"
 cog_log="${local_run_dir}/cog.log"
+
+# The run name is the identity of one submission: it names the artifact directory
+# the per-test logs are written to and the run directory the slurm .out files land
+# in. Re-using it puts two revisions' logs in one place, and nothing downstream can
+# separate them -- ensure_baseline.sh parses with `cat <slurm_log_dir>/*.out`, which
+# would concatenate both into a single results JSON. The prose said to use a fresh
+# name per attempt long before this guard existed and a resumed sweep still re-used
+# `-a1`, because the operator picking the name is not the one who knows it was
+# already spent. So it is checked rather than documented.
+if [[ -e "${cog_log}" && "${reuse_run_name}" -eq 0 && "${dry_run}" -eq 0 ]]; then
+  nrlta_die "$(printf '%s\n' \
+    "run name '${run_name}' was already used (${cog_log} exists)." \
+    "Bump the attempt suffix (-a1 -> -a2) so this submission gets its own artifacts," \
+    "or pass --reuse-run-name to overwrite the previous one knowingly.")"
+fi
 mkdir -p "${local_run_dir}"
 
 # Resolve which NeMo-RL is under test. Default to the integration branch: it is
@@ -159,6 +169,28 @@ else
       "If this is the integration branch, create it with sync_integration.sh first," \
       "or pass --nemo-rl-ref worktree to test the local checkout.")"
   fi
+fi
+
+# Default the Bridge pin to the one the NeMo-RL *under test* points at, which is
+# the combination NeMo-RL ships. Pairing a current megatron-core with a Bridge
+# from anywhere else breaks every test deep inside Bridge and reads as the
+# author's bug. This has to run after the NeMo-RL revision is resolved, and has
+# to read the pin out of that revision rather than out of the local checkout's
+# HEAD: those are different commits whenever the operator is on a branch, so
+# reading HEAD silently made the Bridge under test a property of the working tree
+# instead of the run.
+if [[ -z "${bridge_ref}" ]]; then
+  if [[ "${nemo_rl_ref}" == "worktree" ]]; then
+    bridge_ref="$(git -C "${NEMO_RL_REPO_PATH}" rev-parse "HEAD:${BRIDGE_SUBMODULE_PATH}" 2>/dev/null || true)"
+  else
+    git -C "${NEMO_RL_REPO_PATH}" fetch -q "${nemo_rl_url}" "${nemo_rl_ref}" 2>/dev/null || true
+    bridge_ref="$(git -C "${NEMO_RL_REPO_PATH}" ls-tree "${nemo_rl_sha}" "${BRIDGE_SUBMODULE_PATH}" 2>/dev/null | awk '{print $3}')"
+  fi
+  [[ -n "${bridge_ref}" ]] || nrlta_die \
+    "could not read the Megatron-Bridge pin at ${BRIDGE_SUBMODULE_PATH} from ${nemo_rl_sha}; pass --bridge-ref explicitly"
+fi
+if [[ "${bridge_ref}" == "image" ]]; then
+  bridge_ref=""
 fi
 
 nrlta_load_tokens
@@ -234,6 +266,14 @@ echo "NEMO_RL_SHA=${nemo_rl_sha}"
 echo "ARTIFACT_DIR=${artifact_dir}"
 echo "SLURM_LOG_DIR=${CLUSTER_RUNS_ROOT}/${run_name}/slurm"
 echo "COG_LOG=${cog_log}"
+# cog picks the QOS up from the environment rather than an argument, so it is
+# invisible in the submitted command line. Record it, and say so when it is
+# missing: the fallback is the cluster default, which is where a run silently
+# turns into a multi-hour queue wait for no visible reason.
+echo "QOS=${COG_SLURM_QOS:-<cluster default>}"
+if [[ -z "${COG_SLURM_QOS:-}" ]]; then
+  nrlta_log "COG_SLURM_QOS is unset; this job inherits the cluster's default QOS and may queue for hours"
+fi
 
 if [[ "${dry_run}" -eq 1 ]]; then
   printf 'cog'

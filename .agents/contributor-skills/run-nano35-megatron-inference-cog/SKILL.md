@@ -13,11 +13,17 @@ loading the existing Megatron dist-checkpoint instead of converting from HF.
 ## Cog and cluster prerequisites
 
 - Use `cog` from `~/cog` with the NeMo-RL repo profile installed. The profile
-  must resolve `~/RL` to the prebuilt `nvcr.io/nvidian/nemo-rl:nightly` image
+  must resolve `~/temp/RL` to the prebuilt `nvcr.io/nvidian/nemo-rl:nightly` image
   and reuse `/opt/nemo_rl_venv`; do not build a new image or venv.
 - Use the registered `oci-hsg` cluster. Its GB200 nodes are aarch64 and have
   4 GPUs per node. The QOS requires whole-node GPU allocations, so always pass
   `--gpus 4`, including jobs that use fewer GPUs internally.
+- `export COG_SLURM_QOS=interactive` before submitting. cog has no flag for the
+  QOS and reads that variable from the environment; left unset the job lands on
+  the cluster default, a much lower scheduling priority for the same request —
+  one pair of jobs sat pending 14 hours that way while identical `interactive`
+  ones started in seconds. `interactive` allows 4 nodes and 8 jobs per user, so
+  the 2-node Ray layout below fits, and it is preemptible.
 - Run NeMo-RL commands from `/opt/nemo-rl`, which contains the complete
   submodules and consistent environment. The synced workspace has empty
   `3rdparty` submodule directories; copy local `examples/` and `nemo_rl/`
@@ -104,10 +110,10 @@ already MTP-stripped.
 
 ```bash
 # 0. Sanity: profile resolves to nemo_rl + image = nightly
-cog profile --repo ~/RL --run-name nano35-mcore-gen --cluster-name oci-hsg
+cog profile --repo ~/temp/RL --run-name nano35-mcore-gen --cluster-name oci-hsg
 
 # 1. One-time per image: import the nightly sqsh (cached afterwards).
-cog prepare-image --repo ~/RL --cluster-name oci-hsg
+cog prepare-image --repo ~/temp/RL --cluster-name oci-hsg
 
 # 2. Mount the llmservice checkpoint tree (weights + HF config/tokenizer) into
 #    the container. cog only auto-mounts the coreai scratch root, so export this
@@ -133,7 +139,7 @@ MODEL_DIR=/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3.5-nano-s
 HF_DIR=/lustre/fsw/portfolios/llmservice/users/dmosallanezh/nemo-evaluator-rundirs/nano_v35/conversions/geshen_ultra_rl_v5_kd600_step30_fixedpath_20260520_1130/hf
 
 cog submit \
-  --repo ~/RL \
+  --repo ~/temp/RL \
   --cluster-name oci-hsg \
   --run-name nano35-mcore-gen \
   --gpus 4 --nodes 1 --ntasks-per-node 1 \
@@ -231,7 +237,7 @@ export COG_EXTRA_MOUNTS='/lustre/fsw/portfolios/llmservice/users/ksanthanam:/lus
 MODEL_DIR=/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3.5-nano-swe-step25/without_mtp
 HF_DIR=/lustre/fsw/portfolios/llmservice/users/dmosallanezh/nemo-evaluator-rundirs/nano_v35/conversions/geshen_ultra_rl_v5_kd600_step30_fixedpath_20260520_1130/hf
 
-cog submit --repo ~/RL --cluster-name oci-hsg --run-name ray-2node-nano35-math \
+cog submit --repo ~/temp/RL --cluster-name oci-hsg --run-name ray-2node-nano35-math \
   --gpus 4 --nodes 2 --ntasks-per-node 1 --partition batch --time 01:30:00 --job-name ray2node-nano35 \
   --launcher ray \
   --setup-command 'cp -rf examples/. /opt/nemo-rl/examples/ 2>/dev/null || true; cp -rf nemo_rl/. /opt/nemo-rl/nemo_rl/ 2>/dev/null || true' \
@@ -314,7 +320,7 @@ export COG_EXTRA_MOUNTS='/lustre/fsw/portfolios/llmservice/users/ksanthanam:/lus
 MODEL_DIR=/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3.5-nano-swe-step25/without_mtp
 HF_DIR=/lustre/fsw/portfolios/llmservice/users/dmosallanezh/nemo-evaluator-rundirs/nano_v35/conversions/geshen_ultra_rl_v5_kd600_step30_fixedpath_20260520_1130/hf
 
-cog submit --repo ~/RL --cluster-name oci-hsg --run-name nano35-mcore-noncolo \
+cog submit --repo ~/temp/RL --cluster-name oci-hsg --run-name nano35-mcore-noncolo \
   --gpus 4 --nodes 2 --ntasks-per-node 1 --partition batch --time 02:00:00 --job-name nano35-noncolo \
   --launcher ray \
   --setup-command 'cp -rf examples/. /opt/nemo-rl/examples/ 2>/dev/null || true; cp -rf nemo_rl/. /opt/nemo-rl/nemo_rl/ 2>/dev/null || true' \
@@ -388,7 +394,7 @@ export COG_EXTRA_MOUNTS='/lustre/fsw/portfolios/llmservice/users/ksanthanam:/lus
 MODEL_DIR=/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3.5-nano-swe-step25/without_mtp
 HF_DIR=/lustre/fsw/portfolios/llmservice/users/dmosallanezh/nemo-evaluator-rundirs/nano_v35/conversions/geshen_ultra_rl_v5_kd600_step30_fixedpath_20260520_1130/hf
 
-cog submit --repo ~/RL --cluster-name oci-hsg --run-name nano35-async-mxfp8 \
+cog submit --repo ~/temp/RL --cluster-name oci-hsg --run-name nano35-async-mxfp8 \
   --gpus 4 --nodes 2 --ntasks-per-node 1 --partition batch --time 04:00:00 --job-name nano35-async-mxfp8 \
   --launcher ray \
   --setup-command 'cp -rf examples/. /opt/nemo-rl/examples/ 2>/dev/null || true; cp -rf nemo_rl/. /opt/nemo-rl/nemo_rl/ 2>/dev/null || true' \
@@ -780,8 +786,8 @@ llmservice path with the cluster (or start the session from a scratch-local copy
 of the checkpoint) if you go the session route:
 
 ```bash
-cog session start --repo ~/RL --session-handle nano35 --gpus 4 --time 04:00:00 --partition batch
-cog session exec --session-handle nano35 --repo ~/RL \
+cog session start --repo ~/temp/RL --session-handle nano35 --gpus 4 --time 04:00:00 --partition batch
+cog session exec --session-handle nano35 --repo ~/temp/RL \
   --command 'cp -rf examples/. /opt/nemo-rl/examples/; cd /opt/nemo-rl && uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py --config examples/nemo_gym/grpo_nanov3.yaml ...same overrides...' \
   --wait-timeout 3600
 cog session stop --session-handle nano35

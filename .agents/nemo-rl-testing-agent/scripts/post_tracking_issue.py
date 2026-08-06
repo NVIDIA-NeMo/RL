@@ -157,24 +157,45 @@ def render(
         "| Test | Status | Assessment |",
         "| --- | --- | --- |",
     ]
+    # One registry entry routinely claims every test in the suite, so writing its
+    # diagnosis into each row turned the table into the same paragraph repeated
+    # seven times. Reference it from the row and write it out once below.
+    diagnoses: dict[str, str] = {}
     for test in tests:
         status = test.get("status", "unknown")
         icon = ICONS.get(status, "❔")
+        issue_id = test.get("known_issue")
         if status == "pass":
             assessment = "—"
         elif test.get("known_issue_stale"):
             assessment = (
                 "**Regressed after its fix was already applied. Needs investigation.**"
             )
-        elif test.get("known_issue"):
-            assessment = (test.get("comment") or "Known issue.").strip()
-            if "](http" not in assessment:
-                assessment += " **No fix raised yet.**"
+        elif issue_id:
+            diagnosis = (test.get("comment") or "Known issue.").strip()
+            if "](http" not in diagnosis:
+                diagnosis += " **No fix raised yet.**"
+            diagnoses.setdefault(issue_id, diagnosis)
+            assessment = f"Known issue `{issue_id}` (see below)."
         else:
             assessment = "**Not yet diagnosed.**"
         if test.get("metric_failure"):
             assessment = f"{test['metric_failure']}. {assessment}"
         lines.append(f"| `{test.get('name', '?')}` | {icon} {status} | {assessment} |")
+
+    if diagnoses:
+        lines += ["", "### Diagnoses", ""]
+        for issue_id, diagnosis in diagnoses.items():
+            affected = [
+                t.get("name", "?") for t in tests if t.get("known_issue") == issue_id
+            ]
+            lines += [
+                f"**`{issue_id}`** — {len(affected)} test(s): "
+                + ", ".join(f"`{name}`" for name in affected),
+                "",
+                diagnosis,
+                "",
+            ]
 
     if any(test.get("status") == "pass (suspect)" for test in tests):
         lines += [
