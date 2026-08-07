@@ -18,7 +18,7 @@ import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch

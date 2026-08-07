@@ -526,9 +526,9 @@ class TestSetup:
         assert metrics.parallel_wall_time_s is None
         assert metrics.parallel_init_enabled is None
 
-    def test_setup_timing_includes_nemo_gym_when_enabled(self, patched_factories):
-        """nemo_gym_init_time_s appears when NeMo-Gym is spun up."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+    def test_nemo_gym_noncolocated_finishes_deferred_load(self, patched_factories):
+        """Non-colocated + gym fans out gym / deferred-load / trainer together."""
+        mc = _make_master_config(colocated=False, backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -542,9 +542,55 @@ class TestSetup:
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
+            actor_args, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # _build_generation runs once (URL reservation only); the load is finished
+        # by _finish_deferred_generation inside the executor.
+        patched_factories["_build_generation"].assert_called_once()
+        _, gen_kwargs = patched_factories["_build_generation"].call_args
+        assert gen_kwargs.get("defer_model_load") is True
+        patched_factories["fake_gen"].load_and_start.assert_called_once_with()
+        assert actor_args.gen_handle is patched_factories["fake_gen"]
+        assert metrics.nemo_gym_init_time_s is not None
+        assert metrics.vllm_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
+
+    @pytest.mark.parametrize("colocated", [True, False])
+    def test_nemo_gym_vllm_init_time_includes_reserve_time(
+        self, patched_factories, colocated
+    ):
+        """vllm_init_time_s folds in the deferred-VllmGeneration reserve time.
+
+        With gym on, _build_generation(defer_model_load=True) does worker-group
+        spawn + port bind (no weight load). That elapsed time has to end up in
+        vllm_init_time_s alongside the deferred-load elapsed; otherwise gym-on
+        runs undercount vLLM setup by the worker-group span.
+        """
+        mc = _make_master_config(colocated=colocated, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        # Deferred _build_generation returns 3.0s of reserve time; _build_generation
+        # is only called once (for reservation), so this is the reserve span.
+        patched_factories["_build_generation"].return_value = (
+            patched_factories["fake_gen"],
+            3.0,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
             _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert metrics.nemo_gym_init_time_s is not None
+        # gen_load_time (from _finish_deferred_generation, unpatched) is ~0 in
+        # the test — the reserve time dominates and must be present.
+        assert metrics.vllm_init_time_s >= 3.0
 
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
