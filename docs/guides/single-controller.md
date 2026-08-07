@@ -159,9 +159,10 @@ SC reads its async knobs from `async_rl:` and **ignores `grpo.async_grpo:` entir
 
 ## Known Missing Features
 
-The SC path is still landing. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
+The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
-- Checkpointing and validation not yet wired (setup raises if enabled).
-- `prev_logprobs_required` / `reference_logprobs_required` gating is provisional — SC currently recomputes `prev_logprobs` even when the loss does not need them.
-- No `over_sampling_ratio` cap on the `windowed` sampler — over-produced groups aged past the window are evicted (wasted rollout compute).
-- Drain gate in refit is not supported yet.
+- Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
+- Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
+- Checkpointing and validation are not yet supported (setup raises if enabled).
+- The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
+- The drain gate in refit is not yet supported.
