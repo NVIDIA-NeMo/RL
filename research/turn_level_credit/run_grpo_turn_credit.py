@@ -57,6 +57,7 @@ def load_master_and_turn_credit_config(
     overrides: list[str],
 ) -> tuple[MasterConfig, TurnCreditConfig]:
     """Load core and research configuration from one YAML file."""
+    register_omegaconf_resolvers()
     config = load_config(config_path)
     if overrides:
         config = parse_hydra_overrides(config, overrides)
@@ -77,7 +78,6 @@ def main() -> None:
     log_container_init_timing()
     init_timer = Timer(context={"worker": "driver"})
 
-    register_omegaconf_resolvers()
     args, overrides = parse_args()
     if args.config is None:
         args.config = os.path.join(
