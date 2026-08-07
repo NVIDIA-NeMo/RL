@@ -73,9 +73,7 @@ For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`) or where e
 CONTAINER=... bash tests/run_unit_in_docker.sh
 ```
 
-The wrapper bind-mounts the current checkout and runs as the calling user, so test artifacts retain their host ownership. It reuses the virtual environments baked into the image without syncing dependencies. This supports testing a custom source commit against an existing CI image when `pyproject.toml`, `uv.lock`, and the submodule revisions are unchanged. A dependency fingerprint mismatch means the container must be rebuilt.
-
-The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docker.md).
+The wrapper bind-mounts the current checkout and runs as the calling user, so test artifacts retain their host ownership. It reuses the virtual environments baked into the image without syncing dependencies. This supports testing a custom source commit against an existing CI image when `pyproject.toml`, `uv.lock`, and the submodule revisions are unchanged. A dependency fingerprint mismatch means the container must be rebuilt. The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docker.md).
 
 ### Track Metrics in Unit Tests
 
