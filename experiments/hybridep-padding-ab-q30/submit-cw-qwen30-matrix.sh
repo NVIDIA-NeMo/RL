@@ -68,7 +68,7 @@ PY
 for SBATCH_VARIABLE in ${!SBATCH_@}; do
   unset "$SBATCH_VARIABLE"
 done
-unset RAY_ADDRESS RAY_NAMESPACE
+unset RAY_ADDRESS RAY_NAMESPACE UV_CACHE_DIR_OVERRIDE
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON=${PYTHON:-python3}
@@ -180,8 +180,6 @@ require_canonical_lustre_path GIT_COMMON_DIR "$GIT_COMMON_DIR"
 [[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" && -f "$BATCH_SCRIPT" ]] || die "invalid source or batch script"
 CUDNN_HOST_PATH=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 require_canonical_lustre_path CUDNN_HOST_PATH "$CUDNN_HOST_PATH"
-URLLIB3_HOST_PATH=${URLLIB3_HOST_PATH:-$PREFLIGHT_VENV/lib/python3.13/site-packages/urllib3}
-require_canonical_lustre_path URLLIB3_HOST_PATH "$URLLIB3_HOST_PATH"
 [[ -z $(git -C "$SOURCE_PATH" status --porcelain --untracked-files=all) ]] || die "NeMo-RL source is dirty"
 [[ -z $(git -C "$SOURCE_PATH" submodule foreach --recursive --quiet 'dirty=$(git status --porcelain --untracked-files=all); if [ -n "$dirty" ]; then printf "%s\n" "$displaypath"; fi') ]] || die "recursive submodule source is dirty"
 ! git -C "$SOURCE_PATH" submodule status --recursive | grep -Eq '^[+-U]' || die "recursive submodule checkout mismatch"
@@ -332,9 +330,7 @@ printf 'cudnn_host_path=%s\ncudnn_container_path=%s\n' \
   "$CUDNN_HOST_PATH" \
   "/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn" \
   >> "$PROVENANCE_ROOT/submission.txt"
-printf 'urllib3_host_path=%s\nurllib3_container_path=%s\n' \
-  "$URLLIB3_HOST_PATH" \
-  "/opt/nemo_rl_venv/lib/python3.13/site-packages/urllib3" \
+printf 'uv_cache_override=disabled\ncontainer_baked_uv_archive_preserved=1\n' \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_checksum_mode=%s\n' \
   "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_CHECKSUM_CACHE" "$CONTAINER_CHECKSUM_MODE" \
@@ -353,7 +349,6 @@ export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES DEEPEP_OVERLAY_TREE_SHA256
 export EXPECTED_GPU_MODEL GPUS_PER_NODE DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING
 export HF_HOME=${HF_CACHE:-$EXPERIMENT_ROOT/hf-cache}
 export HF_DATASETS_CACHE=$HF_HOME/datasets
-export UV_CACHE_DIR_OVERRIDE=${UV_CACHE_DIR_OVERRIDE:-$EXPERIMENT_ROOT/uv-cache}
 export NRL_NODE_LOCAL_UV_CACHE_DIR=${NRL_NODE_LOCAL_UV_CACHE_DIR:-/tmp/nemo-rl-uv-cache-$ARM}
 export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-/tmp/nemo-rl-venvs-$ARM-$LOCAL_HEAD}
 export CACHE_ROOT=$EXPERIMENT_ROOT/caches
@@ -366,16 +361,14 @@ export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_HOME=$CUDNN_CONTAINER_PATH
 export CUDNN_PATH=$CUDNN_HOME
-export URLLIB3_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/urllib3
 export PYTHONDONTWRITEBYTECODE=1
 export LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
 export MCORE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE${PYTHONPATH:+:$PYTHONPATH}"
-mkdir -p "$HF_DATASETS_CACHE" "$UV_CACHE_DIR_OVERRIDE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$WANDB_CACHE_DIR"
+mkdir -p "$HF_DATASETS_CACHE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$WANDB_CACHE_DIR"
 require_canonical_lustre_path HF_HOME "$HF_HOME"
 require_canonical_lustre_path HF_DATASETS_CACHE "$HF_DATASETS_CACHE"
-require_canonical_lustre_path UV_CACHE_DIR_OVERRIDE "$UV_CACHE_DIR_OVERRIDE"
 require_canonical_lustre_path CACHE_ROOT "$CACHE_ROOT"
 require_canonical_lustre_path PIP_CACHE_DIR "$PIP_CACHE_DIR"
 require_canonical_lustre_path XDG_CACHE_HOME "$XDG_CACHE_HOME"
@@ -392,7 +385,7 @@ export CONTAINER
 
 EXTRA_MOUNTS=${MOUNTS:-}
 validate_extra_mounts "$EXTRA_MOUNTS"
-MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH,$URLLIB3_HOST_PATH:$URLLIB3_CONTAINER_PATH"
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH"
 if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/"* ]]; then
   MOUNTS_VALUE="$MOUNTS_VALUE,$GIT_COMMON_DIR:$GIT_COMMON_DIR"
 fi
@@ -417,17 +410,19 @@ RUN_PYTHON=/opt/nemo_rl_venv/bin/python
 [[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
 "$RUN_PYTHON" - <<'PY'
 import importlib.util
-import os
 from pathlib import Path
 
+import click
 import ray
 import requests
 import urllib3
 import urllib3.exceptions
+from ray.scripts.scripts import main as ray_cli_main
 
-assert Path(urllib3.__file__).resolve().is_relative_to(
-    Path(os.environ["URLLIB3_CONTAINER_PATH"]).resolve()
-)
+assert click.ClickException
+assert ray_cli_main
+assert Path(click.__file__).resolve().is_file()
+assert Path(urllib3.__file__).resolve().is_file()
 spec = importlib.util.find_spec("uvloop")
 assert spec is None or hasattr(__import__("uvloop"), "install")
 PY

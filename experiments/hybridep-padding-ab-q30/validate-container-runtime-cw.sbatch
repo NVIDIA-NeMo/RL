@@ -23,19 +23,17 @@ set -euo pipefail
 
 : "${CONTAINER:?CONTAINER is required}"
 : "${CUDNN_HOST_PATH:?CUDNN_HOST_PATH is required}"
-: "${URLLIB3_HOST_PATH:?URLLIB3_HOST_PATH is required}"
 : "${DEEPEP_OVERLAY_DIR:?DEEPEP_OVERLAY_DIR is required}"
 
 export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
-export URLLIB3_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/urllib3
 export DEEPEP_OVERLAY_DIR
 export LD_LIBRARY_PATH="/usr/local/cuda/compat/lib:$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=$DEEPEP_OVERLAY_DIR
 
-MOUNTS="$CUDNN_HOST_PATH:$CUDNN_HOME,$URLLIB3_HOST_PATH:$URLLIB3_CONTAINER_PATH,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
-CONTAINER_ENV=PYTHONPATH,LD_LIBRARY_PATH,CUDNN_HOME,CUDNN_PATH,URLLIB3_CONTAINER_PATH,DEEPEP_OVERLAY_DIR,PYTHONDONTWRITEBYTECODE
+MOUNTS="$CUDNN_HOST_PATH:$CUDNN_HOME,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
+CONTAINER_ENV=PYTHONPATH,LD_LIBRARY_PATH,CUDNN_HOME,CUDNN_PATH,DEEPEP_OVERLAY_DIR,PYTHONDONTWRITEBYTECODE
 
 srun --no-container-mount-home \
   --container-image="$CONTAINER" \
@@ -50,6 +48,7 @@ import os
 import platform
 from pathlib import Path
 
+import click
 import deep_ep
 import deep_ep_cpp
 import hybrid_ep_cpp
@@ -58,10 +57,13 @@ import requests
 import torch
 import urllib3
 import urllib3.exceptions
+from ray.scripts.scripts import main as ray_cli_main
 
 overlay = Path(os.environ["DEEPEP_OVERLAY_DIR"]).resolve()
-urllib3_root = Path(os.environ["URLLIB3_CONTAINER_PATH"]).resolve()
-assert Path(urllib3.__file__).resolve().is_relative_to(urllib3_root)
+assert click.ClickException
+assert ray_cli_main
+assert Path(click.__file__).resolve().is_file()
+assert Path(urllib3.__file__).resolve().is_file()
 module_paths = {}
 for module in (deep_ep, deep_ep_cpp, hybrid_ep_cpp):
     module_path = Path(module.__file__).resolve()
