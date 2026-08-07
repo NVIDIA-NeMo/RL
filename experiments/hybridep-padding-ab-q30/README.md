@@ -2,8 +2,10 @@
 
 This experiment isolates dispatcher padding and DeepEP revision effects on the
 canonical four-node, eight-GPU-per-node H100 performance recipe. All arms run
-20 packed-sequence GRPO steps from the frozen NeMo-RL `ba473d4752` lineage and
-use the same container, model cache, topology, batch settings, and node class.
+20 packed-sequence GRPO steps and use the same container, model cache,
+topology, batch settings, and node class. The official arms use NeMo-RL
+`ba473d4752`; the legacy arm uses `d833180b9` with Bridge `a68c7c893` and
+MCore `f812f5b3d`.
 
 | Arm | Dispatcher | DeepEP | Padding path |
 |---|---|---|---|
@@ -13,9 +15,10 @@ use the same container, model cache, topology, batch settings, and node class.
 | `legacy-prepad-17cf` | HybridEP | `17cfb817` | one NeMo pre-pad per microbatch; PR 5008 padding disabled |
 
 `arm_matrix.py` is the authoritative machine-readable contract. The launcher
-fails closed on source and recursive submodule state, pushed branch identity,
-container SHA, DeepEP wheel metadata and SHA, H100 count, effective MCore
-configuration, and the legacy padding contract.
+fails closed on exact source and recursive submodule commits, pushed branch
+identity, container SHA, DeepEP wheel metadata and SHA, frozen Python
+environment manifest, all eight H100 names, effective MCore configuration,
+and the legacy padding contract.
 
 ## Render and validate
 
@@ -33,10 +36,10 @@ wheel and build-generated metadata for their selected DeepEP commit.
 
 ```bash
 export ACCOUNT=<fairshare-selected-account>
-export SOURCE_PATH=/lustre/path/to/pushed-recursive-checkout
-export FORK_BRANCH=sna/hybridep-padding-ab-q30-20260807
+export SOURCE_PATH=/lustre/path/to/the-arm-specific-frozen-recursive-checkout
 export CONTAINER=/lustre/path/to/nemo-rl-nightly.sqsh
 export CONTAINER_SHA256=<sha256>
+export PREFLIGHT_MANIFEST_SHA256=<sorted-pip-freeze-sha256>
 export DEEPEP_17CF_WHEEL=/lustre/path/to/deep_ep-17cf-x86_64.whl
 export DEEPEP_17CF_METADATA=/lustre/path/to/17cf-build-metadata.json
 export DEEPEP_F725_WHEEL=/lustre/path/to/deep_ep-f725-x86_64.whl
@@ -49,9 +52,11 @@ ARM=official-pr5008-17cf \
   bash experiments/hybridep-padding-ab-q30/submit-cw-qwen30-matrix.sh
 ```
 
-The launcher requests all eight GPUs on every node with `--gpus-per-node=8`,
-does not request exclusive access, and does not set explicit CPU or memory
-requests. Each arm has an independent output directory and runtime overlay.
+The launcher submits `ray-nonexclusive.sub`, requests all eight GPUs on every
+node with `--gpus-per-node=8`, does not request exclusive access, and does not
+set explicit CPU or memory requests. The wrapper passes Slurm's proportional
+CPU allocation to `ray.sub`. Each arm has an independent output directory and
+runtime overlay, and all persistent paths are required to live under Lustre.
 
 ## Analysis contract
 

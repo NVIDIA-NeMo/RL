@@ -12,6 +12,7 @@ LAUNCHER = (
     ROOT / "experiments" / "hybridep-padding-ab-q30" / "submit-cw-qwen30-matrix.sh"
 )
 RECIPE = "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
+BATCH_SCRIPT = ROOT / "experiments" / "hybridep-padding-ab-q30" / "ray-nonexclusive.sub"
 
 
 def _render(arm: str, *, test_only: bool = False) -> dict[str, str]:
@@ -98,6 +99,11 @@ def test_rendered_arm_contract(
     assert rendered["deepep_commit"] == deepep_commit
     assert rendered["requires_deepep_artifact"] == requires_deepep
     assert rendered["source_profile"] in {"official", "legacy"}
+    assert len(rendered["nemo_rl_commit"]) == 40
+    assert len(rendered["bridge_commit"]) == 40
+    assert len(rendered["mcore_commit"]) == 40
+    assert rendered["source_branch"].startswith("sna/")
+    assert Path(rendered["batch_script"]) == BATCH_SCRIPT
     assert rendered["job_name"].endswith(arm)
     assert rendered["output_root"].endswith(f"/{arm}")
     assert "grpo.max_num_steps=20" in rendered["training_command"]
@@ -108,6 +114,22 @@ def test_rendered_arm_contract(
     assert "--exclusive" not in rendered["sbatch_command"]
     assert "--cpus" not in rendered["sbatch_command"]
     assert "--mem" not in rendered["sbatch_command"]
+    assert str(BATCH_SCRIPT) in rendered["sbatch_command"]
+    if legacy_prepadding == "1":
+        assert (
+            "++policy.megatron_cfg.moe_hybridep_prepad_packed_inputs=true"
+            in rendered["training_command"]
+        )
+    else:
+        assert "moe_hybridep_prepad_packed_inputs" not in rendered["training_command"]
+
+
+def test_effective_batch_script_is_nonexclusive_and_uses_allocated_cpus() -> None:
+    batch_script = BATCH_SCRIPT.read_text()
+
+    assert "#SBATCH --exclusive" not in batch_script
+    assert "SLURM_CPUS_ON_NODE" in batch_script
+    assert 'exec bash "$SOURCE_PATH/ray.sub"' in batch_script
 
 
 def test_rendered_test_only_is_added_exactly_once() -> None:

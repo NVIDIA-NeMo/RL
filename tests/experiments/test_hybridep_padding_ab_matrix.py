@@ -88,6 +88,16 @@ def test_arm_contract(arm_name: str, expected: dict[str, object]) -> None:
     assert arm.max_steps == 20
     for field_name, expected_value in expected.items():
         assert getattr(arm, field_name) == expected_value
+    if arm.source_profile == "official":
+        assert arm.nemo_rl_commit == matrix.OFFICIAL_NEMO_RL
+        assert arm.bridge_commit == matrix.OFFICIAL_BRIDGE
+        assert arm.mcore_commit == matrix.OFFICIAL_MCORE
+        assert arm.source_branch == matrix.OFFICIAL_BRANCH
+    else:
+        assert arm.nemo_rl_commit == matrix.LEGACY_NEMO_RL
+        assert arm.bridge_commit == matrix.LEGACY_BRIDGE
+        assert arm.mcore_commit == matrix.LEGACY_MCORE
+        assert arm.source_branch == matrix.LEGACY_BRANCH
 
 
 def test_matrix_cli_emits_all_four_arms_as_json() -> None:
