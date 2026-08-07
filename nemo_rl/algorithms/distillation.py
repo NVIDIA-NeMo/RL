@@ -1123,14 +1123,6 @@ def distillation_train(
                 master_config.cluster["num_nodes"]
                 * master_config.cluster["gpus_per_node"]
             )
-            metrics.update(
-                {
-                    "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
-                    / total_time
-                    / total_num_gpus
-                }
-            )
-
             print(f"  • Total step time: {total_time:.2f}s", flush=True)
 
             # Display all other timing metrics
@@ -1141,10 +1133,19 @@ def distillation_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
+            performance_metrics: dict[str, float] = {
+                "valid_tokens_per_sec_per_gpu": metrics["global_valid_toks"]
+                / total_time
+                / total_num_gpus
+            }
+            if "total_num_tokens" in metrics:
+                performance_metrics["tokens_per_sec_per_gpu"] = (
+                    metrics["total_num_tokens"] / total_time / total_num_gpus
+                )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(
+                performance_metrics, total_steps + 1, prefix="performance"
+            )
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
             timer.reset()

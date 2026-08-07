@@ -644,13 +644,21 @@ def sft_train(
                 master_config.cluster["num_nodes"]
                 * master_config.cluster["gpus_per_node"]
             )
+            performance_metrics: dict[str, float] = {}
             if total_time > 0:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                performance_metrics["valid_tokens_per_sec_per_gpu"] = (
                     metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
                 )
+                if "total_num_tokens" in metrics:
+                    performance_metrics["tokens_per_sec_per_gpu"] = (
+                        metrics["total_num_tokens"] / total_time / total_num_gpus
+                    )
             else:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
+                performance_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(
+                performance_metrics, total_steps + 1, prefix="performance"
+            )
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
             timer.reset()

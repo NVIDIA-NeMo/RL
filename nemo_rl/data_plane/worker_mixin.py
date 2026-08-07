@@ -182,6 +182,7 @@ class TQWorkerMixin:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
 
+    @wrap_with_nvtx_name("policy_worker/tq_fetch")
     def _fetch(
         self,
         meta: "KVBatchMeta",
@@ -409,6 +410,7 @@ class TQWorkerMixin:
 
         write_columns(self._require_dp_client(), meta, fields)
 
+    @wrap_with_nvtx_name("policy_worker/tq_write_back")
     def _write_back_result_field(
         self,
         meta: "KVBatchMeta",
