@@ -23,6 +23,7 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import inspect
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
@@ -85,6 +86,33 @@ def _needs_kv_cache_for_shared_layers(model: nn.Module) -> bool:
     return isinstance(num_kv_shared_layers, int) and num_kv_shared_layers > 0
 
 
+def _forward_accepts(model: nn.Module, name: str) -> bool:
+    """Reports whether ``model.forward()`` accepts a given keyword argument.
+
+    Mirrors ``nemo_automodel._transformers.capabilities._supports_seq_lens``:
+    a ``**kwargs`` in the signature counts as accepting anything, and an
+    uninspectable forward is assumed permissive so this never removes an
+    argument a model actually needs.
+
+    Args:
+        model: The model whose forward signature to inspect.
+        name: The keyword argument name to look for.
+
+    Returns:
+        True if the argument can be passed to ``model.forward()``.
+    """
+    forward = getattr(model, "forward", None)
+    if not callable(forward):
+        return True
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        return True
+    if name in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def model_forward(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
@@ -136,6 +164,11 @@ def model_forward(
             model_args["mm_token_type_ids"] = torch.zeros_like(
                 processed_inputs.input_ids
             )
+
+    # Masked diffusion LMs (LLaDA) attend bidirectionally and derive positions
+    # internally, so their forward has no position_ids parameter at all.
+    if not _forward_accepts(model, "position_ids"):
+        del model_args["position_ids"]
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:
