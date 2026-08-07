@@ -120,6 +120,7 @@ Optional globals:
 | `GPUS_PER_NODE` | `4` | GPUs claimed per node. Set this before registering pools; it sizes hetgroup 1 and is exported to `ray.sub`, so it must match the physical GPUs per node for both components. |
 | `NUM_EXTERNAL_SERVICE_NODES` | empty | Expected hetgroup 1 node count. Pass it to `validate_external_vllm_submission` to fail before `sbatch` on a topology mismatch; validation warns and skips this check when unset. |
 | `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`. |
+| `EXTERNAL_VLLM_SKIP_PREFLIGHT` | `0` | Set to `1` to skip the container and Python import checks for a previously validated, pinned image. Replica and load-balancer health checks still gate training startup. |
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
 | `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |

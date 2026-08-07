@@ -458,6 +458,39 @@ def test_launcher_rejects_more_than_two_hetgroups():
     assert "Expected exactly two Slurm hetgroups, got 3" in result.stderr
 
 
+def test_launcher_rejects_invalid_preflight_opt_out():
+    script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
+    env = {
+        "PATH": os.environ["PATH"],
+        "SLURM_JOB_ID": "123",
+        "SLURM_HET_SIZE": "2",
+        "SLURM_JOB_NODELIST_HET_GROUP_0": "ray[01-02]",
+        "SLURM_JOB_NODELIST_HET_GROUP_1": "service[01-02]",
+        "SLURM_JOB_ACCOUNT": "account",
+        "SLURM_JOB_PARTITION": "partition",
+        "SLURM_SUBMIT_DIR": str(REPO_ROOT),
+        "BASE_LOG_DIR": "/lustre/logs",
+        "CONTAINER": "training.sqsh",
+        "MOUNTS": "/lustre:/lustre",
+        "COMMAND": "run __TEST_BASE_URL__",
+        "EXTERNAL_VLLM_POOLS": "TEST",
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(
+            REPO_ROOT / "tools/external_gym_vllm"
+        ),
+        "EXTERNAL_VLLM_SKIP_PREFLIGHT": "yes",
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "EXTERNAL_VLLM_SKIP_PREFLIGHT must be 0 or 1" in result.stderr
+
+
 def test_launcher_requires_nl2bash_placeholder_when_pool_is_enabled():
     script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
     env = {
@@ -585,6 +618,9 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert 'preflight_labels+=("${display_names[${pool}]} container")' in source
     assert 'preflight_labels+=("load balancer container")' in source
     assert "${preflight_labels[${preflight_index}]}" in source
+    assert 'EXTERNAL_VLLM_SKIP_PREFLIGHT="${EXTERNAL_VLLM_SKIP_PREFLIGHT:-0}"' in source
+    assert 'if [[ "${EXTERNAL_VLLM_SKIP_PREFLIGHT}" == "1" ]]; then' in source
+    assert 'echo "[WARN] Skipping external-vLLM container preflights"' in source
     assert 'export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"' in source
     assert 'export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"' in source
     assert 'SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
