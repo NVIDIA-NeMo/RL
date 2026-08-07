@@ -18,7 +18,8 @@ from nemo_rl.environments.nemo_gym import NemoGym
 
 
 class _Tokenizer:
-    def batch_decode(self, batch):
+    def batch_decode(self, batch, *, clean_up_tokenization_spaces: bool):
+        assert clean_up_tokenization_spaces is False
         return [" ".join(map(str, token_ids)) for token_ids in batch]
 
 

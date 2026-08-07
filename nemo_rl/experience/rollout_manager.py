@@ -306,7 +306,11 @@ class AsyncRolloutImpl:
 
         assistant_message: dict = {
             "role": "assistant",
-            "content": self._tokenizer.decode(generated_ids, skip_special_tokens=True),
+            "content": self._tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ),
             "token_ids": generated_ids,
         }
         if "logprobs" in output:

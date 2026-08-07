@@ -245,7 +245,11 @@ def create_app(
             if gen_logprobs:
                 gen_logprobs.pop()
 
-        gen_text = tokenizer.decode(gen_token_ids, skip_special_tokens=False)
+        gen_text = tokenizer.decode(
+            gen_token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
 
         finish_reason = "stop"
         if gen.finish_reason is not None:
@@ -307,7 +311,9 @@ def create_app(
             response["choices"][0]["logprobs"] = {
                 "content": [
                     {
-                        "token": tokenizer.decode([tid]),
+                        "token": tokenizer.decode(
+                            [tid], clean_up_tokenization_spaces=False
+                        ),
                         "logprob": lp,
                         "bytes": None,
                         "top_logprobs": [],
