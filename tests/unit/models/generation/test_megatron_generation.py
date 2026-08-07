@@ -397,7 +397,14 @@ def test_megatron_generation_colocated(
     config["generation"]["mcore_generation_config"]["expose_http_server"] = (
         transformer_impl == "transformer_engine"
     )
-    config["megatron_cfg"]["transformer_impl"] = transformer_impl
+    # The parametrized impl is the GENERATION-side one; training always runs
+    # transformer_engine (the worker rejects inference_optimized on training
+    # workers). transformer_engine => dual-mode (matched impl, shared model);
+    # inference_optimized => the worker builds a dedicated resharded
+    # inference model on the shared GPUs.
+    config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+        transformer_impl
+    )
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
@@ -426,8 +433,9 @@ def test_megatron_generation_colocated(
             assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
 
         if transformer_impl == "inference_optimized":
-            # Dual-mode: the same shared model must run the trainable TE
-            # fallback (train step, finite loss) before fast-path generation.
+            # Reshard mode: the TE training model takes a train step (finite
+            # loss) before the engine ever starts; generation then runs on
+            # the dedicated inference_optimized model built at first wake.
             torch.manual_seed(42)
             train_data = BatchedDataDict(
                 {

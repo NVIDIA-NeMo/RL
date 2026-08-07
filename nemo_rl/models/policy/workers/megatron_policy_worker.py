@@ -473,16 +473,17 @@ class MegatronPolicyWorkerImpl(
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
-        if config["megatron_cfg"].get("transformer_impl") == "inference_optimized":
-            if (
-                config["megatron_cfg"]["tensor_model_parallel_size"] > 1
-                and not config["megatron_cfg"]["sequence_parallel"]
-            ):
-                config["megatron_cfg"]["sequence_parallel"] = True
-                print(
-                    "transformer_impl=inference_optimized with TP>1: "
-                    "enabling megatron_cfg.sequence_parallel."
-                )
+        if init_optimizer:
+            assert (
+                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
+            ), (
+                "transformer_impl=inference_optimized must not be set on training "
+                "workers: training and logprob forwards run the TE path. Set "
+                "policy.generation.mcore_generation_config.transformer_impl="
+                "inference_optimized instead — with colocated generation the "
+                "worker builds a dedicated resharded inference model from that "
+                "config; non-colocated generation has always honored it."
+            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,

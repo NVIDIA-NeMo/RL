@@ -4129,10 +4129,6 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    NEED_REFIT = not (
-        isinstance(policy_generation, MegatronGeneration)
-        and master_config.policy["generation"]["colocated"]["enabled"]
-    )
     assert policy_generation is not None
 
     # Training state
@@ -4151,7 +4147,7 @@ def async_grpo_train(
 
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
-    ), "Colocated async GRPO is unsupported for the desired generation backend."
+    ), "Colocated async GRPO is only supported for the Megatron generation backend."
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -4288,21 +4284,7 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...", flush=True)
-    if colocated_inference:
-        # Colocated mode currently does not support weights refit.
-        print("🔄 Initializing colocated Megatron inference engine...")
-        try:
-            policy.offload_before_refit()
-            policy_generation.prepare_for_generation()
-            POLICY_GENERATION_STALE = False
-            print("✅ Colocated Megatron engine initialized")
-        except Exception as e:
-            print(f"❌ Colocated Megatron engine initialization failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-    elif NEED_REFIT and POLICY_GENERATION_STALE:
+    if POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...", flush=True)
         try:
             refit_policy_generation(
@@ -4356,9 +4338,9 @@ def async_grpo_train(
                 processor=processor,
             )
             initial_val_metrics = val_metrics
-            # Colocated engine stays alive across steps (preserves KV cache).
-            if not colocated_inference:
-                policy_generation.finish_generation()
+            # A colocated engine keeps serving between phases (preserves its
+            # KV/prefix cache); the backend makes that call, not the loop.
+            policy_generation.finish_generation(for_training=False)
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             if master_config.grpo.debug_payload_metrics:
@@ -4745,7 +4727,7 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 generation_logger_metrics = None
-                if colocated_inference:
+                if policy_generation.blocks_training():
                     print("⏸️ Pausing colocated engine + collector for training...")
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
@@ -4753,7 +4735,7 @@ def async_grpo_train(
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )
-                    policy_generation.finish_generation()
+                    policy_generation.finish_generation(for_training=True)
 
                 # Training phase (same as sync version)
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -4898,21 +4880,24 @@ def async_grpo_train(
                 )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
-                if colocated_inference:
-                    # Colocated mode currently does not support weights refit.
-                    with timer.time("weight_sync"):
+                if colocated_inference and will_save_checkpoint:
+                    # Wake-deferral (checkpoint scheduling, which the backend
+                    # cannot see): the engine is about to be saved, so leave it
+                    # asleep; just drop training-only buffers and version-stamp
+                    # the weights. The post-save block wakes it and resumes
+                    # collection.
+                    print("⏸️ Keeping colocated engine asleep for checkpointing...")
+                    # Seed the category with 0.0 (no refit wake happens on
+                    # save-bound steps) so efficiency summaries, which skip
+                    # missing keys, stay comparable across modes.
+                    with timer.time("idle/refit_bubble"):
+                        pass
+                    with timer.time("offload_before_refit"):
                         policy.offload_before_refit()
                     POLICY_GENERATION_STALE = False
                     weight_version += 1
                     trajectory_collector.set_weight_version.remote(weight_version)
-                    if will_save_checkpoint:
-                        # Don't wake up engine if we're about to send it to sleep for checkpointing.
-                        print("⏸️ Keeping colocated engine asleep for checkpointing...")
-                    else:
-                        print("🔄 Resuming colocated engine after training step...")
-                        policy_generation.prepare_for_generation()
-                        trajectory_collector.resume_after_refit.remote()
-                elif NEED_REFIT:
+                else:
                     timer.start("idle/refit_bubble")
 
                     # Measure pending-generation wait as exposed_generation time
@@ -4922,7 +4907,8 @@ def async_grpo_train(
 
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
-                    if policy_generation is not None:
+                    # (colocated collects them before the engine sleeps for training).
+                    if policy_generation is not None and generation_logger_metrics is None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )
@@ -4974,12 +4960,7 @@ def async_grpo_train(
                 # Run validation if it's a validation step or last step with val_at_end
                 if should_run_validation:
                     with timer.time("idle/validation"):
-                        if colocated_inference:
-                            # No refit path exists in colocated mode.
-                            # On save-bound steps, engine stayed asleep after training.
-                            if will_save_checkpoint:
-                                policy_generation.prepare_for_generation()
-                        elif NEED_REFIT and POLICY_GENERATION_STALE:
+                        if POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
                                 policy,
                                 policy_generation,
@@ -4987,6 +4968,9 @@ def async_grpo_train(
                             )
                             POLICY_GENERATION_STALE = False
                         else:
+                            # No-op on an already-running engine; wakes the
+                            # colocated engine when it stayed asleep for a
+                            # save-bound step.
                             policy_generation.prepare_for_generation()
                         val_metrics, validation_timings = validate(
                             policy_generation,
@@ -4998,8 +4982,12 @@ def async_grpo_train(
                             logger=logger,
                             processor=processor,
                         )
-                        if not colocated_inference or will_save_checkpoint:
-                            policy_generation.finish_generation()
+                        # Save-bound steps need the GPUs for checkpointing,
+                        # so the engine must stand down; otherwise a colocated
+                        # engine keeps serving (backend's call).
+                        policy_generation.finish_generation(
+                            for_training=will_save_checkpoint
+                        )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

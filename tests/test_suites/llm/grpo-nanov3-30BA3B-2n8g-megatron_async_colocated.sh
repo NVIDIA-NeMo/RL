@@ -31,8 +31,6 @@ uv run examples/run_grpo.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
-        'max(data["train/reward"]) > 0.0'
-fi
+uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/reward"]) > 0.0' \
+    'median(data["train/gen_kl_error"]) < 1.3'
