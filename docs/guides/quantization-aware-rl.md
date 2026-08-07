@@ -32,9 +32,10 @@ The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dy
 
 ## Simulated KV-Cache Quantization
 
-QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
-the Megatron policy and vLLM rollout model. Use the same complete recipe for
-both workers; calibrated K/V amax values are transferred during refit.
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in the
+Megatron policy, the vLLM rollout model, or both. Configure each worker's
+`quant_cfg` independently. Calibrated K/V amax values available on the policy
+are transferred to compatible rollout quantizers during refit.
 
 ```yaml
 policy:
@@ -54,7 +55,8 @@ The KV-only examples are:
 These recipes intentionally disable weight, input, Q, and P quantizers so a
 test can isolate simulated K/V behavior. They can also serve as the K/V portion
 of a complete user-authored recipe. Constant-amax K/V recipes need no amax
-transfer, but policy and rollout must still use the same recipe.
+transfer. Policy and rollout may use different recipes or enable K/V
+quantization on only one side.
 
 This path does not enable vLLM's native FP8 KV-cache storage. Set neither
 `policy.generation.real_quant` nor a native vLLM KV-cache dtype for these

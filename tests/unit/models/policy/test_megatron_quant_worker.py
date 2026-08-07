@@ -52,7 +52,6 @@ if _MODELOPT_AVAILABLE:
 
         from nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker import (
             MegatronQuantPolicyWorker,
-            _validate_simulated_kv_quantization_config,
         )
 
         _WORKER_IMPORTABLE = True
@@ -77,14 +76,6 @@ _NUM_GPUS = 2
 _NVFP4_A16_RECIPE = (
     Path(__file__).resolve().parents[4]
     / "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml"
-).as_posix()
-_KV_CACHE_FP8_RECIPE = (
-    Path(__file__).resolve().parents[4]
-    / "examples/modelopt/quant_configs/kv_cache_fp8.yaml"
-).as_posix()
-_KV_CACHE_NVFP4_RECIPE = (
-    Path(__file__).resolve().parents[4]
-    / "examples/modelopt/quant_configs/kv_cache_nvfp4.yaml"
 ).as_posix()
 
 
@@ -118,110 +109,6 @@ def _make_real_quant_worker():
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
     return worker
-
-
-def _simulated_kv_config():
-    return {
-        "quant_cfg": _KV_CACHE_FP8_RECIPE,
-        "generation": {
-            "backend": "vllm",
-            "quant_cfg": _KV_CACHE_FP8_RECIPE,
-            "real_quant": False,
-            "vllm_cfg": {"kv_cache_dtype": "auto"},
-        },
-    }
-
-
-@requires_weight_folding
-def test_simulated_kv_config_accepts_matching_fake_quant_recipes():
-    _validate_simulated_kv_quantization_config(_simulated_kv_config())
-
-
-@requires_weight_folding
-@pytest.mark.parametrize(
-    ("update", "match"),
-    [
-        (
-            {"quant_cfg": _KV_CACHE_NVFP4_RECIPE},
-            "policy.quant_cfg and policy.generation.quant_cfg",
-        ),
-        ({"real_quant": True}, "does not support policy.generation.real_quant"),
-        (
-            {"vllm_cfg": {"kv_cache_dtype": "fp8"}},
-            "vllm_cfg.kv_cache_dtype=auto",
-        ),
-    ],
-    ids=["different-recipe", "real-quant", "native-kv-cache"],
-)
-def test_simulated_kv_config_rejects_incompatible_rollout(update, match):
-    config = _simulated_kv_config()
-    config["generation"].update(update)
-
-    with pytest.raises(ValueError, match=match):
-        _validate_simulated_kv_quantization_config(config)
-
-
-@requires_weight_folding
-def test_simulated_kv_config_detects_path_qualified_selector(tmp_path):
-    recipe = tmp_path / "path-qualified-kv.yaml"
-    recipe.write_text(
-        """quantize:
-  algorithm: max
-  quant_cfg:
-    - quantizer_name: '*'
-      enable: false
-    - quantizer_name: '*core_attention.k_bmm_quantizer'
-      enable: true
-      cfg:
-        num_bits: e4m3
-"""
-    )
-    config = _simulated_kv_config()
-    config["quant_cfg"] = recipe.as_posix()
-    config["generation"].update({"quant_cfg": recipe.as_posix(), "real_quant": True})
-
-    with pytest.raises(ValueError, match="does not support.*real_quant"):
-        _validate_simulated_kv_quantization_config(config)
-
-
-@requires_weight_folding
-def test_simulated_kv_config_keeps_global_enable_after_path_exclusion(tmp_path):
-    recipe = tmp_path / "kv-with-draft-exclusion.yaml"
-    recipe.write_text(
-        """quantize:
-  algorithm: max
-  quant_cfg:
-    - quantizer_name: '*'
-      enable: false
-    - quantizer_name: '*[kv]_bmm_quantizer'
-      enable: true
-      cfg:
-        num_bits: e4m3
-    - quantizer_name: '*draft.*[kv]_bmm_quantizer'
-      enable: false
-"""
-    )
-    config = _simulated_kv_config()
-    config["quant_cfg"] = recipe.as_posix()
-    config["generation"].update({"quant_cfg": recipe.as_posix(), "real_quant": True})
-
-    with pytest.raises(ValueError, match="does not support.*real_quant"):
-        _validate_simulated_kv_quantization_config(config)
-
-
-@requires_weight_folding
-def test_simulated_kv_config_does_not_constrain_non_kv_recipes():
-    _validate_simulated_kv_quantization_config(
-        {
-            "quant_cfg": "FP8_DEFAULT_CFG",
-            "generation": {
-                "backend": "vllm",
-                "quant_cfg": _NVFP4_A16_RECIPE,
-                "real_quant": False,
-                "vllm_cfg": {"kv_cache_dtype": "auto"},
-            },
-        }
-    )
 
 
 @requires_weight_folding
