@@ -1,11 +1,15 @@
 # Qwen3-30B-A3B HybridEP Padding A/B
 
-This experiment isolates dispatcher padding and DeepEP revision effects on the
-canonical four-node, eight-GPU-per-node H100 performance recipe. All arms run
-20 packed-sequence GRPO steps and use the same container, model cache,
-topology, batch settings, and node class. The official arms use NeMo-RL
-`ba473d4752`; the legacy arm uses `d833180b9` with Bridge `a68c7c893` and
-MCore `f812f5b3d`.
+This experiment compares the latest official stack with MCore PR 5008 against
+the historical custom stack, and compares two DeepEP revisions on the official
+stack. It does not attribute official-versus-legacy differences to PR 5008
+alone because the NeMo-RL, Bridge, and MCore revisions differ. All arms run 20
+packed-sequence GRPO steps on the canonical four-node,
+eight-GPU-per-node H100 recipe with the same container, model cache, topology,
+batch settings, and node class. The official arms use NeMo-RL base
+`e496258b0` plus the one-line HybridEP PR 5008 flag mapping at `5b786edf1`,
+Bridge `573e088c9`, and MCore `6513e3e23`; the legacy arm uses NeMo-RL
+`d833180b9` with Bridge `a68c7c893` and MCore `f812f5b3d`.
 
 | Arm | Dispatcher | DeepEP | Padding path |
 |---|---|---|---|
@@ -69,5 +73,6 @@ steady-state sensitivity window. Report arithmetic mean phase times and
 arithmetic mean of the canonical logged tokens/s/GPU metrics for Policy,
 LogProb, generation, and end-to-end; do not reconstruct throughput from
 separately averaged counters. Also report included/missing/valid sample counts,
-reward, KL, validation accuracy, failures, and bounded padding telemetry
-separately from the performance runs.
+reward, KL, validation accuracy, and failures. Timed runs leave legacy padding
+telemetry disabled. Set `COLLECT_PADDING_TELEMETRY=1` only for a separate
+legacy diagnostic run so warning I/O cannot bias the performance comparison.

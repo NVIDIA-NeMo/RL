@@ -75,10 +75,12 @@ PYTHON=${PYTHON:-python3}
 ARM=${ARM:?Set ARM to one of the names emitted by arm_matrix.py --list}
 RENDER_ONLY=${RENDER_ONLY:-0}
 TEST_ONLY=${TEST_ONLY:-0}
+COLLECT_PADDING_TELEMETRY=${COLLECT_PADDING_TELEMETRY:-0}
 SEGMENT=4
 
 [[ "$RENDER_ONLY" == 0 || "$RENDER_ONLY" == 1 ]] || die "RENDER_ONLY must be 0 or 1"
 [[ "$TEST_ONLY" == 0 || "$TEST_ONLY" == 1 ]] || die "TEST_ONLY must be 0 or 1"
+[[ "$COLLECT_PADDING_TELEMETRY" == 0 || "$COLLECT_PADDING_TELEMETRY" == 1 ]] || die "COLLECT_PADDING_TELEMETRY must be 0 or 1"
 
 IFS=$'\t' read -r ARM_NAME DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING \
   EXPECTED_DEEPEP_COMMIT SOURCE_PROFILE EXPECTED_NEMO_RL_COMMIT \
@@ -88,6 +90,9 @@ IFS=$'\t' read -r ARM_NAME DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADD
     "$PYTHON" "$SCRIPT_DIR/arm_matrix.py" --arm "$ARM" --format tsv
   )
 [[ "$ARM_NAME" == "$ARM" ]] || die "arm matrix resolution failed"
+if [[ "$COLLECT_PADDING_TELEMETRY" == 1 && "$LEGACY_PREPADDING" != 1 ]]; then
+  die "COLLECT_PADDING_TELEMETRY requires the legacy pre-padding arm"
+fi
 
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-padding-ab-q30/cw-h100}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$EXPERIMENT_ROOT/$ARM}
@@ -141,6 +146,7 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   printf 'hybridep_backend=%s\n' "$BACKEND_NAME"
   printf 'pad_uneven_dispatch_inputs=%s\n' "$PAD_UNEVEN"
   printf 'legacy_prepadding=%s\n' "$LEGACY_PREPADDING"
+  printf 'padding_telemetry=%s\n' "$COLLECT_PADDING_TELEMETRY"
   printf 'deepep_commit=%s\n' "$EXPECTED_DEEPEP_COMMIT"
   printf 'requires_deepep_artifact=%s\n' "$REQUIRES_DEEPEP_ARTIFACT"
   printf 'source_profile=%s\n' "$SOURCE_PROFILE"
@@ -332,6 +338,8 @@ printf 'cudnn_host_path=%s\ncudnn_container_path=%s\n' \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'uv_cache_override=disabled\ncontainer_baked_uv_archive_preserved=1\n' \
   >> "$PROVENANCE_ROOT/submission.txt"
+printf 'padding_telemetry=%s\n' "$COLLECT_PADDING_TELEMETRY" \
+  >> "$PROVENANCE_ROOT/submission.txt"
 printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_checksum_mode=%s\n' \
   "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_CHECKSUM_CACHE" "$CONTAINER_CHECKSUM_MODE" \
   >> "$PROVENANCE_ROOT/submission.txt"
@@ -398,7 +406,7 @@ fi
 export MOUNTS="$MOUNTS_VALUE${EXTRA_MOUNTS:+,$EXTRA_MOUNTS}"
 export BASE_LOG_DIR="$OUTPUT_ROOT"
 export PREFLIGHT_MANIFEST_SHA256
-if [[ "$LEGACY_PREPADDING" == 1 ]]; then
+if [[ "$COLLECT_PADDING_TELEMETRY" == 1 ]]; then
   export NEMO_RL_HYBRIDEP_LOG_PACKING=1
   export NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS=32
 fi

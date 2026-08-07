@@ -33,12 +33,18 @@ STAGE_NIGHTLY_SCRIPT = (
 )
 
 
-def _render(arm: str, *, test_only: bool = False) -> dict[str, str]:
+def _render(
+    arm: str,
+    *,
+    test_only: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     env = {
         **os.environ,
         "ARM": arm,
         "RENDER_ONLY": "1",
         "TEST_ONLY": str(int(test_only)),
+        **(extra_env or {}),
     }
     result = subprocess.run(
         ["bash", str(LAUNCHER)],
@@ -114,6 +120,7 @@ def test_rendered_arm_contract(
     assert rendered["hybridep_backend"] == backend
     assert rendered["pad_uneven_dispatch_inputs"] == pad_uneven
     assert rendered["legacy_prepadding"] == legacy_prepadding
+    assert rendered["padding_telemetry"] == "0"
     assert rendered["deepep_commit"] == deepep_commit
     assert rendered["requires_deepep_artifact"] == requires_deepep
     assert rendered["source_profile"] in {"official", "legacy"}
@@ -148,6 +155,33 @@ def test_rendered_arm_contract(
         )
     else:
         assert "moe_hybridep_prepad_packed_inputs" not in rendered["training_command"]
+
+
+def test_padding_telemetry_is_opt_in_and_legacy_only() -> None:
+    rendered = _render(
+        "legacy-prepad-17cf",
+        extra_env={"COLLECT_PADDING_TELEMETRY": "1"},
+    )
+
+    assert rendered["padding_telemetry"] == "1"
+
+    env = {
+        **os.environ,
+        "ARM": "official-pr5008-17cf",
+        "RENDER_ONLY": "1",
+        "COLLECT_PADDING_TELEMETRY": "1",
+    }
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "COLLECT_PADDING_TELEMETRY requires the legacy pre-padding arm" in result.stderr
 
 
 def test_effective_batch_script_is_nonexclusive_and_uses_allocated_cpus() -> None:
