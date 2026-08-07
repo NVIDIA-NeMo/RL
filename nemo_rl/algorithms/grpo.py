@@ -55,7 +55,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
-    log_generation_metrics_to_wandb,
+    log_generation_metrics,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -95,6 +95,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -404,6 +405,20 @@ def setup(
     )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+    elif generation_config["backend"] == "dynamo":
+        # Validate the complete managed-Dynamo boundary before allocating Ray
+        # placement groups or starting any external services.
+        if grpo_config.async_grpo.in_flight_weight_updates:
+            raise ValueError(
+                "grpo.async_grpo.in_flight_weight_updates must be false when "
+                "policy.generation.backend='dynamo'; managed Dynamo drains "
+                "rollouts before layerwise weight refit"
+            )
+        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+            policy_config.get("hf_config_overrides") or {}
+        )
+        generation_config = DynamoConfig.model_validate(generation_config).model_dump()
+        policy_config["generation"] = generation_config
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -888,6 +903,10 @@ def setup(
                     gpus_per_instance = trtllm_cfg[
                         "tensor_parallel_size"
                     ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                elif generation_config["backend"] == "dynamo":
+                    gpus_per_instance = DynamoConfig.model_validate(
+                        generation_config
+                    ).engine_world_size
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -961,6 +980,10 @@ def setup(
                 MegatronGeneration.init_cluster_placement_groups(
                     inference_cluster, policy_config
                 )
+            elif generation_config["backend"] == "dynamo":
+                # Managed Dynamo creates one single-node engine per placement
+                # group and does not need a backend-specific PG strategy.
+                inference_cluster.get_placement_groups()
             else:
                 {
                     "vllm": VllmGeneration,
@@ -1380,6 +1403,40 @@ def setup(
             )
             worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
 
+    elif backend == "dynamo":
+        # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
+
+        def init_dynamo():
+            t0 = time.perf_counter()
+            generation = DynamoGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                tokenizer=tokenizer,
+                tokenizer_config=policy_config["tokenizer"],
+            )
+            return generation, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_dynamo,
+            generation_name="Dynamo",
+            init_time_key="dynamo_init_time_s",
+            colocated_inference=False,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        if enable_nemo_gym:
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.dp_openai_server_base_urls,
+                generation_config["model_name"],
+            )
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+
+        print(
+            "  ✓ Using Dynamo backend "
+            f"(frontend: {policy_generation.dp_openai_server_base_urls[0]})",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -1412,15 +1469,16 @@ def setup(
         and checkpoint_engine_config is None
     ):
         t0 = time.perf_counter()
-        ip, port = train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # world includes all training workers and all inference workers
-        train_world_size = train_cluster.world_size()
-        inference_world_size = inference_nodes * inference_gpus_per_node
-        world_size = train_world_size + inference_world_size
-
         # init collective
         if backend == "megatron":
+            ip, port = train_cluster.get_master_address_and_port()
+            print(
+                f"Using ip: {ip}, port: {port} for collective communication",
+                flush=True,
+            )
+            train_world_size = train_cluster.world_size()
+            inference_world_size = inference_nodes * inference_gpus_per_node
+            world_size = train_world_size + inference_world_size
             refit_backend = policy_config["generation"]["mcore_generation_config"][
                 "refit_backend"
             ]
@@ -1439,7 +1497,7 @@ def setup(
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
-        elif nccl_reshard_refit_enabled:
+        elif nccl_reshard_refit_enabled or backend == "dynamo":
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -1450,6 +1508,14 @@ def setup(
             )
             policy_generation.weight_synchronizer.init_communicator()
         else:
+            ip, port = train_cluster.get_master_address_and_port()
+            print(
+                f"Using ip: {ip}, port: {port} for collective communication",
+                flush=True,
+            )
+            train_world_size = train_cluster.world_size()
+            inference_world_size = inference_nodes * inference_gpus_per_node
+            world_size = train_world_size + inference_world_size
             futures_train = policy.init_collective(
                 ip, port, world_size, train_world_size=train_world_size
             )
@@ -1498,7 +1564,7 @@ def setup(
             flush=True,
         )
     else:
-        if not (nccl_reshard_refit_enabled and not colocated_inference):
+        if getattr(policy_generation, "weight_synchronizer", None) is None:
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
@@ -2004,6 +2070,7 @@ def _apply_configured_message_level_advantage_penalties(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
+    Dynamo is intrinsically async because all rollouts use its HTTP frontend.
     SGLang only uses async rollouts when explicitly configured with
     ``policy.generation.use_async_rollouts``. vLLM and Megatron use async
     rollouts when their respective ``async_engine`` config is enabled.
@@ -2012,6 +2079,9 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     if generation_config is None:
         return False
     backend = generation_config.get("backend", "")
+
+    if backend == "dynamo":
+        return True
 
     if backend == "sglang":
         return bool(generation_config.get("use_async_rollouts", False))
@@ -2112,6 +2182,8 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         should_expose_http_server = generation_config["trtllm_cfg"].get(
             "expose_http_server"
         )
+    elif generation_config["backend"] == "dynamo":
+        should_expose_http_server = generation_config["vllm_cfg"]["expose_http_server"]
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -3589,9 +3661,8 @@ def grpo_train(
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
                 .get("enable_vllm_metrics_logger", False)
-                and master_config.logger["wandb_enabled"]
             ):
-                log_generation_metrics_to_wandb(
+                log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
                     master_config.policy["generation"]["vllm_cfg"][
@@ -3998,13 +4069,18 @@ def async_grpo_train(
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
-    ), (
-        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
+    assert backend in (
+        "vllm",
+        "megatron",
+        "trtllm",
+        "dynamo",
+    ) and _should_use_async_rollouts(master_config), (
+        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation "
+        "engine, or Dynamo. Set policy.generation.vllm_cfg.async_engine=true "
+        "(vLLM), "
         "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
-        "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
+        "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM), or "
+        "policy.generation.backend=dynamo."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
@@ -4190,13 +4266,11 @@ def async_grpo_train(
         next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
+    defer_collection_until_refit = backend == "dynamo"
+    if not defer_collection_until_refit:
+        trajectory_collector.start_collection.remote(dataloader)
+        trajectory_collector.set_weight_version.remote(weight_version)
+        print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
@@ -4230,6 +4304,13 @@ def async_grpo_train(
 
             traceback.print_exc()
             return
+
+    if defer_collection_until_refit:
+        # Dynamo workers start with dummy weights. Publish the initial weight
+        # version before allowing any request to reach the freshly refit fleet.
+        ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+        trajectory_collector.start_collection.remote(dataloader)
+        print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -5072,9 +5153,8 @@ def async_grpo_train(
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
                 .get("enable_vllm_metrics_logger", False)
-                and master_config.logger["wandb_enabled"]
             ):
-                log_generation_metrics_to_wandb(
+                log_generation_metrics(
                     generation_logger_metrics,
                     step + 1,
                     master_config.policy["generation"]["vllm_cfg"][
@@ -5192,7 +5272,6 @@ def async_grpo_train(
         except Exception as e:
             print(f"Error finalizing pending checkpoint: {e}")
 
-        # Clean up
         print("🛑 Stopping trajectory collection...")
         try:
             ray.kill(trajectory_collector)

@@ -363,6 +363,7 @@ jobs:
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       build-args: |
         MAX_JOBS=4
+        BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
@@ -735,6 +736,8 @@ jobs:
           - script: L1_Functional_Tests_Other_1
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Other_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Dynamo
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     needs: [pre-flight, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}

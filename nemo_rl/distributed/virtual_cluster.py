@@ -85,9 +85,12 @@ class PY_EXECUTABLES:
 # service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
 # the full layout including Ray's own GCS / worker gRPC ports.
 #
+#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
-#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
-#                                                 (policy.generation.port_range_low/high)
+#   3000-4999    Shared NeMo RL generation band  (policy.generation.port_range_low/high)
+#     3000-3999  Dynamo frontend/token-wrapper HTTP endpoints
+#     4000-4099  Dynamo worker system endpoints  (node-local engine index)
+#     4100-4999  Other generation HTTP servers + SGLang engine NCCL/dist_init
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
@@ -96,6 +99,12 @@ class PY_EXECUTABLES:
 #   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
 DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH = 1400
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH = 4100
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
 DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
