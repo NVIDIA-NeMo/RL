@@ -1237,11 +1237,13 @@ def setup(
                 "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
                 flush=True,
             )
+            vllm_reserve_t0 = time.perf_counter()
             deferred_vllm = VllmGeneration(
                 cluster=inference_cluster,
                 config=generation_config,
                 defer_model_load=True,
             )
+            vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
             print(
                 f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
                 f"{deferred_vllm.dp_openai_server_base_urls}",
@@ -1286,14 +1288,14 @@ def setup(
                 results = {k: f.result() for k, f in submitted.items()}
 
             if colocated_inference:
-                policy_generation, vllm_time, policy, policy_time = results[
+                policy_generation, vllm_load_time, policy, policy_time = results[
                     "vllm_policy"
                 ]
             else:
-                policy_generation, vllm_time = results["vllm"]
+                policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            setup_timing_metrics.vllm_init_time_s = vllm_time
+            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:

@@ -455,6 +455,12 @@ def setup_single_controller(
     train_cluster, inference_cluster = _build_clusters(master_config)
     colocated = generation_config["colocated"]["enabled"]
 
+    # Create build tasks for generation / trainer / (nemo-gym) workers
+    build_tasks: dict[str, Callable[[], Any]] = {}
+    generation = None
+    defer_generation_model_load = False
+    gen_reserve_time = 0.0
+
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
     ) -> tuple[Any, Any, dict[str, float]]:
@@ -488,13 +494,9 @@ def setup_single_controller(
 
         return generation, trainer, time_metrics
 
-    # Create build tasks for generation / trainer / (nemo-gym) workers
-    build_tasks: dict[str, Callable[[], Any]] = {}
-    generation = None
-    defer_generation_model_load = False
     if use_nemo_gym:
         # defer generation, only get base_urls for nemo_gym spinup
-        generation, _ = _build_generation(
+        generation, gen_reserve_time = _build_generation(
             inference_cluster,
             master_config=master_config,
             defer_model_load=True,
@@ -546,12 +548,18 @@ def setup_single_controller(
 
     if colocated:
         generation, trainer, time_metrics = results["generation_trainer"]
-        setattr(setup_timing_metrics, gen_init_time_key, time_metrics["gen_time"])
+        setattr(
+            setup_timing_metrics,
+            gen_init_time_key,
+            time_metrics["gen_time"] + gen_reserve_time,
+        )
         setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     else:
-        generation, gen_time = results["generation"]
+        generation, gen_load_time = results["generation"]
         trainer, trainer_time = results["trainer"]
-        setattr(setup_timing_metrics, gen_init_time_key, gen_time)
+        setattr(
+            setup_timing_metrics, gen_init_time_key, gen_load_time + gen_reserve_time
+        )
         setup_timing_metrics.policy_init_time_s = trainer_time
 
     worker_setup_time = time.perf_counter() - setup_start_time
