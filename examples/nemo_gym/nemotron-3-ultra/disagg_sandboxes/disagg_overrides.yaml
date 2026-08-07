@@ -1,0 +1,99 @@
+# =============================================================================
+# Disaggregated-sandbox overrides — shared fragment, NOT loadable standalone
+# =============================================================================
+# Merged after a full pipeclean config by pipeclean_6k_disagg.yaml and
+# pipeclean_6k_disagg_sc.yaml (kept free of `defaults:` on purpose: a fragment
+# that re-inherited the base would re-apply base values over the SC overlay).
+#
+# What "disaggregated" changes: tool execution for the sandbox-backed servers
+# (ns_tools stateful python, math_formal_lean lean compilation) moves from
+# colocated per-node nemo-skills containers to pods on an external sandbox
+# service. The launchers set NO_COLOCATED_SANDBOX=1 so no sandbox container is
+# deployed in the Slurm job at all.
+#
+# REQUIREMENTS
+#   - NeMo-Gym with the sandbox_pool backend (branch hemild/rlvr-osb-473f446f
+#     on NVIDIA-NeMo/Gym until merged) mounted at the usual Gym overlay path.
+#   - OPENSANDBOX_BASE_URL / OPENSANDBOX_API_KEY in the job environment (the
+#     Gym-side configs read them via ${oc.env:...}).
+#   - NS_SANDBOX_IMAGE: a nemo-skills sandbox image reference the service can
+#     pull (serves the NS HTTP protocol via /start-with-nginx.sh).
+#
+# PREWARMING (recommended at scale): create a server-side Pool of ready pods
+# before the job starts and set NS_SANDBOX_POOL_REF to its name — allocation
+# is then sub-second per pod instead of image-pull + service boot. With
+# NS_SANDBOX_POOL_REF unset, pods are created directly at Gym startup
+# (pool_fallback also degrades poolRef claims to direct creates when the pool
+# is exhausted).
+#
+# SIZING (measured on GB200-class CPU pods, 4 CPUs each):
+#   - Keep concurrent sessions per pod ≈ CPUs per pod. CPU contention does not
+#     fail loudly — it slows tool execs past exec_timeout_s and silently clears
+#     session state (~27% of rollouts at 2x oversubscription vs ~3% at 1x).
+#   - exec_timeout_s=60: model-written brute-force code routinely exceeds 30s.
+#   - Pod memory limits >= 16Gi at high session density; kernels accumulate.
+# =============================================================================
+
+env:
+  nemo_gym:
+    # ns_tools: stateful python tool execution on a shared pod pool with sticky
+    # session routing: ~16k sessions per step ride the pool as held state, while
+    # CONCURRENT EXECS are bounded by pods x NUM_WORKERS (sessions/pod ≈ CPUs/pod
+    # applies to executing sessions, not held ones).
+    ns_tools:
+      resources_servers:
+        ns_tools:
+          sandbox_type: sandbox_pool
+          # 60s, not the base recipe's 10s: model-written brute-force code
+          # routinely runs past 30s, and the timeout interrupt silently clears
+          # session state — at scale that surfaces as unexplained rollout loss.
+          nemo_skills_tool_overrides:
+            DirectPythonTool:
+              exec_timeout_s: ${oc.decode:${oc.env:NS_TOOLS_EXEC_TIMEOUT_S,60}}
+          sandbox_pool:
+            image: ${oc.env:NS_SANDBOX_IMAGE}
+            pool_ref: ${oc.env:NS_SANDBOX_POOL_REF,''}
+            # 256 pods x NUM_WORKERS=4 = 1,024 concurrent sessions at the safe
+            # sessions/pod ≈ CPUs/pod ratio (validated: 16,384 requests at
+            # 1,024 concurrency, 100% success, zero session recreations).
+            size: ${oc.decode:${oc.env:NS_SANDBOX_POOL_SIZE,256}}
+            # Explicit for visibility; claims degrade to direct creates when
+            # the pool is exhausted, so a full pool is a slowdown, not a fault.
+            pool_fallback: ${oc.decode:${oc.env:NS_SANDBOX_POOL_FALLBACK,true}}
+            env:
+              NUM_WORKERS: "4"
+
+    # math_formal_lean: lean compilation on a warm pod pool. A cold pod's first
+    # `import Mathlib` lazy-pulls ~5GB of olean files (~15 min); a warmed pod
+    # verifies in ~4s, so pool pods prefetch once at Gym startup.
+    math_formal_lean:
+      resources_servers:
+        math_formal_lean:
+          sandbox_backend: gym_sandbox
+          opensandbox:
+            provider:
+              opensandbox:
+                connection:
+                  domain: ${oc.env:OPENSANDBOX_BASE_URL}
+                  api_key: ${oc.env:OPENSANDBOX_API_KEY}
+                  use_server_proxy: true
+                  # Provider-layer field (request_timeout_s) — NOT the SDK-layer
+                  # request_timeout used by ns_tools' sandbox_pool block. The
+                  # wrong name is swallowed by the pool-fill's except and leaves
+                  # a healthy-looking server with a permanently empty lean pool.
+                  request_timeout_s: 180
+                operations:
+                  background_exec: true
+            image: ${oc.env:NS_SANDBOX_IMAGE}
+            # Prewarmed server-side pool: pods warm-compile mathlib at start, so
+            # claims are instantly hot instead of paying the per-pod olean pull
+            # at Gym startup. Claims degrade to direct creates on failure, but a
+            # cold pod's first compile (~15 min) far exceeds the 120s admission
+            # window — the fallback keeps the server alive, not the verifies:
+            # if the pool is missing, fix the pool.
+            pool_ref: ${oc.env:LEAN_SANDBOX_POOL_REF,''}
+            # One in-flight compile per pod: mathlib compiles are multi-core,
+            # and the admission queue rejects (reward 0) after 120s — measured
+            # 22/96 admission timeouts at 32 concurrent verifies on 8 pods.
+            pool_size: ${oc.decode:${oc.env:LEAN_SANDBOX_POOL_SIZE,32}}
+            max_concurrent: ${oc.decode:${oc.env:LEAN_SANDBOX_MAX_CONCURRENT,32}}
