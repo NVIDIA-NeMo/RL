@@ -17,7 +17,6 @@ Returns NeMoGym fields (prompt_token_ids, generation_token_ids, generation_log_p
 Supports Qwen3 tool calling, DeepSeekR1Parser reasoning, and prefix token splicing.
 """
 
-import asyncio
 import logging
 import threading
 import time
@@ -214,9 +213,8 @@ def create_app(
         )
 
         try:
-            outputs = await asyncio.to_thread(
-                llm.generate,
-                [{"prompt_token_ids": adj_prompt}],
+            output = await llm.generate_async(
+                {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
             )
         except RequestError as e:
@@ -228,7 +226,6 @@ def create_app(
                 )
             raise
 
-        output = outputs[0]
         gen = output.outputs[0]
         gen_token_ids = list(gen.token_ids)
 
