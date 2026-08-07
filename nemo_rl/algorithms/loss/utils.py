@@ -32,6 +32,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
+from nemo_rl.models.policy.utils import XTokenTransportContext
 
 
 def prepare_loss_input(
@@ -44,6 +45,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    xtoken_transport: Optional[XTokenTransportContext] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -59,6 +61,8 @@ def prepare_loss_input(
         chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
             computation (policy.logprob_chunk_size); avoids materializing
             full-size float32 logits during training.
+        xtoken_transport: Received cross-node teacher-logit buffers and this
+            worker's x-token collective rank.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -158,6 +162,7 @@ def prepare_loss_input(
             projection_matrix_paths=loss_fn.projection_matrix_paths,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            xtoken_transport=xtoken_transport,
         )
         loss_input = {
             "logits": logits,

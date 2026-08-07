@@ -70,3 +70,25 @@ class StatelessProcessGroup:
         self.nccl_communicator.broadcast(
             sendbuf=tensor, recvbuf=tensor, root=src, stream=int(stream.cuda_stream)
         )
+
+    def send(
+        self,
+        tensor: torch.Tensor,
+        peer: int,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Send ``tensor`` to ``peer`` on the NCCL communicator."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.nccl_communicator.send(tensor, peer, stream=int(stream.cuda_stream))
+
+    def recv(
+        self,
+        tensor: torch.Tensor,
+        peer: int,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Receive a tensor from ``peer`` on the NCCL communicator."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.nccl_communicator.recv(tensor, peer, stream=int(stream.cuda_stream))
