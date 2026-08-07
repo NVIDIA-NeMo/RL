@@ -1,5 +1,6 @@
 """Tests for scoped integration with NeMo-RL's synchronous GRPO modules."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 
 pytest.importorskip("ray", reason="NeMo-RL integration dependencies are unavailable")
 
+from run_grpo_turn_credit import load_master_and_turn_credit_config
 from turn_level_credit.config import TurnCreditConfig
 from turn_level_credit.integration import install_turn_credit_runtime
 
@@ -18,10 +20,7 @@ from nemo_rl.experience import rollouts as rollout_module
 
 def _master_config():
     return SimpleNamespace(
-        grpo={
-            "adv_estimator": {"name": "grpo"},
-            "async_grpo": {"enabled": False},
-        },
+        grpo=grpo_module.GRPOConfig(),
         data_plane={"enabled": False},
         env={"should_use_nemo_gym": False},
         policy={
@@ -31,6 +30,36 @@ def _master_config():
             }
         },
     )
+
+
+def test_checked_in_config_loads_current_master_schema():
+    config_path = (
+        Path(__file__).parents[2] / "configs" / "grpo_math_0.5b_turn_credit.yaml"
+    )
+
+    master_config, turn_credit_config = load_master_and_turn_credit_config(
+        str(config_path),
+        [],
+    )
+
+    assert isinstance(master_config, grpo_module.MasterConfig)
+    assert master_config.grpo.adv_estimator.name == "grpo"
+    assert turn_credit_config == TurnCreditConfig(enabled=True, turn_weight=0.2)
+
+
+def test_disabled_runtime_does_not_install_hooks():
+    original_calculate_rewards = rollout_module.calculate_rewards
+    original_rollout = grpo_module.run_multi_turn_rollout
+    original_estimator_factory = grpo_module._create_advantage_estimator
+
+    with install_turn_credit_runtime(TurnCreditConfig(enabled=False)):
+        assert rollout_module.calculate_rewards is original_calculate_rewards
+        assert grpo_module.run_multi_turn_rollout is original_rollout
+        assert grpo_module._create_advantage_estimator is original_estimator_factory
+
+    assert rollout_module.calculate_rewards is original_calculate_rewards
+    assert grpo_module.run_multi_turn_rollout is original_rollout
+    assert grpo_module._create_advantage_estimator is original_estimator_factory
 
 
 def test_runtime_hooks_capture_metrics_and_restore_after_error(monkeypatch):
@@ -63,7 +92,7 @@ def test_runtime_hooks_capture_metrics_and_restore_after_error(monkeypatch):
         rollout_batch = kwargs["input_batch"]
         environment_return = rollout_module.calculate_rewards(rollout_batch, {})
         rollout_batch["total_reward"] = environment_return.rewards
-        return rollout_batch, {}
+        return rollout_batch, {"total_turns": 1}
 
     class _BaseEstimator:
         def compute_advantage(self, **_kwargs):

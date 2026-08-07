@@ -34,6 +34,7 @@ from turn_level_credit.trace import (
     remove_turn_annotations,
     tensorize_turn_traces,
     validate_raw_reward_sums,
+    validate_turn_count,
 )
 from turn_level_credit.validation import validate_supported_path
 
@@ -80,6 +81,9 @@ def install_turn_credit_runtime(
         turn_batch = tensorize_turn_traces(final_batch["message_log"])
         if turn_batch.max_turns == 0:
             raise ValueError("Enabled turn credit captured no environment transitions")
+        if "total_turns" not in metrics:
+            raise ValueError("Rollout metrics are missing required total_turns")
+        validate_turn_count(turn_batch, metrics["total_turns"])
         validate_raw_reward_sums(
             turn_batch,
             final_batch["total_reward"],

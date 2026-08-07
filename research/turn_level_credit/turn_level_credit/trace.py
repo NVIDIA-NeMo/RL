@@ -64,6 +64,25 @@ class TurnBatch:
         return self.rewards.shape[1]
 
 
+def _validate_terminal_order(turn_batch: TurnBatch) -> None:
+    """Reject terminal flags outside the final observed turn of a trajectory."""
+    if bool((turn_batch.terminateds & ~turn_batch.mask).any().item()):
+        raise ValueError("Padded turns cannot carry terminal flags")
+    for row in range(turn_batch.batch_size):
+        observed_indices = torch.nonzero(turn_batch.mask[row], as_tuple=False).flatten()
+        terminal_indices = torch.nonzero(
+            turn_batch.terminateds[row] & turn_batch.mask[row],
+            as_tuple=False,
+        ).flatten()
+        if terminal_indices.numel() > 1 or (
+            terminal_indices.numel() == 1
+            and terminal_indices[0] != observed_indices[-1]
+        ):
+            raise ValueError(
+                f"Trajectory row {row} contains an observed turn after termination"
+            )
+
+
 def _as_scalar_reward_rows(
     rewards: torch.Tensor | dict[str, torch.Tensor],
     *,
@@ -250,13 +269,15 @@ def tensorize_turn_traces(
             assistant_spans[row, turn_index] = torch.tensor([start, end])
             terminateds[row, turn_index] = record.terminated
 
-    return TurnBatch(
+    turn_batch = TurnBatch(
         rewards=rewards,
         mask=mask,
         trainable_mask=trainable_mask,
         assistant_spans=assistant_spans,
         terminateds=terminateds,
     )
+    _validate_terminal_order(turn_batch)
+    return turn_batch
 
 
 def attach_turn_batch(
@@ -336,7 +357,22 @@ def turn_batch_from_mapping(batch: Mapping[str, Any]) -> TurnBatch:
         )
     if not torch.isfinite(turn_batch.rewards[turn_batch.mask]).all():
         raise ValueError("Observed turn rewards contain non-finite values")
+    _validate_terminal_order(turn_batch)
     return turn_batch
+
+
+def validate_turn_count(turn_batch: TurnBatch, total_turns: int) -> None:
+    """Match captured transitions against the rollout's authoritative count."""
+    if isinstance(total_turns, bool) or not isinstance(total_turns, int):
+        raise TypeError("Rollout metric total_turns must be an integer")
+    if total_turns < 0:
+        raise ValueError("Rollout metric total_turns must be non-negative")
+    observed_turns = int(turn_batch.mask.sum().item())
+    if observed_turns != total_turns:
+        raise ValueError(
+            "Captured turn count does not match rollout total_turns: "
+            f"captured={observed_turns}, total_turns={total_turns}"
+        )
 
 
 def validate_raw_reward_sums(

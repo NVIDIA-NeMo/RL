@@ -14,6 +14,7 @@ from turn_level_credit.trace import (
     tensorize_turn_traces,
     turn_batch_from_mapping,
     validate_raw_reward_sums,
+    validate_turn_count,
 )
 
 
@@ -225,6 +226,39 @@ def test_turn_batch_round_trip_and_raw_sum_mismatch():
             torch.tensor([1.0]),
             atol=1.0e-6,
         )
+
+
+def test_turn_count_detects_a_missing_zero_reward_transition():
+    logs = [[_message("assistant", [1], generated=True)]]
+    record_environment_turn(
+        logs,
+        _environment_return(torch.tensor([0.0]), [False]),
+    )
+    turn_batch = tensorize_turn_traces(logs)
+
+    with pytest.raises(ValueError, match="captured=1, total_turns=2"):
+        validate_turn_count(turn_batch, 2)
+
+
+def test_tensorization_rejects_turn_after_terminal_transition():
+    logs = [[_message("assistant", [1], generated=True)]]
+    record_environment_turn(
+        logs,
+        _environment_return(torch.tensor([0.0]), [True]),
+    )
+    logs[0].extend(
+        [
+            _message("user", [2]),
+            _message("assistant", [3], generated=True),
+        ]
+    )
+    record_environment_turn(
+        logs,
+        _environment_return(torch.tensor([1.0]), [True]),
+    )
+
+    with pytest.raises(ValueError, match="after termination"):
+        tensorize_turn_traces(logs)
 
 
 def test_scatter_rejects_span_touching_non_trainable_token():

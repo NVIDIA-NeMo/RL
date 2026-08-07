@@ -27,19 +27,15 @@ def _uses_async_rollouts(master_config: "MasterConfig") -> bool:
     generation_config = master_config.policy["generation"]
     if generation_config is None:
         return False
-    backend = generation_config.get("backend", "")
+    backend = generation_config["backend"]
     if backend == "sglang":
-        return bool(generation_config.get("use_async_rollouts", False))
+        return bool(generation_config.get("use_async_rollouts"))
     if backend == "vllm":
-        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+        return bool(generation_config["vllm_cfg"]["async_engine"])
     if backend == "trtllm":
         return True
     if backend == "megatron":
-        return bool(
-            generation_config.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
-        )
+        return bool(generation_config["mcore_generation_config"]["async_engine"])
     return False
 
 
@@ -48,21 +44,18 @@ def validate_supported_path(
     turn_credit_config: TurnCreditConfig,
 ) -> None:
     """Fail at startup for execution paths not validated by this project."""
-    estimator_config = master_config.grpo.get("adv_estimator")
-    estimator_name = (
-        estimator_config["name"] if estimator_config is not None else "grpo"
-    )
+    estimator_name = master_config.grpo.adv_estimator.name
     if estimator_name != "grpo":
         raise ValueError(
             "Turn-level credit currently supports only grpo.adv_estimator.name=grpo"
         )
-    if master_config.grpo.get("async_grpo", {}).get("enabled"):
+    if master_config.grpo.async_grpo.enabled:
         raise ValueError("Turn-level credit research does not support async GRPO")
-    if master_config.data_plane and master_config.data_plane.get("enabled", False):
+    if master_config.data_plane and master_config.data_plane["enabled"]:
         raise ValueError(
             "Turn-level credit research supports only data_plane.enabled=false"
         )
-    if master_config.env.get("should_use_nemo_gym", False):
+    if master_config.env.get("should_use_nemo_gym"):
         raise ValueError(
             "Native NeMo Gym step rewards require the versioned contract tracked "
             "by NVIDIA-NeMo/Gym#1298 and are not inferred by this project"
