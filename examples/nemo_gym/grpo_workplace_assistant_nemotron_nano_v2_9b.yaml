@@ -269,6 +269,21 @@ policy:
       resources:
         gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
         num_nodes: null # Decides number of nodes to be dedicated to generation
+    # Optional heterogeneous replica groups (requires colocated.enabled=false).
+    # Group gpus must sum to the colocated.resources budget; overrides are
+    # deep-merged onto this generation config. Example:
+    # server_groups:
+    #   - name: low_latency
+    #     gpus: 2
+    #     overrides:
+    #       vllm_cfg: { tensor_parallel_size: 1 }
+    #       vllm_kwargs: { max_num_seqs: 16 }
+    #   - name: high_throughput
+    #     gpus: 4
+    #     overrides:
+    #       vllm_cfg: { tensor_parallel_size: 4 }
+    #       vllm_kwargs: { max_num_seqs: 512 }
+    server_groups: null
 
 data:
   # The complete trajectory is managed by gym, which will pass the entire thing to vllm.

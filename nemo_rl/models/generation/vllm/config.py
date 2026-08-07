@@ -144,6 +144,8 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # [{name, gpus, overrides: {vllm_cfg, vllm_kwargs}}], see vllm/multi_group.py
+    server_groups: NotRequired[list[dict[str, Any]] | None]
     # Null uses the topology default (IPC colocated, NCCL non-colocated).
     # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
