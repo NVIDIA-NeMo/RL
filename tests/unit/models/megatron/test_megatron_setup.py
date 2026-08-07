@@ -514,6 +514,62 @@ class TestValidateModelPaths:
 
 
 @pytest.mark.mcore
+class TestApplyModelOverrides:
+    """Tests for generic Megatron Bridge model-provider overrides."""
+
+    def test_applies_leaf_nested_object_and_mapping_overrides(self):
+        """Overrides follow the hierarchy without replacing nested configs."""
+        from nemo_rl.models.megatron.setup import _apply_model_overrides
+
+        nested_config = SimpleNamespace(enabled=False, mode="default")
+        mapping_config = {"preserved": 1, "nested": {"old": 2}}
+        model_cfg = SimpleNamespace(
+            masked_softmax_fusion=True,
+            nested_config=nested_config,
+            mapping_config=mapping_config,
+        )
+
+        _apply_model_overrides(
+            model_cfg,
+            {
+                "masked_softmax_fusion": False,
+                "nested_config": {"enabled": True},
+                "mapping_config": {"nested": {"new": 3}},
+            },
+        )
+
+        assert model_cfg.masked_softmax_fusion is False
+        assert model_cfg.nested_config is nested_config
+        assert model_cfg.nested_config.enabled is True
+        assert model_cfg.nested_config.mode == "default"
+        assert model_cfg.mapping_config == {
+            "preserved": 1,
+            "nested": {"old": 2, "new": 3},
+        }
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected_path"),
+        [
+            ({"typo": True}, "policy.megatron_cfg.model_overrides.typo"),
+            (
+                {"nested_config": {"typo": True}},
+                "policy.megatron_cfg.model_overrides.nested_config.typo",
+            ),
+        ],
+    )
+    def test_unknown_object_attribute_raises_with_full_path(
+        self, overrides, expected_path
+    ):
+        """Misspelled provider fields fail early with an actionable path."""
+        from nemo_rl.models.megatron.setup import _apply_model_overrides
+
+        model_cfg = SimpleNamespace(nested_config=SimpleNamespace(enabled=False))
+
+        with pytest.raises(AttributeError, match=expected_path):
+            _apply_model_overrides(model_cfg, overrides)
+
+
+@pytest.mark.mcore
 class TestApplyParallelismConfig:
     """Tests for _apply_parallelism_config function."""
 
@@ -1991,7 +2047,7 @@ class TestMakePolicyLikeConfig:
 
 @pytest.mark.mcore
 class TestSetupModelConfig:
-    """Tests for setup_model_config — hf_config_overrides handling."""
+    """Tests for setup_model_config override handling."""
 
     _HELPER_PATCHES = [
         "nemo_rl.models.megatron.setup._create_megatron_config",
@@ -2059,6 +2115,39 @@ class TestSetupModelConfig:
             trust_remote_code=True,
             rope_scaling={"rope_type": "yarn", "factor": 4.0},
         )
+
+    def test_applies_model_overrides_to_loaded_provider(self, tmp_path, request):
+        """model_overrides must update the provider returned by Bridge."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        iteration_dir = tmp_path / "iter_0000000"
+        iteration_dir.mkdir()
+        (iteration_dir / "run_config.yaml").touch()
+        model_cfg = SimpleNamespace(
+            masked_softmax_fusion=True,
+            __post_init__=MagicMock(),
+        )
+        config = {
+            "pretrained_checkpoint": None,
+            "megatron_cfg": {"model_overrides": {"masked_softmax_fusion": False}},
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(model_cfg, None),
+        ):
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+
+        assert model_cfg.masked_softmax_fusion is False
+        model_cfg.__post_init__.assert_called_once_with()
 
     def test_megatron_lm_no_overrides_calls_autoconfig_without_extra_kwargs(
         self, request
