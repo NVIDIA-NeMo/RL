@@ -205,9 +205,21 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             train_world_size,
             inference_world_size,
         )
-        self._generation.prepare_nccl_reshard_refit_info(nccl_reshard_refit_info)
+
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            make_nccl_reshard_refit_info_wire_safe,
+        )
+
+        # SingleController sends this across vLLM's subprocess boundary, so avoid
+        # Megatron-dependent Tensor pickles.
+        wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
+            nccl_reshard_refit_info
+        )
+        self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
 
     def shutdown(self) -> None:
         # The NCCL process groups' lifecycle is managed by Ray actor teardown;
         # the workers that own the groups are destroyed with the cluster.
-        pass
+        # Drop the local wrapper reference explicitly without changing how the
+        # object graph is serialized into SingleControllerActor.
+        self._generation = None
