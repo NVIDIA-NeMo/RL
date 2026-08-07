@@ -744,6 +744,12 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
+        # Colocated generation reuses the policy's cluster; need to decide topology here.
+        if (
+            node_resource_constraints is not None
+            and generation_config["backend"] == "megatron"
+        ):
+            MegatronGeneration.init_cluster_placement_groups(cluster, policy_config)
         print(
             f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
@@ -858,7 +864,7 @@ def setup(
                         flush=True,
                     )
 
-                # Inference topology: each vLLM/SGLang instance spans
+                # Inference topology: each inference instance spans
                 # nodes_per_instance nodes; keep those within one domain
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
                 #
@@ -866,7 +872,13 @@ def setup(
                 # For SGLang: gpus_per_server already includes all parallelism
                 #   dimensions (TP, DP-attention, PP are internal subdivisions),
                 #   so we use it directly without multiplying by pp_size.
-                if generation_config["backend"] == "vllm":
+                # For Megatron: the NVLink-domain span of the parallelism the
+                #   generation workers actually run with.
+                if generation_config["backend"] == "megatron":
+                    gpus_per_instance = MegatronGeneration.nvlink_domain_span(
+                        policy_config
+                    )
+                elif generation_config["backend"] == "vllm":
                     vllm_cfg = generation_config.get("vllm_cfg", {})
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
@@ -944,13 +956,19 @@ def setup(
             node_resource_constraints=inference_node_resource_constraints,
         )
         if inference_node_resource_constraints is not None:
-            {
-                "vllm": VllmGeneration,
-                "trtllm": TrtllmGeneration,
-            }[generation_config["backend"]].init_cluster_placement_groups(
-                inference_cluster,
-                generation_config,
-            )
+            if generation_config["backend"] == "megatron":
+                # Megatron inference reuses the training parallelism config.
+                MegatronGeneration.init_cluster_placement_groups(
+                    inference_cluster, policy_config
+                )
+            else:
+                {
+                    "vllm": VllmGeneration,
+                    "trtllm": TrtllmGeneration,
+                }[generation_config["backend"]].init_cluster_placement_groups(
+                    inference_cluster,
+                    generation_config,
+                )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
