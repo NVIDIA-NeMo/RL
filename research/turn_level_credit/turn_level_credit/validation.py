@@ -14,12 +14,14 @@
 
 """Pure configuration validation for the supported research execution path."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from turn_level_credit.config import TurnCreditConfig
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+    from nemo_rl.models.generation.vllm.config import VllmConfig
 
 
 def _uses_async_rollouts(master_config: "MasterConfig") -> bool:
@@ -31,11 +33,13 @@ def _uses_async_rollouts(master_config: "MasterConfig") -> bool:
     if backend == "sglang":
         return bool(generation_config.get("use_async_rollouts"))
     if backend == "vllm":
-        return bool(generation_config["vllm_cfg"]["async_engine"])
+        vllm_config = cast("VllmConfig", generation_config)
+        return bool(vllm_config["vllm_cfg"]["async_engine"])
     if backend == "trtllm":
         return True
     if backend == "megatron":
-        return bool(generation_config["mcore_generation_config"]["async_engine"])
+        mcore_config = cast("MCoreGenerationConfig", generation_config)
+        return bool(mcore_config["mcore_generation_config"]["async_engine"])
     return False
 
 
