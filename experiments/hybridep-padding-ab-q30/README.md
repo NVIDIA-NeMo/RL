@@ -34,7 +34,7 @@ and the legacy padding contract.
 The dated container is paired with a checksum-pinned frozen preflight venv
 whose full manifest was validated on H100. The launcher mounts that venv at the
 same Lustre path and injects its Python, Transformer Engine, cuDNN, and source
-paths into every containerized `srun`. The corresponding intentional
+paths into the Ray head and worker containers. The corresponding intentional
 `NRL_IGNORE_VERSION_MISMATCH=1` exception is recorded as
 `validated_frozen_preflight_venv`; forced venv rebuilding remains disabled.
 The Ray daemon, driver, and bootstrap use that frozen runtime. Megatron and

@@ -31,11 +31,17 @@ STAGE_NIGHTLY_SCRIPT = (
     / "hybridep-padding-ab-q30"
     / "stage-nightly-container-cw.sbatch"
 )
+OCI_STAGE_QWEN30_SCRIPT = (
+    ROOT
+    / "experiments"
+    / "hybridep-padding-ab-q30"
+    / "stage-qwen30-oci-nrt.sbatch"
+)
 LAUNCH_BIN = ROOT / "experiments" / "hybridep-padding-ab-q30" / "launch-bin"
 SRUN_WRAPPER = LAUNCH_BIN / "srun"
 UV_WRAPPER = LAUNCH_BIN / "uv"
 PREFLIGHT_MANIFEST_SHA256 = (
-    "f80438561d65a2be18ed888dac438b5dbea93dc5a374e5acbb37e0db3c6d8816"
+    "ab6797d70d846ae8a9734947f1cac99e1b0184fa7f2ac6c0e2643e77700649da"
 )
 
 
@@ -307,6 +313,24 @@ def test_nightly_staging_job_is_reproducible_and_does_not_strand_gpus() -> None:
     assert "metadata_file" in stage_script
     assert "source_commit=" in stage_script
     assert "mv -Tf" in stage_script
+
+
+def test_oci_qwen30_staging_uses_cpu_and_persistent_lustre() -> None:
+    stage_script = OCI_STAGE_QWEN30_SCRIPT.read_text()
+
+    assert "#SBATCH --nodes=1" in stage_script
+    assert "#SBATCH --ntasks=1" in stage_script
+    assert "#SBATCH --gpus" not in stage_script
+    assert "#SBATCH --gres" not in stage_script
+    assert "#SBATCH --exclusive" not in stage_script
+    assert "#SBATCH --cpus" not in stage_script
+    assert "#SBATCH --mem" not in stage_script
+    assert "Qwen/Qwen3-30B-A3B" in stage_script
+    assert "snapshot_download" in stage_script
+    assert "--no-container-mount-home" in stage_script
+    assert "must be a canonical /lustre path" in stage_script
+    assert "HF_TOKEN" not in stage_script
+    assert "stage-metadata-$SLURM_JOB_ID.json" in stage_script
 
 
 def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
