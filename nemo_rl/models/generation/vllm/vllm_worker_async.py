@@ -353,6 +353,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -639,6 +640,15 @@ class VllmAsyncGenerationWorkerImpl(
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        # The embedded server is constructed directly instead of through
+        # vLLM's CLI, where chat-template file paths are normally loaded.
+        # OnlineRenderer expects literal Jinja content; passing a path renders
+        # the path itself and drops multimodal placeholders such as <image>.
+        configured_chat_template = serving_chat_kwargs.get("chat_template")
+        if configured_chat_template is not None:
+            serving_chat_kwargs["chat_template"] = load_chat_template(
+                configured_chat_template
+            )
         online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
@@ -1343,6 +1353,13 @@ class VllmAsyncGenerationWorkerImpl(
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def _reset_encoder_cache_after_weight_update(self) -> None:
+        """Invalidate vision features produced by the previous model weights."""
+        assert self.llm is not None
+        reset_encoder_cache = getattr(self.llm, "reset_encoder_cache", None)
+        if reset_encoder_cache is not None:
+            await reset_encoder_cache()
+
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -1374,6 +1391,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1410,6 +1428,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1469,6 +1488,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
