@@ -3,6 +3,8 @@
 defaults: "grpo_math_1B.yaml"
 
 grpo:
+  deduplicate_multimodal_data: false
+  debug_payload_metrics: false
   num_prompts_per_step: 8
   reward_shaping:
     overlong_buffer_length: 512
