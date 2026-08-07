@@ -39,6 +39,27 @@ for most models, but it is not guaranteed for every architecture or recipe. If
 you encounter errors with the standard Megatron layer specs, leave it unset or
 set it to `false` to exercise ModelOpt's Megatron layer-spec path.
 
+## Frozen-Weight Logprob Optimization
+
+QARL can avoid repeatedly fake-quantizing the same frozen weights during the
+no-gradient policy and reference logprob passes. Set
+`policy.quant_fold_frozen_weight_snap: true` to enable it; it defaults to `false`.
+
+When enabled, NeMo RL calls ModelOpt's `fold_weight` once at the start of the pass,
+which writes each fake-quantized weight into its existing parameter storage and
+disables the weight quantizer. Forwards during the pass then read an already-quantized
+weight instead of re-quantizing it on every microbatch. The original weights are
+restored and the quantizers re-enabled before training resumes.
+
+This applies to any quantization format. `fold_weight` disables only the *weight*
+quantizer, so recipes that also quantize activations (such as W4A4) keep their input
+and output quantizers running and produce unchanged logprobs. Weight quantizers built
+as a `SequentialQuantizer` (W4A4 double-quant) are left alone by `fold_weight`, so
+those modules simply do not benefit.
+
+The option costs one temporary copy of each folded weight shard, held only for the
+duration of the pass.
+
 ## Quantization-Aware GRPO (QA-GRPO)
 
 ### Configuration
@@ -51,6 +72,7 @@ defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 policy:
   quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+  quant_fold_frozen_weight_snap: true
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
@@ -289,6 +311,7 @@ defaults: "../configs/distillation_math_megatron.yaml"
 
 policy:
     quant_cfg: "NVFP4_DEFAULT_CFG"
+    quant_fold_frozen_weight_snap: true
     quant_calib_data: "cnn_dailymail"
     quant_calib_size: 512
     quant_batch_size: 1
@@ -318,6 +341,7 @@ These parameters are added under the `policy` section:
 | `quant_calib_size` | Number of samples for the calibration pass |
 | `quant_batch_size` | Batch size during calibration |
 | `quant_sequence_length` | Sequence length for calibration data |
+| `quant_fold_frozen_weight_snap` | Optional boolean, default `false`. During frozen-weight logprob passes, fold each fake-quantized weight into its parameter once via ModelOpt's `fold_weight` instead of re-quantizing every microbatch. Weights and quantizers are restored afterwards. Safe for any format, including activation-quantized recipes such as W4A4. |
 
 The `policy.generation.quant_cfg` should match `policy.quant_cfg` to ensure consistent quantization between training and generation.
 

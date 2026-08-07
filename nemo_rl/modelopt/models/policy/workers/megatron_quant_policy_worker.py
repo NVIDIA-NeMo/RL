@@ -40,6 +40,9 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
     quantize_model,
     symlink_pre_quantized_model,
 )
+from nemo_rl.modelopt.models.policy.workers.weight_folding import (
+    temporarily_fold_weights,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     resolve_nvfp4_real_quant_mode,
@@ -430,6 +433,22 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             "with_amax": with_amax,
             "positive_amax": positive_amax,
         }
+
+    def get_logprobs(self, *args, **kwargs):
+        """Compute logprobs, optionally folding the frozen weights for the stage.
+
+        With ``policy.quant_fold_frozen_weight_snap`` set, each weight is fake-quantized
+        once for the whole stage instead of on every microbatch forward. Off by default;
+        when unset this is exactly the base implementation.
+
+        Safe only because the re-scoring pass runs under ``no_grad`` with no optimizer
+        step -- the fold is written into the parameter and reverted on exit.
+        """
+        if not self.cfg.get("quant_fold_frozen_weight_snap"):
+            return super().get_logprobs(*args, **kwargs)
+
+        with temporarily_fold_weights(self.model, verbose=True, rank=self.rank):
+            return super().get_logprobs(*args, **kwargs)
 
     def generate(self, **kwargs):
         """Quantized Megatron generation is not supported.
