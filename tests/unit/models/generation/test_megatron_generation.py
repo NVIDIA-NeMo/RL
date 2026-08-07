@@ -391,17 +391,7 @@ def test_megatron_generation_colocated(
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
-    # Eager engine startup (expose_http_server) flips MLM's process-wide
-    # InferenceMode on at construction; the inference_optimized leg trains
-    # before any generate/suspend cycle, so it must construct engine-less.
-    config["generation"]["mcore_generation_config"]["expose_http_server"] = (
-        transformer_impl == "transformer_engine"
-    )
-    # The parametrized impl is the GENERATION-side one; training always runs
-    # transformer_engine (the worker rejects inference_optimized on training
-    # workers). transformer_engine => dual-mode (matched impl, shared model);
-    # inference_optimized => the worker builds a dedicated resharded
-    # inference model on the shared GPUs.
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
     config["generation"]["mcore_generation_config"]["transformer_impl"] = (
         transformer_impl
     )
@@ -426,16 +416,18 @@ def test_megatron_generation_colocated(
         assert "max_tokens" not in config["megatron_cfg"]
         assert config["megatron_cfg"] == megatron_cfg_before
 
-        if transformer_impl == "transformer_engine":
-            # setup() hands dp_openai_server_base_urls to NeMo Gym right after
-            # construction, so the colocated constructor must have collected them.
-            assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
-            assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+        # setup() hands dp_openai_server_base_urls to NeMo Gym right after
+        # construction, so the colocated constructor must have collected them.
+        assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
+        assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+
+        # Production order: generation comes first, on the eagerly started engine.
+        outputs = mg.generate(test_input_data, greedy=True)
+        _assert_valid_generation_output(outputs, test_input_data)
 
         if transformer_impl == "inference_optimized":
-            # Reshard mode: the TE training model takes a train step (finite
-            # loss) before the engine ever starts; generation then runs on
-            # the dedicated inference_optimized model built at first wake.
+            # Engine stands down for training.
+            mg.finish_generation(for_training=True)
             torch.manual_seed(42)
             train_data = BatchedDataDict(
                 {
@@ -453,7 +445,7 @@ def test_megatron_generation_colocated(
             )
             policy.finish_training()
 
-        # re-entering generation mode must be a no-op on the running engine
+        # Re-entering generation mode: wakes the slept engine.
         mg.prepare_for_generation()
         outputs = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(outputs, test_input_data)
