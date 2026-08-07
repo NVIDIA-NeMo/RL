@@ -240,6 +240,15 @@ def test_container_checksum_cache_is_bound_to_file_identity() -> None:
     assert "container_stat_fingerprint=" in launcher
 
 
+def test_external_worktree_git_common_dir_is_mounted() -> None:
+    launcher = LAUNCHER.read_text()
+
+    assert "rev-parse --path-format=absolute --git-common-dir" in launcher
+    assert 'require_canonical_lustre_path GIT_COMMON_DIR "$GIT_COMMON_DIR"' in launcher
+    assert ',$GIT_COMMON_DIR:$GIT_COMMON_DIR' in launcher
+    assert "git_common_dir=" in launcher
+
+
 def test_unknown_arm_fails_before_side_effects() -> None:
     env = {**os.environ, "ARM": "typo", "RENDER_ONLY": "1"}
 

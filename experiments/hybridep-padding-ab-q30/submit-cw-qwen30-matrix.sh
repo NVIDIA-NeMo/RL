@@ -153,6 +153,8 @@ mkdir -p "$OUTPUT_ROOT"
 require_canonical_lustre_path SOURCE_PATH "$SOURCE_PATH"
 require_canonical_lustre_path OUTPUT_ROOT "$OUTPUT_ROOT"
 require_canonical_lustre_path PREFLIGHT_VENV "$PREFLIGHT_VENV"
+GIT_COMMON_DIR=$(git -C "$SOURCE_PATH" rev-parse --path-format=absolute --git-common-dir)
+require_canonical_lustre_path GIT_COMMON_DIR "$GIT_COMMON_DIR"
 [[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" && -f "$BATCH_SCRIPT" ]] || die "invalid source or batch script"
 [[ -x "$PREFLIGHT_VENV/bin/python" || -L "$PREFLIGHT_VENV/bin/python" ]] || die "preflight venv is missing: $PREFLIGHT_VENV"
 [[ -z $(git -C "$SOURCE_PATH" status --porcelain --untracked-files=all) ]] || die "NeMo-RL source is dirty"
@@ -263,6 +265,7 @@ printf 'arm=%s\nsource_profile=%s\nnemo_rl_commit=%s\nbridge_commit=%s\nmcore_co
 printf 'source_branch=%s\npreflight_manifest_sha256=%s\nbatch_script=%s\n' \
   "$SOURCE_BRANCH" "$PREFLIGHT_MANIFEST_SHA256" "$BATCH_SCRIPT" \
   >> "$PROVENANCE_ROOT/submission.txt"
+printf 'git_common_dir=%s\n' "$GIT_COMMON_DIR" >> "$PROVENANCE_ROOT/submission.txt"
 printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_checksum_mode=%s\n' \
   "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_CHECKSUM_CACHE" "$CONTAINER_CHECKSUM_MODE" \
   >> "$PROVENANCE_ROOT/submission.txt"
@@ -317,6 +320,9 @@ export CONTAINER
 EXTRA_MOUNTS=${MOUNTS:-}
 validate_extra_mounts "$EXTRA_MOUNTS"
 MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$CACHE_ROOT:$CACHE_ROOT"
+if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/"* ]]; then
+  MOUNTS_VALUE="$MOUNTS_VALUE,$GIT_COMMON_DIR:$GIT_COMMON_DIR"
+fi
 if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
   DEEPEP_DIR=$(dirname "$DEEPEP_WHEEL")
   export DEEPEP_OVERLAY_DIR="/tmp/nemo-rl-deepep-$ARM-$DEEPEP_SHA256"
