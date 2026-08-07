@@ -67,6 +67,10 @@ policy:
     # Inherited: TP=8, EP=16, CP=2, sequence packing enabled, MTP disabled.
     mtp_num_layers: 0
   generation:
+    # Circle counting should terminate far below the model's 16K context.
+    # Bound pathological self-correction loops that otherwise dominate each
+    # async batch's tail latency.
+    max_new_tokens: 4096
     colocated:
       enabled: false
       resources:
