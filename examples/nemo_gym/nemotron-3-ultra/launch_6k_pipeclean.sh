@@ -20,8 +20,9 @@
 # pipeclean recipe. Sets the validated node split and config path, then
 # forwards to the launcher.
 #
-# Shape (GB200 NVL72, 4 GPUs/node → 6144 GPUs):
-#   Training 512 / vLLM 960 / Gym 64
+# Shape (GB200 NVL72, 4 GPUs/node):
+#   NeMo RL: Training 512 / vLLM 960 / Gym 48
+#   External judges: GenRM 16 nodes / NL2Bash 2 nodes
 #
 # Usage — the site block below supplies model, data, container and Slurm
 # defaults for the GB200 cluster this recipe was validated on, so a bare
@@ -63,7 +64,7 @@ export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 
 # Must carry vLLM 0.25.1 in the RL venvs to match this branch's code; a
 # pre-bump image fails at import with "cannot import name ServingTokenization".
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:main_ultra_recipes_prebaked_venvs_20260730.squashfs}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:nightly-20260806-sandbox.squashfs}"
 export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre:/lustre}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/${USER}/.cache/nemotron_ultra}"
@@ -73,16 +74,30 @@ export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansub
 export NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8}"
 export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B}"
 
+# Serve the two large judge models outside the training Ray cluster. The pool
+# sizes and model-specific flags match their native-DP definitions in
+# pipeclean_6k.yaml; the safety judge remains inside Gym.
+export EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-1}"
+export GENRM_REPLICAS="${GENRM_REPLICAS:-16}"
+export GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
+export GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-deepseek_r1}"
+export GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-0}"
+export NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-2}"
+export NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
+export EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-2}"
+export EXTERNAL_VLLM_SKIP_PREFLIGHT="${EXTERNAL_VLLM_SKIP_PREFLIGHT:-1}"
+
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_sw_pre}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # A 6K allocation may additionally need SLURM_QOS, SLURM_RESERVATION and
 # EXCLUDE_NODES. They are left unset because a reservation you do not hold
 # makes sbatch fail outright; see ultra_launch.sh for the variable names.
 
-# 6K node split (~33% train / ~63% gen / ~4% gym). Callers may override.
+# Preserve the non-judge Gym capacity after moving 18 judge nodes out of Gym,
+# then round up to a segment-compatible 48-node Ray allocation.
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-512}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-960}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-64}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-48}"
 
 # CP=16 is baked into pipeclean_6k.yaml; allow an override for memory experiments.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"

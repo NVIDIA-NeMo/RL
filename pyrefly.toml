@@ -239,6 +239,8 @@ project-includes = [
   "nemo_rl/weight_sync/nccl_reshard_weight_synchronizer.py",
   "nemo_rl/weight_sync/xferdtensor.py",
   "nemo_rl/weight_sync/xferdtensor_python.py",
+  "tools/external_gym_vllm/vllm_pool_lb.py",
+  "tools/external_gym_vllm/serve_vllm_on_ray.py",
   "tools/model_diagnostics/1.max_model_len_respected.py",
   "tools/model_diagnostics/2.long_generation_decode_vs_prefill.py",
   "tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py",

@@ -1,0 +1,17 @@
+# =============================================================================
+# Nemotron 3 Ultra — 6K-GPU pipeclean with DISAGGREGATED sandboxes
+# =============================================================================
+# The 6K pipeclean recipe with tool execution moved off the Slurm allocation:
+# ns_tools and math_formal_lean run against pods on an external sandbox
+# service instead of colocated per-node nemo-skills containers. Everything
+# about the model, parallelism, batch shape, sequence length and the Gym blend
+# is inherited unchanged, so a run of this config is comparable against a
+# pipeclean_6k.yaml run on the same node split.
+#
+# Launch with disagg_sandboxes/launch_6k_disagg.sh, which sets
+# NO_COLOCATED_SANDBOX=1 and the required service variables. See
+# disagg_overrides.yaml for requirements, prewarming and sizing notes.
+# =============================================================================
+defaults:
+  - ../pipeclean_6k.yaml
+  - disagg_overrides.yaml
