@@ -47,6 +47,9 @@ set -euo pipefail
 export UV_PROJECT_ENVIRONMENT="$PREFLIGHT_VENV"
 export VIRTUAL_ENV="$PREFLIGHT_VENV"
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
+export CUDNN_HOME="$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn"
+export CUDNN_PATH="$CUDNN_HOME"
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 uv run --no-sync python -m pip freeze | LC_ALL=C sort | tee "$OUTPUT_ROOT/preflight-venv.txt"
 sha256sum "$OUTPUT_ROOT/preflight-venv.txt" | tee "$OUTPUT_ROOT/preflight-venv.sha256"
 uv run --no-sync pytest -q \
