@@ -271,7 +271,11 @@ def test_container_runtime_probe_is_nonexclusive_and_one_gpu() -> None:
     assert "import deep_ep" in runtime_probe
     assert "import transformer_engine.pytorch as te" in runtime_probe
     assert ': "${SOURCE_PATH:?SOURCE_PATH is required}"' in runtime_probe
+    assert ': "${PREFLIGHT_VENV:?PREFLIGHT_VENV is required}"' in runtime_probe
     assert '$SOURCE_PATH:$SOURCE_PATH' in runtime_probe
+    assert '$PREFLIGHT_VENV:$PREFLIGHT_VENV' in runtime_probe
+    assert "RUN_PYTHON=$PREFLIGHT_VENV/bin/python" in runtime_probe
+    assert "export NRL_IGNORE_VERSION_MISMATCH=1" in runtime_probe
     assert "from nemo_rl.models.megatron.setup import _apply_moe_config" in runtime_probe
     assert "moe_hybridep_pad_uneven_dispatch_inputs is True" in runtime_probe
     assert "MANIFEST_OUTPUT" in runtime_probe

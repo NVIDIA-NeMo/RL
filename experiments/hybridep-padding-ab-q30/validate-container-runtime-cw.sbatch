@@ -27,6 +27,7 @@ unset NRL_IGNORE_VERSION_MISMATCH NRL_FORCE_REBUILD_VENVS
 : "${DEEPEP_OVERLAY_DIR:?DEEPEP_OVERLAY_DIR is required}"
 : "${MANIFEST_OUTPUT:?MANIFEST_OUTPUT is required}"
 : "${SOURCE_PATH:?SOURCE_PATH is required}"
+: "${PREFLIGHT_VENV:?PREFLIGHT_VENV is required}"
 
 resolved_manifest_output=$(realpath -m -- "$MANIFEST_OUTPUT")
 [[ "$resolved_manifest_output" == "$MANIFEST_OUTPUT" && "$MANIFEST_OUTPUT" == /lustre/* ]] || {
@@ -39,19 +40,30 @@ resolved_source_path=$(realpath -e -- "$SOURCE_PATH")
   printf 'ERROR: SOURCE_PATH must be a canonical /lustre path\n' >&2
   exit 2
 }
+resolved_preflight_venv=$(realpath -e -- "$PREFLIGHT_VENV")
+[[ "$resolved_preflight_venv" == "$PREFLIGHT_VENV" && "$PREFLIGHT_VENV" == /lustre/* ]] || {
+  printf 'ERROR: PREFLIGHT_VENV must be a canonical /lustre path\n' >&2
+  exit 2
+}
 
-export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export DEEPEP_OVERLAY_DIR
 export SOURCE_PATH
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
 export MCORE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+export PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages
+export UV_PROJECT_ENVIRONMENT=$PREFLIGHT_VENV
+export VIRTUAL_ENV=$PREFLIGHT_VENV
+export PATH=$PREFLIGHT_VENV/bin:$PATH
 export LD_LIBRARY_PATH="/usr/local/cuda/compat/lib:$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH=$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$DEEPEP_OVERLAY_DIR
+export PYTHONPATH=$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$DEEPEP_OVERLAY_DIR:$PREFLIGHT_SITE_PACKAGES
+export NRL_IGNORE_VERSION_MISMATCH=1
+export RUN_PYTHON=$PREFLIGHT_VENV/bin/python
 
-MOUNTS="$SOURCE_PATH:$SOURCE_PATH,$CUDNN_HOST_PATH:$CUDNN_HOME,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
-CONTAINER_ENV=PYTHONPATH,LD_LIBRARY_PATH,CUDNN_HOME,CUDNN_PATH,DEEPEP_OVERLAY_DIR,PYTHONDONTWRITEBYTECODE,SOURCE_PATH,BRIDGE_SOURCE,MCORE_SOURCE
+MOUNTS="$SOURCE_PATH:$SOURCE_PATH,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
+CONTAINER_ENV=PATH,PYTHONPATH,LD_LIBRARY_PATH,CUDNN_HOME,CUDNN_PATH,DEEPEP_OVERLAY_DIR,PYTHONDONTWRITEBYTECODE,SOURCE_PATH,BRIDGE_SOURCE,MCORE_SOURCE,PREFLIGHT_SITE_PACKAGES,UV_PROJECT_ENVIRONMENT,VIRTUAL_ENV,NRL_IGNORE_VERSION_MISMATCH,RUN_PYTHON
 
 srun --no-container-mount-home \
   --container-image="$CONTAINER" \
@@ -59,7 +71,7 @@ srun --no-container-mount-home \
   --container-env="$CONTAINER_ENV" \
   --container-workdir=/tmp \
   --nodes=1 --ntasks=1 --gpus-per-task=1 \
-  bash -lc '/opt/nemo_rl_venv/bin/python - <<'"'"'PY'"'"'
+  bash -lc '"$RUN_PYTHON" - <<'"'"'PY'"'"'
 import json
 import importlib.util
 import os
@@ -155,6 +167,6 @@ srun --no-container-mount-home \
   --container-env="$CONTAINER_ENV" \
   --container-workdir=/tmp \
   --nodes=1 --ntasks=1 --gpus-per-task=1 \
-  bash -lc '/opt/nemo_rl_venv/bin/python -m pip freeze | LC_ALL=C sort' \
+  bash -lc '"$RUN_PYTHON" -m pip freeze | LC_ALL=C sort' \
   > "$MANIFEST_OUTPUT"
 sha256sum "$MANIFEST_OUTPUT"
