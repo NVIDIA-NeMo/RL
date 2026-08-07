@@ -52,7 +52,8 @@ export CUDNN_PATH="$CUDNN_HOME"
 export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 uv run --no-sync python -m pip freeze | LC_ALL=C sort | tee "$OUTPUT_ROOT/preflight-venv.txt"
 sha256sum "$OUTPUT_ROOT/preflight-venv.txt" | tee "$OUTPUT_ROOT/preflight-venv.sha256"
-uv run --no-sync pytest -q \
+uv run --no-sync python -c "import nemo_rl.models.megatron.data as module; print(module.__file__)"
+PYTEST_PLUGINS=nemo_rl.models.megatron.data uv run --no-sync pytest -q \
   --mcore-only \
   tests/unit/models/megatron/test_megatron_data.py \
   tests/unit/models/megatron/test_megatron_setup.py \
