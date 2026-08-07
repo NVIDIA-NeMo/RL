@@ -1,329 +1,212 @@
-# Transformer Engine NVFP4 Training with Per-Token vLLM Rollout
+# End-to-End NVFP4 Training with Per-Token vLLM Rollout
 
-NeMo RL supports an experimental W4A4 path that uses Transformer Engine (TE)
-NVFP4 for Megatron policy training and dynamic per-token NVFP4 activation
-scales for vLLM fused-MoE rollout. The path reuses the standard Megatron and
-vLLM workers and does not require ModelOpt quantization-aware training state,
-calibration, or a separate worker type.
+## Overview
 
-During each refit, the standard Megatron-Bridge conversion produces
-Hugging-Face-named weights. The Megatron policy worker quantizes routed-expert
-weights into the NVFP4 checkpoint representation and fuses them per layer for
-transport. The vLLM worker expands the transport representation, loads it
-through vLLM's layerwise-reload lifecycle, and rebuilds a fused-MoE kernel that
-derives activation scales independently for every token.
+NeMo RL supports end-to-end W4A4 reinforcement learning for Qwen3 MoE models
+on NVIDIA Blackwell GPUs. During policy training, Transformer Engine (TE)
+applies NVFP4 to routed-expert MLP computation with per-token activation
+scaling. During rollout, vLLM uses NVFP4 fused-MoE kernels with the same
+per-token activation granularity.
 
-For the user-facing configuration entry point, see
-[Quantization-Aware RL](../guides/quantization-aware-rl.md).
+The model keeps BF16 master parameters and FP32 optimizer states. Attention,
+routers, shared experts, embeddings, normalization layers, and selected
+boundary layers remain in BF16. The policy backward pass currently uses TE's
+dequantized path.
 
-## Motivation
+After every policy update, NeMo RL quantizes the updated routed-expert weights,
+packs them for transfer, and refits the colocated vLLM engines before the next
+rollout. This keeps the training and rollout paths on the same NVFP4 weight and
+activation-scaling contract.
 
-The existing ModelOpt QARL flow owns quantizer state and can export calibrated
-or weight-only deployment formats through its dedicated integration. TE-native
-FP4 training has a different contract: quantization is selected through
-Megatron's transformer configuration and per-module precision recipe, without
-ModelOpt calibration metadata.
+## Performance and GPU Memory
 
-This feature connects that TE training contract to a real W4A4 rollout while
-keeping the policy and generation architecture unchanged.
+The following comparison uses Qwen3-30B-A3B-Base with DAPO on 8 nodes with
+4 GB200 GPUs per node, a global batch size of 512, and a 20K response limit.
+Training uses TP=2, EP=8, and PP=1; each vLLM engine uses TP=1.
+Each value is the median over the 502 logged steps shared by both runs between
+steps 200 and 800. These are representative runs rather than a controlled
+precision-only A/B; their configurations differ beyond numerical precision.
 
-| Goal | Design choice |
-|---|---|
-| Use TE NVFP4 in policy training | Add a strict `fp4_cfg` and load Megatron's per-module precision recipe |
-| Match rollout activation granularity | Build the vLLM fused-MoE kernel with dynamic per-token activation scaling |
-| Avoid a second policy or generation worker | Add mode-specific hooks to the standard workers |
-| Keep refit payload practical | Quantize on the policy worker and transport six fused tensors per expert layer |
-| Protect existing modes | Validate the feature at setup and leave all disabled-mode paths unchanged |
+| Metric | BF16 | NVFP4 W4A4 | Change |
+|---|---:|---:|---:|
+| Rollout generation throughput | 457.9 tokens/s/GPU | 799.4 tokens/s/GPU | 1.75x |
+| Generation time | 319.2 s | 144.7 s | 2.21x faster |
+| Observed step time | 390.9 s | 224.8 s | 42.5% lower |
+| Token-normalized end-to-end throughput | 376.1 tokens/s/GPU | 506.2 tokens/s/GPU | 1.35x |
+| Weight transfer and update | 1.76 s | 17.93 s | 16.17 s higher |
 
-The first version intentionally does not provide a general-purpose NVFP4
-plugin system, ModelOpt compatibility layer, arbitrary model support, or an
-alternative refit transport.
+The NVFP4 run generated shorter responses in this interval, so observed step
+time alone overstates the speedup: its median response length was approximately
+6,219 tokens, compared with 7,730 tokens for BF16. Generation throughput and
+token-normalized end-to-end throughput control for this difference. Policy
+training time is currently similar because the backward path remains
+dequantized; the main gain comes from W4A4 rollout.
 
-## Architecture
+NVFP4 stores each quantized weight using an E2M1 value, one E4M3 scale per
+16-value block, and one FP32 global scale per tensor. Excluding the small
+per-tensor scale overhead, this is approximately 4.5 bits per quantized weight,
+compared with 16 bits for BF16.
 
-```mermaid
-flowchart LR
-    A[Megatron and TE mixed BF16 and NVFP4 training] --> B[Megatron-Bridge HF weight export]
-    B --> C[NeMo RL quantizes and fuses MoE expert weights]
-    C --> D[Existing CUDA IPC and ZMQ refit]
-    D --> E[vLLM loads native TP and PP shards and rebuilds MoE kernels]
-    E --> F[Per-token NVFP4 rollout]
-    F --> A
+Both runs set `gpu_memory_utilization=0.5`. The vLLM logs report the following
+rollout memory values for each TP=1 engine:
+
+| Rollout memory | BF16 | NVFP4 W4A4 | Change |
+|---|---:|---:|---:|
+| Model weights | 56.88 GiB | 18.07 GiB | 68.2% lower |
+| Available KV cache | 30.37 GiB | 79.70 GiB | 2.62x |
+| KV cache token capacity | 331,744 | 870,560 | 2.62x |
+
+These values describe the vLLM rollout model and KV cache, not the peak memory
+of the complete colocated RL process. Process-wide GPU samples also include TE
+training workspaces, quantization buffers, and allocator caching, and did not
+show a lower end-to-end peak in this comparison. The current result therefore
+demonstrates lower rollout weight memory and greater KV-cache headroom, rather
+than lower peak memory for the full training process.
+
+The current performance result includes quantization and weight refit after
+each policy update. Refit is still a visible part of the step and remains an
+optimization target. Training-quality curves will be added after the ongoing
+long-run stability validation is complete.
+
+## Quick Start
+
+Start with the complete Qwen3-30B-A3B example:
+
+```bash
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml
 ```
 
-The algorithm controller still calls the existing policy and generation
-interfaces. Quantization changes the representation inside the refit stream;
-it does not introduce a new controller path or Ray worker class.
-
-### Component responsibilities
-
-| Component | Responsibility |
-|---|---|
-| Transformer Engine | NVFP4 policy forward and dequantized policy backward |
-| Megatron Core | FP4 configuration, per-module precision matching, and sequence-alignment requirements |
-| Megatron-Bridge | Standard Megatron-to-Hugging-Face naming and TP/PP/EP reconstruction |
-| NeMo RL policy worker | Expert selection, NVFP4 weight quantization, layer fusion, and refit streaming |
-| NeMo RL vLLM integration | Strict mode validation, quantization registration, fused-tensor expansion, and reload lifecycle |
-| vLLM and FlashInfer | Runtime tensor layout, fused-MoE execution, and dynamic per-token activation scales |
-
-## Policy training
-
-The policy enables TE FP4 through `policy.megatron_cfg.fp4_cfg`:
+The feature-specific policy configuration is:
 
 ```yaml
 policy:
+  generation:
+    colocated:
+      enabled: true
+    nvfp4_pertoken_rollout:
+      enabled: true
+      additional_ignore:
+        - "*.layers.0.mlp.experts*"
+        - "*.layers.1.mlp.experts*"
+        - "*.layers.44.mlp.experts*"
+        - "*.layers.45.mlp.experts*"
+        - "*.layers.46.mlp.experts*"
+        - "*.layers.47.mlp.experts*"
+    vllm_cfg:
+      precision: bfloat16
+      kv_cache_dtype: auto
+      expert_parallel_size: 1
+
   megatron_cfg:
+    moe_router_dtype: fp32
     fp4_cfg:
       enabled: true
       fp4: e2m1
       fp4_recipe: nvfp4
       fp4_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
     te_precision_config_file: examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml
+    env_vars:
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: "1"
+      NVTE_NVFP4_DISABLE_RHT: "1"
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: "1"
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: "1"
+      NVTE_BACKWARD_OVERRIDE: dequantized
 ```
 
-TE and Megatron own the FP4 forward and backward implementation. NeMo RL only
-maps the YAML fields into the Megatron model configuration and supplies the
-per-module recipe. With `fp4_param=false`, model parameters remain BF16 and the
-standard mixed-precision optimizer retains FP32 master parameters; NVFP4 is the
-training compute format rather than the stored parameter format.
+`additional_ignore` keeps complete routed-expert layers in BF16 during rollout.
+It must cover the same boundary layers selected by
+`first_last_layers_bf16`, `num_layers_at_start_in_bf16`, and
+`num_layers_at_end_in_bf16`. Only complete expert-layer patterns in the form
+`*.layers.<index>.mlp.experts*` are accepted.
 
-The validated precision recipe keeps attention input and output projections in
-BF16 and applies NVFP4 to MLP linears. This matches the rollout scope, where
-only routed experts are quantized. Selected first and last transformer layers
-may also remain in BF16.
+## How It Works
 
-NeMo RL uses a conservative 128-token alignment for FP4 packed sequences in
-the TE block-scaled GEMM path. FP8 and FP4 cannot be enabled together.
-
-`NVTE_BACKWARD_OVERRIDE=dequantized` is valid for the policy backward pass but
-not for inference-only policy forwards such as log-probability calculation.
-The standard policy worker therefore removes it from the process-wide
-environment and restores it only around training forward/backward calls. This
-behavior is active only when `fp4_cfg.enabled` is true.
-
-The validated recipe also enables row-scaled NVFP4 activations and disables
-random Hadamard transforms, 2D quantization, and stochastic rounding. These TE
-environment settings pin the training-side numerical contract used by the
-per-token rollout smoke test; they are not applied as global NeMo RL defaults.
-
-If first/last layers are kept in BF16, the matching complete expert layers must
-also be listed under rollout `additional_ignore`. The policy worker warns when
-a training-side BF16 boundary layer is not covered by that rollout list.
-
-## Refit representation
-
-The implementation wraps the existing policy export iterator after
-Megatron-Bridge has produced Hugging-Face names. It does not replace
-Megatron-Bridge conversion or distributed topology handling.
-
-For every selected expert layer, the producer:
-
-1. collects the numbered `gate_proj`, `up_proj`, and `down_proj` weights;
-2. stacks experts and concatenates gate and up projections into W13;
-3. computes one global W13 scale per expert and quantizes block-16 values;
-4. emits packed weights, E4M3 block scales, and FP32 global scales;
-5. fuses ignored BF16 expert layers into gate/up and down 3D tensors; and
-6. passes every non-expert tensor through unchanged.
-
-| Transport tensor | Dtype | Logical contents |
-|---|---|---|
-| `w13_weight` | `uint8` | Packed gate and up weights |
-| `w13_weight_scale` | `float8_e4m3fn` | Block-16 W13 scales |
-| `w13_weight_scale_2` | `float32` | Shared gate/up global scale per expert |
-| `w2_weight` | `uint8` | Packed down-projection weights |
-| `w2_weight_scale` | `float8_e4m3fn` | Block-16 W2 scales |
-| `w2_weight_scale_2` | `float32` | W2 global scale per expert |
-| `gate_up_proj` (ignored layers) | `bfloat16` | Fused gate/up expert weights |
-| `down_proj` (ignored layers) | `bfloat16` | Fused down-projection expert weights |
-
-Fusing each layer into six transport tensors is an IPC optimization, not a new
-checkpoint format. Sending every expert projection separately would create
-tens of thousands of per-tensor handshakes for a large MoE model. Immediately
-before `model.load_weights`, the vLLM extension expands the tensors into the
-per-expert names accepted by vLLM's routed-expert loader. The expansion creates
-views and does not duplicate the packed payload.
-
-Ignored expert layers use vLLM's native BF16 fused checkpoint names and remain
-as two 3D tensors per layer. The ignore list controls quantization; it does not
-reintroduce per-expert transport overhead.
-
-The producer is implemented with PyTorch and has no vLLM import because
-Megatron and vLLM run in isolated environments. Its packed values and scales
-are tested bit for bit against vLLM 0.26's native online NVFP4 weight
-quantizer.
-
-The current export is post-EP: Megatron-Bridge reconstructs the BF16 expert set
-before NeMo RL quantizes it. Moving quantization before the expert-parallel
-gather requires a separate, general Megatron-Bridge export hook and is outside
-this change.
-
-## vLLM rollout
-
-The vLLM integration registers `nvfp4_pertoken`, a constrained quantization
-configuration based on vLLM's stock ModelOpt NVFP4 fused-MoE method. The name
-describes the runtime format; the policy does not use ModelOpt QAT.
-
-`NvFp4PerTokenConfig` is not instantiated directly by NeMo RL. NeMo RL
-registers the class under a new quantization name and selects that name in the
-engine arguments. vLLM then constructs the config through its normal registry.
-The subclass inherits ModelOpt's parsing, weight creation, and loading logic;
-it replaces only the fused-MoE method used to build the per-token kernel.
-
-The generation model starts with `load_format=dummy` because a BF16 checkpoint
-cannot initialize NVFP4-shaped runtime parameters. NeMo RL's colocated
-training lifecycle always performs a complete refit before the first rollout,
-and setup rejects standalone evaluation for this mode.
-
-On every load, the worker extension:
-
-1. enters vLLM's layerwise-reload lifecycle;
-2. restores checkpoint-layout storage;
-3. expands and loads the fused transport tensors;
-4. sets neutral stored input scales because activations are scaled dynamically;
-5. converts weights to the FlashInfer TRT-LLM runtime layout;
-6. rebuilds the fused-MoE kernel with `per_token_activation=True`; and
-7. synchronizes the device before acknowledging reusable IPC buffers.
-
-Reloaded scale tensors are made contiguous so vLLM can copy converted values
-back into stable storage referenced by CUDA graphs. A refit error is fatal in
-this mode because continuing with dummy, incomplete, or stale expert weights
-would produce invalid rollouts.
-
-### vLLM model parallelism
-
-The refit producer emits complete logical tensors; it does not pre-shard them
-for the generation topology. The same stream reaches every rank in a vLLM
-engine, and vLLM's standard model loaders select the tensors owned by that
-rank.
-
-Tensor parallelism therefore uses vLLM's native routed-expert and dense-layer
-sharding; the NeMo RL extension does not implement a second TP layout.
-Pipeline parallelism likewise uses vLLM's native stage ownership. PP greater
-than one requires the asynchronous engine in NeMo RL's current vLLM generation
-orchestration.
-
-The current sender still transfers the complete stream to every PP stage.
-Non-local layers are skipped correctly, but PP does not yet reduce refit bytes
-or producer work. Expert parallelism remains disabled because the FlashInfer
-per-token-activation fused-MoE path does not support vLLM's modular-EP path.
-
-## Why weights are quantized on the policy side
-
-vLLM 0.26 can accept BF16 MoE weights and quantize them online. That path is
-useful for loading an ordinary checkpoint, but using it for every NeMo RL refit
-would keep the larger BF16 transport payload and move repeated quantization
-into every rollout worker. It would also require broader changes to the vLLM
-reload path.
-
-The selected producer uses the same numerical operation while preserving the
-existing named-tensor transport and worker isolation. This keeps the change
-local to two optional hooks and sends the already packed representation. The
-native online quantizer remains the independent correctness oracle in unit
-tests.
-
-## Configuration and validation
-
-Enable the mode under the existing vLLM generation configuration:
-
-```yaml
-policy:
-  generation:
-    nvfp4_pertoken_rollout:
-      enabled: true
-      additional_ignore:
-        - "*.layers.0.mlp.experts*"
+```mermaid
+flowchart LR
+    A[TE per-token NVFP4 policy training] --> B[Megatron-Bridge HF weight export]
+    B --> C[Quantize and pack routed experts]
+    C --> D[Colocated weight refit]
+    D --> E[vLLM per-token NVFP4 rollout]
+    E --> A
 ```
 
-`additional_ignore` accepts only complete expert-layer patterns. Partial
-expert or projection exclusions would make fused layer tensors internally
-inconsistent and are rejected.
+### Per-token NVFP4 policy training
 
-The validated scope is deliberately narrow:
+`policy.megatron_cfg.fp4_cfg` enables TE NVFP4, while
+`te_precision_config_file` selects which modules use it. The provided precision
+recipe applies NVFP4 to MLP linears and keeps attention linears in BF16.
 
-| Setting | Supported value |
+`fp4_param=false` keeps persistent model parameters in BF16. NVFP4 is used for
+the selected forward computations, while the optimizer continues to update the
+BF16 model through FP32 master parameters. FP8 and FP4 cannot be enabled
+together.
+
+During policy training, per-token activation scaling gives each token its own
+activation range. This reduces the effect of outlier tokens and matches the
+activation granularity used by the rollout kernel.
+
+### Weight refit
+
+Megatron-Bridge exports the updated policy weights with Hugging Face parameter
+names and reconstructs tensors across the training TP, PP, and EP topology.
+NeMo RL then processes each routed-expert layer:
+
+1. collect the gate, up, and down projection weights;
+2. fuse gate and up projections into W13;
+3. quantize weights in 16-value NVFP4 blocks;
+4. emit packed weights, block scales, and global scales; and
+5. fuse each quantized layer into six transport tensors.
+
+Layer fusion keeps the refit stream compact: large MoE models transfer six
+tensors per quantized expert layer instead of separate tensors for every expert
+and projection. Ignored BF16 expert layers use two fused tensors per layer.
+
+The current path quantizes after Megatron-Bridge reconstructs the expert
+weights. Each vLLM engine receives the stream and its native loaders select the
+TP and PP shards owned by the local rank.
+
+### Per-token vLLM rollout
+
+NeMo RL configures vLLM with the `nvfp4_pertoken` quantization mode. During
+refit, vLLM loads the packed expert weights, prepares them for the FlashInfer
+fused-MoE runtime, and rebuilds the affected kernels. Rollout activations are
+quantized dynamically for each token; no static activation calibration is
+required.
+
+The reload path preserves the parameter storage used by CUDA graphs and
+synchronizes the device before refit buffers are reused. A failed or incomplete
+refit stops the rollout instead of continuing with stale weights.
+
+## Supported Configuration
+
+| Setting | Current support |
 |---|---|
-| Generation backend | vLLM, colocated, synchronous or asynchronous |
-| vLLM parallelism per engine | TP and PP values accepted by vLLM/model sharding; PP>1 requires async; EP=1 |
-| Model layout | `Qwen3MoeForCausalLM`, every decoder layer MoE |
+| Hardware | NVIDIA Blackwell; validated on GB200 |
+| Model | `Qwen3MoeForCausalLM` with an MoE block in every decoder layer |
+| Quantized modules | Routed-expert MLP projections |
+| Policy parameters | BF16 with `fp4_param=false` |
+| Rollout | Colocated vLLM, synchronous or asynchronous |
+| vLLM tensor parallelism | Supported; TP=1 and TP=2 are validated |
+| vLLM pipeline parallelism | Supported; PP=1 and PP=2 are validated; PP>1 requires the asynchronous engine |
+| vLLM expert parallelism | EP=1 |
 | KV cache | `auto` |
-| vLLM model dtype | `bfloat16` |
-| Refit transport | Default colocated CUDA IPC/ZMQ path |
-| Speculative decoding | Disabled |
-| Standalone evaluation | Not supported |
-| ModelOpt generation keys | `quant_cfg` and `real_quant` must be unset |
+| Refit transport | Default colocated CUDA IPC/ZMQ path (`refit_transport: null`) |
 
-These checks are setup-time failures rather than best-effort fallbacks. They
-define the supported contract and prevent silent use of an incompatible loader
-or kernel; the validation table below separately records the topologies that
-have been exercised. Enabling the rollout also requires BF16 policy model
-parameters, E2M1 NVFP4, and `fp4_param=false`.
+Other generation quantization settings, including `generation.quant_cfg` and
+`generation.real_quant`, must be unset when this mode is enabled. Incompatible
+settings are reported during setup.
 
-## Dependencies
+Dense MLP layers, hybrid dense/MoE layouts, and vLLM expert parallelism are not
+yet supported by this path.
 
-| Dependency | Version or status | Reason |
-|---|---|---|
-| Transformer Engine | 2.18.0 (`e7c550c5`) | Row-scaled NVFP4 training, packed GroupedLinear wgrad allocation, and dequantized-backward operand preservation |
-| NVIDIA cuDNN Frontend | 1.25.0 | Header API required to build Transformer Engine 2.18 |
-| vLLM | 0.26.0 | Per-token NVFP4 fused-MoE kernel and layerwise-reload interfaces |
-| FlashInfer | 0.6.14 | FlashInfer TRT-LLM MoE backend used by the per-token kernel |
-| NVIDIA CUTLASS DSL | 4.6.0 | Required by the vLLM/FlashInfer runtime combination |
-| Megatron-Bridge | Existing NeMo RL revision | No additional change is required for the post-EP design |
+## Roadmap
 
-The generated `uv.lock` records the vLLM and Transformer Engine upgrades and
-their transitive dependency resolution.
-
-## Alternatives considered
-
-| Alternative | Decision |
-|---|---|
-| Dedicated quantized policy or generation worker | Rejected; both workers already expose the required configuration and refit extension points |
-| ModelOpt QAT export | Not applicable to TE-native FP4 because no ModelOpt quantizer state or calibration metadata exists |
-| vLLM online weight quantization for every refit | Not selected; it retains BF16 transport and requires a broader receiver-side change without a demonstrated end-to-end advantage |
-| Pre-EP expert quantization | Deferred to a separate optimization because it requires a new Megatron-Bridge API and does not change the final vLLM payload or reload work |
-| User-defined projection-level ignore patterns | Rejected because a partially quantized fused expert layer cannot satisfy the loader contract |
-
-## Validation
-
-The test strategy covers the representation boundary rather than only checking
-that a short training command exits successfully:
-
-| Layer | Coverage |
-|---|---|
-| Quantization math | Bitwise comparison with vLLM's native NVFP4 quantizer, shape validation, zero blocks, and 2D/3D equivalence |
-| Refit producer | Expert grouping, shared W13 scale, complete-layer ignore, fused transport, expansion, and incomplete-stream failures |
-| Training configuration | FP4/FP8 exclusion, 128-token alignment, precision-recipe matching, BF16 boundary layers, and scoped backward override |
-| Generation configuration | Colocation, PP async requirement, EP exclusion, model layout, evaluation, speculative decoding, and conflicting engine settings |
-| Reload lifecycle | Stable parameter storage, fatal failures, and synchronization before IPC acknowledgment |
-| End to end | Two GRPO steps on 4 nodes × 4 GB200 GPUs, covering initial and post-update refits plus finite training metrics |
-| vLLM model parallelism | TP=2/PP=1 synchronous, TP=1/PP=2 asynchronous, and TP=2/PP=2 asynchronous initialization, refit, generation, and rollout; the combined topology covers two refits and training steps |
-
-The end-to-end run is a functional smoke test, not a convergence or throughput
-claim. Longer accuracy and performance studies remain recipe- and
-model-specific.
-
-## Key implementation files
-
-| File | Purpose |
-|---|---|
-| `nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken.py` | vLLM-free producer, transport fusion, expansion, and HF quantization metadata |
-| `nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken_vllm.py` | vLLM quantization method and reload worker extension |
-| `nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken_config.py` | Strict shared configuration schema |
-| `nemo_rl/models/policy/workers/megatron_policy_worker.py` | Optional standard-worker refit hook and training-only environment scope |
-| `nemo_rl/models/generation/vllm/vllm_worker.py` | Optional standard-worker engine configuration |
-| `examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml` | Attention-BF16 and MLP-NVFP4 precision mapping |
-
-## Current limitations
-
-- Only the validated Qwen3 all-MoE layout is accepted.
-- vLLM EP must be one per rollout engine; PP greater than one requires the
-  asynchronous engine.
-- PP stages currently receive the complete refit stream, so PP is correct but
-  does not reduce refit transfer volume.
-- TP or PP sizes greater than two rely on vLLM's native loaders but have not
-  yet been exercised by the topology smoke test.
-- The mode is limited to colocated training and generation.
-- Attention, shared experts, routers, embeddings, norms, and output heads remain
-  in their native dtype.
-- Expert quantization currently happens after Megatron-Bridge's EP gather.
-- Model initialization depends on the mandatory first refit and therefore does
-  not support standalone evaluation.
+- Reduce refit latency and data movement, including quantization before the
+  expert-parallel gather.
+- Add native NVFP4 backward computation.
+- Complete longer stability and model-quality studies and publish the training
+  curves.
