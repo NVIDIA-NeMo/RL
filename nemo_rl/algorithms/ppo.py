@@ -2454,6 +2454,12 @@ def ppo_train(
                 )
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
+                # Pre-whitening advantage scale (see
+                # GeneralizedAdvantageEstimator._compute_raw_advantage_metrics).
+                # normalize_advantages pins the post-whitening std to 1.0, so this
+                # is the only place the critic's residual scale is observable.
+                if getattr(adv_estimator, "last_metrics", None):
+                    metrics.update(adv_estimator.last_metrics)
                 if train_results is not None:
                     metrics = {
                         **metrics,
@@ -3698,6 +3704,13 @@ def async_ppo_train(
                 response_advantages = torch.masked_select(
                     flat_advantages, flat_token_mask.bool()
                 )
+
+                # Pre-whitening advantage scale (see
+                # GeneralizedAdvantageEstimator._compute_raw_advantage_metrics).
+                # normalize_advantages pins the post-whitening std to 1.0, so this
+                # is the only place the critic's residual scale is observable.
+                if getattr(adv_estimator, "last_metrics", None):
+                    metrics.update(adv_estimator.last_metrics)
 
                 metrics.update(
                     {
