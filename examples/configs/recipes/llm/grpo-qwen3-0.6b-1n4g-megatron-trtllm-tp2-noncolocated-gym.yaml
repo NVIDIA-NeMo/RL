@@ -1,0 +1,87 @@
+defaults: ../../../nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  adv_estimator:
+    name: reinforce_plus_plus
+    minus_baseline: false
+  async_grpo:
+    in_flight_weight_updates: true
+  val_period: 1000
+  val_at_start: false
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-0.6b-1n4g-megatron-trtllm-tp2-noncolocated-gym
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: Qwen/Qwen3-0.6B
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 8
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 2
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-06
+      weight_decay: 0.01
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+  generation:
+    backend: trtllm
+    max_new_tokens: 512
+    stop_token_ids:
+    - 151643
+    - 151645
+    trtllm_cfg:
+      tensor_parallel_size: 2
+      moe_tensor_parallel_size: null
+      moe_expert_parallel_size: null
+      max_model_len: ${policy.max_total_sequence_length}
+      precision: ${policy.precision}
+      async_engine: true
+      gpu_memory_utilization: 0.6
+      max_batch_size: 64
+      max_num_tokens: 4096
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      expose_http_server: true
+      default_chat_template_kwargs:
+        enable_thinking: false
+      tool_parser: qwen3_coder
+      reasoning_parser: qwen3
+    trtllm_kwargs:
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+logger:
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-0.6b-1n4g-megatron-trtllm-tp2-noncolocated-gym
+cluster:
+  gpus_per_node: 4

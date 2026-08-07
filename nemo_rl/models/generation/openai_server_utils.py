@@ -22,6 +22,7 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+from collections.abc import Collection
 from typing import Any
 
 
@@ -30,6 +31,7 @@ def replace_prefix_tokens(
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    model_stop_token_ids: Collection[int] | None = None,
 ) -> list[int]:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
@@ -95,11 +97,9 @@ def replace_prefix_tokens(
     eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
 
-    # The model isn't guaranteed to end on EOS (e.g. it hit max_tokens); chat
-    # templates always add one, so cut the model input to just before its EOS.
-    model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids[-1] == eos_token_id:
-        model_cut_end -= 1
+    effective_stop_token_ids = set(model_stop_token_ids or ())
+    effective_stop_token_ids.add(eos_token_id)
+    model_ended_with_stop = model_prefix_token_ids[-1] in effective_stop_token_ids
 
     # Locate the turn boundary by EOS count rather than token position. Qwen3
     # templates may strip prior reasoning blocks when re-rendering history;
@@ -112,7 +112,8 @@ def replace_prefix_tokens(
         if tid == eos_token_id:
             count_seen += 1
             if count_seen == count_needed:
-                template_cut_start = pos
+                # Keep sampled stops; otherwise let the template add the missing EOS.
+                template_cut_start = pos + int(model_ended_with_stop)
                 break
 
     assert template_cut_start >= 0, (
@@ -124,6 +125,4 @@ def replace_prefix_tokens(
         f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
     )
 
-    return (
-        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
-    )
+    return model_prefix_token_ids + template_token_ids[template_cut_start:]

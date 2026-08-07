@@ -319,14 +319,16 @@ def attach_routed_experts_to_chat_response_choices(
 
 
 def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
-    """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
+    """Dump a vLLM chat response while preserving NeMo-RL dynamic fields."""
     response_dict = response.model_dump()
     for choice, choice_dict in zip(
         getattr(response, "choices", []), response_dict.get("choices", [])
     ):
-        routed_experts = getattr(
-            getattr(choice, "message", None), "routed_experts", None
-        )
+        message = getattr(choice, "message", None)
+        prompt_token_ids = getattr(message, "prompt_token_ids", None)
+        if prompt_token_ids is not None:
+            choice_dict.setdefault("message", {})["prompt_token_ids"] = prompt_token_ids
+        routed_experts = getattr(message, "routed_experts", None)
         if routed_experts is not None:
             choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
     return response_dict
