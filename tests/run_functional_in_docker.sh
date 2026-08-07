@@ -28,8 +28,7 @@ CONTAINER=${CONTAINER}
 
 export HF_HOME=${HF_HOME:-$(realpath $SCRIPT_DIR/../hf_home)}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$(realpath $SCRIPT_DIR/../hf_datasets_cache)}
-CONTAINER_HOME=${CONTAINER_HOME:-"$PROJECT_ROOT/.cache/nemo-rl/home"}
-mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$CONTAINER_HOME"
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 
 # Check if running in GitLab CI
 INTERACTIVE_FLAG=""
@@ -39,13 +38,15 @@ if [[ "${CI:-false}" != "true" ]]; then
 fi
 
 # Use the caller's identity so files written to the bind-mounted checkout keep
-# their host ownership. --no-sync reuses the dependency-complete CI image; a
-# dependency fingerprint mismatch means the image must be rebuilt.
+# their host ownership. A container-owned tmpfs keeps HOME writable without
+# exposing another host path. It remains executable because torch compile loads
+# artifacts from the cache. --no-sync reuses the dependency-complete CI image;
+# a dependency fingerprint mismatch means the image must be rebuilt.
 docker run --user "$(id -u):$(id -g)" $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864 --rm --gpus '"device=0,1"' \
   -v "$PROJECT_ROOT:$PROJECT_ROOT" \
   -v "$HF_HOME:/hf_home" \
   -v "$HF_DATASETS_CACHE:/hf_datasets_cache" \
-  -v "$CONTAINER_HOME:/home/nemo-rl" \
+  --tmpfs "/home/nemo-rl:rw,exec,nosuid,nodev,mode=0700,uid=$(id -u),gid=$(id -g)" \
   -e WANDB_API_KEY \
   -e HF_TOKEN \
   -e HF_HOME=/hf_home \

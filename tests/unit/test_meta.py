@@ -57,6 +57,11 @@ def test_local_container_test_wrappers_use_the_calling_user():
         script = (REPO_ROOT / relative_path).read_text()
 
         assert '--user "$(id -u):$(id -g)"' in script
+        assert (
+            '--tmpfs "/home/nemo-rl:rw,exec,nosuid,nodev,mode=0700,uid=$(id -u),gid=$(id -g)"'
+            in script
+        )
+        assert "CONTAINER_HOME" not in script
         assert "UV_CACHE_DIR=/home/nemo-rl/.cache/uv" in script
         assert "uv run --no-sync" in script
         assert "-u root" not in script
