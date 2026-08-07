@@ -215,6 +215,9 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    # Preserve the packer's order (or omit for backward compatibility), or
+    # execute each DP rank's assigned bins largest-first for allocator reuse.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
 
 
 class RewardModelConfig(TypedDict):
@@ -542,7 +545,7 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
-    refit_buffer_size_gb: NotRequired[float]
+    refit_buffer_size_gb: NotRequired[float | int]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]

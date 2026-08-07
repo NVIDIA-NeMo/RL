@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
@@ -27,6 +28,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # gather site, so training math is unaffected. When the expert count cannot be
 # determined, fall back to int16.
 ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int16
+
+# A routed-expert row whose every top-k slot is this value means "no route was
+# captured for this token"; the Megatron replay install falls back to the model's
+# own router for those rows. Partially-negative rows are rejected as corruption.
+ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL = -1
 
 _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int8: "int8",
@@ -196,9 +202,17 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    # Validation-only sampling. The exemplar YAMLs default these to the train
+    # values above via interpolation (${.temperature}, ...), so validation
+    # samples exactly like training unless overridden. Only honored on the
+    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    val_temperature: float
+    val_top_p: float
+    val_top_k: int | None
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
+    bad_words: NotRequired[list[str] | None]
     colocated: NotRequired[ColocationConfig]
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
@@ -207,6 +221,33 @@ class GenerationConfig(TypedDict):
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+
+
+@dataclass
+class GenerationSamplingParams:
+    """Sampling profile threaded explicitly through rollout entry points.
+
+    Rollout callers construct one from the relevant ``GenerationConfig``
+    fields (train or validation) so the sampling used for a rollout is
+    visible at the call site instead of flowing through config side-channels.
+    Named to distinguish it from ``TrainingSamplingParams`` (train-time logit
+    filtering) and vLLM's own ``SamplingParams``.
+    """
+
+    temperature: float
+    top_p: float
+    top_k: int | None
+
+    @classmethod
+    def from_generation_config(
+        cls, generation_config: "GenerationConfig"
+    ) -> "GenerationSamplingParams":
+        """Build the train-time sampling profile from a generation config."""
+        return cls(
+            temperature=generation_config["temperature"],
+            top_p=generation_config["top_p"],
+            top_k=generation_config["top_k"],
+        )
 
 
 class GenerationDatumSpec(TypedDict):
@@ -306,7 +347,7 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         pass
@@ -340,6 +381,14 @@ class GenerationInterface(ABC):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
+        raise NotImplementedError
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard."""
         raise NotImplementedError
 
     # Optional hook; backends may override to invalidate any reusable caches

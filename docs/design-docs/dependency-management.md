@@ -57,6 +57,12 @@ The virtual environment location depends on your runtime environment:
 - **Bare metal**: The venv defaults to `.venv/` local to your NeMo RL clone
 - **Container**: The container sets [`UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv`](https://github.com/NVIDIA-NeMo/RL/blob/main/docker/Dockerfile#L67), so the environment is synced to `/opt/nemo_rl_venv`. Note that this location is ephemeral to the container instance.
 
+> [!WARNING]
+> If you see a ray version or python version mismatch between the server and the client, it indicates
+> your container should be rebuilt since `ray` and/or `python` (and potentially several other packages)
+> have drifted between your container and code. Rebuilding the container will lead to faster startup
+> times since dependencies will not have to be synced on all the nodes simultaneously.
+
 ### 3. `source .venv/bin/activate`
 
 Activates the virtual environment, setting up the Python path and environment variables so your script runs with the correct dependencies.

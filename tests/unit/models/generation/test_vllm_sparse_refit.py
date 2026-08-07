@@ -571,6 +571,21 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     ]
 
 
+def test_sync_post_init_binds_numa() -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker._sparse_refit_receiver = None
+    worker._mtp_load_from_disk = False
+    worker.report_device_id = MagicMock(return_value=["0"])
+    worker.llm = MagicMock()
+
+    worker.post_init()
+
+    assert worker.vllm_device_ids == ["0"]
+    assert worker.llm.collective_rpc.call_args_list == [
+        call("bind_numa", args=()),
+    ]
+
+
 def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
     from nemo_rl.models.generation.vllm import vllm_sparse_refit as refit_module
 

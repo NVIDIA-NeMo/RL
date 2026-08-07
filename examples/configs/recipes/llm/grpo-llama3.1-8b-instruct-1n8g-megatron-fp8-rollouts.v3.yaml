@@ -34,6 +34,13 @@ policy:
       precision: fp8
       max_model_len: 4096
       use_deep_gemm: true
+    vllm_kwargs:
+      # Empirical value that stops the CuMemAllocator wake-up OOM under vLLM
+      # 0.25 (takes precedence over gpu_memory_utilization). Not a 0.20-
+      # equivalent: 0.20 gave this engine 36.13 GiB, so this is a ~45% cut.
+      # Read https://github.com/NVIDIA-NeMo/RL/issues/3412 before retuning --
+      # this recipe's driver cannot detect a too-small pin.
+      kv_cache_memory_bytes: 21474836480  # 20 GiB
 data:
   max_input_seq_length: 4096
 logger:
