@@ -1,0 +1,113 @@
+# GRPO for masked diffusion language models (dLLMs).
+#
+# Implements the training setup of GDPO (https://arxiv.org/abs/2510.08554):
+# sequences are scored by an ELBO estimated with Semi-deterministic Monte Carlo
+# (SDMC) instead of an autoregressive product of next-token probabilities, and
+# the policy ratio is taken at the sequence level.
+#
+# Not to be confused with `grpo.adv_estimator.name = "gdpo"`, which is the
+# unrelated multi-reward estimator from https://arxiv.org/abs/2601.05242.
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  # The ELBO is a noisy estimate of the sequence likelihood, so dividing the
+  # group advantage by its standard deviation amplifies estimator noise on
+  # low-variance groups. GDPO follows Dr.GRPO in leaving advantages unnormalized.
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+
+loss_fn:
+  # GSPO-shaped objective: one importance ratio per sequence, from the
+  # length-normalized ELBO difference, rather than one ratio per token.
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  # A dLLM's rollouts are produced by the denoising sampler on the training
+  # weights, so there is no inference-engine likelihood gap to correct for.
+  use_importance_sampling_correction: false
+  # dLLMs score token i at position i; there is no next-token shift to undo.
+  position_aligned_logprobs: true
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 3.0e-4
+  ratio_clip_max: 4.0e-4
+
+policy:
+  model_name: "GSAI-ML/LLaDA-8B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  # Must equal train_micro_batch_size: the old, reference, and current ELBOs of
+  # a rollout are only comparable when estimated at identical masks, and the
+  # masks are drawn from a seeded generator over the microbatch's shape.
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+  precision: "bfloat16"
+
+  dllm:
+    # Switches the policy from next-token logprobs to the SDMC ELBO.
+    enabled: true
+    # Read from the model config (LLaDA publishes `mask_token_id`) when unset.
+    # 126336 for LLaDA-8B, 156895 for LLaDA2.0.
+    mask_id: null
+    # Integration rule over the mask ratio t. "gauss-1".."gauss-5" are the
+    # deterministic Gauss-Legendre rules of the SDMC scheme; "simpson" and "mc"
+    # (double Monte Carlo) are kept for ablations. Each likelihood evaluation
+    # costs len(quadrature points) * mc_samples forward passes.
+    quadrature: "gauss-2"
+    mc_samples: 1
+    # Probability of masking each prompt token. 0.0 keeps the prompt intact,
+    # matching the dLLM SFT objective.
+    p_mask_prompt: 0.0
+    # False for masked diffusion LMs, which are trained position-aligned.
+    shift_targets: false
+    # Block-wise denoising schedule. max_new_tokens must be a multiple of
+    # block_length.
+    block_length: 32
+    diffusion_steps: 128
+    # Unsupervised classifier-free guidance. 0.0 disables it and halves the
+    # number of forward passes per denoising step.
+    cfg_scale: 0.0
+
+  dtensor_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+    # Context parallelism shards the sequence, but the ELBO masks positions
+    # across the whole sequence.
+    context_parallel_size: 1
+
+  # Both reorder or reuse tokens in ways that assume a causal factorization.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+
+  generation:
+    # Masked diffusion models decode a fixed-width canvas and keep no KV cache,
+    # so rollouts run in the training workers rather than in vLLM/SGLang/TRT-LLM.
+    backend: "dllm"
+    colocated:
+      enabled: true
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
