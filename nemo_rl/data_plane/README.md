@@ -414,9 +414,10 @@ for defaults** — the adapter has no hidden `cfg.get(key, default)`
 fallbacks. The canonical exemplar is
 `examples/configs/grpo_math_1B.yaml`.
 
-All eight keys below are **required** when `enabled=true`. Recipes
-under `examples/configs/recipes/**/*.yaml` inherit them via
-`defaults:` from the exemplar.
+The first eight keys below are **required** when `enabled=true`. Recipes
+under `examples/configs/recipes/**/*.yaml` inherit them via `defaults:` from
+the exemplar. `use_gdr` is optional for backward compatibility; omitting it
+disables GDR.
 
 ```yaml
 data_plane:
@@ -428,6 +429,7 @@ data_plane:
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
   global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
+  use_gdr: false                       # GPU-memory RDMA staging in CUDA-initialized clients
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -436,7 +438,20 @@ Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
 - **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+  scale. Set `use_gdr: true` to move tensor payloads through a registered
+  GPU staging buffer; persistent queued data remains in CPU RAM.
+
+Mooncake transport selection:
+
+- **TCP** — set `backend: mooncake_cpu`, leave `use_gdr` omitted or false,
+  and leave `MC_MOONCAKE_PROTOCOL` unset (or set it to `tcp`).
+- **CPU RDMA** — set `backend: mooncake_cpu`, leave `use_gdr` omitted or
+  false, and export `MC_MOONCAKE_PROTOCOL=rdma` plus the cluster-appropriate
+  `MC_MOONCAKE_DEVICE` before launching.
+- **GPU RDMA (GDR)** — set `backend: mooncake_cpu` and `use_gdr: true`.
+  This defaults the Mooncake protocol to RDMA and lets each CUDA-initialized
+  client select its local RDMA device. If `MC_MOONCAKE_PROTOCOL` is set
+  explicitly, it must be `rdma`.
 
 Capacity rule of thumb (any backend):
 
