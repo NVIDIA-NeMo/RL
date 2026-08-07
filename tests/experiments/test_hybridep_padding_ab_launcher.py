@@ -239,9 +239,14 @@ def test_inherited_sbatch_options_are_sanitized() -> None:
 def test_inherited_ray_cluster_address_is_sanitized() -> None:
     launcher = LAUNCHER.read_text()
     validator = VALIDATE_SCRIPT.read_text()
+    runtime_validator = RUNTIME_VALIDATE_SCRIPT.read_text()
 
     assert "unset RAY_ADDRESS RAY_NAMESPACE" in launcher
     assert "unset RAY_ADDRESS RAY_NAMESPACE" in validator
+    assert "NRL_IGNORE_VERSION_MISMATCH" in launcher
+    assert "NRL_FORCE_REBUILD_VENVS" in launcher
+    assert "NRL_IGNORE_VERSION_MISMATCH" in runtime_validator
+    assert "NRL_FORCE_REBUILD_VENVS" in runtime_validator
 
 
 def test_f725_builder_has_explicit_gpu_allocation_contract() -> None:

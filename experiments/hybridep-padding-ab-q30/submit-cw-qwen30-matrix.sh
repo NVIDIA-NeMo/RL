@@ -69,6 +69,7 @@ for SBATCH_VARIABLE in ${!SBATCH_@}; do
   unset "$SBATCH_VARIABLE"
 done
 unset RAY_ADDRESS RAY_NAMESPACE UV_CACHE_DIR_OVERRIDE
+unset NRL_IGNORE_VERSION_MISMATCH NRL_FORCE_REBUILD_VENVS
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON=${PYTHON:-python3}
@@ -337,6 +338,8 @@ printf 'cudnn_host_path=%s\ncudnn_container_path=%s\n' \
   "/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn" \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'uv_cache_override=disabled\ncontainer_baked_uv_archive_preserved=1\n' \
+  >> "$PROVENANCE_ROOT/submission.txt"
+printf 'version_mismatch_override=disabled\nforce_rebuild_venvs=disabled\n' \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'padding_telemetry=%s\n' "$COLLECT_PADDING_TELEMETRY" \
   >> "$PROVENANCE_ROOT/submission.txt"

@@ -20,6 +20,7 @@
 # limitations under the License.
 
 set -euo pipefail
+unset NRL_IGNORE_VERSION_MISMATCH NRL_FORCE_REBUILD_VENVS
 
 : "${CONTAINER:?CONTAINER is required}"
 : "${CUDNN_HOST_PATH:?CUDNN_HOST_PATH is required}"
