@@ -96,18 +96,23 @@ Field definitions:
 
 The SC path splits the async-GRPO loop across a rollout pump and a train pump that share a `TQReplayBuffer` and are orchestrated by the `SingleControllerActor`.
 
+![SC ownership and call model: driver, SingleControllerActor, and remote worker groups](../assets/sc-ownership.png)
+
+*The driver builds every heavy object and cloudpickles it into `SingleControllerActor` (a CPU-only Ray actor). `TQReplayBuffer`, `RolloutManager`, and the sampler live inside that actor — reaching them is a direct call, not RPC. Only the generation worker group, `TQPolicy`, and the TransferQueue data plane are separate processes; the dashed arrows are the only hops that cross a process boundary.*
+
 ### Core components
 
 #### 1. `SingleControllerActor` (`nemo_rl/algorithms/single_controller.py`)
 
 - Single Ray actor that runs `_rollout_pump` and `_train_pump` concurrently as asyncio tasks.
-- Receives a fully-constructed `SingleControllerActorArgs` (cloudpickled by the driver) — the actor does no construction work of its own, because running setup inside a nested Ray actor breaks `runtime_env` resolution.
+- Receives a fully-constructed `SingleControllerActorArgs` (cloudpickled by the driver) — the actor does no construction work of its own, because running setup inside a nested Ray actor breaks `runtime_env` resolution. Exception: `Logger` is built inside the actor, because wandb/TB backends hold a `_thread.lock` that cloudpickle can't serialize.
+- On startup, rebinds `self._rollout_manager._tq_buffer = self._buffer`. `rollout_manager` and `tq_buffer` are separate fields on the args dataclass, so Ray deserializes them as two independent buffers; without the rebind, the writer and the sampler would see different copies and the sampler would never observe committed groups.
 - Pump crashes propagate to the driver; in-flight rollouts drain on exit.
 
 #### 2. `TQReplayBuffer` (`nemo_rl/algorithms/async_utils/replay_buffer.py`)
 
 - Group-granular replay buffer with reserve/commit slot accounting.
-- On `commit`, the producer tensorizes the prompt group into N training-shaped rows and records the `start_weight` and `end_weight` versions the rollout observed.
+- `start_weight` is stamped on the slot at `reserve` (dispatch); `commit` tensorizes the group into N training-shaped rows, records `end_weight`, and flips the slot ready. Because slots are appended at reserve, buffer index order equals dispatch order and `start_weight` only ever increases down the buffer — which is why `windowed` and `weight_fifo` usually pick the same groups and diverge only when rollouts finish out of order.
 - Tracks `target_step` per group when the sampler assigns one at admit time (used by `in_order`).
 
 #### 3. `RolloutManager.generate_and_push` (`nemo_rl/experience/rollout_manager.py`)
