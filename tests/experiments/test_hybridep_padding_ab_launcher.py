@@ -114,6 +114,7 @@ def test_rendered_arm_contract(
     assert len(rendered["container_sha256"]) == 64
     assert len(rendered["preflight_manifest_sha256"]) == 64
     assert rendered["sbatch_environment_sanitized"] == "1"
+    assert rendered["ray_environment_sanitized"] == "1"
     assert rendered["job_name"].endswith(arm)
     assert rendered["output_root"].endswith(f"/{arm}")
     assert "grpo.max_num_steps=20" in rendered["training_command"]
@@ -171,6 +172,14 @@ def test_inherited_sbatch_options_are_sanitized() -> None:
     assert "--exclusive" not in rendered["sbatch_command"]
     assert "--cpus" not in rendered["sbatch_command"]
     assert "--mem" not in rendered["sbatch_command"]
+
+
+def test_inherited_ray_cluster_address_is_sanitized() -> None:
+    launcher = LAUNCHER.read_text()
+    validator = VALIDATE_SCRIPT.read_text()
+
+    assert "unset RAY_ADDRESS RAY_NAMESPACE" in launcher
+    assert "unset RAY_ADDRESS RAY_NAMESPACE" in validator
 
 
 def test_f725_builder_has_explicit_gpu_allocation_contract() -> None:

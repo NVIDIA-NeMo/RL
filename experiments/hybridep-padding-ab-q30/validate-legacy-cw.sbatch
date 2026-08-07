@@ -58,6 +58,7 @@ archive_unit_results() {
   fi
 }
 trap archive_unit_results EXIT
+unset RAY_ADDRESS RAY_NAMESPACE
 export UV_PROJECT_ENVIRONMENT="$PREFLIGHT_VENV"
 export VIRTUAL_ENV="$PREFLIGHT_VENV"
 export PATH="$PREFLIGHT_VENV/bin:$PATH"

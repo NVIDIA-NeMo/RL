@@ -46,6 +46,7 @@ validate_extra_mounts() {
 for SBATCH_VARIABLE in ${!SBATCH_@}; do
   unset "$SBATCH_VARIABLE"
 done
+unset RAY_ADDRESS RAY_NAMESPACE
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON=${PYTHON:-python3}
@@ -130,6 +131,7 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   printf 'preflight_manifest_sha256=%s\n' "$PREFLIGHT_MANIFEST_SHA256"
   printf 'batch_script=%s\n' "$BATCH_SCRIPT"
   printf 'sbatch_environment_sanitized=1\n'
+  printf 'ray_environment_sanitized=1\n'
   printf 'job_name=%s\n' "$JOB_NAME"
   printf 'output_root=%s\n' "$OUTPUT_ROOT"
   printf 'training_command=%s\n' "$TRAINING_COMMAND"
