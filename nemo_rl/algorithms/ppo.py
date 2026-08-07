@@ -1657,6 +1657,7 @@ def _build_ppo_rollout_dump_payload(
     prompt_lengths: torch.Tensor,
     content: list[str],
     repeated_batch: BatchedDataDict[DatumSpec],
+    adv_raw_metrics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the packed per-token rollout dump payload for torch.save.
 
@@ -1741,6 +1742,18 @@ def _build_ppo_rollout_dump_payload(
         payload["returns"] = _pack_float("returns")
     if "reference_policy_logprobs" in train_data:
         payload["reference_policy_logprobs"] = _pack_float("reference_policy_logprobs")
+
+    # ``advantages`` above are POST-whitening (normalize_advantages pins their std
+    # to 1.0). Whitening is affine, so the pre-whitening advantages -- the critic's
+    # actual residual scale, R - V(s_t) at lambda=1 -- are recoverable exactly:
+    #     adv_raw = advantages * adv_raw_std + adv_raw_mean
+    # Stored as two scalars rather than a second packed tensor (same information,
+    # ~13MB/dump cheaper).
+    if adv_raw_metrics:
+        for key in ("mean", "std"):
+            value = adv_raw_metrics.get(f"adv_raw/{key}")
+            if value is not None:
+                payload[f"adv_raw_{key}"] = float(value)
 
     if num_generations_per_prompt > 0:
         payload["prompt_group_index"] = (
@@ -2285,6 +2298,9 @@ def ppo_train(
                             prompt_lengths=repeated_batch["length"],
                             content=flat_messages["content"],
                             repeated_batch=repeated_batch,
+                            adv_raw_metrics=getattr(
+                                adv_estimator, "last_metrics", None
+                            ),
                         )
                         torch.save(rollout_dump_payload, rollout_dump_path)
                         print(f"  📝 Dumped rollout data to {rollout_dump_path}")
@@ -3966,6 +3982,7 @@ def async_ppo_train(
                         prompt_lengths=repeated_batch["length"],
                         content=flat_messages_content,
                         repeated_batch=repeated_batch,
+                        adv_raw_metrics=getattr(adv_estimator, "last_metrics", None),
                     )
                     torch.save(rollout_dump_payload, rollout_dump_path)
                     print(f"  📝 Dumped rollout data to {rollout_dump_path}")
