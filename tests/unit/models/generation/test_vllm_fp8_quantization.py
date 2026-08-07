@@ -15,6 +15,7 @@
 import types
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.vllm
 
@@ -78,6 +79,30 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
+
+
+def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    def flattened_quantize(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = tensor.numel() // tensor.shape[-1]
+        return (
+            torch.zeros(rows, tensor.shape[-1], dtype=torch.float8_e4m3fn),
+            torch.zeros(rows * tensor.shape[-1] // 32, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", flattened_quantize)
+
+    value, scale = fp8.quantize_mxfp8_weight(weight)
+
+    assert value.shape == weight.shape
+    assert scale.shape == (2, 3, 1)
+    assert torch.all(scale == 1)
 
 
 @pytest.mark.parametrize(
@@ -169,6 +194,56 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         for path in patched_paths
     )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
+
+def test_initialize_mxfp8_moe_kernel_once(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    layer = types.SimpleNamespace(
+        _expert_routing_tables=lambda: ("logical", "physical", "replicated")
+    )
+    moe_config = object()
+    quant_config = object()
+    experts_cls = object()
+    kernel = object()
+    quant_config_calls = []
+    kernel_calls = []
+
+    def get_quant_config(candidate_layer):
+        quant_config_calls.append(candidate_layer)
+        return quant_config
+
+    quant_method = types.SimpleNamespace(
+        moe=moe_config,
+        moe_kernel=None,
+        mxfp8_backend="flashinfer_trtllm",
+        experts_cls=experts_cls,
+        get_fused_moe_quant_config=get_quant_config,
+    )
+
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    def make_kernel(**kwargs):
+        kernel_calls.append(kwargs)
+        return kernel
+
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+
+    fp8._initialize_mxfp8_moe_kernel(quant_method, layer)
+    fp8._initialize_mxfp8_moe_kernel(quant_method, layer)
+
+    assert quant_method.moe_kernel is kernel
+    assert quant_method.moe_quant_config is quant_config
+    assert quant_config_calls == [layer]
+    assert kernel_calls == [
+        {
+            "moe_quant_config": quant_config,
+            "moe_config": moe_config,
+            "fp8_backend": "flashinfer_trtllm",
+            "experts_cls": experts_cls,
+            "routing_tables": ("logical", "physical", "replicated"),
+            "layer": layer,
+        }
+    ]
 
 
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
