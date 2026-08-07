@@ -249,6 +249,9 @@ def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> N
     assert '--target "$DEEPEP_OVERLAY_TEMP" --no-deps --reinstall' in launcher
     assert 'mv "$DEEPEP_OVERLAY_TEMP" "$DEEPEP_OVERLAY_DIR"' in launcher
     assert 'require_canonical_lustre_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"' in launcher
+    assert 'directory_tree_sha256 "$DEEPEP_OVERLAY_TEMP"' in launcher
+    assert 'directory_tree_sha256 "$DEEPEP_OVERLAY_DIR"' in launcher
+    assert "export PYTHONDONTWRITEBYTECODE=1" in launcher
     assert '$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR' in launcher
     assert 'UV_NO_CONFIG=1 uv pip install --target "$DEEPEP_OVERLAY_DIR"' not in setup
     assert "import deep_ep, deep_ep_cpp, hybrid_ep_cpp" in setup

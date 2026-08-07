@@ -42,6 +42,28 @@ validate_extra_mounts() {
     [[ "$destination" == /* && "$destination" != /home && "$destination" != /home/* && "$destination" != *'/../'* ]] || die "invalid MOUNTS destination: $destination"
   done
 }
+directory_tree_sha256() {
+  python3 - "$1" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+tree_hash = hashlib.sha256()
+for path in sorted(root.rglob("*")):
+    if not path.is_file() or path.name == ".tree-sha256":
+        continue
+    relative_path = path.relative_to(root).as_posix().encode()
+    tree_hash.update(len(relative_path).to_bytes(8, "big"))
+    tree_hash.update(relative_path)
+    file_hash = hashlib.sha256()
+    with path.open("rb") as file_object:
+        for chunk in iter(lambda: file_object.read(1024 * 1024), b""):
+            file_hash.update(chunk)
+    tree_hash.update(file_hash.digest())
+print(tree_hash.hexdigest())
+PY
+}
 
 for SBATCH_VARIABLE in ${!SBATCH_@}; do
   unset "$SBATCH_VARIABLE"
@@ -218,6 +240,7 @@ DEEPEP_METADATA=none
 DEEPEP_SHA256=none
 DEEPEP_OVERLAY_DIR=none
 DEEPEP_OVERLAY_BYTES=0
+DEEPEP_OVERLAY_TREE_SHA256=none
 if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
   if [[ "$EXPECTED_DEEPEP_COMMIT" == 17cfb817bccec3a9c247013360cc550c2bac441e ]]; then
     DEEPEP_WHEEL=${DEEPEP_17CF_WHEEL:?Set DEEPEP_17CF_WHEEL}
@@ -268,6 +291,7 @@ PY
     compgen -G "$DEEPEP_OVERLAY_TEMP/deep_ep_cpp*.so" >/dev/null || die "DeepEP extension is absent from staged overlay"
     compgen -G "$DEEPEP_OVERLAY_TEMP/hybrid_ep_cpp*.so" >/dev/null || die "HybridEP extension is absent from staged overlay"
     printf '%s\n' "$DEEPEP_SHA256" > "$DEEPEP_OVERLAY_TEMP/.wheel-sha256"
+    directory_tree_sha256 "$DEEPEP_OVERLAY_TEMP" > "$DEEPEP_OVERLAY_TEMP/.tree-sha256"
     mv "$DEEPEP_OVERLAY_TEMP" "$DEEPEP_OVERLAY_DIR"
     trap - EXIT
   fi
@@ -276,6 +300,9 @@ PY
   require_canonical_lustre_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"
   [[ -f "$DEEPEP_OVERLAY_MANIFEST" ]] || die "DeepEP overlay manifest is missing"
   [[ $(<"$DEEPEP_OVERLAY_MANIFEST") == "$DEEPEP_SHA256" ]] || die "DeepEP overlay checksum mismatch"
+  [[ -f "$DEEPEP_OVERLAY_DIR/.tree-sha256" ]] || die "DeepEP overlay tree manifest is missing"
+  DEEPEP_OVERLAY_TREE_SHA256=$(<"$DEEPEP_OVERLAY_DIR/.tree-sha256")
+  [[ $(directory_tree_sha256 "$DEEPEP_OVERLAY_DIR") == "$DEEPEP_OVERLAY_TREE_SHA256" ]] || die "DeepEP overlay tree checksum mismatch"
   compgen -G "$DEEPEP_OVERLAY_DIR/deep_ep_cpp*.so" >/dev/null || die "DeepEP overlay extension is missing"
   compgen -G "$DEEPEP_OVERLAY_DIR/hybrid_ep_cpp*.so" >/dev/null || die "HybridEP overlay extension is missing"
   DEEPEP_OVERLAY_BYTES=$(du -sb "$DEEPEP_OVERLAY_DIR" | cut -f1)
@@ -307,14 +334,14 @@ printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_ch
 printf 'harness_commit=%s\nlauncher_sha256=%s\nbatch_script_sha256=%s\nmatrix_sha256=%s\n' \
   "$HARNESS_COMMIT" "$LAUNCHER_SHA256" "$BATCH_SCRIPT_SHA256" "$MATRIX_SHA256" \
   >> "$PROVENANCE_ROOT/submission.txt"
-printf 'deepep_overlay_dir=%s\ndeepep_overlay_bytes=%s\n' \
-  "$DEEPEP_OVERLAY_DIR" "$DEEPEP_OVERLAY_BYTES" \
+printf 'deepep_overlay_dir=%s\ndeepep_overlay_bytes=%s\ndeepep_overlay_tree_sha256=%s\n' \
+  "$DEEPEP_OVERLAY_DIR" "$DEEPEP_OVERLAY_BYTES" "$DEEPEP_OVERLAY_TREE_SHA256" \
   >> "$PROVENANCE_ROOT/submission.txt"
 
 export SOURCE_PATH OUTPUT_ROOT PROVENANCE_ROOT RECIPE MAX_STEPS ARM SOURCE_PROFILE
 export EXPECTED_NEMO_RL_COMMIT EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT
 export EXPECTED_DEEPEP_COMMIT DEEPEP_WHEEL DEEPEP_METADATA DEEPEP_SHA256
-export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES
+export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES DEEPEP_OVERLAY_TREE_SHA256
 export EXPECTED_GPU_MODEL GPUS_PER_NODE DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING
 export HF_HOME=${HF_CACHE:-$EXPERIMENT_ROOT/hf-cache}
 export HF_DATASETS_CACHE=$HF_HOME/datasets
@@ -332,6 +359,7 @@ export TRITON_CACHE_DIR=/tmp/nemo-rl-triton-$ARM-$LOCAL_HEAD
 export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
+export PYTHONDONTWRITEBYTECODE=1
 export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
@@ -393,6 +421,7 @@ GPU_MODELS=$(nvidia-smi --query-gpu=name --format=csv,noheader)
 if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
   [[ $(sha256sum "$DEEPEP_WHEEL" | cut -d' ' -f1) == "$DEEPEP_SHA256" ]]
   [[ $(<"$DEEPEP_OVERLAY_DIR/.wheel-sha256") == "$DEEPEP_SHA256" ]]
+  [[ $(<"$DEEPEP_OVERLAY_DIR/.tree-sha256") == "$DEEPEP_OVERLAY_TREE_SHA256" ]]
   "$RUN_PYTHON" - <<'PY'
 import os
 from pathlib import Path
