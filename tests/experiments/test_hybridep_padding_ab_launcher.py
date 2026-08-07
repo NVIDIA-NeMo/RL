@@ -16,6 +16,9 @@ BATCH_SCRIPT = ROOT / "experiments" / "hybridep-padding-ab-q30" / "ray-nonexclus
 BUILD_SCRIPT = (
     ROOT / "experiments" / "hybridep-padding-ab-q30" / "build-f725-wheel.sbatch"
 )
+VALIDATE_SCRIPT = (
+    ROOT / "experiments" / "hybridep-padding-ab-q30" / "validate-legacy-cw.sbatch"
+)
 
 
 def _render(arm: str, *, test_only: bool = False) -> dict[str, str]:
@@ -177,6 +180,16 @@ def test_f725_builder_has_explicit_gpu_allocation_contract() -> None:
     assert "#SBATCH --ntasks=1" in build_script
     assert "#SBATCH --gpus-per-node=1" in build_script
     assert "#SBATCH --time=01:00:00" in build_script
+
+
+def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
+    launcher = LAUNCHER.read_text()
+    validator = VALIDATE_SCRIPT.read_text()
+
+    for script in (launcher, validator):
+        assert "Megatron-Bridge/src" in script
+        assert "Megatron-Bridge/3rdparty/Megatron-LM" in script
+        assert 'export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE' in script
 
 
 def test_unknown_arm_fails_before_side_effects() -> None:
