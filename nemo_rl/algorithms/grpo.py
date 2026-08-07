@@ -98,6 +98,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
+    GenerationSamplingParams,
     resolve_routed_experts_dtype_name_for_model,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -246,7 +247,13 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool = False
+    # Counts PROMPTS, not rollouts: with val_num_generations_per_prompt = k,
+    # total validation rollouts = max_val_samples * k.
     max_val_samples: int | None = 256  # None for NeMo-Gym compatibility
+    # Number of independent validation rollouts generated for each prompt;
+    # k > 1 additionally reports pass@k over each prompt's k rollouts as the
+    # pass_k metric.
+    val_num_generations_per_prompt: int = 1
     # Early stop: end training once this validation metric (e.g. accuracy,
     # always reported, or pass_k with grouped validation) reaches
     # stop_at_validation_threshold; null disables early stopping.
@@ -397,6 +404,40 @@ def setup(
     )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+
+    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
+    # path; everywhere else validation must sample exactly like training.
+    val_sampling_overridden = (
+        generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+        or generation_config["val_top_k"] != generation_config["top_k"]
+    )
+    if val_sampling_overridden:
+        assert generation_config["backend"] == "vllm" and _should_use_nemo_gym(
+            master_config
+        ), (
+            "generation.val_temperature/val_top_p/val_top_k differing from the "
+            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+        )
+        # The NeMo-Gym path only stamps temperature/top_p onto requests and
+        # rejects any top_k at rollout time, so a val_top_k override can never
+        # be honored — fail here instead of at the first validation step.
+        assert not generation_config["val_top_k"], (
+            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
+            "only honors val_temperature/val_top_p. Leave val_top_k null."
+        )
+    assert grpo_config.val_num_generations_per_prompt >= 1, (
+        "grpo.val_num_generations_per_prompt must be >= 1"
+    )
+    # pass_k is only reported when k > 1; catch the mismatch here instead of
+    # at the first validation step.
+    assert not (
+        grpo_config.stop_at_validation_metric == "pass_k"
+        and grpo_config.val_num_generations_per_prompt <= 1
+    ), (
+        "grpo.stop_at_validation_metric='pass_k' requires "
+        "grpo.val_num_generations_per_prompt > 1"
+    )
 
     # Set seed for all random number generators
     set_seed(grpo_config.seed)
@@ -1047,6 +1088,7 @@ def setup(
                 tokenizer=tokenizer,
                 processor=processor,
                 weights_path=weights_path,
+                skip_weight_load=True,
             )
         return mg, time.perf_counter() - t0
 
@@ -2000,6 +2042,9 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    # update multimodal data unconditionally
+    extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
+    train_data.update(extra_multimodal_data)
     return train_data
 
 
@@ -3681,6 +3726,10 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
+        # >= 1 is validated in setup().
+        val_num_generations_per_prompt = (
+            master_config.grpo.val_num_generations_per_prompt
+        )
 
         total_rewards = []
         total_lengths = []
@@ -3693,12 +3742,23 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
+            if val_num_generations_per_prompt > 1:
+                val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
+
             additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
+                # Validation-only sampling (e.g. near-greedy validation);
+                # defaults to the train profile via the exemplar YAML
+                # interpolations. Training rollouts keep policy.generation.
+                val_sampling_params = GenerationSamplingParams(
+                    temperature=generation_config["val_temperature"],
+                    top_p=generation_config["val_top_p"],
+                    top_k=generation_config["val_top_k"],
+                )
                 nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -3706,6 +3766,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
+                    sampling_params=val_sampling_params,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],
                         wandb_config=master_config.logger["wandb"],
@@ -3756,11 +3817,26 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics
+        # Calculate validation metrics. accuracy is the mean reward over all
+        # rollouts; grouped validation (val_num_generations_per_prompt > 1)
+        # additionally reports pass@k over each prompt's k rollouts as pass_k.
         num_samples = len(total_rewards)
+        pass_k = None
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
             accuracy = rewards_t.mean().item()
+            if val_num_generations_per_prompt > 1:
+                assert num_samples % val_num_generations_per_prompt == 0, (
+                    "Validation rewards must be divisible by "
+                    "grpo.val_num_generations_per_prompt"
+                )
+                pass_k = (
+                    (rewards_t.view(-1, val_num_generations_per_prompt) > 0)
+                    .any(dim=1)
+                    .float()
+                    .mean()
+                    .item()
+                )
         else:
             accuracy = 0.0
 
@@ -3773,6 +3849,8 @@ def validate(
             "avg_length": avg_length,
             **additional_metrics_to_report,
         }
+        if pass_k is not None:
+            val_metrics["pass_k"] = pass_k
 
         # Print sample conversations only once at the end of validation
         try:
@@ -3913,6 +3991,7 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
     ).get("enabled", False):
