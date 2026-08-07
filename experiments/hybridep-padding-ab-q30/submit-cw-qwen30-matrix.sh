@@ -102,7 +102,7 @@ REQUIRES_DEEPEP_ARTIFACT=$HYBRIDEP_BACKEND
 BACKEND_NAME=none
 [[ "$HYBRIDEP_BACKEND" == 0 ]] || BACKEND_NAME=hybridep
 
-RUN_ARGS=(uv run --no-sync examples/run_grpo.py --config "$RECIPE"
+RUN_ARGS=(uv run --active --no-sync examples/run_grpo.py --config "$RECIPE"
   "grpo.max_num_steps=$MAX_STEPS" checkpointing.enabled=false
   policy.sequence_packing.enabled=true
   "policy.megatron_cfg.moe_token_dispatcher_type=$DISPATCHER")
@@ -277,7 +277,7 @@ PY
   DEEPEP_OVERLAY_ROOT="$EXPERIMENT_ROOT/artifacts/deepep-overlays"
   mkdir -p "$DEEPEP_OVERLAY_ROOT"
   require_canonical_lustre_path DEEPEP_OVERLAY_ROOT "$DEEPEP_OVERLAY_ROOT"
-  DEEPEP_OVERLAY_DIR="$DEEPEP_OVERLAY_ROOT/$DEEPEP_SHA256"
+  DEEPEP_OVERLAY_DIR="$DEEPEP_OVERLAY_ROOT/$DEEPEP_SHA256-tree-v1"
   DEEPEP_OVERLAY_MANIFEST="$DEEPEP_OVERLAY_DIR/.wheel-sha256"
   DEEPEP_OVERLAY_LOCK="$DEEPEP_OVERLAY_ROOT/.$DEEPEP_SHA256.lock"
   exec 9>"$DEEPEP_OVERLAY_LOCK"
@@ -286,7 +286,8 @@ PY
     DEEPEP_OVERLAY_TEMP=$(mktemp -d "$DEEPEP_OVERLAY_ROOT/.$DEEPEP_SHA256.XXXXXX")
     cleanup_deepep_overlay_temp() { rm -rf -- "$DEEPEP_OVERLAY_TEMP"; }
     trap cleanup_deepep_overlay_temp EXIT
-    UV_NO_CONFIG=1 uv pip install --python "$PREFLIGHT_VENV/bin/python" \
+    UV_NO_CONFIG=1 uv pip install --python-version 3.13 \
+      --python-platform x86_64-unknown-linux-gnu \
       --target "$DEEPEP_OVERLAY_TEMP" --no-deps --reinstall "$DEEPEP_WHEEL"
     compgen -G "$DEEPEP_OVERLAY_TEMP/deep_ep_cpp*.so" >/dev/null || die "DeepEP extension is absent from staged overlay"
     compgen -G "$DEEPEP_OVERLAY_TEMP/hybrid_ep_cpp*.so" >/dev/null || die "HybridEP extension is absent from staged overlay"
@@ -339,6 +340,7 @@ printf 'deepep_overlay_dir=%s\ndeepep_overlay_bytes=%s\ndeepep_overlay_tree_sha2
   >> "$PROVENANCE_ROOT/submission.txt"
 
 export SOURCE_PATH OUTPUT_ROOT PROVENANCE_ROOT RECIPE MAX_STEPS ARM SOURCE_PROFILE
+export PREFLIGHT_VENV
 export EXPECTED_NEMO_RL_COMMIT EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT
 export EXPECTED_DEEPEP_COMMIT DEEPEP_WHEEL DEEPEP_METADATA DEEPEP_SHA256
 export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES DEEPEP_OVERLAY_TREE_SHA256
@@ -409,8 +411,9 @@ fi
 read -r -d '' SETUP_COMMAND <<'SETUP' || true
 set -euo pipefail
 cd "$SOURCE_PATH"
-RUN_PYTHON=$(uv run --no-sync python -c 'import sys; print(sys.executable)')
+RUN_PYTHON=$(uv run --active --no-sync python -c 'import sys; print(sys.executable)')
 [[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
+"$RUN_PYTHON" -c 'import os, sys; assert os.path.realpath(sys.prefix) == os.path.realpath(os.environ["PREFLIGHT_VENV"])'
 "$RUN_PYTHON" -c 'import ray, requests, urllib3.exceptions'
 VENV_MANIFEST="$PROVENANCE_ROOT/venv-$(hostname).txt"
 "$RUN_PYTHON" -m pip freeze | LC_ALL=C sort > "$VENV_MANIFEST"
@@ -447,7 +450,7 @@ MCORE=$BRIDGE/3rdparty/Megatron-LM
 [[ $(git -C "$BRIDGE" rev-parse HEAD) == "$EXPECTED_BRIDGE_COMMIT" ]]
 [[ $(git -C "$MCORE" rev-parse HEAD) == "$EXPECTED_MCORE_COMMIT" ]]
 
-uv run --no-sync python - <<'PY'
+uv run --active --no-sync python - <<'PY'
 import os
 from types import SimpleNamespace
 
@@ -488,7 +491,7 @@ if os.environ["LEGACY_PREPADDING"] == "1":
 PY
 
 if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
-  uv run --no-sync python - <<'PY'
+  uv run --active --no-sync python - <<'PY'
 import os
 from pathlib import Path
 

@@ -118,6 +118,7 @@ def test_rendered_arm_contract(
     assert rendered["job_name"].endswith(arm)
     assert rendered["output_root"].endswith(f"/{arm}")
     assert "grpo.max_num_steps=20" in rendered["training_command"]
+    assert "uv run --active --no-sync" in rendered["training_command"]
     assert "policy.sequence_packing.enabled=true" in rendered["training_command"]
     assert "--nodes=4" in rendered["sbatch_command"]
     assert "--gpus-per-node=8" in rendered["sbatch_command"]
@@ -224,6 +225,9 @@ def test_ray_bootstrap_uses_the_pinned_preflight_site_packages() -> None:
 
     assert "PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages" in launcher
     assert "import ray, requests, urllib3.exceptions" in launcher
+    assert "RUN_PYTHON=$(uv run --active --no-sync python" in launcher
+    assert "os.path.realpath(sys.prefix)" in launcher
+    assert "os.environ[\"PREFLIGHT_VENV\"]" in launcher
     assert "/opt/nemo_rl_venv/bin/ray --version" in validator
     assert "import ray, requests, urllib3, urllib3.exceptions" in validator
     assert 'LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' in launcher
@@ -241,11 +245,14 @@ def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> N
     )[0]
 
     assert 'DEEPEP_OVERLAY_ROOT="$EXPERIMENT_ROOT/artifacts/deepep-overlays"' in launcher
-    assert 'DEEPEP_OVERLAY_DIR="$DEEPEP_OVERLAY_ROOT/$DEEPEP_SHA256"' in launcher
     assert (
-        'UV_NO_CONFIG=1 uv pip install --python "$PREFLIGHT_VENV/bin/python"'
+        'DEEPEP_OVERLAY_DIR="$DEEPEP_OVERLAY_ROOT/$DEEPEP_SHA256-tree-v1"'
         in launcher
     )
+    assert (
+        "UV_NO_CONFIG=1 uv pip install --python-version 3.13" in launcher
+    )
+    assert "--python-platform x86_64-unknown-linux-gnu" in launcher
     assert '--target "$DEEPEP_OVERLAY_TEMP" --no-deps --reinstall' in launcher
     assert 'mv "$DEEPEP_OVERLAY_TEMP" "$DEEPEP_OVERLAY_DIR"' in launcher
     assert 'require_canonical_lustre_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"' in launcher
