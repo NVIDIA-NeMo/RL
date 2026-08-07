@@ -4439,6 +4439,7 @@ docs = [
     { name = "swagger-plugin-for-sphinx" },
 ]
 nemo-gym-router = [
+    { name = "smg" },
     { name = "vllm-router" },
 ]
 test = [
@@ -4591,7 +4592,10 @@ docs = [
     { name = "sphinxcontrib-mermaid" },
     { name = "swagger-plugin-for-sphinx" },
 ]
-nemo-gym-router = [{ name = "vllm-router", specifier = "==0.1.15" }]
+nemo-gym-router = [
+    { name = "smg", specifier = "==1.9.0" },
+    { name = "vllm-router", specifier = "==0.1.15" },
+]
 test = [
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytest-asyncio" },
@@ -7011,6 +7015,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/76/53/9c513747547fd595d5c143259129ea8b9c3ea2f6b7bb9dcea2b1966ded3c/smart_open-8.0.1.tar.gz", hash = "sha256:18b1c4496003c6902be17c15f032b5c319f307c89c6ae9e6b028b508bed8b2cf", size = 61882, upload-time = "2026-07-15T13:56:10.492Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c3/96/325b8c507ccecc50421fecc0345a502ee6e4a44785af3c4e6ecbadad624a/smart_open-8.0.1-py3-none-any.whl", hash = "sha256:3e97f90e92a952cb57863dfe132082c400a52eeeb27c067692fb51dbcc5b0089", size = 73504, upload-time = "2026-07-15T13:56:09.033Z" },
+]
+
+[[package]]
+name = "smg"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "grpcio-health-checking" },
+    { name = "pyyaml" },
+    { name = "setproctitle" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/13/c8/7707780338e7bd79769ba521a86f73c8272468c58006685ab9b2feacf221/smg-1.9.0.tar.gz", hash = "sha256:a075234d6d21a2aea0494ad599bfce2a81d11e8a1a1d9bb4e4f0f12f5a2031b6", size = 3163976, upload-time = "2026-07-30T06:29:14.463Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/2d/1648875495491340ae4353c3c05c04b07b514636bb0d7b408b6120756d32/smg-1.9.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:38261c1de77f10f8b16fffe20d19235f6c888d2e257029f6c0e66071e62d1446", size = 30724795, upload-time = "2026-07-30T06:28:59.565Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/ae/9eb904c003c6d45d34f75d97ccd1a3fcb5520c09ee83718e83c013858afe/smg-1.9.0-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:cb0462657ecfb8179f3781023d61a5ca92ff26f48557b196e5e4f74e5cbad25d", size = 32326605, upload-time = "2026-07-30T06:29:02.879Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/a5/2ca1b5bbc9bf8ebbbd23eb77cf7dba30214715693e80c7839502271544ba/smg-1.9.0-cp38-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:3cce9c414271dea3aff43503251176d46d1ca793dcad0eed40aa65e1c7d759f9", size = 32436109, upload-time = "2026-07-30T06:29:05.944Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/59/b8d1e3abdfd9e4f901bf2e444d69bf4e914261518090d64f199c3d3e347f/smg-1.9.0-cp38-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:11c2bea9079a15681c5d2c23ca4fdac47d4781a80d85317d1e7f479ab059a9dd", size = 30833940, upload-time = "2026-07-30T06:29:09.243Z" },
 ]
 
 [[package]]
