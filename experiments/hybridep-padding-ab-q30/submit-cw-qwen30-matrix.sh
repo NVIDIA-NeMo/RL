@@ -293,6 +293,7 @@ export TRITON_CACHE_DIR=/tmp/nemo-rl-triton-$ARM-$LOCAL_HEAD
 export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
 export PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src

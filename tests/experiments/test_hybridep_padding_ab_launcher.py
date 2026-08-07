@@ -212,6 +212,7 @@ def test_ray_bootstrap_uses_the_pinned_preflight_site_packages() -> None:
     assert "import ray, requests, urllib3.exceptions" in launcher
     assert "/opt/nemo_rl_venv/bin/ray --version" in validator
     assert "import ray, requests, urllib3, urllib3.exceptions" in validator
+    assert 'LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' in launcher
 
 
 def test_validator_archives_pytest_results_outside_the_source_tree() -> None:
