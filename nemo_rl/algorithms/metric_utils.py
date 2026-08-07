@@ -22,11 +22,16 @@ from typing import Any, Optional
 class SetupTimingMetrics:
     """Driver-side per-phase timings collected during setup."""
 
-    # Generation-backend init (exactly one populated per run).
+    # grpo.py only: generation-backend init (exactly one populated per run).
     vllm_init_time_s: Optional[float] = None
     sglang_init_time_s: Optional[float] = None
     trtllm_init_time_s: Optional[float] = None
     megatron_generation_init_time_s: Optional[float] = None
+
+    # SC only: generation init (reserve + load).
+    generation_init_time_s: Optional[float] = None
+    generation_init_reserve_time_s: Optional[float] = None
+    generation_init_load_time_s: Optional[float] = None
 
     policy_init_time_s: Optional[float] = None
     nemo_gym_init_time_s: Optional[float] = None
@@ -60,12 +65,34 @@ class SetupTimingMetrics:
 
 
 def print_setup_timing_summary(
-    metrics: SetupTimingMetrics, gen_init_time_key: str
+    metrics: SetupTimingMetrics, gen_init_time_key: Optional[str] = None
 ) -> None:
-    """Print the setup-phase summary block."""
+    """Print the setup-phase summary block.
+
+    Args:
+        metrics: Populated timing metrics.
+        gen_init_time_key: grpo.py passes the backend-specific field name
+            (e.g. "vllm_init_time_s"); SC leaves it None and the summary
+            reads generation_init_time_s (+ optional reserve/load split).
+    """
     print("\n▶ Worker Initialization Timing:")
 
-    print(f"  Generation init: {getattr(metrics, gen_init_time_key):.1f}s")
+    if metrics.generation_init_reserve_time_s:
+        # SC + gym-on path
+        print(
+            f"  Generation init: {metrics.generation_init_time_s:.1f}s"
+            f" (reserve {metrics.generation_init_reserve_time_s:.1f}s"
+            f" + load {metrics.generation_init_load_time_s:.1f}s)"
+        )
+    elif gen_init_time_key is None:
+        # SC + gym-off path
+        assert metrics.generation_init_time_s is not None
+        print(f"  Generation init: {metrics.generation_init_time_s:.1f}s")
+    else:
+        # grpo.py path
+        assert metrics.generation_init_time_s is None
+        print(f"  Generation init: {getattr(metrics, gen_init_time_key):.1f}s")
+
     print(f"  Policy init: {metrics.policy_init_time_s:.1f}s")
 
     if metrics.nemo_gym_init_time_s:

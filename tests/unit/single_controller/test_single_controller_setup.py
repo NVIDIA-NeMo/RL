@@ -431,13 +431,13 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
     def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
-        """Colocated vLLM records vllm+policy+collective+total+worker fields."""
+        """Colocated vLLM records gen+policy+collective+total+worker fields."""
         mc = _make_master_config(colocated=True, backend="vllm")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         for field in (
-            "vllm_init_time_s",
+            "generation_init_time_s",
             "policy_init_time_s",
             "collective_init_time_s",
             "worker_setup_time_s",
@@ -451,6 +451,9 @@ class TestSetup:
         # shared SetupTimingMetrics — SC does not emit them.
         assert metrics.parallel_wall_time_s is None
         assert metrics.parallel_init_enabled is None
+        # Reserve/load split is populated on the gym-on path only.
+        assert metrics.generation_init_reserve_time_s is None
+        assert metrics.generation_init_load_time_s is None
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records the same per-phase fields as colocated."""
@@ -458,21 +461,26 @@ class TestSetup:
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert metrics.vllm_init_time_s is not None
+        assert metrics.generation_init_time_s is not None
         assert metrics.policy_init_time_s is not None
         assert metrics.worker_setup_time_s is not None
         # parallel_wall_time_s / parallel_init_enabled are grpo.py-only.
         assert metrics.parallel_wall_time_s is None
         assert metrics.parallel_init_enabled is None
+        # Reserve/load split is populated on the gym-on path only.
+        assert metrics.generation_init_reserve_time_s is None
+        assert metrics.generation_init_load_time_s is None
 
-    def test_setup_timing_uses_sglang_key_for_sglang_backend(self, patched_factories):
-        """Generation-init field follows the backend name (sglang_init_time_s)."""
+    def test_setup_timing_backend_agnostic_for_sglang(self, patched_factories):
+        """SC uses the backend-agnostic generation_init_time_s regardless of backend."""
         mc = _make_master_config(colocated=True, backend="sglang")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert metrics.sglang_init_time_s is not None
+        assert metrics.generation_init_time_s is not None
+        # Backend-specific fields are grpo.py-only; SC does not populate them.
         assert metrics.vllm_init_time_s is None
+        assert metrics.sglang_init_time_s is None
 
     def test_nemo_gym_uses_deferred_vllm_load(self, patched_factories):
         """NeMo-Gym path reserves vLLM ports up-front and finishes the load afterwards."""
@@ -519,7 +527,7 @@ class TestSetup:
             _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert metrics.nemo_gym_init_time_s is not None
-        assert metrics.vllm_init_time_s is not None
+        assert metrics.generation_init_time_s is not None
         assert metrics.policy_init_time_s is not None
         assert metrics.worker_setup_time_s is not None
         # parallel_wall_time_s / parallel_init_enabled are grpo.py-only.
@@ -552,19 +560,20 @@ class TestSetup:
         patched_factories["fake_gen"].load_and_start.assert_called_once_with()
         assert actor_args.gen_handle is patched_factories["fake_gen"]
         assert metrics.nemo_gym_init_time_s is not None
-        assert metrics.vllm_init_time_s is not None
+        assert metrics.generation_init_time_s is not None
         assert metrics.policy_init_time_s is not None
 
     @pytest.mark.parametrize("colocated", [True, False])
-    def test_nemo_gym_vllm_init_time_includes_reserve_time(
+    def test_nemo_gym_generation_init_time_includes_reserve_time(
         self, patched_factories, colocated
     ):
-        """vllm_init_time_s folds in the deferred-VllmGeneration reserve time.
+        """generation_init_time_s folds in the deferred-VllmGeneration reserve time.
 
         With gym on, _build_generation(defer_model_load=True) does worker-group
         spawn + port bind (no weight load). That elapsed time has to end up in
-        vllm_init_time_s alongside the deferred-load elapsed; otherwise gym-on
-        runs undercount vLLM setup by the worker-group span.
+        generation_init_time_s alongside the deferred-load elapsed; otherwise
+        gym-on runs undercount generation setup by the worker-group span. The
+        reserve/load split is also exposed for overlap analysis.
         """
         mc = _make_master_config(colocated=colocated, backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
@@ -590,7 +599,9 @@ class TestSetup:
 
         # gen_load_time (from _finish_deferred_generation, unpatched) is ~0 in
         # the test — the reserve time dominates and must be present.
-        assert metrics.vllm_init_time_s >= 3.0
+        assert metrics.generation_init_time_s >= 3.0
+        assert metrics.generation_init_reserve_time_s == 3.0
+        assert metrics.generation_init_load_time_s is not None
 
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):

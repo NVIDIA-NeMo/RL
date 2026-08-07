@@ -442,14 +442,6 @@ def setup_single_controller(
     # ==========================
     setup_start_time = time.perf_counter()
     setup_timing_metrics = SetupTimingMetrics()
-    gen_backend = generation_config["backend"]
-    # TODO: SC doesn't support megatron generation yet; the megatron branch is
-    # defensive — mirrors grpo.py so the metric key stays valid if we add it.
-    gen_init_time_key = (
-        "megatron_generation_init_time_s"
-        if gen_backend == "megatron"
-        else f"{gen_backend}_init_time_s"
-    )
 
     # Create clusters
     train_cluster, inference_cluster = _build_clusters(master_config)
@@ -542,25 +534,22 @@ def setup_single_controller(
         submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
         results = {k: f.result() for k, f in submitted.items()}
 
-    if use_nemo_gym:
-        env_handles["nemo_gym"], gym_time = results["nemo_gym"]
-        setup_timing_metrics.nemo_gym_init_time_s = gym_time
-
     if colocated:
         generation, trainer, time_metrics = results["generation_trainer"]
-        setattr(
-            setup_timing_metrics,
-            gen_init_time_key,
-            time_metrics["gen_time"] + gen_reserve_time,
-        )
+        gen_load_time = time_metrics["gen_time"]
         setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     else:
         generation, gen_load_time = results["generation"]
         trainer, trainer_time = results["trainer"]
-        setattr(
-            setup_timing_metrics, gen_init_time_key, gen_load_time + gen_reserve_time
-        )
         setup_timing_metrics.policy_init_time_s = trainer_time
+    setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
+
+    if use_nemo_gym:
+        env_handles["nemo_gym"], gym_time = results["nemo_gym"]
+        setup_timing_metrics.nemo_gym_init_time_s = gym_time
+        # the two fields are only meaningful when use_nemo_gym enabled
+        setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
+        setup_timing_metrics.generation_init_load_time_s = gen_load_time
 
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time
@@ -575,7 +564,7 @@ def setup_single_controller(
     weight_synchronizer = create_weight_synchronizer(
         policy=trainer,
         generation=generation,
-        generation_backend=gen_backend,
+        generation_backend=generation_config["backend"],
         colocated=colocated,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
@@ -616,7 +605,7 @@ def setup_single_controller(
     total_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.total_setup_time_s = total_setup_time
     setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
-    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    print_setup_timing_summary(setup_timing_metrics)
 
     # Build actor args and return
     actor_args = SingleControllerActorArgs(

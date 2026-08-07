@@ -145,7 +145,9 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
         ),
         logger={},
     )
-    setup_metrics = SetupTimingMetrics(vllm_init_time_s=1.5, policy_init_time_s=2.5)
+    setup_metrics = SetupTimingMetrics(
+        generation_init_time_s=1.5, policy_init_time_s=2.5
+    )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
         dp_client=None,
