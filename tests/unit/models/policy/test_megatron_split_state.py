@@ -111,6 +111,7 @@ def _make_worker(loss_type):
     )
 
     w = object.__new__(MegatronPolicyWorkerImpl)
+    w._policy_profiler = None
     w.model = _make_mock_model()
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)
@@ -774,6 +775,101 @@ class TestAbort:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state is not None
         assert float(w._train_step_state["local_valid_seqs"].item()) == 0.0
+
+
+class TestPolicyProfilerLifecycle:
+    def test_begin_finish_profiles_one_complete_step(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._policy_profiler = MagicMock()
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        w._policy_profiler.begin_train_step.assert_called_once_with()
+        w._policy_profiler.finish_train_step.assert_called_once_with()
+        w._policy_profiler.abort_train_step.assert_not_called()
+
+    def test_explicit_abort_aborts_profiler(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._policy_profiler = MagicMock()
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.abort_train_step()
+
+        w._policy_profiler.abort_train_step.assert_called_once_with(
+            reason="policy_train_step_aborted"
+        )
+        w._policy_profiler.finish_train_step.assert_not_called()
+
+    def test_explicit_profiler_abort_error_still_cleans_worker_state(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._policy_profiler = MagicMock()
+        w._policy_profiler.abort_train_step.side_effect = RuntimeError(
+            "profiler abort failed"
+        )
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+
+        with pytest.raises(RuntimeError, match="profiler abort failed"):
+            w.abort_train_step()
+
+        assert w._train_step_state is None
+
+    def test_begin_error_aborts_profiler(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._policy_profiler = MagicMock()
+        w.model.train.side_effect = ValueError("begin failed")
+
+        with pytest.raises(ValueError, match="begin failed"):
+            w.begin_train_step(loss_fn=w._test_loss_fn)
+
+        w._policy_profiler.abort_train_step.assert_called_once_with(
+            reason="policy_train_begin_error"
+        )
+
+    def test_microbatch_error_aborts_profiler_once(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._policy_profiler = MagicMock()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w._train_microbatch_body = MagicMock(side_effect=ValueError("mb failed"))
+
+        with pytest.raises(ValueError, match="mb failed"):
+            w.train_microbatch(_fake_batch())
+
+        # The explicit worker abort cleans its split-step state after the
+        # immediate profiler flush without sending a second terminal callback.
+        w.abort_train_step()
+        w._policy_profiler.abort_train_step.assert_called_once_with(
+            reason="policy_train_microbatch_error"
+        )
+        assert w._train_step_state is None
+
+    def test_finish_error_aborts_profiler(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._policy_profiler = MagicMock()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w._finish_train_step_body = MagicMock(side_effect=ValueError("finish failed"))
+
+        with pytest.raises(ValueError, match="finish failed"):
+            w.finish_train_step()
+
+        w._policy_profiler.abort_train_step.assert_called_once_with(
+            reason="policy_train_finish_error"
+        )
 
 
 # ── grad_sync_func full lifecycle (integration of begin → finish/abort) ─

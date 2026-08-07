@@ -228,6 +228,7 @@ project-includes = [
   "nemo_rl/models/megatron/memory_saver.py",
   "nemo_rl/models/policy/__init__.py",
   "nemo_rl/models/policy/interfaces.py",
+  "nemo_rl/models/policy/profiling.py",
   "nemo_rl/models/policy/tq_policy.py",
   "nemo_rl/models/policy/utils.py",
   "nemo_rl/models/policy/workers/__init__.py",
