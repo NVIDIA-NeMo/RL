@@ -356,6 +356,14 @@ policy:
       # exceed available slots. 256 matches the Ultra GB200 serving reference
       # (Gym nemotron_3_ultra_dev_nemorl_gb200.yaml).
       max_num_seqs: 256
+      # Pinned because the refit path cannot address the default backend's
+      # layout against a 0.25 container. Left at the default "auto", 0.25 picks
+      # the FlashInfer TRT-LLM BF16 MoE, whose expert weights are 3D grouped
+      # tensors under the new routed_experts submodule. Refit then hands them to
+      # a loader that rejects the expert dimension, failing with "shard_dim=0 is
+      # not a valid data dimension for a 3D tensor (expected 1 or 2)".
+      # flashinfer_cutlass keeps the layout refit can address.
+      moe_backend: flashinfer_cutlass
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
         cudagraph_mode: PIECEWISE
