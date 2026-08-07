@@ -28,8 +28,7 @@ CONTAINER=${CONTAINER}
 
 export HF_HOME=${HF_HOME:-$(realpath $SCRIPT_DIR/../hf_home)}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$(realpath $SCRIPT_DIR/../hf_datasets_cache)}
-mkdir -p $HF_HOME
-mkdir -p $HF_DATASETS_CACHE
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 
 # Check if running in GitLab CI
 INTERACTIVE_FLAG=""
@@ -38,23 +37,22 @@ if [[ "${CI:-false}" != "true" ]]; then
     INTERACTIVE_FLAG="-it"
 fi
 
-# Note: we run as root because:
-#  1. running as ray prevents us from writing into the current working directory
-#  2. running as ourselves (-u $(id -u):$(id -g)) causes torch compile to fail
-#
-# The workaround is we launch the job but set umask 000 so all files created as root are rwxrwxrwx.
-# We have found that 111 does not always work and can leave the filesystem permissions in a bad state.
-
-# Run the script inside the Docker container with GPU support
-docker run -u root $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864 --rm --gpus '"device=0,1"' \
+# Use the caller's identity so files written to the bind-mounted checkout keep
+# their host ownership. A container-owned tmpfs keeps HOME writable without
+# exposing another host path. It remains executable because torch compile loads
+# artifacts from the cache. --no-sync reuses the dependency-complete CI image;
+# a dependency fingerprint mismatch means the image must be rebuilt.
+docker run --user "$(id -u):$(id -g)" $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864 --rm --gpus '"device=0,1"' \
   -v "$PROJECT_ROOT:$PROJECT_ROOT" \
-  -v $HF_HOME:/hf_home \
-  -v $HF_DATASETS_CACHE:/hf_datasets_cache \
+  -v "$HF_HOME:/hf_home" \
+  -v "$HF_DATASETS_CACHE:/hf_datasets_cache" \
+  --tmpfs "/home/nemo-rl:rw,exec,nosuid,nodev,mode=0700,uid=$(id -u),gid=$(id -g)" \
   -e WANDB_API_KEY \
   -e HF_TOKEN \
   -e HF_HOME=/hf_home \
   -e HF_DATASETS_CACHE=/hf_datasets_cache \
-  -e HOME=/tmp/ \
+  -e HOME=/home/nemo-rl \
+  -e UV_CACHE_DIR=/home/nemo-rl/.cache/uv \
   -w $SCRIPT_DIR \
   "$CONTAINER" -- \
-  bash -x -c "umask 000 && uv run bash -x $TEST_SCRIPT"
+  bash -x -c 'uv run --no-sync bash -x "$1"' bash "$TEST_SCRIPT"

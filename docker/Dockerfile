@@ -24,6 +24,7 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+ARG UV_VERSION=0.11.28
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -49,6 +50,10 @@ FROM scratch AS trtllm-ccache-output-base
 # Override with: --build-context custom-setup=<your-dir>
 FROM scratch AS custom-setup
 COPY docker/install_apptainer.sh /
+
+# Pin the official uv image so build-time tooling is fetched through the
+# container registry's content-addressed distribution path.
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa AS uv
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -105,12 +110,15 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
-# Install uv and python
-ARG UV_VERSION=0.11.28
+# Install uv and Python outside /root so the image can also be used by an
+# arbitrary runtime UID. Keep the cache in /opt because the project venv uses
+# symlinks into it.
+ARG UV_VERSION
 ARG PYTHON_VERSION=3.13.14
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    uv python install ${PYTHON_VERSION}
+ENV UV_CACHE_DIR=/opt/uv/cache
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+COPY --from=uv /uv /uvx /usr/local/bin/
+RUN uv python install --no-bin ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -198,8 +206,8 @@ if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
     echo "Cache key mismatch (base image or uv version changed) — skipping stale seed"
 elif [ -n "$SEED_KEY" ]; then
     echo "Seeding uv cache (key=${CACHE_KEY})"
-    mkdir -p /root/.cache/uv
-    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
+    mkdir -p "${UV_CACHE_DIR}"
+    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ "${UV_CACHE_DIR}/" 2>/dev/null || true
 fi
 
 uv venv --seed
@@ -234,9 +242,9 @@ uv sync --link-mode symlink --frozen --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
-echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
+echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 EOF
 
 # Keep the frequently changing TRT-LLM build inputs after the other backend
@@ -279,11 +287,11 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 # uv uses the shared image cache. Only the custom wheel needs a cache mount
 # because uv can miss no-build-isolation wheels across build environments.
 echo "TRT-LLM cache state before build:"
-du -sh /root/.cache/uv /root/.cache/trtllm-wheels
+du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 
 TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
 set +e
-UV_CACHE_DIR=/root/.cache/uv \
+UV_CACHE_DIR="${UV_CACHE_DIR}" \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
@@ -300,7 +308,7 @@ fi
 rm -f "$TRTLLM_SYNC_LOG"
 
 echo "TRT-LLM cache state after build:"
-du -sh /root/.cache/uv /root/.cache/trtllm-wheels
+du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 
 # Restore the intended default environment in the same layer so the transient
 # TRT-LLM installation does not add a large intermediate venv layer.
@@ -308,7 +316,7 @@ uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # The final sync can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -381,7 +389,7 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
 fi
 # Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
-# stay in /root/.cache/uv, which remains available to symlinked environments.
+# stay in ${UV_CACHE_DIR}, which remains available to symlinked environments.
 # Mirror only the current content-addressed TRT-LLM wheel into the image so
 # runtime `uv run --extra trtllm` calls do not fall back to a source build.
 export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
