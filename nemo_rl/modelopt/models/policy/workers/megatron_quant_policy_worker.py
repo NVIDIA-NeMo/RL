@@ -19,6 +19,7 @@ import os
 import warnings
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import ray
@@ -42,6 +43,7 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
 )
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+    resolve_quant_cfg,
     resolve_nvfp4_real_quant_mode,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -143,6 +145,56 @@ def _set_quantization_model_specs(model_config, disable_modelopt_layer_spec: boo
         model_config.mamba_stack_spec = stack_spec
 
 
+def _validate_simulated_kv_quantization_config(config: Mapping[str, object]) -> None:
+    """Reject incompatible policy and vLLM simulated K/V configurations."""
+    from modelopt.torch.quantization.config import QuantizeConfig
+
+    generation = config.get("generation")
+    generation = generation if isinstance(generation, Mapping) else {}
+    policy_source = config.get("quant_cfg")
+    generation_source = generation.get("quant_cfg")
+
+    def _resolve(source):
+        if not isinstance(source, str) or not source:
+            return None
+        return QuantizeConfig(**resolve_quant_cfg(source))
+
+    def _enables_kv_cache(recipe) -> bool:
+        if recipe is None:
+            return False
+        for entry in recipe.quant_cfg:
+            leaf_pattern = entry.quantizer_name.rsplit(".", 1)[-1]
+            if entry.enable and any(
+                fnmatchcase(f"{kind}_bmm_quantizer", leaf_pattern)
+                for kind in ("k", "v")
+            ):
+                return True
+        return False
+
+    policy_recipe = _resolve(policy_source)
+    generation_recipe = _resolve(generation_source)
+    if not (_enables_kv_cache(policy_recipe) or _enables_kv_cache(generation_recipe)):
+        return
+
+    if policy_recipe != generation_recipe:
+        raise ValueError(
+            "Simulated K/V quantization requires policy.quant_cfg and "
+            "policy.generation.quant_cfg to resolve to the same recipe."
+        )
+    if generation.get("real_quant"):
+        raise ValueError(
+            "Simulated K/V quantization does not support policy.generation.real_quant."
+        )
+    vllm_cfg = generation.get("vllm_cfg")
+    vllm_cfg = vllm_cfg if isinstance(vllm_cfg, Mapping) else {}
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    if kv_cache_dtype != "auto":
+        raise ValueError(
+            "Simulated K/V quantization requires "
+            "policy.generation.vllm_cfg.kv_cache_dtype=auto."
+        )
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_quant_policy_worker")
 )  # pragma: no cover
@@ -156,6 +208,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
+        _validate_simulated_kv_quantization_config(config)
         megatron_cfg = config.get("megatron_cfg", {}) or {}
         # Default to True to match the underlying Megatron-Bridge
         assert not megatron_cfg.get("gradient_accumulation_fusion", True), (
