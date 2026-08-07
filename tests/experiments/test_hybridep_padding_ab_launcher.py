@@ -141,7 +141,20 @@ def test_effective_batch_script_is_nonexclusive_and_uses_allocated_cpus() -> Non
 
     assert "#SBATCH --exclusive" not in batch_script
     assert "SLURM_CPUS_ON_NODE" in batch_script
+    assert 'export NRL_MATRIX_JOB_ID=${SLURM_JOB_ID:?SLURM_JOB_ID is required}' in batch_script
     assert 'exec bash "$SOURCE_PATH/ray.sub"' in batch_script
+
+
+def test_driver_uses_job_id_captured_before_ray_clears_slurm_environment() -> None:
+    launcher = LAUNCHER.read_text()
+    driver = launcher.split("read -r -d '' COMMAND <<'DRIVER'", 1)[1].split(
+        "\nDRIVER", 1
+    )[0]
+
+    assert ': "${NRL_MATRIX_JOB_ID:?NRL_MATRIX_JOB_ID is required}"' in driver
+    assert "__SLURM_JOB_ID__/$NRL_MATRIX_JOB_ID" in driver
+    assert 'training-$NRL_MATRIX_JOB_ID.log' in driver
+    assert "$SLURM_JOB_ID" not in driver
 
 
 def test_rendered_test_only_is_added_exactly_once() -> None:
@@ -219,6 +232,26 @@ def test_ray_bootstrap_uses_the_pinned_preflight_site_packages() -> None:
         in launcher
     )
     assert '$CUDNN_HOME:$CUDNN_CONTAINER_PATH' in launcher
+
+
+def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> None:
+    launcher = LAUNCHER.read_text()
+    setup = launcher.split("read -r -d '' SETUP_COMMAND <<'SETUP'", 1)[1].split(
+        "\nSETUP", 1
+    )[0]
+
+    assert 'DEEPEP_OVERLAY_ROOT="$EXPERIMENT_ROOT/artifacts/deepep-overlays"' in launcher
+    assert 'DEEPEP_OVERLAY_DIR="$DEEPEP_OVERLAY_ROOT/$DEEPEP_SHA256"' in launcher
+    assert (
+        'UV_NO_CONFIG=1 uv pip install --python "$PREFLIGHT_VENV/bin/python"'
+        in launcher
+    )
+    assert '--target "$DEEPEP_OVERLAY_TEMP" --no-deps --reinstall' in launcher
+    assert 'mv "$DEEPEP_OVERLAY_TEMP" "$DEEPEP_OVERLAY_DIR"' in launcher
+    assert 'require_canonical_lustre_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"' in launcher
+    assert '$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR' in launcher
+    assert 'UV_NO_CONFIG=1 uv pip install --target "$DEEPEP_OVERLAY_DIR"' not in setup
+    assert "import deep_ep, deep_ep_cpp, hybrid_ep_cpp" in setup
 
 
 def test_validator_archives_pytest_results_outside_the_source_tree() -> None:

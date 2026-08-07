@@ -139,7 +139,7 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   exit 0
 fi
 
-for command_name in git mktemp mv python3 realpath sbatch sshare sha256sum stat; do
+for command_name in du flock git mktemp mv python3 realpath sbatch sshare sha256sum stat uv; do
   require_command "$command_name"
 done
 : "${ACCOUNT:?Set ACCOUNT after checking FairShare immediately before submission}"
@@ -216,6 +216,8 @@ fi
 DEEPEP_WHEEL=none
 DEEPEP_METADATA=none
 DEEPEP_SHA256=none
+DEEPEP_OVERLAY_DIR=none
+DEEPEP_OVERLAY_BYTES=0
 if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
   if [[ "$EXPECTED_DEEPEP_COMMIT" == 17cfb817bccec3a9c247013360cc550c2bac441e ]]; then
     DEEPEP_WHEEL=${DEEPEP_17CF_WHEEL:?Set DEEPEP_17CF_WHEEL}
@@ -248,6 +250,35 @@ PY
   [[ "$META_WHEEL" == "$DEEPEP_WHEEL" || "$META_WHEEL" == "$(basename "$DEEPEP_WHEEL")" ]] || die "DeepEP metadata wheel mismatch"
   DEEPEP_SHA256=$(sha256sum "$DEEPEP_WHEEL" | cut -d' ' -f1)
   [[ "$DEEPEP_SHA256" == "$META_SHA" ]] || die "DeepEP wheel checksum mismatch"
+
+  DEEPEP_OVERLAY_ROOT="$EXPERIMENT_ROOT/artifacts/deepep-overlays"
+  mkdir -p "$DEEPEP_OVERLAY_ROOT"
+  require_canonical_lustre_path DEEPEP_OVERLAY_ROOT "$DEEPEP_OVERLAY_ROOT"
+  DEEPEP_OVERLAY_DIR="$DEEPEP_OVERLAY_ROOT/$DEEPEP_SHA256"
+  DEEPEP_OVERLAY_MANIFEST="$DEEPEP_OVERLAY_DIR/.wheel-sha256"
+  DEEPEP_OVERLAY_LOCK="$DEEPEP_OVERLAY_ROOT/.$DEEPEP_SHA256.lock"
+  exec 9>"$DEEPEP_OVERLAY_LOCK"
+  flock 9
+  if [[ ! -d "$DEEPEP_OVERLAY_DIR" ]]; then
+    DEEPEP_OVERLAY_TEMP=$(mktemp -d "$DEEPEP_OVERLAY_ROOT/.$DEEPEP_SHA256.XXXXXX")
+    cleanup_deepep_overlay_temp() { rm -rf -- "$DEEPEP_OVERLAY_TEMP"; }
+    trap cleanup_deepep_overlay_temp EXIT
+    UV_NO_CONFIG=1 uv pip install --python "$PREFLIGHT_VENV/bin/python" \
+      --target "$DEEPEP_OVERLAY_TEMP" --no-deps --reinstall "$DEEPEP_WHEEL"
+    compgen -G "$DEEPEP_OVERLAY_TEMP/deep_ep_cpp*.so" >/dev/null || die "DeepEP extension is absent from staged overlay"
+    compgen -G "$DEEPEP_OVERLAY_TEMP/hybrid_ep_cpp*.so" >/dev/null || die "HybridEP extension is absent from staged overlay"
+    printf '%s\n' "$DEEPEP_SHA256" > "$DEEPEP_OVERLAY_TEMP/.wheel-sha256"
+    mv "$DEEPEP_OVERLAY_TEMP" "$DEEPEP_OVERLAY_DIR"
+    trap - EXIT
+  fi
+  flock -u 9
+  exec 9>&-
+  require_canonical_lustre_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"
+  [[ -f "$DEEPEP_OVERLAY_MANIFEST" ]] || die "DeepEP overlay manifest is missing"
+  [[ $(<"$DEEPEP_OVERLAY_MANIFEST") == "$DEEPEP_SHA256" ]] || die "DeepEP overlay checksum mismatch"
+  compgen -G "$DEEPEP_OVERLAY_DIR/deep_ep_cpp*.so" >/dev/null || die "DeepEP overlay extension is missing"
+  compgen -G "$DEEPEP_OVERLAY_DIR/hybrid_ep_cpp*.so" >/dev/null || die "HybridEP overlay extension is missing"
+  DEEPEP_OVERLAY_BYTES=$(du -sb "$DEEPEP_OVERLAY_DIR" | cut -f1)
 fi
 
 mkdir -p "$OUTPUT_ROOT"
@@ -276,10 +307,14 @@ printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_ch
 printf 'harness_commit=%s\nlauncher_sha256=%s\nbatch_script_sha256=%s\nmatrix_sha256=%s\n' \
   "$HARNESS_COMMIT" "$LAUNCHER_SHA256" "$BATCH_SCRIPT_SHA256" "$MATRIX_SHA256" \
   >> "$PROVENANCE_ROOT/submission.txt"
+printf 'deepep_overlay_dir=%s\ndeepep_overlay_bytes=%s\n' \
+  "$DEEPEP_OVERLAY_DIR" "$DEEPEP_OVERLAY_BYTES" \
+  >> "$PROVENANCE_ROOT/submission.txt"
 
 export SOURCE_PATH OUTPUT_ROOT PROVENANCE_ROOT RECIPE MAX_STEPS ARM SOURCE_PROFILE
 export EXPECTED_NEMO_RL_COMMIT EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT
 export EXPECTED_DEEPEP_COMMIT DEEPEP_WHEEL DEEPEP_METADATA DEEPEP_SHA256
+export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES
 export EXPECTED_GPU_MODEL GPUS_PER_NODE DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING
 export HF_HOME=${HF_CACHE:-$EXPERIMENT_ROOT/hf-cache}
 export HF_DATASETS_CACHE=$HF_HOME/datasets
@@ -331,11 +366,9 @@ if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/
 fi
 if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
   DEEPEP_DIR=$(dirname "$DEEPEP_WHEEL")
-  export DEEPEP_OVERLAY_DIR="/tmp/nemo-rl-deepep-$ARM-$DEEPEP_SHA256"
-  require_canonical_tmp_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"
   export PYTHONPATH="$DEEPEP_OVERLAY_DIR${PYTHONPATH:+:$PYTHONPATH}"
   export LD_LIBRARY_PATH="$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  MOUNTS_VALUE="$MOUNTS_VALUE,$DEEPEP_DIR:$DEEPEP_DIR"
+  MOUNTS_VALUE="$MOUNTS_VALUE,$DEEPEP_DIR:$DEEPEP_DIR,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
 fi
 export MOUNTS="$MOUNTS_VALUE${EXTRA_MOUNTS:+,$EXTRA_MOUNTS}"
 export BASE_LOG_DIR="$OUTPUT_ROOT"
@@ -359,15 +392,24 @@ GPU_MODELS=$(nvidia-smi --query-gpu=name --format=csv,noheader)
 [[ -z $(printf '%s\n' "$GPU_MODELS" | sed '/^$/d' | grep -Fvx "$EXPECTED_GPU_MODEL") ]]
 if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
   [[ $(sha256sum "$DEEPEP_WHEEL" | cut -d' ' -f1) == "$DEEPEP_SHA256" ]]
-  rm -rf "$DEEPEP_OVERLAY_DIR"
-  mkdir -p "$DEEPEP_OVERLAY_DIR"
-  UV_NO_CONFIG=1 uv pip install --target "$DEEPEP_OVERLAY_DIR" --no-deps --reinstall "$DEEPEP_WHEEL"
+  [[ $(<"$DEEPEP_OVERLAY_DIR/.wheel-sha256") == "$DEEPEP_SHA256" ]]
+  "$RUN_PYTHON" - <<'PY'
+import os
+from pathlib import Path
+
+import deep_ep, deep_ep_cpp, hybrid_ep_cpp
+
+overlay = Path(os.environ["DEEPEP_OVERLAY_DIR"]).resolve()
+for module in (deep_ep, deep_ep_cpp, hybrid_ep_cpp):
+    assert Path(module.__file__).resolve().is_relative_to(overlay)
+PY
 fi
 SETUP
 export SETUP_COMMAND
 
 read -r -d '' COMMAND <<'DRIVER' || true
 set -euo pipefail
+: "${NRL_MATRIX_JOB_ID:?NRL_MATRIX_JOB_ID is required}"
 cd "$SOURCE_PATH"
 [[ $(git rev-parse HEAD) == "$EXPECTED_NEMO_RL_COMMIT" ]]
 [[ -z $(git status --porcelain --untracked-files=all) ]]
@@ -431,8 +473,8 @@ for module in (deep_ep, deep_ep_cpp, hybrid_ep_cpp):
 PY
 fi
 
-TRAINING_COMMAND=${TRAINING_COMMAND//__SLURM_JOB_ID__/$SLURM_JOB_ID}
-eval "$TRAINING_COMMAND" 2>&1 | tee "$OUTPUT_ROOT/training-$SLURM_JOB_ID.log"
+TRAINING_COMMAND=${TRAINING_COMMAND//__SLURM_JOB_ID__/$NRL_MATRIX_JOB_ID}
+eval "$TRAINING_COMMAND" 2>&1 | tee "$OUTPUT_ROOT/training-$NRL_MATRIX_JOB_ID.log"
 DRIVER
 export COMMAND TRAINING_COMMAND WANDB_ENABLED WANDB_PROJECT WANDB_NAME
 

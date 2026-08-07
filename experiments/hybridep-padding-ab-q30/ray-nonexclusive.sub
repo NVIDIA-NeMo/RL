@@ -21,6 +21,7 @@ set -euo pipefail
   printf 'ERROR: ray.sub is missing from SOURCE_PATH: %s\n' "$SOURCE_PATH" >&2
   exit 1
 }
+export NRL_MATRIX_JOB_ID=${SLURM_JOB_ID:?SLURM_JOB_ID is required}
 
 if [[ -z "${CPUS_PER_WORKER:-}" ]]; then
   ALLOCATED_CPUS=${SLURM_CPUS_ON_NODE:?SLURM_CPUS_ON_NODE is required}
