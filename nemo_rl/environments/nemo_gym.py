@@ -1169,14 +1169,31 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
-    # Publish this trainer's sampling params to NeMo Gym through generic config keys so the Gym
-    # model server can force on-policy sampling regardless of what an external harness requests.
-    # Gym holds no NeMo-RL-specific knowledge; it only reads these keys (see the model server's
-    # sampling_overrides). The vLLM generation worker asserts requests match this config, so
-    # pinning here is required, not optional, for captured rollouts to stay on-policy.
-    nemo_gym_cfg = config.env["nemo_gym"]
-    nemo_gym_cfg["policy_generation_temperature"] = generation_config["temperature"]
-    nemo_gym_cfg["policy_generation_top_p"] = generation_config["top_p"]
+    # Publish the training sampling params for a Gym model server to put on requests it
+    # serves for an external agent harness.
+    #
+    # A native agent does not need this. _prepare_nemo_gym_rows stamps temperature and
+    # top_p on every row, the agent builds its request from the row, and Gym forwards
+    # them. An external harness is a released binary that builds its own requests and
+    # never reads the row, so its rollout turns arrive with no sampling params and its
+    # auxiliary turns, such as a title generator or a context compressor, arrive with
+    # whatever the harness hardcoded. create_chat_completion rejects both, and once
+    # retries are exhausted the trajectory is dropped.
+    #
+    # Published as one dict so a model server config reads it in one interpolation. The
+    # value is the training profile: a harness cannot honour a per-rollout profile anyway,
+    # since it never reads the row, so validation rollouts it serves also sample this way.
+    #
+    # top_k is left out: it stays null on this path and the vLLM worker force-sets -1.
+    #
+    # Written at the top of the nemo_gym block because that whole block becomes Gym's global
+    # config: grpo.py passes dict(env_configs["nemo_gym"]) as initial_global_config_dict, so a
+    # key here is a key Gym config files can interpolate.
+    nemo_gym_cfg = config.env.setdefault("nemo_gym", {})
+    nemo_gym_cfg["policy_generation_sampling"] = {
+        "temperature": generation_config["temperature"],
+        "top_p": generation_config["top_p"],
+    }
 
 
 def spinup_nemo_gym_actor(

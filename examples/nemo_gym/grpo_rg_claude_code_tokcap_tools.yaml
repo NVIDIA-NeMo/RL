@@ -264,6 +264,15 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/reasoning_gym/configs/reasoning_gym_claude_code_agent_model_server.yaml  # claude_code harness bound to the Gym model server
+    # The harness builds its own requests and never reads the row, so it sends no sampling
+    # params and the engine would apply a default of its own. Pin the training profile on the
+    # model server it talks to. setup_nemo_gym_config publishes policy_generation_sampling.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
     # External-harness token-id capture: the harness returns no token ids, so capture them and rebuild.
     # token_capture_dir is node-local (the model server and the reader are colocated on one node).
     token_id_capture:
