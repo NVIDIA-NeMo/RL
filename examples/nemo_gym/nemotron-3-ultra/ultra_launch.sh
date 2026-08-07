@@ -444,6 +444,13 @@ else
   echo "[WARN] WANDB_API_KEY is not set — W&B logging will be disabled." >&2
 fi
 
+# Exported rather than interpolated into TRAIN_CMD, which ray.sub writes to a
+# file under LOG_DIR and echoes into provenance. srun carries the exported
+# value into the container, so TRAIN_CMD only needs to reference the name.
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN
+fi
+
 # =============================================================================
 # Training overrides
 # =============================================================================
@@ -861,7 +868,7 @@ VLLM_FLASHINFER_MOE_BACKEND=latency \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
-HF_TOKEN=${HF_TOKEN:-} \
+HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
 uv run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
