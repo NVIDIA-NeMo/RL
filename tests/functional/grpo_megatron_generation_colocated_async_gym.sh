@@ -58,23 +58,30 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.dtensor_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
-    policy.megatron_cfg.tensor_model_parallel_size=1 \
+    policy.megatron_cfg.tensor_model_parallel_size=2 \
     policy.megatron_cfg.pipeline_model_parallel_size=1 \
     policy.megatron_cfg.expert_model_parallel_size=1 \
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.backend=megatron \
     policy.generation.mcore_generation_config.expose_http_server=true \
+    policy.generation.mcore_generation_config.enable_prefix_caching=true \
     policy.max_total_sequence_length=512 \
     policy.generation.max_new_tokens=128 \
     policy.generation.colocated.enabled=true \
+    ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
+    ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     grpo.num_prompts_per_step=4 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=10 \
     grpo.val_period=5 \
+    grpo.async_grpo.enabled=true \
+    grpo.async_grpo.max_trajectory_age_steps=1 \
+    grpo.async_grpo.in_flight_weight_updates=true \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
+    loss_fn.use_importance_sampling_correction=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
@@ -89,7 +96,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Smoke-level thresholds, mirroring grpo_megatron_generation_non_colocated_async_gym.sh.
+# Smoke-level thresholds. Tighten after first successful runs on CI.
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'data["validation/accuracy"]["10"] > 0.1'
