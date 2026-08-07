@@ -181,8 +181,8 @@ def _build_generation(
         defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later.
 
     Returns:
-        gen: The generation object (VllmGeneration or SGLangGeneration).
-        elapsed_s: Wall time spent in this call.
+        A tuple of (generation object, wall time spent in this call). The
+        generation object is a VllmGeneration or SGLangGeneration.
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
@@ -232,8 +232,7 @@ def _finish_deferred_generation(generation: Any) -> tuple[Any, float]:
         generation: The deferred generation object.
 
     Returns:
-        generation: The finished generation object.
-        elapsed_s: Wall time spent in this call.
+        A tuple of (finished generation object, wall time spent in this call).
     """
     t0 = time.perf_counter()
     generation.load_and_start()
@@ -256,8 +255,7 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
 
     Returns:
-        trainer: The TQPolicy trainer.
-        elapsed_s: Wall time spent in this call.
+        A tuple of (TQPolicy trainer, wall time spent in this call).
     """
     t0 = time.perf_counter()
     loss_config = master_config.loss_fn
@@ -284,8 +282,7 @@ def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any,
         base_urls: Reserved vLLM OpenAI server URLs.
 
     Returns:
-        actor: The NeMo-Gym actor.
-        elapsed_s: Wall time spent in this call.
+        A tuple of (NeMo-Gym actor, wall time spent in this call).
     """
     t0 = time.perf_counter()
     policy_config = master_config.policy
@@ -363,8 +360,8 @@ def setup_single_controller(
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
-        actor_args: Pre-built SC actor args.
-        setup_timing_metrics: Driver-side per-phase timings, logged by the SC actor.
+        A tuple of (pre-built SC actor args, driver-side per-phase timings
+        logged by the SC actor).
     """
     validate_single_controller_config(master_config)
 
@@ -469,9 +466,8 @@ def setup_single_controller(
             generation: Pre-reserved generation handle when defer_generation_model_load=True; None otherwise.
 
         Returns:
-            generation: The finalized generation object.
-            trainer: The TQPolicy trainer.
-            time_metrics: Per-phase wall times keyed as "gen_time" and "trainer_time".
+            A tuple of (finalized generation object, TQPolicy trainer,
+            per-phase wall times keyed as "gen_time" and "trainer_time").
         """
         time_metrics = {}
 
