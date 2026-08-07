@@ -99,7 +99,7 @@ printf -v TRAINING_COMMAND '%q ' "${RUN_ARGS[@]}"
 TRAINING_COMMAND=${TRAINING_COMMAND% }
 
 SBATCH_RENDER=(sbatch --nodes="$NODES" --gpus-per-node="$GPUS_PER_NODE" --segment="$SEGMENT"
-  --account="$ACCOUNT_FOR_RENDER" --partition=batch --time=01:00:00
+  --account="$ACCOUNT_FOR_RENDER" --partition=batch --time=02:00:00
   --job-name="$JOB_NAME" --output="$OUTPUT_ROOT/slurm-%j.out"
   --error="$OUTPUT_ROOT/slurm-%j.out" --export=ALL)
 [[ "$TEST_ONLY" == 0 ]] || SBATCH_RENDER+=(--test-only)
@@ -432,7 +432,7 @@ DRIVER
 export COMMAND TRAINING_COMMAND WANDB_ENABLED WANDB_PROJECT WANDB_NAME
 
 SBATCH_ARGS=(--nodes="$NODES" --gpus-per-node="$GPUS_PER_NODE" --segment="$SEGMENT"
-  --account="$ACCOUNT" --partition=batch --time=01:00:00
+  --account="$ACCOUNT" --partition=batch --time=02:00:00
   --job-name="$JOB_NAME" --output="$OUTPUT_ROOT/slurm-%j.out"
   --error="$OUTPUT_ROOT/slurm-%j.out" --export=ALL)
 [[ "$TEST_ONLY" == 0 ]] || SBATCH_ARGS+=(--test-only)

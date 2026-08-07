@@ -122,6 +122,7 @@ def test_rendered_arm_contract(
     assert "--nodes=4" in rendered["sbatch_command"]
     assert "--gpus-per-node=8" in rendered["sbatch_command"]
     assert "--segment=4" in rendered["sbatch_command"]
+    assert "--time=02:00:00" in rendered["sbatch_command"]
     assert "--exclusive" not in rendered["sbatch_command"]
     assert "--cpus" not in rendered["sbatch_command"]
     assert "--mem" not in rendered["sbatch_command"]
