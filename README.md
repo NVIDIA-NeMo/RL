@@ -761,6 +761,10 @@ Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that c
 For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Set Up Clusters](docs/cluster.md) documentation.
 
 ## Tips and Tricks
+- Megatron policy workers support optional profiler plugins around complete
+  training updates. See the [policy profiler guide](docs/policy-profiler.md)
+  for the plugin contract and configuration.
+
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
 
   ```sh
