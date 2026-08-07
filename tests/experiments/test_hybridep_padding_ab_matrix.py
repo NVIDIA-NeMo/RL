@@ -124,7 +124,8 @@ def test_matrix_cli_emits_all_four_arms_as_json() -> None:
 def test_official_profile_is_frozen_at_upstream_latest_main() -> None:
     matrix = _load_matrix_module()
 
-    assert matrix.OFFICIAL_NEMO_RL == "e496258b0285d42d5d9af30671e81722bca916dc"
+    assert matrix.OFFICIAL_BASE_NEMO_RL == "e496258b0285d42d5d9af30671e81722bca916dc"
+    assert matrix.OFFICIAL_NEMO_RL == "5b786edf18aab67ac0a51fa5e5382472f34a4c3a"
     assert matrix.OFFICIAL_BRANCH == "sna/q30-official-main-e496-20260807"
     assert matrix.OFFICIAL_BRIDGE == "573e088c9c6740082c39744e03dc5b009e730ed4"
     assert matrix.OFFICIAL_MCORE == "6513e3e23d6b5eda6a1c934990b15e804237732b"
