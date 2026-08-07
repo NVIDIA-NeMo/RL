@@ -137,20 +137,61 @@ def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
 
 
 class TestGenerateAndPushFlow:
+    def test_explicit_registry_tracks_only_inflight_generation(self):
+        registry: dict[str, tuple[asyncio.Task[None], int]] = {}
+        buf = _FakeBuffer()
+
+        async def _assert_registered(_sample):
+            assert len(registry) == 1
+            task, start_version = next(iter(registry.values()))
+            assert task is asyncio.current_task()
+            assert start_version == 3
+
+        mgr = _make_manager(buf, _FakeImpl(on_run=_assert_registered))
+        mgr.set_weight_version(3)
+
+        _run(
+            mgr.generate_and_push(
+                {"prompt": "p"},
+                inflight_registry=registry,
+            )
+        )
+
+        assert registry == {}
+
     def test_rollout_failure_removes_reserved_group(self):
         async def _fail_rollout(_sample):
             raise RuntimeError("injected rollout failure")
 
+        registry: dict[str, tuple[asyncio.Task[None], int]] = {}
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl(on_run=_fail_rollout))
 
         with pytest.raises(RuntimeError, match="injected rollout failure"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push({"prompt": "p"}, inflight_registry=registry))
 
         assert len(buf.reserve_calls) == 1
         assert len(buf.remove_calls) == 1
         assert buf._slots == []
         assert buf.commit_calls == []
+        assert registry == {}
+
+    def test_cleanup_failure_does_not_mask_original_exception(self):
+        class _RaisingBuffer(_FakeBuffer):
+            async def remove_group(self, group_id, *, remove_in_dp=False):
+                raise RuntimeError("remove_group cleanup boom")
+
+        class _OriginalError(Exception):
+            pass
+
+        async def _raise_original(_sample):
+            raise _OriginalError("original rollout failure")
+
+        buf = _RaisingBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_raise_original))
+
+        with pytest.raises(_OriginalError):
+            _run(mgr.generate_and_push({"prompt": "p"}))
 
     def test_reserves_then_runs_then_commits(self):
         events: list[str] = []
