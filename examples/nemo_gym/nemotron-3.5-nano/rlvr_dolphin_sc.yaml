@@ -88,17 +88,16 @@ policy:
     # expert_parallel_size=1 (allowed alongside any TP; the other legal value is
     # EP == TP).
     #
-    # TWO THINGS TO CHECK ON THE FIRST RUN:
-    #   1. If the container lacks the nccl4py M2N integration, xferdtensor.py
-    #      logs "nccl.m2n.reshard not found" and silently falls back to a Python
-    #      implementation. Grep the first run's logs for that line.
-    #   2. This checkpoint trains an MTP head, and the bulk path is selected by
-    #      an FFN name regex. If the HF export emits MTP-layer expert
-    #      projections, they take the bulk path and need a vLLM destination
-    #      parameter that does not exist with MTP inference disabled. The
-    #      baseline broadcast path does not distinguish them, so this is the one
-    #      failure mode the baseline cannot rule out. REFIT_TRANSPORT=null is
-    #      the escape hatch.
+    # STILL WORTH CHECKING ON THE FIRST RUN: if the container lacks the nccl4py
+    # M2N integration, xferdtensor.py logs "nccl.m2n.reshard not found" and
+    # silently falls back to a Python implementation. Grep the logs for it.
+    #
+    # The MTP-head risk flagged here before is now handled: this checkpoint's HF
+    # export does emit MTP expert projections (mtp.layers.N.mixer.experts.*), and
+    # they did take the bulk path and fail (job 5943756, "layer_prefix mismatch:
+    # mtp != backbone"). is_nccl_reshard_param now routes anything under mtp. to
+    # the misc path, matching what the broadcast baseline does with them.
+    # REFIT_TRANSPORT=null remains the escape hatch.
     # -------------------------------------------------------------------------
     refit_transport: nccl_reshard
 

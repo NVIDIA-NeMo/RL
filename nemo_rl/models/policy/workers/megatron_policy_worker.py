@@ -2418,7 +2418,12 @@ class MegatronPolicyWorkerImpl(
                     _xfer_bytes += _nbytes
                     if layer_prefix is not None:
                         assert layer_prefix == _extract_layer_prefix(name), (
-                            f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
+                            f"layer_prefix mismatch: {layer_prefix} != "
+                            f"{_extract_layer_prefix(name)} (param {name!r}). Every "
+                            "bulk-path param must live under one module prefix, since "
+                            "that prefix keys the layer-to-PP-stage map. A param from a "
+                            "sibling module (e.g. an MTP head) matched the FFN name "
+                            "whitelist and must be excluded in is_nccl_reshard_param."
                         )
                     else:  # first param layer_prefix=None
                         layer_prefix = _extract_layer_prefix(name)

@@ -64,6 +64,15 @@ nccl-reshard-refit implementation:
   `model_update_group` and are loaded on the generation side through the backend's
   regular `load_weights` machinery.
 
+Two families of FFN-named weights are deliberately excluded from the bulk path and left
+to the misc path: shared experts, which fuse differently on the generation side, and
+Multi-Token-Prediction heads. MTP weights are exported under a top-level `mtp.` module
+rather than the backbone prefix, and the bulk path assumes every parameter it handles
+shares one module prefix because that prefix keys the layer-to-PP-stage map. The misc
+path also matches what the broadcast refit already does with them: vLLM's `load_weights`
+drops them unless MTP speculative decoding is enabled and gives the drafter a
+destination.
+
 The feature is integrated into the `nemo_rl/weight_sync/` framework:
 `create_weight_synchronizer(..., nccl_reshard_refit=True)` returns a
 `NcclReshardWeightSynchronizer` whose `init_communicator()` performs the one-time setup
