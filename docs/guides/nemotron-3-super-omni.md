@@ -33,11 +33,12 @@ template is passed to both the Hugging Face tokenizer and the vLLM chat server.
 
 ## Launch
 
-The launcher defaults to the checkpoint, blended Gym data, Slurm account, and
-cache settings used by the migration source script. Its default NeMo RL image
-uses the Python 3.13 runtime required by the current main branch; the older
-Python 3.12 handoff image is not compatible with the current lockfile. Every
-value can be overridden with an environment variable:
+The launcher deliberately has no site-specific checkpoint, data, container,
+cache, or Slurm-account defaults. Export each required path explicitly. The
+container's Python and Ray versions must match the repository lock; when an
+older image is unavoidable, `CLUSTER_VENV` can point at a shared venv containing
+the locked driver runtime and the launcher will use its base Python for rebuilt
+actor environments:
 
 ```bash
 MODEL_PATH=/path/to/nemotron-super-omni-hf \
@@ -47,8 +48,17 @@ SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
 PERSISTENT_CACHE=/shared/cache/nemo-rl-super-omni \
 SLURM_ACCOUNT=your_account \
 SLURM_PARTITION=batch \
+CLUSTER_VENV=/shared/venvs/nemo-rl-driver \
+NRL_FORCE_REBUILD_VENVS=true \
+GYM_SKIP_VENV_IF_PRESENT=false \
 bash examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh
 ```
+
+The default rebuilds Gym service venvs rather than trusting image-baked
+dependencies. Set `GYM_SKIP_VENV_IF_PRESENT=true` only when the image's Gym
+venvs have already been validated against the locked Python and Ray versions.
+Submitted runs use a commit-suffixed, locked snapshot and record source,
+submodule, container, model, and runtime metadata beside it.
 
 ### Weights & Biases
 
@@ -61,19 +71,19 @@ container cannot read a `wandb login` credential from `~/.netrc`; only
 ```bash
 export WANDB_API_KEY=<key>       # log live
 export WANDB_MODE=offline        # log locally, `wandb sync <run-dir>` later
-EXTRA_OVERRIDES="logger.wandb_enabled=false"   # skip W&B entirely
+EXTRA_HYDRA_ARGS="logger.wandb_enabled=false"  # skip W&B entirely
 ```
 
 The launcher checks this before submitting and refuses to burn an allocation
 on a run that cannot log.
 
 Set `DRY_RUN=true` to print the complete training command and `sbatch`
-invocation without submitting. Use `EXTRA_OVERRIDES` for Hydra overrides, for
+invocation without submitting. Use `EXTRA_HYDRA_ARGS` for Hydra overrides, for
 example a short validation run:
 
 ```bash
 DRY_RUN=true \
-EXTRA_OVERRIDES="grpo.max_num_steps=1 checkpointing.enabled=false" \
+EXTRA_HYDRA_ARGS="grpo.max_num_steps=1 checkpointing.enabled=false" \
 bash examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh
 ```
 
@@ -86,7 +96,7 @@ This smoke keeps the policy topology intact while using 4 generation nodes,
 EXP_NAME=smoke-super-omni-mtp-off-8n \
 SBATCH_NUM_NODES=8 \
 SLURM_TIME_LIMIT=00:30:00 \
-EXTRA_OVERRIDES="cluster.num_nodes=8 \
+EXTRA_HYDRA_ARGS="cluster.num_nodes=8 \
 policy.generation.colocated.resources.num_nodes=4 \
 grpo.max_num_steps=1 \
 grpo.num_prompts_per_step=2 \
@@ -120,21 +130,36 @@ plumbing check. Override
 `on_policy_distillation.teacher_model_by_agent_name.circle_count_simple_agent`
 with a stronger Omni checkpoint for real distillation.
 
-Generate or provide NeMo-Gym `circle_count_simple_agent` rows with one
-`input_image` and the matching `agent_ref`, then launch:
+Generate deterministic NeMo-Gym `circle_count_simple_agent` rows with one
+`input_image` and the matching `agent_ref`:
+
+```bash
+python examples/nemo_gym/nemotron-3-super-omni/prepare_circle_count_mopd_data.py \
+  --out /shared/data/circle_count_train.jsonl \
+  --num-samples 512
+```
+
+Then launch:
 
 ```bash
 MODEL_PATH=/path/to/nemotron-super-omni-hf \
+TEACHER_MODEL_PATH=/path/to/nemotron-super-omni-teacher-hf \
 TRAIN_PATH=/path/to/circle_count_train.jsonl \
 CONTAINER=/path/to/nemo-rl-super-omni.sqsh \
 PERSISTENT_CACHE=/shared/cache/nemo-rl-super-omni \
 SLURM_ACCOUNT=your_account \
+WANDB_ENTITY=your_entity \
 WANDB_API_KEY=... \
 bash examples/nemo_gym/nemotron-3-super-omni/run_mopd_circle_count.sh
 ```
 
 `SANDBOX_CONTAINER` is optional and only needed by Gym resources that launch a
 NeMo-Skills sandbox; `circle_count_simple_agent` does not.
+
+`TEACHER_MODEL_PATH` is optional. When omitted, the teacher defaults to
+`MODEL_PATH` for a self-distillation plumbing check. A separate teacher must use
+a tokenizer, processor, chat template, vocabulary, and multimodal architecture
+compatible with the student.
 
 Before the full run, use the four-node, three-step exact-stack smoke:
 

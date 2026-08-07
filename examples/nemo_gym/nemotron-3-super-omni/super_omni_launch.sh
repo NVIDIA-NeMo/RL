@@ -38,10 +38,19 @@ SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 SBATCH_NUM_NODES="${SBATCH_NUM_NODES:-$(awk '/^cluster:/{f=1} f && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")}"
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-/scratch:/scratch,/lustre:/lustre}"
 EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:-}"
+CLUSTER_VENV="${CLUSTER_VENV:-}"
+NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-${CLUSTER_VENV:+true}}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
+GYM_SKIP_VENV_IF_PRESENT="${GYM_SKIP_VENV_IF_PRESENT:-false}"
 WANDB_PROJ="${WANDB_PROJ:-grpo-super-omni}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-}"
 DRY_RUN="${DRY_RUN:-false}"
+
+while [[ -n "${TEACHER_MODEL_PATH}" && "${TEACHER_MODEL_PATH}" == */ && "${TEACHER_MODEL_PATH}" != "/" ]]; do
+    TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH%/}"
+done
 
 CHECKPOINT_DIR="results/${EXP_NAME}"
 LOG_DIR="logs/${EXP_NAME}"
@@ -73,6 +82,47 @@ if (( ${#unset_placeholders[@]} )); then
     exit 1
 fi
 
+if [[ -n "${CLUSTER_VENV}" ]]; then
+    for tool in python python3 ray; do
+        if [[ ! -x "${CLUSTER_VENV}/bin/${tool}" ]]; then
+            echo "Error: CLUSTER_VENV is missing executable bin/${tool}: ${CLUSTER_VENV}" >&2
+            exit 1
+        fi
+    done
+
+    # Actor environments must use the same Python patch version as the Ray
+    # head/driver. A relocatable venv exposes its underlying interpreter here.
+    export UV_PYTHON="${UV_PYTHON:-$("${CLUSTER_VENV}/bin/python" -c 'import sys; print(sys._base_executable)')}"
+
+    read -r -d '' cluster_venv_setup <<SETUPEOF || true
+set -euo pipefail
+CLUSTER_VENV=${CLUSTER_VENV}
+for tool in python python3 ray; do
+    src="\${CLUSTER_VENV}/bin/\${tool}"
+    dst="/opt/nemo_rl_venv/bin/\${tool}"
+    test -x "\${src}"
+    rm -f "\${dst}"
+    printf '#!/bin/sh\nexec "%s" "\$@"\n' "\${src}" > "\${dst}"
+    chmod 0755 "\${dst}"
+done
+hash -r
+python -c 'import platform, ray; print("[cluster_venv] Python=" + platform.python_version() + " Ray=" + ray.__version__)'
+SETUPEOF
+    if [[ -n "${SETUP_COMMAND:-}" ]]; then
+        SETUP_COMMAND="${SETUP_COMMAND}"$'\n'"${cluster_venv_setup}"
+    else
+        SETUP_COMMAND="${cluster_venv_setup}"
+    fi
+    export SETUP_COMMAND
+fi
+
+if [[ -n "${TEACHER_MODEL_PATH}" ]]; then
+    EXTRA_HYDRA_ARGS+=" on_policy_distillation.teacher_model_by_agent_name.circle_count_simple_agent=${TEACHER_MODEL_PATH}"
+fi
+if [[ -n "${WANDB_ENTITY}" ]]; then
+    EXTRA_HYDRA_ARGS+=" ++logger.wandb.entity=${WANDB_ENTITY}"
+fi
+
 # The driver builds the W&B run before any worker starts, so a missing
 # credential kills the job minutes into a full allocation. ~/.netrc is not
 # enough when /home is unmounted inside the container; only the environment
@@ -87,16 +137,58 @@ if [[ ! "${EXTRA_HYDRA_ARGS}" =~ logger\.wandb_enabled=([Ff]alse|0) ]] \
 fi
 export WANDB_MODE
 
-mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
-         "${MEGATRON_CONFIG_LOCK_DIR}" "${HF_MODULES_CACHE_DIR}"
+if [[ "${DRY_RUN}" != true ]]; then
+    mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+             "${MEGATRON_CONFIG_LOCK_DIR}" "${HF_MODULES_CACHE_DIR}"
+fi
 export OMP_NUM_THREADS=16
 
-SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
-echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
-(
-    cd "${CODE_DIR}"
-    rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
-)
+if [[ "${DRY_RUN}" != true && "${ALLOW_DIRTY_SNAPSHOT:-false}" != true ]]; then
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "Error: tracked root changes would make the snapshot disagree with its commit." >&2
+        echo "Commit/stash them, or set ALLOW_DIRTY_SNAPSHOT=true for development only." >&2
+        exit 1
+    fi
+    if ! git submodule foreach --quiet --recursive 'git diff --quiet && git diff --cached --quiet'; then
+        echo "Error: a submodule has tracked changes; refusing a non-reproducible snapshot." >&2
+        exit 1
+    fi
+fi
+
+SOURCE_SHA="$(git rev-parse --verify HEAD)"
+SNAPSHOT_NAME="${EXP_NAME}-${SOURCE_SHA:0:12}"
+if [[ "${DRY_RUN}" == true ]]; then
+    SNAPSHOT_DIR="$(realpath "${CODE_DIR}")"
+else
+    SNAPSHOT_ROOT="${CODE_DIR}/${CODE_SNAPSHOT_DIRNAME:-code_snapshots}"
+    mkdir -p "${SNAPSHOT_ROOT}"
+    SNAPSHOT_LOCK="${SNAPSHOT_ROOT}/.${SNAPSHOT_NAME}.lock"
+    exec {SNAPSHOT_LOCK_FD}>"${SNAPSHOT_LOCK}"
+    flock "${SNAPSHOT_LOCK_FD}"
+
+    SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${SNAPSHOT_NAME}")")
+    if [[ ! -f "${SNAPSHOT_DIR}/.nrl_snapshot_complete" ]]; then
+        echo "Finalizing tracked files in code snapshot: ${SNAPSHOT_DIR}"
+        (
+            cd "${CODE_DIR}"
+            rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
+            printf '%s\n' "${SOURCE_SHA}" > "${SNAPSHOT_DIR}/.nrl_source_commit"
+            git submodule status --recursive > "${SNAPSHOT_DIR}/.nrl_submodules" || true
+            touch "${SNAPSHOT_DIR}/.nrl_snapshot_complete"
+        )
+    fi
+    {
+        echo "source_commit=${SOURCE_SHA}"
+        echo "config=${CONFIG_PATH}"
+        echo "container=${CONTAINER}"
+        echo "model=${MODEL_PATH}"
+        echo "teacher_model=${TEACHER_MODEL_PATH:-${MODEL_PATH}}"
+        echo "cluster_venv=${CLUSTER_VENV:-container-default}"
+        if [[ -n "${CLUSTER_VENV}" ]]; then
+            "${CLUSTER_VENV}/bin/python" -c 'import platform, ray; print("python=" + platform.python_version()); print("ray=" + ray.__version__)'
+        fi
+    } > "${SNAPSHOT_DIR}/.nrl_run_manifest"
+fi
 cd "${SNAPSHOT_DIR}"
 
 # Megatron is imported from the checkout rather than the container's
@@ -130,7 +222,6 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WS_BASE} \
     NEMO_GYM_VENV_DIR=${GYM_VENV_DIR} \
     NRL_VLLM_USE_V1=1 \
-    NRL_IGNORE_VERSION_MISMATCH=1 \
     WANDB_MODE=${WANDB_MODE} \
     VLLM_ATTENTION_BACKEND=FLASH_ATTN \
     NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS} \
@@ -139,7 +230,7 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     python ./${ENTRYPOINT} \
     --config ${CONFIG_PATH} \
     ++env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
-    env.nemo_gym.skip_venv_if_present=true \
+    env.nemo_gym.skip_venv_if_present=${GYM_SKIP_VENV_IF_PRESENT} \
     policy.model_name=${MODEL_PATH} \
     policy.tokenizer.chat_template=${CHAT_TEMPLATE} \
     policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template=${CHAT_TEMPLATE} \
@@ -155,8 +246,7 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
 export CONTAINER
 export SANDBOX_CONTAINER
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
-BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
-BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+BASE_MOUNTS+=",${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
 echo "========================================"
@@ -187,6 +277,11 @@ if [[ "${DRY_RUN}" == true ]]; then
     echo "[dry-run] sbatch invocation:"
     echo "${SBATCH_ARGS[@]}"
 else
+    existing_job="$(squeue -h -u "${USER}" -n "${EXP_NAME}" -o '%i' 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "${existing_job}" ]]; then
+        echo "Job ${existing_job} already exists for experiment ${EXP_NAME}; not submitting a duplicate."
+        exit 0
+    fi
     echo "Submitting job: ${EXP_NAME}"
     "${SBATCH_ARGS[@]}"
 fi
