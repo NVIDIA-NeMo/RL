@@ -633,6 +633,11 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                 per_layer_logging=self.cfg["megatron_cfg"].get(
                     "moe_per_layer_logging", False
                 ),
+                # Pre-initialize the aux-loss tracker on every PP rank so the
+                # cross-PP all_reduce inside get_moe_metrics does not hang when a
+                # rank saved no aux loss this step (e.g. MTP MoE on the last stage).
+                num_layers=getattr(model_config, "num_layers", None),
+                mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
