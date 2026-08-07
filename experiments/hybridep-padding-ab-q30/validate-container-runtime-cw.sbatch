@@ -28,7 +28,7 @@ set -euo pipefail
 export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export DEEPEP_OVERLAY_DIR
-export LD_LIBRARY_PATH="$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
+export LD_LIBRARY_PATH="/usr/local/cuda/compat:$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=$DEEPEP_OVERLAY_DIR
 
