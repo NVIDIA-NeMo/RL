@@ -1656,6 +1656,89 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     assert batch_cache is not None
 
 
+@pytest.mark.parametrize(
+    "reward_values",
+    [
+        pytest.param([1.0, 0.0, 0.0, 0.0], id="single-success"),
+        pytest.param([1.0, 1.0, 1.0, 0.0], id="single-failure"),
+        pytest.param([1.0, 1.0, 0.0, 0.0], id="balanced"),
+    ],
+)
+def test_grpo_train_dynamic_sampling_with_loo_keeps_prompt_group_intact(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+    reward_values: list[float],
+) -> None:
+    """A diverse prompt's responses must reach training as one complete group."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    expected_training_rewards = torch.tensor(reward_values)
+    rollout_metrics = {"mean_gen_tokens_per_sample": 1.0}
+
+    def fake_rollout(*_args: Any, **kwargs: Any) -> tuple[BatchedDataDict, dict]:
+        rollout_batch = kwargs["input_batch"]
+        assert rollout_batch.size == 4
+        for message_log in rollout_batch["message_log"]:
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4]),
+                }
+            )
+        rollout_batch["total_reward"] = expected_training_rewards.clone()
+        return rollout_batch, rollout_metrics
+
+    captured_rewards: list[torch.Tensor] = []
+
+    def capture_training_batch(repeated_batch: BatchedDataDict) -> int:
+        captured_rewards.append(repeated_batch["filtered_reward"].clone())
+        raise RuntimeError("captured dynamic-sampling training batch")
+
+    monkeypatch.setattr(
+        grpo_mod, "_should_use_async_rollouts", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", fake_rollout)
+    monkeypatch.setattr(grpo_mod, "refit_policy_generation", lambda *_args: {})
+    monkeypatch.setattr(grpo_mod, "_apply_mask_sample_filter", capture_training_batch)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 1,
+            "max_num_epochs": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
+            "num_prompts_per_step": 1,
+            "num_generations_per_prompt": 4,
+            "dynamic_sampling_max_gen_batches": 2,
+            "use_dynamic_sampling": True,
+            "use_leave_one_out_baseline": True,
+        }
+    )
+    master_config.grpo["adv_estimator"]["use_leave_one_out_baseline"] = True
+
+    with pytest.raises(RuntimeError, match="captured dynamic-sampling training batch"):
+        grpo_mod.grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert len(captured_rewards) == 1
+    torch.testing.assert_close(captured_rewards[0], expected_training_rewards)
+
+
 def test_dapo_dynamic_sampling_disabled(mock_grpo_components):
     """Test that when dynamic sampling is disabled, all prompts are kept regardless of std."""
     batch_size = 6
