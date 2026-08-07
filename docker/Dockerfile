@@ -24,6 +24,7 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+ARG UV_VERSION=0.11.28
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -52,7 +53,6 @@ COPY docker/install_apptainer.sh /
 
 # Pin the official uv image so build-time tooling is fetched through the
 # container registry's content-addressed distribution path.
-ARG UV_VERSION=0.11.28
 FROM ghcr.io/astral-sh/uv:${UV_VERSION}@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa AS uv
 
 FROM ${BASE_IMAGE} AS base

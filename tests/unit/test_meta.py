@@ -36,6 +36,9 @@ def test_ci_image_runtime_dependencies_are_readable_by_non_root_users():
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text()
     workflow = (REPO_ROOT / ".github" / "workflows" / "cicd-main.yml").read_text()
 
+    assert dockerfile.index("ARG UV_VERSION=0.11.28") < dockerfile.index(
+        "FROM scratch AS nemo-rl"
+    )
     assert (
         "FROM ghcr.io/astral-sh/uv:${UV_VERSION}@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa AS uv"
         in dockerfile
