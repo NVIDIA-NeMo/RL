@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+require_command() { command -v "$1" >/dev/null || die "missing command: $1"; }
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PYTHON=${PYTHON:-python3}
+ARM=${ARM:?Set ARM to one of the names emitted by arm_matrix.py --list}
+RENDER_ONLY=${RENDER_ONLY:-0}
+TEST_ONLY=${TEST_ONLY:-0}
+SEGMENT=4
+
+[[ "$RENDER_ONLY" == 0 || "$RENDER_ONLY" == 1 ]] || die "RENDER_ONLY must be 0 or 1"
+[[ "$TEST_ONLY" == 0 || "$TEST_ONLY" == 1 ]] || die "TEST_ONLY must be 0 or 1"
+
+IFS=$'\t' read -r ARM_NAME DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING \
+  EXPECTED_DEEPEP_COMMIT SOURCE_PROFILE RECIPE NODES GPUS_PER_NODE MAX_STEPS < <(
+    "$PYTHON" "$SCRIPT_DIR/arm_matrix.py" --arm "$ARM" --format tsv
+  )
+[[ "$ARM_NAME" == "$ARM" ]] || die "arm matrix resolution failed"
+
+EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-padding-ab-q30/cw-h100}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$EXPERIMENT_ROOT/$ARM}
+SOURCE_PATH=${SOURCE_PATH:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}
+ACCOUNT_FOR_RENDER=${ACCOUNT:-ACCOUNT_REQUIRED}
+JOB_NAME=${JOB_NAME:-$ACCOUNT_FOR_RENDER:hybridep-q30-$ARM}
+WANDB_ENABLED=${WANDB_ENABLED:-true}
+WANDB_PROJECT=${WANDB_PROJECT:-sna-hybridep-padding-ab-h100}
+WANDB_NAME=${WANDB_NAME:-q30-$ARM}
+REQUIRES_DEEPEP_ARTIFACT=$HYBRIDEP_BACKEND
+BACKEND_NAME=none
+[[ "$HYBRIDEP_BACKEND" == 0 ]] || BACKEND_NAME=hybridep
+
+TRAINING_COMMAND="uv run --no-sync examples/run_grpo.py --config $RECIPE grpo.max_num_steps=$MAX_STEPS checkpointing.enabled=false policy.sequence_packing.enabled=true policy.megatron_cfg.moe_token_dispatcher_type=$DISPATCHER"
+if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
+  TRAINING_COMMAND="$TRAINING_COMMAND ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep ++policy.megatron_cfg.moe_hybridep_num_sms=32 ++policy.megatron_cfg.moe_hybridep_pad_uneven_dispatch_inputs=$([[ $PAD_UNEVEN == 1 ]] && printf true || printf false)"
+fi
+TRAINING_COMMAND="$TRAINING_COMMAND logger.log_dir=$OUTPUT_ROOT/training-\$SLURM_JOB_ID logger.wandb_enabled=$WANDB_ENABLED logger.wandb.project=$WANDB_PROJECT logger.wandb.name=$WANDB_NAME"
+
+SBATCH_RENDER=(sbatch --nodes="$NODES" --gpus-per-node="$GPUS_PER_NODE" --segment="$SEGMENT"
+  --account="$ACCOUNT_FOR_RENDER" --partition=batch --time=01:00:00
+  --job-name="$JOB_NAME" --output="$OUTPUT_ROOT/slurm-%j.out"
+  --error="$OUTPUT_ROOT/slurm-%j.out" --export=ALL)
+[[ "$TEST_ONLY" == 0 ]] || SBATCH_RENDER+=(--test-only)
+SBATCH_RENDER+=("$SOURCE_PATH/ray.sub")
+printf -v SBATCH_COMMAND '%q ' "${SBATCH_RENDER[@]}"
+SBATCH_COMMAND=${SBATCH_COMMAND% }
+
+if [[ "$RENDER_ONLY" == 1 ]]; then
+  printf 'arm=%s\n' "$ARM"
+  printf 'recipe=%s\n' "$RECIPE"
+  printf 'nodes=%s\n' "$NODES"
+  printf 'gpus_per_node=%s\n' "$GPUS_PER_NODE"
+  printf 'segment=%s\n' "$SEGMENT"
+  printf 'max_steps=%s\n' "$MAX_STEPS"
+  printf 'sequence_packing=1\n'
+  printf 'dispatcher=%s\n' "$DISPATCHER"
+  printf 'hybridep_backend=%s\n' "$BACKEND_NAME"
+  printf 'pad_uneven_dispatch_inputs=%s\n' "$PAD_UNEVEN"
+  printf 'legacy_prepadding=%s\n' "$LEGACY_PREPADDING"
+  printf 'deepep_commit=%s\n' "$EXPECTED_DEEPEP_COMMIT"
+  printf 'requires_deepep_artifact=%s\n' "$REQUIRES_DEEPEP_ARTIFACT"
+  printf 'source_profile=%s\n' "$SOURCE_PROFILE"
+  printf 'job_name=%s\n' "$JOB_NAME"
+  printf 'output_root=%s\n' "$OUTPUT_ROOT"
+  printf 'training_command=%s\n' "$TRAINING_COMMAND"
+  printf 'sbatch_command=%s\n' "$SBATCH_COMMAND"
+  exit 0
+fi
+
+for command_name in git python3 sbatch sshare sha256sum nvidia-smi; do
+  require_command "$command_name"
+done
+: "${ACCOUNT:?Set ACCOUNT after checking FairShare immediately before submission}"
+: "${CONTAINER:?Set CONTAINER to an immutable image reference or local squashfs}"
+: "${FORK_BRANCH:?Set FORK_BRANCH to the pushed source branch}"
+
+EXPECTED_BASE_COMMIT=${EXPECTED_BASE_COMMIT:-ba473d47520472938482dae9a7f36414d034a110}
+EXPECTED_BRIDGE_COMMIT=${EXPECTED_BRIDGE_COMMIT:-573e088c9c6740082c39744e03dc5b009e730ed4}
+EXPECTED_MCORE_COMMIT=${EXPECTED_MCORE_COMMIT:-6513e3e23d6b5eda6a1c934990b15e804237732b}
+MCORE_5008_COMMIT=${MCORE_5008_COMMIT:-81770cb015eab05785ecd540ba929d1400a52f67}
+FORK_REMOTE=${FORK_REMOTE:-fork}
+EXPECTED_GPU_MODEL=${EXPECTED_GPU_MODEL:-H100}
+EXPECTED_ARCHITECTURE=x86_64
+PREFLIGHT_VENV=${PREFLIGHT_VENV:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-upstream5008-validation/cw-h100/preflight-venv}
+
+[[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" ]] || die "invalid SOURCE_PATH: $SOURCE_PATH"
+[[ -x "$PREFLIGHT_VENV/bin/python" ]] || die "preflight venv is missing: $PREFLIGHT_VENV"
+[[ -z $(git -C "$SOURCE_PATH" status --porcelain --untracked-files=all) ]] || die "NeMo-RL source is dirty"
+[[ -z $(git -C "$SOURCE_PATH" submodule foreach --recursive --quiet 'dirty=$(git status --porcelain --untracked-files=all); if [ -n "$dirty" ]; then printf "%s\n" "$displaypath"; fi') ]] || die "recursive submodule source is dirty"
+! git -C "$SOURCE_PATH" submodule status --recursive | grep -Eq '^[+-U]' || die "recursive submodule checkout mismatch"
+git -C "$SOURCE_PATH" merge-base --is-ancestor "$EXPECTED_BASE_COMMIT" HEAD || die "frozen experiment base is absent"
+
+LOCAL_HEAD=$(git -C "$SOURCE_PATH" rev-parse HEAD)
+PUSHED_HEAD=$(git -C "$SOURCE_PATH" ls-remote "$FORK_REMOTE" "refs/heads/$FORK_BRANCH" | cut -f1)
+[[ -n "$PUSHED_HEAD" && "$LOCAL_HEAD" == "$PUSHED_HEAD" ]] || die "HEAD is not the pushed fork branch commit"
+
+BRIDGE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+MCORE=$BRIDGE/3rdparty/Megatron-LM
+[[ $(git -C "$BRIDGE" rev-parse HEAD) == "$EXPECTED_BRIDGE_COMMIT" ]] || die "Megatron-Bridge commit mismatch"
+[[ $(git -C "$MCORE" rev-parse HEAD) == "$EXPECTED_MCORE_COMMIT" ]] || die "Megatron-Core commit mismatch"
+if [[ "$SOURCE_PROFILE" == official ]]; then
+  git -C "$MCORE" merge-base --is-ancestor "$MCORE_5008_COMMIT" HEAD || die "Megatron-Core PR 5008 is absent"
+else
+  : "${EXPECTED_LEGACY_NEMO_COMMIT:?Set EXPECTED_LEGACY_NEMO_COMMIT for the legacy arm}"
+  git -C "$SOURCE_PATH" merge-base --is-ancestor "$EXPECTED_LEGACY_NEMO_COMMIT" HEAD || die "legacy NeMo pre-padding commit is absent"
+fi
+
+if [[ -f "$CONTAINER" ]]; then
+  : "${CONTAINER_SHA256:?Set CONTAINER_SHA256 for a local container image}"
+  [[ $(sha256sum "$CONTAINER" | cut -d' ' -f1) == "$CONTAINER_SHA256" ]] || die "container checksum mismatch"
+elif [[ ! "$CONTAINER" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  die "CONTAINER must be a checksum-verified local image or digest-pinned reference"
+fi
+
+DEEPEP_WHEEL=none
+DEEPEP_METADATA=none
+DEEPEP_SHA256=none
+if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
+  if [[ "$EXPECTED_DEEPEP_COMMIT" == 17cfb817bccec3a9c247013360cc550c2bac441e ]]; then
+    DEEPEP_WHEEL=${DEEPEP_17CF_WHEEL:?Set DEEPEP_17CF_WHEEL}
+    DEEPEP_METADATA=${DEEPEP_17CF_METADATA:?Set DEEPEP_17CF_METADATA}
+  else
+    DEEPEP_WHEEL=${DEEPEP_F725_WHEEL:?Set DEEPEP_F725_WHEEL}
+    DEEPEP_METADATA=${DEEPEP_F725_METADATA:?Set DEEPEP_F725_METADATA}
+  fi
+  [[ -f "$DEEPEP_WHEEL" && -f "$DEEPEP_METADATA" ]] || die "DeepEP wheel or metadata is missing"
+  IFS=$'\t' read -r META_COMMIT META_PLATFORM META_ARCH META_WHEEL META_SHA < <(
+    python3 - "$DEEPEP_METADATA" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as metadata_file:
+    metadata = json.load(metadata_file)
+keys = ("commit", "platform", "architecture", "wheel", "sha256")
+values = []
+for key in keys:
+    value = metadata.get(key)
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"missing DeepEP metadata field: {key}")
+    values.append(value)
+print("\t".join(values))
+PY
+  )
+  [[ "$META_COMMIT" == "$EXPECTED_DEEPEP_COMMIT" && "$META_PLATFORM" == linux && "$META_ARCH" == "$EXPECTED_ARCHITECTURE" ]] || die "DeepEP metadata platform or commit mismatch"
+  [[ "$META_WHEEL" == "$DEEPEP_WHEEL" || "$META_WHEEL" == "$(basename "$DEEPEP_WHEEL")" ]] || die "DeepEP metadata wheel mismatch"
+  DEEPEP_SHA256=$(sha256sum "$DEEPEP_WHEEL" | cut -d' ' -f1)
+  [[ "$DEEPEP_SHA256" == "$META_SHA" ]] || die "DeepEP wheel checksum mismatch"
+fi
+
+mkdir -p "$OUTPUT_ROOT"
+RUN_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+FAIRSHARE_LOG=$OUTPUT_ROOT/fairshare-$RUN_STAMP.txt
+sshare -A "$ACCOUNT" -u "$USER" -o Cluster,Account,User,FairShare | tee "$FAIRSHARE_LOG"
+grep -F "$ACCOUNT" "$FAIRSHARE_LOG" >/dev/null || die "ACCOUNT is absent from FairShare output"
+
+PROVENANCE_ROOT=$OUTPUT_ROOT/provenance-$RUN_STAMP
+mkdir -p "$PROVENANCE_ROOT"
+printf 'arm=%s\nsource_profile=%s\nnemo_rl_commit=%s\nbridge_commit=%s\nmcore_commit=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_sha256=%s\ncontainer=%s\ncontainer_sha256=%s\nrecipe=%s\nmax_steps=%s\n' \
+  "$ARM" "$SOURCE_PROFILE" "$LOCAL_HEAD" "$EXPECTED_BRIDGE_COMMIT" "$EXPECTED_MCORE_COMMIT" \
+  "$EXPECTED_DEEPEP_COMMIT" "$DEEPEP_WHEEL" "$DEEPEP_SHA256" "$CONTAINER" "${CONTAINER_SHA256:-digest-pinned}" "$RECIPE" "$MAX_STEPS" \
+  > "$PROVENANCE_ROOT/submission.txt"
+
+export SOURCE_PATH OUTPUT_ROOT PROVENANCE_ROOT RECIPE MAX_STEPS ARM SOURCE_PROFILE
+export EXPECTED_NEMO_RL_COMMIT="$LOCAL_HEAD" EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT
+export EXPECTED_DEEPEP_COMMIT DEEPEP_WHEEL DEEPEP_METADATA DEEPEP_SHA256
+export EXPECTED_GPU_MODEL GPUS_PER_NODE DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING
+export HF_HOME=${HF_CACHE:-$EXPERIMENT_ROOT/hf-cache}
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export UV_PROJECT_ENVIRONMENT=$PREFLIGHT_VENV
+export VIRTUAL_ENV=$PREFLIGHT_VENV
+export UV_CACHE_DIR=${UV_CACHE_DIR:-$EXPERIMENT_ROOT/uv-cache}
+export NRL_NODE_LOCAL_UV_CACHE_DIR=${NRL_NODE_LOCAL_UV_CACHE_DIR:-/tmp/nemo-rl-uv-cache-$ARM}
+export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-/tmp/nemo-rl-venvs-$ARM-$LOCAL_HEAD}
+export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
+export CUDNN_PATH=$CUDNN_HOME
+export PATH="$PREFLIGHT_VENV/bin:$PATH"
+mkdir -p "$HF_HOME" "$UV_CACHE_DIR"
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
+export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128
+export NVLINK_DOMAIN_SIZE=8 USE_MNNVL=0
+export CONTAINER
+
+EXTRA_MOUNTS=${MOUNTS:-}
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$UV_CACHE_DIR:$UV_CACHE_DIR"
+if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
+  DEEPEP_DIR=$(dirname "$DEEPEP_WHEEL")
+  export DEEPEP_OVERLAY_DIR="/tmp/nemo-rl-deepep-$ARM-$DEEPEP_SHA256"
+  export PYTHONPATH="$DEEPEP_OVERLAY_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  export LD_LIBRARY_PATH="$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  MOUNTS_VALUE="$MOUNTS_VALUE,$DEEPEP_DIR:$DEEPEP_DIR"
+fi
+export MOUNTS="$MOUNTS_VALUE${EXTRA_MOUNTS:+,$EXTRA_MOUNTS}"
+
+read -r -d '' SETUP_COMMAND <<'SETUP' || true
+set -euo pipefail
+cd "$SOURCE_PATH"
+RUN_PYTHON=$(uv run --no-sync python -c 'import sys; print(sys.executable)')
+[[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
+GPU_MODELS=$(nvidia-smi --query-gpu=name --format=csv,noheader)
+[[ $(printf '%s\n' "$GPU_MODELS" | sed '/^$/d' | wc -l) -eq "$GPUS_PER_NODE" ]]
+[[ "$GPU_MODELS" == *"$EXPECTED_GPU_MODEL"* ]]
+if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
+  [[ $(sha256sum "$DEEPEP_WHEEL" | cut -d' ' -f1) == "$DEEPEP_SHA256" ]]
+  rm -rf "$DEEPEP_OVERLAY_DIR"
+  mkdir -p "$DEEPEP_OVERLAY_DIR"
+  UV_NO_CONFIG=1 uv pip install --target "$DEEPEP_OVERLAY_DIR" --no-deps --reinstall "$DEEPEP_WHEEL"
+fi
+SETUP
+export SETUP_COMMAND
+
+read -r -d '' COMMAND <<'DRIVER' || true
+set -euo pipefail
+cd "$SOURCE_PATH"
+[[ $(git rev-parse HEAD) == "$EXPECTED_NEMO_RL_COMMIT" ]]
+[[ -z $(git status --porcelain --untracked-files=all) ]]
+BRIDGE=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+MCORE=$BRIDGE/3rdparty/Megatron-LM
+[[ $(git -C "$BRIDGE" rev-parse HEAD) == "$EXPECTED_BRIDGE_COMMIT" ]]
+[[ $(git -C "$MCORE" rev-parse HEAD) == "$EXPECTED_MCORE_COMMIT" ]]
+
+uv run --no-sync python - <<'PY'
+import os
+from types import SimpleNamespace
+
+from nemo_rl.models.megatron.setup import _apply_moe_config
+
+dispatcher = os.environ["DISPATCHER"]
+hybridep = os.environ["HYBRIDEP_BACKEND"] == "1"
+expected_padding = os.environ["PAD_UNEVEN"] == "1"
+megatron_cfg = {
+    "expert_tensor_parallel_size": 1,
+    "expert_model_parallel_size": 8,
+    "moe_router_dtype": "float32",
+    "moe_router_load_balancing_type": "none",
+    "moe_router_bias_update_rate": 0.0,
+    "moe_permute_fusion": True,
+    "moe_enable_deepep": False,
+    "moe_token_dispatcher_type": dispatcher,
+    "moe_shared_expert_overlap": True,
+}
+if hybridep:
+    megatron_cfg.update(
+        moe_flex_dispatcher_backend="hybridep",
+        moe_hybridep_num_sms=32,
+        moe_hybridep_pad_uneven_dispatch_inputs=expected_padding,
+    )
+model_cfg = SimpleNamespace(moe_hybridep_pad_uneven_dispatch_inputs=False)
+_apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is expected_padding
+if os.environ["LEGACY_PREPADDING"] == "1":
+    from nemo_rl.models.megatron.data import get_hybridep_prepadding_contract
+
+    assert get_hybridep_prepadding_contract() == {
+        "enabled": True,
+        "mcore_router_masks_padding": True,
+    }
+PY
+
+if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
+  uv run --no-sync python - <<'PY'
+import os
+from pathlib import Path
+
+import deep_ep
+import deep_ep_cpp
+import hybrid_ep_cpp
+
+overlay = Path(os.environ["DEEPEP_OVERLAY_DIR"]).resolve()
+for module in (deep_ep, deep_ep_cpp, hybrid_ep_cpp):
+    assert Path(module.__file__).resolve().is_relative_to(overlay)
+PY
+fi
+
+RUN_ARGS=(
+  --config "$RECIPE"
+  "grpo.max_num_steps=$MAX_STEPS"
+  checkpointing.enabled=false
+  policy.sequence_packing.enabled=true
+  "policy.megatron_cfg.moe_token_dispatcher_type=$DISPATCHER"
+  "logger.log_dir=$OUTPUT_ROOT/training-$SLURM_JOB_ID"
+  "logger.wandb_enabled=$WANDB_ENABLED"
+  "logger.wandb.project=$WANDB_PROJECT"
+  "logger.wandb.name=$WANDB_NAME"
+)
+if [[ "$HYBRIDEP_BACKEND" == 1 ]]; then
+  RUN_ARGS+=(
+    ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep
+    ++policy.megatron_cfg.moe_hybridep_num_sms=32
+    "++policy.megatron_cfg.moe_hybridep_pad_uneven_dispatch_inputs=$([[ $PAD_UNEVEN == 1 ]] && printf true || printf false)"
+  )
+fi
+uv run --no-sync examples/run_grpo.py "${RUN_ARGS[@]}" 2>&1 | tee "$OUTPUT_ROOT/training-$SLURM_JOB_ID.log"
+DRIVER
+export COMMAND WANDB_ENABLED WANDB_PROJECT WANDB_NAME
+
+SBATCH_ARGS=(--nodes="$NODES" --gpus-per-node="$GPUS_PER_NODE" --segment="$SEGMENT"
+  --account="$ACCOUNT" --partition=batch --time=01:00:00
+  --job-name="$JOB_NAME" --output="$OUTPUT_ROOT/slurm-%j.out"
+  --error="$OUTPUT_ROOT/slurm-%j.out" --export=ALL)
+[[ "$TEST_ONLY" == 0 ]] || SBATCH_ARGS+=(--test-only)
+sbatch "${SBATCH_ARGS[@]}" "$SOURCE_PATH/ray.sub"
