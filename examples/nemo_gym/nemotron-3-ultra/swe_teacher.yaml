@@ -354,6 +354,7 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
       # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can

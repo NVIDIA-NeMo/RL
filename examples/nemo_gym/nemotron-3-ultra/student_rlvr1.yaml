@@ -334,6 +334,7 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
       # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can
@@ -374,10 +375,11 @@ data:
 # =============================================================================
 # Environment — NeMo Gym + Judge Models
 #
-# Judge model paths and the GenRM service URL are set by the launcher:
-#   - genrm_model.base_url      ← GENRM_BASE_URL
-#   - nl2bash_judge_model.model ← NL2BASH_JUDGE_MODEL
-#   - safety_judge_model.model  ← SAFETY_JUDGE_MODEL
+# Judge model paths and external service URLs are set by the launcher:
+#   - genrm_model.model/base_url      ← GENRM_MODEL / GENRM_BASE_URL
+#   - nl2bash_judge_model.model       ← NL2BASH_JUDGE_MODEL
+#   - nl2bash_judge_model.base_url    ← NL2BASH_BASE_URL
+#   - safety_judge_model.model        ← SAFETY_JUDGE_MODEL
 # =============================================================================
 env:
   should_use_nemo_gym: true
@@ -502,7 +504,8 @@ env:
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16]
 
-    # NL2Bash / general judge: TP=4 on GB200 192GB
+    # NL2Bash / general judge: use NL2BASH_BASE_URL for an external service,
+    # otherwise launch TP=4 locally on GB200 192GB.
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
