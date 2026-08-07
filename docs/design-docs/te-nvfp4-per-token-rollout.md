@@ -43,15 +43,12 @@ alternative refit transport.
 
 ```mermaid
 flowchart LR
-    A[RL algorithm controller] --> B[Standard Megatron policy worker]
-    B --> C[TE NVFP4 training forward]
-    B --> D[Standard Megatron-Bridge HF export]
-    D --> E[NeMo RL expert quantization and layer fusion]
-    E --> F[Existing CUDA IPC and ZMQ refit]
-    F --> G[Standard vLLM generation worker]
-    G --> H[Layerwise reload and kernel rebuild]
-    H --> I[Per-token NVFP4 fused-MoE rollout]
-    I --> A
+    A[Megatron and TE mixed BF16 and NVFP4 training] --> B[Megatron-Bridge HF weight export]
+    B --> C[NeMo RL quantizes and fuses MoE expert weights]
+    C --> D[Existing CUDA IPC and ZMQ refit]
+    D --> E[vLLM loads native TP and PP shards and rebuilds MoE kernels]
+    E --> F[Per-token NVFP4 rollout]
+    F --> A
 ```
 
 The algorithm controller still calls the existing policy and generation
@@ -83,6 +80,12 @@ policy:
       fp4_param: false
     te_precision_config_file: examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml
 ```
+
+TE and Megatron own the FP4 forward and backward implementation. NeMo RL only
+maps the YAML fields into the Megatron model configuration and supplies the
+per-module recipe. With `fp4_param=false`, model parameters remain BF16 and the
+standard mixed-precision optimizer retains FP32 master parameters; NVFP4 is the
+training compute format rather than the stored parameter format.
 
 The validated precision recipe keeps attention input and output projections in
 BF16 and applies NVFP4 to MLP linears. This matches the rollout scope, where
@@ -160,6 +163,12 @@ The vLLM integration registers `nvfp4_pertoken`, a constrained quantization
 configuration based on vLLM's stock ModelOpt NVFP4 fused-MoE method. The name
 describes the runtime format; the policy does not use ModelOpt QAT.
 
+`NvFp4PerTokenConfig` is not instantiated directly by NeMo RL. NeMo RL
+registers the class under a new quantization name and selects that name in the
+engine arguments. vLLM then constructs the config through its normal registry.
+The subclass inherits ModelOpt's parsing, weight creation, and loading logic;
+it replaces only the fused-MoE method used to build the per-token kernel.
+
 The generation model starts with `load_format=dummy` because a BF16 checkpoint
 cannot initialize NVFP4-shaped runtime parameters. NeMo RL's colocated
 training lifecycle always performs a complete refit before the first rollout,
@@ -179,6 +188,24 @@ Reloaded scale tensors are made contiguous so vLLM can copy converted values
 back into stable storage referenced by CUDA graphs. A refit error is fatal in
 this mode because continuing with dummy, incomplete, or stale expert weights
 would produce invalid rollouts.
+
+### vLLM model parallelism
+
+The refit producer emits complete logical tensors; it does not pre-shard them
+for the generation topology. The same stream reaches every rank in a vLLM
+engine, and vLLM's standard model loaders select the tensors owned by that
+rank.
+
+Tensor parallelism therefore uses vLLM's native routed-expert and dense-layer
+sharding; the NeMo RL extension does not implement a second TP layout.
+Pipeline parallelism likewise uses vLLM's native stage ownership. PP greater
+than one requires the asynchronous engine in NeMo RL's current vLLM generation
+orchestration.
+
+The current sender still transfers the complete stream to every PP stage.
+Non-local layers are skipped correctly, but PP does not yet reduce refit bytes
+or producer work. Expert parallelism remains disabled because the FlashInfer
+per-token-activation fused-MoE path does not support vLLM's modular-EP path.
 
 ## Why weights are quantized on the policy side
 
@@ -211,12 +238,12 @@ policy:
 expert or projection exclusions would make fused layer tensors internally
 inconsistent and are rejected.
 
-The initial validated scope is deliberately narrow:
+The validated scope is deliberately narrow:
 
 | Setting | Supported value |
 |---|---|
-| Generation backend | vLLM, colocated, synchronous |
-| vLLM parallelism per engine | TP=1, PP=1, EP=1 |
+| Generation backend | vLLM, colocated, synchronous or asynchronous |
+| vLLM parallelism per engine | TP and PP values accepted by vLLM/model sharding; PP>1 requires async; EP=1 |
 | Model layout | `Qwen3MoeForCausalLM`, every decoder layer MoE |
 | KV cache | `auto` |
 | vLLM model dtype | `bfloat16` |
@@ -226,21 +253,24 @@ The initial validated scope is deliberately narrow:
 | ModelOpt generation keys | `quant_cfg` and `real_quant` must be unset |
 
 These checks are setup-time failures rather than best-effort fallbacks. They
-define the combinations exercised end to end and prevent silent use of an
-incompatible loader or kernel. Enabling the rollout also requires the policy
-contract shown above: BF16 master precision, E2M1 NVFP4, and `fp4_param=false`.
+define the supported contract and prevent silent use of an incompatible loader
+or kernel; the validation table below separately records the topologies that
+have been exercised. Enabling the rollout also requires BF16 policy model
+parameters, E2M1 NVFP4, and `fp4_param=false`.
 
 ## Dependencies
 
 | Dependency | Version or status | Reason |
 |---|---|---|
+| Transformer Engine | 2.18.0 (`e7c550c5`) | Row-scaled NVFP4 training, packed GroupedLinear wgrad allocation, and dequantized-backward operand preservation |
+| NVIDIA cuDNN Frontend | 1.25.0 | Header API required to build Transformer Engine 2.18 |
 | vLLM | 0.26.0 | Per-token NVFP4 fused-MoE kernel and layerwise-reload interfaces |
 | FlashInfer | 0.6.14 | FlashInfer TRT-LLM MoE backend used by the per-token kernel |
 | NVIDIA CUTLASS DSL | 4.6.0 | Required by the vLLM/FlashInfer runtime combination |
 | Megatron-Bridge | Existing NeMo RL revision | No additional change is required for the post-EP design |
 
-The generated `uv.lock` records the vLLM runtime upgrade and its transitive
-dependency resolution.
+The generated `uv.lock` records the vLLM and Transformer Engine upgrades and
+their transitive dependency resolution.
 
 ## Alternatives considered
 
@@ -262,9 +292,10 @@ that a short training command exits successfully:
 | Quantization math | Bitwise comparison with vLLM's native NVFP4 quantizer, shape validation, zero blocks, and 2D/3D equivalence |
 | Refit producer | Expert grouping, shared W13 scale, complete-layer ignore, fused transport, expansion, and incomplete-stream failures |
 | Training configuration | FP4/FP8 exclusion, 128-token alignment, precision-recipe matching, BF16 boundary layers, and scoped backward override |
-| Generation configuration | Unsupported topology, model layout, evaluation, speculative decoding, and conflicting engine settings |
+| Generation configuration | Colocation, PP async requirement, EP exclusion, model layout, evaluation, speculative decoding, and conflicting engine settings |
 | Reload lifecycle | Stable parameter storage, fatal failures, and synchronization before IPC acknowledgment |
 | End to end | Two GRPO steps on 4 nodes × 4 GB200 GPUs, covering initial and post-update refits plus finite training metrics |
+| vLLM model parallelism | TP=2/PP=1 synchronous, TP=1/PP=2 asynchronous, and TP=2/PP=2 asynchronous initialization, refit, generation, and rollout; the combined topology covers two refits and training steps |
 
 The end-to-end run is a functional smoke test, not a convergence or throughput
 claim. Longer accuracy and performance studies remain recipe- and
@@ -284,8 +315,13 @@ model-specific.
 ## Current limitations
 
 - Only the validated Qwen3 all-MoE layout is accepted.
-- vLLM TP, PP, and EP must each be one per rollout engine.
-- The mode is limited to colocated synchronous training and generation.
+- vLLM EP must be one per rollout engine; PP greater than one requires the
+  asynchronous engine.
+- PP stages currently receive the complete refit stream, so PP is correct but
+  does not reduce refit transfer volume.
+- TP or PP sizes greater than two rely on vLLM's native loaders but have not
+  yet been exercised by the topology smoke test.
+- The mode is limited to colocated training and generation.
 - Attention, shared experts, routers, embeddings, norms, and output heads remain
   in their native dtype.
 - Expert quantization currently happens after Megatron-Bridge's EP gather.
