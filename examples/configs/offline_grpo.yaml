@@ -1,0 +1,94 @@
+defaults: sft.yaml
+
+# KRAFTON-style offline GRPO over pre-generated teacher trajectories.
+offline_grpo:
+  # policy.train_global_batch_size must equal the product of these two values.
+  num_prompts_per_step: 4
+  num_responses_per_prompt: 8
+  response_selection: random # one of: first, random
+
+  # KRAFTON's released recipe uses the unnormalized group-relative reward.
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  all_positive_bias: 0.1
+  positive_reward_threshold: 0.0
+
+  max_num_epochs: 3
+  max_num_steps: 60
+  val_period: 10
+  val_batches: 8
+  val_num_prompts_per_step: 4
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: false
+  seed: 42
+
+loss_fn:
+  # The frozen initial policy supplies the continual-post-training KL anchor.
+  reference_policy_kl_penalty: 0.1
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+
+policy:
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 32768
+  optimizer:
+    kwargs:
+      lr: 1.0e-7
+  megatron_cfg:
+    optimizer:
+      lr: 1.0e-7
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_init: 1.0e-7
+
+data:
+  _override_: true
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: true
+  add_eos: true
+  shuffle: true
+  num_workers: 1
+
+  # Each row represents one prompt group. KRAFTON's prepared parquet uses
+  # prompt, target_lst, and target_rewards.
+  train:
+    data_path: /path/to/OpenThoughts.parquet
+    subset: null
+    split: train
+    prompt_key: prompt
+    responses_key: target_lst
+    rewards_key: target_rewards
+    prompt_file: null
+    system_prompt_file: null
+  validation:
+    data_path: /path/to/offline_grpo_validation.parquet
+    subset: null
+    split: train
+    prompt_key: prompt
+    responses_key: target_lst
+    rewards_key: target_rewards
+    prompt_file: null
+    system_prompt_file: null
+
+checkpointing:
+  checkpoint_dir: results/offline_grpo
+  metric_name: val:val_loss
+  higher_is_better: false
+
+# Replace SFT's dataset-name interpolations; offline groups use column mappings
+# rather than the response-dataset registry.
+logger:
+  wandb:
+    project: offline-grpo
+    name: offline-grpo
+  swanlab:
+    project: offline-grpo
+    name: offline-grpo
+  tensorboard:
+    log_dir: tb_logs-offline-grpo
+  mlflow:
+    experiment_name: offline-grpo
+    run_name: offline-grpo

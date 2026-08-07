@@ -62,7 +62,7 @@ Learn about DTensor and Megatron Core training backends, their capabilities, and
 :link: about/algorithms/index
 :link-type: doc
 
-Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
+Discover supported algorithms including online and offline GRPO, PPO, SFT, DPO, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
 :::
 
 :::{grid-item-card} {octicon}`graph` Evaluation
@@ -91,6 +91,13 @@ Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for dist
 :link-type: doc
 
 Reproduce DeepscaleR results with NeMo RL using GRPO on mathematical reasoning tasks.
+:::
+
+:::{grid-item-card} {octicon}`database` Offline GRPO
+:link: guides/offline-grpo
+:link-type: doc
+
+Train on grouped, rewarded teacher trajectories without allocating rollout or reward-environment workers.
 :::
 
 :::{grid-item-card} {octicon}`number` SFT on OpenMathInstruct2
@@ -273,6 +280,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/offline-grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md

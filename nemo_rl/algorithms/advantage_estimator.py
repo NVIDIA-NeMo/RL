@@ -63,8 +63,11 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
+        grouping_prompt_ids = (
+            prompt_ids.unsqueeze(-1) if prompt_ids.ndim == 1 else prompt_ids
+        )
         baseline, std = calculate_baseline_and_std_per_prompt(
-            prompt_ids,
+            grouping_prompt_ids,
             rewards,
             torch.ones_like(rewards),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
@@ -80,6 +83,69 @@ class GRPOAdvantageEstimator:
             )
 
         return advantages.expand(mask.shape)
+
+
+class OfflineGRPOAdvantageEstimator:
+    """GRPO advantages for fixed groups of rewarded teacher trajectories.
+
+    Unlike online GRPO, a group solved perfectly by the teacher can still be
+    informative for the student. Such groups receive ``all_positive_bias``
+    instead of the otherwise-zero group-relative advantage.
+    """
+
+    def __init__(
+        self,
+        *,
+        use_leave_one_out_baseline: bool,
+        normalize_rewards: bool,
+        all_positive_bias: float,
+        positive_reward_threshold: float,
+    ) -> None:
+        self.use_leave_one_out_baseline = use_leave_one_out_baseline
+        self.normalize_rewards = normalize_rewards
+        self.all_positive_bias = all_positive_bias
+        self.positive_reward_threshold = positive_reward_threshold
+
+    def compute_advantage(
+        self,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute group-relative advantages with an all-positive override.
+
+        Args:
+            prompt_ids: Prompt-group identifier for every trajectory, shape
+                ``[batch_size]``.
+            rewards: Scalar trajectory rewards, shape ``[batch_size]``.
+            mask: Response-token mask, shape ``[batch_size, sequence_length]``.
+
+        Returns:
+            Token-expanded advantages with the same shape as ``mask``.
+        """
+        grouping_prompt_ids = (
+            prompt_ids.unsqueeze(-1) if prompt_ids.ndim == 1 else prompt_ids
+        )
+        baseline, std = calculate_baseline_and_std_per_prompt(
+            grouping_prompt_ids,
+            rewards,
+            (mask.sum(dim=-1) > 0).to(rewards.dtype),
+            leave_one_out_baseline=self.use_leave_one_out_baseline,
+        )
+        advantages = rewards - baseline
+
+        if self.normalize_rewards:
+            non_zero_std_mask = std > 0
+            advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
+                std[non_zero_std_mask] + 1e-6
+            )
+
+        for prompt_id in torch.unique(prompt_ids):
+            group_mask = prompt_ids == prompt_id
+            if torch.all(rewards[group_mask] > self.positive_reward_threshold):
+                advantages[group_mask] = self.all_positive_bias
+
+        return advantages.unsqueeze(-1).expand(mask.shape)
 
 
 class GDPOAdvantageEstimator:

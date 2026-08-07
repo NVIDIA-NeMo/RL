@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 from pydantic import BaseModel
@@ -782,6 +782,112 @@ class ClippedPGLossFn(LossFunction):
                 "positive_nll_loss": nll_loss.item(),
             },
         )
+
+
+class OfflineGRPOLossConfig(BaseModel, extra="allow"):
+    """KRAFTON-style offline GRPO loss configuration."""
+
+    reference_policy_kl_penalty: float = 0.1
+    reference_policy_kl_type: Literal["k1", "k2", "k3"] = "k3"
+    kl_input_clamp_value: float | None = 20.0
+    kl_output_clamp_value: float | None = 10.0
+
+
+class OfflineGRPOLossFn(LossFunction):
+    r"""Probability-weighted offline GRPO with reference-policy KL.
+
+    The teacher behavior likelihood is unknown in the KRAFTON formulation and
+    is approximated as one. The per-token actor term is therefore
+    ``-advantage * exp(current_logprob)``. This is intentionally distinct from
+    advantage-weighted NLL, whose actor term would be
+    ``-advantage * current_logprob``.
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(
+        self,
+        cfg: OfflineGRPOLossConfig,
+        use_fused_linear_logprobs: bool = False,
+    ) -> None:
+        if cfg.reference_policy_kl_penalty < 0:
+            raise ValueError("reference_policy_kl_penalty must be non-negative")
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_type = cfg.reference_policy_kl_type
+        self.kl_input_clamp_value = cfg.kl_input_clamp_value
+        self.kl_output_clamp_value = cfg.kl_output_clamp_value
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.metric_normalizations: dict[str, MetricNormalizer] = {
+            "loss": MetricNormalizer.TOKENS,
+            "actor_loss": MetricNormalizer.TOKENS,
+            "kl_penalty": MetricNormalizer.TOKENS,
+            "offline_probability": MetricNormalizer.TOKENS,
+            "advantage": MetricNormalizer.TOKENS,
+            "num_valid_samples": MetricNormalizer.NONE,
+        }
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute the offline actor and reference-policy KL losses."""
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+        advantages = data["advantages"][:, 1:]
+
+        offline_probabilities = next_token_logprobs.exp()
+        actor_loss = masked_mean(
+            -advantages * offline_probabilities,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        if self.reference_policy_kl_penalty > 0:
+            if "reference_policy_logprobs" not in data:
+                raise ValueError(
+                    "reference_policy_logprobs are required when "
+                    "reference_policy_kl_penalty is positive"
+                )
+            reference_logprobs = data["reference_policy_logprobs"][:, 1:]
+            per_token_kl = calculate_kl(
+                next_token_logprobs,
+                reference_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+            )
+            kl_penalty = masked_mean(
+                per_token_kl,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+        else:
+            kl_penalty = torch.tensor(0.0, device=next_token_logprobs.device)
+
+        loss = actor_loss + self.reference_policy_kl_penalty * kl_penalty
+        offline_probability = masked_mean(
+            offline_probabilities.detach(),
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+        mean_advantage = masked_mean(
+            advantages.detach(),
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+        return loss, {
+            "loss": loss.item(),
+            "actor_loss": actor_loss.item(),
+            "kl_penalty": kl_penalty.item(),
+            "offline_probability": offline_probability.item(),
+            "advantage": mean_advantage.item(),
+            "num_valid_samples": sample_mask.sum().item(),
+        }
 
 
 class NLLLossFn(LossFunction):

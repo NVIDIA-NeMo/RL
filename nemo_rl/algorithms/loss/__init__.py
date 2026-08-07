@@ -26,6 +26,8 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
     NLLLossFn,
+    OfflineGRPOLossConfig,
+    OfflineGRPOLossFn,
     PreferenceLossDataDict,
     PreferenceLossFn,
 )
@@ -53,6 +55,8 @@ __all__ = [
     "MseValueLossConfig",
     "MseValueLossFn",
     "NLLLossFn",
+    "OfflineGRPOLossConfig",
+    "OfflineGRPOLossFn",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
     "prepare_loss_input",
