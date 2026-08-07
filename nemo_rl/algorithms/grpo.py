@@ -1452,8 +1452,27 @@ def setup(
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
+    if backend == "megatron":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=None if colocated_inference else inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+        if not colocated_inference:
+            # Load the model weights now.
+            t0 = time.perf_counter()
+            policy_generation.weight_synchronizer.sync_weights()
+            worker_init_timing_metrics["initial_weight_sync_time_s"] = (
+                time.perf_counter() - t0
+            )
     # if it is not colocated inference, initialize collective communication for update weights
-    if (
+    elif (
         not colocated_inference
         and remote_transport is None
         and checkpoint_engine_config is None
@@ -1467,26 +1486,7 @@ def setup(
         world_size = train_world_size + inference_world_size
 
         # init collective
-        if backend == "megatron":
-            refit_backend = policy_config["generation"]["mcore_generation_config"][
-                "refit_backend"
-            ]
-            futures_train = policy.init_collective_mcore_generation(
-                ip,
-                port,
-                world_size,
-                rank_offset=0,
-                refit_backend=refit_backend,
-            )
-            futures_inference = policy_generation.init_collective(
-                ip,
-                port,
-                world_size,
-                train_world_size=train_world_size,
-                refit_backend=refit_backend,
-            )
-            ray.get(futures_train + futures_inference)
-        elif nccl_reshard_refit_enabled:
+        if nccl_reshard_refit_enabled:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -2331,26 +2331,9 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
-    # Megatron generation backend needs explicit suspend/resume around refits.
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.suspend_for_refit()
-
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+    if colocated_inference:
         policy.offload_before_refit()
-    # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["weights"])
-
-    if (
-        not colocated_inference
-        and isinstance(policy_generation, MegatronGeneration)
-        and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
-        == "nvshmem"
-    ):
-        futures_train = policy.preinit_nvshmem()
-        futures_inference = policy_generation.preinit_nvshmem_collective()
-        ray.get(futures_train + futures_inference)
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -2403,12 +2386,7 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
-            else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
+            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
@@ -2427,13 +2405,7 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-    # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
-
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.resume_after_refit()
 
     return {}
 

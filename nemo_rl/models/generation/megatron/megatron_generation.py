@@ -30,6 +30,7 @@ from nemo_rl.models.generation.megatron.config import (
     merged_inference_megatron_cfg,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
@@ -120,6 +121,8 @@ class MegatronGeneration(GenerationInterface):
         self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        # Installed by setup via create_weight_synchronizer.
+        self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
         if policy is not None:
             # Reuse the existing training policy.
