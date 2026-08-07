@@ -106,9 +106,18 @@ export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # EXCLUDE_NODES; see launch_6k_pipeclean.sh.
 
 # 6K node split, identical to the legacy pipeclean. Callers may override.
+#
+# With GenRM and NL2Bash served from the external hetgroup, the only Gym model
+# still asking for GPUs is the safety judge at TP=4 x DP=2, which is 8 GPUs, or
+# 2 nodes. The rest of this pool backs Gym's CPU-side resource servers, which
+# carry ~16k tool sessions per step and degrade silently under CPU contention
+# rather than failing, so it is sized for them and not for the judge: 32 keeps
+# ~30 nodes of that headroom and returns 16 to generation. train + gen + gym
+# must be a multiple of SEGMENT_SIZE=16, and 976 still divides evenly into TP=8
+# instances (976 x 4 GPUs / 8 = 488).
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-512}"
-export NUM_GEN_NODES="${NUM_GEN_NODES:-960}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-48}"
+export NUM_GEN_NODES="${NUM_GEN_NODES:-976}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-32}"
 
 # CP=16 is baked into pipeclean_6k.yaml; allow an override for memory experiments.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"
