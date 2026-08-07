@@ -19,6 +19,12 @@ BUILD_SCRIPT = (
 VALIDATE_SCRIPT = (
     ROOT / "experiments" / "hybridep-padding-ab-q30" / "validate-legacy-cw.sbatch"
 )
+RUNTIME_VALIDATE_SCRIPT = (
+    ROOT
+    / "experiments"
+    / "hybridep-padding-ab-q30"
+    / "validate-container-runtime-cw.sbatch"
+)
 
 
 def _render(arm: str, *, test_only: bool = False) -> dict[str, str]:
@@ -118,7 +124,8 @@ def test_rendered_arm_contract(
     assert rendered["job_name"].endswith(arm)
     assert rendered["output_root"].endswith(f"/{arm}")
     assert "grpo.max_num_steps=20" in rendered["training_command"]
-    assert "uv run --active --no-sync" in rendered["training_command"]
+    assert "uv run --no-sync" in rendered["training_command"]
+    assert "--active" not in rendered["training_command"]
     assert "policy.sequence_packing.enabled=true" in rendered["training_command"]
     assert "--nodes=4" in rendered["sbatch_command"]
     assert "--gpus-per-node=8" in rendered["sbatch_command"]
@@ -206,6 +213,21 @@ def test_f725_builder_has_explicit_gpu_allocation_contract() -> None:
     assert "#SBATCH --time=01:00:00" in build_script
 
 
+def test_container_runtime_probe_is_nonexclusive_and_one_gpu() -> None:
+    runtime_probe = RUNTIME_VALIDATE_SCRIPT.read_text()
+
+    assert "#SBATCH --nodes=1" in runtime_probe
+    assert "#SBATCH --ntasks=1" in runtime_probe
+    assert "#SBATCH --gpus-per-node=1" in runtime_probe
+    assert "#SBATCH --segment=1" in runtime_probe
+    assert "#SBATCH --exclusive" not in runtime_probe
+    assert "#SBATCH --cpus" not in runtime_probe
+    assert "#SBATCH --mem" not in runtime_probe
+    assert "import deep_ep" in runtime_probe
+    assert 'assert hasattr(uvloop, "install")' in runtime_probe
+    assert "--container-env=" in runtime_probe
+
+
 def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
     launcher = LAUNCHER.read_text()
     validator = VALIDATE_SCRIPT.read_text()
@@ -213,29 +235,35 @@ def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
     for script in (launcher, validator):
         assert "Megatron-Bridge/src" in script
         assert "Megatron-Bridge/3rdparty/Megatron-LM" in script
-        assert (
-            'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES'
-            in script
-        )
+    assert 'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE${PYTHONPATH' in launcher
+    assert (
+        'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES'
+        in validator
+    )
 
 
-def test_ray_bootstrap_uses_the_pinned_preflight_site_packages() -> None:
+def test_ray_bootstrap_uses_container_runtime_with_pinned_cudnn_only() -> None:
     launcher = LAUNCHER.read_text()
     validator = VALIDATE_SCRIPT.read_text()
 
-    assert "PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages" in launcher
-    assert "import ray, requests, urllib3.exceptions" in launcher
-    assert "RUN_PYTHON=$(uv run --active --no-sync python" in launcher
-    assert "os.path.realpath(sys.prefix)" in launcher
-    assert "os.environ[\"PREFLIGHT_VENV\"]" in launcher
+    assert "PREFLIGHT_SITE_PACKAGES=" not in launcher
+    assert "import ray, requests, urllib3.exceptions, uvloop" in launcher
+    assert "RUN_PYTHON=/opt/nemo_rl_venv/bin/python" in launcher
+    assert 'env -u PYTHONPATH "$RUN_PYTHON" -m pip freeze' in launcher
+    assert 'export PATH="$PREFLIGHT_VENV/bin:$PATH"' not in launcher
+    assert "export VIRTUAL_ENV=" not in launcher
+    assert "export UV_PROJECT_ENVIRONMENT=" not in launcher
     assert "/opt/nemo_rl_venv/bin/ray --version" in validator
     assert "import ray, requests, urllib3, urllib3.exceptions" in validator
-    assert 'LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' in launcher
+    assert (
+        'LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+        in launcher
+    )
     assert (
         "CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn"
         in launcher
     )
-    assert '$CUDNN_HOME:$CUDNN_CONTAINER_PATH' in launcher
+    assert '$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH' in launcher
 
 
 def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> None:

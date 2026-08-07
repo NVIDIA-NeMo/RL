@@ -33,7 +33,7 @@ LEGACY_BRANCH = "sna/hybridep-legacy-prepad-q30-20260807"
 CW_CONTAINER = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo-rl-nightly-20260805/nemo_rl_nightly_20260805_15171871.sqsh"
 CW_CONTAINER_SHA256 = "6623720fedcc82b31ab1f09f385590a5cf07751c35e5f6bf740a8b79c691b680"
 CW_PREFLIGHT_MANIFEST_SHA256 = (
-    "ab6797d70d846ae8a9734947f1cac99e1b0184fa7f2ac6c0e2643e77700649da"
+    "5ce0491c23f73e388e44eebc16c7d6f8ec2a142db58eeaae2392c1fa32c50824"
 )
 QWEN30_RECIPE = "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
 
