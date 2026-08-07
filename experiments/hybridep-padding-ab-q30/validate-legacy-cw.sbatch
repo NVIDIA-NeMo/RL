@@ -44,6 +44,20 @@ srun \
   --container-workdir="$SOURCE_PATH" \
   bash -lc '
 set -euo pipefail
+archive_unit_results() {
+  local archive="$OUTPUT_ROOT/generated-test-artifacts"
+  local dated_result
+  mkdir -p "$archive"
+  if [[ -f "$SOURCE_PATH/tests/unit/unit_results.json" ]]; then
+    mv "$SOURCE_PATH/tests/unit/unit_results.json" "$archive/unit_results.json"
+  fi
+  if [[ -d "$SOURCE_PATH/tests/unit/unit_results" ]]; then
+    while IFS= read -r -d "" dated_result; do
+      mv "$dated_result" "$archive/"
+    done < <(find "$SOURCE_PATH/tests/unit/unit_results" -maxdepth 1 -type f -name "*.json" -print0)
+  fi
+}
+trap archive_unit_results EXIT
 export UV_PROJECT_ENVIRONMENT="$PREFLIGHT_VENV"
 export VIRTUAL_ENV="$PREFLIGHT_VENV"
 export PATH="$PREFLIGHT_VENV/bin:$PATH"

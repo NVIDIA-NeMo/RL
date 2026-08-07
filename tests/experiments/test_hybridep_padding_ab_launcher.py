@@ -205,6 +205,14 @@ def test_ray_bootstrap_uses_the_pinned_preflight_site_packages() -> None:
     assert "import ray, requests, urllib3, urllib3.exceptions" in validator
 
 
+def test_validator_archives_pytest_results_outside_the_source_tree() -> None:
+    validator = VALIDATE_SCRIPT.read_text()
+
+    assert "archive_unit_results()" in validator
+    assert "trap archive_unit_results EXIT" in validator
+    assert '$OUTPUT_ROOT/generated-test-artifacts' in validator
+
+
 def test_login_node_preflight_does_not_require_gpu_tools() -> None:
     launcher = LAUNCHER.read_text()
 
