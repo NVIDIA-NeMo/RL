@@ -52,8 +52,11 @@ ARM=official-pr5008-17cf \
 The launcher submits `ray-nonexclusive.sub`, requests all eight GPUs on every
 node with `--gpus-per-node=8`, does not request exclusive access, and does not
 set explicit CPU or memory requests. The wrapper passes Slurm's proportional
-CPU allocation to `ray.sub`. Each arm has an independent output directory and
-runtime overlay. The matrix pins one container path, checksum, and Python
+CPU allocation and a stable job identifier to `ray.sub`. Each arm has an
+independent output directory. HybridEP wheels are installed once into a
+checksum-keyed immutable overlay on Lustre, mounted into every node, and
+import-validated before Ray starts. The matrix records the expanded overlay
+size and pins one container path, checksum, and Python
 environment manifest hash for every arm,
 removes inherited `SBATCH_*` allocation options, rejects non-canonical or
 non-Lustre persistent paths, and redirects package/compiler caches away from
