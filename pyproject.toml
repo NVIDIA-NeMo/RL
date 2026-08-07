@@ -211,10 +211,7 @@ modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext==0.6.0",
 ] # for ft_launcher (fault-tolerant training launcher)
-nemo_gym = [
-  "nemo_gym",
-  "vllm-router==0.1.15",
-]
+nemo_gym = ["nemo_gym", "smg==1.9.0", "vllm-router==0.1.15"]
 
 [dependency-groups]
 
