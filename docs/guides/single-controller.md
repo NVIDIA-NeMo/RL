@@ -61,6 +61,10 @@ All SC async-RL runtime knobs live under `async_rl:` in the master config. The m
 
 Pick one of four modes with `sampler.name`. Each mode takes its own knobs, listed below — a knob from one mode has no effect under another:
 
+![Sampler modes: same buffer, four different training batches](../assets/sc-sampler-modes.png)
+
+*Same buffer under trainer weight 2 (`num_prompts_per_step=2`, staleness window `[0, 2]`). `windowed` and `weight_fifo` select on `start_weight` (stamped at dispatch); `in_order` selects on `target_step` (stamped at admit). The three usually pick the same groups and diverge only when rollouts finish out of order, as drawn here.*
+
 
 | `sampler.name` | Rollout gating                                                                                                          | Train selection                                                                                                   | Typical use                                                                                                  |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
