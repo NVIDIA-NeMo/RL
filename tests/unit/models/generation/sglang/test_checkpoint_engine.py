@@ -194,13 +194,19 @@ def test_checkpoint_engine_alignment_handles_different_transport_buckets():
 
     aligned = asyncio.run(collect())
 
+    # Assert the tensors, not just the names. The aligner itself enforces name
+    # equality across ranks, so a name-only assertion holds under any rank
+    # permutation and would not catch a shard being handed to the wrong rank.
     assert [
-        [[name for name, _tensor in rank_batch] for rank_batch in batch]
+        [
+            [(name, tensor.tolist()) for name, tensor in rank_batch]
+            for rank_batch in batch
+        ]
         for batch in aligned
     ] == [
-        [["a"], ["a"]],
-        [["b"], ["b"]],
-        [["c"], ["c"]],
+        [[("a", [1.0])], [("a", [4.0])]],
+        [[("b", [2.0])], [("b", [5.0])]],
+        [[("c", [3.0])], [("c", [6.0])]],
     ]
 
 

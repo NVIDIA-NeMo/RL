@@ -36,6 +36,7 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_sync.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_nixl_non_colocated.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
