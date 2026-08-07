@@ -207,7 +207,10 @@ class SingleControllerActor:
             rollout_task.cancel()
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
-            self._logger.finish()
+            try:
+                self._weight_synchronizer.shutdown()
+            finally:
+                self._logger.finish()
 
         return {
             "train_steps": self._train_steps,
