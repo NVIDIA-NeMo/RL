@@ -41,10 +41,9 @@ checkpointing:
   save_optimizer: true
 
 grpo:
-  # Stability setting: halve the prompt groups while retaining 16 generations
-  # per prompt. This yields 4096 samples/step and an async replay-buffer
-  # capacity of 512 groups instead of 1024.
-  num_prompts_per_step: 256
+  # Validated V1 setting: 128 prompt groups with 16 generations per prompt.
+  # This yields 2048 samples/step and a 256-group async replay buffer.
+  num_prompts_per_step: 128
   # Validation is effectively off in the reference; genrm cohort envs are
   # train-only and would hang under eval.
   val_period: 10000000
@@ -57,13 +56,13 @@ grpo:
   val_start_at: -1
 
 # -----------------------------------------------------------------------------
-# Policy — nano parallelism (reference: TP=4 CP=4 EP=16 PP=1 ETP=1)
+# Policy — validated V1 parallelism: TP=4 CP=4 EP=8 PP=1 ETP=1
 # -----------------------------------------------------------------------------
 policy:
   model_name: /lustre/fsw/portfolios/llmservice/users/venkats/training_actual_0603/nano_n3_post/checkpoints/nano-3.5-sft-v10-closethink-unmask-orig6k-from-midtrain-100B-lc-lr2e-5/eval/iter_0006000/hf
 
-  # Must equal num_prompts_per_step * num_generations_per_prompt: 256 * 16.
-  train_global_batch_size: 4096
+  # Must equal num_prompts_per_step * num_generations_per_prompt: 128 * 16.
+  train_global_batch_size: 2048
 
   # Ultra base is 49152. Reference nano runs 73728.
   max_total_sequence_length: 73728
@@ -71,8 +70,8 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
-    # 128 routed experts / EP16 = 8 experts per rank
-    expert_model_parallel_size: 16
+    # 128 routed experts / EP8 = 16 experts per rank
+    expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     context_parallel_size: 4
     moe_token_dispatcher_type: "alltoall"
