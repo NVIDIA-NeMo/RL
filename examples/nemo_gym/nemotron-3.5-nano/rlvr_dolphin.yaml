@@ -120,6 +120,16 @@ policy:
       # Hybrid Mamba allocates one state slot per running sequence. Base uses
       # 256 (sized for ultra); the reference nano run uses 64 at 73728 tokens.
       max_num_seqs: 64
+      # Required on vLLM 0.25 and NOT accepted by 0.20 -- this branch only runs
+      # against a 0.25 container. Left at the default "auto", 0.25 picks the
+      # FlashInfer TRT-LLM BF16 MoE, whose expert weights are 3D grouped
+      # tensors under the new routed_experts submodule. Refit then hands them to
+      # a loader that rejects the expert dimension: job 5944595 died in
+      # update_weights_from_collective with "shard_dim=0 is not a valid data
+      # dimension for a 3D tensor (expected 1 or 2)". flashinfer_cutlass keeps
+      # the layout refit can address and is the backend the 64-node Ultra smoke
+      # run (job 5939591) refit through step 4 with on this same container.
+      moe_backend: flashinfer_cutlass
 
     colocated:
       enabled: false
@@ -261,6 +271,13 @@ env:
       responses_api_models:
         local_vllm_model:
           model: /lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8
+          # Launch this judge from the Gym venv, not the RL one. On a 0.25
+          # container the RL venv pairs vLLM 0.25 with the openai version
+          # uv.lock pins, and `vllm serve` then fails to import NamespaceTool
+          # from openai.types.responses (job 5943331). The Gym venv is
+          # self-consistent. Judges need no weight sync, so they gain nothing
+          # from sharing the RL venv.
+          ray_worker_py_executable: /opt/gym_venvs/responses_api_models/local_vllm_model/.venv/bin/python
           vllm_serve_env_vars:
             # Matches the known-working internal dolphin/bear judge recipe.
             NCCL_MNNVL_ENABLE: "0"
