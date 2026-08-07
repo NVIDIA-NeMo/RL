@@ -264,6 +264,10 @@ def test_container_runtime_probe_is_nonexclusive_and_one_gpu() -> None:
     assert "#SBATCH --cpus" not in runtime_probe
     assert "#SBATCH --mem" not in runtime_probe
     assert "import deep_ep" in runtime_probe
+    assert "import transformer_engine.pytorch as te" in runtime_probe
+    assert "MANIFEST_OUTPUT" in runtime_probe
+    assert 'pip freeze | LC_ALL=C sort' in runtime_probe
+    assert 'sha256sum "$MANIFEST_OUTPUT"' in runtime_probe
     assert 'importlib.util.find_spec("uvloop")' in runtime_probe
     assert 'assert hasattr(uvloop, "install")' in runtime_probe
     assert "--container-env=" in runtime_probe

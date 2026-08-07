@@ -24,6 +24,14 @@ set -euo pipefail
 : "${CONTAINER:?CONTAINER is required}"
 : "${CUDNN_HOST_PATH:?CUDNN_HOST_PATH is required}"
 : "${DEEPEP_OVERLAY_DIR:?DEEPEP_OVERLAY_DIR is required}"
+: "${MANIFEST_OUTPUT:?MANIFEST_OUTPUT is required}"
+
+resolved_manifest_output=$(realpath -m -- "$MANIFEST_OUTPUT")
+[[ "$resolved_manifest_output" == "$MANIFEST_OUTPUT" && "$MANIFEST_OUTPUT" == /lustre/* ]] || {
+  printf 'ERROR: MANIFEST_OUTPUT must be a canonical /lustre path\n' >&2
+  exit 2
+}
+mkdir -p "$(dirname -- "$MANIFEST_OUTPUT")"
 
 export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
@@ -55,6 +63,7 @@ import hybrid_ep_cpp
 import ray
 import requests
 import torch
+import transformer_engine.pytorch as te
 import urllib3
 import urllib3.exceptions
 from ray.scripts.scripts import main as ray_cli_main
@@ -62,6 +71,7 @@ from ray.scripts.scripts import main as ray_cli_main
 overlay = Path(os.environ["DEEPEP_OVERLAY_DIR"]).resolve()
 assert click.ClickException
 assert ray_cli_main
+assert te
 assert Path(click.__file__).resolve().is_file()
 assert Path(urllib3.__file__).resolve().is_file()
 module_paths = {}
@@ -104,3 +114,13 @@ assert compat_files
 assert cuda_available
 assert torch.cuda.get_device_capability(0) == (9, 0)
 PY'
+
+srun --no-container-mount-home \
+  --container-image="$CONTAINER" \
+  --container-mounts="$MOUNTS" \
+  --container-env="$CONTAINER_ENV" \
+  --container-workdir=/tmp \
+  --nodes=1 --ntasks=1 --gpus-per-task=1 \
+  bash -lc '/opt/nemo_rl_venv/bin/python -m pip freeze | LC_ALL=C sort' \
+  > "$MANIFEST_OUTPUT"
+sha256sum "$MANIFEST_OUTPUT"
