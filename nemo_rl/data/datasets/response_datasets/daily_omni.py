@@ -33,14 +33,18 @@ class DailyOmniDataset(RawDataset):
     """
 
     task_name = "daily-omni"
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
 
     def __init__(
         self,
         split: str = "train",
         split_validation_size: float = 0,
         seed: int = 42,
+        include_single_letter_instruction: bool = True,
         **kwargs,
     ):
+        self.include_single_letter_instruction = include_single_letter_instruction
         # train, valA, and valB are supported splits.
         SPLIT_TO_HF_NAME = {
             "train": "liarliar/Daily-Omni",
@@ -48,14 +52,15 @@ class DailyOmniDataset(RawDataset):
         if split not in SPLIT_TO_HF_NAME:
             raise ValueError(f"Invalid split: {split}. Please use 'train'.")
 
-        self.hf_cache_dir = get_huggingface_cache_path(SPLIT_TO_HF_NAME[split])
-        if not self.hf_cache_dir:
+        hf_cache_dir = get_huggingface_cache_path(SPLIT_TO_HF_NAME[split])
+        if not hf_cache_dir:
             # download the dataset
-            self.hf_cache_dir = snapshot_download(
+            hf_cache_dir = snapshot_download(
                 repo_id=SPLIT_TO_HF_NAME[split], repo_type="dataset"
             )
-        if not self.hf_cache_dir:
+        if not hf_cache_dir:
             raise ValueError("Cannot download DailyOmniDataset.")
+        self.hf_cache_dir = hf_cache_dir
 
         json_file = os.path.join(self.hf_cache_dir, "qa.json")
 
@@ -104,34 +109,47 @@ class DailyOmniDataset(RawDataset):
         self.split_train_validation(split_validation_size, seed)
 
     @classmethod
-    def get_prompt(cls, data: dict[str, Any]) -> str:
+    def get_prompt(
+        cls,
+        data: dict[str, Any],
+        include_single_letter_instruction: bool = True,
+    ) -> str:
         # WARNING: model could have preference of a different prompt
         prompt = data["Question"] + "\n" + "\n".join(data["Choice"])
-        candidate_answers = [chr(ord("A") + idx) for idx in range(len(data["Choice"]))]
-        candidate_answers_all_but_last = ",".join(candidate_answers[:-1])
-        prompt += (
-            "\n"
-            + "Your replies must contain only a single letter "
-            + f"(either {candidate_answers_all_but_last} or {candidate_answers[-1]})."
-        )
+        if include_single_letter_instruction:
+            candidate_answers = [
+                chr(ord("A") + idx) for idx in range(len(data["Choice"]))
+            ]
+            candidate_answers_all_but_last = ",".join(candidate_answers[:-1])
+            prompt += (
+                "\n"
+                + "Your replies must contain only a single letter "
+                + f"(either {candidate_answers_all_but_last} or {candidate_answers[-1]})."
+            )
         return prompt
 
-    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        video_dir = os.path.join(self.hf_cache_dir, "Videos", data["video_id"])
-        video_path = os.path.join(video_dir, data["video_id"] + "_video.mp4")
-        audio_path = os.path.join(video_dir, data["video_id"] + "_audio.wav")
+    def format_data(self, datum_dict: dict[str, Any]) -> dict[str, Any]:
+        video_dir = os.path.join(self.hf_cache_dir, "Videos", datum_dict["video_id"])
+        video_path = os.path.join(video_dir, datum_dict["video_id"] + "_video.mp4")
+        audio_path = os.path.join(video_dir, datum_dict["video_id"] + "_audio.wav")
         # Audio + video flow as two independent content items so the
         # Qwen2.5-Omni chat template renders both <|VIDEO|> and <|AUDIO|>
         # placeholders (Daily-Omni is an audio-visual benchmark).
         user_content = [
             {"type": "video", "video": video_path},
             {"type": "audio", "audio": load_audio_from_file(audio_path)},
-            {"type": "text", "text": self.get_prompt(data)},
+            {
+                "type": "text",
+                "text": self.get_prompt(
+                    datum_dict,
+                    include_single_letter_instruction=self.include_single_letter_instruction,
+                ),
+            },
         ]
         return {
             "messages": [
                 {"role": "user", "content": user_content},
-                {"role": "assistant", "content": data["Answer"]},
+                {"role": "assistant", "content": datum_dict["Answer"]},
             ],
             "task_name": self.task_name,
         }

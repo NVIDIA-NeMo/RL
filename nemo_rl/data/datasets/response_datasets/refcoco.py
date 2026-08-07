@@ -171,6 +171,9 @@ class RefCOCODataset(RawDataset):
         download_dir: Directory to download the dataset to, default is "./coco_images"
     """
 
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
+
     def __init__(
         self,
         split: str = "train",

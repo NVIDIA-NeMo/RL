@@ -38,6 +38,7 @@ tokenizer:
 data:
   prompt_file: examples/prompts/daily_omni.txt
   dataset_name: "daily-omni"
+  include_single_letter_instruction: false
   split: "train"
   env_name: vlm
 
