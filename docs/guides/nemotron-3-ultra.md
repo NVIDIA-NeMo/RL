@@ -255,8 +255,8 @@ supplies those.
 |---|---|---|
 | `EXTERNAL_JUDGES` | `0` | `1` serves GenRM and NL2Bash in a second hetgroup |
 | `GENRM_REPLICAS`, `GENRM_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 GenRM servers and TP per server |
-| `GENRM_REASONING_PARSER` | _required_ | Path to the reasoning-parser plugin `.py` served with the GenRM checkpoint |
-| `GENRM_REASONING_PARSER_NAME` | `ultra_v3` | Parser name registered by that plugin, or a parser built into vLLM |
+| `GENRM_REASONING_PARSER` | _empty_ | Optional path to a reasoning-parser plugin `.py`; omit it when `GENRM_REASONING_PARSER_NAME` is built into vLLM |
+| `GENRM_REASONING_PARSER_NAME` | `ultra_v3` | Parser name registered by the optional plugin, or a parser built into vLLM |
 | `NL2BASH_REPLICAS`, `NL2BASH_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 NL2Bash servers and TP per server |
 | `EXTERNAL_VLLM_SEGMENT_SIZE` | `4` | SLURM `--segment` for the external component |
 

@@ -20,9 +20,10 @@
 # pipeclean, driven by run_grpo_single_controller.py with streaming
 # forward/backward and the TransferQueue data plane.
 #
-# Shape (GB200 NVL72, 4 GPUs/node → 6144 GPUs), unchanged from the legacy
-# pipeclean so the two are comparable:
-#   Training 512 / vLLM 960 / Gym 64
+# Shape (GB200 NVL72, 4 GPUs/node), unchanged from the legacy pipeclean so the
+# two are comparable:
+#   NeMo RL: Training 512 / vLLM 960 / Gym 48
+#   External judges: GenRM 16 nodes / NL2Bash 2 nodes
 #
 # Smaller-scale SC runs at a 4:1 generation-to-training ratio were still
 # generation-bound, spending 71-73% of the step in exposed_generation. If this
@@ -75,7 +76,7 @@ export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/jiaqiz/
 export TRAIN_PATH="${TRAIN_PATH:-/lustre/fsw/portfolios/llmservice/users/jiaqiz/data/gym/rl-data-tools/blends/curriculum_v35_inescapable-sawfly.train.efforts0p15_qamathcode.jsonl}"
 export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/images/high_stripe/rl.nightly.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:nightly-20260806-sandbox.squashfs}"
 export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre:/lustre}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/${USER}/.cache/nemotron_ultra}"
@@ -85,6 +86,17 @@ export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansub
 export NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8}"
 export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B}"
 
+# Keep judge deployment identical to launch_6k_pipeclean.sh so the comparison
+# isolates the SingleController path.
+export EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-1}"
+export GENRM_REPLICAS="${GENRM_REPLICAS:-16}"
+export GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
+export GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-deepseek_r1}"
+export GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-0}"
+export NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-2}"
+export NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
+export EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-2}"
+
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_sw_pre}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # A 6K allocation may additionally need SLURM_QOS, SLURM_RESERVATION and
@@ -93,7 +105,7 @@ export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # 6K node split, identical to the legacy pipeclean. Callers may override.
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-512}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-960}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-64}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-48}"
 
 # CP=16 is baked into pipeclean_6k.yaml; allow an override for memory experiments.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"
