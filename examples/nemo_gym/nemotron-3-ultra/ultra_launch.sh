@@ -48,8 +48,7 @@ set -euo pipefail
 #                                          Slurm hetgroup instead of inside Gym
 #   GENRM_REPLICAS=4                       External GenRM servers (DP=1 each)
 #   GENRM_TENSOR_PARALLEL_SIZE=4           TP per external GenRM server
-#   GENRM_REASONING_PARSER=                Reasoning-parser plugin .py;
-#                                          required when EXTERNAL_JUDGES=1
+#   GENRM_REASONING_PARSER=                Optional reasoning-parser plugin .py
 #   GENRM_REASONING_PARSER_NAME=ultra_v3
 #   NL2BASH_REPLICAS=4                     External NL2Bash servers (DP=1 each)
 #   NL2BASH_TENSOR_PARALLEL_SIZE=4         TP per external NL2Bash server
@@ -64,6 +63,9 @@ set -euo pipefail
 #                                          Defaults to the NeMo Gym GRPO runner;
 #                                          set ./examples/run_grpo_single_controller.py
 #                                          for SingleController recipes
+#   MOUNT_GYM=1                            0 to use the Gym installation baked
+#                                          into the container instead of
+#                                          mounting the checkout's submodule
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
@@ -171,7 +173,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
   GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER}}"
   GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
-  : "${GENRM_REASONING_PARSER:?GENRM_REASONING_PARSER is required when EXTERNAL_JUDGES=1}"
+  GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-}"
   GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
   GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
   GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
@@ -202,7 +204,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
   EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 
-  register_external_vllm_pool GENRM \
+  genrm_pool_args=(
     --display-name GenRM \
     --model "${GENRM_MODEL}" \
     --container "${GENRM_CONTAINER}" \
@@ -213,8 +215,12 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
     --vllm-port "${GENRM_VLLM_PORT}" \
     --lb-port "${GENRM_LB_PORT}" \
     --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
-    --url-placeholder "${GENRM_BASE_URL}" \
-    --shared-path "${GENRM_REASONING_PARSER}"
+    --url-placeholder "${GENRM_BASE_URL}"
+  )
+  if [[ -n "${GENRM_REASONING_PARSER}" ]]; then
+    genrm_pool_args+=(--shared-path "${GENRM_REASONING_PARSER}")
+  fi
+  register_external_vllm_pool GENRM "${genrm_pool_args[@]}"
   external_vllm_pool_env GENRM \
     "FLASHINFER_WORKSPACE_BASE=/tmp" \
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
@@ -226,13 +232,15 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
     --max-num-seqs 256
     --gpu-memory-utilization 0.95
     --enable-prefix-caching
-    --reasoning-parser-plugin "${GENRM_REASONING_PARSER}"
     --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
     --enable-auto-tool-choice
     --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
     --compilation-config "${GENRM_COMPILATION_CONFIG}"
     --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
   )
+  if [[ -n "${GENRM_REASONING_PARSER}" ]]; then
+    genrm_vllm_args+=(--reasoning-parser-plugin "${GENRM_REASONING_PARSER}")
+  fi
   [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
   external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
 
@@ -308,7 +316,7 @@ JOB_NAME="${EXP_NAME}"
 # =============================================================================
 # Output directories
 # =============================================================================
-RESULTS_DIR="${RESULTS_DIR:-results/${EXP_NAME}}"
+RESULTS_DIR="${RESULTS_DIR:-${PROJECT_ROOT}/results/${EXP_NAME}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}"
 
 # Per-submission dirs for logs and Slurm output (timestamped for history).
@@ -393,6 +401,11 @@ CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-}"
 # =============================================================================
 export CONTAINER
 MOUNTS="${MOUNTS:-}"
+MOUNT_GYM="${MOUNT_GYM:-1}"
+if [[ "${MOUNT_GYM}" != "0" && "${MOUNT_GYM}" != "1" ]]; then
+  echo "ERROR: MOUNT_GYM must be 0 or 1 (got '${MOUNT_GYM}')." >&2
+  exit 1
+fi
 
 # GB200 NVL72 defaults to 4 GPUs/node. Allow H100 smoke configs to request
 # their native 8-GPU node shape through the launch environment.
@@ -716,9 +729,11 @@ if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
+if [[ "${MOUNT_GYM}" == "1" && -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
   _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
   echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+elif [[ "${MOUNT_GYM}" == "0" ]]; then
+  echo "  Mount: Gym disabled (using container-baked Gym)"
 fi
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
@@ -841,6 +856,7 @@ uv run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
+cluster.segment_size=${SEGMENT_SIZE} \
 policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
 env.nemo_gym.num_gpu_nodes=${NUM_GYM_NODES} \
 checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
