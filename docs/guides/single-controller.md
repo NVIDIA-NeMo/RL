@@ -154,7 +154,7 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 
 ### Migrating a legacy async config
 
-SC reads its async knobs from `async_rl:` and **ignores `grpo.async_grpo:` entirely**.
+SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`** — `run_grpo_single_controller.py` raises if a legacy block is still present, so null it out when porting rather than leaving it in place.
 
 | Legacy `grpo.async_grpo.*` | SC equivalent `async_rl.*` |
 | -------------------------- | -------------------------- |

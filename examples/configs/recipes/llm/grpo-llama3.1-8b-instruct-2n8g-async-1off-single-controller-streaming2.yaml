@@ -8,9 +8,8 @@ logger:
 
 # SC does not support validation and checkpointing yet.
 grpo:
-  # Null out the legacy async_grpo block inherited from
-  # performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml: SC reads
-  # async_rl instead and would silently ignore any values left here.
+  # Null out the legacy async_grpo block inherited from performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
   async_grpo: null
   val_period: 0
 
