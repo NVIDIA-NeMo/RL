@@ -162,6 +162,8 @@ project-includes = [
   "nemo_rl/models/dtensor/parallelize.py",
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
+"nemo_rl/models/generation/dllm/__init__.py",
+"nemo_rl/models/generation/dllm/denoise.py",
   "nemo_rl/models/generation/interfaces.py",
   "nemo_rl/models/generation/megatron/__init__.py",
   "nemo_rl/models/generation/megatron/config.py",
