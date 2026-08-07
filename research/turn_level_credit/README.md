@@ -198,6 +198,3 @@ default credit weight or clipping policy without those measurements.
   rollout metrics. A promoted core version should additionally expose
   post-filter auxiliary-advantage metrics through a shared estimator contract.
 - TRACE needs separate prefix-plus-gold-answer scoring and is a later change.
-
-The complete integration and promotion audit is in
-[`docs/design-docs/turn-level-credit-assignment.md`](../../docs/design-docs/turn-level-credit-assignment.md).
