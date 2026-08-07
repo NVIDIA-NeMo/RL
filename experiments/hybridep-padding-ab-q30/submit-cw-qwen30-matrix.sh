@@ -72,6 +72,7 @@ unset RAY_ADDRESS RAY_NAMESPACE UV_CACHE_DIR_OVERRIDE
 unset NRL_IGNORE_VERSION_MISMATCH NRL_FORCE_REBUILD_VENVS
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+LAUNCH_BIN=$SCRIPT_DIR/launch-bin
 PYTHON=${PYTHON:-python3}
 ARM=${ARM:?Set ARM to one of the names emitted by arm_matrix.py --list}
 RENDER_ONLY=${RENDER_ONLY:-0}
@@ -98,6 +99,8 @@ fi
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-padding-ab-q30/cw-h100}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$EXPERIMENT_ROOT/$ARM}
 SOURCE_PATH=${SOURCE_PATH:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}
+PREFLIGHT_VENV=${PREFLIGHT_VENV:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-upstream5008-validation/cw-h100/preflight-venv}
+RUN_PYTHON=$PREFLIGHT_VENV/bin/python
 BATCH_SCRIPT=$SCRIPT_DIR/ray-nonexclusive.sub
 ACCOUNT_FOR_RENDER=${ACCOUNT:-ACCOUNT_REQUIRED}
 JOB_NAME=${JOB_NAME:-$ACCOUNT_FOR_RENDER:hybridep-q30-$ARM}
@@ -108,7 +111,7 @@ REQUIRES_DEEPEP_ARTIFACT=$HYBRIDEP_BACKEND
 BACKEND_NAME=none
 [[ "$HYBRIDEP_BACKEND" == 0 ]] || BACKEND_NAME=hybridep
 
-RUN_ARGS=(uv run --no-sync examples/run_grpo.py --config "$RECIPE"
+RUN_ARGS=("$RUN_PYTHON" examples/run_grpo.py --config "$RECIPE"
   "grpo.max_num_steps=$MAX_STEPS" checkpointing.enabled=false
   policy.sequence_packing.enabled=true
   "policy.megatron_cfg.moe_token_dispatcher_type=$DISPATCHER")
@@ -176,17 +179,21 @@ SOURCE_REMOTE=fork
 MCORE_5008_COMMIT=81770cb015eab05785ecd540ba929d1400a52f67
 EXPECTED_GPU_MODEL='NVIDIA H100 80GB HBM3'
 EXPECTED_ARCHITECTURE=x86_64
-PREFLIGHT_VENV=${PREFLIGHT_VENV:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-upstream5008-validation/cw-h100/preflight-venv}
-
 mkdir -p "$OUTPUT_ROOT"
 require_canonical_lustre_path SOURCE_PATH "$SOURCE_PATH"
 require_canonical_lustre_path OUTPUT_ROOT "$OUTPUT_ROOT"
 require_canonical_lustre_path PREFLIGHT_VENV "$PREFLIGHT_VENV"
+require_canonical_lustre_path LAUNCH_BIN "$LAUNCH_BIN"
 GIT_COMMON_DIR=$(git -C "$SOURCE_PATH" rev-parse --path-format=absolute --git-common-dir)
 require_canonical_lustre_path GIT_COMMON_DIR "$GIT_COMMON_DIR"
 [[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" && -f "$BATCH_SCRIPT" ]] || die "invalid source or batch script"
-CUDNN_HOST_PATH=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
-require_canonical_lustre_path CUDNN_HOST_PATH "$CUDNN_HOST_PATH"
+PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages
+CUDNN_HOME=$PREFLIGHT_SITE_PACKAGES/nvidia/cudnn
+CUDNN_PATH=$CUDNN_HOME
+require_canonical_lustre_path PREFLIGHT_SITE_PACKAGES "$PREFLIGHT_SITE_PACKAGES"
+require_canonical_lustre_path CUDNN_HOME "$CUDNN_HOME"
+[[ -L "$RUN_PYTHON" || -x "$RUN_PYTHON" ]] || die "preflight Python is missing: $RUN_PYTHON"
+[[ -x "$LAUNCH_BIN/srun" && -x "$LAUNCH_BIN/uv" ]] || die "runtime launch wrappers are missing or not executable"
 [[ -z $(git -C "$SOURCE_PATH" status --porcelain --untracked-files=all) ]] || die "NeMo-RL source is dirty"
 [[ -z $(git -C "$SOURCE_PATH" submodule foreach --recursive --quiet 'dirty=$(git status --porcelain --untracked-files=all); if [ -n "$dirty" ]; then printf "%s\n" "$displaypath"; fi') ]] || die "recursive submodule source is dirty"
 ! git -C "$SOURCE_PATH" submodule status --recursive | grep -Eq '^[+-U]' || die "recursive submodule checkout mismatch"
@@ -197,6 +204,8 @@ HARNESS_COMMIT=$(git -C "$HARNESS_ROOT" rev-parse HEAD)
 LAUNCHER_SHA256=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)
 BATCH_SCRIPT_SHA256=$(sha256sum "$BATCH_SCRIPT" | cut -d' ' -f1)
 MATRIX_SHA256=$(sha256sum "$SCRIPT_DIR/arm_matrix.py" | cut -d' ' -f1)
+SRUN_WRAPPER_SHA256=$(sha256sum "$LAUNCH_BIN/srun" | cut -d' ' -f1)
+UV_WRAPPER_SHA256=$(sha256sum "$LAUNCH_BIN/uv" | cut -d' ' -f1)
 LOCAL_HEAD=$(git -C "$SOURCE_PATH" rev-parse HEAD)
 [[ "$LOCAL_HEAD" == "$EXPECTED_NEMO_RL_COMMIT" ]] || die "NeMo-RL commit mismatch"
 PUSHED_HEAD=$(git -C "$SOURCE_PATH" ls-remote "$SOURCE_REMOTE" "refs/heads/$SOURCE_BRANCH" | cut -f1)
@@ -333,13 +342,14 @@ printf 'source_branch=%s\npreflight_manifest_sha256=%s\nbatch_script=%s\n' \
   "$SOURCE_BRANCH" "$PREFLIGHT_MANIFEST_SHA256" "$BATCH_SCRIPT" \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'git_common_dir=%s\n' "$GIT_COMMON_DIR" >> "$PROVENANCE_ROOT/submission.txt"
-printf 'cudnn_host_path=%s\ncudnn_container_path=%s\n' \
-  "$CUDNN_HOST_PATH" \
-  "/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn" \
+printf 'preflight_venv=%s\npreflight_site_packages=%s\nrun_python=%s\ncudnn_path=%s\n' \
+  "$PREFLIGHT_VENV" "$PREFLIGHT_SITE_PACKAGES" "$RUN_PYTHON" "$CUDNN_HOME" \
   >> "$PROVENANCE_ROOT/submission.txt"
-printf 'uv_cache_override=disabled\ncontainer_baked_uv_archive_preserved=1\n' \
+printf 'uv_cache_override=disabled\nfrozen_preflight_runtime=1\n' \
   >> "$PROVENANCE_ROOT/submission.txt"
-printf 'version_mismatch_override=disabled\nforce_rebuild_venvs=disabled\n' \
+printf 'version_mismatch_override=validated_frozen_preflight_venv\nforce_rebuild_venvs=disabled\n' \
+  >> "$PROVENANCE_ROOT/submission.txt"
+printf 'driver_runtime=frozen_preflight_venv\nactor_runtime=specialized_uv_venvs\nactor_system_executable_override=disabled\n' \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'padding_telemetry=%s\n' "$COLLECT_PADDING_TELEMETRY" \
   >> "$PROVENANCE_ROOT/submission.txt"
@@ -348,6 +358,9 @@ printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_ch
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'harness_commit=%s\nlauncher_sha256=%s\nbatch_script_sha256=%s\nmatrix_sha256=%s\n' \
   "$HARNESS_COMMIT" "$LAUNCHER_SHA256" "$BATCH_SCRIPT_SHA256" "$MATRIX_SHA256" \
+  >> "$PROVENANCE_ROOT/submission.txt"
+printf 'srun_wrapper_sha256=%s\nuv_wrapper_sha256=%s\n' \
+  "$SRUN_WRAPPER_SHA256" "$UV_WRAPPER_SHA256" \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'deepep_overlay_dir=%s\ndeepep_overlay_bytes=%s\ndeepep_overlay_tree_sha256=%s\n' \
   "$DEEPEP_OVERLAY_DIR" "$DEEPEP_OVERLAY_BYTES" "$DEEPEP_OVERLAY_TREE_SHA256" \
@@ -358,6 +371,10 @@ export EXPECTED_NEMO_RL_COMMIT EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT
 export EXPECTED_DEEPEP_COMMIT DEEPEP_WHEEL DEEPEP_METADATA DEEPEP_SHA256
 export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES DEEPEP_OVERLAY_TREE_SHA256
 export EXPECTED_GPU_MODEL GPUS_PER_NODE DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING
+export PREFLIGHT_VENV PREFLIGHT_SITE_PACKAGES RUN_PYTHON
+export UV_PROJECT_ENVIRONMENT=$PREFLIGHT_VENV
+export VIRTUAL_ENV=$PREFLIGHT_VENV
+export NRL_IGNORE_VERSION_MISMATCH=1
 export HF_HOME=${HF_CACHE:-$EXPERIMENT_ROOT/hf-cache}
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export NRL_NODE_LOCAL_UV_CACHE_DIR=${NRL_NODE_LOCAL_UV_CACHE_DIR:-/tmp/nemo-rl-uv-cache-$ARM}
@@ -369,14 +386,16 @@ export TORCH_HOME=$CACHE_ROOT/torch
 export WANDB_CACHE_DIR=$CACHE_ROOT/wandb
 export TRITON_CACHE_DIR=/tmp/nemo-rl-triton-$ARM-$LOCAL_HEAD
 export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
-export CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-export CUDNN_HOME=$CUDNN_CONTAINER_PATH
-export CUDNN_PATH=$CUDNN_HOME
+export CUDNN_HOME CUDNN_PATH
 export PYTHONDONTWRITEBYTECODE=1
-export LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LAUNCH_BIN
+export SRUN_WRAPPER_AUDIT_LOG=$OUTPUT_ROOT/srun-wrapper-$RUN_STAMP.log
+export UV_WRAPPER_AUDIT_LOG=$OUTPUT_ROOT/uv-wrapper-$RUN_STAMP.log
+export PATH="$LAUNCH_BIN:$PREFLIGHT_VENV/bin:/opt/nemo_rl_venv/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
 export MCORE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
-export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$HF_DATASETS_CACHE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$WANDB_CACHE_DIR"
 require_canonical_lustre_path HF_HOME "$HF_HOME"
 require_canonical_lustre_path HF_DATASETS_CACHE "$HF_DATASETS_CACHE"
@@ -396,7 +415,7 @@ export CONTAINER
 
 EXTRA_MOUNTS=${MOUNTS:-}
 validate_extra_mounts "$EXTRA_MOUNTS"
-MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH"
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$LAUNCH_BIN:$LAUNCH_BIN"
 if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/"* ]]; then
   MOUNTS_VALUE="$MOUNTS_VALUE,$GIT_COMMON_DIR:$GIT_COMMON_DIR"
 fi
@@ -417,7 +436,7 @@ fi
 read -r -d '' SETUP_COMMAND <<'SETUP' || true
 set -euo pipefail
 cd "$SOURCE_PATH"
-RUN_PYTHON=/opt/nemo_rl_venv/bin/python
+: "${RUN_PYTHON:?RUN_PYTHON is required}"
 [[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
 "$RUN_PYTHON" - <<'PY'
 import importlib.util
@@ -426,12 +445,14 @@ from pathlib import Path
 import click
 import ray
 import requests
+import transformer_engine.pytorch as te
 import urllib3
 import urllib3.exceptions
 from ray.scripts.scripts import main as ray_cli_main
 
 assert click.ClickException
 assert ray_cli_main
+assert te
 assert Path(click.__file__).resolve().is_file()
 assert Path(urllib3.__file__).resolve().is_file()
 spec = importlib.util.find_spec("uvloop")

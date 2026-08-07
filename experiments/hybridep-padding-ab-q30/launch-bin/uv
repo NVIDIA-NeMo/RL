@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+set -euo pipefail
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+
+: "${UV_WRAPPER_AUDIT_LOG:?UV_WRAPPER_AUDIT_LOG is required}"
+wrapper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+if [[ -n "${UV_REAL_BIN:-}" ]]; then
+  real_uv=$UV_REAL_BIN
+else
+  IFS=: read -r -a path_entries <<< "$PATH"
+  delegate_entries=()
+  for path_entry in "${path_entries[@]}"; do
+    [[ "$path_entry" == "$wrapper_dir" ]] && continue
+    delegate_entries+=("$path_entry")
+  done
+  [[ ${#delegate_entries[@]} -gt 0 ]] || die "PATH has no uv delegate candidates"
+  delegate_path=$(IFS=:; printf '%s' "${delegate_entries[*]}")
+  real_uv=$(PATH="$delegate_path" command -v uv || true)
+fi
+
+[[ -n "$real_uv" && -x "$real_uv" ]] || die "real uv is not executable: ${real_uv:-missing}"
+[[ "$(readlink -f -- "$real_uv")" != "$(readlink -f -- "${BASH_SOURCE[0]}")" ]] || die "uv wrapper recursion detected"
+printf 'mode=delegate uv_no_config=%s argc=%s first=%s real_uv=%s\n' \
+  "${UV_NO_CONFIG-unset}" "$#" "${1-none}" "$real_uv" >> "$UV_WRAPPER_AUDIT_LOG"
+exec "$real_uv" "$@"

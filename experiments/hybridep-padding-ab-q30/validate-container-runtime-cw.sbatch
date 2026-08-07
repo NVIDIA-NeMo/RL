@@ -167,6 +167,6 @@ srun --no-container-mount-home \
   --container-env="$CONTAINER_ENV" \
   --container-workdir=/tmp \
   --nodes=1 --ntasks=1 --gpus-per-task=1 \
-  bash -lc '"$RUN_PYTHON" -m pip freeze | LC_ALL=C sort' \
+  bash -lc 'env -u PYTHONPATH "$RUN_PYTHON" -m pip freeze | LC_ALL=C sort' \
   > "$MANIFEST_OUTPUT"
 sha256sum "$MANIFEST_OUTPUT"

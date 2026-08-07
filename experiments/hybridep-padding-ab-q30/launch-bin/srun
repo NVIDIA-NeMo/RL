@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+set -euo pipefail
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+
+REAL_SRUN=${SRUN_REAL_BIN:-/cm/shared/apps/slurm/current/bin/srun}
+: "${SRUN_WRAPPER_AUDIT_LOG:?SRUN_WRAPPER_AUDIT_LOG is required}"
+[[ -x "$REAL_SRUN" ]] || die "real srun is not executable: $REAL_SRUN"
+
+containerized=0
+runtime_container=0
+has_container_env=0
+for argument in "$@"; do
+  case "$argument" in
+    --container-image | --container-image=*) containerized=1 ;;
+    --container-name=ray-head | --container-name=ray-worker) runtime_container=1 ;;
+    --container-env | --container-env=*) has_container_env=1 ;;
+  esac
+done
+
+if [[ "$containerized" -eq 1 && "$runtime_container" -eq 1 ]]; then
+  [[ "$has_container_env" -eq 0 ]] || die "container-env is managed by the wrapper"
+  : "${UV_PROJECT_ENVIRONMENT:?UV_PROJECT_ENVIRONMENT is required}"
+  : "${VIRTUAL_ENV:?VIRTUAL_ENV is required}"
+  : "${CUDNN_HOME:?CUDNN_HOME is required}"
+  : "${CUDNN_PATH:?CUDNN_PATH is required}"
+  : "${PREFLIGHT_SITE_PACKAGES:?PREFLIGHT_SITE_PACKAGES is required}"
+  : "${RUN_PYTHON:?RUN_PYTHON is required}"
+  : "${NRL_IGNORE_VERSION_MISMATCH:?NRL_IGNORE_VERSION_MISMATCH is required}"
+  : "${NEMO_RL_VENV_DIR:?NEMO_RL_VENV_DIR is required}"
+
+  container_env=PATH,PYTHONPATH,LD_LIBRARY_PATH,UV_PROJECT_ENVIRONMENT,VIRTUAL_ENV,CUDNN_HOME,CUDNN_PATH,PREFLIGHT_SITE_PACKAGES,RUN_PYTHON,NRL_IGNORE_VERSION_MISMATCH,NEMO_RL_VENV_DIR,PYTHONDONTWRITEBYTECODE,UV_WRAPPER_AUDIT_LOG,SRUN_WRAPPER_AUDIT_LOG
+  if [[ "${DEEPEP_OVERLAY_DIR:-none}" != none ]]; then
+    container_env+=,DEEPEP_OVERLAY_DIR,DEEPEP_WHEEL,DEEPEP_SHA256,DEEPEP_OVERLAY_TREE_SHA256
+  fi
+  printf 'mode=containerized injected=%s real_srun=%s\n' \
+    "$container_env" "$REAL_SRUN" >> "$SRUN_WRAPPER_AUDIT_LOG"
+  exec "$REAL_SRUN" --container-env="$container_env" "$@"
+fi
+
+if [[ "$containerized" -eq 1 ]]; then
+  printf 'mode=delegate-other-container real_srun=%s\n' \
+    "$REAL_SRUN" >> "$SRUN_WRAPPER_AUDIT_LOG"
+  exec "$REAL_SRUN" "$@"
+fi
+
+printf 'mode=delegate-noncontainer real_srun=%s\n' \
+  "$REAL_SRUN" >> "$SRUN_WRAPPER_AUDIT_LOG"
+exec "$REAL_SRUN" "$@"

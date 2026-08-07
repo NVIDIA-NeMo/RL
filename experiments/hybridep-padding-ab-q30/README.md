@@ -18,11 +18,32 @@ Bridge `573e088c9`, and MCore `6513e3e23`; the legacy arm uses NeMo-RL
 | `official-pr5008-f725` | HybridEP | `f725d296` | MCore PR 5008 per-dispatch padding |
 | `legacy-prepad-17cf` | HybridEP | `17cfb817` | one NeMo pre-pad per microbatch; PR 5008 padding disabled |
 
+The official path first takes the maximum local dispatch size across the MoE
+communication group, then rounds that maximum up to MCore's 64-token HybridEP
+alignment. The historical NeMo path pads the packed microbatch before the
+dispatcher and is intentionally retained only as a legacy stack comparison.
+`NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128` controls the DeepEP combine API chunk
+size; it is not a request to add another 128-token input-padding layer.
+
 `arm_matrix.py` is the authoritative machine-readable contract. The launcher
 fails closed on exact source and recursive submodule commits, pushed branch
 identity, container SHA, DeepEP wheel metadata and SHA, frozen Python
 environment manifest, all eight H100 names, effective MCore configuration,
 and the legacy padding contract.
+
+The dated container is paired with a checksum-pinned frozen preflight venv
+whose full manifest was validated on H100. The launcher mounts that venv at the
+same Lustre path and injects its Python, Transformer Engine, cuDNN, and source
+paths into every containerized `srun`. The corresponding intentional
+`NRL_IGNORE_VERSION_MISMATCH=1` exception is recorded as
+`validated_frozen_preflight_venv`; forced venv rebuilding remains disabled.
+The Ray daemon, driver, and bootstrap use that frozen runtime. Megatron and
+vLLM actors retain NeMo-RL's specialized `uv`-built actor environments, matching
+the previously successful CW execution; the frozen environment intentionally
+does not contain vLLM. The base-venv manifest is generated with `PYTHONPATH`
+cleared so the 17cf and
+f725 DeepEP overlays cannot contaminate its hash; each overlay is attested
+separately by its wheel and expanded-tree hashes.
 
 ## Render and validate
 

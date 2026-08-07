@@ -31,6 +31,12 @@ STAGE_NIGHTLY_SCRIPT = (
     / "hybridep-padding-ab-q30"
     / "stage-nightly-container-cw.sbatch"
 )
+LAUNCH_BIN = ROOT / "experiments" / "hybridep-padding-ab-q30" / "launch-bin"
+SRUN_WRAPPER = LAUNCH_BIN / "srun"
+UV_WRAPPER = LAUNCH_BIN / "uv"
+PREFLIGHT_MANIFEST_SHA256 = (
+    "f80438561d65a2be18ed888dac438b5dbea93dc5a374e5acbb37e0db3c6d8816"
+)
 
 
 def _render(
@@ -131,13 +137,14 @@ def test_rendered_arm_contract(
     assert Path(rendered["batch_script"]) == BATCH_SCRIPT
     assert rendered["container"].endswith("nemo_rl_nightly_20260805_15171871.sqsh")
     assert len(rendered["container_sha256"]) == 64
-    assert len(rendered["preflight_manifest_sha256"]) == 64
+    assert rendered["preflight_manifest_sha256"] == PREFLIGHT_MANIFEST_SHA256
     assert rendered["sbatch_environment_sanitized"] == "1"
     assert rendered["ray_environment_sanitized"] == "1"
     assert rendered["job_name"].endswith(arm)
     assert rendered["output_root"].endswith(f"/{arm}")
     assert "grpo.max_num_steps=20" in rendered["training_command"]
-    assert "uv run --no-sync" in rendered["training_command"]
+    assert "uv run --no-sync" not in rendered["training_command"]
+    assert "/preflight-venv/bin/python examples/run_grpo.py" in rendered["training_command"]
     assert "--active" not in rendered["training_command"]
     assert "policy.sequence_packing.enabled=true" in rendered["training_command"]
     assert "--nodes=4" in rendered["sbatch_command"]
@@ -309,36 +316,48 @@ def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
     for script in (launcher, validator):
         assert "Megatron-Bridge/src" in script
         assert "Megatron-Bridge/3rdparty/Megatron-LM" in script
-    assert 'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE${PYTHONPATH' in launcher
+    assert (
+        'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES'
+        in launcher
+    )
     assert (
         'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES'
         in validator
     )
 
 
-def test_ray_bootstrap_preserves_baked_uv_archive_and_pins_cudnn() -> None:
+def test_ray_bootstrap_uses_validated_frozen_preflight_runtime() -> None:
     launcher = LAUNCHER.read_text()
     validator = VALIDATE_SCRIPT.read_text()
 
-    assert "PREFLIGHT_SITE_PACKAGES=" not in launcher
+    assert "PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages" in launcher
     assert 'importlib.util.find_spec("uvloop")' in launcher
-    assert "RUN_PYTHON=/opt/nemo_rl_venv/bin/python" in launcher
+    assert "RUN_PYTHON=$PREFLIGHT_VENV/bin/python" in launcher
     assert 'env -u PYTHONPATH "$RUN_PYTHON" -m pip freeze' in launcher
-    assert 'export PATH="$PREFLIGHT_VENV/bin:$PATH"' not in launcher
-    assert "export VIRTUAL_ENV=" not in launcher
-    assert "export UV_PROJECT_ENVIRONMENT=" not in launcher
+    assert (
+        "env -u PYTHONPATH \"$RUN_PYTHON\" -m pip freeze"
+        in RUNTIME_VALIDATE_SCRIPT.read_text()
+    )
+    assert 'export PATH="$LAUNCH_BIN:$PREFLIGHT_VENV/bin:/opt/nemo_rl_venv/bin:$PATH"' in launcher
+    assert "export VIRTUAL_ENV=$PREFLIGHT_VENV" in launcher
+    assert "export UV_PROJECT_ENVIRONMENT=$PREFLIGHT_VENV" in launcher
+    assert "export NRL_IGNORE_VERSION_MISMATCH=1" in launcher
+    assert "version_mismatch_override=validated_frozen_preflight_venv" in launcher
+    assert "force_rebuild_venvs=disabled" in launcher
+    assert '$PREFLIGHT_VENV:$PREFLIGHT_VENV' in launcher
+    assert '$LAUNCH_BIN:$LAUNCH_BIN' in launcher
     assert "/opt/nemo_rl_venv/bin/ray --version" in validator
     assert "import ray, requests, urllib3, urllib3.exceptions" in validator
     assert (
-        'LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+        'LD_LIBRARY_PATH="$CUDNN_HOME/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
         in launcher
     )
     assert "/usr/local/cuda/compat/lib:$CUDNN_HOME/lib" in RUNTIME_VALIDATE_SCRIPT.read_text()
     assert (
-        "CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn"
+        "CUDNN_HOME=$PREFLIGHT_SITE_PACKAGES/nvidia/cudnn"
         in launcher
     )
-    assert '$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH' in launcher
+    assert "CUDNN_CONTAINER_PATH" not in launcher
     assert "unset RAY_ADDRESS RAY_NAMESPACE UV_CACHE_DIR_OVERRIDE" in launcher
     assert "export UV_CACHE_DIR_OVERRIDE" not in launcher
     assert "UV_CACHE_DIR_OVERRIDE=${" not in launcher
@@ -352,6 +371,134 @@ def test_ray_bootstrap_preserves_baked_uv_archive_and_pins_cudnn() -> None:
     assert "URLLIB3_CONTAINER_PATH" not in runtime_probe
     assert "from ray.scripts.scripts import main as ray_cli_main" in runtime_probe
     assert "assert click.ClickException" in runtime_probe
+
+
+def test_srun_wrapper_injects_frozen_runtime_without_requiring_deepep(
+    tmp_path: Path,
+) -> None:
+    fake_srun = tmp_path / "srun-real"
+    fake_srun.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$@"\n')
+    fake_srun.chmod(0o755)
+    audit_log = tmp_path / "srun-audit.log"
+    env = {
+        **os.environ,
+        "SRUN_REAL_BIN": str(fake_srun),
+        "SRUN_WRAPPER_AUDIT_LOG": str(audit_log),
+        "UV_PROJECT_ENVIRONMENT": "/lustre/preflight-venv",
+        "VIRTUAL_ENV": "/lustre/preflight-venv",
+        "CUDNN_HOME": "/lustre/preflight-venv/cudnn",
+        "CUDNN_PATH": "/lustre/preflight-venv/cudnn",
+        "PREFLIGHT_SITE_PACKAGES": "/lustre/preflight-venv/site-packages",
+        "RUN_PYTHON": "/lustre/preflight-venv/bin/python",
+        "NRL_IGNORE_VERSION_MISMATCH": "1",
+        "NEMO_RL_VENV_DIR": "/tmp/nemo-rl-venvs",
+    }
+
+    result = subprocess.run(
+        [
+            str(SRUN_WRAPPER),
+            "--container-image=image.sqsh",
+            "--container-name=ray-head",
+            "bash",
+            "-lc",
+            "true",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    arguments = result.stdout.splitlines()
+    container_env = next(arg for arg in arguments if arg.startswith("--container-env="))
+    assert "UV_PROJECT_ENVIRONMENT" in container_env
+    assert "PREFLIGHT_SITE_PACKAGES" in container_env
+    assert "RUN_PYTHON" in container_env
+    assert "NRL_IGNORE_VERSION_MISMATCH" in container_env
+    assert "DEEPEP_OVERLAY_DIR" not in container_env
+    assert "mode=containerized" in audit_log.read_text()
+
+
+def test_srun_wrapper_does_not_inject_runtime_into_sandbox_container(
+    tmp_path: Path,
+) -> None:
+    fake_srun = tmp_path / "srun-real"
+    fake_srun.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$@"\n')
+    fake_srun.chmod(0o755)
+    audit_log = tmp_path / "srun-audit.log"
+    env = {
+        **os.environ,
+        "SRUN_REAL_BIN": str(fake_srun),
+        "SRUN_WRAPPER_AUDIT_LOG": str(audit_log),
+    }
+
+    result = subprocess.run(
+        [
+            str(SRUN_WRAPPER),
+            "--container-image=sandbox.sqsh",
+            "--container-mounts=/tmp/sandbox:/tmp/sandbox",
+            "true",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert all(not arg.startswith("--container-env=") for arg in result.stdout.splitlines())
+    assert "mode=delegate-other-container" in audit_log.read_text()
+
+
+def test_srun_wrapper_rejects_an_existing_container_env(tmp_path: Path) -> None:
+    fake_srun = tmp_path / "srun-real"
+    fake_srun.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_srun.chmod(0o755)
+    env = {
+        **os.environ,
+        "SRUN_REAL_BIN": str(fake_srun),
+        "SRUN_WRAPPER_AUDIT_LOG": str(tmp_path / "srun-audit.log"),
+    }
+
+    result = subprocess.run(
+        [
+            str(SRUN_WRAPPER),
+            "--container-image=image.sqsh",
+            "--container-name=ray-head",
+            "--container-env=PATH",
+            "true",
+        ],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "container-env is managed by the wrapper" in result.stderr
+
+
+def test_uv_wrapper_delegates_without_recursing(tmp_path: Path) -> None:
+    fake_uv = tmp_path / "uv-real"
+    fake_uv.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$@"\n')
+    fake_uv.chmod(0o755)
+    audit_log = tmp_path / "uv-audit.log"
+    env = {
+        **os.environ,
+        "PATH": f"{LAUNCH_BIN}:{os.environ['PATH']}",
+        "UV_REAL_BIN": str(fake_uv),
+        "UV_WRAPPER_AUDIT_LOG": str(audit_log),
+    }
+
+    result = subprocess.run(
+        [str(UV_WRAPPER), "run", "--no-sync", "python", "-V"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.splitlines() == ["run", "--no-sync", "python", "-V"]
+    assert "mode=delegate" in audit_log.read_text()
 
 
 def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> None:
