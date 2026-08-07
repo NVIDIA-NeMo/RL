@@ -525,6 +525,20 @@ def test_uv_wrapper_delegates_without_recursing(tmp_path: Path) -> None:
     assert "mode=delegate" in audit_log.read_text()
 
 
+def test_launcher_stages_and_mounts_a_pinned_uv_delegate() -> None:
+    launcher = LAUNCHER.read_text()
+    srun_wrapper = SRUN_WRAPPER.read_text()
+
+    assert "UV_DELEGATE_SOURCE=$(command -v uv)" in launcher
+    assert 'UV_DELEGATE_SHA256=$(sha256sum "$UV_DELEGATE_SOURCE"' in launcher
+    assert 'UV_REAL_BIN="$UV_ARTIFACT_DIR/uv"' in launcher
+    assert '[[ $(sha256sum "$UV_REAL_BIN"' in launcher
+    assert "uv_delegate_sha256=%s" in launcher
+    assert "$UV_ARTIFACT_DIR:$UV_ARTIFACT_DIR:ro" in launcher
+    assert "export UV_REAL_BIN" in launcher
+    assert "UV_REAL_BIN" in srun_wrapper.split("container_env=", 1)[1]
+
+
 def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> None:
     launcher = LAUNCHER.read_text()
     setup = launcher.split("read -r -d '' SETUP_COMMAND <<'SETUP'", 1)[1].split(

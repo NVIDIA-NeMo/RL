@@ -171,7 +171,7 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   exit 0
 fi
 
-for command_name in du flock git mktemp mv python3 realpath sbatch sshare sha256sum stat uv; do
+for command_name in cp du flock git mktemp mv python3 realpath sbatch sshare sha256sum stat uv; do
   require_command "$command_name"
 done
 : "${ACCOUNT:?Set ACCOUNT after checking FairShare immediately before submission}"
@@ -184,6 +184,24 @@ require_canonical_lustre_path SOURCE_PATH "$SOURCE_PATH"
 require_canonical_lustre_path OUTPUT_ROOT "$OUTPUT_ROOT"
 require_canonical_lustre_path PREFLIGHT_VENV "$PREFLIGHT_VENV"
 require_canonical_lustre_path LAUNCH_BIN "$LAUNCH_BIN"
+UV_DELEGATE_SOURCE=$(command -v uv)
+require_canonical_lustre_path UV_DELEGATE_SOURCE "$UV_DELEGATE_SOURCE"
+UV_DELEGATE_SHA256=$(sha256sum "$UV_DELEGATE_SOURCE" | cut -d' ' -f1)
+UV_ARTIFACT_DIR=$EXPERIMENT_ROOT/artifacts/uv/$UV_DELEGATE_SHA256
+mkdir -p "$UV_ARTIFACT_DIR"
+require_canonical_lustre_path UV_ARTIFACT_DIR "$UV_ARTIFACT_DIR"
+UV_REAL_BIN="$UV_ARTIFACT_DIR/uv"
+(
+  flock 9
+  if [[ ! -x "$UV_REAL_BIN" ]]; then
+    UV_REAL_BIN_TEMP=$(mktemp "$UV_ARTIFACT_DIR/uv.tmp.XXXXXX")
+    cp "$UV_DELEGATE_SOURCE" "$UV_REAL_BIN_TEMP"
+    chmod 0755 "$UV_REAL_BIN_TEMP"
+    mv -f "$UV_REAL_BIN_TEMP" "$UV_REAL_BIN"
+  fi
+) 9>"$UV_ARTIFACT_DIR/.stage.lock"
+[[ $(sha256sum "$UV_REAL_BIN" | cut -d' ' -f1) == "$UV_DELEGATE_SHA256" ]] || die "staged uv checksum mismatch"
+UV_DELEGATE_VERSION=$($UV_REAL_BIN --version)
 GIT_COMMON_DIR=$(git -C "$SOURCE_PATH" rev-parse --path-format=absolute --git-common-dir)
 require_canonical_lustre_path GIT_COMMON_DIR "$GIT_COMMON_DIR"
 [[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" && -f "$BATCH_SCRIPT" ]] || die "invalid source or batch script"
@@ -362,6 +380,9 @@ printf 'harness_commit=%s\nlauncher_sha256=%s\nbatch_script_sha256=%s\nmatrix_sh
 printf 'srun_wrapper_sha256=%s\nuv_wrapper_sha256=%s\n' \
   "$SRUN_WRAPPER_SHA256" "$UV_WRAPPER_SHA256" \
   >> "$PROVENANCE_ROOT/submission.txt"
+printf 'uv_delegate_source=%s\nuv_delegate_bin=%s\nuv_delegate_sha256=%s\nuv_delegate_version=%s\n' \
+  "$UV_DELEGATE_SOURCE" "$UV_REAL_BIN" "$UV_DELEGATE_SHA256" "$UV_DELEGATE_VERSION" \
+  >> "$PROVENANCE_ROOT/submission.txt"
 printf 'deepep_overlay_dir=%s\ndeepep_overlay_bytes=%s\ndeepep_overlay_tree_sha256=%s\n' \
   "$DEEPEP_OVERLAY_DIR" "$DEEPEP_OVERLAY_BYTES" "$DEEPEP_OVERLAY_TREE_SHA256" \
   >> "$PROVENANCE_ROOT/submission.txt"
@@ -372,6 +393,7 @@ export EXPECTED_DEEPEP_COMMIT DEEPEP_WHEEL DEEPEP_METADATA DEEPEP_SHA256
 export DEEPEP_OVERLAY_DIR DEEPEP_OVERLAY_BYTES DEEPEP_OVERLAY_TREE_SHA256
 export EXPECTED_GPU_MODEL GPUS_PER_NODE DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING
 export PREFLIGHT_VENV PREFLIGHT_SITE_PACKAGES RUN_PYTHON
+export UV_REAL_BIN
 export UV_PROJECT_ENVIRONMENT=$PREFLIGHT_VENV
 export VIRTUAL_ENV=$PREFLIGHT_VENV
 export NRL_IGNORE_VERSION_MISMATCH=1
@@ -415,7 +437,7 @@ export CONTAINER
 
 EXTRA_MOUNTS=${MOUNTS:-}
 validate_extra_mounts "$EXTRA_MOUNTS"
-MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$LAUNCH_BIN:$LAUNCH_BIN"
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$LAUNCH_BIN:$LAUNCH_BIN,$UV_ARTIFACT_DIR:$UV_ARTIFACT_DIR:ro"
 if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/"* ]]; then
   MOUNTS_VALUE="$MOUNTS_VALUE,$GIT_COMMON_DIR:$GIT_COMMON_DIR"
 fi
