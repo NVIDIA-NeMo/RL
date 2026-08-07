@@ -1,0 +1,159 @@
+# =============================================================================
+# Nemotron 3 Ultra — 6K-GPU pipeclean on the SingleController path
+# =============================================================================
+# Overlay on pipeclean_6k.yaml that swaps the legacy async-GRPO driver for the
+# SingleController (SC) architecture: streaming forward/backward, the
+# TransferQueue data plane, and gated in-order rollout sampling.
+#
+# Everything about the model, parallelism, batch shape, sequence length and the
+# Gym blend is inherited unchanged, so a run of this config is comparable
+# against a pipeclean_6k.yaml run on the same node split.
+#
+# Entrypoint: examples/run_grpo_single_controller.py (NOT run_grpo_nemo_gym.py).
+# launch_6k_pipeclean_sc.sh sets that via TRAIN_ENTRYPOINT.
+#
+# Derived from two validated SC runs of a smaller model at GBS=512 (PPS=32),
+# one at the full-cohort streaming threshold and one at a quarter of it. The
+# second demonstrates streaming: each step's forward/backward is dispatched in
+# 2-3 chunks instead of one.
+#
+# Group vs sample units: async_rl counts PROMPT GROUPS, not generations. One
+# optimizer cohort here is 16384 / 16 = 1024 groups, versus 32 in the Nano runs.
+# =============================================================================
+defaults: pipeclean_6k.yaml
+
+# =============================================================================
+# Checkpointing — must be off
+# =============================================================================
+# setup_single_controller raises NotImplementedError when
+# checkpointing.enabled is true (single_controller_utils/setup.py). Saving is
+# still a TODO on the SC path (single_controller.py). The run therefore cannot
+# resume across the wall clock: size max_num_steps to fit one allocation.
+# =============================================================================
+checkpointing:
+  enabled: false
+
+grpo:
+  # Required because loss_fn.reference_policy_kl_penalty is 0.0. No reference
+  # model is built, but SC still computes reference logprobs unless this is
+  # set, and then fails with AttributeError: 'MegatronPolicyWorker' has no
+  # 'reference_state_dict'.
+  skip_reference_policy_logprobs_calculation: true
+
+  # val_period=-1 / val_at_start=false / val_at_end=false are inherited and
+  # already satisfy the SC guard (it rejects val_period > 0). No change needed.
+  #
+  # grpo.async_grpo is inherited and dead on this path — SC never reads it —
+  # but env.nemo_gym interpolates ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}
+  # for num_groups_nemo_rl, so removing the block would break config load.
+
+policy:
+  # ---------------------------------------------------------------------------
+  # Speculative-decoding draft head. run_grpo_single_controller.py reads
+  # config.policy["draft"]["enabled"] unconditionally, so omitting this block
+  # is a KeyError before Ray starts. The nemo_gym runner guards it with an `in`
+  # check, which is why pipeclean_6k.yaml does not need it.
+  # ---------------------------------------------------------------------------
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  generation:
+    # ---------------------------------------------------------------------------
+    # Weight refit transport. The inherited default (null) broadcasts every full
+    # parameter tensor from training to all 3840 generation ranks. nccl_reshard
+    # instead moves each parameter shard-to-shard between the two parallelism
+    # layouts over NCCL's M2N reshard, so no rank ever materializes a full
+    # tensor. The bulk path covers the MoE FFN projections, which are 97-98% of
+    # the weights at EP=64.
+    #
+    # Declared here rather than passed with `+` because refit_transport is
+    # NotRequired in VllmConfig; with the key present, REFIT_TRANSPORT=null in
+    # launch_6k_pipeclean_sc.sh falls back to the broadcast path.
+    #
+    # Experimental, and it degrades quietly: if the container lacks the nccl4py
+    # M2N integration, xferdtensor.py logs "nccl.m2n.reshard not found" and uses
+    # a Python implementation instead. Check the first run's logs for that line.
+    #
+    # Config already satisfies every constraint in
+    # docs/design-docs/nccl-reshard-refit.md: non-colocated, Megatron train,
+    # vLLM gen, ETP=1, PP=1 with no custom layout, BF16 end to end, and vLLM
+    # expert_parallel_size == tensor_parallel_size (8).
+    # ---------------------------------------------------------------------------
+    refit_transport: nccl_reshard
+
+    vllm_cfg:
+      # 0.85 -> 0.80. The NCCL staging buffer for update_weights_from_collective
+      # grows with generation rank count; a smaller-scale run OOM'd there at
+      # 0.85 with 128 generation ranks after running fine at 32. This recipe has
+      # 3840. Costs KV cache, so watch generation throughput.
+      #
+      # This is the pressure refit_transport: nccl_reshard removes, so 0.85 may
+      # be recoverable once a reshard run is confirmed healthy. Left at 0.80
+      # so the two only differ in the transport.
+      gpu_memory_utilization: 0.80
+
+# =============================================================================
+# SingleController async RL — required by MasterConfig
+# =============================================================================
+# in_order stamps each dispatched cohort with its exact target optimizer step.
+# The lookahead is the ceiling on off-policyness: generation may start a cohort
+# at most this many optimizer steps before the step that trains on it, so the
+# reported `lag` settles there once generation is the bottleneck.
+#
+# 4 buys deep generation/training overlap at the cost of policy freshness. The
+# loss compensates via truncated importance sampling (loss_fn:
+# use_importance_sampling_correction, truncated_importance_sampling_ratio 5),
+# but watch token_mult_prob_error and is_oob_ratio — if they climb, the
+# correction is being asked to cover too large a policy gap. Drop to 1 (the
+# validated value at smaller scale) if training destabilizes.
+# =============================================================================
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 4
+  recompute_kv_cache_after_weight_updates: false
+
+  # Begin forward/backward once this many groups are ready rather than waiting
+  # for all 1024; the remainder streams in behind it and accumulates into the
+  # single GBS=16384 optimizer step. 256 is 25% of the cohort, the ratio the
+  # smaller-scale streaming run used (8 of 32) to get 2-3 chunks per step.
+  min_groups_for_streaming_train: 256
+
+  # Let the current cohort and all four lookahead cohorts generate concurrently.
+  max_inflight_prompts: 5120
+
+  # Hard floor, not a preference: validate_sampler_buffer_capacity raises if
+  # this is below num_prompts_per_step * (max_lookahead_versions + 1)
+  # = 1024 * 5 = 5120, because the rollout pump would deadlock waiting for
+  # buffer slots. It scales with the lookahead, so raising one raises both.
+  max_buffered_rollouts: 5120
+
+  diagnostics: false
+
+# =============================================================================
+# TransferQueue data plane — mandatory for the SC path
+# =============================================================================
+# run_grpo_single_controller.py refuses to start unless enabled is true, and
+# DataPlaneConfig requires every key below with no Python-side defaults.
+# global_segment_size / local_buffer_size are read only when backend is
+# mooncake_cpu, but must still be present.
+# =============================================================================
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  storage_capacity: 1000000
+  # UNVALIDATED AT THIS SCALE. The smaller-scale reference uses 2 for 512
+  # rows/step at 73728 tokens; this recipe pushes 16384 rows/step at 131072
+  # tokens, roughly 57x the bytes, and the lookahead of 4 keeps up to 5120
+  # groups (81920 rows) resident at once. 64 is proportional to the per-step
+  # volume, not measured — raise it first if the TQ storage actors bottleneck
+  # or OOM.
+  num_storage_units: 64
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888  # 512 GiB
+  local_buffer_size:   68719476736   # 64 GiB

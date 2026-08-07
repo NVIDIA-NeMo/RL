@@ -191,8 +191,12 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     ``load_weights`` path.
 
     Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
+    Co-trained MTP weights are also routed to misc because vLLM keeps the MTP
+    drafter separate from the main model and updates it through ``load_weights``.
     """
     if "shared_expert" in param_name:
+        return False
+    if param_name.startswith("mtp."):
         return False
     return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
         FFN_GROUPED_EXPERT_SUFFIXES
@@ -245,6 +249,44 @@ def _restore_placement(p):
             return Shard(p["dim"])
         return Replicate()
     return Replicate()
+
+
+def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
+    """Copy refit metadata into types safe for vLLM's subprocess RPC.
+
+    Megatron patches Torch's tensor pickle reducer to use its safe_globals
+    loader. vLLM worker subprocesses intentionally do not install Megatron, so
+    even the small CPU rank tensors in MeshInfo cannot cross that pickle
+    boundary. Convert meshes and placements to the plain representation that
+    restore_refit_info_placements accepts.
+    """
+
+    def _wire_mesh(mesh):
+        if isinstance(mesh, MeshInfo):
+            return {"mesh": mesh.mesh.tolist()}
+        return mesh
+
+    def _wire_placement(placement):
+        if isinstance(placement, Shard):
+            return {"dim": placement.dim}
+        if isinstance(placement, Replicate):
+            return {}
+        return placement
+
+    wire_info = dict(refit_info)
+    wire_layers = {}
+    for layer_name, params in refit_info.get("per_layer_params", {}).items():
+        wire_params = []
+        for param_info in params:
+            wire_param = dict(param_info)
+            for key in ("src_mesh_info", "dst_mesh_info"):
+                wire_param[key] = _wire_mesh(wire_param.get(key))
+            for key in ("src_placements", "dst_placements"):
+                wire_param[key] = [_wire_placement(p) for p in wire_param.get(key, [])]
+            wire_params.append(wire_param)
+        wire_layers[layer_name] = wire_params
+    wire_info["per_layer_params"] = wire_layers
+    return wire_info
 
 
 def restore_refit_info_placements(refit_info: dict) -> dict:
