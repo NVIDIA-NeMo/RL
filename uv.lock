@@ -106,7 +106,7 @@ overrides = [
     { name = "numpy", specifier = ">=2.1.0" },
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
-    { name = "nvidia-cudnn-frontend", specifier = "==1.23.0" },
+    { name = "nvidia-cudnn-frontend", specifier = "==1.25.0" },
     { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" },
     { name = "nvidia-nccl-cu13", specifier = "==2.30.7" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform != 'darwin'", specifier = ">=3.6.5" },
@@ -118,7 +118,7 @@ overrides = [
     { name = "timm", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.16" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=e7c550c5f80636cf841a8204b1d6f85a5f3f28b7" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
 excludes = ["nvidia-cutlass-dsl-libs-base"]
@@ -187,13 +187,9 @@ version = "10.16.1.11"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.16.1+c9877be"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
-
-[[manifest.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.16.1+c9877be"
-requires-dist = ["torch", "transformer-engine"]
+version = "2.18.0+e7c550c5"
+requires-dist = ["einops", "importlib-metadata>=1.0", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.25.0", "onnx", "onnxscript", "packaging", "pydantic", "torch>=2.1"]
+provides-extras = ["core-cu13", "pytorch"]
 
 [[package]]
 name = "absl-py"
@@ -4712,6 +4708,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvdlfw-inspect"
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/86/94188e03e5d4dd7b73c390b0cddcde5618b3799c18e327b2bf15763f6137/nvdlfw_inspect-0.2.2-py3-none-any.whl", hash = "sha256:8a4dc2814c5a4cd19ae304170b9bfa514538ef3c3eb243a45a82404ec3cb279d", size = 30964, upload-time = "2025-12-03T10:52:01.933Z" },
+]
+
+[[package]]
 name = "nvidia-cublas"
 version = "13.5.1.27"
 source = { registry = "https://pypi.org/simple" }
@@ -4814,11 +4822,11 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.23.0"
+version = "1.25.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/bc/eed9ae32a00a7c501f6ca3b93782fe50b3c9fd9168d500586b761f42f2bd/nvidia_cudnn_frontend-1.23.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aa35283da087d65cdc1ea12a7872f90ed5a725e8ed0d8009b82d801bf92ad0ae", size = 2935910, upload-time = "2026-04-29T19:15:20.96Z" },
-    { url = "https://files.pythonhosted.org/packages/ad/14/4e0b66650d68f32d4c7b46e8b33cb98e69497f3fc1a9f63a02328a45d694/nvidia_cudnn_frontend-1.23.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a8b817a0deb94f394b082f1ca389829ec0c9c85411a1092f08719c66bbaa1e39", size = 3082233, upload-time = "2026-04-29T19:15:48.864Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/37/ea07ff3578cb3cc847fbed4e7eb84bf02afa81bed437dc0a5e8b7f040c9f/nvidia_cudnn_frontend-1.25.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e8a223ef2e821bbe89fdc6a461cbce36b509e2daaa0a4425eb387060e0cc6ec7", size = 3263340, upload-time = "2026-06-10T21:08:53.528Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/ff/072bc1ed5e6d7efaf785498e6610a0b2152603c1e020faa6e6b8761d4505/nvidia_cudnn_frontend-1.25.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:95ab349dfc871a4e7e5b7ceaed649a22b968ce02bca9be1d0a0a577e80fa6832", size = 3414303, upload-time = "2026-06-10T21:09:15.951Z" },
 ]
 
 [[package]]
@@ -8193,10 +8201,15 @@ dependencies = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.16.1+c9877be"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.16#c9877beb87ad7e711e1869dd0b5062167ede447a" }
+version = "2.18.0+e7c550c5"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=e7c550c5f80636cf841a8204b1d6f85a5f3f28b7#e7c550c5f80636cf841a8204b1d6f85a5f3f28b7" }
 dependencies = [
+    { name = "einops" },
     { name = "importlib-metadata" },
+    { name = "nvdlfw-inspect" },
+    { name = "nvidia-cudnn-frontend" },
+    { name = "onnx" },
+    { name = "onnxscript" },
     { name = "packaging" },
     { name = "pydantic" },
     { name = "torch" },

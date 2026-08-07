@@ -609,8 +609,6 @@ def test_nvfp4_pertoken_rejects_standalone_eval():
     "mutation",
     [
         {"colocated": {"enabled": False}},
-        {"vllm_cfg": {"async_engine": True}},
-        {"vllm_cfg": {"tensor_parallel_size": 2}},
         {"vllm_cfg": {"pipeline_parallel_size": 2}},
         {"vllm_cfg": {"expert_parallel_size": 2}},
         {"vllm_cfg": {"kv_cache_dtype": "fp8"}},
@@ -618,13 +616,34 @@ def test_nvfp4_pertoken_rejects_standalone_eval():
     ],
 )
 def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
-    """The fused refit stream requires colocated synchronous TP=PP=EP=1."""
+    """The fused refit stream requires colocated rollout and vLLM EP=1."""
     config = _make_nvfp4_pertoken_generation_config()
     _deep_update(config, mutation)
     with pytest.raises(ValueError, match="nvfp4_pertoken_rollout"):
         configure_generation_config(
             config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
         )
+
+
+@pytest.mark.parametrize(
+    "vllm_cfg",
+    [
+        {"tensor_parallel_size": 2},
+        {"pipeline_parallel_size": 2, "async_engine": True},
+        {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 2,
+            "async_engine": True,
+        },
+    ],
+)
+def test_nvfp4_pertoken_validation_accepts_vllm_model_parallelism(vllm_cfg):
+    """Setup accepts TP and async PP values for vLLM to validate further."""
+    config = _make_nvfp4_pertoken_generation_config()
+    config["vllm_cfg"].update(vllm_cfg)
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
 
 
 @pytest.mark.parametrize(

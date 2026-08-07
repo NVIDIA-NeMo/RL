@@ -321,7 +321,6 @@ environments = [
 ]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
-  "transformer-engine-torch",
   "transformer-engine",
   "flash-attn",
   "mamba-ssm",
@@ -349,10 +348,10 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.16",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@e7c550c5f80636cf841a8204b1d6f85a5f3f28b7",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.23.0",
+  "nvidia-cudnn-frontend==1.25.0",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
@@ -520,7 +519,6 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
-transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
@@ -562,13 +560,19 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.16.1+c9877be"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.16.1+c9877be"
-requires-dist = ["torch", "transformer-engine"]
+version = "2.18.0+e7c550c5"
+requires-dist = [
+  "einops",
+  "importlib-metadata>=1.0",
+  "nvdlfw-inspect",
+  "nvidia-cudnn-frontend>=1.25.0",
+  "onnx",
+  "onnxscript",
+  "packaging",
+  "pydantic",
+  "torch>=2.1",
+]
+provides-extras = ["core-cu13", "pytorch"]
 
 [[tool.uv.dependency-metadata]]
 name = "nv-grouped-gemm"
