@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
@@ -702,8 +703,22 @@ class AsyncTrajectoryCollector:
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
             if multimodal_data:
+                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+                    row_indices
+                )
+                # A mixed batch can route image rows to an Omni teacher and
+                # text-only rows to a plain GPT teacher. Do not pass modality
+                # kwargs whose selected rows are all absent.
                 sub_data.update(
-                    BatchedDataDict(multimodal_data).select_indices(row_indices)
+                    {
+                        key: value
+                        for key, value in selected_multimodal.items()
+                        if value is not None
+                        and not (
+                            isinstance(value, PackedTensor)
+                            and all(item is None for item in value.tensors)
+                        )
+                    }
                 )
 
             # Serialize calls per teacher to prevent NCCL collective desync

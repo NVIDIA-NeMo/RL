@@ -26,6 +26,7 @@ from nemo_rl.environments.nemo_gym import (
     _detect_invalid_tool_call_and_malformed_thinking,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    sanitize_nemo_gym_example_image_placeholders,
     spinup_nemo_gym_actor,
 )
 
@@ -68,6 +69,49 @@ def test_detect_invalid_tool_call_and_malformed_thinking(
     assert _detect_invalid_tool_call_and_malformed_thinking(output_item_dict) == (
         expected_invalid_tool_call,
         expected_malformed_thinking,
+    )
+
+
+def test_sanitize_image_placeholders_uses_structured_images_as_source_of_truth():
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Count <img><image></img>."},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA==",
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    sanitized = sanitize_nemo_gym_example_image_placeholders(example)
+
+    assert sanitized["responses_create_params"]["input"][0]["content"][0]["text"] == (
+        "Count ."
+    )
+    assert (
+        "<image>"
+        in example["responses_create_params"]["input"][0]["content"][0]["text"]
+    )
+
+
+def test_sanitize_image_placeholders_preserves_text_only_meaning():
+    example = {
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "Describe the <image>."}]
+        }
+    }
+
+    sanitized = sanitize_nemo_gym_example_image_placeholders(example)
+
+    assert sanitized["responses_create_params"]["input"][0]["content"] == (
+        "Describe the image."
     )
 
 
@@ -135,9 +179,7 @@ def test_spinup_nemo_gym_actor_uses_venv_directory_in_runtime_env(monkeypatch):
     )
 
     assert result is actor
-    make_runtime_env.assert_called_once_with(
-        "nemo_rl.environments.nemo_gym.NemoGym"
-    )
+    make_runtime_env.assert_called_once_with("nemo_rl.environments.nemo_gym.NemoGym")
     assert nemo_gym_cls.options.call_args.kwargs["runtime_env"] == runtime_env
     assert runtime_env["env_vars"]["VIRTUAL_ENV"] == venv_dir
     assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == venv_dir
