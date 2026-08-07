@@ -230,8 +230,14 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link: guides/quantization-aware-rl
 :link-type: doc
 
-Run quantized GRPO and distillation with NVIDIA ModelOpt, or TE NVFP4
-training with per-token vLLM rollout.
+Run quantized GRPO and distillation with NVIDIA ModelOpt.
+:::
+
+:::{grid-item-card} {octicon}`meter` End-to-End NVFP4 Training
+:link: design-docs/te-nvfp4-per-token-rollout
+:link-type: doc
+
+Run W4A4 policy training and per-token vLLM rollout on NVIDIA Blackwell GPUs.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
