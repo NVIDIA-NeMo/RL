@@ -143,7 +143,19 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 | Batch boundary   | Sampled by target weight                 | Sampler-defined; can decouple rollout dispatch from train batch (streaming)          |
 
 
-If you want a straight port of legacy semantics, use `sampler.name: in_order` with `max_lookahead_versions` matching your old `max_trajectory_age_steps` and `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}`.
+### Migrating a legacy async config
+
+SC reads its async knobs from `async_rl:` and **ignores `grpo.async_grpo:` entirely**.
+
+| Legacy `grpo.async_grpo.*` | SC equivalent `async_rl.*` |
+| -------------------------- | -------------------------- |
+| `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
+| `max_trajectory_age_steps: N` | `sampler.name: in_order` with `sampler.max_lookahead_versions: N` |
+| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same) |
+| `in_flight_weight_updates` | Always effectively true; `false`-equivalent behavior is not yet supported (drain-gate tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625)) |
+| *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}` |
+| *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
+| *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
 ## Known Missing Features
 
@@ -153,4 +165,3 @@ The SC path is still landing. Feature gaps are tracked in [issue #2625](https://
 - `prev_logprobs_required` / `reference_logprobs_required` gating is provisional — SC currently recomputes `prev_logprobs` even when the loss does not need them.
 - No `over_sampling_ratio` cap on the `windowed` sampler — over-produced groups aged past the window are evicted (wasted rollout compute).
 - Drain gate in refit is not supported yet.
-
