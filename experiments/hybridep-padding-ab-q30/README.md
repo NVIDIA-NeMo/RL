@@ -63,6 +63,8 @@ non-Lustre persistent paths, and redirects package/compiler caches away from
 
 The primary comparison uses matched Steps 2–20. Steps 5–20 are reported as a
 steady-state sensitivity window. Report arithmetic mean phase times and
-ratio-of-sums tokens/s/GPU for Policy, LogProb, generation, and end-to-end.
-Also report reward, KL, validation accuracy, failures, and bounded padding
-telemetry separately from the performance runs.
+arithmetic mean of the canonical logged tokens/s/GPU metrics for Policy,
+LogProb, generation, and end-to-end; do not reconstruct throughput from
+separately averaged counters. Also report included/missing/valid sample counts,
+reward, KL, validation accuracy, failures, and bounded padding telemetry
+separately from the performance runs.
