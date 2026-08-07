@@ -224,6 +224,7 @@ def test_container_runtime_probe_is_nonexclusive_and_one_gpu() -> None:
     assert "#SBATCH --cpus" not in runtime_probe
     assert "#SBATCH --mem" not in runtime_probe
     assert "import deep_ep" in runtime_probe
+    assert 'importlib.util.find_spec("uvloop")' in runtime_probe
     assert 'assert hasattr(uvloop, "install")' in runtime_probe
     assert "--container-env=" in runtime_probe
 
@@ -247,7 +248,7 @@ def test_ray_bootstrap_uses_container_runtime_with_pinned_cudnn_only() -> None:
     validator = VALIDATE_SCRIPT.read_text()
 
     assert "PREFLIGHT_SITE_PACKAGES=" not in launcher
-    assert "import ray, requests, urllib3.exceptions, uvloop" in launcher
+    assert 'importlib.util.find_spec("uvloop")' in launcher
     assert "RUN_PYTHON=/opt/nemo_rl_venv/bin/python" in launcher
     assert 'env -u PYTHONPATH "$RUN_PYTHON" -m pip freeze' in launcher
     assert 'export PATH="$PREFLIGHT_VENV/bin:$PATH"' not in launcher

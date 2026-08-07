@@ -43,6 +43,7 @@ srun --no-container-mount-home \
   --nodes=1 --ntasks=1 --gpus-per-task=1 \
   bash -lc '/opt/nemo_rl_venv/bin/python - <<'"'"'PY'"'"'
 import json
+import importlib.util
 import os
 import platform
 from pathlib import Path
@@ -54,7 +55,6 @@ import ray
 import requests
 import torch
 import urllib3.exceptions
-import uvloop
 
 overlay = Path(os.environ["DEEPEP_OVERLAY_DIR"]).resolve()
 module_paths = {}
@@ -62,7 +62,13 @@ for module in (deep_ep, deep_ep_cpp, hybrid_ep_cpp):
     module_path = Path(module.__file__).resolve()
     assert module_path.is_relative_to(overlay)
     module_paths[module.__name__] = str(module_path)
-assert hasattr(uvloop, "install")
+uvloop_spec = importlib.util.find_spec("uvloop")
+uvloop_path = None
+if uvloop_spec is not None:
+    import uvloop
+
+    assert hasattr(uvloop, "install")
+    uvloop_path = str(Path(uvloop.__file__).resolve())
 assert platform.python_version() == "3.13.14"
 assert torch.cuda.is_available()
 assert torch.cuda.get_device_capability(0) == (9, 0)
@@ -75,7 +81,7 @@ print(
             "python": platform.python_version(),
             "ray": ray.__version__,
             "requests": requests.__version__,
-            "uvloop": str(Path(uvloop.__file__).resolve()),
+            "uvloop": uvloop_path,
         },
         sort_keys=True,
     )

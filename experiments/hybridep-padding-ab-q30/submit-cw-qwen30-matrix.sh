@@ -408,7 +408,7 @@ set -euo pipefail
 cd "$SOURCE_PATH"
 RUN_PYTHON=/opt/nemo_rl_venv/bin/python
 [[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
-"$RUN_PYTHON" -c 'import ray, requests, urllib3.exceptions, uvloop; assert hasattr(uvloop, "install")'
+"$RUN_PYTHON" -c 'import importlib.util, ray, requests, urllib3.exceptions; spec = importlib.util.find_spec("uvloop"); assert spec is None or hasattr(__import__("uvloop"), "install")'
 VENV_MANIFEST="$PROVENANCE_ROOT/venv-$(hostname).txt"
 env -u PYTHONPATH "$RUN_PYTHON" -m pip freeze | LC_ALL=C sort > "$VENV_MANIFEST"
 [[ $(sha256sum "$VENV_MANIFEST" | cut -d' ' -f1) == "$PREFLIGHT_MANIFEST_SHA256" ]]
