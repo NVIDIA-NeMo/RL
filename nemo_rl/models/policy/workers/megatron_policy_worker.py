@@ -2760,7 +2760,9 @@ class MegatronPolicyWorkerImpl(
         # Resolve the inference layout the same way the non-colocated generation policy does:
         # overlay the sparse mcore_generation_config onto a copy of megatron_cfg.
         inference_config = copy.deepcopy(config)
-        inference_config["megatron_cfg"] = merged_inference_megatron_cfg(inference_config)
+        inference_config["megatron_cfg"] = merged_inference_megatron_cfg(
+            inference_config
+        )
         # Inference never uses CP: pin CP=1, so CP>1 training builds a separate inference model.
         inference_config["megatron_cfg"]["context_parallel_size"] = 1
 
