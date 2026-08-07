@@ -72,12 +72,12 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def _mooncake_transport_config() -> dict:
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "tcp")
+def _mooncake_transport_config(*, use_gdr: bool) -> dict:
+    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "rdma" if use_gdr else "tcp")
     if protocol != "rdma":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
-    if not device:
+    if not device and not use_gdr:
         try:
             out = subprocess.run(
                 [
@@ -94,7 +94,7 @@ def _mooncake_transport_config() -> dict:
             device = out or ""
         except Exception:
             device = ""
-    if device:
+    if device and not use_gdr:
         os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
     return {"protocol": "rdma", "device_name": device}
 
@@ -213,6 +213,9 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
     backend = cfg["backend"]
     storage_capacity = cfg["storage_capacity"]
     num_storage_units = cfg["num_storage_units"]
+    use_gdr = bool(cfg.get("use_gdr"))
+    if use_gdr and backend != "mooncake_cpu":
+        raise ValueError("data_plane.use_gdr requires backend='mooncake_cpu'")
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
@@ -286,7 +289,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
-                    **_mooncake_transport_config(),
+                    **_mooncake_transport_config(use_gdr=use_gdr),
+                    "use_gdr": use_gdr,
                 },
             },
         }

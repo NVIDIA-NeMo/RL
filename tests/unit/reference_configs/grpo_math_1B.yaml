@@ -504,6 +504,7 @@ data_plane:
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
+  use_gdr: false                     # optional; true enables GPU RDMA staging in CUDA TQ clients
   # observability:                    # NotRequired
   #   enabled: false
 

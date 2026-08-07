@@ -41,6 +41,11 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_pack_per_token_field_truncates_sp_padding` — pack_per_token_field slices each row to its own length, dropping SP padding.
 - `test_pack_per_token_field_exact_fit_matches_to_nested_by_length` — At exact fit, `pack_per_token_field` matches `to_nested_by_length`.
 
+## `test_mooncake_gdr.py` (2 tests)
+
+- `test_mooncake_cpu_keeps_tcp_default` — CPU mode remains TCP by default.
+- `test_mooncake_gdr_uses_rdma_with_client_local_device_selection` — GDR selects RDMA and leaves NIC selection to each client.
+
 ## `test_codec_wire_stripped.py` (5 tests)
 
 - `test_unwrap_wire_stripped_payload_empty_td_to_none` — Empty TD (batch_dims=0) → None.

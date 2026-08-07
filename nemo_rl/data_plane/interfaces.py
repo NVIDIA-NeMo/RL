@@ -58,6 +58,9 @@ class DataPlaneConfig(TypedDict):
     ``backend == "mooncake_cpu"``; the simple backend ignores them.
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
+
+    ``use_gdr`` is optional for backward compatibility. When omitted, GDR is
+    disabled. It may only be enabled with ``backend == "mooncake_cpu"``.
     """
 
     enabled: bool
@@ -68,6 +71,7 @@ class DataPlaneConfig(TypedDict):
     claim_meta_poll_interval_s: float
     global_segment_size: int
     local_buffer_size: int
+    use_gdr: NotRequired[bool]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]

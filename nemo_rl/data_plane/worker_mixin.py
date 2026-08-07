@@ -144,6 +144,11 @@ class TQWorkerMixin:
             return
         from nemo_rl.data_plane import build_data_plane_client
 
+        if cfg.get("use_gdr") and not torch.cuda.is_initialized():
+            raise RuntimeError(
+                "CUDA must be initialized before attaching TransferQueue with GDR"
+            )
+
         # bootstrap=False — the driver already created the named
         # controller actor; this process attaches as a client.
         self._dp_client = build_data_plane_client(cfg, bootstrap=False)
