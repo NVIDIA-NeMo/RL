@@ -243,7 +243,7 @@ def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
     )
 
 
-def test_ray_bootstrap_uses_container_runtime_with_pinned_cudnn_only() -> None:
+def test_ray_bootstrap_uses_container_runtime_with_pinned_compat_packages() -> None:
     launcher = LAUNCHER.read_text()
     validator = VALIDATE_SCRIPT.read_text()
 
@@ -266,6 +266,16 @@ def test_ray_bootstrap_uses_container_runtime_with_pinned_cudnn_only() -> None:
         in launcher
     )
     assert '$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH' in launcher
+    assert (
+        "URLLIB3_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/urllib3"
+        in launcher
+    )
+    assert '$URLLIB3_HOST_PATH:$URLLIB3_CONTAINER_PATH' in launcher
+    assert "urllib3_host_path=%s\\n" in launcher
+    assert "urllib3_container_path=%s\\n" in launcher
+    runtime_probe = RUNTIME_VALIDATE_SCRIPT.read_text()
+    assert ': "${URLLIB3_HOST_PATH:?URLLIB3_HOST_PATH is required}"' in runtime_probe
+    assert '$URLLIB3_HOST_PATH:$URLLIB3_CONTAINER_PATH' in runtime_probe
 
 
 def test_deepep_overlay_is_staged_once_on_lustre_and_validated_on_compute() -> None:

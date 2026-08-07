@@ -180,6 +180,8 @@ require_canonical_lustre_path GIT_COMMON_DIR "$GIT_COMMON_DIR"
 [[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" && -f "$BATCH_SCRIPT" ]] || die "invalid source or batch script"
 CUDNN_HOST_PATH=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 require_canonical_lustre_path CUDNN_HOST_PATH "$CUDNN_HOST_PATH"
+URLLIB3_HOST_PATH=${URLLIB3_HOST_PATH:-$PREFLIGHT_VENV/lib/python3.13/site-packages/urllib3}
+require_canonical_lustre_path URLLIB3_HOST_PATH "$URLLIB3_HOST_PATH"
 [[ -z $(git -C "$SOURCE_PATH" status --porcelain --untracked-files=all) ]] || die "NeMo-RL source is dirty"
 [[ -z $(git -C "$SOURCE_PATH" submodule foreach --recursive --quiet 'dirty=$(git status --porcelain --untracked-files=all); if [ -n "$dirty" ]; then printf "%s\n" "$displaypath"; fi') ]] || die "recursive submodule source is dirty"
 ! git -C "$SOURCE_PATH" submodule status --recursive | grep -Eq '^[+-U]' || die "recursive submodule checkout mismatch"
@@ -330,6 +332,10 @@ printf 'cudnn_host_path=%s\ncudnn_container_path=%s\n' \
   "$CUDNN_HOST_PATH" \
   "/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn" \
   >> "$PROVENANCE_ROOT/submission.txt"
+printf 'urllib3_host_path=%s\nurllib3_container_path=%s\n' \
+  "$URLLIB3_HOST_PATH" \
+  "/opt/nemo_rl_venv/lib/python3.13/site-packages/urllib3" \
+  >> "$PROVENANCE_ROOT/submission.txt"
 printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_checksum_mode=%s\n' \
   "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_CHECKSUM_CACHE" "$CONTAINER_CHECKSUM_MODE" \
   >> "$PROVENANCE_ROOT/submission.txt"
@@ -360,6 +366,7 @@ export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_HOME=$CUDNN_CONTAINER_PATH
 export CUDNN_PATH=$CUDNN_HOME
+export URLLIB3_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/urllib3
 export PYTHONDONTWRITEBYTECODE=1
 export LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
@@ -385,7 +392,7 @@ export CONTAINER
 
 EXTRA_MOUNTS=${MOUNTS:-}
 validate_extra_mounts "$EXTRA_MOUNTS"
-MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH"
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$CACHE_ROOT:$CACHE_ROOT,$CUDNN_HOST_PATH:$CUDNN_CONTAINER_PATH,$URLLIB3_HOST_PATH:$URLLIB3_CONTAINER_PATH"
 if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/"* ]]; then
   MOUNTS_VALUE="$MOUNTS_VALUE,$GIT_COMMON_DIR:$GIT_COMMON_DIR"
 fi
@@ -408,7 +415,22 @@ set -euo pipefail
 cd "$SOURCE_PATH"
 RUN_PYTHON=/opt/nemo_rl_venv/bin/python
 [[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
-"$RUN_PYTHON" -c 'import importlib.util, ray, requests, urllib3.exceptions; spec = importlib.util.find_spec("uvloop"); assert spec is None or hasattr(__import__("uvloop"), "install")'
+"$RUN_PYTHON" - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+
+import ray
+import requests
+import urllib3
+import urllib3.exceptions
+
+assert Path(urllib3.__file__).resolve().is_relative_to(
+    Path(os.environ["URLLIB3_CONTAINER_PATH"]).resolve()
+)
+spec = importlib.util.find_spec("uvloop")
+assert spec is None or hasattr(__import__("uvloop"), "install")
+PY
 VENV_MANIFEST="$PROVENANCE_ROOT/venv-$(hostname).txt"
 env -u PYTHONPATH "$RUN_PYTHON" -m pip freeze | LC_ALL=C sort > "$VENV_MANIFEST"
 [[ $(sha256sum "$VENV_MANIFEST" | cut -d' ' -f1) == "$PREFLIGHT_MANIFEST_SHA256" ]]
