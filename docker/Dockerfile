@@ -50,6 +50,11 @@ FROM scratch AS trtllm-ccache-output-base
 FROM scratch AS custom-setup
 COPY docker/install_apptainer.sh /
 
+# Pin the official uv image so build-time tooling is fetched through the
+# container registry's content-addressed distribution path.
+ARG UV_VERSION=0.11.28
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa AS uv
+
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
 ENV NRL_CONTAINER=1
@@ -108,12 +113,12 @@ RUN GITHUB_ARTIFACTORY=github.com \
 # Install uv and Python outside /root so the image can also be used by an
 # arbitrary runtime UID. Keep the cache in /opt because the project venv uses
 # symlinks into it.
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION
 ARG PYTHON_VERSION=3.13.14
 ENV UV_CACHE_DIR=/opt/uv/cache
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh && \
-    uv python install --no-bin ${PYTHON_VERSION}
+COPY --from=uv /uv /uvx /usr/local/bin/
+RUN uv python install --no-bin ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
