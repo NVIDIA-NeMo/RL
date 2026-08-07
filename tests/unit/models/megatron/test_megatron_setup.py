@@ -1259,9 +1259,7 @@ class TestApplyMcoreConfigOverrides:
 
         model_cfg = SimpleNamespace()
 
-        applied = _apply_mcore_config_overrides(
-            model_cfg, {"megatron_cfg": {}}, rank=0
-        )
+        applied = _apply_mcore_config_overrides(model_cfg, {"megatron_cfg": {}}, rank=0)
 
         assert applied is False
         assert capsys.readouterr().out == ""

@@ -12,3 +12,4 @@ logger:
     run_name: sft-qwen2.5-math7b-2n4g-megatron
 cluster:
   gpus_per_node: 4
+
