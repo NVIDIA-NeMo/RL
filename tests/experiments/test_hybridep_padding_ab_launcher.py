@@ -192,6 +192,13 @@ def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
         assert 'export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE' in script
 
 
+def test_login_node_preflight_does_not_require_gpu_tools() -> None:
+    launcher = LAUNCHER.read_text()
+
+    assert "for command_name in git python3 realpath sbatch sshare sha256sum; do" in launcher
+    assert 'GPU_MODELS=$(nvidia-smi --query-gpu=name --format=csv,noheader)' in launcher
+
+
 def test_unknown_arm_fails_before_side_effects() -> None:
     env = {**os.environ, "ARM": "typo", "RENDER_ONLY": "1"}
 

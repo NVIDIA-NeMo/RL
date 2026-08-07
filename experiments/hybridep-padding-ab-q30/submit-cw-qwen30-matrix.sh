@@ -137,7 +137,7 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   exit 0
 fi
 
-for command_name in git python3 realpath sbatch sshare sha256sum nvidia-smi; do
+for command_name in git python3 realpath sbatch sshare sha256sum; do
   require_command "$command_name"
 done
 : "${ACCOUNT:?Set ACCOUNT after checking FairShare immediately before submission}"
