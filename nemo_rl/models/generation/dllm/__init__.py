@@ -25,8 +25,10 @@ from nemo_rl.models.generation.dllm.denoise import (
     get_num_transfer_tokens,
     unpack_generations,
 )
+from nemo_rl.models.generation.dllm.dllm_generation import DllmGeneration
 
 __all__ = [
+    "DllmGeneration",
     "block_denoise",
     "build_canvas",
     "get_num_transfer_tokens",
