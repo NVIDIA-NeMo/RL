@@ -28,15 +28,16 @@ delta and NIXL cannot both be active.
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM | Megatron | Requires matching BF16 or blockwise FP8 precision; Megatron ETP must be 1. Currently supporting Megatron+vLLM backends. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
-| NIXL, full weights | vLLM | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. |
+| NIXL, full weights | vLLM or SGLang | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. SGLang requires one node per logical engine. |
 | NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
 
-Non-colocated SGLang generation is supported with a Megatron policy and
-`refit_transport: null`; it creates its own NCCL weight-update group. The NIXL
-restrictions are on the generation backend; both Megatron and DTensor policy
-workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
-initialized by the GRPO and distillation setup paths; PPO currently requires
-colocated generation.
+Non-colocated SGLang generation has two paths: a Megatron policy with
+`refit_transport: null`, which creates its own NCCL weight-update group, and
+checkpoint-engine refit (`refit_transport: nixl`), which works with either
+policy backend. The NIXL restrictions are on the generation backend; both
+Megatron and DTensor policy workers can send weights. Sparse delta is currently
+limited to GRPO. NIXL is initialized by the GRPO and distillation setup paths;
+PPO currently requires colocated generation.
 
 ## Minimal Configuration
 
