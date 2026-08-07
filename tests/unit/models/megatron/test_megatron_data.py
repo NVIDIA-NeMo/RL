@@ -427,21 +427,61 @@ class TestProcessMicrobatch:
             result.packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded
         )
 
-    def test_process_microbatch_rejects_mtp_with_model_cp_slicing(self):
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_keeps_full_mtp_mask_for_model_cp_slicing(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        """A model that slices CP inputs itself receives the full, unsharded mask.
+
+        Such a model inserts media into the full THD row before selecting its
+        CP-owned tokens, and validates that every token-aligned tensor it shards
+        has the same sequence length. Handing it a CP-local mask alongside
+        full-length input_ids fails that check before training starts, so the
+        mask must stay full and be sliced by the model in lockstep with the
+        tokens.
+        """
         from nemo_rl.models.megatron.data import process_microbatch
 
-        with pytest.raises(NotImplementedError, match="do not yet support MTP"):
-            process_microbatch(
-                {
-                    "input_ids": torch.tensor([[1, 2, 3, 4]]),
-                    "input_lengths": torch.tensor([4]),
-                    "mtp_loss_mask": torch.ones(1, 4),
-                },
-                seq_length_key="input_lengths",
-                pack_sequences=True,
-                model_slices_context_parallel_inputs=True,
-                straggler_timer=MagicMock(),
-            )
+        # Distinct lengths at index 0 and 1 so the assertion catches the wrong
+        # read: index 0 is the full THD row, index 1 the CP-local shard.
+        packed_idx0 = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        packed_idx1 = torch.tensor([[1, 1, 1, 0]])
+        mock_pack.return_value = (
+            packed_idx0,
+            packed_idx1,
+            MagicMock(),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+        )
+
+        data_dict = {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 0, 0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 3]),
+            "mtp_loss_mask": torch.tensor(
+                [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]]
+            ),
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.mtp_loss_mask is not None
+        # The full row, not the CP-sharded one.
+        assert torch.equal(result.mtp_loss_mask, packed_idx0)
+        # And it lines up with the tokens the model will slice.
+        assert result.input_ids_cp_sharded is result.input_ids
+        assert result.mtp_loss_mask.shape[1] == result.input_ids_cp_sharded.shape[1]
 
     def test_caller_packing_matches_mbridge_thd_contract(self):
         from megatron.bridge.data.packing.in_batch import (
