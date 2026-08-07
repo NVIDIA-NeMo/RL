@@ -37,9 +37,6 @@ wheel and build-generated metadata for their selected DeepEP commit.
 ```bash
 export ACCOUNT=<fairshare-selected-account>
 export SOURCE_PATH=/lustre/path/to/the-arm-specific-frozen-recursive-checkout
-export CONTAINER=/lustre/path/to/nemo-rl-nightly.sqsh
-export CONTAINER_SHA256=<sha256>
-export PREFLIGHT_MANIFEST_SHA256=<sorted-pip-freeze-sha256>
 export DEEPEP_17CF_WHEEL=/lustre/path/to/deep_ep-17cf-x86_64.whl
 export DEEPEP_17CF_METADATA=/lustre/path/to/17cf-build-metadata.json
 export DEEPEP_F725_WHEEL=/lustre/path/to/deep_ep-f725-x86_64.whl
@@ -56,7 +53,11 @@ The launcher submits `ray-nonexclusive.sub`, requests all eight GPUs on every
 node with `--gpus-per-node=8`, does not request exclusive access, and does not
 set explicit CPU or memory requests. The wrapper passes Slurm's proportional
 CPU allocation to `ray.sub`. Each arm has an independent output directory and
-runtime overlay, and all persistent paths are required to live under Lustre.
+runtime overlay. The matrix pins one container path, checksum, and Python
+environment manifest hash for every arm,
+removes inherited `SBATCH_*` allocation options, rejects non-canonical or
+non-Lustre persistent paths, and redirects package/compiler caches away from
+`/home`.
 
 ## Analysis contract
 

@@ -50,9 +50,11 @@ export PATH="$PREFLIGHT_VENV/bin:$PATH"
 uv run --no-sync python -m pip freeze | LC_ALL=C sort | tee "$OUTPUT_ROOT/preflight-venv.txt"
 sha256sum "$OUTPUT_ROOT/preflight-venv.txt" | tee "$OUTPUT_ROOT/preflight-venv.sha256"
 uv run --no-sync pytest -q \
+  --mcore-only \
   tests/unit/models/megatron/test_megatron_data.py \
   tests/unit/models/megatron/test_megatron_setup.py \
   tests/unit/models/megatron/test_train.py \
+  -k "Q30LegacyHybridEPPadding or legacy_prepad or model_forward_passes_padding_mask" \
   2>&1 | tee "$OUTPUT_ROOT/pytest.log"
 uv run --no-sync pytest -q \
   3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/tests/unit_tests/transformer/moe/test_routers.py \

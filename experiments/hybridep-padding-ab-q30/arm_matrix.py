@@ -30,6 +30,11 @@ LEGACY_NEMO_RL = "d833180b9847daedafedaed6d7d1da6a013f14d0"
 LEGACY_BRIDGE = "a68c7c893ea2c342660de0eef8a45032de8e9c89"
 LEGACY_MCORE = "f812f5b3d20aa144c1762431ae77782f059dd9f9"
 LEGACY_BRANCH = "sna/hybridep-legacy-prepad-q30-20260807"
+CW_CONTAINER = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo-rl-nightly-20260805/nemo_rl_nightly_20260805_15171871.sqsh"
+CW_CONTAINER_SHA256 = "6623720fedcc82b31ab1f09f385590a5cf07751c35e5f6bf740a8b79c691b680"
+CW_PREFLIGHT_MANIFEST_SHA256 = (
+    "ab6797d70d846ae8a9734947f1cac99e1b0184fa7f2ac6c0e2643e77700649da"
+)
 QWEN30_RECIPE = "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
 
 
@@ -46,6 +51,9 @@ class ExperimentArm:
     bridge_commit: str
     mcore_commit: str
     source_branch: str
+    container: str = CW_CONTAINER
+    container_sha256: str = CW_CONTAINER_SHA256
+    preflight_manifest_sha256: str = CW_PREFLIGHT_MANIFEST_SHA256
     recipe: str = QWEN30_RECIPE
     nodes: int = 4
     gpus_per_node: int = 8
@@ -129,6 +137,9 @@ def _as_tsv(arm: ExperimentArm) -> str:
         arm.bridge_commit,
         arm.mcore_commit,
         arm.source_branch,
+        arm.container,
+        arm.container_sha256,
+        arm.preflight_manifest_sha256,
         arm.recipe,
         str(arm.nodes),
         str(arm.gpus_per_node),

@@ -18,9 +18,34 @@ set -euo pipefail
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 require_command() { command -v "$1" >/dev/null || die "missing command: $1"; }
-require_lustre_path() { [[ "$2" == /lustre/* ]] || die "$1 must be under /lustre: $2"; }
-require_tmp_path() { [[ "$2" == /tmp/* ]] || die "$1 must be under /tmp: $2"; }
-reject_home_path() { [[ "$2" != /home && "$2" != /home/* && "$2" != *:/home && "$2" != *:/home/* ]] || die "$1 must not use /home: $2"; }
+require_canonical_lustre_path() {
+  local resolved
+  resolved=$(realpath -e -- "$2") || die "$1 does not exist: $2"
+  [[ "$resolved" == "$2" && "$resolved" == /lustre/* ]] || die "$1 must be a canonical /lustre path: $2"
+}
+require_canonical_tmp_path() {
+  local resolved
+  resolved=$(realpath -m -- "$2") || die "$1 is invalid: $2"
+  [[ "$resolved" == "$2" && "$resolved" == /tmp/* ]] || die "$1 must be a canonical /tmp path: $2"
+}
+validate_extra_mounts() {
+  local entry host destination remainder
+  local -a entries
+  [[ -z "$1" ]] && return
+  IFS=',' read -r -a entries <<< "$1"
+  for entry in "${entries[@]}"; do
+    host=${entry%%:*}
+    remainder=${entry#*:}
+    [[ "$remainder" != "$entry" ]] || die "invalid MOUNTS entry: $entry"
+    destination=${remainder%%:*}
+    require_canonical_lustre_path MOUNTS "$host"
+    [[ "$destination" == /* && "$destination" != /home && "$destination" != /home/* && "$destination" != *'/../'* ]] || die "invalid MOUNTS destination: $destination"
+  done
+}
+
+for SBATCH_VARIABLE in ${!SBATCH_@}; do
+  unset "$SBATCH_VARIABLE"
+done
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON=${PYTHON:-python3}
@@ -34,8 +59,9 @@ SEGMENT=4
 
 IFS=$'\t' read -r ARM_NAME DISPATCHER HYBRIDEP_BACKEND PAD_UNEVEN LEGACY_PREPADDING \
   EXPECTED_DEEPEP_COMMIT SOURCE_PROFILE EXPECTED_NEMO_RL_COMMIT \
-  EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT SOURCE_BRANCH RECIPE NODES \
-  GPUS_PER_NODE MAX_STEPS < <(
+  EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT SOURCE_BRANCH CONTAINER \
+  CONTAINER_SHA256 PREFLIGHT_MANIFEST_SHA256 RECIPE NODES GPUS_PER_NODE \
+  MAX_STEPS < <(
     "$PYTHON" "$SCRIPT_DIR/arm_matrix.py" --arm "$ARM" --format tsv
   )
 [[ "$ARM_NAME" == "$ARM" ]] || die "arm matrix resolution failed"
@@ -99,7 +125,11 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   printf 'bridge_commit=%s\n' "$EXPECTED_BRIDGE_COMMIT"
   printf 'mcore_commit=%s\n' "$EXPECTED_MCORE_COMMIT"
   printf 'source_branch=%s\n' "$SOURCE_BRANCH"
+  printf 'container=%s\n' "$CONTAINER"
+  printf 'container_sha256=%s\n' "$CONTAINER_SHA256"
+  printf 'preflight_manifest_sha256=%s\n' "$PREFLIGHT_MANIFEST_SHA256"
   printf 'batch_script=%s\n' "$BATCH_SCRIPT"
+  printf 'sbatch_environment_sanitized=1\n'
   printf 'job_name=%s\n' "$JOB_NAME"
   printf 'output_root=%s\n' "$OUTPUT_ROOT"
   printf 'training_command=%s\n' "$TRAINING_COMMAND"
@@ -107,26 +137,32 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   exit 0
 fi
 
-for command_name in git python3 sbatch sshare sha256sum nvidia-smi; do
+for command_name in git python3 realpath sbatch sshare sha256sum nvidia-smi; do
   require_command "$command_name"
 done
 : "${ACCOUNT:?Set ACCOUNT after checking FairShare immediately before submission}"
-: "${CONTAINER:?Set CONTAINER to an immutable image reference or local squashfs}"
 SOURCE_REMOTE=fork
 MCORE_5008_COMMIT=81770cb015eab05785ecd540ba929d1400a52f67
 EXPECTED_GPU_MODEL='NVIDIA H100 80GB HBM3'
 EXPECTED_ARCHITECTURE=x86_64
 PREFLIGHT_VENV=${PREFLIGHT_VENV:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-upstream5008-validation/cw-h100/preflight-venv}
-: "${PREFLIGHT_MANIFEST_SHA256:?Set PREFLIGHT_MANIFEST_SHA256 to the frozen pip-freeze manifest hash}"
 
-require_lustre_path SOURCE_PATH "$SOURCE_PATH"
-require_lustre_path OUTPUT_ROOT "$OUTPUT_ROOT"
-require_lustre_path PREFLIGHT_VENV "$PREFLIGHT_VENV"
+mkdir -p "$OUTPUT_ROOT"
+require_canonical_lustre_path SOURCE_PATH "$SOURCE_PATH"
+require_canonical_lustre_path OUTPUT_ROOT "$OUTPUT_ROOT"
+require_canonical_lustre_path PREFLIGHT_VENV "$PREFLIGHT_VENV"
 [[ -f "$SOURCE_PATH/$RECIPE" && -f "$SOURCE_PATH/ray.sub" && -f "$BATCH_SCRIPT" ]] || die "invalid source or batch script"
 [[ -x "$PREFLIGHT_VENV/bin/python" || -L "$PREFLIGHT_VENV/bin/python" ]] || die "preflight venv is missing: $PREFLIGHT_VENV"
 [[ -z $(git -C "$SOURCE_PATH" status --porcelain --untracked-files=all) ]] || die "NeMo-RL source is dirty"
 [[ -z $(git -C "$SOURCE_PATH" submodule foreach --recursive --quiet 'dirty=$(git status --porcelain --untracked-files=all); if [ -n "$dirty" ]; then printf "%s\n" "$displaypath"; fi') ]] || die "recursive submodule source is dirty"
 ! git -C "$SOURCE_PATH" submodule status --recursive | grep -Eq '^[+-U]' || die "recursive submodule checkout mismatch"
+HARNESS_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
+require_canonical_lustre_path HARNESS_ROOT "$HARNESS_ROOT"
+[[ -z $(git -C "$HARNESS_ROOT" status --porcelain --untracked-files=all) ]] || die "experiment harness is dirty"
+HARNESS_COMMIT=$(git -C "$HARNESS_ROOT" rev-parse HEAD)
+LAUNCHER_SHA256=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)
+BATCH_SCRIPT_SHA256=$(sha256sum "$BATCH_SCRIPT" | cut -d' ' -f1)
+MATRIX_SHA256=$(sha256sum "$SCRIPT_DIR/arm_matrix.py" | cut -d' ' -f1)
 LOCAL_HEAD=$(git -C "$SOURCE_PATH" rev-parse HEAD)
 [[ "$LOCAL_HEAD" == "$EXPECTED_NEMO_RL_COMMIT" ]] || die "NeMo-RL commit mismatch"
 PUSHED_HEAD=$(git -C "$SOURCE_PATH" ls-remote "$SOURCE_REMOTE" "refs/heads/$SOURCE_BRANCH" | cut -f1)
@@ -143,8 +179,7 @@ else
 fi
 
 if [[ -f "$CONTAINER" ]]; then
-  require_lustre_path CONTAINER "$CONTAINER"
-  : "${CONTAINER_SHA256:?Set CONTAINER_SHA256 for a local container image}"
+  require_canonical_lustre_path CONTAINER "$CONTAINER"
   [[ $(sha256sum "$CONTAINER" | cut -d' ' -f1) == "$CONTAINER_SHA256" ]] || die "container checksum mismatch"
 elif [[ ! "$CONTAINER" =~ @sha256:[0-9a-f]{64}$ ]]; then
   die "CONTAINER must be a checksum-verified local image or digest-pinned reference"
@@ -161,8 +196,8 @@ if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
     DEEPEP_WHEEL=${DEEPEP_F725_WHEEL:?Set DEEPEP_F725_WHEEL}
     DEEPEP_METADATA=${DEEPEP_F725_METADATA:?Set DEEPEP_F725_METADATA}
   fi
-  require_lustre_path DEEPEP_WHEEL "$DEEPEP_WHEEL"
-  require_lustre_path DEEPEP_METADATA "$DEEPEP_METADATA"
+  require_canonical_lustre_path DEEPEP_WHEEL "$DEEPEP_WHEEL"
+  require_canonical_lustre_path DEEPEP_METADATA "$DEEPEP_METADATA"
   [[ -f "$DEEPEP_WHEEL" && -f "$DEEPEP_METADATA" ]] || die "DeepEP wheel or metadata is missing"
   IFS=$'\t' read -r META_COMMIT META_PLATFORM META_ARCH META_WHEEL META_SHA < <(
     python3 - "$DEEPEP_METADATA" <<'PY'
@@ -202,6 +237,9 @@ printf 'arm=%s\nsource_profile=%s\nnemo_rl_commit=%s\nbridge_commit=%s\nmcore_co
 printf 'source_branch=%s\npreflight_manifest_sha256=%s\nbatch_script=%s\n' \
   "$SOURCE_BRANCH" "$PREFLIGHT_MANIFEST_SHA256" "$BATCH_SCRIPT" \
   >> "$PROVENANCE_ROOT/submission.txt"
+printf 'harness_commit=%s\nlauncher_sha256=%s\nbatch_script_sha256=%s\nmatrix_sha256=%s\n' \
+  "$HARNESS_COMMIT" "$LAUNCHER_SHA256" "$BATCH_SCRIPT_SHA256" "$MATRIX_SHA256" \
+  >> "$PROVENANCE_ROOT/submission.txt"
 
 export SOURCE_PATH OUTPUT_ROOT PROVENANCE_ROOT RECIPE MAX_STEPS ARM SOURCE_PROFILE
 export EXPECTED_NEMO_RL_COMMIT EXPECTED_BRIDGE_COMMIT EXPECTED_MCORE_COMMIT
@@ -214,27 +252,41 @@ export VIRTUAL_ENV=$PREFLIGHT_VENV
 export UV_CACHE_DIR_OVERRIDE=${UV_CACHE_DIR_OVERRIDE:-$EXPERIMENT_ROOT/uv-cache}
 export NRL_NODE_LOCAL_UV_CACHE_DIR=${NRL_NODE_LOCAL_UV_CACHE_DIR:-/tmp/nemo-rl-uv-cache-$ARM}
 export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-/tmp/nemo-rl-venvs-$ARM-$LOCAL_HEAD}
+export CACHE_ROOT=$EXPERIMENT_ROOT/caches
+export PIP_CACHE_DIR=$CACHE_ROOT/pip
+export XDG_CACHE_HOME=$CACHE_ROOT/xdg
+export TORCH_HOME=$CACHE_ROOT/torch
+export WANDB_CACHE_DIR=$CACHE_ROOT/wandb
+export TRITON_CACHE_DIR=/tmp/nemo-rl-triton-$ARM-$LOCAL_HEAD
+export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
-require_lustre_path HF_HOME "$HF_HOME"
-require_lustre_path HF_DATASETS_CACHE "$HF_DATASETS_CACHE"
-require_lustre_path UV_CACHE_DIR_OVERRIDE "$UV_CACHE_DIR_OVERRIDE"
-require_tmp_path NRL_NODE_LOCAL_UV_CACHE_DIR "$NRL_NODE_LOCAL_UV_CACHE_DIR"
-require_tmp_path NEMO_RL_VENV_DIR "$NEMO_RL_VENV_DIR"
-mkdir -p "$HF_HOME" "$UV_CACHE_DIR_OVERRIDE"
+mkdir -p "$HF_DATASETS_CACHE" "$UV_CACHE_DIR_OVERRIDE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$WANDB_CACHE_DIR"
+require_canonical_lustre_path HF_HOME "$HF_HOME"
+require_canonical_lustre_path HF_DATASETS_CACHE "$HF_DATASETS_CACHE"
+require_canonical_lustre_path UV_CACHE_DIR_OVERRIDE "$UV_CACHE_DIR_OVERRIDE"
+require_canonical_lustre_path CACHE_ROOT "$CACHE_ROOT"
+require_canonical_lustre_path PIP_CACHE_DIR "$PIP_CACHE_DIR"
+require_canonical_lustre_path XDG_CACHE_HOME "$XDG_CACHE_HOME"
+require_canonical_lustre_path TORCH_HOME "$TORCH_HOME"
+require_canonical_lustre_path WANDB_CACHE_DIR "$WANDB_CACHE_DIR"
+require_canonical_tmp_path NRL_NODE_LOCAL_UV_CACHE_DIR "$NRL_NODE_LOCAL_UV_CACHE_DIR"
+require_canonical_tmp_path NEMO_RL_VENV_DIR "$NEMO_RL_VENV_DIR"
+require_canonical_tmp_path TRITON_CACHE_DIR "$TRITON_CACHE_DIR"
+require_canonical_tmp_path CUDA_CACHE_PATH "$CUDA_CACHE_PATH"
 export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
 export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128
 export NVLINK_DOMAIN_SIZE=8 USE_MNNVL=0
 export CONTAINER
 
 EXTRA_MOUNTS=${MOUNTS:-}
-reject_home_path MOUNTS "$EXTRA_MOUNTS"
-MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$PREFLIGHT_VENV:$PREFLIGHT_VENV"
+validate_extra_mounts "$EXTRA_MOUNTS"
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$CACHE_ROOT:$CACHE_ROOT"
 if [[ "$REQUIRES_DEEPEP_ARTIFACT" == 1 ]]; then
   DEEPEP_DIR=$(dirname "$DEEPEP_WHEEL")
   export DEEPEP_OVERLAY_DIR="/tmp/nemo-rl-deepep-$ARM-$DEEPEP_SHA256"
-  require_tmp_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"
+  require_canonical_tmp_path DEEPEP_OVERLAY_DIR "$DEEPEP_OVERLAY_DIR"
   export PYTHONPATH="$DEEPEP_OVERLAY_DIR${PYTHONPATH:+:$PYTHONPATH}"
   export LD_LIBRARY_PATH="$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   MOUNTS_VALUE="$MOUNTS_VALUE,$DEEPEP_DIR:$DEEPEP_DIR"

@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=1
+#SBATCH --time=01:00:00
+
 set -euo pipefail
 
 : "${SLURM_JOB_ID:?SLURM_JOB_ID is required}"
@@ -22,7 +27,7 @@ BUILDER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/ne
 BUILDER_SHA256=1e7479c1b1252eb35735627e0980b0edbae228f05e86a6e6d65a50af8bb72ee9
 CONTAINER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo-rl-nightly-20260805/nemo_rl_nightly_20260805_15171871.sqsh
 CONTAINER_SHA256=6623720fedcc82b31ab1f09f385590a5cf07751c35e5f6bf740a8b79c691b680
-NCCL_WHEEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-x86-b200-h100/artifacts/nccl/nvidia-nccl-cu13-2.30.4-14633389/nvidia_nccl_cu13-2.30.4-py3-none-manylinux_2_18_x86_64.whl
+NCCL_WHEEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-x86-b200-h100/cw-dfw/q30-triplet-main-d3f3eb5-20260729/artifacts/nccl/nvidia-nccl-cu13-2.30.4-14633389/nvidia_nccl_cu13-2.30.4-py3-none-manylinux_2_18_x86_64.whl
 NCCL_WHEEL_SHA256=534dbf3058cadb625f08ab0d17f1dffad3b961a2bfa360d66633fcf21be53f57
 OUTPUT_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments/hybridep-padding-ab-q30/cw-h100/artifacts/deepep
 DEEPEP_COMMIT=f725d29699f5bda9ba789456bb9579af69844685

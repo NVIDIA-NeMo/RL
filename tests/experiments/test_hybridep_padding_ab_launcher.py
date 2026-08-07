@@ -13,6 +13,9 @@ LAUNCHER = (
 )
 RECIPE = "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
 BATCH_SCRIPT = ROOT / "experiments" / "hybridep-padding-ab-q30" / "ray-nonexclusive.sub"
+BUILD_SCRIPT = (
+    ROOT / "experiments" / "hybridep-padding-ab-q30" / "build-f725-wheel.sbatch"
+)
 
 
 def _render(arm: str, *, test_only: bool = False) -> dict[str, str]:
@@ -104,6 +107,10 @@ def test_rendered_arm_contract(
     assert len(rendered["mcore_commit"]) == 40
     assert rendered["source_branch"].startswith("sna/")
     assert Path(rendered["batch_script"]) == BATCH_SCRIPT
+    assert rendered["container"].endswith("nemo_rl_nightly_20260805_15171871.sqsh")
+    assert len(rendered["container_sha256"]) == 64
+    assert len(rendered["preflight_manifest_sha256"]) == 64
+    assert rendered["sbatch_environment_sanitized"] == "1"
     assert rendered["job_name"].endswith(arm)
     assert rendered["output_root"].endswith(f"/{arm}")
     assert "grpo.max_num_steps=20" in rendered["training_command"]
@@ -136,6 +143,40 @@ def test_rendered_test_only_is_added_exactly_once() -> None:
     rendered = _render("official-pr5008-17cf", test_only=True)
 
     assert rendered["sbatch_command"].split().count("--test-only") == 1
+
+
+def test_inherited_sbatch_options_are_sanitized() -> None:
+    env = {
+        **os.environ,
+        "ARM": "official-alltoall",
+        "RENDER_ONLY": "1",
+        "SBATCH_EXCLUSIVE": "1",
+        "SBATCH_CPUS_PER_GPU": "64",
+        "SBATCH_MEM": "1T",
+    }
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rendered = dict(line.split("=", 1) for line in result.stdout.splitlines())
+
+    assert rendered["sbatch_environment_sanitized"] == "1"
+    assert "--exclusive" not in rendered["sbatch_command"]
+    assert "--cpus" not in rendered["sbatch_command"]
+    assert "--mem" not in rendered["sbatch_command"]
+
+
+def test_f725_builder_has_explicit_gpu_allocation_contract() -> None:
+    build_script = BUILD_SCRIPT.read_text()
+
+    assert "#SBATCH --nodes=1" in build_script
+    assert "#SBATCH --ntasks=1" in build_script
+    assert "#SBATCH --gpus-per-node=1" in build_script
+    assert "#SBATCH --time=01:00:00" in build_script
 
 
 def test_unknown_arm_fails_before_side_effects() -> None:

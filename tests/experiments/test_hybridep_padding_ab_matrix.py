@@ -86,6 +86,9 @@ def test_arm_contract(arm_name: str, expected: dict[str, object]) -> None:
     assert arm.nodes == 4
     assert arm.gpus_per_node == 8
     assert arm.max_steps == 20
+    assert arm.container == matrix.CW_CONTAINER
+    assert arm.container_sha256 == matrix.CW_CONTAINER_SHA256
+    assert arm.preflight_manifest_sha256 == matrix.CW_PREFLIGHT_MANIFEST_SHA256
     for field_name, expected_value in expected.items():
         assert getattr(arm, field_name) == expected_value
     if arm.source_profile == "official":
