@@ -257,10 +257,10 @@ def test_ray_bootstrap_uses_container_runtime_with_pinned_cudnn_only() -> None:
     assert "/opt/nemo_rl_venv/bin/ray --version" in validator
     assert "import ray, requests, urllib3, urllib3.exceptions" in validator
     assert (
-        'LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib:/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+        'LD_LIBRARY_PATH="$CUDNN_CONTAINER_PATH/lib:/usr/local/cuda/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
         in launcher
     )
-    assert "/usr/local/cuda/compat:$CUDNN_HOME/lib" in RUNTIME_VALIDATE_SCRIPT.read_text()
+    assert "/usr/local/cuda/compat/lib:$CUDNN_HOME/lib" in RUNTIME_VALIDATE_SCRIPT.read_text()
     assert (
         "CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn"
         in launcher

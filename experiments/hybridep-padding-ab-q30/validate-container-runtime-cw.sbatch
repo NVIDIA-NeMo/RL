@@ -28,7 +28,7 @@ set -euo pipefail
 export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export DEEPEP_OVERLAY_DIR
-export LD_LIBRARY_PATH="/usr/local/cuda/compat:$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
+export LD_LIBRARY_PATH="/usr/local/cuda/compat/lib:$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=$DEEPEP_OVERLAY_DIR
 
@@ -70,20 +70,28 @@ if uvloop_spec is not None:
     assert hasattr(uvloop, "install")
     uvloop_path = str(Path(uvloop.__file__).resolve())
 assert platform.python_version() == "3.13.14"
-assert torch.cuda.is_available()
-assert torch.cuda.get_device_capability(0) == (9, 0)
+compat_path = Path("/usr/local/cuda/compat/lib")
+compat_files = sorted(path.name for path in compat_path.glob("libcuda.so*"))
+cuda_available = torch.cuda.is_available()
 print(
     json.dumps(
         {
             "cuda": torch.version.cuda,
+            "cuda_available": cuda_available,
+            "cuda_compat_files": compat_files,
             "deepep_modules": module_paths,
-            "gpu": torch.cuda.get_device_name(0),
+            "gpu": torch.cuda.get_device_name(0) if cuda_available else None,
+            "ld_library_path": os.environ["LD_LIBRARY_PATH"],
             "python": platform.python_version(),
             "ray": ray.__version__,
             "requests": requests.__version__,
             "uvloop": uvloop_path,
         },
         sort_keys=True,
-    )
+    ),
+    flush=True,
 )
+assert compat_files
+assert cuda_available
+assert torch.cuda.get_device_capability(0) == (9, 0)
 PY'
