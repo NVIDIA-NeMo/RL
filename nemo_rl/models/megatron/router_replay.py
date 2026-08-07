@@ -57,8 +57,15 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
 
-    if generation.get("backend") != "vllm":
-        raise ValueError("router_replay.enabled requires vLLM generation.")
+    # PATCH(PR-4 router-replay-mcore): allow the megatron generation backend.
+    # The mcore dynamic engine records per-token routing natively
+    # (model_config.moe_enable_routing_replay -> RoutingMetadata static buffers
+    # -> DynamicInferenceRequest.routing_indices); the megatron worker packs it
+    # into GenerationOutputSpec["routed_experts"] with vLLM-identical alignment.
+    if generation.get("backend") not in ("vllm", "megatron"):
+        raise ValueError(
+            "router_replay.enabled requires vLLM or megatron generation."
+        )
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
 

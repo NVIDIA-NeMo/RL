@@ -313,6 +313,25 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
+    # PATCH(det batch-invariant): env-gated activation of the fork's batch-invariant
+    # kernels (incl. te_gemm_cublas_pinned — cuBLASLt workspace starved to force
+    # SPLITK_NUM=1). Nightly NeMo-RL dropped the batch_invariant_mode config key, so
+    # gate on NRL_BATCH_INVARIANT=1; NRL_BI_KERNELS selects categories. Runs in EVERY
+    # MegatronPolicyWorker (train AND dedicated-gen), so both forwards get the pin.
+    import os as _os
+
+    if _os.environ.get("NRL_BATCH_INVARIANT", "0") == "1":
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            enable_batch_invariant_mode,
+        )
+
+        enable_batch_invariant_mode()
+        print(
+            f"[NRL_BATCH_INVARIANT] batch-invariant kernels ENABLED "
+            f"(NRL_BI_KERNELS={_os.environ.get('NRL_BI_KERNELS', 'all')})",
+            flush=True,
+        )
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -836,6 +855,18 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
+    # PATCH(det attention num_splits pin): nightly mcore's TEDotProductAttention pins
+    # flash-attn num_splits=1 ONLY when config.batch_invariant_mode is truthy
+    # (extensions/transformer_engine.py ~:1618). Nightly NeMo-RL dropped the config
+    # knob, so with only the kernel monkeypatches active, inference attention kept the
+    # AUTO split-KV heuristic -> batch-shape-dependent softmax partial ordering
+    # (bf16-visible) -> router flips. Gate on the same env as the kernel patches.
+    import os as _os_bi
+
+    if _os_bi.environ.get("NRL_BATCH_INVARIANT", "0") == "1":
+        model_cfg.batch_invariant_mode = True
+        print("[NRL_BATCH_INVARIANT] model_cfg.batch_invariant_mode=True (num_splits=1 pin)", flush=True)
+
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
@@ -956,6 +987,33 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+        # PATCH(PR-2/infopt-spec): Megatron-Bridge providers never map
+        # transformer_impl -> layer spec: GPTModelProvider.default_layer_spec branches
+        # only on use_transformer_engine_full_layer_spec (both branches TE), so
+        # "inference_optimized" silently builds TE modules and the whole fused
+        # inference stack (InferenceGroupedMLP, InferenceTopKRouter, inference
+        # dispatchers) is unreachable. Assign the inference-optimized GPT layer spec
+        # through the provider's documented override field (same hook the modelopt
+        # path uses). Callable form so it resolves against the FINAL provider fields
+        # at provide() time (after parallelism/MoE/precision overrides).
+        if model_cfg.transformer_impl == "inference_optimized":
+
+            def _inference_optimized_layer_spec(provider, vp_stage=None):
+                from megatron.core.models.gpt.gpt_layer_specs import (
+                    get_gpt_layer_with_inference_spec,
+                )
+
+                return get_gpt_layer_with_inference_spec(
+                    qk_layernorm=getattr(provider, "qk_layernorm", False),
+                    multi_latent_attention=getattr(
+                        provider, "multi_latent_attention", False
+                    ),
+                    qk_l2_norm=getattr(provider, "qk_l2_norm", False),
+                    num_experts=getattr(provider, "num_moe_experts", None),
+                    moe_grouped_gemm=getattr(provider, "moe_grouped_gemm", False),
+                )
+
+            model_cfg.transformer_layer_spec = _inference_optimized_layer_spec
     if "cuda_graph_impl" in config["megatron_cfg"]:
         model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
         if model_cfg.cuda_graph_impl != "none":

@@ -1,0 +1,114 @@
+# GRPO config — Qwen3-30B-A3B, Megatron INFERENCE-OPTIMIZED generation.
+# Copy of grpo_math_qwen30ba3b_megatron.yaml with the colleague's mcore_generation_config
+# block baked in (so transformer_impl etc. load from YAML, not the corrupting +CLI merge).
+# Mounted over /opt/nemo-rl/examples/configs/grpo_math_qwen30ba3b_megatron.yaml at run time.
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+
+policy:
+  model_name: "Qwen/Qwen3-30B-A3B"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 4
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  router_replay:
+    enabled: false
+
+  dtensor_cfg:
+    enabled: false
+
+  sequence_packing:
+    enabled: False
+
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: True
+    pipeline_dtype: ${policy.precision}
+    # Required when capturing CUDA graphs with expert parallelism (EP>1).
+    moe_pad_experts_for_cuda_graph_inference: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-7
+      min_lr: 3.0e-8
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 1000
+      lr_warmup_iters: 13
+      lr_warmup_init: 3.0e-8
+
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+
+  generation:
+    backend: "megatron"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+    stop_strings: null
+    # Inference-optimized Megatron generation (colleague's config, baked into YAML).
+    mcore_generation_config:
+      max_model_len: ${policy.max_total_sequence_length}
+      transformer_impl: "inference_optimized"
+      cuda_graph_impl: "local"
+      inference_cuda_graph_scope: "block"
+      inference_moe_token_dispatcher_type: "nvls"
+      inference_grouped_gemm_backend: "vllm"
+      moe_pad_experts_for_cuda_graph_inference: false
+      moe_router_num_groups: null
+      moe_router_group_topk: null
+      pipeline_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: False
+      context_parallel_size: 1
+      tensor_model_parallel_size: 1
+      buffer_size_gb: 20
+      num_cuda_graphs: -1
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      max_tokens: 16384
+      kv_cache_management_mode: "persist"
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nvshmem"
+      async_engine: true
+      expose_http_server: true
+      enable_prefix_caching: true
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
+  segment_size: null
