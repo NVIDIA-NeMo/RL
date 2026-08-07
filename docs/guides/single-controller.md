@@ -1,5 +1,9 @@
 # Train with Single-Controller (Async GRPO)
 
+:::{warning}
+The Single-Controller path is a **beta feature** and still under active development. The API and configuration surface are not yet stable and may change without notice. Issues and feedback are welcome — please file them at [github.com/NVIDIA-NeMo/RL/issues](https://github.com/NVIDIA-NeMo/RL/issues).
+:::
+
 The Single-Controller (SC) path is an alternative async GRPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in [async-grpo.md](./async-grpo.md), SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
 
 ## Configure the Single-Controller Path
@@ -36,7 +40,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 4  # inference GPUs; remainder go to training
     ```
 
-3. **One RL step = one optimizer step.** The SC train pump does not support multi-mini-step inside a single RL step (see the validator in `single_controller_utils/config.py`):
+3. **One RL step = one optimizer step.** The SC train pump does not support multi-mini-step inside a single RL step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)):
 
     ```python
     num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
@@ -55,7 +59,7 @@ All SC async-RL runtime knobs live under `async_rl:` in the master config. The m
 
 ### Sampler modes
 
-The sampler is a discriminated union over `sampler.name`. Four modes are shipped:
+Pick one of four modes with `sampler.name`. Each mode takes its own knobs, listed below — a knob from one mode has no effect under another:
 
 
 | `sampler.name` | Rollout gating                                                                                                          | Train selection                                                                                                   | Typical use                                                                                                  |
@@ -68,14 +72,14 @@ The sampler is a discriminated union over `sampler.name`. Four modes are shipped
 
 ### Config → behavior map
 
-The exemplars shipped in this PR stack cover the four canonical setups:
+The shipped exemplars cover three of the four modes:
 
 
 | Mode                             | `sampler.name` | Sampler knob                   | `min_groups_for_streaming_train` | `max_buffered_rollouts`                               | Exemplar |
 | -------------------------------- | -------------- | ------------------------------ | -------------------------------- | ----------------------------------------------------- | -------- |
 | Sync / on-policy                 | `in_order`     | `max_lookahead_versions: 0`    | `${grpo.num_prompts_per_step}`   | `num_prompts_per_step × 1`                            | [`grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml`](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml) |
 | Async, exact batch→step matching | `in_order`     | `max_lookahead_versions: >= 1` | `x <= num_prompts_per_step`   | `num_prompts_per_step × (max_lookahead_versions + 1)` | [`grpo_math_1B_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml) |
-| Streaming, gated dispatch        | `weight_fifo`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | / |
+| Streaming, gated dispatch        | `weight_fifo`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | — (none shipped) |
 | Streaming, over-sampled          | `windowed`     | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | Larger than the gated capacity (dispatch is ungated)  | [`grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml`](../../examples/configs/recipes/llm/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml) |
 
 
@@ -107,10 +111,10 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 - One entry point per prompt group: reserve a buffer slot, drive the rollout via `AsyncRolloutImpl` or `AsyncNemoGymRolloutImpl`, and commit with the observed weight versions.
 - `env_handles` provide per-task environments to the rollout implementations.
 
-#### 4. `StalenessSampler` (`nemo_rl/algorithms/async_utils/staleness_sampler.py`)
+#### 4. Samplers (`nemo_rl/algorithms/async_utils/staleness_sampler.py`)
 
 - Filter-only prompt-group selector over `TQReplayBuffer`. The base `PromptGroupSampler` protocol defines `admit`, `select`, and `evict`.
-- `WindowedSampler`, `WeightFifoSampler`, `InOrderSampler` are the built-in policies (one per row in the [Sampler modes](#sampler-modes) table). `CustomSampler` imports a user-supplied class by FQN.
+- `WindowedSampler`, `WeightFifoSampler`, `InOrderSampler` are the built-in policies (one per row in the [Sampler modes](#sampler-modes) table). The `custom` mode (`CustomSamplerConfig.target`) makes `create_sampler` import a user-supplied class by FQN and type-check it against `PromptGroupSampler`.
 
 #### 5. `_rollout_pump` and `_train_pump`
 
