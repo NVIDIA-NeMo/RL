@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,104 @@ def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
 
     assert result.shape == (batch_size, S)
     assert torch.allclose(result, torch.tensor(2.0))
+
+
+class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
+    """Capture the batch passed to a teacher for row-alignment assertions."""
+
+    def __init__(self, fill_value=1.0, dp_size=4):
+        super().__init__(fill_value=fill_value, dp_size=dp_size)
+        self.received: BatchedDataDict | None = None
+
+    def get_logprobs(self, data):
+        self.received = data
+        return super().get_logprobs(data)
+
+
+def _row_marked_packed_tensor(markers):
+    return PackedTensor(
+        [
+            None
+            if marker is None
+            else torch.full((1, 2), float(marker), dtype=torch.float32)
+            for marker in markers
+        ],
+        dim_to_pack=0,
+    )
+
+
+def _received_row_markers(packed):
+    return [
+        None if tensor is None else float(tensor[0, 0]) for tensor in packed.tensors
+    ]
+
+
+def test_compute_teacher_logprobs_selects_multimodal_rows_per_teacher():
+    """Each teacher receives image and tensor rows matching its token rows."""
+    math_twg = _RecordingTeacherWorkerGroup(fill_value=1.0, dp_size=1)
+    code_twg = _RecordingTeacherWorkerGroup(fill_value=2.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"math": math_twg, "code": code_twg},
+        alias_to_group_alias={"math_agent": "math", "code_agent": "code"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "math_agent": "/ckpt/math",
+                "code_agent": "/ckpt/code",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+
+    agent_refs = [
+        {"name": "math_agent"},
+        {"name": "code_agent"},
+        {"name": "math_agent"},
+        {"name": "code_agent"},
+    ]
+    collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (4, 8)),
+        agent_refs,
+        multimodal_data={
+            # Mixed image/text rows exercise PackedTensor's None-row handling.
+            "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
+        },
+    )
+
+    assert math_twg.received is not None
+    assert code_twg.received is not None
+    assert _received_row_markers(math_twg.received["pixel_values"]) == [0.0, 2.0]
+    assert _received_row_markers(math_twg.received["imgs_sizes"]) == [10.0, 12.0]
+    assert "pixel_values" not in code_twg.received
+    assert "imgs_sizes" not in code_twg.received
+
+
+def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
+    """DP padding repeats the same multimodal row as the repeated token row."""
+    twg = _RecordingTeacherWorkerGroup(fill_value=3.0, dp_size=4)
+    collector = _make_collector(
+        teacher_worker_groups={"math": twg},
+        alias_to_group_alias={"math_agent": "math"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math_agent": "/ckpt/math"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result, _ = collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (1, 8)),
+        [{"name": "math_agent"}],
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([7]),
+            "num_frames": torch.tensor([[1]]),
+        },
+    )
+
+    assert twg.received is not None
+    assert twg.received["input_ids"].shape[0] == 4
+    assert _received_row_markers(twg.received["pixel_values"]) == [7.0] * 4
+    assert torch.equal(twg.received["num_frames"], torch.ones(4, 1, dtype=torch.long))
+    assert result.shape == (1, 8)
 
 
 def test_compute_teacher_logprobs_routes_to_correct_teacher():
