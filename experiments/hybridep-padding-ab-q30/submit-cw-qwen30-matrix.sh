@@ -266,6 +266,10 @@ printf 'source_branch=%s\npreflight_manifest_sha256=%s\nbatch_script=%s\n' \
   "$SOURCE_BRANCH" "$PREFLIGHT_MANIFEST_SHA256" "$BATCH_SCRIPT" \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'git_common_dir=%s\n' "$GIT_COMMON_DIR" >> "$PROVENANCE_ROOT/submission.txt"
+printf 'cudnn_host_path=%s\ncudnn_container_path=%s\n' \
+  "$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn" \
+  "/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn" \
+  >> "$PROVENANCE_ROOT/submission.txt"
 printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_checksum_mode=%s\n' \
   "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_CHECKSUM_CACHE" "$CONTAINER_CHECKSUM_MODE" \
   >> "$PROVENANCE_ROOT/submission.txt"
@@ -294,6 +298,7 @@ export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDNN_CONTAINER_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
 export PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
@@ -320,7 +325,7 @@ export CONTAINER
 
 EXTRA_MOUNTS=${MOUNTS:-}
 validate_extra_mounts "$EXTRA_MOUNTS"
-MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$CACHE_ROOT:$CACHE_ROOT"
+MOUNTS_VALUE="$SOURCE_PATH:$SOURCE_PATH,$OUTPUT_ROOT:$OUTPUT_ROOT,$HF_HOME:$HF_HOME,$PREFLIGHT_VENV:$PREFLIGHT_VENV,$CACHE_ROOT:$CACHE_ROOT,$CUDNN_HOME:$CUDNN_CONTAINER_PATH"
 if [[ "$GIT_COMMON_DIR" != "$SOURCE_PATH" && "$GIT_COMMON_DIR" != "$SOURCE_PATH/"* ]]; then
   MOUNTS_VALUE="$MOUNTS_VALUE,$GIT_COMMON_DIR:$GIT_COMMON_DIR"
 fi
