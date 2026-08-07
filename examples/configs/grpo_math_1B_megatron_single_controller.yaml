@@ -21,7 +21,6 @@ async_rl:
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
 
-# SC does not support checkpointing yet.
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-single-controller
