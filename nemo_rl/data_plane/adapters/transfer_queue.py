@@ -73,7 +73,11 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "tcp")
+    # Default to RDMA so production clusters (RoCE/IB) pick up the
+    # zero-copy MooncakeStore path introduced in TQ v0.1.8 without
+    # needing env tweaks. Hosts without an mlx5 device fall back to TCP
+    # below so the dev path (laptop, non-RDMA cluster) still works.
+    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "rdma")
     if protocol != "rdma":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
@@ -84,7 +88,7 @@ def _mooncake_transport_config() -> dict:
                     "sh",
                     "-c",
                     "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $d)); "
+                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $(dirname $d))); "
                     "done | head -1",
                 ],
                 check=False,
@@ -94,8 +98,28 @@ def _mooncake_transport_config() -> dict:
             device = out or ""
         except Exception:
             device = ""
-    if device:
-        os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
+    if not device:
+        detail = (
+            "no RoCE-capable mlx5 device detected under /sys/class/infiniband"
+        )
+        if "MC_MOONCAKE_PROTOCOL" in os.environ:
+            # Explicitly asked for RDMA. Falling back to TCP here would let a
+            # verification run pass without ever touching RDMA, so refuse.
+            raise RuntimeError(
+                f"MC_MOONCAKE_PROTOCOL=rdma was requested explicitly but {detail}. "
+                "Refusing to fall back to TCP. Set MC_MOONCAKE_PROTOCOL=tcp to "
+                "use TCP, or MC_MOONCAKE_DEVICE=<dev> to name the device."
+            )
+        # RDMA is only the default here, not a request — keep the dev path
+        # (laptop, non-RDMA cluster) working.
+        warnings.warn(
+            f"RDMA is the default transport but {detail}; falling back to TCP. "
+            "Set MC_MOONCAKE_PROTOCOL=tcp to silence.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {"protocol": "tcp"}
+    os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
     return {"protocol": "rdma", "device_name": device}
 
 
