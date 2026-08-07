@@ -33,6 +33,10 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
+    DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
+    DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
     PY_EXECUTABLES,
     RayVirtualCluster,
     ResourceInsufficientError,
@@ -587,3 +591,22 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
     # Avoid privileged ports (<1024).
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+
+
+def test_vllm_router_default_port_ranges_use_reserved_gap():
+    assert (
+        DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
+        DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
+    ) == (1320, 1360)
+    assert (
+        DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
+        DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+    ) == (1360, 1400)
+    assert 1312 < DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW
+    assert (
+        DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH
+        <= DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW
+    )
+    assert (
+        DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH <= DEFAULT_MASTER_PORT_RANGE_LOW
+    )
