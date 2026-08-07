@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy.dllm.config import DllmConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
-
-if TYPE_CHECKING:
-    # Type-only: importing the dllm package at runtime would pull torch in
-    # through nemo_rl.models.policy.dllm.elbo while this module is still
-    # initializing.
-    from nemo_rl.models.policy.dllm.config import DllmConfig
 
 
 def _patch_transformers_tokenizer_class_set():
@@ -545,7 +540,7 @@ class PolicyConfig(TypedDict):
     # estimated by SDMC quadrature instead of autoregressive token logprobs.
     # Loaded from YAML as a plain dict; coerce it with
     # nemo_rl.models.policy.dllm.dllm_config_from_policy.
-    dllm: NotRequired["DllmConfig"]
+    dllm: NotRequired[DllmConfig]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
