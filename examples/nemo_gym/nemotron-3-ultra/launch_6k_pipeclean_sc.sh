@@ -80,6 +80,7 @@ export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 # pre-bump image fails at import with "cannot import name ServingTokenization".
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:nightly-20260806-sandbox.squashfs}"
 export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
+export MOUNT_GYM="${MOUNT_GYM:-0}"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre:/lustre}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/${USER}/.cache/nemotron_ultra}"
 export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/llmservice/users/${USER}/hf_home}"
