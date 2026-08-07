@@ -253,7 +253,11 @@ def sanitize_nemo_gym_example_image_placeholders(nemo_gym_example: dict) -> dict
     for item in input_items:
         if not isinstance(item, dict):
             continue
-        content = item.get("content", "")
+        # No default: Responses API items such as function_call,
+        # function_call_output and reasoning carry no content key, and a ""
+        # default would satisfy the str branch below and write the field onto
+        # them, shipping fabricated items to the Gym server.
+        content = item.get("content")
         if isinstance(content, str):
             item["content"] = _normalize_image_placeholders(content, replacement)
             continue
