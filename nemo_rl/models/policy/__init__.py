@@ -562,5 +562,13 @@ class PolicyConfig(TypedDict):
     # If true, use standard Megatron layer specs while keeping ModelOpt
     # quantization enabled. Useful for faster QARL runs and logged in configs.
     disable_modelopt_layer_spec: NotRequired[bool]
+    # Opt-in (QAT only): during the frozen-weight logprob re-scoring stage, fold the
+    # fake-quantized ("snapped") weight into the parameter once via ModelOpt's
+    # fold_weight and disable the weight quantizer, instead of re-snapping on every
+    # microbatch forward. The weights and quantizers are restored on exit. Safe because
+    # that stage runs under no_grad with no optimizer step. Costs one extra copy of the
+    # weight shard for the duration of the stage. Absent/False = disabled.
+    # Megatron QAT only.
+    quant_fold_frozen_weight_snap: NotRequired[bool]
 
     is_vlm: NotRequired[bool]

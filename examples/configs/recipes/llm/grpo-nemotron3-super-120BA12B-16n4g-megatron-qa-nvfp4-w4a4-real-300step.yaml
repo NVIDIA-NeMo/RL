@@ -6,6 +6,7 @@ checkpointing:
 policy:
   disable_modelopt_layer_spec: true
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+  quant_fold_frozen_weight_snap: true
   quant_calib_data: cnn_dailymail
   quant_calib_size: 16
   quant_batch_size: 1
