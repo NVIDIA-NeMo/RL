@@ -1,0 +1,14 @@
+# =============================================================================
+# Nemotron 3 Ultra — 6K-GPU pipeclean, SingleController + DISAGGREGATED sandboxes
+# =============================================================================
+# pipeclean_6k_sc.yaml (streaming forward/backward, TransferQueue data plane,
+# checkpointing off) with tool execution on an external sandbox service. The
+# disagg fragment is merged AFTER the SC overlay so both sets of deltas apply;
+# they touch disjoint keys.
+#
+# Launch with disagg_sandboxes/launch_6k_disagg_sc.sh. See
+# disagg_overrides.yaml for requirements, prewarming and sizing notes.
+# =============================================================================
+defaults:
+  - ../pipeclean_6k_sc.yaml
+  - disagg_overrides.yaml
