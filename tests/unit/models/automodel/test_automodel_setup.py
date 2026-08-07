@@ -18,6 +18,7 @@ import os
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 pytest_plugins = []
 try:
@@ -38,6 +39,21 @@ from nemo_rl.models.automodel.setup import (
     setup_reference_model_state,
     validate_and_prepare_config,
 )
+from nemo_rl.models.policy import (
+    PytorchOptimizerConfig,
+    RewardModelConfig,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    SinglePytorchMilestonesConfig,
+    SinglePytorchSchedulerConfig,
+)
+
+
+def _enabled_sequence_packing() -> SequencePackingConfig:
+    return SequencePackingConfig(
+        train_mb_tokens=256,
+        algorithm="modified_first_fit_decreasing",
+    )
 
 
 def test_token_classification_backport_still_required():
@@ -53,7 +69,7 @@ def mock_config():
         "precision": "bfloat16",
         "max_grad_norm": 1.0,
         "offload_optimizer_for_logprob": False,
-        "sequence_packing": {"enabled": False},
+        "sequence_packing": SequencePackingConfigDisabled(),
         "dtensor_cfg": {
             "cpu_offload": False,
             "tensor_parallel_size": 1,
@@ -69,10 +85,10 @@ def mock_config():
             "colocated": {"enabled": True},
         },
         "hf_config_overrides": {},
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "kwargs": {"lr": 1e-4},
-        },
+        "optimizer": PytorchOptimizerConfig(
+            name="torch.optim.AdamW",
+            kwargs={"lr": 1e-4},
+        ),
     }
 
 
@@ -154,7 +170,7 @@ class TestValidateAndPrepareConfig:
         mock_config,
     ):
         """Test that sequence packing with VLM raises ValueError."""
-        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["sequence_packing"] = _enabled_sequence_packing()
         processor = MagicMock()
 
         with pytest.raises(
@@ -182,10 +198,10 @@ class TestValidateAndPrepareConfig:
         """Test reward model configuration with Bradley-Terry type."""
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
 
-        mock_config["reward_model_cfg"] = {
-            "enabled": True,
-            "reward_model_type": "bradley_terry",
-        }
+        mock_config["reward_model_cfg"] = RewardModelConfig(
+            enabled=True,
+            reward_model_type="bradley_terry",
+        )
 
         result = validate_and_prepare_config(
             config=mock_config,
@@ -210,7 +226,7 @@ class TestValidateAndPrepareConfig:
         mock_config,
     ):
         """Test that CP with sequence packing raises ValueError."""
-        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["sequence_packing"] = _enabled_sequence_packing()
         mock_config["dtensor_cfg"]["context_parallel_size"] = 2
 
         with pytest.raises(
@@ -273,13 +289,13 @@ class TestValidateAndPrepareConfig:
         mock_resolve_class.return_value = Mock
 
         # Test FA2 for sequence packing with cp=1
-        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["sequence_packing"] = _enabled_sequence_packing()
         mock_config["dtensor_cfg"]["context_parallel_size"] = 1
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "flash_attention_2"
 
         # Test SDPA for cp > 1
-        mock_config["sequence_packing"]["enabled"] = False
+        mock_config["sequence_packing"] = SequencePackingConfigDisabled()
         mock_config["dtensor_cfg"]["context_parallel_size"] = 2
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "sdpa"
@@ -399,11 +415,11 @@ class TestValidateAndPrepareConfig:
     ):
         """Test that sequence packing with reward model raises NotImplementedError."""
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
-        mock_config["sequence_packing"]["enabled"] = True
-        mock_config["reward_model_cfg"] = {
-            "enabled": True,
-            "reward_model_type": "bradley_terry",
-        }
+        mock_config["sequence_packing"] = _enabled_sequence_packing()
+        mock_config["reward_model_cfg"] = RewardModelConfig(
+            enabled=True,
+            reward_model_type="bradley_terry",
+        )
 
         with pytest.raises(
             NotImplementedError,
@@ -428,10 +444,10 @@ class TestValidateAndPrepareConfig:
     ):
         """Test that unknown reward model type raises ValueError."""
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
-        mock_config["reward_model_cfg"] = {
-            "enabled": True,
-            "reward_model_type": "unknown_type",
-        }
+        mock_config["reward_model_cfg"] = RewardModelConfig(
+            enabled=True,
+            reward_model_type="unknown_type",
+        )
 
         with pytest.raises(ValueError, match="Unknown reward model type: unknown_type"):
             validate_and_prepare_config(
@@ -461,10 +477,10 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig.torch_dtype = "float32"
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
 
-        mock_config["reward_model_cfg"] = {
-            "enabled": True,
-            "reward_model_type": "bradley_terry",
-        }
+        mock_config["reward_model_cfg"] = RewardModelConfig(
+            enabled=True,
+            reward_model_type="bradley_terry",
+        )
 
         result = validate_and_prepare_config(
             config=mock_config,
@@ -493,7 +509,7 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
 
-        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["sequence_packing"] = _enabled_sequence_packing()
         mock_config["dtensor_cfg"]["context_parallel_size"] = 1
 
         result = validate_and_prepare_config(
@@ -1284,10 +1300,10 @@ class TestSetupModelAndOptimizer:
 
         mock_get_class.side_effect = get_class_side_effect
 
-        mock_config["scheduler"] = {
-            "name": "torch.optim.lr_scheduler.StepLR",
-            "kwargs": {"step_size": 10},
-        }
+        mock_config["scheduler"] = SinglePytorchSchedulerConfig(
+            name="torch.optim.lr_scheduler.StepLR",
+            kwargs={"step_size": 10},
+        )
 
         result = setup_model_and_optimizer(
             config=mock_config,
@@ -1335,12 +1351,15 @@ class TestSetupModelAndOptimizer:
         mock_get_class.side_effect = get_class_side_effect
 
         mock_config["scheduler"] = [
-            {
-                "name": "torch.optim.lr_scheduler.LinearLR",
-                "kwargs": {"start_factor": 0.1},
-            },
-            {"name": "torch.optim.lr_scheduler.StepLR", "kwargs": {"step_size": 10}},
-            {"milestones": [5]},
+            SinglePytorchSchedulerConfig(
+                name="torch.optim.lr_scheduler.LinearLR",
+                kwargs={"start_factor": 0.1},
+            ),
+            SinglePytorchSchedulerConfig(
+                name="torch.optim.lr_scheduler.StepLR",
+                kwargs={"step_size": 10},
+            ),
+            SinglePytorchMilestonesConfig(milestones=[5]),
         ]
 
         result = setup_model_and_optimizer(
@@ -1978,7 +1997,7 @@ class TestGetTokenizer:
         mock_tokenizer.pad_token = "<pad>"
         mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
 
-        with pytest.raises(AssertionError, match="chat_template_kwargs should be"):
+        with pytest.raises(ValidationError, match="chat_template_kwargs"):
             get_tokenizer(
                 {
                     "name": "gpt2",

@@ -55,6 +55,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
+    is_fastokens_enabled,
     log_generation_metrics_to_wandb,
     print_efficiency_summary,
     print_performance_metrics,
@@ -573,7 +574,7 @@ def setup(
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
         # tokens across packed-sequence boundaries.
-        assert not policy_config["sequence_packing"]["enabled"], (
+        assert not policy_config["sequence_packing"].enabled, (
             "Linear CE fusion loss is not supported with sequence packing for GRPO. "
             "The fused path has not been validated with cu_seqlens-based logprob "
             "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
@@ -655,7 +656,7 @@ def setup(
             model_name=model_name,
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
-            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            use_fastokens=is_fastokens_enabled(policy_config["tokenizer"]),
         )
         return actor, time.perf_counter() - t0
 

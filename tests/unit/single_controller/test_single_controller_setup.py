@@ -29,6 +29,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.models.policy import RouterReplayConfig
 
 
 def _make_master_config(
@@ -287,7 +288,7 @@ class TestSetup:
 
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
         mc = _make_master_config(colocated=True)
-        mc.policy["router_replay"] = {"enabled": True}
+        mc.policy["router_replay"] = RouterReplayConfig()
 
         actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
