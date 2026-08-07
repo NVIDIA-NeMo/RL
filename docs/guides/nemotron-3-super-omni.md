@@ -186,8 +186,7 @@ vision and sound freeze flags, explicit MTP disablement, refit buffer sizing,
 the model's serving chat template, and Super-recipe-gated normalization of its
 dynamic-resolution image tensors.
 
-The matching validation driver is
-[`vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.sh`](../../tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.sh).
-It remains a manually invoked functional test because the production topology
-uses 16 nodes. The 8-node command above completed an end-to-end optimizer step
-and refit in Slurm job `1545077`.
+Use the four-node smoke command above as the minimum functional acceptance test.
+It completed three optimizer/refit steps in Slurm job `1633404`. The production
+topology subsequently completed seven consecutive optimizer/refit steps in
+ten-node Slurm job `1637034`.

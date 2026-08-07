@@ -8,7 +8,9 @@ grpo:
   zero_variance_prompt_filtering: false
   async_grpo:
     enabled: true
-    in_flight_weight_updates: true
+    # Super trains the vision tower. Quiesce generation so encoder-cache
+    # invalidation is ordered after refit and before post-refit image requests.
+    in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
 loss_fn:
   token_level_loss: false
@@ -63,7 +65,10 @@ policy:
     - <so_start>
     - <so_end>
     vllm_cfg:
-      gpu_memory_utilization: 0.8
+      # vLLM 0.25's CUDA graph pools and 0.8 KV-cache target exceed H100 memory
+      # for Super. Eager mode with 0.5 is the validated refit-safe budget.
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
       load_format: auto
       enable_prefix_caching: false
       skip_tokenizer_init: false
@@ -75,9 +80,14 @@ policy:
         NRL_REFIT_NUM_BUFFERS: '1'
       http_server_serving_chat_kwargs:
         chat_template: ${policy.tokenizer.chat_template}
-        chat_template_content_format: openai
+        # The checkpoint template expects ordinary strings; OpenAI content
+        # lists are stringified into malformed system prompts.
+        chat_template_content_format: string
         reasoning_parser: deepseek_r1
     vllm_kwargs:
+      # The auto-selected FlashInfer TRTLLM blocked expert layout cannot accept
+      # the HF-shaped tensors used by collective refit.
+      moe_backend: triton
       limit_mm_per_prompt:
         image: 3
       mm_processor_cache_gb: 0

@@ -171,20 +171,16 @@ def test_compute_teacher_logprobs_selects_multimodal_rows_per_teacher():
         multimodal_data={
             # Mixed image/text rows exercise PackedTensor's None-row handling.
             "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
-            "imgs_sizes": torch.tensor([[0, 10], [1, 11], [2, 12], [3, 13]]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
         },
     )
 
     assert math_twg.received is not None
     assert code_twg.received is not None
     assert _received_row_markers(math_twg.received["pixel_values"]) == [0.0, 2.0]
-    assert _received_row_markers(code_twg.received["pixel_values"]) == [None, None]
-    assert torch.equal(
-        math_twg.received["imgs_sizes"], torch.tensor([[0, 10], [2, 12]])
-    )
-    assert torch.equal(
-        code_twg.received["imgs_sizes"], torch.tensor([[1, 11], [3, 13]])
-    )
+    assert _received_row_markers(math_twg.received["imgs_sizes"]) == [10.0, 12.0]
+    assert "pixel_values" not in code_twg.received
+    assert "imgs_sizes" not in code_twg.received
 
 
 def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():

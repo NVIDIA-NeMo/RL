@@ -85,7 +85,11 @@ def main() -> None:
                     "incomplete_reason": incomplete.get("reason"),
                     "leaked_metadata": any(
                         marker in request_json
-                        for marker in ('"circles"', '"target_color"', '"expected_count"')
+                        for marker in (
+                            '"circles"',
+                            '"target_color"',
+                            '"expected_count"',
+                        )
                     ),
                     "boxed": bool(re.search(r"\\boxed\{[^}]+\}", text)),
                     "image_grounded": "circle" in text.lower()
