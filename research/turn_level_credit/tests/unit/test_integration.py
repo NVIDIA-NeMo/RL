@@ -62,7 +62,7 @@ def test_disabled_runtime_does_not_install_hooks():
     assert grpo_module._create_advantage_estimator is original_estimator_factory
 
 
-def test_runtime_hooks_capture_metrics_and_restore_after_error(monkeypatch):
+def test_runtime_hooks_capture_metrics_and_restore_after_error(monkeypatch, capsys):
     batch = BatchedDataDict(
         {
             "message_log": [
@@ -126,6 +126,10 @@ def test_runtime_hooks_capture_metrics_and_restore_after_error(monkeypatch):
             assert final_batch["assistant_turn_spans"].tolist() == [[[0, 2]]]
             assert metrics["turn_credit/environment_reward/mean"] == 0.75
             assert metrics["turn_credit/credit/mean"] == 0.75
+            metric_line = capsys.readouterr().out
+            assert "TURN_CREDIT_ROLLOUT_METRICS" in metric_line
+            assert "turn_credit/turns_per_sample/mean=1.0" in metric_line
+            assert "turn_credit/environment_reward/mean=0.75" in metric_line
             assert torch.allclose(
                 estimator.compute_advantage(
                     prompt_ids=torch.tensor([0]),

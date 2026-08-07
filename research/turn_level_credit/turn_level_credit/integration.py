@@ -101,29 +101,31 @@ def install_turn_credit_runtime(
             discount=turn_credit_config.discount,
         )
         observed_credit = credit[turn_batch.mask]
-        metrics.update(
-            {
-                "turn_credit/turns_per_sample/mean": float(
-                    turns_per_sample.float().mean().item()
-                ),
-                "turn_credit/turns_per_sample/max": int(turns_per_sample.max().item()),
-                "turn_credit/trainable_turns_per_sample/mean": float(
-                    trainable_turns_per_sample.float().mean().item()
-                ),
-                "turn_credit/trainable_turns_per_sample/max": int(
-                    trainable_turns_per_sample.max().item()
-                ),
-                "turn_credit/environment_reward/mean": float(
-                    observed_rewards.mean().item()
-                ),
-                "turn_credit/environment_reward/std": float(
-                    observed_rewards.std(unbiased=False).item()
-                ),
-                "turn_credit/credit/mean": float(observed_credit.mean().item()),
-                "turn_credit/credit/std": float(
-                    observed_credit.std(unbiased=False).item()
-                ),
-            }
+        turn_metrics = {
+            "turn_credit/turns_per_sample/mean": float(
+                turns_per_sample.float().mean().item()
+            ),
+            "turn_credit/turns_per_sample/max": int(turns_per_sample.max().item()),
+            "turn_credit/trainable_turns_per_sample/mean": float(
+                trainable_turns_per_sample.float().mean().item()
+            ),
+            "turn_credit/trainable_turns_per_sample/max": int(
+                trainable_turns_per_sample.max().item()
+            ),
+            "turn_credit/environment_reward/mean": float(
+                observed_rewards.mean().item()
+            ),
+            "turn_credit/environment_reward/std": float(
+                observed_rewards.std(unbiased=False).item()
+            ),
+            "turn_credit/credit/mean": float(observed_credit.mean().item()),
+            "turn_credit/credit/std": float(observed_credit.std(unbiased=False).item()),
+        }
+        metrics.update(turn_metrics)
+        print(
+            "TURN_CREDIT_ROLLOUT_METRICS "
+            + " ".join(f"{key}={value}" for key, value in sorted(turn_metrics.items())),
+            flush=True,
         )
         return final_batch, metrics
 
