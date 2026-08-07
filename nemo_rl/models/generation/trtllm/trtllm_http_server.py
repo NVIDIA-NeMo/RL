@@ -17,7 +17,6 @@ Returns NeMoGym fields (prompt_token_ids, generation_token_ids, generation_log_p
 Supports Qwen3 tool calling, DeepSeekR1Parser reasoning, and prefix token splicing.
 """
 
-import asyncio
 import logging
 import threading
 import time
@@ -121,11 +120,11 @@ def create_app(
 
         # The NeMo-RL generation config, not the request, is the source of truth
         # for sampling params.
-        for key in ("temperature", "top_p"):
+        for key in ("temperature", "top_p", "top_k"):
             if body.get(key) is not None:
-                assert body[key] == sampling_config[key], (
+                assert body[key] == sampling_config.get(key), (
                     f"request {key} {body[key]!r} must match the "
-                    f"NeMo-RL generation config ({sampling_config[key]})"
+                    f"NeMo-RL generation config ({sampling_config.get(key)})"
                 )
 
         # Request kwargs override server defaults.
@@ -199,19 +198,23 @@ def create_app(
         from tensorrt_llm import SamplingParams as TrtSamplingParams
         from tensorrt_llm.executor.utils import RequestError
 
+        # Same convention as the direct path (_build_sampling_params): TRT-LLM
+        # spells "no top-k restriction" as 0, the generation config as null.
+        top_k_cfg = sampling_config.get("top_k")
         sampling = TrtSamplingParams(
             temperature=float(sampling_config["temperature"]),
             top_p=float(sampling_config["top_p"]),
+            top_k=int(top_k_cfg) if top_k_cfg is not None else 0,
             max_tokens=int(max_tokens),
             # Include generated stop tokens so the adapter can trim tokens and logprobs together.
             include_stop_str_in_output=True,
             logprobs=True,
+            logprobs_simple_format=True,
         )
 
         try:
-            outputs = await asyncio.to_thread(
-                llm.generate,
-                [{"prompt_token_ids": adj_prompt}],
+            output = await llm.generate_async(
+                {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
             )
         except RequestError as e:
@@ -223,7 +226,6 @@ def create_app(
                 )
             raise
 
-        output = outputs[0]
         gen = output.outputs[0]
         gen_token_ids = list(gen.token_ids)
 
