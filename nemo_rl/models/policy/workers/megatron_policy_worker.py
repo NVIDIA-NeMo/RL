@@ -54,7 +54,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.config import (
-    apply_megatron_inference_overrides,
+    merged_inference_megatron_cfg,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
@@ -2721,7 +2721,7 @@ class MegatronPolicyWorkerImpl(
         # Resolve the inference layout the same way the non-colocated generation policy does:
         # overlay the sparse mcore_generation_config onto a copy of megatron_cfg.
         inference_config = copy.deepcopy(config)
-        apply_megatron_inference_overrides(inference_config)
+        inference_config["megatron_cfg"] = merged_inference_megatron_cfg(inference_config)
         # Inference never uses CP: pin CP=1, so CP>1 training builds a separate inference model.
         inference_config["megatron_cfg"]["context_parallel_size"] = 1
 
