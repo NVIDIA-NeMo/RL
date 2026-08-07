@@ -1,5 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+PROJECT_ROOT=$(realpath "$SCRIPT_DIR/..")
 
 set -eou pipefail
 
@@ -18,8 +19,9 @@ fi
 
 CONTAINER=${CONTAINER}
 
-export HF_HOME=${HF_HOME:-$(realpath $SCRIPT_DIR/../hf_home)}
-mkdir -p $HF_HOME
+export HF_HOME=${HF_HOME:-"$PROJECT_ROOT/hf_home"}
+CONTAINER_HOME=${CONTAINER_HOME:-"$PROJECT_ROOT/.cache/nemo-rl/home"}
+mkdir -p "$HF_HOME" "$CONTAINER_HOME"
 
 # Check if running in GitLab CI
 INTERACTIVE_FLAG=""
@@ -28,12 +30,22 @@ if [[ "${CI:-false}" != "true" ]]; then
     INTERACTIVE_FLAG="-it"
 fi
 
-# Note: we run as root because:
-#  1. running as ray prevents us from writing into the current working directory
-#  2. running as ourselves (-u $(id -u):$(id -g)) causes torch compile to fail
-#
-# The workaround is we launch the job but set umask 000 so all files created as root are rwxrwxrwx.
-# We have found that 111 does not always work and can leave the filesystem permissions in a bad state.
-
-# Run the script inside the Docker container with GPU support
-docker run -u root $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE --rm --gpus '"device=0,1"' -v "$(realpath $SCRIPT_DIR/..):/workspace" -v $HF_HOME:/hf_home -e HF_TOKEN -e HF_HOME=/hf_home -e HOME=/tmp/ -w /workspace/tests "$CONTAINER" -- bash -x -c "umask 000 && uv run --group test bash -x ./run_unit.sh $@"
+# Use the caller's identity so files written to the bind-mounted checkout keep
+# their host ownership. --no-sync reuses the dependency-complete CI image; a
+# dependency fingerprint mismatch means the image must be rebuilt.
+docker run --user "$(id -u):$(id -g)" $INTERACTIVE_FLAG \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --cap-add=SYS_PTRACE \
+  --rm \
+  --gpus '"device=0,1"' \
+  -v "$PROJECT_ROOT:/workspace" \
+  -v "$HF_HOME:/hf_home" \
+  -v "$CONTAINER_HOME:/home/nemo-rl" \
+  -e HF_TOKEN \
+  -e HF_HOME=/hf_home \
+  -e HOME=/home/nemo-rl \
+  -e UV_CACHE_DIR=/home/nemo-rl/.cache/uv \
+  -w /workspace/tests \
+  "$CONTAINER" -- \
+  bash -x -c 'uv run --no-sync --group test bash -x ./run_unit.sh "$@"' bash "$@"
