@@ -1,7 +1,10 @@
 """Tests for turn-level credit configuration."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
+from run_grpo_turn_credit import load_master_and_turn_credit_config
 from turn_level_credit.config import TurnCreditConfig
 
 
@@ -55,3 +58,20 @@ def test_config_rejects_unknown_fields():
 def test_config_rejects_non_finite_numbers(field, value):
     with pytest.raises(ValidationError):
         TurnCreditConfig.model_validate({field: value})
+
+
+def test_sliding_puzzle_pilot_is_multi_turn_and_macro_only_by_default():
+    config_path = (
+        Path(__file__).parents[2] / "configs" / "grpo_sliding_puzzle_turn_credit.yaml"
+    )
+
+    master_config, turn_credit_config = load_master_and_turn_credit_config(
+        str(config_path),
+        [],
+    )
+
+    assert master_config.grpo.max_rollout_turns == 6
+    assert master_config.grpo.max_num_steps == 10
+    assert master_config.policy["train_global_batch_size"] == 16
+    assert turn_credit_config.enabled
+    assert turn_credit_config.turn_weight == 0.0

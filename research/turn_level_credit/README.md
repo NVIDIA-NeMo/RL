@@ -141,6 +141,30 @@ bash \
   tests/test_suites/llm/grpo-qwen2.5-0.5b-instruct-1n1g-dtensor2tp1-turn-credit.sh
 ```
 
+## Run the multi-turn pilot
+
+The sliding-puzzle pilot uses NeMo-RL's native multi-turn environment and
+reports puzzle success, turns per sample, truncation, and turn-credit reward
+distributions:
+
+```bash
+uv run run_grpo_turn_credit_sliding_puzzle.py \
+  --config configs/grpo_sliding_puzzle_turn_credit.yaml
+```
+
+The checked-in configuration is the macro-only control (`turn_weight: 0`). A
+matched treatment changes only `turn_credit.turn_weight`, for example:
+
+```bash
+uv run run_grpo_turn_credit_sliding_puzzle.py \
+  --config configs/grpo_sliding_puzzle_turn_credit.yaml \
+  turn_credit.turn_weight=0.2
+```
+
+This ten-step pilot is a feasibility and signal-quality gate, not evidence of
+an accuracy improvement. A performance claim requires longer matched runs and
+at least three seeds.
+
 ## Evidence required before claiming an improvement
 
 The next scientific experiment needs a genuinely long-horizon environment with
