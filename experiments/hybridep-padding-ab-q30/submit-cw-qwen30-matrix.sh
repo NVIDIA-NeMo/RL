@@ -289,9 +289,11 @@ export CUDA_CACHE_PATH=/tmp/nemo-rl-cuda-cache-$ARM-$LOCAL_HEAD
 export CUDNN_HOME=$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
+export PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages
 export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
 export MCORE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
-export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE${PYTHONPATH:+:$PYTHONPATH}"
+[[ -d "$PREFLIGHT_SITE_PACKAGES" ]] || die "preflight site-packages is missing: $PREFLIGHT_SITE_PACKAGES"
+export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$HF_DATASETS_CACHE" "$UV_CACHE_DIR_OVERRIDE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$WANDB_CACHE_DIR"
 require_canonical_lustre_path HF_HOME "$HF_HOME"
 require_canonical_lustre_path HF_DATASETS_CACHE "$HF_DATASETS_CACHE"
@@ -334,6 +336,7 @@ set -euo pipefail
 cd "$SOURCE_PATH"
 RUN_PYTHON=$(uv run --no-sync python -c 'import sys; print(sys.executable)')
 [[ $("$RUN_PYTHON" -c 'import platform; print(platform.python_version())') == 3.13.14 ]]
+"$RUN_PYTHON" -c 'import ray, requests, urllib3.exceptions'
 VENV_MANIFEST="$PROVENANCE_ROOT/venv-$(hostname).txt"
 "$RUN_PYTHON" -m pip freeze | LC_ALL=C sort > "$VENV_MANIFEST"
 [[ $(sha256sum "$VENV_MANIFEST" | cut -d' ' -f1) == "$PREFLIGHT_MANIFEST_SHA256" ]]

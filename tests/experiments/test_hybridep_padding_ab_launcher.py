@@ -189,7 +189,20 @@ def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
     for script in (launcher, validator):
         assert "Megatron-Bridge/src" in script
         assert "Megatron-Bridge/3rdparty/Megatron-LM" in script
-        assert 'export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE' in script
+        assert (
+            'PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES'
+            in script
+        )
+
+
+def test_ray_bootstrap_uses_the_pinned_preflight_site_packages() -> None:
+    launcher = LAUNCHER.read_text()
+    validator = VALIDATE_SCRIPT.read_text()
+
+    assert "PREFLIGHT_SITE_PACKAGES=$PREFLIGHT_VENV/lib/python3.13/site-packages" in launcher
+    assert "import ray, requests, urllib3.exceptions" in launcher
+    assert "/opt/nemo_rl_venv/bin/ray --version" in validator
+    assert "import ray, requests, urllib3, urllib3.exceptions" in validator
 
 
 def test_login_node_preflight_does_not_require_gpu_tools() -> None:

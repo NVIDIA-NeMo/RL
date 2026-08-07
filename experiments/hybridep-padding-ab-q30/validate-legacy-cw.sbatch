@@ -47,14 +47,17 @@ set -euo pipefail
 export UV_PROJECT_ENVIRONMENT="$PREFLIGHT_VENV"
 export VIRTUAL_ENV="$PREFLIGHT_VENV"
 export PATH="$PREFLIGHT_VENV/bin:$PATH"
+PREFLIGHT_SITE_PACKAGES="$PREFLIGHT_VENV/lib/python3.13/site-packages"
 BRIDGE_SOURCE="$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src"
 MCORE_SOURCE="$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
-export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$PREFLIGHT_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
 export CUDNN_HOME="$PREFLIGHT_VENV/lib/python3.13/site-packages/nvidia/cudnn"
 export CUDNN_PATH="$CUDNN_HOME"
 export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 uv run --no-sync python -m pip freeze | LC_ALL=C sort | tee "$OUTPUT_ROOT/preflight-venv.txt"
 sha256sum "$OUTPUT_ROOT/preflight-venv.txt" | tee "$OUTPUT_ROOT/preflight-venv.sha256"
+/opt/nemo_rl_venv/bin/python -c "import ray, requests, urllib3, urllib3.exceptions; print(ray.__file__); print(requests.__file__); print(urllib3.__file__)"
+/opt/nemo_rl_venv/bin/ray --version
 uv run --no-sync python -c "import nemo_rl.models.megatron.data as module; print(module.__file__)"
 PYTEST_PLUGINS=nemo_rl.models.megatron.data uv run --no-sync pytest -q \
   --mcore-only \
