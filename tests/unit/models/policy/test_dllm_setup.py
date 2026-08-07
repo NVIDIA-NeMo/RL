@@ -151,3 +151,60 @@ def test_consistent_shifting_pair_is_allowed():
     policy = make_policy()
     policy["dllm"]["shift_targets"] = True
     validate_dllm_policy(policy, dict(VALID_LOSS, position_aligned_logprobs=False))
+
+
+VALID_GENERATION = {
+    "backend": "dllm",
+    "colocated": {"enabled": True},
+    "max_new_tokens": 128,
+}
+
+
+def make_generation(**overrides):
+    cfg = dict(VALID_GENERATION)
+    cfg["colocated"] = dict(VALID_GENERATION["colocated"])
+    cfg.update(overrides)
+    return cfg
+
+
+def test_a_dllm_generation_block_passes_validation():
+    validate_dllm_policy(make_policy(generation=make_generation()), VALID_LOSS)
+
+
+def test_an_absent_generation_block_is_not_validated():
+    """Logprob-only entrypoints (SFT, evaluation) configure no rollouts."""
+    policy = make_policy()
+    policy["generation"] = None
+    validate_dllm_policy(policy, VALID_LOSS)
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm", "megatron"])
+def test_autoregressive_backends_are_rejected(backend):
+    policy = make_policy(generation=make_generation(backend=backend))
+    with pytest.raises(ValueError, match="have no KV cache"):
+        validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_non_colocated_generation_is_rejected():
+    policy = make_policy(generation=make_generation())
+    policy["generation"]["colocated"]["enabled"] = False
+    with pytest.raises(ValueError, match="colocated.enabled must be true"):
+        validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_max_new_tokens_must_be_a_multiple_of_the_block_length():
+    policy = make_policy(generation=make_generation(max_new_tokens=100))
+    with pytest.raises(ValueError, match="multiple of policy.dllm.block_length"):
+        validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_a_matching_custom_block_length_is_accepted():
+    policy = make_policy(generation=make_generation(max_new_tokens=96))
+    policy["dllm"]["block_length"] = 48
+    validate_dllm_policy(policy, VALID_LOSS)
+
+
+def test_generation_is_not_validated_when_dllm_is_disabled():
+    """A non-dLLM policy keeps whatever generation backend it configured."""
+    policy = make_policy(dllm=False, generation=make_generation(backend="vllm"))
+    validate_dllm_policy(policy, VALID_LOSS)

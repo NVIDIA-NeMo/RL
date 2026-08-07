@@ -110,7 +110,39 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any) -> None:
             "but the ELBO masks positions across the whole sequence. Set it to 1."
         )
 
-    _validate_dllm_loss(loss_cfg, dllm_config_from_policy(policy_cfg))
+    dllm_cfg = dllm_config_from_policy(policy_cfg)
+    _validate_dllm_generation(policy_cfg.get("generation"), dllm_cfg)
+    _validate_dllm_loss(loss_cfg, dllm_cfg)
+
+
+def _validate_dllm_generation(generation_cfg: Any, dllm_cfg: Any) -> None:
+    """Rejects rollout settings the denoising sampler cannot honor."""
+    if generation_cfg is None:
+        return
+
+    backend = generation_cfg.get("backend")
+    if backend != "dllm":
+        raise ValueError(
+            f"policy.generation.backend is '{backend}', but policy.dllm.enabled "
+            "is true. Masked diffusion models decode a fixed-width canvas and "
+            "have no KV cache, so the autoregressive engines cannot serve them. "
+            "Set policy.generation.backend='dllm'."
+        )
+
+    if not generation_cfg.get("colocated", {}).get("enabled", True):
+        raise ValueError(
+            "policy.generation.colocated.enabled must be true with "
+            "policy.generation.backend='dllm': rollouts run in the training "
+            "workers, so there is no separate inference cluster to place."
+        )
+
+    max_new_tokens = generation_cfg.get("max_new_tokens")
+    if max_new_tokens is not None and max_new_tokens % dllm_cfg.block_length != 0:
+        raise ValueError(
+            f"policy.generation.max_new_tokens ({max_new_tokens}) must be a "
+            f"multiple of policy.dllm.block_length ({dllm_cfg.block_length}): "
+            "the generation region is denoised in whole blocks."
+        )
 
 
 def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:

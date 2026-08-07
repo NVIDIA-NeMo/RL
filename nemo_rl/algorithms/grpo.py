@@ -100,6 +100,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     resolve_routed_experts_dtype_name_for_model,
 )
+from nemo_rl.models.generation.dllm import DllmGeneration
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -699,7 +700,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
+            if generation_config["backend"] in ("megatron", "dllm")
             else 2,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
@@ -1135,6 +1136,22 @@ def setup(
                 generation_config["model_name"],
             )
             worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+
+        print(
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+    elif backend == "dllm":
+        # Masked diffusion models denoise on the training weights, so there is
+        # no inference engine to stand up and nothing to refit.
+        assert colocated_inference, (
+            "The dllm generation backend runs inside the training workers, so "
+            "policy.generation.colocated.enabled must be true."
+        )
+        policy, policy_time = init_policy()
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        policy_generation = DllmGeneration(config=policy_config, policy=policy)
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -2648,8 +2665,12 @@ def grpo_train(
     kv_scales_cache = None  # Cache reused for computed kv scales
 
     NEED_REFIT = not (
-        isinstance(policy_generation, MegatronGeneration)
-        and master_config.policy["generation"]["colocated"]["enabled"]
+        (
+            isinstance(policy_generation, MegatronGeneration)
+            and master_config.policy["generation"]["colocated"]["enabled"]
+        )
+        # dLLM rollouts read the live training weights; there is nothing to sync.
+        or isinstance(policy_generation, DllmGeneration)
     )
     assert policy_generation is not None
 
@@ -3973,8 +3994,12 @@ def async_grpo_train(
     )
     timeout.start_iterations()
     NEED_REFIT = not (
-        isinstance(policy_generation, MegatronGeneration)
-        and master_config.policy["generation"]["colocated"]["enabled"]
+        (
+            isinstance(policy_generation, MegatronGeneration)
+            and master_config.policy["generation"]["colocated"]["enabled"]
+        )
+        # dLLM rollouts read the live training weights; there is nothing to sync.
+        or isinstance(policy_generation, DllmGeneration)
     )
     assert policy_generation is not None
 
