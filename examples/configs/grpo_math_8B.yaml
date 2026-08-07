@@ -56,6 +56,9 @@ policy:
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
+    fault_tolerance:
+      enabled: false
+      auto_recover: true
 
 cluster:
   gpus_per_node: 8

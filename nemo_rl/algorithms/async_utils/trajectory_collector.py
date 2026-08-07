@@ -540,8 +540,36 @@ class AsyncTrajectoryCollector:
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")
 
-    def resume_after_refit(self) -> None:
-        """Resume new generation starts after refit is complete."""
+    def resume_after_refit(self, worker_sync_state=None) -> None:
+        """Resume new generation starts after refit is complete.
+
+        Args:
+            worker_sync_state: Optional tuple of (all_workers, dp_leader_indices,
+                dead_indices) from the main process's VllmGeneration.  Passed
+                whenever fault-tolerant recovery may have added new DP shards
+                since the AC was last synced.  Without this, the AC's stale copy
+                never learns about replacement actors and raises "no alive DP
+                shards remaining" after the next fault kills its last known shard.
+        """
+        if worker_sync_state is not None:
+            try:
+                all_workers, dp_leader_indices, dead_indices = worker_sync_state
+                wg = self.policy_generation.worker_group
+                # Extend worker list with newly spawned recovery actors.
+                if len(all_workers) > len(wg._workers):
+                    wg._workers.extend(all_workers[len(wg._workers):])
+                # Replace dp_leader_worker_indices (main process has ground
+                # truth via the router).
+                wg.dp_leader_worker_indices[:] = list(dp_leader_indices)
+                # Union dead indices: keep deaths the AC already detected plus
+                # what the main process knows about.
+                wg._dead_indices.update(dead_indices)
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[resume_after_refit] worker state sync failed: {e}; "
+                    f"continuing without sync",
+                    flush=True,
+                )
         print("🔄 Resuming generation starts after refit")
 
         # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if

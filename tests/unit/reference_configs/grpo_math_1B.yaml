@@ -402,6 +402,9 @@ policy:
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}
+    fault_tolerance:
+      enabled: false
+      auto_recover: true
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources

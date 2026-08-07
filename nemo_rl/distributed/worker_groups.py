@@ -217,11 +217,14 @@ class RayWorkerBuilder:
                     worker_kwargs.update(init_kwargs)
 
             # Create options for Ray actor
-            options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
-                placement_group=placement_group,
-                placement_group_bundle_index=placement_group_bundle_index,
-                placement_group_capture_child_tasks=True,
-            )
+            if placement_group is not None:
+                options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=placement_group_bundle_index,
+                    placement_group_capture_child_tasks=True,
+                )
+            # else: use whatever scheduling_strategy was supplied in extra_options
+            # (e.g. NodeAffinitySchedulingStrategy for SLURM restarts), or Ray default.
             options["num_gpus"] = num_gpus
             worker = worker_class.options(**options).remote(
                 *self.init_args, **worker_kwargs
@@ -361,6 +364,14 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
+        # Indices of ray.kill'd workers; dispatch methods skip these to avoid RayActorError.
+        self._dead_indices: set[int] = set()
+        # Stash builder + env vars so add_worker can spawn new DP shards post-init.
+        self._remote_worker_builder = remote_worker_builder
+        self._env_vars: dict[str, str] = dict(env_vars)
+        # Monotonic counter for unique actor names; never decremented so retries
+        # don't collide with stale Ray namespace entries from failed attempts.
+        self._add_worker_seq: int = 0
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -568,7 +579,7 @@ class RayWorkerGroup:
                     else 0
                 )
 
-                # Build the worker's runtime_env with per-worker env_vars
+                # Pass these options to the remote_worker_builder
                 runtime_env = {
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
@@ -674,6 +685,242 @@ class RayWorkerGroup:
         """Number of data parallel shards."""
         return len(self.dp_leader_worker_indices)
 
+    @property
+    def dead_indices(self) -> set[int]:
+        """Worker indices removed via mark_workers_dead."""
+        return self._dead_indices
+
+    def mark_workers_dead(self, indices: list[int]) -> None:
+        """Drop these worker indices from the dispatch set.
+
+        Called after ``ray.kill`` on a shard's actor so subsequent dispatches skip it.
+        Also shrinks ``dp_leader_worker_indices`` so ``dp_size`` reflects the new count.
+        ``indices`` must contain ALL workers in the shard (leader + TP followers);
+        passing a partial list leaves followers in the dispatch set and causes RayActorError.
+        """
+        if not indices:
+            return
+        self._dead_indices.update(indices)
+        self.dp_leader_worker_indices = [
+            i for i in self.dp_leader_worker_indices if i not in self._dead_indices
+        ]
+
+    def spawn_worker_only(
+        self,
+        placement_group: PlacementGroup,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+        dp_shard_idx: Optional[int] = None,
+        compact_dead_indices: bool = True,
+        local_rank: int = 0,
+        node_id: Optional[str] = None,
+        placement_group_bundle_index: int = 0,
+    ) -> tuple[Any, str, tuple[int, list[int]], int]:
+        """Phase A of add_worker: spawn the actor handle WITHOUT appending.
+
+        Returns ``(actor_handle, name, bundle_indices, dp_shard_idx)``. The actor's
+        ``__init__`` runs asynchronously; the caller can drive setup methods on the handle
+        while it finishes. The actor is invisible to dispatch until ``append_spawned_worker``
+        is called, so in-flight work continues at the pre-fault world size.
+        """
+        if self._remote_worker_builder is None:
+            raise RuntimeError(
+                "RayWorkerGroup.spawn_worker_only requires remote_worker_builder to "
+                "have been stashed at __init__ time."
+            )
+        # Compact dead indices first so the appended worker lands at a
+        # contiguous slot. Done in this phase so the indices we hand back
+        # are stable for ``append_spawned_worker``.
+        if compact_dead_indices and self._dead_indices:
+            alive_workers: list[ray.actor.ActorHandle] = []
+            alive_metadata: list[dict[str, Any]] = []
+            old_to_new: dict[int, int] = {}
+            for old_idx, worker in enumerate(self._workers):
+                if old_idx in self._dead_indices:
+                    continue
+                old_to_new[old_idx] = len(alive_workers)
+                alive_workers.append(worker)
+                alive_metadata.append(self._worker_metadata[old_idx])
+            self._workers = alive_workers
+            self._worker_metadata = alive_metadata
+            self.dp_leader_worker_indices = [
+                old_to_new[i]
+                for i in self.dp_leader_worker_indices
+                if i in old_to_new
+            ]
+            self._dead_indices = set()
+
+        new_worker_idx = len(self._workers)
+        if dp_shard_idx is None:
+            dp_shard_idx = len(self.dp_leader_worker_indices)
+        # Leaders (local_rank == 0) must always supply explicit bundle_indices
+        # so configure_worker can compute the correct VLLM_CACHE_ROOT seed and
+        # VLLM_RAY_BUNDLE_INDICES.  Followers (local_rank > 0) must pass None
+        # so configure_worker leaves init_kwargs["bundle_indices"] unset,
+        # which keeps is_model_owner=False and prevents them from trying to
+        # initialise a full vLLM engine.
+        assert not (bundle_indices is None and local_rank == 0), (
+            "spawn_worker_only: bundle_indices must be provided for the leader (local_rank=0). "
+            "Pass the dead shard's bundle indices from dead_bundle_indices."
+        )
+
+        # NODE_RANK must be an integer even for followers that have no
+        # bundle_indices; fall back to new_worker_idx.
+        node_rank = bundle_indices[0] if bundle_indices is not None else new_worker_idx
+
+        worker_env_vars = deepcopy(self._env_vars)
+        for k, v in os.environ.items():
+            if k not in worker_env_vars:
+                worker_env_vars[k] = v
+        worker_env_vars.update(
+            {
+                "RANK": str(new_worker_idx),
+                "LOCAL_RANK": str(local_rank),
+                "WORLD_SIZE": str(new_worker_idx + 1),
+                "MASTER_ADDR": self.master_address,
+                "MASTER_PORT": str(self.master_port),
+                "NODE_RANK": str(node_rank),
+            }
+        )
+        for k in (
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+            "RAY_CLIENT_MODE",
+            "RAY_JOB_ID",
+            "RAY_LD_PRELOAD",
+            "RAY_RAYLET_PID",
+            "RAY_USAGE_STATS_ENABLED",
+        ):
+            worker_env_vars.pop(k, None)
+
+        actor_python_env = get_actor_python_env(
+            self._remote_worker_builder.ray_actor_class_fqn
+        )
+        if actor_python_env.startswith("uv"):
+            py_executable = create_local_venv_on_each_node(
+                py_executable=actor_python_env,
+                venv_name=self._remote_worker_builder.ray_actor_class_fqn,
+            )
+        else:
+            py_executable = actor_python_env
+
+        runtime_env = {
+            "env_vars": worker_env_vars,
+            "py_executable": py_executable,
+        }
+        py_venv = os.path.dirname(os.path.dirname(py_executable))
+        runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+        runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
+
+        # Monotonic name (NOT new_worker_idx) so a failed create doesn't
+        # collide with the next attempt.
+        self._add_worker_seq += 1
+        name = f"{self.name_prefix}-added-{self._add_worker_seq}"
+        extra_options: dict[str, Any] = {"runtime_env": runtime_env, "name": name}
+        if node_id is not None:
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+            extra_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False
+            )
+
+        num_gpus = (
+            1 / self.cluster.max_colocated_worker_groups
+            if self.cluster.use_gpus
+            else 0
+        )
+
+        worker = self._remote_worker_builder(
+            placement_group=placement_group,
+            placement_group_bundle_index=placement_group_bundle_index,
+            num_gpus=num_gpus,
+            bundle_indices=bundle_indices,
+            **extra_options,
+        )
+
+        return worker, name, bundle_indices, dp_shard_idx
+
+    def append_spawned_worker(
+        self,
+        worker: Any,
+        name: str,
+        bundle_indices: Optional[tuple[int, list[int]]],
+        dp_shard_idx: int,
+        pre_append_hook: Optional[Callable[[], None]] = None,
+        is_leader: bool = True,
+        local_rank: int = 0,
+    ) -> int:
+        """Phase B of add_worker: append a pre-spawned actor.
+
+        After this call, the worker is visible to all dispatch methods and will
+        be included in the next ``init_collective`` / ``reset_collective``.
+        ``pre_append_hook`` fires just before the append so the caller can
+        update any gates at the moment the world size changes.
+        Only the shard leader (``is_leader=True``) is added to
+        ``dp_leader_worker_indices``; TP followers are appended to ``_workers``
+        but not registered as dispatch targets.
+        """
+        if pre_append_hook is not None:
+            pre_append_hook()
+
+        new_worker_idx = len(self._workers)
+        self._workers.append(worker)
+        node_idx = bundle_indices[0] if bundle_indices is not None else 0
+        self._worker_metadata.append(
+            {
+                "node_idx": node_idx,
+                "local_rank": local_rank,
+                "global_rank": new_worker_idx,
+                "name": name,
+                "bundle_indices": bundle_indices,
+                "dp_shard_idx": dp_shard_idx,
+            }
+        )
+        # If there are dead slots, update the sharding layout so that
+        # get_worker_coords(new_worker_idx) returns valid coordinates
+        # instead of raising ValueError.  Inheriting the dead worker's slot
+        # gives the replacement the same DP/TP/PP coords as the shard it
+        # replaces, without any index compaction.
+        #
+        # With TP>1 each shard has (leader + N followers). dead_slots is the
+        # sorted list of all dead worker indices NOT currently in
+        # dp_leader_worker_indices (i.e. the original leader once removed, plus
+        # all followers).  local_rank indexes into that list so each new worker
+        # inherits the coords of the dead worker it replaces positionally:
+        #   local_rank=0 (leader) → dead_slots[0] (was the dead shard leader)
+        #   local_rank=1          → dead_slots[1] (was TP follower rank 1)
+        #   etc.
+        if self._dead_indices and hasattr(
+            self.sharding_annotations, "replace_worker_id"
+        ):
+            # Candidate dead slots: dead workers not currently in
+            # dp_leader_worker_indices.  Across multiple recovery cycles the
+            # layout entries for slots from EARLIER cycles have already been
+            # overwritten (e.g. slot 0 → 16 after cycle-1 recovery), so
+            # _dead_indices contains stale entries no longer present in the
+            # layout.  Filter to the subset still in the layout.
+            #
+            # append_spawned_worker is called once per TP rank in ascending
+            # local_rank order (0, 1, 2, ...) within a single recovery.  Each
+            # call consumes the FIRST remaining slot (dead_slots[0]) because
+            # the prior call already removed the previous first entry by
+            # replacing it.  Using local_rank as the index is wrong: after
+            # local_rank=0 removes slot 0 the filtered list shrinks, so
+            # local_rank=1 would pick index 1 of the shorter list (wrong TP
+            # coords) and local_rank=2 would go out of bounds entirely.
+            all_dead = sorted(
+                idx for idx in self._dead_indices
+                if idx not in self.dp_leader_worker_indices
+            )
+            dead_slots = [
+                slot for slot in all_dead
+                if self.sharding_annotations.contains_worker_id(slot)
+            ]
+            if dead_slots:
+                self.sharding_annotations.replace_worker_id(
+                    dead_slots[0], new_worker_idx
+                )
+        if is_leader:
+            self.dp_leader_worker_indices.append(new_worker_idx)
+        return new_worker_idx
+
     def run_single_worker_single_data(
         self,
         method_name: str,
@@ -713,6 +960,7 @@ class RayWorkerGroup:
         *args,
         run_rank_0_only_axes: list[str] | None = None,
         common_kwargs: Optional[dict[str, Any]] = None,
+        restrict_to_indices: Optional[set[int]] = None,
         **kwargs,
     ) -> list[ray.ObjectRef]:
         """Run a method on all workers in parallel with different data.
@@ -723,6 +971,12 @@ class RayWorkerGroup:
                    e.g. [[arg1_for_worker_1, arg1_for_worker_2], [arg2_for_worker_1, arg2_for_worker_2]]
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
             common_kwargs: Keyword arguments to pass to all workers
+            restrict_to_indices: When provided, dispatch ONLY to workers whose index is in
+                this set (in addition to dead-index and rank-0-only filters). Used by
+                ``_raw_init_collective`` to dispatch only to the frozen joinable cohort,
+                excluding backfill shards that are alive but not yet joinable — without
+                this, the data list length mismatches the dispatch count and triggers an
+                assertion. ``rank_prefix`` / data lists must be sized to the restricted set.
             **kwargs: Keyword arguments to pass to workers/groups
                       e.g. {"key1": [value_for_worker_1, value_for_worker_2], "key2": [value_for_worker_1, value_for_worker_2]}
 
@@ -777,6 +1031,10 @@ class RayWorkerGroup:
 
         data_idx = 0
         for worker_idx, worker in enumerate(self.workers):
+            if worker_idx in self._dead_indices:
+                continue
+            if restrict_to_indices is not None and worker_idx not in restrict_to_indices:
+                continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 
             # Determine if this worker should receive data
@@ -816,6 +1074,7 @@ class RayWorkerGroup:
         method_name: str,
         *args,
         run_rank_0_only_axes: list[str] | None = None,
+        restrict_to_indices: Optional[set[int]] = None,
         **kwargs,
     ) -> list[ray.ObjectRef]:
         """Run a method on all workers in parallel with the same data.
@@ -824,6 +1083,8 @@ class RayWorkerGroup:
             method_name: Name of the method to call on each worker
             *args, **kwargs: Arguments to pass to the method
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
+            restrict_to_indices: When provided, dispatch ONLY to workers whose index is in
+                this set. Dead workers are always skipped regardless of this set.
 
         Returns:
             list[ray.ObjectRef]: A list of ray futures
@@ -842,6 +1103,10 @@ class RayWorkerGroup:
             run_rank_0_only_axes = []
 
         for worker_idx, worker in enumerate(self.workers):
+            if worker_idx in self._dead_indices:
+                continue
+            if restrict_to_indices is not None and worker_idx not in restrict_to_indices:
+                continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 
             # Determine if this worker should receive data
@@ -963,6 +1228,8 @@ class RayWorkerGroup:
         return_from_workers = []
         # For each worker, determine what data it should receive
         for worker_idx, worker in enumerate(self._workers):
+            if worker_idx in self._dead_indices:
+                continue
             # Get the worker's coordinates in the sharding space
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 

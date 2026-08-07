@@ -1339,8 +1339,84 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
+    async def collect_tp_worker_handles_async(self) -> list:
+        """Collect Ray actor handles for internal TP workers (RayExecutorV2 path).
+
+        Returns handles for ``RayWorkerProc`` actors; returns an empty list
+        when ``multiproc_executor`` is used (subprocess workers don't have
+        Ray handles — use ``collect_tp_process_pids_async`` instead).
+        """
+        if self.llm is None:
+            self._tp_worker_handles: list = []
+            return []
+        try:
+            result = await self.llm.collective_rpc(
+                "get_tp_worker_actor_handle", args=tuple()
+            )
+            handles = result if isinstance(result, list) else [result]
+            self._tp_worker_handles = [h for h in handles if h is not None]
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[VllmAsyncGenerationWorker] collect_tp_worker_handles failed "
+                f"(non-fatal): {e}",
+                flush=True,
+            )
+            self._tp_worker_handles = []
+        return self._tp_worker_handles
+
+    async def collect_tp_process_pids_async(self) -> list:
+        """Collect OS PIDs for all internal TP worker processes.
+
+        Works for both ``RayExecutorV2`` (Ray actor PIDs) and
+        ``multiproc_executor`` (subprocess PIDs).  Used as a fallback when
+        actor handles are unavailable (e.g. single-node TP using
+        multiprocessing instead of Ray-distributed workers).
+        """
+        if self.llm is None:
+            self._tp_worker_pids: list = []
+            return []
+        try:
+            result = await self.llm.collective_rpc(
+                "get_tp_worker_pid", args=tuple()
+            )
+            pids = result if isinstance(result, list) else [result]
+            self._tp_worker_pids = [p for p in pids if p is not None]
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[VllmAsyncGenerationWorker] collect_tp_process_pids failed "
+                f"(non-fatal): {e}",
+                flush=True,
+            )
+            self._tp_worker_pids = []
+        return self._tp_worker_pids
+
+    async def reset_collective_async(self) -> None:
+        """Async version of reset_collective.
+
+        Tears down the cross-cluster NCCL comm via collective_rpc into the
+        VllmInternalWorkerExtension running inside the engine process.
+        Non-model-owner (TP follower placeholder) actors skip this silently.
+        """
+        if self.llm is None:
+            return
+        await self.llm.collective_rpc("reset_collective", args=tuple())
+
+    async def warmup_nccl_library_async(self) -> None:
+        """Async version of warmup_nccl_library.
+
+        Delegates to the VllmInternalWorkerExtension method inside the engine
+        process via collective_rpc, which pre-warms NCCL's per-process lazy
+        init before the first real cross-cluster collective.
+        Non-model-owner (TP follower placeholder) actors skip this silently.
+        """
+        if self.llm is None:
+            return
+        await self.llm.collective_rpc("warmup_nccl_library", args=tuple())
+
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
+        if self.llm is None:
+            return
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def update_weights_via_ipc_zmq_async(
