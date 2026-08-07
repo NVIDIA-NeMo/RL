@@ -345,6 +345,7 @@ testing.md
 documentation.md
 debugging.md
 nsys-profiling.md
+policy-profiler.md
 fp8.md
 guides/use-custom-vllm.md
 ```
