@@ -529,7 +529,7 @@ def test_launcher_stages_and_mounts_a_pinned_uv_delegate() -> None:
     launcher = LAUNCHER.read_text()
     srun_wrapper = SRUN_WRAPPER.read_text()
 
-    assert "UV_DELEGATE_SOURCE=$(command -v uv)" in launcher
+    assert 'UV_DELEGATE_SOURCE=$(realpath -e -- "$(command -v uv)")' in launcher
     assert 'UV_DELEGATE_SHA256=$(sha256sum "$UV_DELEGATE_SOURCE"' in launcher
     assert 'UV_REAL_BIN="$UV_ARTIFACT_DIR/uv"' in launcher
     assert '[[ $(sha256sum "$UV_REAL_BIN"' in launcher

@@ -184,7 +184,7 @@ require_canonical_lustre_path SOURCE_PATH "$SOURCE_PATH"
 require_canonical_lustre_path OUTPUT_ROOT "$OUTPUT_ROOT"
 require_canonical_lustre_path PREFLIGHT_VENV "$PREFLIGHT_VENV"
 require_canonical_lustre_path LAUNCH_BIN "$LAUNCH_BIN"
-UV_DELEGATE_SOURCE=$(command -v uv)
+UV_DELEGATE_SOURCE=$(realpath -e -- "$(command -v uv)")
 require_canonical_lustre_path UV_DELEGATE_SOURCE "$UV_DELEGATE_SOURCE"
 UV_DELEGATE_SHA256=$(sha256sum "$UV_DELEGATE_SOURCE" | cut -d' ' -f1)
 UV_ARTIFACT_DIR=$EXPERIMENT_ROOT/artifacts/uv/$UV_DELEGATE_SHA256
