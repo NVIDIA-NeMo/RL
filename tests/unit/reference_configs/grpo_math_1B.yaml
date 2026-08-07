@@ -171,6 +171,7 @@ policy:
 
   megatron_cfg:
     enabled: false
+    model_overrides: {}
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
