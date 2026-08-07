@@ -1,14 +1,14 @@
-# Nemotron 3.5 Nano
+# Nemotron 3.5 Lightning
 
 This guide describes the reference NeMo RL recipes for post-training Nemotron
-3.5 Nano on four-GPU GB200 nodes:
+3.5 Lightning on four-GPU GB200 nodes:
 
 - SWE reinforcement learning with executable software-engineering environments.
 - RLVR with external GenRM and general-purpose judge pools plus an in-cluster
   safety judge.
 
 The recipes and shared launcher are under
-`examples/nemo_gym/nemotron-3.5-nano/`.
+`examples/nemo_gym/nemotron-3.5-lightning/`.
 
 ## Reference topology
 
@@ -54,7 +54,9 @@ Hugging Face model ID may be used instead of an absolute model path.
 
 ## Prepare the inputs
 
-Set `MODEL_PATH` to a transformers-compatible Nemotron 3.5 Nano checkpoint.
+Set `MODEL_PATH` to a transformers-compatible Nemotron 3.5 Lightning
+checkpoint, such as
+`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`.
 Prepare separate JSONL files for training and validation in the format expected
 by `NemoGymDataset`.
 
@@ -89,7 +91,7 @@ The reference external deployments use expert parallelism and serve the
 OpenAI-compatible model name `model`. The launcher injects both load-balancer
 URLs and model names into Gym after all backends become healthy.
 The model-specific vLLM arguments are intentionally defined in
-`nano35_launch.sh`; `tools/external_gym_vllm/run_in_allocation.sh` only implements
+`lightning35_launch.sh`; `tools/external_gym_vllm/run_in_allocation.sh` only implements
 the generic lifecycle for the named external pools.
 
 ## Launch script
@@ -97,7 +99,7 @@ the generic lifecycle for the named external pools.
 Both recipes use:
 
 ```text
-examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh
+examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh
 ```
 
 Common required variables:
@@ -105,7 +107,7 @@ Common required variables:
 | Variable | Purpose |
 |---|---|
 | `EXP_NAME` | Slurm job name, W&B run name, and output-directory suffix. |
-| `MODEL_PATH` | Starting Nemotron 3.5 Nano checkpoint. |
+| `MODEL_PATH` | Starting Nemotron 3.5 Lightning checkpoint. |
 | `TRAIN_PATH`, `VAL_PATH` | Training and validation JSONL files. |
 | `CONTAINER` | NeMo RL training container. |
 | `SANDBOX_CONTAINER` | NeMo Skills sandbox container. |
@@ -122,7 +124,7 @@ Useful optional variables:
 | `WALLTIME` | `4:00:00` | Slurm time limit. |
 | `SLURM_QOS`, `SLURM_RESERVATION`, `EXCLUDE_NODES` | empty | Optional Slurm controls. |
 | `WANDB_API_KEY` | unset | Enables W&B when set. |
-| `WANDB_PROJ` | `nemotron-3.5-nano` | W&B project. |
+| `WANDB_PROJ` | `nemotron-3.5-lightning` | W&B project. |
 | `HF_HOME`, `HF_TOKEN` | unset | Hugging Face cache and token. |
 | `USE_SNAPSHOT` | `1` | Snapshot tracked source before submission. |
 | `USE_CUSTOM_VLLM` | `0` | Set to `1` to source the repository's custom vLLM environment. |
@@ -133,8 +135,8 @@ Additional Hydra overrides may follow the recipe name.
 ## Run SWE
 
 ```bash
-EXP_NAME=nano35-swe \
-MODEL_PATH=/path/to/nemotron-3.5-nano-checkpoint \
+EXP_NAME=lightning35-swe \
+MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
 TRAIN_PATH=/path/to/swe-train.jsonl \
 VAL_PATH=/path/to/swe-validation.jsonl \
 SIF_DIR=/path/to/swe-sif-root \
@@ -144,7 +146,7 @@ PERSISTENT_CACHE=/path/to/shared/cache \
 EXTRA_MOUNTS=/shared:/shared,/lustre:/lustre \
 SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
-bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh swe
+bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh swe
 ```
 
 The reference SWE configuration uses TP=4, CP=16, EP=32, GBS=512, 32 prompts
@@ -154,8 +156,8 @@ per step, 16 generations per prompt, an agent concurrency of 1024, and a
 ## Run RLVR
 
 ```bash
-EXP_NAME=nano35-rlvr \
-MODEL_PATH=/path/to/nemotron-3.5-nano-checkpoint \
+EXP_NAME=lightning35-rlvr \
+MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
 TRAIN_PATH=/path/to/rlvr-train.jsonl \
 VAL_PATH=/path/to/rlvr-validation.jsonl \
 GENRM_MODEL=/path/to/genrm-checkpoint \
@@ -165,12 +167,12 @@ SAFETY_JUDGE_MODEL=/path/to/safety-judge-checkpoint \
 CONTAINER=/path/to/nemo-rl-container.sqsh \
 SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
 PERSISTENT_CACHE=/path/to/shared/cache \
-RESULTS_DIR=/lustre/path/to/results/nano35-rlvr \
-BASE_LOG_DIR=/lustre/path/to/ray-logs/nano35-rlvr \
+RESULTS_DIR=/lustre/path/to/results/lightning35-rlvr \
+BASE_LOG_DIR=/lustre/path/to/ray-logs/lightning35-rlvr \
 EXTRA_MOUNTS=/shared:/shared,/lustre:/lustre \
 SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
-bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh rlvr
+bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh rlvr
 ```
 
 The reference RLVR configuration uses TP=4, CP=4, EP=16, GBS=8192, 512
@@ -185,7 +187,7 @@ overrides without submitting:
 
 ```bash
 DRY_RUN=1 \
-EXP_NAME=nano35-dry-run \
+EXP_NAME=lightning35-dry-run \
 MODEL_PATH=/path/to/model \
 TRAIN_PATH=/path/to/train.jsonl \
 VAL_PATH=/path/to/validation.jsonl \
@@ -195,7 +197,7 @@ SANDBOX_CONTAINER=/path/to/sandbox.sqsh \
 PERSISTENT_CACHE=/path/to/cache \
 SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
-bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh swe
+bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh swe
 ```
 
 After submission, the launcher prints the Slurm, Ray, checkpoint, and

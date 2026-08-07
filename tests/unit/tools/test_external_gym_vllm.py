@@ -833,9 +833,10 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
     )
 
 
-def test_nano_launcher_owns_model_specific_external_pool_configuration():
+def test_lightning_launcher_owns_model_specific_external_pool_configuration():
     launcher = (
-        REPO_ROOT / "examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh"
+        REPO_ROOT
+        / "examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh"
     ).read_text()
 
     assert "register_external_vllm_pool GENRM" in launcher

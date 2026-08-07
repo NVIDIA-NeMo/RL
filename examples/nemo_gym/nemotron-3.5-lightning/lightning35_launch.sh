@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # =============================================================================
-# nano35_launch.sh
+# lightning35_launch.sh
 #
-# Public launcher for Nemotron 3.5 Nano post-training on a SLURM cluster.
+# Public launcher for Nemotron 3.5 Lightning post-training on a SLURM cluster.
 #
 # The SWE and RLVR workload semantics live in sibling YAML files. This launcher
 # handles Slurm submission, code snapshotting, persistent caches, container
@@ -12,8 +12,8 @@ set -euo pipefail
 #
 # Usage:
 #
-#   EXP_NAME=nano35-swe \
-#   MODEL_PATH=/path/to/nano35-checkpoint \
+#   EXP_NAME=lightning35-swe \
+#   MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
 #   TRAIN_PATH=/path/to/train.jsonl \
 #   VAL_PATH=/path/to/val.jsonl \
 #   CONTAINER=/path/to/nemo-rl-container.sqsh \
@@ -22,10 +22,10 @@ set -euo pipefail
 #   SLURM_PARTITION=batch \
 #   SLURM_ACCOUNT=your_account \
 #   SIF_DIR=/path/to/swe-sif-root \
-#   bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh swe
+#   bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh swe
 #
-#   EXP_NAME=nano35-rlvr \
-#   MODEL_PATH=/path/to/nano35-checkpoint \
+#   EXP_NAME=lightning35-rlvr \
+#   MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
 #   TRAIN_PATH=/path/to/train.jsonl \
 #   VAL_PATH=/path/to/val.jsonl \
 #   CONTAINER=/path/to/nemo-rl-container.sqsh \
@@ -37,7 +37,7 @@ set -euo pipefail
 #   GENRM_REASONING_PARSER=/path/to/ultra_v3_reasoning_parser.py \
 #   NL2BASH_JUDGE_MODEL=/path/to/general-judge-checkpoint \
 #   SAFETY_JUDGE_MODEL=/path/to/safety-checkpoint \
-#   bash examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh rlvr
+#   bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh rlvr
 #
 # Optional knobs:
 #   WALLTIME=4:00:00                       Slurm --time
@@ -73,12 +73,12 @@ set -euo pipefail
 #   HF_HOME=                               HuggingFace cache root (recommended)
 #   HF_TOKEN=                              HuggingFace API token
 #   WANDB_API_KEY=                         Weights & Biases API key
-#   WANDB_PROJ=nemotron-3.5-nano           W&B project
+#   WANDB_PROJ=nemotron-3.5-lightning      W&B project
 #   WANDB_ENTITY=                          W&B entity
 #   SLURM_COMMENT=                         Job-reaper exemption JSON
 #
 # Hydra overrides are forwarded verbatim as positional arguments:
-#   bash .../nano35_launch.sh swe policy.megatron_cfg.optimizer.lr=1e-6
+#   bash .../lightning35_launch.sh swe policy.megatron_cfg.optimizer.lr=1e-6
 #
 # The reference profiles target four-GPU GB200 nodes. With external service
 # nodes, Slurm uses two heterogeneous components so the services remain outside
@@ -102,7 +102,7 @@ shift
 
 case "${RECIPE}" in
   swe)
-    CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/swe.yaml}"
+    CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-lightning/swe.yaml}"
     NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-16}"
     NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
     NUM_GYM_NODES="${NUM_GYM_NODES:-0}"
@@ -115,7 +115,7 @@ case "${RECIPE}" in
     SAFETY_JUDGE_MODEL=""
     ;;
   rlvr)
-    CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr.yaml}"
+    CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml}"
     NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
     NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
     NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
@@ -431,7 +431,7 @@ fi
 # =============================================================================
 # W&B configuration
 # =============================================================================
-WANDB_PROJ="${WANDB_PROJ:-nemotron-3.5-nano}"
+WANDB_PROJ="${WANDB_PROJ:-nemotron-3.5-lightning}"
 WANDB_NAME="${EXP_NAME}"
 WANDB_ENABLED=False
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
@@ -716,7 +716,7 @@ fi
 # To overlay additional components (e.g. a local Megatron-LM checkout), pass
 # EXTRA_MOUNTS as a comma-separated list of host:container pairs:
 #
-#   EXTRA_MOUNTS="/path/to/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM" bash nano35_launch.sh swe
+#   EXTRA_MOUNTS="/path/to/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM" bash lightning35_launch.sh swe
 #
 # Container paths for reference:
 #   /opt/nemo-rl/nemo_rl                                              — Python package
@@ -742,9 +742,9 @@ if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-  echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
+if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-lightning" ]]; then
+  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-lightning:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-lightning"
+  echo "  Mount: Lightning 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-lightning"
 fi
 GYM_SOURCE="${PROJECT_ROOT}/3rdparty/Gym-workspace/Gym"
 if [[ ! -f "${GYM_SOURCE}/responses_api_models/local_vllm_model/local_vllm_model_actor.py" ]]; then
@@ -922,7 +922,7 @@ fi
 # =============================================================================
 echo ""
 echo "================================================================"
-echo "  Nemotron 3.5 Nano — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
+echo "  Nemotron 3.5 Lightning — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
 echo "  Config:      ${CONFIG_PATH}"
