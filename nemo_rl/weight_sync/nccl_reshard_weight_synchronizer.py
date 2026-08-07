@@ -210,6 +210,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             make_nccl_reshard_refit_info_wire_safe,
         )
 
+        # SingleController sends this across vLLM's subprocess boundary, so avoid
+        # Megatron-dependent Tensor pickles.
         wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
             nccl_reshard_refit_info
         )

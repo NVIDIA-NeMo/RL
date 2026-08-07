@@ -254,11 +254,10 @@ def _restore_placement(p):
 def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
     """Copy refit metadata into types safe for vLLM's subprocess RPC.
 
-    Megatron patches Torch's tensor pickle reducer to use its safe_globals
-    loader. vLLM worker subprocesses intentionally do not install Megatron, so
-    even the small CPU rank tensors in MeshInfo cannot cross that pickle
-    boundary. Convert meshes and placements to the plain representation that
-    restore_refit_info_placements accepts.
+    Importing ``megatron.core`` replaces ``torch.storage._load_from_bytes`` with
+    a Megatron function, so Tensor pickles require Megatron at unpickle time.
+    vLLM subprocesses may not have it importable; convert the metadata to the
+    plain representation accepted by ``restore_refit_info_placements``.
     """
 
     def _wire_mesh(mesh):
