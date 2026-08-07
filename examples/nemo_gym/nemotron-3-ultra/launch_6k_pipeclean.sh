@@ -93,16 +93,11 @@ export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # EXCLUDE_NODES. They are left unset because a reservation you do not hold
 # makes sbatch fail outright; see ultra_launch.sh for the variable names.
 
-# Gym is sized for its CPU-side resource servers, not for the judges: with the
-# 18 judge nodes moved to the external hetgroup, the only Gym model still asking
-# for GPUs is the safety judge (TP=4 x DP=2 = 8 GPUs = 2 nodes), while the
-# servers behind ~16k tool sessions per step degrade silently under CPU
-# contention. 32 keeps ~30 nodes of that headroom and returns 16 to generation.
-# train + gen + gym must be a multiple of SEGMENT_SIZE=16, and 976 still divides
-# evenly into TP=8 instances (976 x 4 GPUs / 8 = 488).
+# Preserve the non-judge Gym capacity after moving 18 judge nodes out of Gym,
+# then round up to a segment-compatible 48-node Ray allocation.
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-512}"
-export NUM_GEN_NODES="${NUM_GEN_NODES:-976}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-32}"
+export NUM_GEN_NODES="${NUM_GEN_NODES:-960}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-48}"
 
 # CP=16 is baked into pipeclean_6k.yaml; allow an override for memory experiments.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"
