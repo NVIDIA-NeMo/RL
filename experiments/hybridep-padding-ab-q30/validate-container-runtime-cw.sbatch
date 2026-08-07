@@ -25,6 +25,7 @@ set -euo pipefail
 : "${CUDNN_HOST_PATH:?CUDNN_HOST_PATH is required}"
 : "${DEEPEP_OVERLAY_DIR:?DEEPEP_OVERLAY_DIR is required}"
 : "${MANIFEST_OUTPUT:?MANIFEST_OUTPUT is required}"
+: "${SOURCE_PATH:?SOURCE_PATH is required}"
 
 resolved_manifest_output=$(realpath -m -- "$MANIFEST_OUTPUT")
 [[ "$resolved_manifest_output" == "$MANIFEST_OUTPUT" && "$MANIFEST_OUTPUT" == /lustre/* ]] || {
@@ -32,16 +33,24 @@ resolved_manifest_output=$(realpath -m -- "$MANIFEST_OUTPUT")
   exit 2
 }
 mkdir -p "$(dirname -- "$MANIFEST_OUTPUT")"
+resolved_source_path=$(realpath -e -- "$SOURCE_PATH")
+[[ "$resolved_source_path" == "$SOURCE_PATH" && "$SOURCE_PATH" == /lustre/* ]] || {
+  printf 'ERROR: SOURCE_PATH must be a canonical /lustre path\n' >&2
+  exit 2
+}
 
 export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 export CUDNN_PATH=$CUDNN_HOME
 export DEEPEP_OVERLAY_DIR
+export SOURCE_PATH
+export BRIDGE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
+export MCORE_SOURCE=$SOURCE_PATH/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 export LD_LIBRARY_PATH="/usr/local/cuda/compat/lib:$CUDNN_HOME/lib:$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR/deep_ep"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH=$DEEPEP_OVERLAY_DIR
+export PYTHONPATH=$SOURCE_PATH:$BRIDGE_SOURCE:$MCORE_SOURCE:$DEEPEP_OVERLAY_DIR
 
-MOUNTS="$CUDNN_HOST_PATH:$CUDNN_HOME,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
-CONTAINER_ENV=PYTHONPATH,LD_LIBRARY_PATH,CUDNN_HOME,CUDNN_PATH,DEEPEP_OVERLAY_DIR,PYTHONDONTWRITEBYTECODE
+MOUNTS="$SOURCE_PATH:$SOURCE_PATH,$CUDNN_HOST_PATH:$CUDNN_HOME,$DEEPEP_OVERLAY_DIR:$DEEPEP_OVERLAY_DIR"
+CONTAINER_ENV=PYTHONPATH,LD_LIBRARY_PATH,CUDNN_HOME,CUDNN_PATH,DEEPEP_OVERLAY_DIR,PYTHONDONTWRITEBYTECODE,SOURCE_PATH,BRIDGE_SOURCE,MCORE_SOURCE
 
 srun --no-container-mount-home \
   --container-image="$CONTAINER" \
@@ -55,6 +64,7 @@ import importlib.util
 import os
 import platform
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import deep_ep
@@ -68,12 +78,35 @@ import urllib3
 import urllib3.exceptions
 from ray.scripts.scripts import main as ray_cli_main
 
+from nemo_rl.models.megatron.setup import _apply_moe_config
+
 overlay = Path(os.environ["DEEPEP_OVERLAY_DIR"]).resolve()
 assert click.ClickException
 assert ray_cli_main
 assert te
 assert Path(click.__file__).resolve().is_file()
 assert Path(urllib3.__file__).resolve().is_file()
+model_cfg = SimpleNamespace(moe_hybridep_pad_uneven_dispatch_inputs=False)
+_apply_moe_config(
+    model_cfg,
+    {
+        "megatron_cfg": {
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 8,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_shared_expert_overlap": True,
+            "moe_flex_dispatcher_backend": "hybridep",
+            "moe_hybridep_num_sms": 32,
+            "moe_hybridep_pad_uneven_dispatch_inputs": True,
+        }
+    },
+)
+assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
 module_paths = {}
 for module in (deep_ep, deep_ep_cpp, hybrid_ep_cpp):
     module_path = Path(module.__file__).resolve()

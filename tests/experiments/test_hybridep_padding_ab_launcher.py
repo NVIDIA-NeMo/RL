@@ -265,6 +265,10 @@ def test_container_runtime_probe_is_nonexclusive_and_one_gpu() -> None:
     assert "#SBATCH --mem" not in runtime_probe
     assert "import deep_ep" in runtime_probe
     assert "import transformer_engine.pytorch as te" in runtime_probe
+    assert ': "${SOURCE_PATH:?SOURCE_PATH is required}"' in runtime_probe
+    assert '$SOURCE_PATH:$SOURCE_PATH' in runtime_probe
+    assert "from nemo_rl.models.megatron.setup import _apply_moe_config" in runtime_probe
+    assert "moe_hybridep_pad_uneven_dispatch_inputs is True" in runtime_probe
     assert "MANIFEST_OUTPUT" in runtime_probe
     assert 'pip freeze | LC_ALL=C sort' in runtime_probe
     assert 'sha256sum "$MANIFEST_OUTPUT"' in runtime_probe
