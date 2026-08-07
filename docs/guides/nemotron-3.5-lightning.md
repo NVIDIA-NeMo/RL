@@ -80,7 +80,39 @@ enroot import -o nemo-rl-lightning35.sqsh \
 Pass the resulting `.sqsh` path as `CONTAINER`. A registry image URI can be
 used instead on clusters that do not require a local squashfs image.
 
-## Prepare the data and models
+## Download and prepare the data
+
+Download the
+[`nvidia/Nemotron-RL-Lightning-Training-Blend`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend)
+dataset and restore its source-backed placeholders. This follows the same
+general workflow as the
+[Nemotron 3 Nano data preparation](nemotron-3-nano.md#download-and-prepare-the-data):
+
+```bash
+uvx --from huggingface-hub hf download \
+  nvidia/Nemotron-RL-Lightning-Training-Blend \
+  --repo-type dataset \
+  --local-dir data
+
+chmod +x data/fill_placeholders.py
+./data/fill_placeholders.py --input-dir data --output-dir data/restored
+```
+
+The resulting `data/restored/rlvr.jsonl` is already in the format expected by
+`NemoGymDataset`. The released blend has one training split, and validation is
+disabled in the reference recipe, so pass this file as both `TRAIN_PATH` and
+`VAL_PATH`:
+
+```bash
+TRAIN_PATH=$PWD/data/restored/rlvr.jsonl
+VAL_PATH=$PWD/data/restored/rlvr.jsonl
+```
+
+Dataset rows select their Gym agent through `agent_ref`; therefore, the agents
+named by the data must be included in `env.nemo_gym.config_paths` in
+`rlvr.yaml`.
+
+## Prepare the models
 
 Set `MODEL_PATH` to a Transformers-compatible Nemotron 3.5 Lightning
 checkpoint. To start from the released checkpoint, use:
@@ -88,11 +120,6 @@ checkpoint. To start from the released checkpoint, use:
 ```bash
 MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 ```
-
-Prepare separate training and validation JSONL files in the format expected by
-`NemoGymDataset`, and pass them as `TRAIN_PATH` and `VAL_PATH`. The dataset
-rows select their Gym agent through `agent_ref`; therefore, the agents named by
-the data must be included in `env.nemo_gym.config_paths` in `rlvr.yaml`.
 
 The reward stack also requires:
 
@@ -156,7 +183,7 @@ Required variables:
 |---|---|
 | `EXP_NAME` | Slurm job name, W&B run name, and output-directory suffix. Reuse it with the same `RESULTS_DIR` to resume. |
 | `MODEL_PATH` | Initial Nemotron 3.5 Lightning policy checkpoint. |
-| `TRAIN_PATH`, `VAL_PATH` | Training and validation JSONL files. |
+| `TRAIN_PATH`, `VAL_PATH` | Restored `rlvr.jsonl` from the Lightning training blend. |
 | `GENRM_MODEL` | GenRM checkpoint or Hugging Face model ID. |
 | `GENRM_REASONING_PARSER` | Shared path to the GenRM vLLM parser plugin. |
 | `NL2BASH_JUDGE_MODEL` | General-purpose judge checkpoint or model ID. |
@@ -196,8 +223,8 @@ of 8192, 512 prompts per step, and 16 generations per prompt.
 ```bash
 EXP_NAME=lightning35-rlvr \
 MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
-TRAIN_PATH=/path/to/rlvr-train.jsonl \
-VAL_PATH=/path/to/rlvr-validation.jsonl \
+TRAIN_PATH=$PWD/data/restored/rlvr.jsonl \
+VAL_PATH=$PWD/data/restored/rlvr.jsonl \
 GENRM_MODEL=/path/to/genrm-checkpoint \
 GENRM_REASONING_PARSER=/path/to/ultra_v3_reasoning_parser.py \
 NL2BASH_JUDGE_MODEL=/path/to/general-judge-checkpoint \
@@ -212,33 +239,3 @@ SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
 bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh rlvr
 ```
-
-## Inspect and resume a launch
-
-Set `DRY_RUN=1` to validate the node split, paths, mounts, and generated Hydra
-overrides without submitting:
-
-```bash
-DRY_RUN=1 \
-EXP_NAME=lightning35-rlvr-dry-run \
-MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
-TRAIN_PATH=/path/to/rlvr-train.jsonl \
-VAL_PATH=/path/to/rlvr-validation.jsonl \
-GENRM_MODEL=/path/to/genrm-checkpoint \
-GENRM_REASONING_PARSER=/path/to/ultra_v3_reasoning_parser.py \
-NL2BASH_JUDGE_MODEL=/path/to/general-judge-checkpoint \
-SAFETY_JUDGE_MODEL=/path/to/safety-judge-checkpoint \
-CONTAINER=/path/to/nemo-rl-lightning35.sqsh \
-SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
-PERSISTENT_CACHE=/path/to/shared/cache \
-RESULTS_DIR=/path/to/results/lightning35-rlvr-dry-run \
-BASE_LOG_DIR=/path/to/results/lightning35-rlvr-dry-run/ray_logs \
-EXTRA_MOUNTS=/shared:/shared \
-SLURM_PARTITION=your-partition \
-SLURM_ACCOUNT=your-account \
-bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh rlvr
-```
-
-After submission, the launcher prints the Slurm, Ray, checkpoint, and
-per-submission log directories. Reusing both `EXP_NAME` and `RESULTS_DIR`
-allows a later submission to resume from the latest saved checkpoint.
