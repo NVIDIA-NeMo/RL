@@ -137,7 +137,7 @@ if [[ "$RENDER_ONLY" == 1 ]]; then
   exit 0
 fi
 
-for command_name in git python3 realpath sbatch sshare sha256sum; do
+for command_name in git mktemp mv python3 realpath sbatch sshare sha256sum stat; do
   require_command "$command_name"
 done
 : "${ACCOUNT:?Set ACCOUNT after checking FairShare immediately before submission}"
@@ -178,9 +178,33 @@ else
   [[ "$LOCAL_HEAD" == d833180b9847daedafedaed6d7d1da6a013f14d0 ]] || die "legacy NeMo pre-padding commit is absent"
 fi
 
+CONTAINER_STAT_FINGERPRINT=remote-digest
+CONTAINER_CHECKSUM_CACHE=remote-digest
+CONTAINER_CHECKSUM_MODE=remote-digest
 if [[ -f "$CONTAINER" ]]; then
   require_canonical_lustre_path CONTAINER "$CONTAINER"
-  [[ $(sha256sum "$CONTAINER" | cut -d' ' -f1) == "$CONTAINER_SHA256" ]] || die "container checksum mismatch"
+  CONTAINER_STAT_FINGERPRINT=$(stat --printf='%d:%i:%s:%Y:%Z' "$CONTAINER")
+  CONTAINER_CHECKSUM_CACHE_DIR=${CONTAINER_CHECKSUM_CACHE_DIR:-$EXPERIMENT_ROOT/checksum-cache}
+  mkdir -p "$CONTAINER_CHECKSUM_CACHE_DIR"
+  require_canonical_lustre_path CONTAINER_CHECKSUM_CACHE_DIR "$CONTAINER_CHECKSUM_CACHE_DIR"
+  CONTAINER_CACHE_KEY=$(printf '%s\t%s\t%s\n' "$CONTAINER" "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_SHA256" | sha256sum | cut -d' ' -f1)
+  CONTAINER_CHECKSUM_CACHE=$CONTAINER_CHECKSUM_CACHE_DIR/$CONTAINER_CACHE_KEY.tsv
+  CACHED_CONTAINER_PATH=
+  CACHED_CONTAINER_STAT=
+  CACHED_CONTAINER_SHA256=
+  if [[ -f "$CONTAINER_CHECKSUM_CACHE" ]]; then
+    IFS=$'\t' read -r CACHED_CONTAINER_PATH CACHED_CONTAINER_STAT CACHED_CONTAINER_SHA256 < "$CONTAINER_CHECKSUM_CACHE" || true
+  fi
+  if [[ "$CACHED_CONTAINER_PATH" == "$CONTAINER" && "$CACHED_CONTAINER_STAT" == "$CONTAINER_STAT_FINGERPRINT" && "$CACHED_CONTAINER_SHA256" == "$CONTAINER_SHA256" ]]; then
+    CONTAINER_CHECKSUM_MODE=cache-hit
+  else
+    ACTUAL_CONTAINER_SHA256=$(sha256sum "$CONTAINER" | cut -d' ' -f1)
+    [[ "$ACTUAL_CONTAINER_SHA256" == "$CONTAINER_SHA256" ]] || die "container checksum mismatch"
+    CONTAINER_CHECKSUM_TEMP=$(mktemp "$CONTAINER_CHECKSUM_CACHE.tmp.XXXXXX")
+    printf '%s\t%s\t%s\n' "$CONTAINER" "$CONTAINER_STAT_FINGERPRINT" "$ACTUAL_CONTAINER_SHA256" > "$CONTAINER_CHECKSUM_TEMP"
+    mv -f "$CONTAINER_CHECKSUM_TEMP" "$CONTAINER_CHECKSUM_CACHE"
+    CONTAINER_CHECKSUM_MODE=cache-miss-verified
+  fi
 elif [[ ! "$CONTAINER" =~ @sha256:[0-9a-f]{64}$ ]]; then
   die "CONTAINER must be a checksum-verified local image or digest-pinned reference"
 fi
@@ -236,6 +260,9 @@ printf 'arm=%s\nsource_profile=%s\nnemo_rl_commit=%s\nbridge_commit=%s\nmcore_co
   > "$PROVENANCE_ROOT/submission.txt"
 printf 'source_branch=%s\npreflight_manifest_sha256=%s\nbatch_script=%s\n' \
   "$SOURCE_BRANCH" "$PREFLIGHT_MANIFEST_SHA256" "$BATCH_SCRIPT" \
+  >> "$PROVENANCE_ROOT/submission.txt"
+printf 'container_stat_fingerprint=%s\ncontainer_checksum_cache=%s\ncontainer_checksum_mode=%s\n' \
+  "$CONTAINER_STAT_FINGERPRINT" "$CONTAINER_CHECKSUM_CACHE" "$CONTAINER_CHECKSUM_MODE" \
   >> "$PROVENANCE_ROOT/submission.txt"
 printf 'harness_commit=%s\nlauncher_sha256=%s\nbatch_script_sha256=%s\nmatrix_sha256=%s\n' \
   "$HARNESS_COMMIT" "$LAUNCHER_SHA256" "$BATCH_SCRIPT_SHA256" "$MATRIX_SHA256" \

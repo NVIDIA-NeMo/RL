@@ -195,8 +195,19 @@ def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
 def test_login_node_preflight_does_not_require_gpu_tools() -> None:
     launcher = LAUNCHER.read_text()
 
-    assert "for command_name in git python3 realpath sbatch sshare sha256sum; do" in launcher
+    assert "nvidia-smi" not in launcher.split("for command_name in ", 1)[1].split("; do", 1)[0]
     assert 'GPU_MODELS=$(nvidia-smi --query-gpu=name --format=csv,noheader)' in launcher
+
+
+def test_container_checksum_cache_is_bound_to_file_identity() -> None:
+    launcher = LAUNCHER.read_text()
+
+    assert "stat --printf='%d:%i:%s:%Y:%Z'" in launcher
+    assert "CONTAINER_CACHE_KEY=" in launcher
+    assert "CONTAINER_CHECKSUM_MODE=cache-hit" in launcher
+    assert "CONTAINER_CHECKSUM_MODE=cache-miss-verified" in launcher
+    assert 'sha256sum "$CONTAINER"' in launcher
+    assert "container_stat_fingerprint=" in launcher
 
 
 def test_unknown_arm_fails_before_side_effects() -> None:
