@@ -79,7 +79,12 @@ set -euo pipefail
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
-: "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+# Disaggregated-sandbox recipes (see disagg_sandboxes/) run tool execution on an
+# external sandbox service instead of colocated per-node containers; they set
+# NO_COLOCATED_SANDBOX=1 to skip the sandbox image requirement and deployment.
+if [[ "${NO_COLOCATED_SANDBOX:-0}" != "1" ]]; then
+  : "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+fi
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
@@ -354,8 +359,14 @@ fi
 # =============================================================================
 # NeMo Skills sandbox (for math_formal_lean, ns_tools, etc.)
 # =============================================================================
-export SANDBOX_CONTAINER
-export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
+if [[ "${NO_COLOCATED_SANDBOX:-0}" == "1" ]]; then
+  # ray.sub skips the sandbox srun (and its readiness gate) when both are empty.
+  export SANDBOX_CONTAINER=""
+  export SANDBOX_COMMAND=""
+else
+  export SANDBOX_CONTAINER
+  export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
+fi
 export NEMO_SKILLS_SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
 # =============================================================================
