@@ -72,11 +72,15 @@ class MCoreGenerationConfig(GenerationConfig):
     mcore_generation_config: MCoreGenerationSpecificArgs
 
 
-def apply_megatron_inference_overrides(policy_config: PolicyConfig) -> None:
-    """Apply inference-only Megatron configs on top of the normal `megatron_cfg`."""
+def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
+    """The `megatron_cfg` a dedicated inference model runs with.
+
+    Overlays the sparse `mcore_generation_config` onto `megatron_cfg`,
+    intentionally overwriting any training-side config with inference-side config.
+    """
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
-    # The overlay is intentionally dynamic: any inference-only key overwrites
-    # its training-side counterpart, so treat the config as a plain dict.
-    megatron_cfg = cast(dict[str, Any], policy_config["megatron_cfg"])
-    megatron_cfg.update(generation_config["mcore_generation_config"])
-    megatron_cfg["activation_checkpointing"] = False
+    return {
+        **cast(dict[str, Any], policy_config["megatron_cfg"]),
+        **(generation_config.get("mcore_generation_config") or {}),
+        "activation_checkpointing": False,
+    }

@@ -27,6 +27,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
+    merged_inference_megatron_cfg,
 )
 from nemo_rl.models.policy import PolicyConfig
 
@@ -45,13 +46,9 @@ class MegatronGeneration(GenerationInterface):
         values apply; non-colocated builds a dedicated policy with
         mcore_generation_config merged on top. Always returns a fresh dict.
         """
-        megatron_cfg = config["megatron_cfg"]
         if config["generation"]["colocated"]["enabled"]:
-            return dict(megatron_cfg)
-        return {
-            **megatron_cfg,
-            **config["generation"].get("mcore_generation_config", {}),
-        }
+            return dict(config["megatron_cfg"])
+        return merged_inference_megatron_cfg(config)
 
     @classmethod
     def nvlink_domain_span(cls, config: PolicyConfig) -> int:
@@ -139,8 +136,6 @@ class MegatronGeneration(GenerationInterface):
             **config,
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
-        # Activation checkpointing is not compatible or useful in inference.
-        self._policy_config["megatron_cfg"]["activation_checkpointing"] = False
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
