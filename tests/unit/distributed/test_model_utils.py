@@ -32,6 +32,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    get_distillation_topk_logprobs_from_logits,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -1583,3 +1584,49 @@ def test_distributed_vocab_topk_ops(
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
+
+
+def test_distillation_topk_non_tp_defers_fp32_upcast():
+    """The non-TP top-k gather must not need a full-vocab fp32 copy.
+
+    Only K columns are read on this path, and ``gather`` then ``to(float32)``
+    is equivalent to ``to(float32)`` then ``gather``. Pin that the returned
+    log-probs and the gradient w.r.t. the student logits stay bitwise identical
+    to the previous full-vocab-upcast formulation, and that the result is still
+    fp32.
+    """
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 1, 8, 512, 4
+    logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
+    teacher_topk_logits = torch.randn(batch, seq, k)
+    # distinct per position, as torch.topk returns: with duplicate indices the
+    # gather backward would accumulate into the (now bf16) input rather than an
+    # fp32 copy, which is a different computation
+    teacher_topk_indices = torch.stack(
+        [
+            torch.stack([torch.randperm(vocab)[:k] for _ in range(seq)])
+            for _ in range(batch)
+        ]
+    )
+
+    student = logits.clone().requires_grad_(True)
+    topk_logprobs, _, h_all = get_distillation_topk_logprobs_from_logits(
+        student_logits=student,
+        teacher_topk_logits=teacher_topk_logits,
+        teacher_topk_indices=teacher_topk_indices,
+        zero_outside_topk=False,
+        calculate_entropy=False,
+    )
+    topk_logprobs.sum().backward()
+
+    reference = logits.clone().requires_grad_(True)
+    expected = torch.nn.functional.log_softmax(
+        reference.to(torch.float32).gather(dim=-1, index=teacher_topk_indices),
+        dim=-1,
+    )[:, :-1, :]
+    expected.sum().backward()
+
+    assert h_all is None
+    assert topk_logprobs.dtype == torch.float32
+    assert torch.equal(topk_logprobs, expected)
+    assert torch.equal(student.grad, reference.grad)
