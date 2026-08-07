@@ -1004,6 +1004,14 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
   fi
 
+  # start-with-nginx.sh elects its cluster-wide nginx load balancer as the first
+  # node of SLURM_JOB_NODELIST, which is the head node this srun excludes. The
+  # master then lands on the one node with no sandbox, every other node comes up
+  # as a proxy to it, and all /execute requests are refused (502). Hand the
+  # sandbox the step's node set instead; :? fails loudly rather than silently
+  # reverting to job scope. The \$ defers expansion to the container's shell.
+  SANDBOX_COMMAND="export SLURM_JOB_NODELIST=\${SLURM_STEP_NODELIST:?sandbox requires SLURM_STEP_NODELIST}; $SANDBOX_COMMAND"
+
   # Multi-node: skip the head (Ray GCS); sandbox dies there and blocks the
   # readiness gate. Single-node: run on the only allocated node.
   SANDBOX_SRUN_EXCLUDE=()
