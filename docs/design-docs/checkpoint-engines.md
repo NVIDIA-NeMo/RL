@@ -358,15 +358,20 @@ To add a backend:
 7. Add backend-specific config under `refit_cfg.<backend>`.
 8. Use a `module:ClassName` `refit_transport` value, or add a short-name
    mapping in `create_checkpoint_engine()` if the backend should be built in.
-9. Run a non-colocated GRPO job and verify the `[vLLM refit]` timing line.
+9. Run a non-colocated GRPO job and verify the per-refit timing line for the
+   generation backend under test (`[vLLM refit]` or `[SGLang refit]`).
 
 Current limitations:
 
-- Checkpoint-engine refit targets non-colocated policy-to-vLLM refit.
-- SGLang and Megatron generation do not implement checkpoint-engine refit;
-  [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288) tracks
-  generation-side support. Megatron and DTensor policy backends are supported
-  when the generation backend is vLLM.
+- Checkpoint-engine refit targets non-colocated policy-to-generation refit, for
+  the vLLM and SGLang generation backends.
+- Megatron generation does not implement checkpoint-engine refit;
+  [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288) tracks the
+  remaining generation-side support. Megatron and DTensor policy backends are
+  supported for both vLLM and SGLang generation.
+- SGLang refit requires each logical engine to fit on a single node
+  (`num_gpus_per_engine <= gpus_per_node`) and does not support
+  `shard_expert_weights=true`. Both are rejected with an explicit error.
 - The built-in NIXL backend uses paired policy-to-rollout transfer only.
 - Sharded vLLM EP refit supports static expert ownership and canonical
   unquantized Triton expert storage. Dynamic EPLB, redundant experts, and
