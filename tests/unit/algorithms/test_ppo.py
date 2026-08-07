@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvantageResult,
     GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
@@ -777,7 +778,7 @@ def _run_mock_ppo_train(
         def compute_advantage(self, **kwargs):
             mask = kwargs["mask"].clone()
             self.masks.append(mask)
-            return mask.clone(), mask.clone()
+            return AdvantageResult(advantages=mask.clone(), returns=mask.clone())
 
     class DummyTimer:
         def __init__(self, *_args, **_kwargs):
