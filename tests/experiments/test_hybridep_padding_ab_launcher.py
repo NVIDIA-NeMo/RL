@@ -25,6 +25,12 @@ RUNTIME_VALIDATE_SCRIPT = (
     / "hybridep-padding-ab-q30"
     / "validate-container-runtime-cw.sbatch"
 )
+STAGE_NIGHTLY_SCRIPT = (
+    ROOT
+    / "experiments"
+    / "hybridep-padding-ab-q30"
+    / "stage-nightly-container-cw.sbatch"
+)
 
 
 def _render(arm: str, *, test_only: bool = False) -> dict[str, str]:
@@ -227,6 +233,22 @@ def test_container_runtime_probe_is_nonexclusive_and_one_gpu() -> None:
     assert 'importlib.util.find_spec("uvloop")' in runtime_probe
     assert 'assert hasattr(uvloop, "install")' in runtime_probe
     assert "--container-env=" in runtime_probe
+
+
+def test_nightly_staging_job_is_reproducible_and_does_not_strand_gpus() -> None:
+    stage_script = STAGE_NIGHTLY_SCRIPT.read_text()
+
+    assert "#SBATCH --nodes=1" in stage_script
+    assert "#SBATCH --ntasks=1" in stage_script
+    assert "#SBATCH --gpus-per-node=1" in stage_script
+    assert "#SBATCH --segment=1" in stage_script
+    assert "#SBATCH --exclusive" not in stage_script
+    assert "#SBATCH --mem" not in stage_script
+    assert "enroot import" in stage_script
+    assert "sha256sum" in stage_script
+    assert "metadata_file" in stage_script
+    assert "source_commit=" in stage_script
+    assert "mv -Tf" in stage_script
 
 
 def test_runtime_and_validator_import_pinned_bridge_and_mcore_sources() -> None:
