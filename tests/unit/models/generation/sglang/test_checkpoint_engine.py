@@ -280,3 +280,197 @@ def test_checkpoint_engine_reports_each_local_device_memory(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties", get_properties)
 
     assert worker.checkpoint_engine_total_memory_bytes() == [100, 200]
+
+
+class _RecyclingEngine:
+    """Engine whose receive buffers are reused, like NIXL's two-buffer rotation.
+
+    ``nemo_rl/utils/checkpoint_engines/nixl.py`` hands out views into a small
+    pool of transfer buffers and rotates through them, so a tensor yielded N
+    advances ago has been overwritten. A fake engine that allocates fresh
+    tensors every batch cannot catch code that holds those references too long,
+    which makes the whole bug class invisible. This one poisons on recycle.
+    """
+
+    shard_expert_weights = False
+
+    def __init__(self, batches, rotation=2):
+        self._batches = batches
+        self._rotation = rotation
+        self._issued = []
+
+    async def receive_weight_batches(self):
+        for index, batch in enumerate(self._batches):
+            recycled = index - self._rotation
+            if recycled >= 0:
+                for _name, tensor in self._issued[recycled]:
+                    tensor.fill_(float("nan"))
+            live = [(name, tensor.clone()) for name, tensor in batch]
+            self._issued.append(live)
+            yield live
+
+
+def test_checkpoint_engine_alignment_never_outlives_recycled_buffers():
+    """The aligner must not hold a batch across more advances than the rotation.
+
+    It only calls ``anext`` for a rank whose deque is already empty, so at most
+    one batch per rank is outstanding. Prefetching would break that and surface
+    here as NaN.
+    """
+    engines = [
+        _RecyclingEngine(
+            batches=[
+                [("a", torch.tensor([1.0])), ("b", torch.tensor([2.0]))],
+                [("c", torch.tensor([3.0]))],
+                [("d", torch.tensor([4.0])), ("e", torch.tensor([5.0]))],
+            ]
+        ),
+        _RecyclingEngine(
+            batches=[
+                [("a", torch.tensor([6.0]))],
+                [("b", torch.tensor([7.0])), ("c", torch.tensor([8.0]))],
+                [("d", torch.tensor([9.0]))],
+                [("e", torch.tensor([10.0]))],
+            ]
+        ),
+    ]
+
+    async def collect():
+        seen = []
+        async for batch in _aligned_checkpoint_engine_batches(engines):
+            # Read the tensors as the consumer would, while the batch is live.
+            seen.append(
+                [[(name, tensor.clone()) for name, tensor in rb] for rb in batch]
+            )
+        return seen
+
+    aligned = asyncio.run(collect())
+
+    flat = [t for batch in aligned for rb in batch for _name, t in rb]
+    assert flat, "aligner yielded nothing"
+    assert not any(torch.isnan(t).any() for t in flat), (
+        "a yielded tensor was backed by a recycled buffer"
+    )
+    assert [[[name for name, _t in rb] for rb in batch] for batch in aligned] == [
+        [["a"], ["a"]],
+        [["b"], ["b"]],
+        [["c"], ["c"]],
+        [["d"], ["d"]],
+        [["e"], ["e"]],
+    ]
+
+
+def test_checkpoint_engine_update_posts_once_per_dtype_group():
+    """NIXL packs buckets by bytes, not dtype, so mixed-dtype batches are normal.
+
+    Each dtype group becomes its own ``update_weights_from_tensor`` call, and
+    every call must carry one payload per SGLang rank.
+    """
+    worker = _Worker()
+    worker.checkpoint_engines = [
+        _Engine(
+            batches=[
+                [
+                    ("w", torch.ones(2, dtype=torch.bfloat16)),
+                    ("norm", torch.ones(1, dtype=torch.float32)),
+                ]
+            ]
+        ),
+        _Engine(
+            batches=[
+                [
+                    ("w", torch.full((2,), 2.0, dtype=torch.bfloat16)),
+                    ("norm", torch.full((1,), 3.0, dtype=torch.float32)),
+                ]
+            ]
+        ),
+    ]
+    worker._checkpoint_engine_target_devices = [
+        torch.device("cpu"),
+        torch.device("cpu"),
+    ]
+
+    assert asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+
+    assert len(worker.update_calls) == 2, "expected one POST per dtype group"
+    for call in worker.update_calls:
+        assert len(call["serialized_named_tensors"]) == 2
+        assert call["load_format"] == "flattened_bucket"
+        assert call["flush_cache"] is False
+    # Exactly one cache invalidation, after every dtype group has been posted.
+    assert worker.invalidated
+
+
+def test_checkpoint_engine_weight_version_advances_across_refits():
+    """``weight_version`` must advance once per refit, not once per POST."""
+    worker = _Worker()
+    worker._checkpoint_engine_target_devices = [torch.device("cpu")]
+
+    for expected in (1, 2):
+        worker.checkpoint_engines = [_Engine(batches=[[("a", torch.ones(1))]])]
+        assert asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+        assert worker._checkpoint_engine_weight_version == expected
+        assert worker.update_calls[-1]["weight_version"] == str(expected)
+
+    assert [call["weight_version"] for call in worker.update_calls] == ["1", "2"]
+
+
+class _RemappingWorker(_Worker):
+    """Worker using the real ``CUDA_VISIBLE_DEVICES`` remapping semantics."""
+
+    def __init__(self, *, visible_devices, **kwargs):
+        super().__init__(**kwargs)
+        self._visible_devices = visible_devices
+
+    def _to_local_gpu_id(self, physical_gpu_id):
+        return self._visible_devices.index(physical_gpu_id)
+
+
+def test_checkpoint_engine_devices_use_the_remapped_base_gpu_id():
+    """``base_gpu_id`` is physical; the receivers must use the local index.
+
+    With ``base_gpu_id=0`` remapping is indistinguishable from doing nothing,
+    which is why the other tests cannot cover this.
+    """
+    worker = _RemappingWorker(visible_devices=[4, 5], gpus_per_node=2)
+    worker.base_gpu_id = 4
+
+    assert worker._checkpoint_engine_devices() == [
+        torch.device("cuda", 0),
+        torch.device("cuda", 1),
+    ]
+
+
+def test_checkpoint_engine_payload_index_matches_sglang_rank():
+    """Payload i must be rank i's shard.
+
+    SGLang indexes the list by its own TP rank, so a transposed payload list
+    would load every shard onto the wrong GPU while still succeeding.
+    """
+    from nemo_rl.models.generation.sglang.utils.train_utils import (
+        FlattenedTensorBucket,
+        MultiprocessingSerializer,
+    )
+
+    worker = _Worker()
+    worker._checkpoint_engine_target_devices = [
+        torch.device("cpu"),
+        torch.device("cpu"),
+        torch.device("cpu"),
+    ]
+    batches = [[("a", torch.tensor([float(rank)]))] for rank in range(3)]
+
+    serialized_by_dtype, _keepalive = worker._serialize_checkpoint_engine_batches(
+        batches
+    )
+
+    assert len(serialized_by_dtype) == 1
+    for rank, payload in enumerate(serialized_by_dtype[0]):
+        decoded = MultiprocessingSerializer.deserialize(payload)
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=decoded["flattened_tensor"],
+            metadata=decoded["metadata"],
+        )
+        torch.testing.assert_close(
+            dict(bucket.reconstruct_tensors())["a"], torch.tensor([float(rank)])
+        )
