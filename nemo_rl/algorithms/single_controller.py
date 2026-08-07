@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-import warnings
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -268,7 +267,7 @@ class SingleControllerActor:
                 flush=True,
             )
             return
-        saved_sampler_name = getattr(self._save_state, "sampler_name", None)
+        saved_sampler_name = self._save_state.sampler_name
         current_sampler_name = self._async_cfg.sampler.name
         if saved_sampler_name != current_sampler_name:
             print(
@@ -596,9 +595,7 @@ class SingleControllerActor:
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 self._consumed_samples += grpo_cfg.num_prompts_per_step
-                self._total_valid_tokens += step_metrics.get(
-                    "global_valid_toks", 0
-                )
+                self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
                 is_last_step = self._train_steps >= grpo_cfg.max_num_steps
@@ -683,7 +680,7 @@ class SingleControllerActor:
         save_state.total_valid_tokens = self._total_valid_tokens
         # The restore skips the replay buffer when the resuming run uses a
         # different sampler (its stamps may never be selectable there).
-        save_state.sampler_name = self._async_cfg.sampler.name  # type: ignore[attr-defined]
+        save_state.sampler_name = self._async_cfg.sampler.name
         # Snapshot before any await so it can't interleave with
         # _rollout_pump iterating this same dataloader.
         dataloader_state = self._dataloader.state_dict()
@@ -692,32 +689,14 @@ class SingleControllerActor:
         if hasattr(save_state, "val_reward"):
             delattr(save_state, "val_reward")
 
+        # validate_single_controller_config already rejected anything but a
+        # "train:" prefix, so step_metrics is the only source to consult.
         full_metric_name = self._master_config.checkpointing["metric_name"]
         if full_metric_name is not None:
-            assert full_metric_name.startswith(
-                "train:"
-            ) or full_metric_name.startswith("val:"), (
-                f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                f" e.g. 'val_reward --> 'val:accuracy'"
-            )
-            prefix, metric_name = full_metric_name.split(":", 1)
-            metrics_source = step_metrics if prefix == "train" else None
-            if not metrics_source:
-                warnings.warn(
-                    f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
-                    "This checkpoint will not be saved as top-k.",
-                    stacklevel=2,
-                )
-                if hasattr(save_state, full_metric_name):
-                    delattr(save_state, full_metric_name)
-            elif metric_name not in metrics_source:
-                raise ValueError(
-                    f"Metric {metric_name} not found in {prefix} metrics"
-                )
-            else:
-                setattr(save_state, full_metric_name, metrics_source[metric_name])
+            metric_name = full_metric_name.split(":", 1)[1]
+            if metric_name not in step_metrics:
+                raise ValueError(f"Metric {metric_name} not found in train metrics")
+            setattr(save_state, full_metric_name, step_metrics[metric_name])
 
         # Flush the previous checkpoint's background finalization first;
         # re-raises a failure from it.

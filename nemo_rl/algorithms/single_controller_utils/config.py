@@ -118,6 +118,22 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         sampler_name=async_config.sampler.name,
     )
 
+    # Top-k retention keys off checkpointing.metric_name, but SC has no
+    # validation loop yet (see _save_checkpoint), so a "val:" metric would
+    # never be collected and top-k would silently degrade to a no-op.
+    metric_name = master_config.checkpointing["metric_name"]
+    if (
+        master_config.checkpointing["enabled"]
+        and metric_name is not None
+        and not metric_name.startswith("train:")
+    ):
+        raise ValueError(
+            f"checkpointing.metric_name={metric_name!r} is not usable on the "
+            "SingleController path: it has no validation loop yet, so only "
+            "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
+            "'train:loss') or set checkpointing.metric_name=null."
+        )
+
     # A non-zero reference-policy KL penalty makes the loss read
     # ``reference_policy_logprobs``, but the SC train pump only computes them
     # when ``skip_reference_policy_logprobs_calculation`` is false (see

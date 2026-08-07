@@ -22,7 +22,7 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -37,6 +37,20 @@ from nemo_rl.utils.timer import Timer
 
 class FakeWeightSynchronizer:
     pass
+
+
+def _checkpointing_config(tmp_path) -> dict:
+    """Minimal checkpointing block for actors built through __init__."""
+    return {
+        "enabled": False,
+        "checkpoint_dir": str(tmp_path / "checkpoints"),
+        "metric_name": None,
+        "higher_is_better": True,
+        "keep_top_k": None,
+        "save_period": 10,
+        "save_optimizer": True,
+        "checkpoint_must_save_by": None,
+    }
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
@@ -82,6 +96,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path,
 ) -> None:
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
@@ -97,6 +112,8 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
             max_buffered_rollouts=4,
         ),
         logger={},
+        # __init__ builds a CheckpointManager + TimeoutChecker from this block.
+        checkpointing=_checkpointing_config(tmp_path),
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -111,6 +128,8 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         train_cluster=None,
         inference_cluster=None,
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 

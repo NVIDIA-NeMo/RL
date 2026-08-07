@@ -10,6 +10,7 @@ grpo:
 
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller
+  metric_name: null
 
 # TransferQueue is mandatory for the SingleController path.
 data_plane:

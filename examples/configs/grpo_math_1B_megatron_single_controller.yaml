@@ -24,6 +24,7 @@ async_rl:
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-single-controller
+  metric_name: null
 
 policy:
   dtensor_cfg:

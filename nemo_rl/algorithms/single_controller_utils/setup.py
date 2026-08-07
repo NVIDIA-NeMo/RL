@@ -334,11 +334,6 @@ def setup_single_controller(
         Optional[dict[str, Any]], checkpointer.load_training_info(last_checkpoint_path)
     )
     save_state = _get_grpo_save_state(loaded_state)
-    # _get_grpo_save_state keeps only the declared GRPOSaveState fields;
-    # re-attach the SC-owned sampler identity used to gate the replay-buffer
-    # restore (written by SC saves as a dynamic attribute).
-    if loaded_state is not None and "sampler_name" in loaded_state:
-        save_state.sampler_name = loaded_state["sampler_name"]  # type: ignore[attr-defined]
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     # ==========================

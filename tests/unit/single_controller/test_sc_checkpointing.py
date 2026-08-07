@@ -21,7 +21,8 @@ Covers:
     boundary, last step, timeout, disabled);
   - async-save finalization (rename deferred until finalize_async_save,
     background failure re-raised at the next save);
-  - metric_name behavior (val:* warn-and-save, train:* value recorded);
+  - metric_name behavior (non-"train:" rejected at config validation,
+    train:* value recorded);
   - dataloader state: train_dataloader.pt written at save, position
     round-trip through a real StatefulDataLoader, dataset-swap guard,
     setup restore wiring + missing-file corruption check;
@@ -415,7 +416,9 @@ def _run_actor_run(mc: MasterConfig, actor_args: SingleControllerActorArgs):
 def _step_dir_names(ckpt_dir: Path) -> set[str]:
     if not ckpt_dir.exists():
         return set()
-    return {p.name for p in ckpt_dir.iterdir() if p.name != "latest_checkpoint_status.json"}
+    return {
+        p.name for p in ckpt_dir.iterdir() if p.name != "latest_checkpoint_status.json"
+    }
 
 
 def _training_info(ckpt_dir: Path, step: int) -> dict[str, Any]:
@@ -575,7 +578,9 @@ class TestSaveTrigger:
         assert not (ckpt_dir / "step_2" / "policy" / "optimizer").exists()
 
     def test_no_save_when_disabled(self, tmp_path):
-        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=1, enabled=False)
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=2, save_period=1, enabled=False
+        )
         trainer = _FakeTrainer()
 
         actor = _run_train_pump(mc, _make_actor_args(trainer=trainer))
@@ -639,17 +644,18 @@ class TestAsyncSaveFinalization:
 
 
 class TestMetricName:
-    def test_val_metric_without_validation_warns_and_still_saves(self, tmp_path):
+    def test_val_metric_rejected_at_validation(self, tmp_path):
+        # SC has no validation loop, so a "val:" metric would never be
+        # collected and top-k retention would silently no-op. The config
+        # validation rejects it up front instead of warning at every save.
         mc = _actor_master_config(
             tmp_path, max_num_steps=2, save_period=2, metric_name="val:accuracy"
         )
 
-        with pytest.warns(UserWarning, match="no val metrics were collected"):
+        with pytest.raises(ValueError, match="no validation loop yet"):
             _run_train_pump(mc, _make_actor_args())
 
-        ckpt_dir = tmp_path / "checkpoints"
-        assert _step_dir_names(ckpt_dir) == {"step_2"}
-        assert "val:accuracy" not in _training_info(ckpt_dir, 2)
+        assert _step_dir_names(tmp_path / "checkpoints") == set()
 
     def test_train_metric_lands_in_training_info(self, tmp_path):
         mc = _actor_master_config(
@@ -670,12 +676,12 @@ class TestMetricName:
         with pytest.raises(ValueError, match="not found in train metrics"):
             _run_train_pump(mc, _make_actor_args())
 
-    def test_metric_name_requires_train_or_val_prefix(self, tmp_path):
+    def test_metric_name_requires_train_prefix(self, tmp_path):
         mc = _actor_master_config(
             tmp_path, max_num_steps=2, save_period=2, metric_name="reward"
         )
 
-        with pytest.raises(AssertionError, match="must start with"):
+        with pytest.raises(ValueError, match="is not usable on the SingleController"):
             _run_train_pump(mc, _make_actor_args())
 
 
@@ -707,9 +713,7 @@ def _write_checkpoint(
     with open(step_dir / "training_info.json", "w") as f:
         # Mirror production serialization: the actor writes vars(save_state)
         # of the GRPOSaveState dataclass; plain dicts model legacy files.
-        json.dump(
-            save_state if isinstance(save_state, dict) else vars(save_state), f
-        )
+        json.dump(save_state if isinstance(save_state, dict) else vars(save_state), f)
     if dataloader_state is not None:
         torch.save(dataloader_state, step_dir / "train_dataloader.pt")
     if config is not None:
