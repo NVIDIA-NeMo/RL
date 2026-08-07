@@ -22,6 +22,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvantageResult,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
@@ -1136,7 +1137,9 @@ def mock_sync_grpo_infrastructure(policy):
         )
     )
     adv_estimator = MagicMock()
-    adv_estimator.compute_advantage.return_value = torch.zeros(1, 4)
+    adv_estimator.compute_advantage.return_value = AdvantageResult(
+        advantages=torch.zeros(1, 4)
+    )
     stack.enter_context(
         patch(
             "nemo_rl.algorithms.grpo_sync._create_advantage_estimator",
@@ -2514,7 +2517,9 @@ def test_grpo_train_clips_advantages_when_configured(
     """Advantages passed to policy.train are clamped when clip bounds are set."""
     extreme_advantages = torch.tensor([[-10.0, 15.0]])
     mock_adv_estimator = MagicMock()
-    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    mock_adv_estimator.compute_advantage.return_value = AdvantageResult(
+        advantages=extreme_advantages.clone()
+    )
     monkeypatch.setattr(
         "nemo_rl.algorithms.grpo._create_advantage_estimator",
         lambda _cfg: mock_adv_estimator,
@@ -2540,7 +2545,9 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
     """Advantages are unchanged when advantage_clip_low/high are null."""
     extreme_advantages = torch.tensor([[-10.0, 15.0]])
     mock_adv_estimator = MagicMock()
-    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    mock_adv_estimator.compute_advantage.return_value = AdvantageResult(
+        advantages=extreme_advantages.clone()
+    )
     monkeypatch.setattr(
         "nemo_rl.algorithms.grpo._create_advantage_estimator",
         lambda _cfg: mock_adv_estimator,
