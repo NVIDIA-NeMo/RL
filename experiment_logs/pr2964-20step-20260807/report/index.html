@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 14:43 PDT</span>
+        <span>Updated 2026-08-08 15:30 PDT</span>
         <span>Base a028b33b · Super fix validation 37c195f4 / 3d6d1324</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore final candidate c8cedc3d</span>
@@ -270,7 +270,7 @@
       <article class="card">
         <div class="label">Overall status</div>
         <div class="value"><span class="pill pending">Both Qwen pairs passed · Super running</span></div>
-        <p>Qwen3-30B-A3B and Qwen3-235B baseline/HybridEP pairs completed 20/20. Super baseline entered Step 11. External-prepadding HybridEP 506397 passed its former hang point, completed two steps without an NCCL mismatch, and entered Step 3. Final routing-mask candidates 506434/506437/506438 are running.</p>
+        <p>Final Qwen3-30B-A3B job 506437 completed 20/20 with the routing-mask candidate and improved policy training by 4.19% and LogProb by 11.80% versus all-to-all. Qwen3-235B 506438 and Super 506434 are still advancing without the former collective-ordering failure. Super retry 506397 independently remains stable beyond that failure point.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -291,7 +291,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 14:43 PDT. Both controlled Qwen pairs completed 20/20. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; replacement 506397 restores one-time input prepadding and has completed two steps without the former timeout. Final combined MCore/NeMo candidates are running as jobs 506434, 506437, and 506438. Focused NeMo tests passed 7/7.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 15:30 PDT. Final Qwen3-30B-A3B job 506437 completed 20/20. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; replacements 506397 and 506434 restore one-time input prepadding and continue beyond the former timeout. Final Qwen3-235B job 506438 is running. Focused NeMo tests passed 7/7.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -408,9 +408,9 @@
         <article class="job">
           <div class="job-head">
             <h3>506437 / 506438 · Final Qwen regression matrix</h3>
-            <span class="pill pending">Running · initial 5-minute checks clean</span>
+            <span class="pill ready">Qwen3-30B-A3B completed · Qwen3-235B running</span>
           </div>
-          <p>Qwen3-30B-A3B uses <code>grpo-qwen3-30ba3b-4n8g.yaml</code> on 4 × 8 B200; Qwen3-235B uses <code>grpo-qwen3-235b-16n8g.yaml</code> on 16 × 8 B200. Both use the final MCore routing/broadcast candidate and showed no fatal, CUDA, or NCCL error during the required startup monitor.</p>
+          <p>Qwen3-30B-A3B uses <code>grpo-qwen3-30ba3b-4n8g.yaml</code> on 4 × 8 B200; Qwen3-235B uses <code>grpo-qwen3-235b-16n8g.yaml</code> on 16 × 8 B200. Both use the final MCore routing/broadcast candidate. Job 506437 completed all 20 training steps and Step 20 validation with Slurm exit <code>0:0</code>. Ten vLLM workers emitted a non-fatal CuMem allocator cleanup warning only after W&amp;B teardown; no training task crashed.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -445,16 +445,16 @@
           <tbody>
             <tr>
               <td><strong>Qwen3-30B-A3B</strong><br><code>grpo-qwen3-30ba3b-4n8g.yaml</code></td>
-              <td>505735</td>
+              <td>506437</td>
               <td>4 × 8 B200</td>
               <td>20 completed</td>
               <td class="metric">20/20 · exit 0</td>
-              <td class="metric">140.08 ± 12.86 s</td>
-              <td class="metric">50.53 ± 1.71 s</td>
-              <td class="metric">51.40 ± 2.85 s</td>
-              <td class="metric">13.73 ± 1.06 s</td>
-              <td class="metric">1,489.91 E2E · 4,106.35 generation · 4,039.14 policy · 15,175.88 logprob <small>tok/s/GPU</small></td>
-              <td class="metric">loss 0.0033 mean · reward 0.5250 mean · final validation accuracy 0.5312</td>
+              <td class="metric">140.63 ± 13.57 s</td>
+              <td class="metric">50.73 ± 1.62 s</td>
+              <td class="metric">51.50 ± 3.27 s</td>
+              <td class="metric">12.99 ± 1.10 s</td>
+              <td class="metric">1,486.28 E2E · 4,093.96 generation · 4,036.69 policy · 16,067.79 logprob <small>tok/s/GPU</small></td>
+              <td class="metric">loss −0.00034 mean · reward 0.52542 mean · final validation accuracy 0.5508</td>
             </tr>
             <tr>
               <td><strong>Qwen3-235B-A22B</strong><br><code>grpo-qwen3-235b-16n8g.yaml</code></td>
@@ -493,23 +493,24 @@
             <tr>
               <th>Metric</th>
               <th>All-to-all · 506133</th>
-              <th>HybridEP · 505735</th>
+              <th>HybridEP · 506437</th>
               <th>HybridEP delta</th>
             </tr>
           </thead>
           <tbody>
-            <tr><td>E2E step time</td><td>142.94 ± 12.03 s</td><td>140.08 ± 12.86 s</td><td class="metric">2.00% faster</td></tr>
-            <tr><td>Generation time</td><td>50.88 ± 1.25 s</td><td>50.53 ± 1.71 s</td><td class="metric">0.69% faster</td></tr>
-            <tr><td>Logprob time</td><td>14.73 ± 0.71 s</td><td>13.73 ± 1.06 s</td><td class="metric">6.77% faster</td></tr>
-            <tr><td>Policy-training time</td><td>53.75 ± 2.76 s</td><td>51.40 ± 2.85 s</td><td class="metric">4.37% faster</td></tr>
-            <tr><td>E2E throughput</td><td>1,459.65 ± 116.52</td><td>1,489.91 ± 126.62</td><td class="metric">2.07% higher</td></tr>
-            <tr><td>Generation throughput</td><td>4,079.56 ± 177.54</td><td>4,106.35 ± 185.43</td><td class="metric">0.66% higher</td></tr>
-            <tr><td>Logprob throughput</td><td>14,112.03 ± 799.43</td><td>15,175.88 ± 1,216.06</td><td class="metric">7.54% higher</td></tr>
-            <tr><td>Policy-training throughput</td><td>3,863.18 ± 112.30</td><td>4,039.14 ± 161.06</td><td class="metric">4.55% higher</td></tr>
+            <tr><td>E2E step time</td><td>142.94 ± 12.03 s</td><td>140.63 ± 13.57 s</td><td class="metric">1.62% faster</td></tr>
+            <tr><td>Generation time</td><td>50.88 ± 1.25 s</td><td>50.73 ± 1.62 s</td><td class="metric">0.29% faster</td></tr>
+            <tr><td>Logprob time</td><td>14.73 ± 0.71 s</td><td>12.99 ± 1.10 s</td><td class="metric">11.80% faster</td></tr>
+            <tr><td>Policy-training time</td><td>53.75 ± 2.76 s</td><td>51.50 ± 3.27 s</td><td class="metric">4.19% faster</td></tr>
+            <tr><td>E2E throughput</td><td>1,459.65 ± 116.52</td><td>1,486.28 ± 126.48</td><td class="metric">1.82% higher</td></tr>
+            <tr><td>Generation throughput</td><td>4,079.56 ± 177.54</td><td>4,093.96 ± 184.97</td><td class="metric">0.35% higher</td></tr>
+            <tr><td>Logprob throughput</td><td>14,112.03 ± 799.43</td><td>16,067.79 ± 1,288.89</td><td class="metric">13.86% higher</td></tr>
+            <tr><td>Policy-training throughput</td><td>3,863.18 ± 112.30</td><td>4,036.69 ± 148.85</td><td class="metric">4.49% higher</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="callout">Correctness sanity: mean reward is 0.52578 baseline vs 0.52501 HybridEP, and all 2,048 samples remain valid at every measured step. Final validation accuracy is 0.5547 vs 0.5312, a difference of 3/128 examples; this small validation sample is not sufficient to assert an accuracy regression.</div>
+      <div class="callout">Correctness sanity: mean reward is 0.52578 baseline vs 0.52542 HybridEP; all 2,048 samples remain valid at every measured step. Final validation accuracy is 0.5547 vs 0.5508, a difference of 1/256 examples. Valid-token volume differs by only +0.034%, so there is no accuracy or sample-loss regression signal in this run. Offline W&amp;B IDs are <code>xwbu7q7x</code> (baseline) and <code>fye8ypa9</code> (HybridEP).</div>
+      <div class="callout">Measured one-time input-alignment overhead for 506437 is 4,736 added tokens over 1,891,712 raw group tokens across 32 logged calls: 0.250% weighted overhead. Only the first call required group padding (57,728 → 62,464; 8.20%); the remaining 31 logged calls were already aligned.</div>
 
       <h3>Qwen3-235B-A22B · controlled baseline comparison</h3>
       <p class="section-note">GCP-NRT B200 · canonical 16n8g performance recipe · arithmetic mean ± sample standard deviation over Steps 2–20 (n=19). Validation steps 10 and 20 are included. Positive delta means HybridEP is faster.</p>
@@ -561,7 +562,7 @@
 
     <section aria-labelledby="charts-title">
       <h2 id="charts-title">Metric charts</h2>
-      <p class="section-note">Qwen3-30B-A3B · GCP-NRT B200 · Steps 2–20. Super has no completed step and is intentionally absent.</p>
+      <p class="section-note">Qwen3-30B-A3B · GCP-NRT B200 · Steps 2–20. Super does not yet have a completed 20-step result and is intentionally absent.</p>
       <div class="chart-grid">
         <article class="chart-card">
           <h3>End-to-end and phase step time</h3>
@@ -678,13 +679,13 @@
         W&amp;B is configured in offline mode by both launchers. Local Slurm, Ray, training, and TensorBoard artifacts are therefore the authoritative result sources. Current MCore keeps original and padded HybridEP token counts internally but does not log them; THD sequence-packing efficiency is distinct and will not be presented as HybridEP dispatch-padding overhead.
       </div>
       <div class="callout">
-        Qwen job 505735 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means 0.0033 and 0.5250, respectively. Final validation accuracy is 0.5312. These checks establish execution stability but do not by themselves prove zero numerical regression against a controlled baseline.
+        Qwen job 506437 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means −0.00034 and 0.52542, respectively. Final validation accuracy is 0.5508, versus 0.5547 for the all-to-all baseline. These checks establish execution stability and show no numerical-regression signal in this sample.
       </div>
       <div class="callout">
         Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for explicitly supported sequence-packed HybridEP cases. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's expert-bias mask broadcast fix remain necessary for this GCP-NRT Super path. Baseline 506123 is running; HybridEP 506397 passed the former first-backward hang, completed Steps 1–2, and entered Step 3.
       </div>
       <div class="callout">
-        Performance follow-up: MCore <code>340af84f</code> masks padding from router statistics but still dispatches padding rows through dropless HybridEP. This is numerically safe for the current no-capacity recipes but adds communication/GEMM work. Final candidate pin <code>c8cedc3d</code> combines the expert-bias broadcast with routing-map/probability zeroing for padding rows. NeMo validation head <code>3d6d1324</code> also makes external prepadding an explicit PP1/MTP0 opt-in; PP8 Qwen3-235B continues using MCore's internal padding. Focused MCore tests passed (2 passed, 1 TE-dependent skip), focused NeMo tests passed 7/7, and performance jobs 506434/506437/506438 are running.
+        Performance follow-up: MCore <code>340af84f</code> masks padding from router statistics but still dispatches padding rows through dropless HybridEP. This is numerically safe for the current no-capacity recipes but adds communication/GEMM work. Final candidate pin <code>c8cedc3d</code> combines the expert-bias broadcast with routing-map/probability zeroing for padding rows. NeMo validation head <code>3d6d1324</code> also makes external prepadding an explicit PP1/MTP0 opt-in; PP8 Qwen3-235B continues using MCore's internal padding. Focused MCore tests passed (2 passed, 1 TE-dependent skip), focused NeMo tests passed 7/7, Qwen3-30B-A3B 506437 completed 20/20, and jobs 506434/506438 are running.
       </div>
     </section>
 
@@ -717,16 +718,16 @@
   <script>
     const qwen = {
       steps: Array.from({length: 19}, (_, i) => i + 2),
-      e2e: [141.376434,151.491272,133.579269,134.744446,137.388199,140.701462,144.236023,133.960602,175.314621,131.006241,139.048737,130.969604,144.669266,133.973831,132.498688,126.287674,129.879333,131.602798,168.775055],
-      generationTime: [48.52092,48.471989,48.157646,51.020451,51.541775,52.348053,52.103336,52.203453,48.391014,48.724537,53.70533,51.312435,52.107052,50.82008,48.85112,50.702309,48.571468,51.462551,50.960423],
-      policyTime: [56.193157,55.229195,53.389847,50.706963,48.577499,52.229424,54.164383,47.160202,49.569061,53.865204,54.881214,51.828514,53.428535,47.732521,48.586777,50.343113,48.474304,52.311768,47.965942],
-      logprobTime: [13.950233,15.518492,14.163158,13.760005,12.041489,13.720075,13.45966,12.017689,15.824485,14.782405,12.951546,13.511565,13.736874,13.120312,14.975283,12.625915,14.547043,13.250062,12.946304],
-      e2eTps: [1451.549316,1436.449097,1515.105713,1532.186279,1422.213379,1573.356567,1559.722656,1434.585938,1150.158936,1551.924927,1540.839355,1646.279785,1531.041138,1496.83667,1502.238037,1607.625488,1528.690063,1622.44812,1204.967773],
-      generationTps: [4229.410156,4489.386719,4202.587402,4046.487061,3791.009277,4228.878418,4317.730957,3681.327393,4166.882812,4172.678711,3989.39502,4201.956543,4250.760254,3946.017822,4074.513672,4004.22168,4087.693115,4149.011719,3990.7146],
-      policyTps: [3651.955078,3940.117188,3790.734131,4071.503662,4022.342773,4238.483887,4153.434082,4075.003662,4067.853516,3774.456055,3903.918457,4160.115723,4145.623535,4201.26416,4096.681641,4032.791748,4095.886475,4081.657715,4239.852051],
-      logprobTps: [14710.499023,14022.59375,14289.65918,15003.889648,16226.841797,16135.011719,16714.255859,15991.260742,12742.258789,13753.637695,16542.564453,15957.634766,16124.09082,15284.463867,13291.540039,16079.886719,13648.496094,16114.544922,15708.614258],
-      reward: [0.492188,0.473633,0.517578,0.541504,0.580566,0.470703,0.423828,0.503418,0.595703,0.508301,0.541016,0.542969,0.473633,0.562012,0.556641,0.588379,0.620117,0.474121,0.508789],
-      loss: [0.01187215,0.00081601,0.01016372,-0.00407417,0.02570075,-0.00174248,0.01571645,0.00617216,0.00028207,-0.00018313,-0.01093547,0.00027856,0.00442182,0.00676935,0.00288285,-0.00506246,-0.00746387,0.00908179,-0.00161264]
+      e2e: [151.417364,133.666960,131.288775,133.173534,128.074733,144.103556,144.486240,132.730987,176.747268,132.986072,139.311693,140.126983,145.541787,132.343622,131.848318,132.491156,129.120749,139.851099,172.645534],
+      generationTime: [48.503705,51.364902,50.527113,48.713117,51.757260,52.376718,52.520043,51.573819,48.782644,48.424495,49.223402,51.547509,53.522949,51.054599,51.629085,48.040639,51.105254,52.080343,51.082498],
+      policyTime: [50.972947,52.359216,48.683785,49.648230,48.163407,52.948454,53.390616,48.691256,49.294447,51.958498,57.433534,57.464343,58.931427,49.846805,49.536594,49.742425,49.178805,51.723827,48.526128],
+      logprobTime: [13.558016,12.462958,12.491612,15.114839,11.554122,12.717578,13.033846,11.265737,14.333719,15.020587,13.635966,12.447426,13.778912,12.663135,12.070612,13.915805,11.680841,12.645470,12.427481],
+      e2eTps: [1352.493700,1637.117115,1542.874668,1550.861116,1520.440897,1540.362535,1550.469663,1447.777270,1143.995231,1534.879011,1539.630494,1544.557758,1525.299694,1513.335823,1515.148258,1529.520958,1541.442571,1530.205840,1178.844209],
+      generationTps: [4222.172971,4260.272301,4008.978824,4239.795523,3762.371970,4237.984524,4265.448357,3726.016624,4144.876428,4215.171076,4357.450345,4198.732813,4147.657191,3922.865899,3869.325824,4218.261928,3894.554923,4109.054547,3984.186284],
+      policyTps: [4017.641610,4179.368696,4160.771902,4159.939950,4043.112247,4192.222868,4195.897075,3946.599927,4101.842003,3928.472512,3734.552177,3766.408993,3767.002711,4017.917384,4032.771192,4073.946952,4047.113753,4137.376944,4194.074282],
+      logprobTps: [15104.793972,17558.308800,16215.851487,13664.297035,16853.731439,17453.930701,17187.676987,17057.464574,14106.459722,13589.184884,15729.617980,17387.869704,16111.202335,15816.015990,16550.092770,14562.434411,17039.202608,16923.132690,16376.785328],
+      reward: [0.491699,0.466797,0.516113,0.553223,0.584961,0.464844,0.435547,0.504883,0.586914,0.515137,0.542969,0.539063,0.470703,0.548828,0.551270,0.597168,0.617188,0.483887,0.511719],
+      loss: [-0.00009734,-0.00978319,0.00937995,-0.00519946,0.00505349,-0.00107705,0.00519808,0.01089864,-0.00825479,-0.00374095,-0.00377353,-0.00854844,0.00243147,0.00120813,0.00010597,0.00337568,-0.00236961,-0.00844904,0.00726205]
     };
 
     function renderLineChart(id, series, options = {}) {
