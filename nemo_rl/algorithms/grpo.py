@@ -1211,7 +1211,7 @@ def setup(
             "policy.generation.colocated.enabled must be true."
         )
         policy, policy_time = init_policy()
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        setup_timing_metrics.policy_init_time_s = policy_time
         policy_generation = DllmGeneration(config=policy_config, policy=policy)
 
         print(
