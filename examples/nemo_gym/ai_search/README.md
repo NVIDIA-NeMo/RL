@@ -14,8 +14,8 @@ agent.
 With the default smoke-test launcher:
 
 1. NeMo RL reads two questions.
-2. vLLM asks Qwen2.5-1.5B to answer each question four times, producing eight
-   independent trajectories.
+2. vLLM asks Qwen2.5-7B-Instruct to answer each question four times, producing
+   eight independent trajectories.
 3. During a trajectory, the model may call the structured `search` tool. NeMo
    Gym sends the query to the local resources server, which batches nearby
    requests, encodes them with E5, searches cuVS, and returns the top passages.
@@ -43,8 +43,9 @@ bash examples/nemo_gym/ai_search/prepare_ai_search.sh
 bash examples/nemo_gym/ai_search/run_ai_search.sh
 ```
 
-The recipe itself is configured for 50 steps. Override the launcher's
-smoke-test default when a longer run is wanted:
+The recipe performs full-parameter training and targets a B300-class GPU. It is
+configured for 50 steps, while the launcher defaults to one step. Override the
+launcher when a longer run is wanted:
 
 ```bash
 AI_SEARCH_MAX_STEPS=50 \
@@ -61,6 +62,12 @@ AI_SEARCH_NUM_PROMPTS=8
 AI_SEARCH_NUM_GENERATIONS=4
 AI_SEARCH_FORCE_INSTALL=1
 ```
+
+Do not assume that CPU offload makes this full-parameter recipe suitable for a
+smaller GPU: it moves substantial policy and optimizer pressure into host RAM.
+Use the target B300-class GPU for the default recipe. A separate 7B LoRA
+diagnostic on an RTX 6000D is recorded in [PERFORMANCE.md](PERFORMANCE.md); it
+validates the pipeline but is not equivalent to the full-parameter run.
 
 `prepare_ai_search.sh` uses `uv` throughout. It installs policy, vLLM, and Gym
 dependencies into one node-local environment because the example runs every
@@ -164,6 +171,10 @@ cuVS brute force, and cuVS CAGRA. It also measures E5 encoding, index search,
 document fetch, query caching, and asynchronous microbatching. See
 [PERFORMANCE.md](PERFORMANCE.md) for measured results and
 [RESEARCH_NOTES.md](RESEARCH_NOTES.md) for the design comparison.
+
+The performance report separates the historical 1.5B full-parameter baseline
+from the current 7B LoRA plumbing check. Neither is a B300 throughput claim for
+the default 7B full-parameter recipe.
 
 ## Current limits
 

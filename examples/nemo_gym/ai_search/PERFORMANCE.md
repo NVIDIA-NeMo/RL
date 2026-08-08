@@ -90,9 +90,49 @@ The configured 2 ms collection window hurts a lone query but helps concurrent
 rollouts. It should be reduced for latency-sensitive serving and retained or
 tuned for high-throughput training.
 
-## Real one-step GRPO run
+## 7B one-step LoRA diagnostic
 
-The end-to-end smoke run used Qwen2.5-1.5B on one RTX 6000D, two prompts, four
+The current Qwen2.5-7B-Instruct path was checked on the same RTX 6000D with
+DTensor V2 LoRA rank 64, two prompts, and four trajectories per prompt. This
+was a smaller-GPU pipeline diagnostic; the checked-in B300 recipe remains
+full-parameter training.
+
+| Stage | Time |
+| --- | ---: |
+| One-time setup | 138.85 s |
+| Initial four-question validation | 2.44 s |
+| Eight training rollouts / generation | 2.75 s |
+| Policy and reference log probabilities | 33.19 s |
+| Policy training | 2.64 s |
+| Reward calculation | 0.0066 s |
+| Post-update four-question validation | 1.84 s |
+| Local `/tmp` adapter checkpoint | 0.31 s |
+| Reported training-step total | 67.89 s |
+
+NeMo RL reported 76.44 end-to-end tokens/s/GPU, 1,885.67 generation
+tokens/s/GPU, 1,966.77 policy-training tokens/s/GPU, and 156.39 policy plus
+reference-logprob tokens/s/GPU. Peak sampled GPU memory was 58.81 GiB, peak
+sampled host memory was 183.42 GiB, and the adapter checkpoint was 666 MiB.
+The eight trajectories made nine search calls; all 17 assistant messages had
+valid tool-call and thinking format, and no search failed.
+
+All eight toy trajectories received the same maximum reward, so their
+group-relative advantages, loss, and gradient norm were zero. The run proves
+that 7B model loading, rollout, cuVS search, reward, log-probability, backward,
+optimizer, validation, and checkpoint code paths execute; it does **not** prove
+that this step changed the policy or improved quality. A learning test needs a
+larger, harder corpus that produces reward variation.
+
+A full-parameter CPU-offload attempt reached policy training but was killed at
+the node's host-memory limit: total use reached 242.01 of 251.40 GiB and the
+policy worker alone used 193.58 GiB. This was not a GPU OOM. It demonstrates
+that CPU offload is not a substitute for the target B300-class GPU on this
+host. No full-parameter B300 timing was collected in this session.
+
+## Historical 1.5B one-step GRPO run
+
+This measurement predates the example's switch to a 7B default. The end-to-end
+smoke run used Qwen2.5-1.5B on one RTX 6000D, two prompts, four
 trajectories per prompt, and a maximum of five Gym agent steps. It performed
 real vLLM generation, structured search calls, reward calculation, reference
 and policy log-probability calculation, backpropagation, optimizer update,

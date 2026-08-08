@@ -1,7 +1,7 @@
 # Train an AI Search Agent with GRPO
 
-The AI-search example trains Qwen2.5 to call a private search tool while
-answering questions. It combines three pieces:
+The AI-search example trains Qwen2.5-7B-Instruct to call a private search tool
+while answering questions. It combines three pieces:
 
 - **NeMo RL** runs vLLM rollout generation and the GRPO update.
 - **NeMo Gym** controls the multi-turn question/search/answer interaction and
@@ -21,10 +21,12 @@ bash examples/nemo_gym/ai_search/prepare_ai_search.sh
 bash examples/nemo_gym/ai_search/run_ai_search.sh
 ```
 
-The launcher defaults to one real optimizer step with two questions and four
-rollouts per question. Artifacts are written under
-`/tmp/nemo-rl-ai-search/runs` so model checkpoints do not accidentally fill a
-shared source filesystem.
+The full-parameter recipe targets a B300-class GPU. The launcher defaults to
+one real optimizer step with two questions and four rollouts per question.
+Artifacts are written under `/tmp/nemo-rl-ai-search/runs` so model checkpoints
+do not accidentally fill a shared source filesystem. CPU offload alone is not
+a supported small-GPU substitute because it can require hundreds of GiB of
+host memory.
 
 Run the 50-step recipe with:
 
