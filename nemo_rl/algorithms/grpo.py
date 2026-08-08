@@ -183,6 +183,10 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
     max_trajectory_age_steps: int = 1
+    # Generation-worker failures tolerated before the AsyncTrajectoryCollector
+    # aborts the run. A successful batch worker resets the count.
+    # 0 makes the very first worker exception fatal.
+    max_generation_failures: int = 0
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
@@ -3986,6 +3990,7 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+    max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
 
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
@@ -4176,7 +4181,9 @@ def async_grpo_train(
     print("📦 Started continuous background trajectory collection")
 
     print(
-        f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
+        f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
+        f"max_age={max_trajectory_age_steps} steps, "
+        f"max_generation_failures={max_generation_failures}"
     )
 
     print("⏳ Preparing policy generation for training...", flush=True)
@@ -4281,6 +4288,7 @@ def async_grpo_train(
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
+        ray.get(trajectory_collector.check_health.remote())
         current_step_ready = ray.get(
             replay_buffer.has_complete_batch.remote(
                 step, num_prompts_per_step, max_trajectory_age_steps
@@ -4357,6 +4365,7 @@ def async_grpo_train(
     # Main training loop
     try:
         while step < master_config.grpo.max_num_steps:
+            ray.get(trajectory_collector.check_health.remote())
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
             print(
@@ -5161,6 +5170,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         # Finalize any pending async checkpoint before tearing down workers.
