@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import json
+import os
 from typing import Any, Optional
 
 import torch
@@ -42,6 +43,33 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+_FAULT_INJECT_ENV_VAR = "NRL_FAULT_INJECT_EVERY_NTH_PROMPT"
+
+
+def _maybe_inject_rollout_fault(input_sample: DatumSpec) -> None:
+    """Fail this prompt's rollout when fault injection is enabled.
+
+    Validation scaffolding for the SingleController's rollout fault tolerance,
+    inert unless NRL_FAULT_INJECT_EVERY_NTH_PROMPT is a positive integer. Gym
+    surfaces env-server 500s and truncated response bodies to the caller rather
+    than retrying them, and reproducing those naturally needs the connection
+    pressure of a 56-node run.
+
+    Keyed on the prompt index rather than a counter so a cursed prompt fails on
+    every attempt. That is what exercises the drop path; a prompt that failed
+    once and then succeeded would only prove the retry.
+    """
+    every = int(os.environ.get(_FAULT_INJECT_ENV_VAR, "0"))
+    if every <= 0:
+        return
+
+    prompt_idx = int(input_sample["idx"])
+    if prompt_idx % every == 0:
+        raise RuntimeError(
+            f"injected rollout fault for prompt {prompt_idx} "
+            f"({_FAULT_INJECT_ENV_VAR}={every})"
+        )
 
 
 class AsyncRolloutImpl:
@@ -715,6 +743,16 @@ class RolloutManager:
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
 
+        # Say so up front, so a run whose env var never reached the actor is
+        # obvious in the first minute instead of looking like a clean pipeclean.
+        every = int(os.environ.get(_FAULT_INJECT_ENV_VAR, "0"))
+        if every > 0:
+            print(
+                f"rollout_manager: fault injection ARMED, every {every}th prompt "
+                f"index will fail every attempt ({_FAULT_INJECT_ENV_VAR}={every})",
+                flush=True,
+            )
+
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
 
@@ -724,6 +762,7 @@ class RolloutManager:
         self._weight_version = int(version)
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+        _maybe_inject_rollout_fault(input_sample)
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(
