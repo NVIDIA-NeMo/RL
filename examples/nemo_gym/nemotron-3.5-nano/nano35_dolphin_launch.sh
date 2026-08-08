@@ -75,20 +75,28 @@ cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 export EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-0}"
 _DEFAULT_GYM_NODES=16
 if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
-  # Per-replica shape copied from the 6K recipe: one TP=4 replica per four-GPU
-  # GB200 node, which keeps each replica inside a single node. Capacity is
-  # matched to what these judges already get, so only their location changes:
-  # four GenRM replicas fill the same four nodes the warm pool ran on, and
-  # eight NL2Bash replicas equal the DP=8 deployment they replace in Gym.
+  # Both pools reproduce the control run's serving shape, not just its GPU count,
+  # so only the judges' location changes. GenRM is 2 replicas at TP=8 spanning
+  # two nodes each, exactly as genrm_worker.sh ran them in the warm pool, filling
+  # the same four nodes. NL2Bash is eight TP=4 replicas, equalling the TP4 x DP8
+  # deployment it replaces in Gym.
+  #
+  # GenRM's TP is the one number worth not "simplifying" to a single node. The
+  # checkpoint is 438 GB, so it is resident once per replica: 4 x TP4 would hold
+  # four copies (1752 GB) on the same 16 GPUs where 2 x TP8 holds two (876 GB),
+  # and the difference comes straight out of KV cache -- roughly 1.1 TB against
+  # 2.0 TB pool-wide. Four replicas would buy more schedulers and more concurrent
+  # slots, but GenRM's long prompts are KV-bound, so the control's shape wins.
   export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230}"
-  export GENRM_REPLICAS="${GENRM_REPLICAS:-4}"
-  export GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
+  export GENRM_REPLICAS="${GENRM_REPLICAS:-2}"
+  export GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-8}"
   # The warm pool serves this checkpoint through the ultra_v3 parser plugin, so
   # carry both the plugin and its name over rather than vLLM's built-ins.
   export GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-/lustre/fsw/portfolios/llmservice/users/lvega/evals/ultra_v3_reasoning_parser.py}"
   export GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
-  # Matches the 6K deployment of this same GenRM checkpoint.
-  export GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-0}"
+  # The control's genrm_worker.sh passes --enable-expert-parallel; the 6K
+  # deployment of this checkpoint does not. Follow the control.
+  export GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
   export NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-8}"
   export NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
   export EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-2}"
