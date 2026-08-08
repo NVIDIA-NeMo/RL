@@ -150,6 +150,19 @@ async_rl:
   # with the lookahead, so raising one raises both.
   max_buffered_rollouts: 640
 
+  # Rollout fault tolerance. Gym retries dropped connections itself, but hands
+  # us env-server 500s and truncated response bodies, and one of those used to
+  # abort the whole run: jobs 5966951 and 5967263 died that way after one and
+  # six steps while the legacy stack absorbed 400 of the same faults and kept
+  # training. A prompt that exhausts its retries is dropped, which costs the
+  # step nothing because the trainer waits on ready groups rather than a fixed
+  # batch.
+  rollout_retries: 1
+  # Consecutive drops that mean the environment servers or the generation
+  # backend are down rather than one prompt being bad. Failing fast then beats
+  # burning the rest of the allocation.
+  max_consecutive_rollout_failures: 32
+
   diagnostics: false
 
 # =============================================================================

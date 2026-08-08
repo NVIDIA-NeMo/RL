@@ -18,6 +18,11 @@ async_rl:
   max_inflight_prompts: ${grpo.num_prompts_per_step}
   # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
   max_buffered_rollouts: 64
+  # Re-dispatch attempts for a prompt whose rollout raised, before dropping it.
+  # 0 disables retry.
+  rollout_retries: 1
+  # Consecutive prompts that may exhaust their retries before the run aborts.
+  max_consecutive_rollout_failures: 32
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
 
