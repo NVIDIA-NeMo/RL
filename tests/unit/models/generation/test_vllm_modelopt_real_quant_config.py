@@ -18,6 +18,7 @@ import sys
 import types
 import weakref
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 import pytest
 import torch
@@ -504,12 +505,13 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
         oracle_module.NvFp4MoeBackend.MARLIN,
         FakeMarlinExperts,
     )
-    oracle_module.make_nvfp4_moe_kernel = lambda **kwargs: events.append(
-        ("make_moe_kernel", kwargs)
-    ) or types.SimpleNamespace(
-        fused_experts=types.SimpleNamespace(
-            process_weights_after_loading=lambda layer: events.append(
-                ("process_moe", layer)
+    oracle_module.make_nvfp4_moe_kernel = lambda **kwargs: (
+        events.append(("make_moe_kernel", kwargs))
+        or types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(
+                process_weights_after_loading=lambda layer: events.append(
+                    ("process_moe", layer)
+                )
             )
         )
     )
@@ -1565,13 +1567,18 @@ def test_real_quant_caches_scoped_reload_roots(monkeypatch):
     assert calls == [(model, False)]
 
 
-def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
+def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     child = torch.nn.Module()
     child.weight = torch.nn.Parameter(torch.ones(1))
-    child.register_buffer("input_quantizer_amax", torch.tensor([1.0]))
+    child.input_quantizer = torch.nn.Module()
+    child.input_quantizer.register_buffer("_amax", torch.tensor([1.0]))
     child.register_buffer("weight_quantizer_amax", torch.tensor([2.0]))
+    child.self_attn = torch.nn.Module()
+    child.self_attn.attn = torch.nn.Module()
+    child.self_attn.attn.k_bmm_quantizer = torch.nn.Module()
+    child.self_attn.attn.k_bmm_quantizer.register_buffer("_amax", torch.tensor([-1.0]))
     model = torch.nn.Module()
     model.child = child
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
@@ -1579,11 +1586,18 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
     seen_names = []
 
     def fake_base_load_weights(self, weights):
+        assert [name for name, _ in weights] == [
+            "child.self_attn.attn.k_bmm_quantizer._amax"
+        ]
         params = dict(child.named_parameters())
         seen_names.extend(params)
-        params["input_quantizer_amax"].weight_loader(
-            params["input_quantizer_amax"],
+        params["input_quantizer._amax"].weight_loader(
+            params["input_quantizer._amax"],
             torch.tensor([3.0]),
+        )
+        params["self_attn.attn.k_bmm_quantizer._amax"].weight_loader(
+            params["self_attn.attn.k_bmm_quantizer._amax"],
+            torch.tensor([4.0]),
         )
         return "loaded"
 
@@ -1598,13 +1612,46 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
         fake_base_load_weights,
     )
 
-    assert extension._load_weights([("unused", torch.ones(1))]) == "loaded"
+    assert (
+        extension._load_weights(
+            [("child.self_attn.k_bmm_quantizer._amax", torch.tensor([4.0]))]
+        )
+        == "loaded"
+    )
 
     assert "weight" in seen_names
-    assert "input_quantizer_amax" in seen_names
+    assert "input_quantizer._amax" in seen_names
+    assert "self_attn.attn.k_bmm_quantizer._amax" in seen_names
     assert "weight_quantizer_amax" not in seen_names
-    assert not hasattr(child.input_quantizer_amax, "weight_loader")
-    torch.testing.assert_close(child.input_quantizer_amax, torch.tensor([3.0]))
+    assert not hasattr(child.input_quantizer._amax, "weight_loader")
+    assert not hasattr(child.self_attn.attn.k_bmm_quantizer._amax, "weight_loader")
+    torch.testing.assert_close(child.input_quantizer._amax, torch.tensor([3.0]))
+    torch.testing.assert_close(
+        child.self_attn.attn.k_bmm_quantizer._amax,
+        torch.tensor([4.0]),
+    )
+
+
+def test_fake_quant_eager_input_amax_loader_supports_direct_vllm_load(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = torch.nn.Module()
+    model.input_quantizer = torch.nn.Module()
+    model.input_quantizer.register_buffer("_amax", torch.tensor([1.0]))
+    model.k_bmm_quantizer = torch.nn.Module()
+    model.k_bmm_quantizer.register_buffer("_amax", torch.tensor([2.0]))
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+
+    with extension._attach_input_quantizer_amax_loaders(model):
+        input_amax = model.input_quantizer._amax
+        assert hasattr(input_amax, "weight_loader")
+        assert not hasattr(model.k_bmm_quantizer._amax, "weight_loader")
+
+        input_amax.weight_loader(input_amax, torch.tensor([3.0]))
+        input_amax.weight_loader(input_amax, torch.tensor([2.0]))
+        torch.testing.assert_close(input_amax, torch.tensor([3.0]))
+
+    assert not hasattr(model.input_quantizer._amax, "weight_loader")
 
 
 def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
@@ -2156,6 +2203,7 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
         "enabled": 3,
         "with_amax": 2,
         "positive_amax": 1,
+        "kv_amax": {},
     }
 
 
@@ -2336,6 +2384,31 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     }
 
     assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+
+
+@pytest.mark.parametrize(
+    ("recipe", "num_bits"),
+    [("kv_cache_fp8.yaml", (4, 3)), ("kv_cache_nvfp4.yaml", (2, 1))],
+)
+def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
+    repo_root = Path(__file__).resolve().parents[4]
+
+    config = resolve_quant_cfg(
+        str((repo_root / "examples/modelopt/quant_configs" / recipe).resolve())
+    )
+
+    kv_config = config["quant_cfg"][1]
+    assert config["algorithm"] == "max"
+    assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
+    assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
+    assert kv_config["enable"] is True
+    assert kv_config["cfg"]["num_bits"] == num_bits
+    if recipe == "kv_cache_nvfp4.yaml":
+        assert kv_config["cfg"]["block_sizes"] == {
+            -1: 16,
+            "type": "dynamic",
+            "scale_bits": (4, 3),
+        }
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):

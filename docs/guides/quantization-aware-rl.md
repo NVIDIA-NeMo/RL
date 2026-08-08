@@ -30,6 +30,40 @@ The following workflow + quantization recipe combinations have been validated en
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
+## Simulated KV-Cache Quantization
+
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in the
+Megatron policy, the vLLM rollout model, or both. Configure each worker's
+`quant_cfg` independently. Calibrated K/V amax values available on the policy
+are transferred to compatible rollout quantizers during refit.
+
+```yaml
+policy:
+  quant_cfg: /absolute/path/to/examples/modelopt/quant_configs/kv_cache_fp8.yaml
+
+  generation:
+    backend: vllm
+    quant_cfg: /absolute/path/to/examples/modelopt/quant_configs/kv_cache_fp8.yaml
+```
+
+The KV-only examples are:
+
+- `kv_cache_fp8.yaml`: calibrated FP8 E4M3 K/V fake quantization.
+- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic
+  per-block scales and a calibrated global amax.
+
+These recipes intentionally disable weight, input, Q, and P quantizers so a
+test can isolate simulated K/V behavior. They can also serve as the K/V portion
+of a complete user-authored recipe. Constant-amax K/V recipes need no amax
+transfer. Policy and rollout may use different recipes or enable K/V
+quantization on only one side.
+
+This path does not enable vLLM's native FP8 KV-cache storage. Set neither
+`policy.generation.real_quant` nor a native vLLM KV-cache dtype for these
+simulated recipes. Affine/rotate recipes, MLA cache quantization, Mamba state
+cache quantization, speculative draft/MTP layers, and models whose HF format
+omits or shares K/V projection tensors are not supported here.
+
 ## ModelOpt Layer Spec Toggle
 
 For QARL configs, try setting `policy.disable_modelopt_layer_spec=true` first.
