@@ -10,11 +10,12 @@
 set -euo pipefail
 
 container=/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh
+probe_gpus_per_node=${PROBE_GPUS_PER_NODE:-8}
 
 srun \
   --nodes=1 \
   --ntasks=1 \
-  --gpus-per-node=8 \
+  --gpus-per-node="${probe_gpus_per_node}" \
   --container-image="${container}" \
   --container-mounts=/lustre:/lustre \
   --no-container-mount-home \
@@ -27,6 +28,9 @@ srun \
     nvidia-smi topo -m
     ls -l /dev/infiniband || true
     ls -l /sys/class/infiniband || true
+    grep -E "^(nvidia_peermem|nv_peer_mem) " /proc/modules || true
+    test -d /sys/module/nvidia_peermem && echo "nvidia_peermem=loaded" || echo "nvidia_peermem=missing"
+    command -v modinfo && modinfo nvidia_peermem || true
     command -v ibv_devices && ibv_devices || true
     command -v ibv_devinfo && ibv_devinfo || true
     ldconfig -p | grep -E "lib(ibverbs|mlx5|nixl|ucp|ucs)" || true
