@@ -226,7 +226,7 @@ def masked_mean(
 
 def mask_out_neg_inf_logprobs(
     logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask out negative infinity log probabilities.
 
     Handling sampling mask mismatch:
@@ -235,13 +235,22 @@ def mask_out_neg_inf_logprobs(
     token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
     Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
 
+    The substituted ``0.0`` is *not* a neutral value: it means log p = 0, i.e.
+    p = 1, while ``generation_logprobs`` at the same position is finite and
+    typically around -5. Anything that compares the two -- the importance ratio,
+    ``token_mult_prob_error``, the sequence-level weights -- reads a large
+    fabricated difference unless the position is also dropped from the reduction
+    mask. Callers must therefore fold ``keep`` into their own mask; returning it
+    is what makes the warning above true.
+
     Args:
         logprobs: Log probabilities.
         mask: Mask.
         logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
-        Masked log probabilities.
+        ``(logprobs, keep)``, where ``keep`` is 0 at positions whose logprob was
+        -inf and 1 elsewhere, with the same shape as ``mask``.
     """
     is_neginf = torch.isinf(logprobs)
     neginf_count = (is_neginf & mask.bool()).sum().item()
@@ -251,10 +260,11 @@ def mask_out_neg_inf_logprobs(
             "(policy top-k/top-p mismatch). Masking out these positions."
         )
 
-    mask = mask * (~is_neginf).float()
+    keep = (~is_neginf).to(mask.dtype)
+    mask = mask * keep
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
-    return logprobs
+    return logprobs, keep
 
 
 def masked_var(
