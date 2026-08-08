@@ -73,6 +73,7 @@ cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 # name is pinned in rlvr_dolphin.yaml instead of passed here.
 # -----------------------------------------------------------------------------
 export EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-0}"
+_DEFAULT_GYM_NODES=16
 if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   # Per-replica shape copied from the 6K recipe: one TP=4 replica per four-GPU
   # GB200 node, which keeps each replica inside a single node. Capacity is
@@ -91,11 +92,17 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   export NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-8}"
   export NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
   export EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-2}"
-  # Gym keeps its node count by default even though the NL2Bash judge vacates
-  # 32 of its GPUs, because Gym's sizing also covers CPU-side env servers that
-  # this change does not touch. Drop NUM_GYM_NODES to 8 once a run confirms the
-  # env servers are comfortable, which brings the total back to 68 nodes --
-  # the same footprint as 64 in-job nodes plus a 4-node warm pool.
+  # Gym drops to 8 nodes because the NL2Bash judge vacates exactly the 8 it was
+  # filling: TP=4 puts one replica on each four-GPU node, and DP=8 means eight
+  # of them. Every Gym node that was not serving NL2Bash stays, so the safety
+  # judge and the CPU-side env servers are untouched.
+  #
+  # That keeps the GPU allocation comparable to the control run. Akash's
+  # baseline was a 64-node job (5931924: 8 train + 40 gen + 16 gym) alongside a
+  # 4-node GenRM pool of its own (5931683 and 5931688, 2 nodes each, spanning
+  # the full training window) -- 68 nodes, 272 GB200 GPUs. This path is
+  # 8 + 40 + 8 in hetgroup 0 plus 12 service nodes, which is the same 68.
+  _DEFAULT_GYM_NODES=8
   #
   # CHECK THIS FIRST IF A POOL FAILS TO START. serve_vllm_on_ray.py imports
   # nemo_rl before vLLM's serve CLI, so pools must run the RL venv; they cannot
@@ -286,7 +293,7 @@ export JOB_REAPER_EXEMPT_IDLE_MINS="${JOB_REAPER_EXEMPT_IDLE_MINS:-60}"
 export CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-00:03:35:00}"
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-8}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-40}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-16}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-${_DEFAULT_GYM_NODES}}"
 export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 
 # -----------------------------------------------------------------------------
