@@ -19,6 +19,10 @@ render_case() {
       config=examples/configs/recipes/llm/performance/grpo-qwen3-235b-16n8g.yaml
       num_nodes=16
       segment_size=
+      model_overrides+=(
+        ++policy.generation.vllm_kwargs.disable_custom_all_reduce=true
+        ++policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_allreduce_rms=false
+      )
       ;;
     nemotron3-super)
       config=examples/configs/recipes/llm/performance/grpo-nemotron3-super-120BA12B-32n8g.yaml

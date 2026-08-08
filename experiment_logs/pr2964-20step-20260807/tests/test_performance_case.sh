@@ -40,7 +40,15 @@ assert_contains "${q235_hybridep}" 'grpo-qwen3-235b-16n8g.yaml'
 assert_contains "${q235_hybridep}" 'policy.megatron_cfg.moe_token_dispatcher_type=flex'
 assert_contains "${q235_hybridep}" '++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep'
 assert_contains "${q235_hybridep}" "++policy.megatron_cfg.env_vars.NVLINK_DOMAIN_SIZE='8'"
+assert_contains "${q235_hybridep}" '++policy.generation.vllm_kwargs.disable_custom_all_reduce=true'
+assert_contains "${q235_hybridep}" '++policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_allreduce_rms=false'
 assert_not_contains "${q235_hybridep}" 'logger.tensorboard_enabled=true'
+
+render_case qwen3-235b baseline /tmp/q235-baseline
+q235_baseline=$(printf '%s\n' "${driver_args[@]}")
+assert_contains "${q235_baseline}" 'policy.megatron_cfg.moe_token_dispatcher_type=alltoall'
+assert_contains "${q235_baseline}" '++policy.generation.vllm_kwargs.disable_custom_all_reduce=true'
+assert_contains "${q235_baseline}" '++policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_allreduce_rms=false'
 
 render_case nemotron3-super baseline /tmp/super-baseline
 super_baseline=$(printf '%s\n' "${driver_args[@]}")
