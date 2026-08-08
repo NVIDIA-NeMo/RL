@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = https://github.com/seonjinn/Megatron-Bridge.git
-	branch = sna/pr2964-hybridep-seqpack-mbridge-main-20260731  # pragma: allowlist secret
+	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+	branch = main
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel

@@ -95,7 +95,7 @@ def model_forward(
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
-        padding_mask: Packed HybridEP fake-token mask (optional)
+        padding_mask: Packed-sequence padding mask for MoE routing (optional)
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
