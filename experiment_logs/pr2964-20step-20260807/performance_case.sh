@@ -13,6 +13,7 @@ render_case() {
       config=examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml
       num_nodes=4
       segment_size=4
+      model_overrides+=(logger.tensorboard_enabled=true)
       ;;
     qwen3-235b)
       config=examples/configs/recipes/llm/performance/grpo-qwen3-235b-16n8g.yaml
@@ -27,6 +28,7 @@ render_case() {
         ++policy.generation.vllm_kwargs.disable_custom_all_reduce=true
         ++policy.generation.vllm_kwargs.moe_backend=triton
         policy.generation.vllm_cfg.enforce_eager=true
+        logger.tensorboard_enabled=true
       )
       ;;
     *)
