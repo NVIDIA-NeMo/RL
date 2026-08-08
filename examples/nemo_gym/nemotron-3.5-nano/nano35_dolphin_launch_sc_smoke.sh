@@ -26,9 +26,9 @@
 #   DRY_RUN=1 bash .../nano35_dolphin_launch_sc_smoke.sh        # inspect only
 #
 # Training parallelism is deliberately NOT scaled. Four nodes is the floor that
-# preserves it exactly: TP=4 x CP=4 x PP=1 fills 16 GPUs, and EP=16 still
-# divides 16 at ETP=1, so every rank owns the same 8 of the 128 routed experts
-# as the full-scale run. The only difference is DP, which drops from 2 to 1.
+# preserves it exactly: TP=4 x CP=4 x PP=1 fills 16 GPUs, and EP=8 still divides
+# 16 at ETP=1, so every rank owns the same 16 of the 128 routed experts as the
+# full-scale run. The only difference is DP, which drops from 2 to 1.
 # Going to 2 training nodes would force CP below 4, and CP=4 is what makes the
 # 73728-token context tractable, so the comparison would stop being meaningful.
 #
@@ -108,7 +108,7 @@ fi
 echo "Nemotron 3.5 Nano — SingleController pipeclean profile"
 echo "  hetgroup 0: train=${NUM_TRAIN_NODES}, generation=${NUM_GEN_NODES}, Gym=${NUM_GYM_NODES}"
 echo "  hetgroup 1: GenRM=${GENRM_REPLICAS}xTP${GENRM_TENSOR_PARALLEL_SIZE}, NL2Bash=${NL2BASH_REPLICAS}xTP${NL2BASH_TENSOR_PARALLEL_SIZE}"
-echo "  parallelism: TP4 x CP4 x EP16 x PP1 (ETP1) — unchanged, DP 2 -> 1"
+echo "  parallelism: TP4 x CP4 x EP8 x PP1 (ETP1) — unchanged, DP 2 -> 1"
 echo "  batch: prompts=${NUM_PROMPTS_PER_STEP}, generations=16, global=${TRAIN_GLOBAL_BATCH_SIZE}"
 echo "  steps: ${NRL_MAX_STEPS}"
 

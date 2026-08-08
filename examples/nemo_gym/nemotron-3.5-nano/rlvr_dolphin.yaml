@@ -78,8 +78,9 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
-    # 128 routed experts / EP16 = 8 experts per rank
-    expert_model_parallel_size: 16
+    # 128 routed experts / EP8 = 16 experts per rank. Matches the control run
+    # (job 5931924) so the judge relocation is the only variable between them.
+    expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     context_parallel_size: 4
     moe_token_dispatcher_type: "alltoall"

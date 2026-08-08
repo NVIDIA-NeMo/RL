@@ -125,7 +125,7 @@ fi
 # EXP_NAME drives the W&B run name, the singleton job name, and the checkpoint
 # and log dirs — so changing it starts a *new* run rather than resuming.
 # -----------------------------------------------------------------------------
-export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-async1-tp4_cp4_ep16_pp1_gpp16_pps128_gbs2048}"
+export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-async1-tp4_cp4_ep8_pp1_gpp16_pps128_gbs2048}"
 export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_dolphin.yaml}"
 
 # -----------------------------------------------------------------------------

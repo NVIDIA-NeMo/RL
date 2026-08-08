@@ -54,7 +54,7 @@ export TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/run_grpo_single_controll
 
 # Distinct from the baseline's EXP_NAME so this starts a new W&B run, run dir
 # and singleton job name rather than colliding with the async-1 baseline.
-export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc-tp4_cp4_ep16_pp1_gpp16_pps128_gbs2048}"
+export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc-tp4_cp4_ep8_pp1_gpp16_pps128_gbs2048}"
 
 # The SC knobs worth sweeping without editing the config.
 #
