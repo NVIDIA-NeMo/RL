@@ -65,9 +65,9 @@ AI_SEARCH_FORCE_INSTALL=1
 
 Do not assume that CPU offload makes this full-parameter recipe suitable for a
 smaller GPU: it moves substantial policy and optimizer pressure into host RAM.
-Use the target B300-class GPU for the default recipe. A separate 7B LoRA
-diagnostic on an RTX 6000D is recorded in [PERFORMANCE.md](PERFORMANCE.md); it
-validates the pipeline but is not equivalent to the full-parameter run.
+Use the target B300-class GPU for the default recipe. A full-parameter B300 run
+and a separate 7B LoRA diagnostic on an RTX 6000D are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 `prepare_ai_search.sh` uses `uv` throughout. It installs policy, vLLM, and Gym
 dependencies into one node-local environment because the example runs every
@@ -172,9 +172,9 @@ document fetch, query caching, and asynchronous microbatching. See
 [PERFORMANCE.md](PERFORMANCE.md) for measured results and
 [RESEARCH_NOTES.md](RESEARCH_NOTES.md) for the design comparison.
 
-The performance report separates the historical 1.5B full-parameter baseline
-from the current 7B LoRA plumbing check. Neither is a B300 throughput claim for
-the default 7B full-parameter recipe.
+The performance report separates the current 7B full-parameter B300 run, a 7B
+LoRA plumbing check on an RTX 6000D, and the historical 1.5B baseline. It also
+explains why the full-parameter and LoRA timings are not a hardware comparison.
 
 ## Current limits
 

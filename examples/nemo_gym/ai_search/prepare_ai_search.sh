@@ -18,6 +18,9 @@ if [[ -z "${UV_BIN}" || ! -x "${UV_BIN}" ]]; then
 fi
 
 export UV_BIN
+# NeMo Gym starts child services with the command name `uv`, so make the
+# directory containing an explicitly supplied UV_BIN visible to those children.
+export PATH="$(dirname "${UV_BIN}"):${PATH}"
 export UV_CACHE_DIR="${AI_SEARCH_UV_CACHE_DIR:-${AI_SEARCH_RUNTIME_DIR}/uv-cache}"
 export HF_HOME="${AI_SEARCH_HF_HOME:-${AI_SEARCH_RUNTIME_DIR}/hf-cache}"
 # Ray's Unix-domain socket path is limited to 107 bytes. Cluster-wide TMPDIR
@@ -61,14 +64,18 @@ mkdir -p \
 
 if [[ "${AI_SEARCH_PREPARE_TRAINING_ENV:-1}" == "1" ]]; then
   AI_SEARCH_ARCH="$(uname -m)"
+  # FlashInfer does not publish this CUDA 13 JIT-cache build on the default
+  # package index. Pin the official release wheel just like vLLM and FlashAttention.
   case "${AI_SEARCH_ARCH}" in
     x86_64)
       AI_SEARCH_VLLM_WHEEL="https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl"
       AI_SEARCH_FLASH_ATTN_WHEEL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl"
+      AI_SEARCH_FLASHINFER_JIT_WHEEL="https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.13/flashinfer_jit_cache-0.6.13+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
       ;;
     aarch64)
       AI_SEARCH_VLLM_WHEEL="https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl"
       AI_SEARCH_FLASH_ATTN_WHEEL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl"
+      AI_SEARCH_FLASHINFER_JIT_WHEEL="https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.13/flashinfer_jit_cache-0.6.13+cu130-cp39-abi3-manylinux_2_28_aarch64.whl"
       ;;
     *)
       echo "AI-search training supports x86_64 and aarch64 CUDA hosts, not ${AI_SEARCH_ARCH}." >&2
@@ -92,8 +99,9 @@ if [[ "${AI_SEARCH_PREPARE_TRAINING_ENV:-1}" == "1" ]]; then
       -e "${AI_SEARCH_REPO_DIR}/3rdparty/Gym-workspace/Gym" \
       "${AI_SEARCH_VLLM_WHEEL}" \
       "${AI_SEARCH_FLASH_ATTN_WHEEL}" \
+      "${AI_SEARCH_FLASHINFER_JIT_WHEEL}" \
       "cuda-python" \
-      "flashinfer-jit-cache==0.6.13"
+      "flashinfer-python==0.6.13"
   fi
 fi
 

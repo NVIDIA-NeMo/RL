@@ -74,6 +74,7 @@ This compares CPU and GPU vector-search implementations, then measures E5
 encoding, cuVS search, document fetch, cache hits, and concurrent search
 microbatching. See the example's
 [performance report](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/nemo_gym/ai_search/PERFORMANCE.md)
-for one RTX 6000D run and its limitations, and the
+for the full-parameter B300 run, the RTX 6000D diagnostics, and their
+limitations, and the
 [README](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/nemo_gym/ai_search/README.md)
 for the data schema, reward, configuration, and extension points.

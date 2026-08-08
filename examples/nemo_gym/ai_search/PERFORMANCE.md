@@ -8,7 +8,7 @@ These measurements answer two different questions:
 
 They do **not** compare model quality with published search-agent systems.
 
-## Measurement setup
+## Vector-search and RTX diagnostic setup
 
 - Date: 2026-08-08
 - GPU: NVIDIA RTX 6000D, 85,651 MiB, driver 595.58.03
@@ -90,6 +90,57 @@ The configured 2 ms collection window hurts a lone query but helps concurrent
 rollouts. It should be reduced for latency-sensitive serving and retained or
 tuned for high-throughput training.
 
+## 7B one-step full-parameter B300 run
+
+The default Qwen2.5-7B-Instruct recipe completed one full-parameter DTensor
+GRPO step on one NVIDIA B300 SXM6 AC (275,040 MiB, driver 595.58.03). The run
+used two prompts and four trajectories per prompt. Slurm job `3543660`
+completed successfully in 13 minutes 1 second, including cold environment
+installation and process startup.
+
+| Stage | Time |
+| --- | ---: |
+| One-time NeMo RL setup | 250.11 s |
+| Initial four-question validation | 16.38 s |
+| Eight training rollouts / generation | 2.34 s |
+| Policy and reference log probabilities | 23.26 s |
+| Policy training | 14.90 s |
+| Reward calculation | 0.0035 s |
+| Post-update four-question validation | 0.88 s |
+| Local `/tmp` full checkpoint | 164.83 s |
+| Reported training-step total | 287.28 s |
+
+NeMo RL reported 17.47 end-to-end tokens/s/GPU, 2,140.33 generation
+tokens/s/GPU, 336.79 policy-training tokens/s/GPU, and 215.73 policy plus
+reference-logprob tokens/s/GPU. One-second external sampling observed a peak
+of 155,472 MiB (151.83 GiB) of GPU memory. Slurm reported a maximum resident
+host-memory footprint of 264,028,472 KiB (251.80 GiB), essentially the entire
+257,852 MiB allocation. The job completed, but a longer run should request
+substantially more host-memory headroom.
+
+The eight trajectories made nine search calls. All 17 assistant messages had
+valid tool-call and thinking format, and no search failed. Every trajectory
+received the same maximum reward of 1.4, however, so GRPO produced zero
+advantages, zero loss, and zero gradient norm. This validates every code path
+through full-parameter optimizer execution and checkpointing, but the toy step
+did not provide a useful reinforcement-learning signal.
+
+Checkpointing consumed 57.4% of the reported step; the portion of the step
+excluding checkpointing was 122.45 seconds. Keep checkpoints on local storage
+and reduce save frequency for throughput runs.
+
+The following numbers contrast the full-parameter B300 run with the RTX LoRA
+diagnostic below. They are useful for locating bottlenecks, not for claiming a
+hardware speedup, because the update and checkpoint workloads differ.
+
+| Metric | B300 full parameter | RTX 6000D LoRA |
+| --- | ---: | ---: |
+| Generation tokens/s/GPU | **2,140.33** | 1,885.67 |
+| Policy + reference logprob tokens/s/GPU | **215.73** | 156.39 |
+| Policy-training tokens/s/GPU | 336.79 | **1,966.77** |
+| End-to-end tokens/s/GPU | 17.47 | **76.44** |
+| Checkpoint time | 164.83 s | **0.31 s** |
+
 ## 7B one-step LoRA diagnostic
 
 The current Qwen2.5-7B-Instruct path was checked on the same RTX 6000D with
@@ -127,7 +178,7 @@ A full-parameter CPU-offload attempt reached policy training but was killed at
 the node's host-memory limit: total use reached 242.01 of 251.40 GiB and the
 policy worker alone used 193.58 GiB. This was not a GPU OOM. It demonstrates
 that CPU offload is not a substitute for the target B300-class GPU on this
-host. No full-parameter B300 timing was collected in this session.
+host.
 
 ## Historical 1.5B one-step GRPO run
 
