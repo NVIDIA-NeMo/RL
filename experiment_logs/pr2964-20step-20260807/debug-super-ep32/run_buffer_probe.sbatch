@@ -41,10 +41,11 @@ srun \
   '
 
 master_addr=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -1)
+probe_gpus_per_node=${PROBE_GPUS_PER_NODE:-8}
 export MASTER_ADDR=${master_addr}
 export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 export PYTHONPATH=${overlay}
-export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=${probe_gpus_per_node}
 export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-128}
 export NVLINK_DOMAIN_SIZE=8
 export USE_MNNVL=0
@@ -56,8 +57,8 @@ fi
 
 srun \
   --nodes="${SLURM_NNODES}" \
-  --ntasks-per-node=8 \
-  --gpus-per-node=8 \
+  --ntasks-per-node="${probe_gpus_per_node}" \
+  --gpus-per-node="${probe_gpus_per_node}" \
   --kill-on-bad-exit=1 \
   --container-image="${container}" \
   --container-mounts=/lustre:/lustre \
