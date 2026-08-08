@@ -10,6 +10,12 @@ policy:
     moe_token_dispatcher_type: flex
     moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   generation:
     vllm_cfg:
       tensor_parallel_size: 8
