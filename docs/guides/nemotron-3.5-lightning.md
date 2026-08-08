@@ -1,47 +1,69 @@
 # Nemotron 3.5 Lightning
 
-This guide explains how to post-train Nemotron 3.5 Lightning with NeMo RL on
-**GB200 NVL72** (ARM64 / aarch64) hardware.
+This guide explains how to reproduce the Nemotron 3.5 Lightning RLVR recipe
+with NeMo RL on **GB200 NVL72** (ARM64 / aarch64) hardware.
 
 ## Overview
 
-The reference recipe trains
-[`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
-with asynchronous GRPO and NeMo Gym rewards. Policy generation and training
-run on separate node pools. GenRM and NL2Bash are deployed as external vLLM
-pools in the same Slurm heterogeneous allocation, while the content-safety
-judge runs in the Gym pool.
+The recipe post-trains Nemotron 3.5 Lightning with asynchronous Group Relative
+Policy Optimization (GRPO) and rewards from NeMo Gym. Training and policy
+generation use separate node pools. The GenRM and general-purpose NL2Bash judge
+run as external vLLM pools in the same Slurm heterogeneous allocation, while
+the smaller content-safety judge runs in the Gym pool.
 
-The recipe and shared launcher are under
+The recipe files are under
 `examples/nemo_gym/nemotron-3.5-lightning/`:
 
-- `rlvr.yaml` contains the training, generation, and Gym configuration.
-- `lightning35_launch.sh` handles Slurm submission, code snapshots, mounts,
-  persistent caches, and deployment-specific overrides.
+- `rlvr.yaml` contains the training, generation, reward, and Gym configuration.
+- `lightning35_launch.sh` handles Slurm submission, code snapshots, persistent
+  caches, container mounts, and run-specific paths.
 
-### Reference topology
+The reference run uses the following training configuration:
 
-| Training | Policy generation | Gym safety judge | External GenRM | External NL2Bash | Total |
-|---:|---:|---:|---:|---:|---:|
-| 32 nodes | 32 nodes | 2 nodes | 16 nodes | 4 nodes | 86 nodes |
+| Setting | Value |
+|---|---:|
+| Maximum sequence length | 73,728 tokens |
+| Prompts per step | 512 |
+| Generations per prompt | 16 |
+| Global batch size | 8,192 |
+| Training parallelism | TP=4, CP=4, EP=16, PP=1 |
+| Policy-generation parallelism | TP=4, PP=1 |
+| Training precision | BF16 |
 
-The launcher reserves the 20 external-service nodes outside the NeMo RL Ray
-cluster. It starts eight independent TP=8, DP=1 GenRM servers on 16 nodes and
-four independent TP=4, DP=1 NL2Bash servers on four nodes. Each service pool
-has a lightweight load balancer. Training starts only after every backend and
-both load balancers are healthy. The two Gym nodes host a TP=4, DP=2 safety
-judge.
+### Topology
 
-The reference topology assumes four GPUs per node. Override node counts,
-`GPUS_PER_NODE`, or segment sizes only after confirming that the model
-parallelism still fits and every allocated GPU is used.
+The recipe uses four GPUs per GB200 node:
+
+| Component | Deployment | Nodes | GPUs |
+|---|---|---:|---:|
+| Training | Megatron TP=4, CP=4, EP=16 | 32 | 128 |
+| Policy generation | NeMo RL vLLM TP=4 | 32 | 128 |
+| Safety judge | Gym vLLM TP=4, DP=2 | 2 | 8 |
+| GenRM | 8 independent TP=8 vLLM servers | 16 | 64 |
+| NL2Bash judge | 4 independent TP=4 vLLM servers | 4 | 16 |
+| **Total** |  | **86** | **344** |
+
+## Prepare the code
+
+Clone NeMo RL and its submodules on a filesystem visible to every allocated
+node:
+
+```bash
+git clone --recursive https://github.com/NVIDIA-NeMo/RL.git
+cd RL
+```
+
+The launcher mounts the current NeMo RL source, Lightning recipe directory,
+and Gym checkout into the training container. With `USE_SNAPSHOT=1` (the
+default), it first snapshots tracked source files so the submitted job uses a
+stable copy.
 
 ## Container
 
 Nemotron 3.5 Lightning uses vLLM and requires an **aarch64 (arm64)** image for
-GB200 NVL72 nodes. Prebake the Gym virtual environments used by `rlvr.yaml` to
-avoid building them on every training launch. From the root of the NeMo RL
-repository, build and push the image:
+GB200 NVL72 nodes. Prebake the NeMo Gym virtual environments used by the recipe
+to avoid building them every time a training job starts. From the root of the
+NeMo RL repository, build and push the image:
 
 ```bash
 docker buildx build \
@@ -62,7 +84,7 @@ docker buildx build \
 Build arguments:
 
 - `NEMO_GYM_PREFETCH_CONFIGS` builds the Gym virtual environments referenced
-  by the RLVR config into the image.
+  by `rlvr.yaml` into the image.
 - `SKIP_SGLANG_BUILD=1` skips SGLang because this recipe uses vLLM.
 - `SKIP_TRTLLM_BUILD=1` skips TensorRT-LLM because this recipe does not use it.
 - `MAX_JOBS` controls parallel build jobs; tune it for the build machine.
@@ -78,85 +100,64 @@ enroot import -o nemo-rl-lightning35.sqsh \
 ```
 
 Pass the resulting `.sqsh` path as `CONTAINER`. A registry image URI can be
-used instead on clusters that do not require a local squashfs image.
+used instead on clusters that do not require a local squashfs image. The same
+image is used for training, policy generation, and the external judge pools by
+default.
 
 ## Download and prepare the data
 
-Download the
-[`nvidia/Nemotron-RL-Lightning-Training-Blend`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend)
-dataset and restore its source-backed placeholders. This follows the same
-general workflow as the
-[Nemotron 3 Nano data preparation](nemotron-3-nano.md#download-and-prepare-the-data):
+The RLVR blend is published as
+[`nvidia/Nemotron-RL-Lightning-Training-Blend`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend).
+It contains `rlvr.jsonl` and `fill_placeholders.py`. Math rows originating from
+`BytedTsinghua-SIA/DAPO-Math-17k` and `Skywork/Skywork-OR1-RL-Data` are
+represented by placeholders; the bundled script restores them from the
+original datasets on Hugging Face. This is the same general preparation flow
+used by the [Nemotron 3 Nano recipe](nemotron-3-nano.md#download-and-prepare-the-data).
 
 ```bash
+export DATA_DIR=/path/to/lightning/data
+
+# Download rlvr.jsonl and fill_placeholders.py.
 uvx --from huggingface-hub hf download \
   nvidia/Nemotron-RL-Lightning-Training-Blend \
   --repo-type dataset \
-  --local-dir data
+  --local-dir lightning-blend
 
-chmod +x data/fill_placeholders.py
-./data/fill_placeholders.py --input-dir data --output-dir data/restored
+# Restore the source-backed placeholders into $DATA_DIR/rlvr.jsonl.
+chmod +x lightning-blend/fill_placeholders.py
+./lightning-blend/fill_placeholders.py \
+  --input-dir lightning-blend \
+  --output-dir "$DATA_DIR"
 ```
 
-The resulting `data/restored/rlvr.jsonl` is already in the format expected by
-`NemoGymDataset`. The released blend has one training split, and validation is
-disabled in the reference recipe, so pass this file as both `TRAIN_PATH` and
-`VAL_PATH`:
+The resulting `$DATA_DIR/rlvr.jsonl` is already in the format expected by
+`NemoGymDataset`. The released recipe does not run periodic, start, or end
+validation, but the launcher still requires both paths. To reproduce the
+reference run, pass the restored blend as both:
 
 ```bash
-TRAIN_PATH=$PWD/data/restored/rlvr.jsonl
-VAL_PATH=$PWD/data/restored/rlvr.jsonl
+TRAIN_PATH=$DATA_DIR/rlvr.jsonl
+VAL_PATH=$DATA_DIR/rlvr.jsonl
 ```
 
-Dataset rows select their Gym agent through `agent_ref`; therefore, the agents
-named by the data must be included in `env.nemo_gym.config_paths` in
-`rlvr.yaml`.
+Rows select their Gym agent through `agent_ref`. The corresponding agent and
+resource-server configs are already listed under `env.nemo_gym.config_paths`
+in `rlvr.yaml`.
 
-## Prepare the models
-
-Set `MODEL_PATH` to a Transformers-compatible Nemotron 3.5 Lightning
-checkpoint. To start from the released checkpoint, use:
-
-```bash
-MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
-```
-
-The reward stack also requires:
-
-- `GENRM_MODEL`: GenRM checkpoint or Hugging Face model ID.
-- `GENRM_REASONING_PARSER`: shared path to the vLLM reasoning-parser plugin
-  used by the GenRM checkpoint.
-- `NL2BASH_JUDGE_MODEL`: general-purpose judge checkpoint or model ID.
-- `SAFETY_JUDGE_MODEL`: content-safety judge checkpoint or model ID.
-
-The external services expose the OpenAI-compatible model name `model`. The
-launcher injects the load-balancer URLs and served model names into the Gym
-configuration after both pools are healthy. Model-specific vLLM arguments
-remain in `lightning35_launch.sh`; the helpers under
-`tools/external_gym_vllm/` implement the generic external-pool lifecycle.
-
-Absolute service model, parser, tool, state, and log paths must be visible in
-the external-service containers. Add their shared filesystem to
-`EXTRA_MOUNTS`. Hugging Face model IDs do not require a filesystem mount.
-
-## Prepare the code
-
-Clone NeMo RL and its submodules:
-
-```bash
-git clone --recursive -b main https://github.com/NVIDIA-NeMo/RL.git
-cd RL
-```
+For each external dataset you elect to use, you are responsible for confirming
+that its license is appropriate for your intended use.
 
 ## Build the sandbox container
 
-Some Gym environments execute code or verification tools in a sandbox. Build
-the sandbox image from the
+Several Gym environments used by the Lightning blend, including `ns_tools`
+and `math_formal_lean`, execute verification tools in a sandbox container.
+Build it from the
 [NeMo Skills Dockerfile](https://github.com/NVIDIA-NeMo/Skills/blob/main/dockerfiles/Dockerfile.sandbox):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Skills.git
 cd Skills
+git checkout b620e79
 docker build -t nemo-skills-sandbox:latest -f dockerfiles/Dockerfile.sandbox .
 ```
 
@@ -169,72 +170,55 @@ enroot import -o nemo-skills-sandbox.sqsh \
 
 Pass this image as `SANDBOX_CONTAINER` when launching training.
 
+## Prepare the policy and judge models
+
+Set `MODEL_PATH` to the Transformers-compatible Nemotron 3.5 Lightning SFT
+checkpoint from which RLVR should start.
+
+```bash
+MODEL_PATH=/path/to/nemotron-3.5-lightning-sft-checkpoint
+```
+
+The recipe uses three judge roles:
+
+| Variable | Reference model | Deployment |
+|---|---|---|
+| `GENRM_MODEL` | [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM) | 8 external TP=8 servers |
+| `NL2BASH_JUDGE_MODEL` | [`Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8) | 4 external TP=4 servers |
+| `SAFETY_JUDGE_MODEL` | [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B) | Gym TP=4, DP=2 |
+
 ## Launch script
 
 Run `examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh` from the
 repository root. The launcher handles Slurm submission, source snapshots,
-persistent caches, container mounts, external vLLM services, and
-deployment-specific Hydra overrides. Training hyperparameters remain in
-`rlvr.yaml`.
+persistent compile caches, container mounts, external vLLM services, and
+run-specific paths. Training hyperparameters and parallelism remain in
+`rlvr.yaml` and the launcher defaults.
 
-Required variables:
+## Launch RLVR
 
-| Variable | Purpose |
-|---|---|
-| `EXP_NAME` | Slurm job name, W&B run name, and output-directory suffix. Reuse it with the same `RESULTS_DIR` to resume. |
-| `MODEL_PATH` | Initial Nemotron 3.5 Lightning policy checkpoint. |
-| `TRAIN_PATH`, `VAL_PATH` | Restored `rlvr.jsonl` from the Lightning training blend. |
-| `GENRM_MODEL` | GenRM checkpoint or Hugging Face model ID. |
-| `GENRM_REASONING_PARSER` | Shared path to the GenRM vLLM parser plugin. |
-| `NL2BASH_JUDGE_MODEL` | General-purpose judge checkpoint or model ID. |
-| `SAFETY_JUDGE_MODEL` | Content-safety judge checkpoint or model ID. |
-| `CONTAINER` | NeMo RL image (`.sqsh` path or registry image URI). |
-| `SANDBOX_CONTAINER` | Sandbox image from [Build the sandbox container](#build-the-sandbox-container). |
-| `PERSISTENT_CACHE` | Shared vLLM, Triton, Inductor, and model cache directory. |
-| `SLURM_PARTITION`, `SLURM_ACCOUNT` | Slurm allocation settings. |
-
-Useful optional variables:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `RESULTS_DIR` | `results/$EXP_NAME` | Stable checkpoint root and per-submission logs. |
-| `BASE_LOG_DIR` | `$RESULTS_DIR/ray_logs` | Ray and external-service logs. |
-| `EXTRA_MOUNTS` | empty | Comma-separated `host:container` mount pairs. |
-| `WALLTIME` | `4:00:00` | Slurm time limit. |
-| `SLURM_QOS`, `SLURM_RESERVATION`, `EXCLUDE_NODES` | empty | Optional Slurm controls. |
-| `NUM_TRAIN_NODES`, `NUM_GEN_NODES`, `NUM_GYM_NODES` | `32`, `32`, `2` | Nodes in the NeMo RL allocation component. |
-| `GENRM_REPLICAS`, `NUM_GENRM_NODES` | `8`, `16` | External GenRM pool size. |
-| `NL2BASH_REPLICAS`, `NUM_NL2BASH_NODES` | `4`, `4` | External general-judge pool size. |
-| `WANDB_API_KEY` | unset | Enables W&B when set. |
-| `WANDB_PROJ` | `nemotron-3.5-lightning` | W&B project. |
-| `HF_HOME`, `HF_TOKEN` | unset | Hugging Face cache and gated-model token. |
-| `USE_SNAPSHOT` | `1` | Snapshot tracked source before submission. |
-| `USE_CUSTOM_VLLM` | `0` | Source the repository custom vLLM environment when set to `1`. |
-| `DRY_RUN` | `0` | Print the resolved command without submitting. |
-
-Additional positional arguments after `rlvr` are forwarded as Hydra
-overrides.
-
-## RLVR
-
-The reference configuration uses TP=4, CP=4, EP=16, PP=1, a global batch size
-of 8192, 512 prompts per step, and 16 generations per prompt.
+The following command launches the complete 86-node reference topology. Run it
+from a NeMo RL checkout located under the shared filesystem root:
 
 ```bash
+export SHARED_ROOT=/shared
+export DATA_DIR=$SHARED_ROOT/data/lightning
+
 EXP_NAME=lightning35-rlvr \
-MODEL_PATH=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
-TRAIN_PATH=$PWD/data/restored/rlvr.jsonl \
-VAL_PATH=$PWD/data/restored/rlvr.jsonl \
-GENRM_MODEL=/path/to/genrm-checkpoint \
-GENRM_REASONING_PARSER=/path/to/ultra_v3_reasoning_parser.py \
-NL2BASH_JUDGE_MODEL=/path/to/general-judge-checkpoint \
-SAFETY_JUDGE_MODEL=/path/to/safety-judge-checkpoint \
-CONTAINER=/path/to/nemo-rl-lightning35.sqsh \
-SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
-PERSISTENT_CACHE=/path/to/shared/cache \
-RESULTS_DIR=/path/to/results/lightning35-rlvr \
-BASE_LOG_DIR=/path/to/results/lightning35-rlvr/ray_logs \
-EXTRA_MOUNTS=/shared:/shared \
+MODEL_PATH=$SHARED_ROOT/models/nemotron-3.5-lightning-sft-checkpoint \
+TRAIN_PATH=$DATA_DIR/rlvr.jsonl \
+VAL_PATH=$DATA_DIR/rlvr.jsonl \
+GENRM_MODEL=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM \
+GENRM_REASONING_PARSER=$SHARED_ROOT/models/parsers/ultra_v3_reasoning_parser.py \
+NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
+SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
+CONTAINER=$SHARED_ROOT/containers/nemo-rl-lightning35.sqsh \
+SANDBOX_CONTAINER=$SHARED_ROOT/containers/nemo-skills-sandbox.sqsh \
+PERSISTENT_CACHE=$SHARED_ROOT/cache/lightning35-rlvr \
+HF_HOME=$SHARED_ROOT/cache/huggingface \
+RESULTS_DIR=$SHARED_ROOT/results/lightning35-rlvr \
+EXTERNAL_VLLM_SHARED_ROOT=$SHARED_ROOT \
+EXTRA_MOUNTS=$SHARED_ROOT:$SHARED_ROOT \
 SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
 bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh rlvr
