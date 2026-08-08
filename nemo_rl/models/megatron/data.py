@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator, Optional, Tuple
 
 import torch
@@ -24,6 +24,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_expert_tensor_and_model_parallel_group,
 )
 from megatron.core.utils import StragglerDetector
 
@@ -101,6 +102,7 @@ def make_processed_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     create_packed_seq_padding_mask: bool = False,
+    prepad_packed_seq_for_hybridep: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -116,6 +118,8 @@ def make_processed_microbatch_iterator(
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
         create_packed_seq_padding_mask: Whether to mask packed padding from MoE routing
+        prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
+            HybridEP group before model forward
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -139,6 +143,7 @@ def make_processed_microbatch_iterator(
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+            prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         )
 
         yield ProcessedMicrobatch(
@@ -191,6 +196,7 @@ def get_microbatch_iterator(
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
     create_packed_seq_padding_mask = False
+    prepad_packed_seq_for_hybridep = False
 
     _, seq_dim_size = get_and_validate_seqlen(data)
 
@@ -205,6 +211,9 @@ def get_microbatch_iterator(
         create_packed_seq_padding_mask = _uses_hybridep_flex_dispatcher(
             cfg["megatron_cfg"]
         )
+        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
+            "megatron_cfg"
+        ].get("moe_hybridep_prepad_packed_inputs")
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -233,6 +242,7 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
         create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+        prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
@@ -269,6 +279,134 @@ def _uses_hybridep_flex_dispatcher(megatron_cfg: dict[str, Any]) -> bool:
     )
 
 
+def _get_hybridep_aligned_seq_len(
+    local_seq_len: int,
+    multiple: int,
+    device: torch.device,
+) -> int:
+    target = torch.tensor([local_seq_len], dtype=torch.int64, device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_expert_tensor_and_model_parallel_group(check_initialized=False)
+        torch.distributed.all_reduce(
+            target,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+        )
+
+    target_seq_len = int(target.item())
+    if multiple > 1:
+        target_seq_len = _round_up_to_multiple(target_seq_len, multiple)
+    return target_seq_len
+
+
+def _get_hybridep_local_pad_multiple(
+    pad_packed_seq_to_multiple_of: int,
+    cp_size: int,
+) -> int:
+    if cp_size == 1:
+        return pad_packed_seq_to_multiple_of
+    if pad_packed_seq_to_multiple_of <= 1:
+        return 1
+    assert pad_packed_seq_to_multiple_of % cp_size == 0, (
+        "HybridEP packed sequence multiple must be divisible by context "
+        f"parallel size; got multiple={pad_packed_seq_to_multiple_of}, "
+        f"cp_size={cp_size}."
+    )
+    return max(1, pad_packed_seq_to_multiple_of // cp_size)
+
+
+def _get_packed_seq_boundaries(
+    cu_seqlens_padded: torch.Tensor,
+) -> list[tuple[int, int]]:
+    boundaries = cu_seqlens_padded.detach().cpu().tolist()
+    return [
+        (int(boundaries[index]), int(boundaries[index + 1]))
+        for index in range(len(boundaries) - 1)
+    ]
+
+
+def _shard_packed_seq_on_this_cp_rank(
+    packed_tensor: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    if cp_size == 1:
+        return packed_tensor
+
+    cp_chunks = []
+    for start, end in _get_packed_seq_boundaries(cu_seqlens_padded):
+        slices = [slice(None)] * packed_tensor.dim()
+        slices[seq_dim] = slice(start, end)
+        cp_chunks.append(
+            _get_tokens_on_this_cp_rank(
+                packed_tensor[tuple(slices)],
+                cp_rank,
+                cp_size,
+                seq_dim=seq_dim,
+            )
+        )
+    return torch.cat(cp_chunks, dim=seq_dim).contiguous()
+
+
+def _pad_packed_seq_for_hybridep(
+    input_ids: torch.Tensor,
+    input_ids_cp_sharded: torch.Tensor,
+    packed_seq_params: PackedSeqParams,
+    cu_seqlens_padded: torch.Tensor,
+    pad_packed_seq_to_multiple_of: int,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
+    """Align packed inputs once, before model collectives can overlap."""
+    local_seq_len = input_ids_cp_sharded.shape[1]
+    local_pad_multiple = _get_hybridep_local_pad_multiple(
+        pad_packed_seq_to_multiple_of,
+        cp_size,
+    )
+    target_seq_len = _get_hybridep_aligned_seq_len(
+        local_seq_len,
+        local_pad_multiple,
+        input_ids_cp_sharded.device,
+    )
+
+    if target_seq_len == local_seq_len:
+        return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
+
+    local_pad_len = target_seq_len - local_seq_len
+    full_pad_len = local_pad_len * cp_size
+    input_ids = torch.nn.functional.pad(input_ids, (0, full_pad_len), value=0)
+
+    cu_seqlens_padded = cu_seqlens_padded.clone()
+    cu_seqlens_padded[-1] += full_pad_len
+    input_ids_cp_sharded = _shard_packed_seq_on_this_cp_rank(
+        input_ids,
+        cu_seqlens_padded,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+    )
+    assert input_ids_cp_sharded.shape[1] == target_seq_len, (
+        "HybridEP CP-local input length must match the aligned target length; "
+        f"got {input_ids_cp_sharded.shape[1]} vs {target_seq_len}."
+    )
+
+    max_last_sequence_len = int(cu_seqlens_padded[-1] - cu_seqlens_padded[-2])
+    max_seqlen = max(int(packed_seq_params.max_seqlen_q), max_last_sequence_len)
+    packed_seq_params = replace(
+        packed_seq_params,
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        total_tokens=target_seq_len,
+    )
+    return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
+
+
 def _get_packed_seq_padding_mask(
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
@@ -300,12 +438,17 @@ def process_microbatch(
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
     create_packed_seq_padding_mask: bool = False,
+    prepad_packed_seq_for_hybridep: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
         raise NotImplementedError(
             "HybridEP padding masks are not supported for models that perform "
             "context-parallel input slicing internally."
+        )
+    if prepad_packed_seq_for_hybridep and delegate_pack_to_model:
+        raise NotImplementedError(
+            "HybridEP input prepadding requires NeMo-owned sequence packing."
         )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
@@ -459,6 +602,21 @@ def process_microbatch(
                 else:
                     input_ids_cp_sharded = local_input_ids
                 if create_packed_seq_padding_mask:
+                    if prepad_packed_seq_for_hybridep:
+                        (
+                            input_ids,
+                            input_ids_cp_sharded,
+                            packed_seq_params,
+                            cu_seqlens_padded,
+                        ) = _pad_packed_seq_for_hybridep(
+                            input_ids=input_ids,
+                            input_ids_cp_sharded=input_ids_cp_sharded,
+                            packed_seq_params=packed_seq_params,
+                            cu_seqlens_padded=cu_seqlens_padded,
+                            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                            cp_rank=get_context_parallel_rank(),
+                            cp_size=get_context_parallel_world_size(),
+                        )
                     full_padding_mask = _get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_padded=cu_seqlens_padded,
