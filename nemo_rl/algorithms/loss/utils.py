@@ -98,7 +98,16 @@ def prepare_loss_input(
             # mask out negative infinity logprobs
             # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            logprobs, keep = mask_out_neg_inf_logprobs(
+                logprobs, mask[:, 1:], "curr_logprobs"
+            )
+            # Fold the -inf positions into ``token_mask`` so the loss excludes
+            # them. The loss re-derives its reduction mask from ``data``
+            # (loss_functions.py, ``mask = token_mask * sample_mask``), so
+            # narrowing the local ``mask`` above would have no effect.
+            token_mask = data["token_mask"].clone()
+            token_mask[:, 1:] = token_mask[:, 1:] * keep
+            data["token_mask"] = token_mask
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -359,7 +368,14 @@ def prepare_packed_loss_input(
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
     if need_top_k_or_top_p_filtering(sampling_params):
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+        logprobs, keep = mask_out_neg_inf_logprobs(
+            logprobs, mask[:, 1:], "curr_logprobs"
+        )
+        # See the note in ``prepare_loss_input``: the loss re-derives its
+        # reduction mask from ``data``, so the narrowing has to land there.
+        token_mask = data["token_mask"].clone()
+        token_mask[:, 1:] = token_mask[:, 1:] * keep
+        data["token_mask"] = token_mask
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")
