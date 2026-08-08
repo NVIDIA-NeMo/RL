@@ -36,11 +36,13 @@ def main() -> None:
             flush=True,
         )
 
+    hidden_dim = 1024 if probe_mode == "dispatch" else 4096
+    num_local_experts = 1 if probe_mode == "dispatch" else 16
     buffer = HybridEPBuffer(
         group=dist.group.WORLD,
-        hidden_dim=4096,
+        hidden_dim=hidden_dim,
         max_num_of_tokens_per_rank=max_tokens,
-        num_local_experts=16,
+        num_local_experts=num_local_experts,
         use_fp8=False,
         num_sms_dispatch_api=32,
         num_sms_combine_api=32,
@@ -50,7 +52,6 @@ def main() -> None:
         print("probe-buffer-created", flush=True)
 
     if probe_mode == "dispatch":
-        hidden_dim = 1024
         num_tokens = min(max_tokens, 128)
         num_experts = world_size
         hidden = torch.full(
