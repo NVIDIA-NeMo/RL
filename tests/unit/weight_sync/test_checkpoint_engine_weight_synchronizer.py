@@ -403,3 +403,16 @@ class TestCheckpointEngineFactory:
                 generation_backend=SGLANG_BACKEND,
                 colocated=False,
             )
+
+    def test_checkpoint_engine_rejects_sglang_data_parallelism(self):
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
+        gen.cfg["backend"] = SGLANG_BACKEND
+        gen.cfg["sglang_cfg"] = {"dp_size": 2}
+
+        with pytest.raises(NotImplementedError, match="dp_size=1"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )

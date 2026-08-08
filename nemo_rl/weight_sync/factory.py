@@ -99,13 +99,18 @@ def create_weight_synchronizer(
         engine_kwargs = checkpoint_engine_config["engine_kwargs"][
             checkpoint_engine_config["backend"]
         ]
-        if generation_backend == SGLANG_BACKEND and engine_kwargs.get(
-            "shard_expert_weights", False
-        ):
-            raise NotImplementedError(
-                "SGLang checkpoint-engine refit does not support "
-                "shard_expert_weights=true; use full-weight MoE refit instead."
-            )
+        if generation_backend == SGLANG_BACKEND:
+            sglang_cfg = generation.cfg.get("sglang_cfg", {})
+            if sglang_cfg.get("dp_size", 1) != 1:
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit currently requires "
+                    "sglang_cfg.dp_size=1."
+                )
+            if engine_kwargs.get("shard_expert_weights", False):
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit does not support "
+                    "shard_expert_weights=true; use full-weight MoE refit instead."
+                )
 
         from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
             CheckpointEngineWeightSynchronizer,
