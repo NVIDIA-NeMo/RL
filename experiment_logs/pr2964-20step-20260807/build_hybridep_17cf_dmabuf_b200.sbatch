@@ -10,7 +10,7 @@
 set -euo pipefail
 
 container=/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh
-source_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source_root=${HYBRID_EP_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 experiment_root=${HYBRID_EP_EXPERIMENT_ROOT:-/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/experiments/pr2964-20step-20260807}
 script_path=${source_root}/build_hybridep_17cf_dmabuf_b200.sbatch
 patch_path=${source_root}/patches/deepep_17cf_dmabuf_fallback.patch
