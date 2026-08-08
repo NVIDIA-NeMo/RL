@@ -295,9 +295,12 @@ export RESULTS_DIR="${RESULTS_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_sw_post}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 export WALLTIME="${WALLTIME:-4:00:00}"
-# Async rollout collection can leave the training GPUs idle while judges work.
-# Match the launcher's 60-minute idle-GPU reaper exemption.
-export JOB_REAPER_EXEMPT_IDLE_MINS="${JOB_REAPER_EXEMPT_IDLE_MINS:-60}"
+# Async rollout collection can leave the training GPUs idle while judges work,
+# and startup is idle end to end: job 5965796 needed 56 minutes to reach its
+# first optimizer step and the reaper took it at 60. This is the name
+# ultra_launch.sh actually reads -- JOB_REAPER_EXEMPT_IDLE_MINS was never
+# consumed by anything, so the banner reported a number with no effect.
+export JOB_REAPER_EXEMPT_MINS="${JOB_REAPER_EXEMPT_MINS:-120}"
 export CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-00:03:35:00}"
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-8}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-40}"
@@ -336,7 +339,7 @@ echo "  GenRM      : ${GENRM_BASE_URL} (external pool; served model name: model)
 echo "  NL2Bash    : served in the Gym pool"
 fi
 echo "  SLURM      : ${SLURM_ACCOUNT} / ${SLURM_PARTITION} / ${WALLTIME}"
-echo "  Reaper     : ${JOB_REAPER_EXEMPT_IDLE_MINS} min idle exemption"
+echo "  Reaper     : ${JOB_REAPER_EXEMPT_MINS} min idle exemption"
 echo "  Nodes      : ${NUM_TRAIN_NODES} train + ${NUM_GEN_NODES} gen + ${NUM_GYM_NODES} gym"
 echo "  W&B        : ${WANDB_ENTITY}/${WANDB_PROJ}"
 echo "================================================================"
