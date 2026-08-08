@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PR #2964 HybridEP 20-step validation</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #64707d;
+      --line: #dce2e8;
+      --panel: #ffffff;
+      --canvas: #f3f6f8;
+      --navy: #17324d;
+      --blue: #2563a6;
+      --blue-soft: #eaf2fb;
+      --amber: #8a5600;
+      --amber-soft: #fff4d6;
+      --green: #17643a;
+      --green-soft: #e7f6ed;
+      --red: #9f2f2f;
+      --red-soft: #fcebec;
+      --shadow: 0 10px 26px rgb(23 50 77 / 8%);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 64px;
+    }
+
+    header {
+      padding: 28px;
+      color: white;
+      background: linear-gradient(135deg, #112a42, #214f77);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 8px; font-size: clamp(1.7rem, 4vw, 2.55rem); line-height: 1.15; }
+    h2 { margin-bottom: 18px; font-size: 1.25rem; color: var(--navy); }
+    h3 { margin-bottom: 8px; font-size: 0.95rem; }
+
+    .eyebrow {
+      margin-bottom: 10px;
+      color: #b9d9f4;
+      font-size: 0.78rem;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .lede { max-width: 780px; margin-bottom: 18px; color: #e4edf5; }
+
+    .header-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.82rem;
+    }
+
+    .header-meta span {
+      padding: 5px 9px;
+      background: rgb(255 255 255 / 10%);
+      border: 1px solid rgb(255 255 255 / 18%);
+      border-radius: 999px;
+    }
+
+    section {
+      margin-top: 26px;
+      padding: 24px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 22px;
+    }
+
+    .card {
+      min-height: 138px;
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+    }
+
+    .card .label {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 750;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .card .value { margin: 9px 0 5px; font-size: 1.2rem; font-weight: 760; color: var(--navy); }
+    .card p { margin: 0; color: var(--muted); font-size: 0.86rem; }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 720;
+      white-space: nowrap;
+    }
+
+    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .pill.gated { color: var(--amber); background: var(--amber-soft); }
+    .pill.ready { color: var(--green); background: var(--green-soft); }
+    .pill.pending { color: var(--blue); background: var(--blue-soft); }
+    .pill.failed { color: var(--red); background: var(--red-soft); }
+
+    .section-note { margin: -8px 0 18px; color: var(--muted); font-size: 0.88rem; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; min-width: 920px; font-size: 0.86rem; }
+    th, td { padding: 12px 13px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: var(--navy); background: #f6f8fa; font-size: 0.72rem; letter-spacing: 0.045em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td.metric { color: var(--muted); font-style: italic; }
+
+    code {
+      padding: 0.12rem 0.32rem;
+      color: #193550;
+      background: #edf2f6;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82em;
+      overflow-wrap: anywhere;
+    }
+
+    .job-grid, .chart-grid, .provenance-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .job, .provenance-item {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcfd;
+    }
+
+    .job-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .job p, .provenance-item p { margin-bottom: 0; color: var(--muted); font-size: 0.84rem; }
+
+    .timeline { margin: 0; padding: 0; list-style: none; counter-reset: phase; }
+    .timeline li {
+      position: relative;
+      margin-left: 15px;
+      padding: 0 0 22px 28px;
+      border-left: 2px solid var(--line);
+    }
+    .timeline li:last-child { padding-bottom: 0; border-left-color: transparent; }
+    .timeline li::before {
+      counter-increment: phase;
+      content: counter(phase);
+      position: absolute;
+      left: -14px;
+      top: -2px;
+      display: grid;
+      width: 26px;
+      height: 26px;
+      place-items: center;
+      color: white;
+      background: var(--blue);
+      border-radius: 50%;
+      font-size: 0.72rem;
+      font-weight: 760;
+    }
+    .timeline p { margin: 3px 0 0; color: var(--muted); font-size: 0.87rem; }
+
+    .chart-card { padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
+    .chart-card h3 { margin-bottom: 12px; }
+    .chart-slot {
+      position: relative;
+      min-height: 220px;
+      overflow: hidden;
+      border: 1px dashed #b9c4ce;
+      border-radius: 9px;
+      background-image:
+        linear-gradient(to right, rgb(23 50 77 / 6%) 1px, transparent 1px),
+        linear-gradient(to bottom, rgb(23 50 77 / 6%) 1px, transparent 1px);
+      background-size: 44px 44px;
+    }
+    .chart-slot[data-empty-label]::after {
+      content: attr(data-empty-label);
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      background: rgb(255 255 255 / 72%);
+      font-size: 0.85rem;
+    }
+    .metric-svg { display: block; width: 100%; min-width: 420px; height: 240px; background: rgb(255 255 255 / 88%); }
+    .metric-svg .axis { stroke: #8a9bab; stroke-width: 1; }
+    .metric-svg .grid { stroke: #dce3e8; stroke-width: 1; }
+    .metric-svg .tick, .metric-svg .legend { fill: #53677a; font: 11px ui-sans-serif, system-ui, sans-serif; }
+    .metric-svg .legend { font-weight: 650; }
+
+    .callout {
+      margin-top: 16px;
+      padding: 14px 16px;
+      color: #654400;
+      background: var(--amber-soft);
+      border-left: 4px solid #d48a00;
+      border-radius: 8px;
+      font-size: 0.87rem;
+    }
+
+    footer { padding: 24px 2px 0; color: var(--muted); font-size: 0.78rem; }
+
+    @media (max-width: 900px) {
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .job-grid, .chart-grid, .provenance-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 560px) {
+      main { width: min(100% - 20px, 1180px); padding-top: 10px; }
+      header, section { padding: 18px; border-radius: 12px; }
+      .cards { grid-template-columns: 1fr; }
+      .job-head { display: block; }
+      .job-head .pill { margin-top: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">NeMo RL · GCP-NRT B200</div>
+      <h1>PR #2964 HybridEP 20-step validation</h1>
+      <p class="lede">
+        Synchronous GRPO validation for Qwen3-30B-A3B and NVIDIA Nemotron 3 Super,
+        using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
+      </p>
+      <div class="header-meta">
+        <span>Updated 2026-08-08 06:40 PDT</span>
+        <span>Validation source a028b33b</span>
+        <span>DeepEP 17cfb817 + f725d296 diagnostics</span>
+        <span>20 steps per workload</span>
+      </div>
+    </header>
+
+    <div class="cards" aria-label="Validation status summary">
+      <article class="card">
+        <div class="label">Overall status</div>
+        <div class="value"><span class="pill gated">Root cause confirmed</span></div>
+        <p>Qwen completed 20/20 with exit 0. Super is blocked by legacy GPU-memory MR registration on GCP B200; CUDA DMA-BUF registration is verified as the software fallback.</p>
+      </article>
+      <article class="card">
+        <div class="label">Validation matrix</div>
+        <div class="value">2 workloads</div>
+        <p>Qwen: 4 nodes / 32 GPUs. Nemotron Super: 32 nodes / 256 GPUs.</p>
+      </article>
+      <article class="card">
+        <div class="label">Runtime artifact</div>
+        <div class="value"><span class="pill ready">A/B reproduced</span></div>
+        <p>Both <code>17cfb817</code> and newer <code>f725d296</code> SM100 wheels fail in the same inter-node constructor; this is not a single-commit regression.</p>
+      </article>
+      <article class="card">
+        <div class="label">Measurements</div>
+        <div class="value"><span class="pill ready">Qwen measured</span></div>
+        <p>Qwen steady-state values use all 19 samples from Steps 2–20. Super completed no training step, so no performance number is reported.</p>
+      </article>
+    </div>
+
+    <section aria-labelledby="jobs-title">
+      <h2 id="jobs-title">Execution chain</h2>
+      <p class="section-note">Final snapshot at 2026-08-08 06:40 PDT. Qwen metrics are final; Super root-cause diagnostics are final, while the software fallback still requires implementation validation.</p>
+      <div class="job-grid">
+        <article class="job">
+          <div class="job-head">
+            <h3>505067 → 505085 · Transfer and SHA</h3>
+            <span class="pill ready">Completed</span>
+          </div>
+          <p>Downloads the proven CW x86 nightly and verifies its full 74 GB SHA256 before any GPU allocation.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505087 · Transferred-image smoke</h3>
+            <span class="pill ready">Completed</span>
+          </div>
+          <p>Checks GPU/Python, vLLM 0.25.1, and DeepEP imports in both frozen actor environments.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505121 · Qwen3-30B-A3B retry</h3>
+            <span class="pill ready">Completed</span>
+          </div>
+          <p>20-step synchronous GRPO on 4 B200 nodes, 8 GPUs per node, segment size 4. Slurm state <code>COMPLETED</code>, exit <code>0:0</code>.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505091 → 505208 → 505245 → 505265 · Nemotron 3 Super</h3>
+            <span class="pill failed">Blocked</span>
+          </div>
+          <p>After isolating two vLLM startup paths, attempt 505265 used custom all-reduce off, Triton MoE, and eager execution. It initialized all 256 policy ranks and reached reference logprob, where all ranks segfaulted in <code>RDMACoordinator::allocate_combine_buffers()</code>. It was cancelled after the fatal driver exit to release 256 idle GPUs.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505516 / 505517 · Commit-independent reproduction</h3>
+            <span class="pill ready">Confirmed</span>
+          </div>
+          <p>Identical 4-node constructor probes reached the inter-node HybridEP path with DeepEP <code>17cfb817</code> and <code>f725d296</code>. Both failed with SIGSEGV, excluding THD padding and a 17cf-only regression.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505626 / 505651 / 505660 · RDMA root cause</h3>
+            <span class="pill ready">Confirmed</span>
+          </div>
+          <p>Trace job 505626 recorded every GPU-memory <code>ibv_reg_mr_iova2</code> call returning <code>NULL</code> with <code>errno=14 (EFAULT)</code>. Job 505651 confirmed <code>nvidia_peermem</code> is not loaded. Job 505660 registered the same CUDA allocation through DMA-BUF successfully with <code>errno=0</code>.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="results-title">
+      <h2 id="results-title">Results</h2>
+      <p class="section-note">Timing and throughput are arithmetic mean ± sample standard deviation over Steps 2–20; Step 1 warm-up is excluded.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Job</th>
+              <th>Topology</th>
+              <th>Steps</th>
+              <th>Completion</th>
+              <th>End-to-end step time</th>
+              <th>Policy train time</th>
+              <th>Logprob time</th>
+              <th>Throughput</th>
+              <th>Reward / loss sanity</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Qwen3-30B-A3B</strong><br><code>grpo-qwen3-30ba3b-4n8g.yaml</code></td>
+              <td>505121</td>
+              <td>4 × 8 B200</td>
+              <td>20 completed</td>
+              <td class="metric">20/20 · exit 0</td>
+              <td class="metric">139.69 ± 12.00 s</td>
+              <td class="metric">50.87 ± 3.39 s</td>
+              <td class="metric">13.74 ± 1.20 s</td>
+              <td class="metric">1,494.17 E2E · 4,088.36 policy · 15,196.53 logprob <small>tok/s/GPU</small></td>
+              <td class="metric">loss 0.0011 mean · reward 0.5258 mean · validation accuracy 0.5469</td>
+            </tr>
+            <tr>
+              <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
+              <td>505091 / 505208 / 505245 / 505265</td>
+              <td>32 × 8 B200</td>
+              <td>0 completed</td>
+              <td class="metric">Reached Step 1 reference logprob; HybridEP RDMA buffer-allocation segfault on 256/256 ranks</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="historical-title">
+      <h2 id="historical-title">Directional historical reference</h2>
+      <p class="section-note">These completed B200 Qwen runs are not a controlled baseline for job 505121: they used 2 × 8 GPUs, 3 steps, older source/container commits, and DeepEP <code>f725d296</code>.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric · steps 2–3</th>
+              <th>All-to-all · 478052</th>
+              <th>HybridEP + THD · 478054</th>
+              <th>Directional change</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>E2E step time</td><td>245.43 s</td><td>228.96 s</td><td>−6.71%</td></tr>
+            <tr><td>Policy step time</td><td>104.88 s</td><td>93.12 s</td><td>−11.21%</td></tr>
+            <tr><td>Logprob time</td><td>26.23 s</td><td>22.68 s</td><td>−13.54%</td></tr>
+            <tr><td>E2E throughput</td><td>1,724.07 tok/s/GPU</td><td>1,847.07 tok/s/GPU</td><td>+7.13%</td></tr>
+            <tr><td>Policy throughput</td><td>4,041.08 tok/s/GPU</td><td>4,543.73 tok/s/GPU</td><td>+12.44%</td></tr>
+            <tr><td>Logprob throughput</td><td>16,133.47 tok/s/GPU</td><td>18,635.42 tok/s/GPU</td><td>+15.51%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">No completed, like-for-like B200 Nemotron3 Super 32 × 8 sync result is available. The successful Qwen run does not cover the failing path: Qwen EP=8 remains within one 8-GPU NVLink domain, while Super EP=32 spans four domains and invokes the DOCA/RDMA coordinator.</div>
+    </section>
+
+    <section aria-labelledby="charts-title">
+      <h2 id="charts-title">Metric charts</h2>
+      <p class="section-note">Qwen3-30B-A3B · GCP-NRT B200 · Steps 2–20. Super has no completed step and is intentionally absent.</p>
+      <div class="chart-grid">
+        <article class="chart-card">
+          <h3>End-to-end and policy step time</h3>
+          <div id="chart-step-time" class="chart-slot" aria-label="Qwen per-step timing chart"></div>
+        </article>
+        <article class="chart-card">
+          <h3>Policy and logprob throughput</h3>
+          <div id="chart-throughput" class="chart-slot" aria-label="Qwen per-step throughput chart"></div>
+        </article>
+        <article class="chart-card">
+          <h3>Reward stability</h3>
+          <div id="chart-training-sanity" class="chart-slot" aria-label="Qwen per-step reward chart"></div>
+        </article>
+        <article class="chart-card">
+          <h3>Logprob consistency · log scale</h3>
+          <div id="chart-token-error" class="chart-slot" aria-label="Qwen token multiplied probability error chart"></div>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="chronology-title">
+      <h2 id="chronology-title">Preparation and failure chronology</h2>
+      <ol class="timeline">
+        <li>
+          <h3>Source and controls locked</h3>
+          <p>Validation source <code>a028b33b</code> contains PR #2964 <code>60a10b4f</code> and the x86 HybridEP dependency <code>a9aaa395</code>. Both recipes retain their canonical batching and parallelism.</p>
+        </li>
+        <li>
+          <h3>Configuration and environment checks prepared</h3>
+          <p><code>validate_configs.sbatch</code>, <code>inspect_frozen_envs.sbatch</code>, and <code>probe_hybridep_b200.sbatch</code> cover Hydra values, actor interpreters, and the failure mode where DeepEP is absent from an image environment.</p>
+        </li>
+        <li>
+          <h3>SM100 HybridEP wheel prepared</h3>
+          <p><code>build_hybridep_17cf_b200.sbatch</code> builds and import-checks DeepEP <code>17cfb817</code>. Launchers verify SHA256 <code>82487725…e5f99</code> before installing its node-local overlay.</p>
+        </li>
+        <li>
+          <h3>Nightly image staging retried</h3>
+          <p>Registry import job 504915 was superseded because a layer containing over one million tiny files could not be extracted within the staging walltime. CW upload 15336366 completed, followed by GCP download 505067 and full SHA gate 505085.</p>
+        </li>
+        <li>
+          <h3>Smoke gate passed</h3>
+          <p>Job 505087 completed successfully and validated Python 3.13.14, vLLM 0.25.1, a visible B200 GPU, and all three DeepEP/HybridEP imports in both frozen actor environments.</p>
+        </li>
+        <li>
+          <h3>Training validations submitted behind the smoke</h3>
+          <p>Qwen attempt 505090 failed before step 0 during vLLM CUDA-graph warmup when one worker on <code>pool0-0167</code> exited. Retry 505121 preserved the recipe, excluded that node, and completed all 20 steps plus Step 20 validation with Slurm exit <code>0:0</code>.</p>
+        </li>
+        <li>
+          <h3>Super vLLM initialization isolated</h3>
+          <p>Super attempt 505091 failed on multiple TP=8 groups at <code>custom_all_reduce.cuh:455</code>. Attempt 505208 disabled that transport and exposed a FlashInfer TRTLLM MoE compiled-GEMM illegal access during CUDA-graph profiling. Attempt 505245 selected Triton MoE but retained CUDA graphs and hit the same compiled-GEMM path.</p>
+        </li>
+        <li>
+          <h3>Super reached HybridEP and exposed the blocking failure</h3>
+          <p>Attempt 505265 additionally enabled eager vLLM execution. All rollout engines and 256 Megatron policy ranks initialized; Step 1 generation, rewards, and advantage computation completed. At reference logprob, HybridEP entered the EP=32 inter-node path and all ranks segfaulted in <code>RDMACoordinator::allocate_combine_buffers()</code>. No Step 1 metric was completed.</p>
+        </li>
+        <li>
+          <h3>Alternative backend availability checked</h3>
+          <p>The exact <code>17cfb817</code> wheel was built with its default DOCA backend. That commit offers an experimental NIXL backend only when built with <code>USE_NIXL=1</code>; it also requires NIXL/UCX/etcd development inputs and an etcd endpoint reachable by every node. Probes 505327 and 505334 found NIXL 1.3 pip wheels with bundled NIXL, UCX, and etcd-client shared libraries, but no <code>nixl.h</code>, coherent <code>NIXL_HOME</code> development prefix, NIXL pkg-config entry, or etcd server executable. The current nightly is therefore not sufficient for the documented NIXL source build and runtime.</p>
+        </li>
+        <li>
+          <h3>Inter-node failure reproduced independently of NeMo RL</h3>
+          <p>Jobs 505516 and 505517 constructed only <code>HybridEPBuffer</code> across four B200 nodes. Both the requested <code>17cfb817</code> wheel and newer <code>f725d296</code> wheel segfaulted before dispatch, so NeMo RL padding, reward computation, and model weights are outside the failure boundary.</p>
+        </li>
+        <li>
+          <h3>Legacy MR failure measured</h3>
+          <p>Job 505626 intercepted the versioned <code>ibv_reg_mr_iova2@IBVERBS_1.8</code> call. All twelve combine-buffer registrations across two ranks returned <code>NULL</code> with <code>EFAULT</code>; DeepEP then dereferenced the null MR. Job 505651 confirmed the node has active RoCE HCAs and accessible uverbs devices but no loaded <code>nvidia_peermem</code> module.</p>
+        </li>
+        <li>
+          <h3>DMA-BUF fallback feasibility passed</h3>
+          <p>Job 505660 exported a 16 MiB CUDA allocation with <code>cuMemGetHandleForAddressRange</code> and registered it on <code>rocep145s0</code> with <code>ibv_reg_dmabuf_mr</code>. The result was non-null with <code>errno=0</code>, proving a software fallback is available on the same nightly and hardware.</p>
+        </li>
+      </ol>
+      <div class="callout">
+        W&amp;B is configured in offline mode by both launchers. Local Slurm, Ray, training, and TensorBoard artifacts are therefore the authoritative result sources. Current MCore keeps original and padded HybridEP token counts internally but does not log them; THD sequence-packing efficiency is distinct and will not be presented as HybridEP dispatch-padding overhead.
+      </div>
+      <div class="callout">
+        Qwen correctness sanity: all logged loss, reward, gradient, and KL values are finite; mean generation KL is 0.00190; median token multiplied-probability error is 1.022 and the final-step value is 1.022, both within the repository's large-model gates. Step 8 is a disclosed outlier at 101.66, so this run proves execution stability but is not sufficient by itself to claim zero numerical regression.
+      </div>
+      <div class="callout">
+        Current conclusion: PR #2964 plus DeepEP <code>17cfb817</code> is validated for Qwen3-30B-A3B EP=8 on B200, including THD packing and 20 training steps. Nemotron3 Super uses the canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code> shape: 32 nodes × 8 GPUs, TP=4, EP=32, GBS=256, MBS=1, and sequence length 8192. Its failure is below NeMo RL's padding path: the GCP B200 nodes do not load <code>nvidia_peermem</code>, legacy <code>ibv_reg_mr</code> returns <code>EFAULT</code>, and DeepEP dereferences the null MR. Repeating the unchanged 256-GPU command is not expected to help. The verified remediation is a guarded CUDA DMA-BUF MR fallback or, operationally, loading <code>nvidia_peermem</code> on the nodes.
+      </div>
+    </section>
+
+    <section aria-labelledby="provenance-title">
+      <h2 id="provenance-title">Reproducibility snapshot</h2>
+      <div class="provenance-grid">
+        <article class="provenance-item">
+          <h3>Runtime</h3>
+          <p>Container: <code>nemo_rl_nightly_20260805_15171871.sqsh</code> · SHA256 <code>6623720f…b680</code><br>DeepEP: <code>17cfb817bccec3a9c247013360cc550c2bac441e</code><br>NCCL NVLS: disabled</p>
+        </article>
+        <article class="provenance-item">
+          <h3>HybridEP topology</h3>
+          <p>8 ranks per NVLink domain · 128 tokens per combine chunk · NVLink domain size 8 · MNNVL disabled · 32 SMs</p>
+        </article>
+        <article class="provenance-item">
+          <h3>Qwen launcher</h3>
+          <p><code>submit_qwen3_30ba3b_20step.sh</code><br>Partition: <code>batch_long</code> · limit: 8 hours · checkpoint writes disabled</p>
+        </article>
+        <article class="provenance-item">
+          <h3>Nemotron launcher</h3>
+          <p><code>submit_nemotron_super_20step.sh</code><br>Partition: <code>batch_long</code> · limit: 8 hours · checkpoint writes disabled · vLLM custom all-reduce disabled · Triton MoE · eager execution for the final diagnostic attempt</p>
+        </article>
+      </div>
+    </section>
+
+    <footer>
+      Self-contained experiment report generated from immutable launch metadata, Slurm/Ray logs, and TensorBoard artifacts.
+    </footer>
+  </main>
+  <script>
+    const qwen = {
+      steps: Array.from({length: 19}, (_, i) => i + 2),
+      e2e: [159.429596,144.234467,141.864151,135.112595,128.523438,139.862411,138.163345,125.178413,165.161423,130.005463,129.576157,139.301086,145.308136,133.497375,132.976669,130.163254,133.82457,135.497253,166.42955],
+      policyTime: [57.659618,56.807316,50.212532,50.931908,49.033836,51.347038,53.152821,43.050941,46.772266,51.734352,52.726631,51.795563,53.726131,48.048325,50.160061,50.579613,47.099133,51.924221,49.809101],
+      logprobTime: [14.401731,15.329932,13.542689,15.535147,12.066398,13.789685,13.769524,14.418426,12.410748,15.340674,12.773835,13.144846,13.852704,13.021117,14.746936,12.683825,12.217013,15.664911,12.325077],
+      e2eTps: [1280.955811,1511.517456,1422.351318,1527.042358,1524.001221,1587.159546,1628.989014,1539.817749,1222.158447,1572.172363,1654.12146,1554.872314,1520.390503,1498.040283,1501.199463,1559.484863,1486.586548,1577.442993,1220.980713],
+      policyTps: [3541.859863,3837.760986,4018.531982,4050.950928,3994.586182,4323.208984,4234.32959,4477.299316,4315.665039,3950.779053,4065.017578,4181.736816,4112.061035,4162.152344,3979.75,4013.230225,4223.895508,4116.367676,4079.721924],
+      logprobTps: [14180.397461,14221.387695,14899.599609,13281.024414,16232.671875,16097.827148,16345.268555,13368.445312,16264.40625,13323.46875,16779.197266,16477.591797,15948.15918,15358.469727,13536.675781,16003.660156,16283.998047,13644.456055,16487.302734],
+      reward: [0.490234,0.469727,0.522949,0.547852,0.579102,0.473145,0.426758,0.51123,0.598145,0.509766,0.549805,0.530273,0.470215,0.552246,0.54541,0.597656,0.617188,0.483887,0.514648],
+      tokenError: [1.022251,1.020869,1.02324,1.021068,1.022222,1.021559,101.656593,1.021848,1.023569,1.021781,1.021458,1.031159,1.021718,1.021537,1.02163,1.021156,1.023274,1.02243,1.021826]
+    };
+
+    function renderLineChart(id, series, options = {}) {
+      const host = document.getElementById(id);
+      const ns = "http://www.w3.org/2000/svg";
+      const width = 640, height = 240;
+      const margin = {left: 48, right: 18, top: 34, bottom: 30};
+      const innerW = width - margin.left - margin.right;
+      const innerH = height - margin.top - margin.bottom;
+      const transform = options.log ? value => Math.log10(value) : value => value;
+      const raw = series.flatMap(item => item.values);
+      let yMin = Math.min(...raw.map(transform));
+      let yMax = Math.max(...raw.map(transform));
+      const padding = Math.max((yMax - yMin) * 0.08, options.log ? 0.02 : 0.001);
+      yMin -= padding;
+      yMax += padding;
+      const x = index => margin.left + index * innerW / (qwen.steps.length - 1);
+      const y = value => margin.top + (yMax - transform(value)) * innerH / (yMax - yMin);
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.setAttribute("class", "metric-svg");
+
+      for (let i = 0; i <= 4; i += 1) {
+        const yy = margin.top + i * innerH / 4;
+        const line = document.createElementNS(ns, "line");
+        line.setAttribute("x1", margin.left);
+        line.setAttribute("x2", width - margin.right);
+        line.setAttribute("y1", yy);
+        line.setAttribute("y2", yy);
+        line.setAttribute("class", "grid");
+        svg.appendChild(line);
+        const tick = document.createElementNS(ns, "text");
+        const scaled = yMax - i * (yMax - yMin) / 4;
+        const value = options.log ? Math.pow(10, scaled) : scaled;
+        tick.textContent = options.format ? options.format(value) : value.toFixed(1);
+        tick.setAttribute("x", margin.left - 7);
+        tick.setAttribute("y", yy + 4);
+        tick.setAttribute("text-anchor", "end");
+        tick.setAttribute("class", "tick");
+        svg.appendChild(tick);
+      }
+
+      [[margin.left, margin.top, margin.left, height - margin.bottom], [margin.left, height - margin.bottom, width - margin.right, height - margin.bottom]].forEach(coords => {
+        const axis = document.createElementNS(ns, "line");
+        ["x1", "y1", "x2", "y2"].forEach((key, i) => axis.setAttribute(key, coords[i]));
+        axis.setAttribute("class", "axis");
+        svg.appendChild(axis);
+      });
+
+      [0, 9, 18].forEach(index => {
+        const tick = document.createElementNS(ns, "text");
+        tick.textContent = `Step ${qwen.steps[index]}`;
+        tick.setAttribute("x", x(index));
+        tick.setAttribute("y", height - 9);
+        tick.setAttribute("text-anchor", index === 0 ? "start" : index === 18 ? "end" : "middle");
+        tick.setAttribute("class", "tick");
+        svg.appendChild(tick);
+      });
+
+      series.forEach((item, seriesIndex) => {
+        const path = document.createElementNS(ns, "polyline");
+        path.setAttribute("points", item.values.map((value, index) => `${x(index)},${y(value)}`).join(" "));
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", item.color);
+        path.setAttribute("stroke-width", "2.4");
+        path.setAttribute("stroke-linejoin", "round");
+        path.setAttribute("stroke-linecap", "round");
+        svg.appendChild(path);
+        const legend = document.createElementNS(ns, "text");
+        legend.textContent = item.name;
+        legend.setAttribute("x", margin.left + seriesIndex * 154);
+        legend.setAttribute("y", 18);
+        legend.setAttribute("class", "legend");
+        legend.setAttribute("fill", item.color);
+        svg.appendChild(legend);
+      });
+      host.appendChild(svg);
+    }
+
+    renderLineChart("chart-step-time", [
+      {name: "E2E", color: "#1769aa", values: qwen.e2e},
+      {name: "Policy", color: "#16896b", values: qwen.policyTime},
+      {name: "Logprob", color: "#d47c0f", values: qwen.logprobTime}
+    ], {format: value => `${value.toFixed(0)}s`});
+    renderLineChart("chart-throughput", [
+      {name: "E2E", color: "#1769aa", values: qwen.e2eTps},
+      {name: "Policy", color: "#16896b", values: qwen.policyTps},
+      {name: "Logprob", color: "#d47c0f", values: qwen.logprobTps}
+    ], {format: value => `${(value / 1000).toFixed(1)}k`});
+    renderLineChart("chart-training-sanity", [
+      {name: "Reward", color: "#7a4fb5", values: qwen.reward}
+    ], {format: value => value.toFixed(2)});
+    renderLineChart("chart-token-error", [
+      {name: "Token mult-prob error", color: "#b33a3a", values: qwen.tokenError}
+    ], {log: true, format: value => value >= 10 ? value.toFixed(0) : value.toFixed(2)});
+  </script>
+</body>
+</html>
