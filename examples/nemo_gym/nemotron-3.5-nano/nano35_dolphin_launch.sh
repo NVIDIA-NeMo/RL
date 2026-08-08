@@ -16,30 +16,45 @@ set -euo pipefail
 # OccupiedIdleGPUsJobReaper --comment exemption — so we set environment and
 # delegate rather than forking 800+ lines.
 #
-# Usage:
-#   GENRM_BASE_URL=http://<lb-host>:9213/v1 \
-#     bash examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch.sh
+# Usage. Judges run one of two ways; see the GenRM section below for the
+# trade-off between them.
+#
+#   Against a warm out-of-band GenRM pool (default; must already be serving):
+#     GENRM_BASE_URL=http://<lb-host>:9213/v1 \
+#       bash examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch.sh
+#
+#   Hosting GenRM and the NL2Bash judge inside the job, as the 6K recipe does:
+#     EXTERNAL_JUDGES=1 \
+#       bash examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch.sh
 #
 #   DRY_RUN=1 GENRM_BASE_URL=... bash .../nano35_dolphin_launch.sh   # inspect only
 #
 # Extra Hydra overrides are forwarded verbatim:
 #   GENRM_BASE_URL=... bash .../nano35_dolphin_launch.sh grpo.max_num_steps=2
-#
-# GenRM must already be serving. See the GenRM section below.
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 
 # -----------------------------------------------------------------------------
-# GenRM — EXTERNAL, and hard-required.
+# GenRM hosting. Two shapes, and this recipe supports both.
 #
-# We serve GenRM out-of-band rather than in-cluster because partition `batch`
-# caps at 4 h: an in-cluster pool would reload the 470 GB bf16 Qwen3-235B on
-# every restart, whereas an external pool stays warm across all of them.
+# EXTERNAL_JUDGES=1 is the 6K shape: GenRM and the NL2Bash judge are
+# co-scheduled in a second Slurm hetgroup inside this job. The allocation
+# wrapper brings up every replica plus one load balancer per pool, waits for
+# health, then substitutes the resolved URLs into the driver command. The job
+# owns its judges, so the reward model lands in provenance and no run can
+# outlive, mismatch, or be starved by a pool it does not control.
 #
-# Stand it up first (copy the dir — it holds .lb_pid_*, logs/ and a flock'd
-# registry, so running geshen's in place would collide with their pool):
+# EXTERNAL_JUDGES=0 (default) keeps GenRM on a separately managed warm pool
+# reached through GENRM_BASE_URL, and leaves the NL2Bash judge in the Gym pool.
+# Partition `batch` caps at 4 h, so a warm pool amortizes the 470 GB bf16
+# Qwen3-235B load across a whole chain of jobs. The in-job path instead pays
+# that load once per job — about ten minutes before training starts, measured
+# on the 6K run — in exchange for being self-contained.
+#
+# To stand up the out-of-band pool (copy the dir first — it holds .lb_pid_*,
+# logs/ and a flock'd registry, so running someone else's in place collides):
 #
 #   cp -r /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/\
 # users/geshen/mopd_nano_fast/genrm_serving  <your-dir>/genrm_serving
@@ -57,9 +72,46 @@ cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 # genrm_worker.sh). ultra_launch.sh sets base_url XOR model, never both, so the
 # name is pinned in rlvr_dolphin.yaml instead of passed here.
 # -----------------------------------------------------------------------------
-: "${GENRM_BASE_URL:?GENRM_BASE_URL must point to the external GenRM /v1 endpoint}"
-export GENRM_BASE_URL
-unset GENRM_MODEL
+export EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-0}"
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
+  # Per-replica shape copied from the 6K recipe: one TP=4 replica per four-GPU
+  # GB200 node, which keeps each replica inside a single node. Capacity is
+  # matched to what these judges already get, so only their location changes:
+  # four GenRM replicas fill the same four nodes the warm pool ran on, and
+  # eight NL2Bash replicas equal the DP=8 deployment they replace in Gym.
+  export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230}"
+  export GENRM_REPLICAS="${GENRM_REPLICAS:-4}"
+  export GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
+  # The warm pool serves this checkpoint through the ultra_v3 parser plugin, so
+  # carry both the plugin and its name over rather than vLLM's built-ins.
+  export GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-/lustre/fsw/portfolios/llmservice/users/lvega/evals/ultra_v3_reasoning_parser.py}"
+  export GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
+  # Matches the 6K deployment of this same GenRM checkpoint.
+  export GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-0}"
+  export NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-8}"
+  export NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
+  export EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-2}"
+  # Gym keeps its node count by default even though the NL2Bash judge vacates
+  # 32 of its GPUs, because Gym's sizing also covers CPU-side env servers that
+  # this change does not touch. Drop NUM_GYM_NODES to 8 once a run confirms the
+  # env servers are comfortable, which brings the total back to 68 nodes --
+  # the same footprint as 64 in-job nodes plus a 4-node warm pool.
+  #
+  # CHECK THIS FIRST IF A POOL FAILS TO START. serve_vllm_on_ray.py imports
+  # nemo_rl before vLLM's serve CLI, so pools must run the RL venv; they cannot
+  # use the Gym venv that rlvr_dolphin.yaml deliberately gives the in-Gym
+  # NL2Bash judge. On a vLLM 0.25 container that RL venv pairs vLLM with the
+  # openai release uv.lock pins, and `vllm serve` dies importing NamespaceTool
+  # from openai.types.responses (job 5943331). Judges share nothing with the
+  # trainer, so the fix is to serve them from an image whose RL venv is
+  # self-consistent rather than to match CONTAINER. Both pools default to
+  # CONTAINER in ultra_launch.sh and are overridable independently:
+  #   GENRM_CONTAINER=<image> NL2BASH_CONTAINER=<image>
+else
+  : "${GENRM_BASE_URL:?GENRM_BASE_URL must point to the external GenRM /v1 endpoint (or set EXTERNAL_JUDGES=1 to host GenRM in-job)}"
+  export GENRM_BASE_URL
+  unset GENRM_MODEL
+fi
 
 # -----------------------------------------------------------------------------
 # Experiment identity
@@ -84,7 +136,10 @@ export TRAIN_PATH="${TRAIN_PATH:-${_BLEND}}"
 export VAL_PATH="${VAL_PATH:-${_BLEND}}"
 
 # -----------------------------------------------------------------------------
-# Judges served in-cluster from the gym pool (GenRM is the only external one).
+# Judge checkpoints. Where they run depends on EXTERNAL_JUDGES above: the safety
+# judge is always served from the Gym pool, and the NL2Bash judge joins it there
+# unless the in-job hetgroup is enabled, in which case Gym skips its local
+# launch and proxies to the pool's load balancer instead.
 # -----------------------------------------------------------------------------
 export NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8}"
 export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B}"
@@ -257,7 +312,14 @@ echo "  Blend      : ${TRAIN_PATH}"
 echo "  Container  : ${CONTAINER}"
 echo "  Cache      : ${PERSISTENT_CACHE}"
 echo "  HF_HOME    : ${HF_HOME}"
-echo "  GenRM      : ${GENRM_BASE_URL} (external; served model name: model)"
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
+echo "  GenRM      : in-job hetgroup — ${GENRM_REPLICAS} x TP=${GENRM_TENSOR_PARALLEL_SIZE}"
+echo "               ${GENRM_MODEL}"
+echo "  NL2Bash    : in-job hetgroup — ${NL2BASH_REPLICAS} x TP=${NL2BASH_TENSOR_PARALLEL_SIZE}"
+else
+echo "  GenRM      : ${GENRM_BASE_URL} (external pool; served model name: model)"
+echo "  NL2Bash    : served in the Gym pool"
+fi
 echo "  SLURM      : ${SLURM_ACCOUNT} / ${SLURM_PARTITION} / ${WALLTIME}"
 echo "  Reaper     : ${JOB_REAPER_EXEMPT_IDLE_MINS} min idle exemption"
 echo "  Nodes      : ${NUM_TRAIN_NODES} train + ${NUM_GEN_NODES} gen + ${NUM_GYM_NODES} gym"

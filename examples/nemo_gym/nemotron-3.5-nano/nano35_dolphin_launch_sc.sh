@@ -30,7 +30,9 @@ set -euo pipefail
 #   DRY_RUN=1 GENRM_BASE_URL=... bash .../nano35_dolphin_launch_sc.sh
 #
 # GenRM must already be serving — see the GenRM section of the baseline script
-# for how to stand up the external pool.
+# for how to stand up the external pool, or pass EXTERNAL_JUDGES=1 to host
+# GenRM and the NL2Bash judge in a hetgroup inside this job instead, which is
+# the shape the 6K recipe uses.
 #
 # Optional:
 #   NRL_MAX_STEPS=10             # short pipeclean
