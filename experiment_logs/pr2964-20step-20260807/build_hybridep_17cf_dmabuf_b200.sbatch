@@ -18,7 +18,7 @@ cache_patch_path=${source_root}/patches/deepep_17cf_cached_nccl_build.patch
 output_root=${experiment_root}/deepep-wheels
 nccl_artifact_cache=${HYBRID_EP_NCCL_ARTIFACT_CACHE:-${experiment_root}/debug-super-ep32/overlays/505979/deep_ep/backend/nccl}
 deepep_base_commit=17cfb817bccec3a9c247013360cc550c2bac441e
-deepep_fix_commit=6d11d654e965b1c967f72adfcec95dbc82043643
+deepep_fix_commit=a9d657d23e2faa56a6456d885b21ddeadcf6c09c
 
 if [[ "${HYBRID_EP_BUILD_STAGE:-host}" != container ]]; then
   mkdir -p "${output_root}"
