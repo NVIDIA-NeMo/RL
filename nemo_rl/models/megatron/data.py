@@ -374,19 +374,58 @@ def _pad_packed_seq_for_hybridep(
         max_log_calls = int(os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS", "32"))
         if _HYBRIDEP_PACKING_LOG_CALLS < max_log_calls:
             _HYBRIDEP_PACKING_LOG_CALLS += 1
-            logger.warning(
-                "HybridEP packed sequence padding: rank=%s call=%s "
-                "local_tokens=%s target_tokens=%s added_tokens=%s overhead_pct=%.4f",
-                torch.distributed.get_rank()
-                if torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                else 0,
-                _HYBRIDEP_PACKING_LOG_CALLS,
-                local_seq_len,
-                target_seq_len,
-                target_seq_len - local_seq_len,
-                100.0 * (target_seq_len - local_seq_len) / max(local_seq_len, 1),
+            distributed = (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
             )
+            rank = torch.distributed.get_rank() if distributed else 0
+            group_raw_tokens = local_seq_len
+            group_padded_tokens = target_seq_len
+            if (
+                distributed
+                and os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE", "1") == "1"
+            ):
+                group = get_expert_tensor_and_model_parallel_group(
+                    check_initialized=False
+                )
+                totals = torch.tensor(
+                    [local_seq_len, target_seq_len],
+                    dtype=torch.int64,
+                    device=input_ids_cp_sharded.device,
+                )
+                torch.distributed.all_reduce(
+                    totals,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+                group_raw_tokens = int(totals[0].item())
+                group_padded_tokens = int(totals[1].item())
+
+            log_ranks = {
+                int(value)
+                for value in os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_RANKS", "0").split(
+                    ","
+                )
+                if value.strip()
+            }
+            if rank in log_ranks:
+                group_added_tokens = group_padded_tokens - group_raw_tokens
+                logger.warning(
+                    "HybridEP packed sequence padding: rank=%s call=%s "
+                    "local_tokens=%s target_tokens=%s added_tokens=%s "
+                    "overhead_pct=%.4f group_raw_tokens=%s "
+                    "group_padded_tokens=%s group_added_tokens=%s "
+                    "group_overhead_pct=%.4f",
+                    rank,
+                    _HYBRIDEP_PACKING_LOG_CALLS,
+                    local_seq_len,
+                    target_seq_len,
+                    target_seq_len - local_seq_len,
+                    100.0 * (target_seq_len - local_seq_len) / max(local_seq_len, 1),
+                    group_raw_tokens,
+                    group_padded_tokens,
+                    group_added_tokens,
+                    100.0 * group_added_tokens / max(group_raw_tokens, 1),
+                )
 
     if target_seq_len == local_seq_len:
         return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
