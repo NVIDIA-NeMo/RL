@@ -14,9 +14,10 @@ container=/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna
 wheel=${DEEPEP_WHEEL:?DEEPEP_WHEEL must identify the wheel under test}
 wheel_sha256=${DEEPEP_WHEEL_SHA256:?DEEPEP_WHEEL_SHA256 must be set}
 overlay=${debug_root}/overlays/${SLURM_JOB_ID}
+trace_library=${overlay}/libtrace_ibverbs.so
 
 test "$(sha256sum "${wheel}" | cut -d' ' -f1)" = "${wheel_sha256}"
-export wheel overlay
+export debug_root wheel overlay trace_library
 
 srun \
   --nodes=1 \
@@ -33,6 +34,10 @@ srun \
       --python /opt/nemo_rl_venv/bin/python \
       --target "${overlay}" \
       --reinstall --no-deps --no-index "${wheel}"
+    if [[ "${TRACE_IBVERBS:-0}" == 1 ]]; then
+      gcc -shared -fPIC -O2 \
+        -o "${trace_library}" "${debug_root}/trace_ibverbs.c" -ldl
+    fi
   '
 
 master_addr=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -1)
@@ -45,6 +50,9 @@ export NVLINK_DOMAIN_SIZE=8
 export USE_MNNVL=0
 export NCCL_NVLS_ENABLE=0
 export PROBE_MAX_TOKENS=${PROBE_MAX_TOKENS:-2048}
+if [[ "${TRACE_IBVERBS:-0}" == 1 ]]; then
+  export LD_PRELOAD=${trace_library}
+fi
 
 srun \
   --nodes=4 \
