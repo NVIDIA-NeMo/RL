@@ -31,6 +31,11 @@ assert_contains "${q30_baseline}" 'grpo-qwen3-30ba3b-4n8g.yaml'
 assert_contains "${q30_baseline}" 'policy.megatron_cfg.moe_token_dispatcher_type=alltoall'
 assert_contains "${q30_baseline}" 'logger.tensorboard_enabled=true'
 assert_not_contains "${q30_baseline}" 'moe_flex_dispatcher_backend=hybridep'
+assert_not_contains "${q30_baseline}" 'moe_hybridep_prepad_packed_inputs=true'
+
+render_case qwen3-30ba3b hybridep /tmp/q30-hybridep
+q30_hybridep=$(printf '%s\n' "${driver_args[@]}")
+assert_contains "${q30_hybridep}" '++policy.megatron_cfg.moe_hybridep_prepad_packed_inputs=true'
 
 render_case qwen3-235b hybridep /tmp/q235-hybridep
 q235_hybridep=$(printf '%s\n' "${driver_args[@]}")
@@ -43,6 +48,7 @@ assert_contains "${q235_hybridep}" "++policy.megatron_cfg.env_vars.NVLINK_DOMAIN
 assert_contains "${q235_hybridep}" '++policy.generation.vllm_kwargs.disable_custom_all_reduce=true'
 assert_contains "${q235_hybridep}" '++policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_allreduce_rms=false'
 assert_not_contains "${q235_hybridep}" 'logger.tensorboard_enabled=true'
+assert_not_contains "${q235_hybridep}" 'moe_hybridep_prepad_packed_inputs=true'
 
 render_case qwen3-235b baseline /tmp/q235-baseline
 q235_baseline=$(printf '%s\n' "${driver_args[@]}")
@@ -66,6 +72,7 @@ assert_contains "${super_hybridep}" '++policy.generation.vllm_kwargs.disable_cus
 assert_contains "${super_hybridep}" '++policy.generation.vllm_kwargs.moe_backend=triton'
 assert_contains "${super_hybridep}" 'policy.generation.vllm_cfg.enforce_eager=true'
 assert_contains "${super_hybridep}" '++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep'
+assert_contains "${super_hybridep}" '++policy.megatron_cfg.moe_hybridep_prepad_packed_inputs=true'
 
 submit_script=$(<"${experiment_dir}/submit_performance_20step.sh")
 assert_contains "${submit_script}" '--comment=${job_reaper_comment}'
