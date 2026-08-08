@@ -61,7 +61,23 @@ from nemo_rl.models.automodel.train import (
     automodel_forward_backward,
     forward_with_post_processing_fn,
 )
+from nemo_rl.models.generation.dllm.denoise import (
+    block_denoise,
+    build_canvas,
+    unpack_generations,
+)
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationOutputSpec,
+    verify_right_padding,
+)
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dllm import (
+    SdmcElboEstimator,
+    accumulate_elbo_logprobs,
+    dllm_config_from_policy,
+    resolve_mask_id,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -350,6 +366,17 @@ class DTensorPolicyWorkerV2Impl(
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
+        # Masked diffusion policies score a sequence by an ELBO estimated over
+        # several masked views of it, rather than by one autoregressive forward.
+        self.dllm_cfg = dllm_config_from_policy(self.cfg)
+        self.dllm_estimator = (
+            None
+            if self.dllm_cfg is None
+            else SdmcElboEstimator(
+                self.dllm_cfg, resolve_mask_id(self.dllm_cfg, self.model_config)
+            )
+        )
+
         # Initialize reference model if requested
         self.reference_model_state_dict = None
         if init_reference_model:
@@ -520,6 +547,14 @@ class DTensorPolicyWorkerV2Impl(
                     train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    # Masked diffusion policies are trained against the same
+                    # ELBO they are scored by, so the training forward has to
+                    # accumulate the quadrature points too -- a single forward
+                    # would make the policy ratio compare two different
+                    # quantities.
+                    elbo_scorer=self._dllm_train_elbo_scorer(sequence_dim)
+                    if self.dllm_estimator is not None
+                    else None,
                 )
 
                 # Extract losses and metrics from results
@@ -587,6 +622,205 @@ class DTensorPolicyWorkerV2Impl(
             return metrics
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
+    def _dllm_elbo_logprobs(
+        self,
+        *,
+        processed_mb: Any,
+        post_processing_fn: Any,
+        sequence_dim: int,
+    ) -> torch.Tensor:
+        """Scores one microbatch by the SDMC ELBO instead of one forward pass.
+
+        Each quadrature point is a differently masked view of the same sequence,
+        so the model input is swapped per point while the targets stay clean.
+
+        Args:
+            processed_mb: The microbatch to score.
+            post_processing_fn: The logprobs post-processor to apply per forward.
+            sequence_dim: Sequence dimension.
+
+        Returns:
+            Per-position ELBO contributions, shape ``[batch, seq_len]``, summing
+            to the scalar ELBO -- the same slot autoregressive logprobs occupy.
+        """
+        processed_inputs = processed_mb.processed_inputs
+        clean_input_ids = processed_inputs.input_ids
+        data_dict = processed_mb.data_dict
+
+        # Only completion tokens are scored; the prompt is conditioning context.
+        completion_mask = data_dict["token_mask"].to(clean_input_ids.device).bool()
+
+        # The old, reference, and current ELBOs of a rollout must share masks, so
+        # the seed travels with the batch rather than being drawn per call.
+        seed = data_dict.get("dllm_mask_seed")
+        if seed is not None:
+            seed = int(seed.flatten()[0].item())
+
+        def score_fn(
+            masked_input_ids: torch.Tensor, target_ids: torch.Tensor
+        ) -> torch.Tensor:
+            processed_inputs.input_ids = masked_input_ids
+            processed_inputs.target_ids = target_ids
+            try:
+                logprobs, _metrics, _ = forward_with_post_processing_fn(
+                    model=self.model,
+                    post_processing_fn=post_processing_fn,
+                    processed_mb=processed_mb,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                    sampling_params=self.sampling_params,
+                    sequence_dim=sequence_dim,
+                )
+            finally:
+                # Leave the microbatch as we found it; callers past this point
+                # (and the next quadrature point) expect the clean sequence.
+                processed_inputs.input_ids = clean_input_ids
+                processed_inputs.target_ids = None
+            return logprobs
+
+        return accumulate_elbo_logprobs(
+            self.dllm_estimator,
+            input_ids=clean_input_ids,
+            completion_mask=completion_mask,
+            seed=seed,
+            score_fn=score_fn,
+        )
+
+    def _dllm_train_elbo_scorer(self, sequence_dim: int) -> Any:
+        """Builds the differentiable ELBO scorer used by the training forward.
+
+        ``get_logprobs`` accumulates the ELBO under ``no_grad`` to produce the
+        old and reference likelihoods. Training needs the same quantity with
+        gradients attached, so the policy ratio compares like with like -- the
+        reference implementation likewise calls its estimator inside
+        ``compute_loss`` (https://arxiv.org/abs/2510.08554).
+
+        Args:
+            sequence_dim: Sequence dimension of the microbatch tensors.
+
+        Returns:
+            A callable mapping a ``ProcessedMicrobatch`` to the ``[batch,
+            seq_len]`` per-position ELBO contributions, with autograd history
+            spanning every quadrature point.
+        """
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+        )
+
+        def score(processed_mb: Any) -> torch.Tensor:
+            return self._dllm_elbo_logprobs(
+                processed_mb=processed_mb,
+                post_processing_fn=logprobs_post_processor,
+                sequence_dim=sequence_dim,
+            )
+
+        return score
+
+    @torch.no_grad()
+    def generate(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generates rollouts by block-wise denoising on the training weights.
+
+        Masked diffusion models decode a fixed-width canvas rather than
+        appending tokens, so there is no KV cache to maintain and no separate
+        inference engine to refit -- generation reads the live policy weights.
+
+        Args:
+            data: Right-padded prompts with ``input_ids`` and ``input_lengths``.
+            greedy: Whether to decode greedily, overriding the sampling config.
+
+        Returns:
+            A BatchedDataDict conforming to ``GenerationOutputSpec``.
+
+        Raises:
+            RuntimeError: If the policy is not configured as a masked diffusion LM.
+        """
+        if self.dllm_estimator is None or self.dllm_cfg is None:
+            raise RuntimeError(
+                "generate() on the DTensor worker is only available for masked "
+                "diffusion policies. Set policy.dllm.enabled=true, or use an "
+                "autoregressive generation backend (vllm, sglang, trtllm)."
+            )
+
+        generation_cfg = self.cfg["generation"]
+        assert generation_cfg is not None, (
+            "policy.generation must be configured to generate."
+        )
+
+        # build_canvas re-aligns right-padded prompts against the generation
+        # region, so left padding here would silently produce a wrong canvas
+        # rather than fail. Same check the other generation backends run.
+        is_right_padded, error_msg = verify_right_padding(
+            data, pad_value=self.tokenizer.pad_token_id
+        )
+        if not is_right_padded:
+            warnings.warn(
+                f"Input to the dllm generation worker is not properly "
+                f"right-padded: {error_msg}"
+            )
+
+        device = torch.cuda.current_device()
+        mask_id = self.dllm_estimator.mask_id
+        pad_id = generation_cfg.get("_pad_token_id", self.tokenizer.pad_token_id)
+
+        self.model.eval()
+        canvas, attention_mask = build_canvas(
+            data["input_ids"].to(device),
+            data["input_lengths"].to(device),
+            gen_length=generation_cfg["max_new_tokens"],
+            mask_id=mask_id,
+            pad_id=pad_id,
+        )
+
+        def logits_fn(input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            logits = self.model(
+                input_ids=input_ids, attention_mask=mask.to(input_ids.dtype)
+            ).logits
+            # Tensor parallelism shards logits over the vocab; sampling and the
+            # confidence ranking both need the full distribution.
+            return logits.full_tensor() if isinstance(logits, DTensor) else logits
+
+        denoised = block_denoise(
+            logits_fn,
+            canvas,
+            attention_mask,
+            gen_start=data["input_ids"].shape[1],
+            mask_id=mask_id,
+            steps=self.dllm_cfg.diffusion_steps,
+            block_length=self.dllm_cfg.block_length,
+            temperature=0.0 if greedy else generation_cfg["temperature"],
+            top_k=None if greedy else generation_cfg["top_k"],
+            top_p=1.0 if greedy else generation_cfg["top_p"],
+            cfg_scale=self.dllm_cfg.cfg_scale,
+            generator=None,
+        )
+
+        stop_token_ids = generation_cfg["stop_token_ids"] or [
+            self.tokenizer.eos_token_id
+        ]
+        outputs = unpack_generations(
+            denoised,
+            data["input_lengths"].to(device),
+            gen_start=data["input_ids"].shape[1],
+            eos_token_ids=stop_token_ids,
+            pad_id=pad_id,
+        )
+        # The ELBO is not a per-token quantity available during decoding; GRPO
+        # recomputes it in get_logprobs, so this slot is left zeroed.
+        outputs["logprobs"] = torch.zeros_like(
+            outputs["output_ids"], dtype=torch.float32
+        )
+        return BatchedDataDict[GenerationOutputSpec](
+            {key: value.cpu() for key, value in outputs.items()}
+        )
+
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -649,16 +883,23 @@ class DTensorPolicyWorkerV2Impl(
                     dtype=self.dtype,
                     autocast_enabled=self.autocast_enabled,
                 ):
-                    # Use forward_with_post_processing_fn for forward pass and post-processing
-                    token_logprobs, _metrics, _ = forward_with_post_processing_fn(
-                        model=self.model,
-                        post_processing_fn=logprobs_post_processor,
-                        processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
-                        sampling_params=self.sampling_params,
-                        sequence_dim=sequence_dim,
-                    )
+                    if self.dllm_estimator is not None:
+                        token_logprobs = self._dllm_elbo_logprobs(
+                            processed_mb=processed_mb,
+                            post_processing_fn=logprobs_post_processor,
+                            sequence_dim=sequence_dim,
+                        )
+                    else:
+                        # Use forward_with_post_processing_fn for forward pass and post-processing
+                        token_logprobs, _metrics, _ = forward_with_post_processing_fn(
+                            model=self.model,
+                            post_processing_fn=logprobs_post_processor,
+                            processed_mb=processed_mb,
+                            is_reward_model=False,
+                            allow_flash_attn_args=self.allow_flash_attn_args,
+                            sampling_params=self.sampling_params,
+                            sequence_dim=sequence_dim,
+                        )
 
                 # skip keeping the logprobs for the dummy batches
                 if batch_idx >= iterator_len:

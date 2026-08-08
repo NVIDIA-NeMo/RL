@@ -79,6 +79,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.dllm import DllmGeneration
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
@@ -415,8 +416,12 @@ def grpo_train_sync(
     kv_scales_cache = None  # Cache reused for computed kv scales
 
     NEED_REFIT = not (
-        isinstance(policy_generation, MegatronGeneration)
-        and master_config.policy["generation"]["colocated"]["enabled"]
+        (
+            isinstance(policy_generation, MegatronGeneration)
+            and master_config.policy["generation"]["colocated"]["enabled"]
+        )
+        # dLLM rollouts read the live training weights; there is nothing to sync.
+        or isinstance(policy_generation, DllmGeneration)
     )
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:

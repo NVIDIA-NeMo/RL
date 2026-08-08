@@ -27,6 +27,7 @@ class SetupTimingMetrics:
     sglang_init_time_s: Optional[float] = None
     trtllm_init_time_s: Optional[float] = None
     megatron_generation_init_time_s: Optional[float] = None
+    dllm_init_time_s: Optional[float] = None
 
     # SC only: generation init (reserve + load).
     generation_init_time_s: Optional[float] = None

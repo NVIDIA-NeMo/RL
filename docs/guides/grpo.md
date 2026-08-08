@@ -353,6 +353,10 @@ We define a {py:class}`~nemo_rl.models.policy.interfaces.PolicyInterface` that c
 
 This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
 
+Masked diffusion language models (LLaDA and friends) have no autoregressive
+likelihood to differentiate, so they are scored by an ELBO instead. See
+[RL for Masked Diffusion Language Models](dllm-rl.md).
+
 ## Fast Generation
 
 We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm/vllm_generation.py) class right now.

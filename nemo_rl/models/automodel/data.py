@@ -101,6 +101,11 @@ class ProcessedInputs:
     # Optional tensors (None when not applicable)
     attention_mask: Optional[torch.Tensor] = None
     position_ids: Optional[torch.Tensor] = None
+    # Tokens to score, when they differ from the tokens fed to the model. Left
+    # None for ordinary training, where the model is scored on its own input.
+    # Set by corruption-based objectives such as the masked-diffusion ELBO,
+    # which feeds a masked sequence but scores the clean tokens underneath it.
+    target_ids: Optional[torch.Tensor] = None
 
     # Flash attention configuration
     flash_attn_kwargs: dict[str, Any] = field(default_factory=dict)
