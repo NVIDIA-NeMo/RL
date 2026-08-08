@@ -33,7 +33,7 @@ render_case "${model}" "${dispatcher}" "${run_root}"
 case "${model}" in
   qwen3-30ba3b) time_limit=03:00:00 ;;
   qwen3-235b) time_limit=06:00:00 ;;
-  nemotron3-super) time_limit=04:00:00 ;;
+  nemotron3-super) time_limit=08:00:00 ;;
 esac
 
 test "$(git -C "${repo}" rev-parse HEAD)" = a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f

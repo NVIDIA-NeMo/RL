@@ -71,5 +71,6 @@ submit_script=$(<"${experiment_dir}/submit_performance_20step.sh")
 assert_contains "${submit_script}" '--comment=${job_reaper_comment}'
 assert_contains "${submit_script}" '"exemptIdleTimeMins":"90"'
 assert_contains "${submit_script}" 'model initialization and colocated vLLM startup'
+assert_contains "${submit_script}" 'nemotron3-super) time_limit=08:00:00'
 
 printf 'performance-case-tests-pass\n'
