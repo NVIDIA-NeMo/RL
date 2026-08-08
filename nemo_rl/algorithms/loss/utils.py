@@ -34,6 +34,98 @@ from nemo_rl.distributed.model_utils import (
 )
 
 
+def map_teacher_logits_to_draft_vocab(
+    teacher_logits: torch.Tensor,
+    d2t: Optional[torch.Tensor],
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Restrict full-vocab teacher logits to the draft vocabulary via ``d2t``.
+
+    ``d2t`` maps draft-vocab index ``i`` to target-vocab index ``i + d2t[i]``.
+    Under tensor parallelism the teacher logits arrive vocab-sharded, so they
+    are gathered to the full vocab and re-sliced to this rank's shard of the
+    draft vocabulary (the draft output layer is sharded the same way). No-op
+    when ``d2t`` is None (full-vocab drafts).
+    """
+    if d2t is None:
+        return teacher_logits
+    reverse_mapping = (
+        torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype) + d2t
+    )
+    if vocab_parallel_group is not None:
+        from megatron.core.tensor_parallel import (
+            gather_from_tensor_model_parallel_region,
+        )
+
+        teacher_logits = gather_from_tensor_model_parallel_region(
+            teacher_logits, vocab_parallel_group
+        )
+        tp_size = torch.distributed.get_world_size(vocab_parallel_group)
+        local_draft_size = len(d2t) // tp_size
+        assert vocab_parallel_rank is not None
+        start_index = vocab_parallel_rank * local_draft_size
+        end_index = (vocab_parallel_rank + 1) * local_draft_size
+        reverse_mapping = reverse_mapping[start_index:end_index]
+    return teacher_logits[:, :, reverse_mapping]
+
+
+def roll_packed_seq_dim(
+    tensor: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    seq_dim: int,
+) -> torch.Tensor:
+    """Left-shift a packed tensor by one along ``seq_dim`` within each segment.
+
+    Equivalent to a per-sequence ``torch.roll(shifts=-1)`` over the packed
+    layout: one global roll followed by zeroing each segment's final slot (the
+    only positions where the global roll would leak the next segment's first
+    row). Segment boundaries come from ``cu_seqlens_padded``, the physical
+    offsets of the packed layout.
+    """
+    rolled = torch.roll(tensor, shifts=-1, dims=seq_dim)
+    boundary_index = (cu_seqlens_padded[1:] - 1).to(
+        dtype=torch.long, device=rolled.device
+    )
+    index: list[Any] = [slice(None)] * rolled.dim()
+    index[seq_dim] = boundary_index
+    rolled[tuple(index)] = 0
+    return rolled
+
+
+def pack_rolled_draft_token_mask(
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+) -> torch.Tensor:
+    """Build the packed draft-loss mask ``[1, T_packed]`` from unpacked masks.
+
+    Mirrors the non-packed DRAFT prepare (``token_mask`` left-shifted by one,
+    scaled by ``sample_mask``), laid out at each sequence's padded offset.
+    Each sequence's last real slot (whose shifted target would cross the
+    boundary) and all padding slots stay zero.
+    """
+    batch_size = token_mask.shape[0]
+    total_packed_len = int(cu_seqlens_padded[-1].item())
+    packed = torch.zeros(
+        total_packed_len, dtype=token_mask.dtype, device=token_mask.device
+    )
+    for i in range(batch_size):
+        actual_len = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
+        packed_start = int(cu_seqlens_padded[i].item())
+        # The packer absorbs bin-level alignment padding into the last
+        # sequence's effective length (see _pack_input_ids), so cu_seqlens can
+        # exceed the unpacked row width; only real tokens carry mask.
+        copy_len = min(actual_len, token_mask.shape[1])
+        if copy_len <= 1:
+            continue
+        packed[packed_start : packed_start + copy_len - 1] = (
+            token_mask[i, 1:copy_len] * sample_mask[i]
+        )
+    return packed.unsqueeze(0)
+
+
 def prepare_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
@@ -179,26 +271,12 @@ def prepare_loss_input(
         token_mask = roll_tensor(
             data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
         )[0]
-        if d2t is not None:
-            reverse_mapping = (
-                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype)
-                + d2t
-            )
-            if vocab_parallel_group is not None:
-                from megatron.core.tensor_parallel import (
-                    gather_from_tensor_model_parallel_region,
-                )
-
-                teacher_logits = gather_from_tensor_model_parallel_region(
-                    teacher_logits, vocab_parallel_group
-                )
-                tp_size = torch.distributed.get_world_size(vocab_parallel_group)
-                local_draft_size = len(d2t) // tp_size
-                assert vocab_parallel_rank is not None
-                start_index = vocab_parallel_rank * local_draft_size
-                end_index = (vocab_parallel_rank + 1) * local_draft_size
-                reverse_mapping = reverse_mapping[start_index:end_index]
-            teacher_logits = teacher_logits[:, :, reverse_mapping]
+        teacher_logits = map_teacher_logits_to_draft_vocab(
+            teacher_logits,
+            d2t,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+        )
         loss_input = {
             "teacher_logits": teacher_logits,
             "student_logits": data["student_logits"],

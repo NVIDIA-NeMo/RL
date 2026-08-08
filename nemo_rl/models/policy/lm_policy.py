@@ -123,12 +123,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
+        if (
+            draft_enabled
+            and int(config.get("megatron_cfg", {}).get("context_parallel_size", 1)) > 1
         ):
+            # Sequence packing itself is supported with the draft; CP is not:
+            # the hidden-state capture and the per-segment shifts assume each
+            # packed sequence lives whole on one rank.
             raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+                "policy.draft.enabled=true does not support context parallelism "
+                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
+                "policy.draft."
             )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
