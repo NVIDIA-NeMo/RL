@@ -5,7 +5,7 @@
 #
 # Same 6-node SingleController shape as swe_nano_sc_interactive.sh; adds the
 # posture the capture path needs (learned on job 5764598, 2026-08-01):
-#   +token_capture.enabled=true      hydra APPEND — no yaml in the nano chain
+#   token_capture.enabled=true       the recipe yaml defines the block (enabled: false)
 #                                    defines the key (pydantic default only)
 #   +env.nemo_gym.rollout_max_attempts_to_avoid_lp_nan=1
 #                                    capture hard-errors otherwise; pin on the
@@ -44,6 +44,6 @@ set +a
 
 INTERACTIVE=1 DRY_RUN=0 INTERACTIVE_WAIT="${INTERACTIVE_WAIT:-1}" \
   bash "${HERE}/ultra_launch.sh" \
-  +token_capture.enabled=true \
+  token_capture.enabled=true \
   +env.nemo_gym.rollout_max_attempts_to_avoid_lp_nan=1 \
   "$@"
