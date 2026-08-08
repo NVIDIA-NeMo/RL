@@ -258,8 +258,8 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 15:43 PDT</span>
-        <span>Base a028b33b · Super fix validation 37c195f4 / 3d6d1324</span>
+        <span>Updated 2026-08-08 16:15 PDT</span>
+        <span>Base a028b33b · Super fix validation 37c195f4 / 3d6d1324 · minimal PR candidate 55f999c2</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore final candidate c8cedc3d</span>
         <span>20 steps per workload</span>
@@ -269,8 +269,8 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Both Qwen pairs passed · Super running</span></div>
-        <p>Final Qwen3-30B-A3B job 506437 completed 20/20 with the routing-mask candidate and improved policy training by 4.19% and LogProb by 11.80% versus all-to-all. Qwen3-235B 506438 and Super 506434 are still advancing without the former collective-ordering failure. Redundant Super retry 506397 was intentionally stopped after seven clean steps to release 256 GPUs.</p>
+        <div class="value"><span class="pill pending">Qwen3-30B passed · Qwen3-235B and Super running</span></div>
+        <p>Final Qwen3-30B-A3B job 506437 completed 20/20 with the routing-mask candidate and improved policy training by 4.19% and LogProb by 11.80% versus all-to-all. Qwen3-235B 506438 has completed Step 15 and Super 506434 has completed Step 7 without the former collective-ordering failure. Redundant Super retry 506397 was intentionally stopped after seven clean steps to release 256 GPUs.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -291,7 +291,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 15:43 PDT. Final Qwen3-30B-A3B job 506437 completed 20/20. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; final replacement 506434 restores one-time input prepadding and continues beyond the former timeout. Qwen3-235B 506438 and the eight-hour Super baseline 506464 are running. Focused NeMo tests passed 7/7.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 16:15 PDT. Final Qwen3-30B-A3B job 506437 completed 20/20. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; final replacement 506434 restores one-time input prepadding and has completed Step 7. Qwen3-235B 506438 has completed Step 15, and the eight-hour Super baseline 506464 has completed Step 1. The clean minimal PR candidate passed 7/7 focused tests in job 506644.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -403,7 +403,7 @@
             <h3>506123 / 506276 / 506397 / 506434 · Canonical Super pair</h3>
             <span class="pill pending">Final baseline and HybridEP candidate running</span>
           </div>
-          <p>Baseline 506123 completed 14 steps and entered Step 15 before its intentionally superseded four-hour allocation timed out; no runtime fatal occurred. Like-for-like eight-hour replacement 506464 has started with the canonical 32n8g recipe. HybridEP 506276 passed full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather during the first policy backward. Retry 506397 aligned once before forward and completed seven clean steps before intentional cancellation. Final job 506434 additionally excludes padding rows from expert dispatch and is advancing through Step 5.</p>
+          <p>Baseline 506123 completed 14 steps and entered Step 15 before its intentionally superseded four-hour allocation timed out; no runtime fatal occurred. Like-for-like eight-hour replacement 506464 completed its first full step with the canonical 32n8g recipe. HybridEP 506276 passed full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather during the first policy backward. Retry 506397 aligned once before forward and completed seven clean steps before intentional cancellation. Final job 506434 additionally excludes padding rows from expert dispatch and has completed Step 7.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -414,10 +414,10 @@
         </article>
         <article class="job">
           <div class="job-head">
-            <h3>506462 · Focused NeMo pre-padding tests</h3>
+            <h3>506462 / 506644 · Focused NeMo pre-padding tests</h3>
             <span class="pill ready">7 passed · exit 0</span>
           </div>
-          <p>Production policy dependencies validate one-time input alignment, CP-local mask preservation, rejection of model-owned packing, explicit opt-in/opt-out behavior, and fail-closed PP/MTP guards. Two earlier launcher attempts collected zero tests because the base and actor environments each supplied only half of the required test/runtime dependencies; the composed environment completed in 34.47 seconds.</p>
+          <p>Production policy dependencies validate one-time input alignment, CP-local mask preservation, rejection of model-owned packing, explicit opt-in/opt-out behavior, and fail-closed PP/MTP guards. Validation job 506462 passed 7/7. Clean minimal PR candidate <code>55f999c2</code> independently passed the same 7/7 tests in job 506644 with Slurm exit <code>0:0</code>.</p>
         </article>
       </div>
     </section>
@@ -473,8 +473,8 @@
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
               <td>baseline 506123 / 506464<br>hang-fix 506397<br>final HybridEP 506434</td>
               <td>32 × 8 B200</td>
-              <td>Step 11 / queued 20-step replacement / Step 2 complete / initializing</td>
-              <td class="metric">Baseline 506123 is advancing; eight-hour replacement 506464 is dependency-queued for the full 20 steps. External-prepadding retry 506397 completed full inter-node LogProb and two policy-training steps without the former collective timeout. Final routing-mask candidate 506434 is running. Final metrics are pending.</td>
+              <td>14 complete / replacement Step 1 / prepad retry 7 / final HybridEP 7</td>
+              <td class="metric">Baseline 506123 completed 14 steps before timeout; eight-hour replacement 506464 completed Step 1. External-prepadding retry 506397 and final routing-mask candidate 506434 each completed seven steps without the former collective timeout. Final Steps 2–20 metrics are pending.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -685,7 +685,7 @@
         Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for explicitly supported sequence-packed HybridEP cases. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's expert-bias mask broadcast fix remain necessary for this GCP-NRT Super path. HybridEP 506397 completed seven clean steps beyond the former hang before intentional cancellation; final candidate 506434 and replacement baseline 506464 are running.
       </div>
       <div class="callout">
-        Performance follow-up: MCore <code>340af84f</code> masks padding from router statistics but still dispatches padding rows through dropless HybridEP. This is numerically safe for the current no-capacity recipes but adds communication/GEMM work. Final candidate pin <code>c8cedc3d</code> combines the expert-bias broadcast with routing-map/probability zeroing for padding rows. NeMo validation head <code>3d6d1324</code> also makes external prepadding an explicit PP1/MTP0 opt-in; PP8 Qwen3-235B continues using MCore's internal padding. Focused MCore tests passed (2 passed, 1 TE-dependent skip), focused NeMo tests passed 7/7, Qwen3-30B-A3B 506437 completed 20/20, and jobs 506434/506438 are running.
+        Performance follow-up: MCore <code>340af84f</code> masks padding from router statistics but still dispatches padding rows through dropless HybridEP. This is numerically safe for the current no-capacity recipes but adds communication/GEMM work. Final candidate pin <code>c8cedc3d</code> combines the expert-bias broadcast with routing-map/probability zeroing for padding rows. NeMo validation head <code>3d6d1324</code> makes external prepadding an explicit PP1/MTP0 opt-in; clean minimal PR candidate <code>55f999c2</code> passed the same seven focused tests in server job 506644. PP8 Qwen3-235B continues using MCore's internal padding. Focused MCore tests passed (2 passed, 1 TE-dependent skip), Qwen3-30B-A3B 506437 completed 20/20, and jobs 506434/506438/506464 are running.
       </div>
     </section>
 
