@@ -1627,6 +1627,73 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
 
 
 @pytest.mark.mcore
+def test_hybridep_prepads_packed_inputs_before_model_forward():
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.megatron import data as megatron_data
+
+    def set_group_max(target, **_kwargs):
+        target.fill_(14)
+
+    input_ids = torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]])
+    cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        qkv_format="thd",
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            megatron_data,
+            "get_expert_tensor_and_model_parallel_group",
+            return_value=MagicMock(),
+        ) as mock_get_group,
+        patch.object(
+            megatron_data.torch.distributed,
+            "all_reduce",
+            side_effect=set_group_max,
+        ) as mock_all_reduce,
+        patch(
+            "nemo_rl.models.megatron.data.torch.distributed.is_available",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.models.megatron.data.torch.distributed.is_initialized",
+            return_value=True,
+        ),
+    ):
+        (
+            padded_input_ids,
+            padded_local_input_ids,
+            padded_params,
+            padded_cu_seqlens,
+        ) = megatron_data._pad_packed_seq_for_hybridep(
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=cu_seqlens_padded,
+            pad_packed_seq_to_multiple_of=8,
+            cp_rank=0,
+            cp_size=1,
+        )
+
+    assert padded_input_ids.shape == (1, 16)
+    assert padded_local_input_ids.shape == (1, 16)
+    assert torch.equal(padded_input_ids[:, :12], input_ids)
+    assert torch.count_nonzero(padded_input_ids[:, 12:]) == 0
+    assert torch.equal(padded_cu_seqlens, torch.tensor([0, 4, 16]))
+    assert padded_params.total_tokens == 16
+    mock_get_group.assert_called_once_with(check_initialized=False)
+    mock_all_reduce.assert_called_once()
+
+
+@pytest.mark.mcore
 @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
 @patch("nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2)
 @patch(
