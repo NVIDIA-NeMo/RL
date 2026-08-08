@@ -59,4 +59,9 @@ assert_contains "${super_hybridep}" '++policy.generation.vllm_kwargs.moe_backend
 assert_contains "${super_hybridep}" 'policy.generation.vllm_cfg.enforce_eager=true'
 assert_contains "${super_hybridep}" '++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep'
 
+submit_script=$(<"${experiment_dir}/submit_performance_20step.sh")
+assert_contains "${submit_script}" '--comment=${job_reaper_comment}'
+assert_contains "${submit_script}" '"exemptIdleTimeMins":"90"'
+assert_contains "${submit_script}" 'model initialization and colocated vLLM startup'
+
 printf 'performance-case-tests-pass\n'

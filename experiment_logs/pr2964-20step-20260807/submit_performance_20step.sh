@@ -26,6 +26,7 @@ wheel_sha256=${HYBRID_EP_WHEEL_SHA256_OVERRIDE:-f181085dcbfdcb88bc2a33f9df52d4ac
 overlay=/tmp/nemo-rl-hybridep-17cf
 job_dependency=${JOB_DEPENDENCY:-}
 slurm_exclude=${SLURM_EXCLUDE:-}
+job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"NeMo-RL performance recipe model initialization and colocated vLLM startup"}}'
 
 render_case "${model}" "${dispatcher}" "${run_root}"
 
@@ -90,6 +91,7 @@ slurm_args=(
   "--time=${time_limit}"
   "--job-name=coreai_chef_posttrain.${run_name}"
   "--output=${run_root}/slurm-%j.out"
+  "--comment=${job_reaper_comment}"
 )
 if [[ -n "${segment_size}" ]]; then
   slurm_args+=("--segment=${segment_size}")
@@ -107,12 +109,12 @@ printf '%s\n' "${job_output}"
 
 if [[ "${mode}" == submit ]]; then
   printf -v rendered_command '%q ' "${driver_args[@]}"
-  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\npr3436_head=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\ncommand=%s\n' \
+  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\npr3436_head=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\njob_reaper_comment=%s\ncommand=%s\n' \
     "${job_output}" "${run_name}" "${model}" "${dispatcher}" "${driver_args[3]}" \
     "${num_nodes}" "$(git rev-parse HEAD)" \
     60a10b4f54c2754d44150771a06260fe9e8b186f \
     a9aaa395c37963a9fd8a7320d61a516c7b714e57 \
     17cfb817bccec3a9c247013360cc550c2bac441e "${wheel}" "${wheel_sha256}" \
-    "${container}" "${job_dependency}" "${slurm_exclude}" "${rendered_command}" \
+    "${container}" "${job_dependency}" "${slurm_exclude}" "${job_reaper_comment}" "${rendered_command}" \
     > "${run_root}/submission.env"
 fi
