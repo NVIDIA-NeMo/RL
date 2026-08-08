@@ -68,9 +68,7 @@ ACTOR_ENVIRONMENT_REGISTRY.update(MODELOPT_ACTOR_REGISTRY)
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:
-    if actor_class_fqn in ACTOR_ENVIRONMENT_REGISTRY:
-        return ACTOR_ENVIRONMENT_REGISTRY[actor_class_fqn]
-    else:
+    if actor_class_fqn not in ACTOR_ENVIRONMENT_REGISTRY:
         raise ValueError(
             f"No actor environment registered for {actor_class_fqn}. "
             f"You're attempting to create an actor ({actor_class_fqn}) "
@@ -83,3 +81,10 @@ def get_actor_python_env(actor_class_fqn: str) -> str:
             "adding a new generation framework or training backend), you'll need to specify the "
             "appropriate environment. See uv.md for more details."
         )
+
+    # Some examples intentionally install every required backend into one environment.
+    # Resolve this flag at call time so callers can opt in after importing NeMo RL, and
+    # apply it consistently to policy, generation, Gym, and support actors.
+    if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
+        return PY_EXECUTABLES.SYSTEM
+    return ACTOR_ENVIRONMENT_REGISTRY[actor_class_fqn]

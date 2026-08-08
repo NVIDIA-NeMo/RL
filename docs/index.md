@@ -114,6 +114,13 @@ Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB20
 Create custom reward environments and integrate them with NeMo RL training pipelines.
 :::
 
+:::{grid-item-card} {octicon}`search` AI Search with cuVS
+:link: guides/ai-search
+:link-type: doc
+
+Train a multi-turn search agent with NeMo Gym, GRPO, and a private NVIDIA cuVS vector index.
+:::
+
 :::{grid-item-card} {octicon}`rocket` Eagle3 Speculative Decoding
 :link: guides/eagle3-speculative-decoding
 :link-type: doc
@@ -302,6 +309,7 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
+guides/ai-search.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md

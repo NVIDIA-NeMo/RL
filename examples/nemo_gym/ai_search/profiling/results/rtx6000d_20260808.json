@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-08-08",
+  "hardware": {
+    "gpu": "NVIDIA RTX 6000D",
+    "gpu_memory_mib": 85651,
+    "driver": "595.58.03",
+    "python": "3.13.14"
+  },
+  "software": {
+    "torch": "2.11.0+cu130",
+    "vllm": "0.25.1",
+    "cuvs": "26.06.00",
+    "cupy": "14.1.1",
+    "transformers": "5.8.1",
+    "nemo_rl_commit": "0e687e6d07623d780a4174310e92382ce738a8a2",
+    "nemo_gym_commit": "473f446f71ec7c1243eb1517fe2440a2b37fe68b"
+  },
+  "retrieval": {
+    "dimension": 384,
+    "top_k": 10,
+    "distribution": "clustered",
+    "results": {
+      "100000": {
+        "repeats": 20,
+        "numpy": {"batch1_p50_ms": 24.609, "batch32_p50_ms": 68.081, "recall_at_10": 1.0},
+        "faiss_cpu": {"batch1_p50_ms": 4.816, "batch32_p50_ms": 16.512, "recall_at_10": 1.0},
+        "torch_cuda": {"batch1_p50_ms": 0.235, "batch32_p50_ms": 0.331, "recall_at_10": 1.0},
+        "cuvs_brute_force": {"batch1_p50_ms": 0.383, "batch32_p50_ms": 0.676, "recall_at_10": 1.0},
+        "cuvs_cagra": {"batch1_p50_ms": 0.694, "batch32_p50_ms": 0.789, "recall_at_10": 1.0}
+      },
+      "1000000": {
+        "repeats": 10,
+        "numpy": {"batch1_p50_ms": 232.361, "batch32_p50_ms": 620.017, "recall_at_10": 1.0},
+        "faiss_cpu": {"batch1_p50_ms": 17.648, "batch32_p50_ms": 144.697, "recall_at_10": 1.0},
+        "torch_cuda": {"batch1_p50_ms": 1.332, "batch32_p50_ms": 2.114, "recall_at_10": 1.0},
+        "cuvs_brute_force": {"batch1_p50_ms": 1.610, "batch32_p50_ms": 2.630, "recall_at_10": 1.0},
+        "cuvs_cagra": {"batch1_p50_ms": 0.712, "batch32_p50_ms": 0.847, "recall_at_10": 1.0}
+      }
+    }
+  },
+  "pipeline": {
+    "documents": 32,
+    "encoder": "intfloat/e5-small-v2",
+    "index": "cuvs/brute_force",
+    "engine_init_ms": 7031.871,
+    "batch1": {"wall_p50_ms": 3.846, "encode_p50_ms": 3.453, "index_p50_ms": 0.371, "fetch_p50_ms": 0.012},
+    "batch4": {"wall_p50_ms": 4.868, "encode_p50_ms": 4.453, "index_p50_ms": 0.381, "fetch_p50_ms": 0.023},
+    "batch8": {"wall_p50_ms": 5.061, "encode_p50_ms": 4.631, "index_p50_ms": 0.386, "fetch_p50_ms": 0.034},
+    "microbatch_speedup_vs_serial": {"batch1": 0.627, "batch4": 2.109, "batch8": 4.076},
+    "cached_query_total_ms": 0.351
+  },
+  "grpo_one_step": {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "prompts": 2,
+    "generations_per_prompt": 4,
+    "setup_s": 102.194,
+    "initial_validation_s": 4.833,
+    "generation_s": 3.131,
+    "policy_and_reference_logprobs_s": 5.626,
+    "policy_training_s": 2.354,
+    "reward_calculation_s": 0.0036,
+    "post_update_validation_s": 2.814,
+    "local_checkpoint_s": 23.042,
+    "total_step_s": 52.066,
+    "generation_tokens_per_second_per_gpu": 1461.975,
+    "policy_training_tokens_per_second_per_gpu": 1945.002,
+    "end_to_end_tokens_per_second_per_gpu": 87.927,
+    "peak_gpu_memory_gib": 40.372,
+    "peak_host_memory_gib": 53.685,
+    "mean_search_calls": 0.5,
+    "invalid_tool_call_rate": 0.0,
+    "search_error_count": 0.0
+  }
+}

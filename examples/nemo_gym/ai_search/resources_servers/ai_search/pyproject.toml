@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=80.10.2", "wheel>=0.46.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemo-rl-ai-search-server"
+version = "0.1.0"
+description = "NeMo Gym local AI-search resources server backed by NVIDIA cuVS"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  # Gym's `env test` command runs pytest inside each isolated server venv.
+  "nemo-gym[dev]",
+  "numpy>=2.1,<3",
+  "pyyaml>=6.0.2",
+  "torch==2.11.0",
+  "transformers>=5.5,<5.9",
+  "cuvs-cu13==26.6.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "cupy-cuda13x==14.1.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=9.0.3",
+  "pytest-asyncio>=1.3.0",
+]
+profile = [
+  "faiss-cpu>=1.12.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["retrieval*"]
+
+[tool.uv.sources]
+nemo-gym = { path = "../../../../../3rdparty/Gym-workspace/Gym", editable = true }
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

@@ -1,0 +1,70 @@
+# GRPO recipe for the local cuVS-backed AI-search environment.
+defaults: ../../configs/recipes/llm/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.yaml
+
+grpo:
+  max_num_epochs: 100
+  max_num_steps: 50
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  max_rollout_turns: 1
+  val_period: 10
+  val_at_start: true
+  val_at_end: true
+  val_num_generations_per_prompt: 1
+  skip_reference_policy_logprobs_calculation: false
+  invalid_tool_call_advantage: -2.0
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+    reward_weights: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+
+policy:
+  max_total_sequence_length: 2048
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      gpu_memory_utilization: 0.45
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+
+data:
+  train:
+    data_path: examples/nemo_gym/ai_search/resources_servers/ai_search/data/train.jsonl
+  validation:
+    data_path: examples/nemo_gym/ai_search/resources_servers/ai_search/data/validation.jsonl
+
+env:
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/ai_search/configs/ai_search.yaml
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-ai-search-qwen2.5-1.5b
+  metric_name: val:accuracy
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 10
+
+logger:
+  log_dir: logs/grpo-ai-search-qwen2.5-1.5b
+  num_val_samples_to_print: 4
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl-ai-search
+    name: qwen2.5-1.5b-cuvs-grpo
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

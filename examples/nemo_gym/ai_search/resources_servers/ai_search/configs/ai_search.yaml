@@ -1,0 +1,75 @@
+ai_search:
+  resources_servers:
+    ai_search:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: Multi-turn local search with an NVIDIA cuVS vector index
+      value: Train models to decide when and how to search a private corpus
+      num_workers: 1
+      search:
+        corpus_path: data/corpus.jsonl
+        embeddings_path: data/index/e5-small-v2.embeddings.npy
+        verify_artifact_hash: true
+        encoder:
+          kind: e5
+          model_name: intfloat/e5-small-v2
+          device: cuda:0
+          dtype: float16
+          batch_size: 64
+          max_length: 256
+          dimension: 384
+          query_prefix: "query: "
+          passage_prefix: "passage: "
+          normalize: true
+          trust_remote_code: false
+        index:
+          kind: cuvs
+          algorithm: brute_force
+          metric: cosine
+          serialized_index_path: data/index/e5-small-v2.brute-force.cuvs
+          save_built_index: true
+          graph_degree: 64
+          intermediate_graph_degree: 128
+          build_algorithm: nn_descent
+          search_width: 1
+          itopk_size: 1024
+        default_top_k: 3
+        max_top_k: 10
+        max_query_chars: 512
+        max_passage_chars: 1800
+        max_search_calls: 4
+        batch_max_size: 64
+        batch_wait_ms: 2.0
+        query_cache_size: 4096
+        include_scores: true
+        reward:
+          answer_weight: 1.0
+          retrieval_weight: 0.25
+          format_weight: 0.1
+          efficiency_weight: 0.05
+          answer_threshold_for_efficiency: 0.5
+
+ai_search_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: ai_search
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 5
+      datasets:
+      - name: train
+        type: train
+        jsonl_fpath: resources_servers/ai_search/data/train.jsonl
+        license: Apache 2.0
+      - name: validation
+        type: validation
+        jsonl_fpath: resources_servers/ai_search/data/validation.jsonl
+        license: Apache 2.0
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/ai_search/data/example.jsonl
