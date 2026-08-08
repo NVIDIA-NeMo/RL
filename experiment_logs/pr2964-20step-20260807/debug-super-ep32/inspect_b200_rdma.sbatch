@@ -38,11 +38,13 @@ import torch
 
 print(f"torch={torch.__version__}")
 print(f"cuda_devices={torch.cuda.device_count()}")
-print(f"nixl={importlib.util.find_spec('nixl')}")
+nixl_spec = importlib.util.find_spec("nixl")
+print(f"nixl={nixl_spec}")
 print(f"sitepackages={site.getsitepackages()}")
 for root, _, files in os.walk("/opt/nemo_rl_venv"):
     for name in files:
         if name.startswith("libnixl") or name in {"nixl.h", "nixl.hpp"}:
             print(os.path.join(root, name))
 PY
+    /opt/nemo_rl_venv/bin/python -m pip show -f nixl nixl-cu13 || true
   '
