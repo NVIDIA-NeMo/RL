@@ -107,6 +107,7 @@ def make_processed_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     create_packed_seq_padding_mask: bool = False,
+    prepad_packed_seq_for_hybridep: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -122,6 +123,8 @@ def make_processed_microbatch_iterator(
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
         create_packed_seq_padding_mask: Whether to mask packed padding from MoE routing
+        prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
+            HybridEP group before model forward
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -145,6 +148,7 @@ def make_processed_microbatch_iterator(
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+            prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         )
 
         yield ProcessedMicrobatch(
@@ -197,6 +201,7 @@ def get_microbatch_iterator(
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
     create_packed_seq_padding_mask = False
+    prepad_packed_seq_for_hybridep = False
 
     _, seq_dim_size = get_and_validate_seqlen(data)
 
@@ -211,6 +216,9 @@ def get_microbatch_iterator(
         create_packed_seq_padding_mask = _uses_hybridep_flex_dispatcher(
             cfg["megatron_cfg"]
         )
+        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
+            "megatron_cfg"
+        ].get("moe_hybridep_prepad_packed_inputs", False)
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -239,6 +247,7 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
         create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+        prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
@@ -493,12 +502,17 @@ def process_microbatch(
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
     create_packed_seq_padding_mask: bool = False,
+    prepad_packed_seq_for_hybridep: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
         raise NotImplementedError(
             "HybridEP padding masks are not supported for models that perform "
             "context-parallel input slicing internally."
+        )
+    if prepad_packed_seq_for_hybridep and delegate_pack_to_model:
+        raise NotImplementedError(
+            "HybridEP input prepadding requires NeMo-owned sequence packing."
         )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
@@ -652,20 +666,21 @@ def process_microbatch(
                 else:
                     input_ids_cp_sharded = local_input_ids
                 if create_packed_seq_padding_mask:
-                    (
-                        input_ids,
-                        input_ids_cp_sharded,
-                        packed_seq_params,
-                        cu_seqlens_padded,
-                    ) = _pad_packed_seq_for_hybridep(
-                        input_ids=input_ids,
-                        input_ids_cp_sharded=input_ids_cp_sharded,
-                        packed_seq_params=packed_seq_params,
-                        cu_seqlens_padded=cu_seqlens_padded,
-                        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
-                    )
+                    if prepad_packed_seq_for_hybridep:
+                        (
+                            input_ids,
+                            input_ids_cp_sharded,
+                            packed_seq_params,
+                            cu_seqlens_padded,
+                        ) = _pad_packed_seq_for_hybridep(
+                            input_ids=input_ids,
+                            input_ids_cp_sharded=input_ids_cp_sharded,
+                            packed_seq_params=packed_seq_params,
+                            cu_seqlens_padded=cu_seqlens_padded,
+                            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                            cp_rank=get_context_parallel_rank(),
+                            cp_size=get_context_parallel_world_size(),
+                        )
                     full_padding_mask = _get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_padded=cu_seqlens_padded,
