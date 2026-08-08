@@ -1,0 +1,12 @@
+---
+cluster: gcp-nrt-cs-001
+ssh_host: gcp-nrt
+user: sna
+remote_cwd: /lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/experiments/pr2964-20step-20260807/debug-super-ep32
+partition: batch
+account: coreai_chef_posttrain
+container_image: /lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh
+mounts:
+  - /lustre:/lustre
+gpus_per_node: 8
+---
