@@ -15,12 +15,18 @@ struct ibv_mr *ibv_reg_mr_iova2(
     void *addr,
     size_t length,
     uint64_t iova,
-    unsigned int access) {
+  unsigned int access) {
   static ibv_reg_mr_iova2_fn real_fn;
   if (real_fn == NULL) {
-    real_fn = (ibv_reg_mr_iova2_fn)dlsym(RTLD_NEXT, "ibv_reg_mr_iova2");
+    void *handle = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+      fprintf(stderr, "ibv-trace dlopen failed: %s\n", dlerror());
+      abort();
+    }
+    real_fn = (ibv_reg_mr_iova2_fn)dlvsym(
+        handle, "ibv_reg_mr_iova2", "IBVERBS_1.8");
     if (real_fn == NULL) {
-      fprintf(stderr, "ibv-trace dlsym failed: %s\n", dlerror());
+      fprintf(stderr, "ibv-trace dlvsym failed: %s\n", dlerror());
       abort();
     }
   }
