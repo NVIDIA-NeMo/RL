@@ -15,7 +15,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${script_dir}/performance_case.sh"
 
 work_root=/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna
-repo=${work_root}/experiments/pr2964-20step-20260807/RL
+repo=${VALIDATION_REPO_OVERRIDE:-${work_root}/experiments/pr2964-20step-20260807/RL}
 experiment_root=${work_root}/experiments/pr2964-20step-20260807
 run_name=${RUN_NAME_OVERRIDE:-${model}-sync-${dispatcher}-pr2964-dmabuf-cudava-20step}
 run_root=${experiment_root}/runs/${run_name}
@@ -26,6 +26,7 @@ wheel_sha256=${HYBRID_EP_WHEEL_SHA256_OVERRIDE:-f181085dcbfdcb88bc2a33f9df52d4ac
 overlay=/tmp/nemo-rl-hybridep-17cf
 job_dependency=${JOB_DEPENDENCY:-}
 slurm_exclude=${SLURM_EXCLUDE:-}
+validation_head=${VALIDATION_HEAD_OVERRIDE:-a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f}
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"NeMo-RL performance recipe model initialization and colocated vLLM startup"}}'
 
 render_case "${model}" "${dispatcher}" "${run_root}"
@@ -36,7 +37,7 @@ case "${model}" in
   nemotron3-super) time_limit=08:00:00 ;;
 esac
 
-test "$(git -C "${repo}" rev-parse HEAD)" = a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f
+test "$(git -C "${repo}" rev-parse HEAD)" = "${validation_head}"
 git -C "${repo}" merge-base --is-ancestor 60a10b4f54c2754d44150771a06260fe9e8b186f HEAD
 git -C "${repo}" merge-base --is-ancestor a9aaa395c37963a9fd8a7320d61a516c7b714e57 HEAD
 test -z "$(git -C "${repo}" status --porcelain --untracked-files=no --ignore-submodules=untracked)"

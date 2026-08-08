@@ -72,5 +72,8 @@ assert_contains "${submit_script}" '--comment=${job_reaper_comment}'
 assert_contains "${submit_script}" '"exemptIdleTimeMins":"90"'
 assert_contains "${submit_script}" 'model initialization and colocated vLLM startup'
 assert_contains "${submit_script}" 'nemotron3-super) time_limit=08:00:00'
+assert_contains "${submit_script}" 'repo=${VALIDATION_REPO_OVERRIDE:-${work_root}/experiments/pr2964-20step-20260807/RL}'
+assert_contains "${submit_script}" 'validation_head=${VALIDATION_HEAD_OVERRIDE:-a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f}'
+assert_contains "${submit_script}" 'test "$(git -C "${repo}" rev-parse HEAD)" = "${validation_head}"'
 
 printf 'performance-case-tests-pass\n'
