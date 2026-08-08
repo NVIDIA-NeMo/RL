@@ -336,3 +336,56 @@ def test_ipc_refit_and_missing_worker_group():
     broken.worker_group.workers = []
     with pytest.raises(RuntimeError, match="Worker group not initialised"):
         broken.update_weights_via_ipc_zmq()
+
+
+def test_clear_logger_metrics_disabled_returns_without_dispatch():
+    # enable_trtllm_metrics_logger absent → early return, no workers touched
+    generation = _bare_generation()
+    generation.clear_logger_metrics()
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
+
+
+def test_clear_logger_metrics_dispatches_when_enabled(monkeypatch):
+    generation = _bare_generation(enable_trtllm_metrics_logger=True)
+    generation.worker_group.run_all_workers_single_data.return_value = [None, None]
+    monkeypatch.setattr(trtllm_generation.ray, "get", lambda values: values)
+
+    generation.clear_logger_metrics()
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "clear_trtllm_logger_metrics",
+        run_rank_0_only_axes=["tensor_parallel"],
+    )
+
+
+def test_get_logger_metrics_disabled_returns_empty():
+    generation = _bare_generation()
+    assert generation.get_logger_metrics() == {}
+    generation.worker_group.run_single_worker_single_data.assert_not_called()
+
+
+def test_get_logger_metrics_returns_reshaped_stats(monkeypatch):
+    generation = _bare_generation(enable_trtllm_metrics_logger=True, dp_size=2)
+    generation.worker_group.dp_size = 2
+    generation.worker_group.get_dp_leader_worker_idx.side_effect = lambda idx: idx
+
+    per_dp_stats = [
+        {
+            "inflight_batch_sizes": [1, 2],
+            "num_pending_samples": [3],
+            "kv_cache_usage_perc": [0.5],
+        },
+        {
+            "inflight_batch_sizes": [4],
+            "num_pending_samples": [5, 6],
+            "kv_cache_usage_perc": [0.8],
+        },
+    ]
+    generation.worker_group.run_single_worker_single_data.side_effect = per_dp_stats
+    monkeypatch.setattr(trtllm_generation.ray, "get", lambda values: values)
+
+    metrics = generation.get_logger_metrics()
+
+    assert metrics["inflight_batch_sizes"] == {0: [1, 2], 1: [4]}
+    assert metrics["num_pending_samples"] == {0: [3], 1: [5, 6]}
+    assert metrics["kv_cache_usage_perc"] == {0: [0.5], 1: [0.8]}

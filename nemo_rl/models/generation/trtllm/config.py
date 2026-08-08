@@ -49,6 +49,11 @@ class TrtllmSpecificArgs(TypedDict):
     #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
     tool_parser: NotRequired[str]
     reasoning_parser: NotRequired[str]
+    # Enable per-iteration in-flight batching telemetry (TRT-LLM analog of
+    # vLLM's per_worker_inflight_batch_sizes). Requires async_engine=True.
+    enable_trtllm_metrics_logger: NotRequired[bool]
+    # Drain poll interval in seconds. Only used when enable_trtllm_metrics_logger is True.
+    trtllm_metrics_logger_interval: NotRequired[float]
 
 
 class TrtllmConfig(GenerationConfig):
