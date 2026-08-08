@@ -258,9 +258,9 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 07:58 PDT</span>
+        <span>Updated 2026-08-08 09:23 PDT</span>
         <span>Validation source a028b33b</span>
-        <span>DeepEP 17cfb817 + f725d296 diagnostics</span>
+        <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>20 steps per workload</span>
       </div>
     </header>
@@ -268,8 +268,8 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill failed">Super inter-node RDMA blocked</span></div>
-        <p>Qwen previously completed 20/20 and retry 505735 reached Step 12 without a fatal error. Super retry 505736 passed generation but failed in its first EP=32 inter-node dispatch; it was cancelled after the fatal worker exits to release 256 GPUs.</p>
+        <div class="value"><span class="pill pending">Qwen pass · Super queued</span></div>
+        <p>Qwen retry 505735 completed 20/20 with Slurm exit 0. Super retry 505736 exposed an inter-node DMA-BUF MR address mismatch. Fix wheel 506072 passed forced two-node dispatch and combine in job 506083; canonical 32 × 8 Super job 506100 is queued for 20 steps.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -278,19 +278,19 @@
       </article>
       <article class="card">
         <div class="label">Runtime artifact</div>
-        <div class="value"><span class="pill failed">Constructor only</span></div>
-        <p>The guarded CUDA DMA-BUF fallback prevents the null-MR constructor segfault, but the first real inter-node transfer receives a negative DOCA CQ status. It is not an end-to-end fix.</p>
+        <div class="value"><span class="pill ready">Inter-node probe passed</span></div>
+        <p>The fix registers a page-aligned DMA-BUF MR while preserving the original CUDA buffer address in every local WQE and exchanged remote address. Job 506083 completed dispatch and combine with exit <code>0:0</code>.</p>
       </article>
       <article class="card">
         <div class="label">Measurements</div>
         <div class="value"><span class="pill ready">Qwen measured</span></div>
-        <p>Qwen steady-state values use all 19 samples from Steps 2–20. Super completed no training step, so no performance number is reported.</p>
+        <p>Latest Qwen steady-state values use all 19 samples from Steps 2–20 of job 505735. Super completed no training step, so no performance number is reported.</p>
       </article>
     </div>
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 07:58 PDT. Qwen retry 505735 is running; Super retry 505736 exposed a second, traffic-time RDMA failure after constructor registration.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 09:23 PDT. Qwen retry 505735 completed, two-node inter-node traffic validation passed, and canonical Super retry 506100 is pending resources.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -344,9 +344,37 @@
         <article class="job">
           <div class="job-head">
             <h3>505735 / 505736 · Canonical 20-step retries</h3>
-            <span class="pill failed">Mixed</span>
+            <span class="pill failed">Qwen pass · Super blocked</span>
           </div>
-          <p>Qwen job 505735 reached Step 12/20 with generation, logprob, and policy training active. Super job 505736 initialized all 256 vLLM and policy workers, completed Step 1 generation/reward/advantage, then failed at <code>hybrid_ep_backend.cuh:1187</code> when <code>doca_gpu_dev_verbs_poll_cq()</code> returned a negative status during the first inter-node reference-logprob dispatch.</p>
+          <p>Qwen job 505735 completed 20/20 with exit <code>0:0</code>. Super job 505736 initialized all 256 vLLM and policy workers, completed Step 1 generation/reward/advantage, then failed at <code>hybrid_ep_backend.cuh:1187</code> when <code>doca_gpu_dev_verbs_poll_cq()</code> returned a negative status during the first inter-node reference-logprob dispatch.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505820 / 505831 / 505845 · First failing WQE</h3>
+            <span class="pill ready">Root cause isolated</span>
+          </div>
+          <p>Job 505820 reproduced the Super CQ assertion with 2 nodes × 1 GPU and forced remote routing. CQ debug 505831 first observed a final flushed WQE. Sequential CQ polling in 505845 identified WQE 0 with mlx5 syndrome <code>0x04</code> (<code>LOCAL_PROT_ERR</code>), proving the local DMA-BUF MR mapping fails before remote atomic.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505892 / 505979 / 506063 · Registration hypotheses</h3>
+            <span class="pill ready">Narrowed</span>
+          </div>
+          <p>Full CUDA allocation registration was rejected for non-page-aligned <code>cudaMalloc</code> addresses. Mirroring NCCL zero-based registration alone also failed because DeepEP consumed <code>mr-&gt;addr</code> as the CUDA buffer address. These small probes failed before any full Super allocation.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>506072 / 506083 · CUDA-VA-preserving fix</h3>
+            <span class="pill ready">Passed</span>
+          </div>
+          <p>Wheel 506072 was built from DeepEP <code>17cfb817</code> plus fix <code>a9d657d2</code>. Job 506083 forced all 128 tokens across two nodes, then completed buffer creation, dispatch, and combine with Slurm exit <code>0:0</code>.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>506100 · Canonical Super 20-step retry</h3>
+            <span class="pill pending">Pending resources</span>
+          </div>
+          <p>Uses <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, 32 nodes × 8 B200 GPUs, the validated wheel SHA <code>f181085d…47f559d</code>, and the same generation compatibility overrides as retry 505736.</p>
         </article>
       </div>
     </section>
@@ -373,22 +401,22 @@
           <tbody>
             <tr>
               <td><strong>Qwen3-30B-A3B</strong><br><code>grpo-qwen3-30ba3b-4n8g.yaml</code></td>
-              <td>505121</td>
+              <td>505735</td>
               <td>4 × 8 B200</td>
               <td>20 completed</td>
               <td class="metric">20/20 · exit 0</td>
-              <td class="metric">139.69 ± 12.00 s</td>
-              <td class="metric">50.87 ± 3.39 s</td>
-              <td class="metric">13.74 ± 1.20 s</td>
-              <td class="metric">1,494.17 E2E · 4,088.36 policy · 15,196.53 logprob <small>tok/s/GPU</small></td>
-              <td class="metric">loss 0.0011 mean · reward 0.5258 mean · validation accuracy 0.5469</td>
+              <td class="metric">140.08 ± 12.86 s</td>
+              <td class="metric">51.40 ± 2.85 s</td>
+              <td class="metric">13.73 ± 1.06 s</td>
+              <td class="metric">1,489.91 E2E · 4,039.14 policy · 15,175.88 logprob <small>tok/s/GPU</small></td>
+              <td class="metric">loss 0.0033 mean · reward 0.5250 mean · final validation accuracy 0.5312</td>
             </tr>
             <tr>
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
-              <td>505091 / 505208 / 505245 / 505265<br>fixed retry: 505736</td>
+              <td>505091 / 505208 / 505245 / 505265<br>DMA-BUF retry: 505736<br>fixed retry: 506100</td>
               <td>32 × 8 B200</td>
               <td>No completed step</td>
-              <td class="metric">505736: Step 1 generation passed; first reference-logprob inter-node dispatch failed at DOCA CQ polling.</td>
+              <td class="metric">506083 inter-node dispatch/combine passed; canonical 506100 is pending. No Super training-step metric yet.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -506,25 +534,37 @@
         </li>
         <li>
           <h3>Canonical model validation resumed</h3>
-          <p>Jobs 505735 and 505736 use the repository performance recipes with 20 steps and explicit HybridEP topology. Qwen reached Step 12 with generation, logprob, and policy training active. Super completed all 256 vLLM and policy-worker initializations plus Step 1 generation, rewards, and advantages.</p>
+          <p>Jobs 505735 and 505736 use the repository performance recipes with 20 steps and explicit HybridEP topology. Qwen completed all 20 steps with Slurm exit <code>0:0</code>. Super completed all 256 vLLM and policy-worker initializations plus Step 1 generation, rewards, and advantages.</p>
         </li>
         <li>
           <h3>Super exposed a traffic-time RDMA completion failure</h3>
           <p>At the first reference-logprob dispatch, all ranks selected the DMA-BUF fallback and began inter-node traffic. The DOCA dispatch kernel then failed at <code>hybrid_ep_backend.cuh:1187</code> because <code>doca_gpu_dev_verbs_poll_cq()</code> returned a negative status. The later Transformer Engine grouped-GEMM launch errors were downstream symptoms of the device-side assertion. Job 505736 was cancelled only after the driver was terminal, avoiding 256 idle GPUs.</p>
         </li>
         <li>
-          <h3>Minimal transfer reproduction launched</h3>
-          <p>Job 505820 uses two nodes and one GPU per node, forces every token to an expert on the other node, and exercises dispatch plus combine without model weights. This closes the gap in the earlier constructor-only probes and will determine whether a DeepEP MR/address correction is sufficient or the cluster needs a GPUDirect RDMA capability change.</p>
+          <h3>Minimal transfer reproduction isolated WQE 0</h3>
+          <p>Job 505820 used two nodes and one GPU per node, forced every token to an expert on the other node, and reproduced the same dispatch assertion without model weights. Job 505831 enabled CQ diagnostics and observed syndrome <code>0x05</code> on the final WQE, meaning it was flushed by an earlier failure. Job 505845 polled completions sequentially and identified WQE 0 with syndrome <code>0x04</code>, which Linux mlx5 maps to <code>IB_WC_LOC_PROT_ERR</code>.</p>
+        </li>
+        <li>
+          <h3>Registration hypotheses rejected cheaply</h3>
+          <p>Jobs 505979 and 506063 showed why the constructor-only fallback was insufficient. DeepEP <code>cudaMalloc</code> pointers can be non-page-aligned, and a DMA-BUF MR base is not necessarily the application buffer base. Using <code>mr-&gt;addr</code> as the token pointer therefore changed the address encoded in the first WQE.</p>
+        </li>
+        <li>
+          <h3>Original CUDA address preserved</h3>
+          <p>Fix <code>a9d657d2</code> registers the page-aligned DMA-BUF span for its lkey/rkey but stores the original allocation pointers in dispatch/combine memory-region metadata and remote address exchange. This is a no-op for the legacy path, where the MR and CUDA addresses already match.</p>
+        </li>
+        <li>
+          <h3>Actual inter-node traffic passed</h3>
+          <p>Job 506083 forced 128 tokens to experts on the other B200 node with probabilities enabled. Both ranks used the DMA-BUF fallback; buffer creation, dispatch, and combine completed before Slurm exit <code>0:0</code>. Canonical 32 × 8 Super retry 506100 is pending resources.</p>
         </li>
       </ol>
       <div class="callout">
         W&amp;B is configured in offline mode by both launchers. Local Slurm, Ray, training, and TensorBoard artifacts are therefore the authoritative result sources. Current MCore keeps original and padded HybridEP token counts internally but does not log them; THD sequence-packing efficiency is distinct and will not be presented as HybridEP dispatch-padding overhead.
       </div>
       <div class="callout">
-        Qwen correctness sanity: all logged loss, reward, gradient, and KL values are finite; mean generation KL is 0.00190; median token multiplied-probability error is 1.022 and the final-step value is 1.022, both within the repository's large-model gates. Step 8 is a disclosed outlier at 101.66, so this run proves execution stability but is not sufficient by itself to claim zero numerical regression.
+        Qwen job 505735 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means 0.0033 and 0.5250, respectively. Final validation accuracy is 0.5312. These checks establish execution stability but do not by themselves prove zero numerical regression against a controlled baseline.
       </div>
       <div class="callout">
-        Current conclusion: the previous NeMo RL patch remains necessary and functional for THD unequal-dispatch padding; Qwen's real training path continues to validate it. Super's EP=32 topology additionally requires inter-node GPUDirect RDMA. On GCP B200, legacy <code>ibv_reg_mr</code> returns <code>EFAULT</code> and the node has no <code>nvidia_peermem</code> module. CUDA DMA-BUF makes registration and construction succeed, but job 505736 proves that the current fallback is insufficient for actual DOCA RDMA traffic. No Super performance metric is valid until the CQ failure is resolved.
+        Current conclusion: the previous NeMo RL patch remains necessary and functional for THD unequal-dispatch padding; Qwen's completed training path validates it. Super's separate failure was in DeepEP inter-node GPUDirect RDMA: GCP-NRT rejects legacy GPU <code>ibv_reg_mr</code>, and the first DMA-BUF fallback conflated MR base and CUDA buffer base. The corrected address handling passes real dispatch and combine. End-to-end Super correctness and performance remain pending job 506100.
       </div>
     </section>
 
