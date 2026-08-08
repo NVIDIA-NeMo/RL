@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator, Optional, Tuple
 
 import torch
@@ -24,6 +26,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_expert_tensor_and_model_parallel_group,
 )
 from megatron.core.utils import StragglerDetector
 
@@ -35,6 +38,9 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+
+logger = logging.getLogger(__name__)
+_HYBRIDEP_PACKING_LOG_CALLS = 0
 
 
 @dataclass
@@ -269,6 +275,154 @@ def _uses_hybridep_flex_dispatcher(megatron_cfg: dict[str, Any]) -> bool:
     )
 
 
+def _get_hybridep_aligned_seq_len(
+    local_seq_len: int,
+    multiple: int,
+    device: torch.device,
+) -> int:
+    target = torch.tensor([local_seq_len], dtype=torch.int64, device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_expert_tensor_and_model_parallel_group(check_initialized=False)
+        torch.distributed.all_reduce(
+            target,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+        )
+
+    target_seq_len = int(target.item())
+    if multiple > 1:
+        target_seq_len = _round_up_to_multiple(target_seq_len, multiple)
+    return target_seq_len
+
+
+def _get_hybridep_local_pad_multiple(
+    pad_packed_seq_to_multiple_of: int,
+    cp_size: int,
+) -> int:
+    if cp_size == 1:
+        return pad_packed_seq_to_multiple_of
+    if pad_packed_seq_to_multiple_of <= 1:
+        return 1
+    assert pad_packed_seq_to_multiple_of % cp_size == 0, (
+        "HybridEP packed sequence multiple must be divisible by context "
+        f"parallel size; got multiple={pad_packed_seq_to_multiple_of}, "
+        f"cp_size={cp_size}."
+    )
+    return max(1, pad_packed_seq_to_multiple_of // cp_size)
+
+
+def _get_packed_seq_boundaries(
+    cu_seqlens_padded: torch.Tensor,
+) -> list[tuple[int, int]]:
+    boundaries = cu_seqlens_padded.detach().cpu().tolist()
+    return [
+        (int(boundaries[index]), int(boundaries[index + 1]))
+        for index in range(len(boundaries) - 1)
+    ]
+
+
+def _shard_packed_seq_on_this_cp_rank(
+    packed_tensor: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    if cp_size == 1:
+        return packed_tensor
+
+    cp_chunks = []
+    for start, end in _get_packed_seq_boundaries(cu_seqlens_padded):
+        slices = [slice(None)] * packed_tensor.dim()
+        slices[seq_dim] = slice(start, end)
+        cp_chunks.append(
+            _get_tokens_on_this_cp_rank(
+                packed_tensor[tuple(slices)],
+                cp_rank,
+                cp_size,
+                seq_dim=seq_dim,
+            )
+        )
+    return torch.cat(cp_chunks, dim=seq_dim).contiguous()
+
+
+def _pad_packed_seq_for_hybridep(
+    input_ids: torch.Tensor,
+    input_ids_cp_sharded: torch.Tensor,
+    packed_seq_params: PackedSeqParams,
+    cu_seqlens_padded: torch.Tensor,
+    pad_packed_seq_to_multiple_of: int,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
+    """Align packed inputs once, before model collectives can overlap."""
+    global _HYBRIDEP_PACKING_LOG_CALLS
+
+    local_seq_len = input_ids_cp_sharded.shape[1]
+    local_pad_multiple = _get_hybridep_local_pad_multiple(
+        pad_packed_seq_to_multiple_of,
+        cp_size,
+    )
+    target_seq_len = _get_hybridep_aligned_seq_len(
+        local_seq_len,
+        local_pad_multiple,
+        input_ids_cp_sharded.device,
+    )
+
+    if os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING", "0") == "1":
+        max_log_calls = int(os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS", "32"))
+        if _HYBRIDEP_PACKING_LOG_CALLS < max_log_calls:
+            _HYBRIDEP_PACKING_LOG_CALLS += 1
+            logger.warning(
+                "HybridEP packed sequence padding: rank=%s call=%s "
+                "local_tokens=%s target_tokens=%s added_tokens=%s overhead_pct=%.4f",
+                torch.distributed.get_rank()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 0,
+                _HYBRIDEP_PACKING_LOG_CALLS,
+                local_seq_len,
+                target_seq_len,
+                target_seq_len - local_seq_len,
+                100.0 * (target_seq_len - local_seq_len) / max(local_seq_len, 1),
+            )
+
+    if target_seq_len == local_seq_len:
+        return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
+
+    local_pad_len = target_seq_len - local_seq_len
+    full_pad_len = local_pad_len * cp_size
+    input_ids = torch.nn.functional.pad(input_ids, (0, full_pad_len), value=0)
+
+    cu_seqlens_padded = cu_seqlens_padded.clone()
+    cu_seqlens_padded[-1] += full_pad_len
+    input_ids_cp_sharded = _shard_packed_seq_on_this_cp_rank(
+        input_ids,
+        cu_seqlens_padded,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+    )
+    assert input_ids_cp_sharded.shape[1] == target_seq_len, (
+        "HybridEP CP-local input length must match the aligned target length; "
+        f"got {input_ids_cp_sharded.shape[1]} vs {target_seq_len}."
+    )
+
+    max_last_sequence_len = int(cu_seqlens_padded[-1] - cu_seqlens_padded[-2])
+    max_seqlen = max(int(packed_seq_params.max_seqlen_q), max_last_sequence_len)
+    packed_seq_params = replace(
+        packed_seq_params,
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        total_tokens=target_seq_len,
+    )
+    return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
+
+
 def _get_packed_seq_padding_mask(
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
@@ -459,6 +613,20 @@ def process_microbatch(
                 else:
                     input_ids_cp_sharded = local_input_ids
                 if create_packed_seq_padding_mask:
+                    (
+                        input_ids,
+                        input_ids_cp_sharded,
+                        packed_seq_params,
+                        cu_seqlens_padded,
+                    ) = _pad_packed_seq_for_hybridep(
+                        input_ids=input_ids,
+                        input_ids_cp_sharded=input_ids_cp_sharded,
+                        packed_seq_params=packed_seq_params,
+                        cu_seqlens_padded=cu_seqlens_padded,
+                        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
                     full_padding_mask = _get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_padded=cu_seqlens_padded,
