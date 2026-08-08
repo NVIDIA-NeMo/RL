@@ -16,7 +16,7 @@ index e2be012..3107841 100644
  
  // Functions realted to get RDMA context.
  ibv_device *ctx_find_dev(const char *ib_devname) {
-@@ -380,6 +384,87 @@ void RDMACoordinator::init(
+@@ -380,6 +384,109 @@ void RDMACoordinator::init(
    rdma_initialized = true;
  }
  
@@ -38,22 +38,37 @@ index e2be012..3107841 100644
 +    throw std::runtime_error(message.str());
 +  }
 +
-+  const long host_page_size = sysconf(_SC_PAGESIZE);
-+  if (host_page_size <= 0) {
-+    throw std::runtime_error("HybridEP failed to query the host page size");
-+  }
-+  const auto page_size = static_cast<uintptr_t>(host_page_size);
 +  const auto iova = reinterpret_cast<uintptr_t>(address);
-+  const auto aligned_address = iova & ~(page_size - 1);
-+  const auto dmabuf_offset = iova - aligned_address;
-+  const auto aligned_length =
-+      (length + dmabuf_offset + page_size - 1) & ~(page_size - 1);
++  CUdeviceptr allocation_base = 0;
++  size_t allocation_size = 0;
++  const CUresult range_result = cuMemGetAddressRange(
++      &allocation_base, &allocation_size, static_cast<CUdeviceptr>(iova));
++  if (range_result != CUDA_SUCCESS) {
++    const char *cuda_error = nullptr;
++    cuGetErrorString(range_result, &cuda_error);
++    std::ostringstream message;
++    message << "HybridEP failed to query the CUDA allocation for " << label
++            << " after ibv_reg_mr returned errno=" << legacy_errno
++            << ": CUDA error=" << range_result << " ("
++            << (cuda_error == nullptr ? "unknown" : cuda_error) << ")";
++    throw std::runtime_error(message.str());
++  }
++  if (allocation_base != static_cast<CUdeviceptr>(iova) ||
++      length > allocation_size) {
++    std::ostringstream message;
++    message << "HybridEP requires a base CUDA allocation for DMA-BUF "
++            << "registration: label=" << label << ", requested=" << address
++            << "/" << length << ", allocation="
++            << reinterpret_cast<void *>(allocation_base) << "/"
++            << allocation_size;
++    throw std::runtime_error(message.str());
++  }
 +
 +  int dmabuf_fd = -1;
 +  const CUresult export_result = cuMemGetHandleForAddressRange(
 +      &dmabuf_fd,
-+      static_cast<CUdeviceptr>(aligned_address),
-+      aligned_length,
++      allocation_base,
++      allocation_size,
 +      CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
 +      0);
 +  if (export_result != CUDA_SUCCESS) {
@@ -70,9 +85,9 @@ index e2be012..3107841 100644
 +  errno = 0;
 +  mr = ibv_reg_dmabuf_mr(
 +      ib_pd,
-+      dmabuf_offset,
-+      length,
-+      iova,
++      0,
++      allocation_size,
++      allocation_base,
 +      dmabuf_fd,
 +      mr_access_flag);
 +  const int dmabuf_errno = errno;
@@ -92,10 +107,17 @@ index e2be012..3107841 100644
 +    fprintf(
 +        stderr,
 +        "[HybridEP] ibv_reg_mr failed with errno=%d; using CUDA DMA-BUF "
-+        "registration fallback (rank=%d, local_rank=%d)\n",
++        "registration fallback (rank=%d, local_rank=%d, label=%s, "
++        "requested=%p/%zu, registered=%p/%zu, mr_addr=%p)\n",
 +        legacy_errno,
 +        node_rank * buffer_config.num_of_ranks_per_node + local_rank,
-+        local_rank);
++        local_rank,
++        label,
++        address,
++        length,
++        reinterpret_cast<void *>(allocation_base),
++        allocation_size,
++        mr->addr);
 +    dmabuf_fallback_logged = true;
 +  }
 +  return mr;
