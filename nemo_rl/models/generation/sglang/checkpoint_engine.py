@@ -109,8 +109,6 @@ async def _aligned_checkpoint_engine_batches(
                 "Checkpoint-engine streams ended with different weights across "
                 "SGLang ranks."
             )
-        if any(not queue for queue in pending):
-            continue
 
         aligned = [[] for _queue in pending]
         while all(pending):
