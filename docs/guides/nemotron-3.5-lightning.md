@@ -5,11 +5,14 @@ with NeMo RL on **GB200 NVL72** (ARM64 / aarch64) hardware.
 
 ## Overview
 
-The recipe post-trains Nemotron 3.5 Lightning with asynchronous Group Relative
-Policy Optimization (GRPO) and rewards from NeMo Gym. Training and policy
-generation use separate node pools. The GenRM and general-purpose NL2Bash judge
-run as external vLLM pools in the same Slurm heterogeneous allocation, while
-the smaller content-safety judge runs in the Gym pool.
+Nemotron 3.5 Lightning is post-trained in a single Reinforcement Learning with
+Verifiable Rewards (RLVR) stage using asynchronous Group Relative Policy
+Optimization (GRPO) and NeMo Gym.
+
+Training and policy generation use separate node pools. The GenRM and
+general-purpose NL2Bash judge run as external vLLM pools in the same Slurm
+heterogeneous allocation, while the smaller content-safety judge runs in the
+Gym pool.
 
 The recipe files are under
 `examples/nemo_gym/nemotron-3.5-lightning/`:
