@@ -237,20 +237,34 @@ During standard DPO training the model materializes a full logit tensor of shape
 
 **How to enable:**
 
-Add the following to your Megatron config in your YAML file:
+For Megatron, add the following to your YAML file:
 
 ```yaml
 policy:
   megatron_cfg:
     enabled: true
     use_fused_linear_logprobs: true
-    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+    fused_linear_logprobs_chunk_size: 256
 ```
+
+For AutoModel, set the equivalent top-level policy keys:
+
+```yaml
+policy:
+  dtensor_cfg:
+    enabled: true
+  use_fused_linear_logprobs: true
+  fused_linear_logprobs_chunk_size: 256
+```
+
+**Limitations:**
+
+- Context parallelism is not supported when fused linear logprobs are enabled.
+- Sequence packing and top-k/top-p training-time filtering are not supported.
+- Sequence packing is not supported with DPO regardless of this setting (see [#719](https://github.com/NVIDIA-NeMo/RL/issues/719)).
 
 **Notes:**
 
-- Context parallelism is not supported when fused linear logprobs are enabled.
-- Sequence packing is not supported with DPO regardless of this setting (see [#719](https://github.com/NVIDIA-NeMo/RL/issues/719)).
 - The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Evaluate the Trained Model
