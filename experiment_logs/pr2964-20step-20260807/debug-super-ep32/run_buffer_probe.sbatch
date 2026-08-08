@@ -50,8 +50,6 @@ srun \
   --nodes=4 \
   --ntasks-per-node=8 \
   --gpus-per-node=8 \
-  --gpus-per-task=1 \
-  --gpu-bind=single:1 \
   --kill-on-bad-exit=1 \
   --container-image="${container}" \
   --container-mounts=/lustre:/lustre \
