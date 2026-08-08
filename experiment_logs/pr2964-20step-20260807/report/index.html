@@ -258,8 +258,8 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 13:41 PDT</span>
-        <span>Base a028b33b · Super fix validation 37c195f4</span>
+        <span>Updated 2026-08-08 14:14 PDT</span>
+        <span>Base a028b33b · Super fix validation 37c195f4 / 3d6d1324</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore padding-mask fix 340af84f</span>
         <span>20 steps per workload</span>
@@ -269,8 +269,8 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Qwen 30B passed · large models running</span></div>
-        <p>Qwen3-30B-A3B baseline 506133 and HybridEP 505735 completed 20/20. Qwen3-235B baseline/HybridEP reached Steps 18/17. Super baseline reached Step 8; external-prepadding HybridEP retry 506397 is queued behind currently occupied B200 nodes.</p>
+        <div class="value"><span class="pill pending">Both Qwen pairs passed · Super running</span></div>
+        <p>Qwen3-30B-A3B and Qwen3-235B baseline/HybridEP pairs completed 20/20. Super baseline entered Step 10. External-prepadding HybridEP 506397 passed its former hang point, completed Step 1, and entered Step 2.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -284,14 +284,14 @@
       </article>
       <article class="card">
         <div class="label">Measurements</div>
-        <div class="value"><span class="pill ready">Qwen controlled pair</span></div>
-        <p>Qwen values use all 19 samples from Steps 2–20 of baseline 506133 and HybridEP 505735. HybridEP improves E2E time 2.00%, logprob time 6.77%, and policy-training time 4.37%.</p>
+        <div class="value"><span class="pill ready">Two controlled Qwen pairs</span></div>
+        <p>Qwen3-30B-A3B improves E2E/logprob/policy time by 2.00%/6.77%/4.37%. Qwen3-235B improves the same metrics by 1.35%/10.33%/22.44%. Both use all 19 samples from Steps 2–20.</p>
       </article>
     </div>
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 13:41 PDT. The controlled Qwen3-30B-A3B pair completed. Qwen3-235B and Super baseline are advancing. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; replacement 506397 restores one-time input prepadding before model collectives.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 14:14 PDT. Both controlled Qwen pairs completed 20/20. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; replacement 506397 restores one-time input prepadding and has crossed the first policy backward into Step 2.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -387,9 +387,9 @@
         <article class="job">
           <div class="job-head">
             <h3>506219 / 506220 · Qwen3-235B controlled retry</h3>
-            <span class="pill pending">Running</span>
+            <span class="pill ready">20/20 passed</span>
           </div>
-          <p>The baseline and HybridEP sides receive the same two generation-only compatibility settings: vLLM custom all-reduce is disabled and <code>fuse_allreduce_rms=false</code>. They have reached Steps 18 and 17, respectively; only the policy dispatcher differs.</p>
+          <p>The baseline and HybridEP sides receive the same two generation-only compatibility settings: vLLM custom all-reduce is disabled and <code>fuse_allreduce_rms=false</code>. Both completed 20/20 with exit <code>0:0</code>; only the policy dispatcher differs.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -401,9 +401,9 @@
         <article class="job">
           <div class="job-head">
             <h3>506123 / 506276 / 506397 · Canonical Super pair</h3>
-            <span class="pill pending">Baseline running · retry queued</span>
+            <span class="pill pending">Baseline running · retry Step 2</span>
           </div>
-          <p>Baseline 506123 reached Step 8. HybridEP 506276 passed generation and full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather on the shared EP communicator during the first policy backward. Retry 506397 uses the same canonical recipe and 32 × 8 topology, but performs that alignment once before forward and disables the per-layer padding collective for packed inputs.</p>
+          <p>Baseline 506123 entered Step 10. HybridEP 506276 passed generation and full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather on the shared EP communicator during the first policy backward. Retry 506397 performs alignment once before forward, completed that first backward and Step 1 without error, and entered Step 2.</p>
         </article>
       </div>
     </section>
@@ -446,21 +446,21 @@
               <td><strong>Qwen3-235B-A22B</strong><br><code>grpo-qwen3-235b-16n8g.yaml</code></td>
               <td>baseline 506219<br>HybridEP 506220</td>
               <td>16 × 8 B200</td>
-              <td>Steps 18 / 17</td>
-              <td class="metric">Both controlled retries are advancing after disabling the same cross-node FlashInfer all-reduce paths. Final Steps 2–20 aggregates are pending.</td>
-              <td class="metric">—</td>
-              <td class="metric">—</td>
-              <td class="metric">—</td>
-              <td class="metric">—</td>
-              <td class="metric">—</td>
-              <td class="metric">—</td>
+              <td>20 / 20</td>
+              <td class="metric">Both completed · exit 0</td>
+              <td class="metric">362.43 ± 131.43 s</td>
+              <td class="metric">252.00 ± 8.41 s</td>
+              <td class="metric">29.02 ± 2.62 s</td>
+              <td class="metric">12.45 ± 1.44 s</td>
+              <td class="metric">66.34 E2E · 89.34 generation · 776.79 policy · 1,818.38 logprob <small>tok/s/GPU</small></td>
+              <td class="metric">loss 0.0048 mean · reward 0.5841 mean · 512 valid samples/step</td>
             </tr>
             <tr>
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
               <td>baseline 506123<br>HybridEP 506397</td>
               <td>32 × 8 B200</td>
-              <td>Step 8 / queued</td>
-              <td class="metric">Baseline is advancing. Two earlier HybridEP retries proved full inter-node reference LogProb and isolated the expert-bias broadcast and per-layer collective-ordering bugs. External-prepadding retry 506397 is pending resources. Final metrics are pending.</td>
+              <td>Step 10 / Step 2</td>
+              <td class="metric">Baseline is advancing. External-prepadding retry 506397 completed generation, full inter-node LogProb, first policy backward, and Step 1 without the former collective timeout. Final metrics are pending.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -496,6 +496,27 @@
         </table>
       </div>
       <div class="callout">Correctness sanity: mean reward is 0.52578 baseline vs 0.52501 HybridEP, and all 2,048 samples remain valid at every measured step. Final validation accuracy is 0.5547 vs 0.5312, a difference of 3/128 examples; this small validation sample is not sufficient to assert an accuracy regression.</div>
+
+      <h3>Qwen3-235B-A22B · controlled baseline comparison</h3>
+      <p class="section-note">GCP-NRT B200 · canonical 16n8g performance recipe · arithmetic mean ± sample standard deviation over Steps 2–20 (n=19). Validation steps 10 and 20 are included. Positive delta means HybridEP is faster.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>All-to-all · 506219</th><th>HybridEP · 506220</th><th>HybridEP delta</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>E2E step time</td><td>367.40 ± 134.91 s</td><td>362.43 ± 131.43 s</td><td class="metric">1.35% faster</td></tr>
+            <tr><td>Generation time</td><td>251.86 ± 8.80 s</td><td>252.00 ± 8.41 s</td><td class="metric">0.06% slower</td></tr>
+            <tr><td>Logprob time</td><td>13.89 ± 1.59 s</td><td>12.45 ± 1.44 s</td><td class="metric">10.33% faster</td></tr>
+            <tr><td>Policy-training time</td><td>37.41 ± 4.43 s</td><td>29.02 ± 2.62 s</td><td class="metric">22.44% faster</td></tr>
+            <tr><td>E2E throughput</td><td>65.53</td><td>66.34</td><td class="metric">1.24% higher</td></tr>
+            <tr><td>Generation throughput</td><td>89.41</td><td>89.34</td><td class="metric">0.08% lower</td></tr>
+            <tr><td>Logprob throughput</td><td>1,630.85</td><td>1,818.38</td><td class="metric">11.50% higher</td></tr>
+            <tr><td>Policy-training throughput</td><td>604.93</td><td>776.79</td><td class="metric">28.41% higher</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">Correctness sanity: mean reward is 0.58378 baseline vs 0.58409 HybridEP; every measured step has 512 valid samples. Offline W&amp;B IDs are <code>ywy8ymxi</code> (baseline) and <code>90u9m07x</code> (HybridEP).</div>
     </section>
 
     <section aria-labelledby="historical-title">
@@ -642,7 +663,10 @@
         Qwen job 505735 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means 0.0033 and 0.5250, respectively. Final validation accuracy is 0.5312. These checks establish execution stability but do not by themselves prove zero numerical regression against a controlled baseline.
       </div>
       <div class="callout">
-        Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for sequence-packed HybridEP. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's expert-bias mask broadcast fix <code>340af84f</code> remain necessary for this GCP-NRT Super path. End-to-end validation is running in baseline 506123 and queued HybridEP 506397.
+        Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for explicitly supported sequence-packed HybridEP cases. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's expert-bias mask broadcast fix <code>340af84f</code> remain necessary for this GCP-NRT Super path. Baseline 506123 is running; HybridEP 506397 passed the former first-backward hang and entered Step 2.
+      </div>
+      <div class="callout">
+        Performance follow-up: MCore <code>340af84f</code> masks padding from router statistics but still dispatches padding rows through dropless HybridEP. This is numerically safe for the current no-capacity recipes but adds communication/GEMM work. Candidate pin <code>c8cedc3d</code> combines the expert-bias broadcast with routing-map/probability zeroing for padding rows. NeMo validation head <code>3d6d1324</code> also makes external prepadding an explicit PP1/MTP0 opt-in; PP8 Qwen3-235B continues using MCore's internal padding. Focused and performance validation are pending.
       </div>
     </section>
 
