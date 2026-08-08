@@ -14,7 +14,9 @@ source_root=${HYBRID_EP_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pw
 experiment_root=${HYBRID_EP_EXPERIMENT_ROOT:-/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/experiments/pr2964-20step-20260807}
 script_path=${source_root}/build_hybridep_17cf_dmabuf_b200.sbatch
 patch_path=${source_root}/patches/deepep_17cf_dmabuf_fallback.patch
+cache_patch_path=${source_root}/patches/deepep_17cf_cached_nccl_build.patch
 output_root=${experiment_root}/deepep-wheels
+nccl_artifact_cache=${HYBRID_EP_NCCL_ARTIFACT_CACHE:-${experiment_root}/debug-super-ep32/overlays/505979/deep_ep/backend/nccl}
 deepep_base_commit=17cfb817bccec3a9c247013360cc550c2bac441e
 deepep_fix_commit=6d11d654e965b1c967f72adfcec95dbc82043643
 
@@ -24,6 +26,7 @@ if [[ "${HYBRID_EP_BUILD_STAGE:-host}" != container ]]; then
   export HYBRID_EP_OUTPUT_ROOT="${output_root}"
   export HYBRID_EP_BASE_COMMIT="${deepep_base_commit}"
   export HYBRID_EP_FIX_COMMIT="${deepep_fix_commit}"
+  export HYBRID_EP_NCCL_ARTIFACT_CACHE="${nccl_artifact_cache}"
   exec srun \
     --nodes=1 \
     --ntasks-per-node=1 \
@@ -49,14 +52,22 @@ wheel_stage=${build_root}/wheel
 import_overlay=${build_root}/import-overlay
 artifact_dir=${HYBRID_EP_OUTPUT_ROOT}/${HYBRID_EP_BASE_COMMIT}-dmabuf-${SLURM_JOB_ID}
 patch_sha256=$(sha256sum "${patch_path}" | cut -d' ' -f1)
+cache_patch_sha256=$(sha256sum "${cache_patch_path}" | cut -d' ' -f1)
+test -d "${HYBRID_EP_NCCL_ARTIFACT_CACHE}/include"
+test -d "${HYBRID_EP_NCCL_ARTIFACT_CACHE}/obj"
+nccl_cache_sha256=$(
+  cd "${HYBRID_EP_NCCL_ARTIFACT_CACHE}"
+  find include obj -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+)
 
-git clone --filter=blob:none --recurse-submodules --branch hybrid-ep \
+git clone --filter=blob:none --branch hybrid-ep \
   https://github.com/deepseek-ai/DeepEP.git "${source_dir}"
 git -C "${source_dir}" checkout --detach "${HYBRID_EP_BASE_COMMIT}"
-git -C "${source_dir}" submodule update --init --recursive
 test "$(git -C "${source_dir}" rev-parse HEAD)" = "${HYBRID_EP_BASE_COMMIT}"
 git -C "${source_dir}" apply --check "${patch_path}"
 git -C "${source_dir}" apply "${patch_path}"
+git -C "${source_dir}" apply --check "${cache_patch_path}"
+git -C "${source_dir}" apply "${cache_patch_path}"
 git -C "${source_dir}" diff --check
 
 mkdir -p "${wheel_stage}" "${import_overlay}"
@@ -83,10 +94,13 @@ mkdir "${artifact_dir}"
 mv "${wheels[0]}" "${artifact_dir}/"
 wheel_path=${artifact_dir}/$(basename "${wheels[0]}")
 sha256sum "${wheel_path}" > "${wheel_path}.sha256"
-printf 'deepep_base_commit=%s\ndeepep_fix_commit=%s\npatch_sha256=%s\ngpu_arch=10.0\nslurm_job_id=%s\nwheel=%s\n' \
+printf 'deepep_base_commit=%s\ndeepep_fix_commit=%s\npatch_sha256=%s\ncache_patch_sha256=%s\nnccl_artifact_cache=%s\nnccl_cache_sha256=%s\ngpu_arch=10.0\nslurm_job_id=%s\nwheel=%s\n' \
   "${HYBRID_EP_BASE_COMMIT}" \
   "${HYBRID_EP_FIX_COMMIT}" \
   "${patch_sha256}" \
+  "${cache_patch_sha256}" \
+  "${HYBRID_EP_NCCL_ARTIFACT_CACHE}" \
+  "${nccl_cache_sha256}" \
   "${SLURM_JOB_ID}" \
   "${wheel_path}" \
   > "${artifact_dir}/metadata.env"

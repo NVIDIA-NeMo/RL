@@ -1,0 +1,59 @@
+diff --git a/setup.py b/setup.py
+index 2c91c6e..0633702 100644
+--- a/setup.py
++++ b/setup.py
+@@ -138,29 +138,44 @@ def get_extension_hybrid_ep_cpp():
+             print('  -> DOCA path: building NCCL/DOCA')
+             sources.extend(["csrc/hybrid_ep/buffer/internode_doca.cu"])
+             rdma_core_dir = os.getenv("RDMA_CORE_HOME", "")
+-            nccl_dir = os.path.join(current_dir, "third-party/nccl")
++            nccl_artifact_cache = os.getenv("HYBRID_EP_NCCL_ARTIFACT_CACHE", "")
+             compile_args["nvcc"].append(f"-DRDMA_CORE_HOME=\"{rdma_core_dir}\"")
+             extra_link_args.append(f"-l:libnvidia-ml.so.1")
+
+-            subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=current_dir)
+-            subprocess.run(
+-                ["make", "-j", "src.build", f"NVCC_GENCODE={to_nvcc_gencode(os.environ['TORCH_CUDA_ARCH_LIST'])}"],
+-                cwd=nccl_dir,
+-                check=True,
+-            )
+-            include_dirs.append(os.path.join(nccl_dir, "src/transport/net_ib/gdaki/doca-gpunetio/include"))
++            if nccl_artifact_cache:
++                nccl_include_dir = os.path.join(nccl_artifact_cache, "include")
++                nccl_object_dir = os.path.join(nccl_artifact_cache, "obj")
++                if not os.path.isdir(nccl_include_dir) or not os.path.isdir(nccl_object_dir):
++                    raise RuntimeError(
++                        "HYBRID_EP_NCCL_ARTIFACT_CACHE must contain include and obj"
++                    )
++            else:
++                nccl_dir = os.path.join(current_dir, "third-party/nccl")
++                subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=current_dir)
++                subprocess.run(
++                    ["make", "-j", "src.build", f"NVCC_GENCODE={to_nvcc_gencode(os.environ['TORCH_CUDA_ARCH_LIST'])}"],
++                    cwd=nccl_dir,
++                    check=True,
++                )
++                nccl_include_dir = os.path.join(
++                    nccl_dir, "src/transport/net_ib/gdaki/doca-gpunetio/include"
++                )
++                nccl_object_dir = os.path.join(
++                    nccl_dir, "build/obj/transport/net_ib/gdaki/doca-gpunetio"
++                )
++            include_dirs.append(nccl_include_dir)
+             include_dirs.append(os.path.join(rdma_core_dir, "include"))
+             library_dirs.append(os.path.join(rdma_core_dir, "lib"))
+             runtime_library_dirs.append(os.path.join(rdma_core_dir, "lib"))
+             libraries.append("mlx5")
+             libraries.append("ibverbs")
+             shutil.copytree(
+-                os.path.join(nccl_dir, "src/transport/net_ib/gdaki/doca-gpunetio/include"),
++                nccl_include_dir,
+                 os.path.join(current_dir, "deep_ep/backend/nccl/include"),
+                 dirs_exist_ok=True
+             )
+             shutil.copytree(
+-                os.path.join(nccl_dir, "build/obj/transport/net_ib/gdaki/doca-gpunetio"),
++                nccl_object_dir,
+                 os.path.join(current_dir, "deep_ep/backend/nccl/obj"),
+                 dirs_exist_ok=True
+             )
