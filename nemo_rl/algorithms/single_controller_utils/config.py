@@ -48,6 +48,15 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
     max_buffered_rollouts: int = 64
+    # Re-dispatch attempts for a prompt whose rollout raised, before giving up on
+    # it. Gym retries dropped connections itself but surfaces HTTP 5xx and
+    # truncated bodies to us, and those are usually transient. 0 disables retry.
+    rollout_retries: int = 1
+    # Consecutive prompts that may exhaust their retries before the run aborts.
+    # Isolated rollout failures are normal and get dropped; this many in a row
+    # means the environment servers or generation backend are down, not that one
+    # prompt is bad, and failing fast beats burning the allocation.
+    max_consecutive_rollout_failures: int = 32
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
 

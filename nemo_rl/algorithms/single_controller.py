@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -149,12 +150,19 @@ class SingleControllerActor:
         self._rollout_permitted.set()
 
         # Set only after _rollout_pump exhausts its configured epochs and all
-        # dispatched tasks finish successfully. Rollout failures propagate
-        # through run() instead of being reported as normal exhaustion.
+        # dispatched tasks finish successfully. Systemic rollout failure
+        # propagates through run() instead of being reported as normal
+        # exhaustion; isolated failures are dropped, see _dispatch_one_prompt.
         self._rollout_exhausted: asyncio.Event = asyncio.Event()
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
+
+        # Prompts dropped after exhausting their retries, and how many of those
+        # happened back to back. The streak is what decides the run is doomed.
+        self._dropped_rollouts: int = 0
+        self._consecutive_rollout_failures: int = 0
+        self._rollout_failure_counts: Counter[str] = Counter()
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
@@ -247,6 +255,66 @@ class SingleControllerActor:
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
+    async def _rollout_with_retries(
+        self, prompt: DatumSpec, target_step: Optional[int]
+    ) -> bool:
+        """Run one prompt, retrying transient failures. True if it committed.
+
+        Returns False when the prompt is dropped, which is deliberately not an
+        error: generate_and_push already rolled back its buffer slot and its
+        DataPlane rows, and the train pump waits on ready groups rather than a
+        fixed batch, so the step simply fills from the next prompts.
+
+        Raises only when prompts keep failing back to back, which means the
+        environment servers or the generation backend are down rather than one
+        prompt being bad.
+        """
+        attempts = 1 + self._async_cfg.rollout_retries
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._rollout_manager.generate_and_push(
+                    prompt, target_step=target_step
+                )
+            except asyncio.CancelledError:
+                # Cancellation is how the TaskGroup and weight sync stop us.
+                # Retrying it would defeat both.
+                raise
+            except Exception as e:
+                name = type(e).__name__
+                self._rollout_failure_counts[name] += 1
+                if attempt < attempts:
+                    print(
+                        f"rollout_pump: prompt failed with {name}: {e} — "
+                        f"retrying ({attempt}/{attempts - 1})",
+                        flush=True,
+                    )
+                    continue
+
+                self._dropped_rollouts += 1
+                self._consecutive_rollout_failures += 1
+                print(
+                    f"rollout_pump: dropping prompt after {attempts} attempt(s), "
+                    f"last error {name}: {e} "
+                    f"(dropped {self._dropped_rollouts} total, "
+                    f"{self._consecutive_rollout_failures} in a row)",
+                    flush=True,
+                )
+                if (
+                    self._consecutive_rollout_failures
+                    > self._async_cfg.max_consecutive_rollout_failures
+                ):
+                    raise RuntimeError(
+                        f"{self._consecutive_rollout_failures} consecutive rollouts "
+                        f"failed; giving up. Failures by type: "
+                        f"{dict(self._rollout_failure_counts)}"
+                    ) from e
+                return False
+            else:
+                self._consecutive_rollout_failures = 0
+                return True
+
+        raise AssertionError("unreachable: the loop always returns or raises")
+
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
@@ -275,12 +343,18 @@ class SingleControllerActor:
             task_started_event.set()
             self._inflight_rollouts += 1
             try:
-                await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
-                )
+                # These tasks run in a TaskGroup, so anything that escapes here
+                # cancels every sibling rollout and tears down the run. One
+                # unlucky prompt must not do that: Gym retries dropped
+                # connections internally but hands us HTTP 5xx and truncated
+                # response bodies, and a single one of those used to be fatal.
+                if not await self._rollout_with_retries(prompt, target_step):
+                    # Nothing was committed, so this permit is ours to give back.
+                    # On success ownership transfers to the train pump, which
+                    # releases it after consuming the committed group.
+                    self._buffer_capacity.release()
+                    return
             except BaseException:
-                # On success ownership transfers to the train pump, which
-                # releases this permit after consuming the committed group.
                 self._buffer_capacity.release()
                 raise
             finally:
@@ -348,7 +422,16 @@ class SingleControllerActor:
             await asyncio.gather(*inflight, return_exceptions=True)
 
         self._rollout_exhausted.set()
-        print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
+        dropped = (
+            f", dropped {self._dropped_rollouts} prompt(s) "
+            f"({dict(self._rollout_failure_counts)})"
+            if self._dropped_rollouts
+            else ""
+        )
+        print(
+            f"rollout_pump: completed {self._current_epoch} epoch(s){dropped}",
+            flush=True,
+        )
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.

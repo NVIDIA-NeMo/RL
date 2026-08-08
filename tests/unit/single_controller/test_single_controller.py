@@ -15,6 +15,7 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -299,3 +300,84 @@ def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
         ),
     ):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+def _retry_controller(**async_cfg_kwargs):
+    """A controller with just enough state for _rollout_with_retries."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(**async_cfg_kwargs)
+    ctrl._dropped_rollouts = 0
+    ctrl._consecutive_rollout_failures = 0
+    ctrl._rollout_failure_counts = Counter()
+    return ctrl
+
+
+def test_rollout_retries_a_transient_failure_then_commits() -> None:
+    # Gym surfaces HTTP 5xx and truncated bodies to us rather than retrying them
+    # itself, and they are usually transient.
+    calls = []
+
+    async def generate_and_push(prompt, *, target_step):
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise RuntimeError("Server disconnected")
+
+    ctrl = _retry_controller(rollout_retries=1)
+    ctrl._rollout_manager = SimpleNamespace(generate_and_push=generate_and_push)
+
+    assert asyncio.run(ctrl._rollout_with_retries({"idx": 0}, None)) is True
+    assert len(calls) == 2
+    assert ctrl._dropped_rollouts == 0
+    # The streak resets on success, so scattered failures never accumulate into
+    # a spurious abort over a long run.
+    assert ctrl._consecutive_rollout_failures == 0
+
+
+def test_rollout_drops_the_prompt_once_retries_are_exhausted() -> None:
+    async def generate_and_push(prompt, *, target_step):
+        raise RuntimeError("HTTP 500")
+
+    ctrl = _retry_controller(rollout_retries=1)
+    ctrl._rollout_manager = SimpleNamespace(generate_and_push=generate_and_push)
+
+    # False, not an exception: escaping here would cancel every sibling rollout
+    # in the pump's TaskGroup and tear down the run over one bad prompt.
+    assert asyncio.run(ctrl._rollout_with_retries({"idx": 0}, None)) is False
+    assert ctrl._dropped_rollouts == 1
+    assert ctrl._rollout_failure_counts["RuntimeError"] == 2
+
+
+def test_rollout_aborts_once_failures_are_consecutive_enough() -> None:
+    async def generate_and_push(prompt, *, target_step):
+        raise RuntimeError("HTTP 500")
+
+    ctrl = _retry_controller(rollout_retries=0, max_consecutive_rollout_failures=2)
+    ctrl._rollout_manager = SimpleNamespace(generate_and_push=generate_and_push)
+
+    async def _drive():
+        return [await ctrl._rollout_with_retries({"idx": i}, None) for i in range(2)]
+
+    # A streak means the env servers or generation backend are down, and failing
+    # fast beats burning the rest of the allocation.
+    assert asyncio.run(_drive()) == [False, False]
+    with pytest.raises(RuntimeError, match="3 consecutive rollouts failed"):
+        asyncio.run(ctrl._rollout_with_retries({"idx": 2}, None))
+
+
+def test_rollout_never_retries_cancellation() -> None:
+    # Cancellation is how the TaskGroup and weight sync stop the pump; retrying
+    # it would defeat both.
+    calls = []
+
+    async def generate_and_push(prompt, *, target_step):
+        calls.append(prompt)
+        raise asyncio.CancelledError()
+
+    ctrl = _retry_controller(rollout_retries=5)
+    ctrl._rollout_manager = SimpleNamespace(generate_and_push=generate_and_push)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(ctrl._rollout_with_retries({"idx": 0}, None))
+    assert len(calls) == 1
+    assert ctrl._dropped_rollouts == 0
