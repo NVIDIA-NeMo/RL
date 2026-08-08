@@ -1631,7 +1631,7 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
 @patch("nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2)
 @patch(
     "nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices",
-    return_value=torch.tensor([0, 3, 4, 7]),
+    return_value=torch.tensor([0, 3, 4, 5, 10, 11]),
 )
 @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
 def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
@@ -1645,7 +1645,7 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
     cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32)
     input_ids = torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]])
-    input_ids_cp_sharded = input_ids[:, [0, 3, 4, 7]]
+    input_ids_cp_sharded = input_ids[:, [0, 3, 4, 5, 10, 11]]
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens_padded,
         cu_seqlens_kv=cu_seqlens_padded,
@@ -1681,7 +1681,7 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
     assert torch.equal(result.cu_seqlens_padded, cu_seqlens_padded)
     assert torch.equal(
         result.padding_mask,
-        torch.tensor([[False, True, False, False]]),
+        torch.tensor([[False, True, False, False, True, True]]),
     )
     mock_indices.assert_called_once_with(
         packed_seq_params,
@@ -1690,6 +1690,23 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
         cp_rank=0,
         device=input_ids.device,
     )
+
+
+@pytest.mark.mcore
+def test_hybridep_padding_mask_rejects_model_owned_cp_slicing():
+    """Do not silently drop the mask in models that own CP input slicing."""
+    from nemo_rl.models.megatron.data import process_microbatch
+
+    with pytest.raises(
+        NotImplementedError,
+        match="context-parallel input slicing internally",
+    ):
+        process_microbatch(
+            {},
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            create_packed_seq_padding_mask=True,
+        )
 
 
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"

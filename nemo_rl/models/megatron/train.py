@@ -18,6 +18,7 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
+from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -27,7 +28,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import (
+    StragglerDetector,
+    get_model_config,
+    unwrap_model,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -68,6 +73,28 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+def _prepare_padding_mask_for_model(
+    model: GPTModel,
+    padding_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match a CP-local padding mask to the model's sequence-parallel layout."""
+    if padding_mask is None or not get_model_config(model).sequence_parallel:
+        return padding_mask
+
+    core_model = unwrap_model(model)
+    if isinstance(core_model, GPTModel) and core_model.pre_process:
+        return padding_mask
+
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(),
+            group=get_tensor_model_parallel_group(),
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
 
 
 def model_forward(
@@ -117,6 +144,7 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
+    padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
     if padding_mask is not None:
         additional_kwargs["padding_mask"] = padding_mask
 

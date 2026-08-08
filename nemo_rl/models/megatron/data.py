@@ -302,6 +302,11 @@ def process_microbatch(
     create_packed_seq_padding_mask: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
+    if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
+        raise NotImplementedError(
+            "HybridEP padding masks are not supported for models that perform "
+            "context-parallel input slicing internally."
+        )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
         input_ids = data_dict["input_ids"]
