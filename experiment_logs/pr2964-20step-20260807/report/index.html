@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 09:23 PDT</span>
+        <span>Updated 2026-08-08 09:40 PDT</span>
         <span>Validation source a028b33b</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>20 steps per workload</span>
@@ -290,7 +290,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 09:23 PDT. Qwen retry 505735 completed, two-node inter-node traffic validation passed, and canonical Super retry 506100 is pending resources.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 09:40 PDT. Qwen retry 505735 completed, two-node inter-node traffic validation passed, and canonical Super retry 506100 is pending resources with a four-hour walltime.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -564,7 +564,7 @@
         Qwen job 505735 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means 0.0033 and 0.5250, respectively. Final validation accuracy is 0.5312. These checks establish execution stability but do not by themselves prove zero numerical regression against a controlled baseline.
       </div>
       <div class="callout">
-        Current conclusion: the previous NeMo RL patch remains necessary and functional for THD unequal-dispatch padding; Qwen's completed training path validates it. Super's separate failure was in DeepEP inter-node GPUDirect RDMA: GCP-NRT rejects legacy GPU <code>ibv_reg_mr</code>, and the first DMA-BUF fallback conflated MR base and CUDA buffer base. The corrected address handling passes real dispatch and combine. End-to-end Super correctness and performance remain pending job 506100.
+        Current conclusion: PR #2964 still supplies the NeMo RL side of the THD contract: it enables MCore's unequal-rank input padding, creates the physical THD padding mask, and aligns that mask with the model's sequence-parallel layout. MCore PR #5008 then equalizes dispatcher input sizes and rounds them to 64 tokens. The former custom MCore fork additionally removed pre-existing THD padding tokens from the actual routing map; official MCore <code>6513e3e2</code> uses the mask for auxiliary-loss and expert-bias accounting but does not perform that route removal. This difference is not the Super crash, but it remains a controlled performance-overhead comparison. Super's failure was in DeepEP inter-node GPUDirect RDMA: GCP-NRT rejects legacy GPU <code>ibv_reg_mr</code>, and the first DMA-BUF fallback conflated MR base and CUDA buffer base. The corrected address handling passes real dispatch and combine. End-to-end Super correctness and performance remain pending job 506100.
       </div>
     </section>
 
