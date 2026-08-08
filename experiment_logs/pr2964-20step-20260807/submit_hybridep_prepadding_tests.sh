@@ -23,7 +23,11 @@ mkdir -p "${run_root}/ray"
 
 COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m pytest --mcore-only -q \
   ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
-  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_uses_input_prepadding"
+  ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_preserves_existing_cp_local_layout \
+  ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_rejects_model_owned_cp_slicing \
+  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_without_opt_in_keeps_dispatch_padding \
+  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_explicitly_uses_input_prepadding \
+  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_input_prepadding_rejects_unsupported_layouts"
 export COMMAND
 export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
