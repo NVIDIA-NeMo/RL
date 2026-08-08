@@ -201,6 +201,13 @@ def test_get_tp_shard_dim(name, expected):
         # shared experts are FFN-named but fuse differently -> misc
         ("model.layers.0.mlp.shared_expert.gate_proj.weight", False),
         ("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", False),
+        # MTP-head FFN weights sit outside the backbone prefix -> misc
+        ("mtp.layers.0.mixer.experts.3.up_proj.weight", False),
+        ("mtp.layers.4.mixer.down_proj.weight", False),
+        ("mtp.layers.0.mixer.experts.gate_up_proj", False),
+        ("model.mtp.layers.0.mlp.up_proj.weight", False),
+        # a backbone layer that merely contains "mtp" in a longer word -> bulk
+        ("backbone.layers.0.mtpx.up_proj.weight", True),
         # non-FFN params -> misc
         ("model.layers.0.self_attn.q_proj.weight", False),
         ("model.embed_tokens.weight", False),

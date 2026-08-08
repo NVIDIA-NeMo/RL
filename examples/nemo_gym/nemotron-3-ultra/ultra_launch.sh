@@ -95,11 +95,19 @@ set -euo pipefail
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
+# Two independent ways to run without colocated sandboxes, both preserved here.
+#
 # Disaggregated-sandbox recipes (see disagg_sandboxes/) run tool execution on an
 # external sandbox service instead of colocated per-node containers; they set
 # NO_COLOCATED_SANDBOX=1 to skip the sandbox image requirement and deployment.
+#
+# Otherwise `?` rather than `:?`: an explicitly empty value is how a recipe opts
+# out of the sandbox entirely. ray.sub only launches it when SANDBOX_CONTAINER
+# and SANDBOX_COMMAND are both non-empty, so a blend that routes to no
+# sandbox-backed env avoids extracting a 14 GB image on every node for nothing.
+# Leaving the variable unset is still an error, so the choice stays deliberate.
 if [[ "${NO_COLOCATED_SANDBOX:-0}" != "1" ]]; then
-  : "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+  : "${SANDBOX_CONTAINER?SANDBOX_CONTAINER is required (nemo-skills sandbox image; set it empty to disable the sandbox)}"
 fi
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
@@ -913,6 +921,8 @@ echo "  Entrypoint:  ${TRAIN_ENTRYPOINT}"
 echo "  Nodes:       ${NUM_TOTAL_NODES} total"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
+else
+echo "    Segment:   ${SEGMENT_SIZE}"
 fi
 echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"

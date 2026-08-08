@@ -181,6 +181,16 @@ FFN_GROUPED_EXPERT_SUFFIXES = (
 )
 
 
+def is_mtp_param(param_name: str) -> bool:
+    """Return True if the param belongs to a Multi-Token-Prediction head.
+
+    Trainers that co-train an MTP head export it as a sibling of the backbone
+    under a top-level ``mtp.`` module, e.g. NemotronH's
+    ``mtp.layers.0.mixer.experts.3.up_proj.weight``.
+    """
+    return param_name.startswith("mtp.") or ".mtp." in param_name
+
+
 def is_nccl_reshard_param(param_name: str) -> bool:
     """Return True iff the param takes the xferdtensor bulk reshard path.
 
@@ -191,12 +201,17 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     ``load_weights`` path.
 
     Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
-    Co-trained MTP weights are also routed to misc because vLLM keeps the MTP
-    drafter separate from the main model and updates it through ``load_weights``.
+
+    MTP-head FFN weights are also routed to the misc path. Their names live
+    under ``mtp.`` rather than the backbone prefix, which the bulk path's
+    per-layer grouping cannot express alongside the backbone's own layers, and
+    vLLM keeps the MTP drafter separate from the main model, updating it through
+    ``load_weights``. The misc path feeds ``load_weights``, which drops them
+    when it has no matching parameter — the same behavior as broadcast refit.
     """
     if "shared_expert" in param_name:
         return False
-    if param_name.startswith("mtp."):
+    if is_mtp_param(param_name):
         return False
     return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
         FFN_GROUPED_EXPERT_SUFFIXES

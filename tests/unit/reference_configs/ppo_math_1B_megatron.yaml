@@ -47,6 +47,7 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  seq_logprob_error_threshold: null
 
 loss_fn:
   disable_ppo_ratio: false
@@ -430,3 +431,6 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null

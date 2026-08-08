@@ -211,7 +211,11 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 >
 > To co-schedule dedicated model servers with training in one Slurm
 > heterogeneous allocation, set `EXTERNAL_JUDGES=1` — see
-> [External judge services](#external-judge-services) below.
+> [External judge services](#external-judge-services) below. That flag is a
+> recipe-level wrapper over the
+> [external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md),
+> which place the server fleet in a second hetgroup, start load balancers on the
+> training component, and inject the resolved endpoints into the driver command.
 
 Optional knobs:
 
