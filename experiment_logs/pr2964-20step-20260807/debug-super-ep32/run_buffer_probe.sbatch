@@ -55,7 +55,7 @@ if [[ "${TRACE_IBVERBS:-0}" == 1 ]]; then
 fi
 
 srun \
-  --nodes=4 \
+  --nodes="${SLURM_NNODES}" \
   --ntasks-per-node=8 \
   --gpus-per-node=8 \
   --kill-on-bad-exit=1 \
