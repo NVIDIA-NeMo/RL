@@ -254,11 +254,11 @@
       <div class="eyebrow">NeMo RL · GCP-NRT B200</div>
       <h1>PR #2964 HybridEP 20-step validation</h1>
       <p class="lede">
-        Synchronous GRPO validation for Qwen3-30B-A3B and NVIDIA Nemotron 3 Super,
+        Synchronous GRPO validation for Qwen3-30B-A3B, Qwen3-235B, and NVIDIA Nemotron 3 Super,
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 09:40 PDT</span>
+        <span>Updated 2026-08-08 10:54 PDT</span>
         <span>Validation source a028b33b</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>20 steps per workload</span>
@@ -268,13 +268,13 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Qwen pass · Super queued</span></div>
-        <p>Qwen retry 505735 completed 20/20 with Slurm exit 0. Super retry 505736 exposed an inter-node DMA-BUF MR address mismatch. Fix wheel 506072 passed forced two-node dispatch and combine in job 506083; canonical 32 × 8 Super job 506100 is queued for 20 steps.</p>
+        <div class="value"><span class="pill pending">Qwen pair passed · Super queued</span></div>
+        <p>Qwen HybridEP 505735 and all-to-all baseline 506133 both completed 20/20 with Slurm exit 0. The fixed DeepEP wheel passed forced two-node dispatch/combine in 506083; canonical 32 × 8 Super job 506100 is queued for 20 steps.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
-        <div class="value">2 workloads</div>
-        <p>Qwen: 4 nodes / 32 GPUs. Nemotron Super: 32 nodes / 256 GPUs.</p>
+        <div class="value">3 workloads</div>
+        <p>Qwen3-30B-A3B: 4 × 8 GPUs. Qwen3-235B: 16 × 8 GPUs. Nemotron Super: 32 × 8 GPUs.</p>
       </article>
       <article class="card">
         <div class="label">Runtime artifact</div>
@@ -283,14 +283,14 @@
       </article>
       <article class="card">
         <div class="label">Measurements</div>
-        <div class="value"><span class="pill ready">Qwen measured</span></div>
-        <p>Latest Qwen steady-state values use all 19 samples from Steps 2–20 of job 505735. Super completed no training step, so no performance number is reported.</p>
+        <div class="value"><span class="pill ready">Qwen controlled pair</span></div>
+        <p>Qwen values use all 19 samples from Steps 2–20 of baseline 506133 and HybridEP 505735. HybridEP improves E2E time 2.00%, logprob time 6.77%, and policy-training time 4.37%.</p>
       </article>
     </div>
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 09:40 PDT. Qwen retry 505735 completed, two-node inter-node traffic validation passed, and canonical Super retry 506100 is pending resources with a four-hour walltime.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 10:54 PDT. The controlled Qwen3-30B-A3B pair completed, two-node inter-node traffic validation passed, Qwen3-235B HybridEP is initializing, and canonical Super retry 506100 is pending resources.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -371,6 +371,20 @@
         </article>
         <article class="job">
           <div class="job-head">
+            <h3>506133 · Qwen3-30B-A3B controlled baseline</h3>
+            <span class="pill ready">20/20 passed</span>
+          </div>
+          <p>Uses the same <code>grpo-qwen3-30ba3b-4n8g.yaml</code>, source, container, fixed wheel overlay, logging, and 20-step window as HybridEP 505735; only the policy dispatcher is set to <code>alltoall</code>. Slurm exit <code>0:0</code>.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>506121 / 506122 · Qwen3-235B pair</h3>
+            <span class="pill pending">HybridEP initializing</span>
+          </div>
+          <p>Both use the canonical <code>grpo-qwen3-235b-16n8g.yaml</code> at 16 × 8 GPUs. Baseline 506121 was externally cancelled after 30 minutes by the occupied-idle reaper while 120/128 GPUs waited for sequential colocated vLLM initialization; no model exception or OOM occurred. HybridEP 506122 is warming the same runtime path before a controlled baseline retry.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
             <h3>506100 · Canonical Super 20-step retry</h3>
             <span class="pill pending">Pending resources</span>
           </div>
@@ -392,6 +406,7 @@
               <th>Steps</th>
               <th>Completion</th>
               <th>End-to-end step time</th>
+              <th>Generation time</th>
               <th>Policy train time</th>
               <th>Logprob time</th>
               <th>Throughput</th>
@@ -406,10 +421,24 @@
               <td>20 completed</td>
               <td class="metric">20/20 · exit 0</td>
               <td class="metric">140.08 ± 12.86 s</td>
+              <td class="metric">50.53 ± 1.71 s</td>
               <td class="metric">51.40 ± 2.85 s</td>
               <td class="metric">13.73 ± 1.06 s</td>
-              <td class="metric">1,489.91 E2E · 4,039.14 policy · 15,175.88 logprob <small>tok/s/GPU</small></td>
+              <td class="metric">1,489.91 E2E · 4,106.35 generation · 4,039.14 policy · 15,175.88 logprob <small>tok/s/GPU</small></td>
               <td class="metric">loss 0.0033 mean · reward 0.5250 mean · final validation accuracy 0.5312</td>
+            </tr>
+            <tr>
+              <td><strong>Qwen3-235B-A22B</strong><br><code>grpo-qwen3-235b-16n8g.yaml</code></td>
+              <td>baseline 506121<br>HybridEP 506122</td>
+              <td>16 × 8 B200</td>
+              <td>Initializing</td>
+              <td class="metric">Baseline was externally reaped during vLLM initialization; HybridEP is running. No training-step metric yet.</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
+              <td class="metric">—</td>
             </tr>
             <tr>
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
@@ -422,10 +451,36 @@
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
+              <td class="metric">—</td>
             </tr>
           </tbody>
         </table>
       </div>
+      <h3>Qwen3-30B-A3B · controlled baseline comparison</h3>
+      <p class="section-note">GCP-NRT B200 · canonical 4n8g performance recipe · arithmetic mean ± sample standard deviation over Steps 2–20 (n=19). Positive delta means HybridEP is faster.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>All-to-all · 506133</th>
+              <th>HybridEP · 505735</th>
+              <th>HybridEP delta</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>E2E step time</td><td>142.94 ± 12.03 s</td><td>140.08 ± 12.86 s</td><td class="metric">2.00% faster</td></tr>
+            <tr><td>Generation time</td><td>50.88 ± 1.25 s</td><td>50.53 ± 1.71 s</td><td class="metric">0.69% faster</td></tr>
+            <tr><td>Logprob time</td><td>14.73 ± 0.71 s</td><td>13.73 ± 1.06 s</td><td class="metric">6.77% faster</td></tr>
+            <tr><td>Policy-training time</td><td>53.75 ± 2.76 s</td><td>51.40 ± 2.85 s</td><td class="metric">4.37% faster</td></tr>
+            <tr><td>E2E throughput</td><td>1,459.65 ± 116.52</td><td>1,489.91 ± 126.62</td><td class="metric">2.07% higher</td></tr>
+            <tr><td>Generation throughput</td><td>4,079.56 ± 177.54</td><td>4,106.35 ± 185.43</td><td class="metric">0.66% higher</td></tr>
+            <tr><td>Logprob throughput</td><td>14,112.03 ± 799.43</td><td>15,175.88 ± 1,216.06</td><td class="metric">7.54% higher</td></tr>
+            <tr><td>Policy-training throughput</td><td>3,863.18 ± 112.30</td><td>4,039.14 ± 161.06</td><td class="metric">4.55% higher</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">Correctness sanity: mean reward is 0.52578 baseline vs 0.52501 HybridEP, and all 2,048 samples remain valid at every measured step. Final validation accuracy is 0.5547 vs 0.5312, a difference of 3/128 examples; this small validation sample is not sufficient to assert an accuracy regression.</div>
     </section>
 
     <section aria-labelledby="historical-title">
@@ -459,11 +514,11 @@
       <p class="section-note">Qwen3-30B-A3B · GCP-NRT B200 · Steps 2–20. Super has no completed step and is intentionally absent.</p>
       <div class="chart-grid">
         <article class="chart-card">
-          <h3>End-to-end and policy step time</h3>
+          <h3>End-to-end and phase step time</h3>
           <div id="chart-step-time" class="chart-slot" aria-label="Qwen per-step timing chart"></div>
         </article>
         <article class="chart-card">
-          <h3>Policy and logprob throughput</h3>
+          <h3>End-to-end and phase throughput</h3>
           <div id="chart-throughput" class="chart-slot" aria-label="Qwen per-step throughput chart"></div>
         </article>
         <article class="chart-card">
@@ -471,8 +526,8 @@
           <div id="chart-training-sanity" class="chart-slot" aria-label="Qwen per-step reward chart"></div>
         </article>
         <article class="chart-card">
-          <h3>Logprob consistency · log scale</h3>
-          <div id="chart-token-error" class="chart-slot" aria-label="Qwen token multiplied probability error chart"></div>
+          <h3>Training loss stability</h3>
+          <div id="chart-loss" class="chart-slot" aria-label="Qwen per-step training loss chart"></div>
         </article>
       </div>
     </section>
@@ -597,14 +652,16 @@
   <script>
     const qwen = {
       steps: Array.from({length: 19}, (_, i) => i + 2),
-      e2e: [159.429596,144.234467,141.864151,135.112595,128.523438,139.862411,138.163345,125.178413,165.161423,130.005463,129.576157,139.301086,145.308136,133.497375,132.976669,130.163254,133.82457,135.497253,166.42955],
-      policyTime: [57.659618,56.807316,50.212532,50.931908,49.033836,51.347038,53.152821,43.050941,46.772266,51.734352,52.726631,51.795563,53.726131,48.048325,50.160061,50.579613,47.099133,51.924221,49.809101],
-      logprobTime: [14.401731,15.329932,13.542689,15.535147,12.066398,13.789685,13.769524,14.418426,12.410748,15.340674,12.773835,13.144846,13.852704,13.021117,14.746936,12.683825,12.217013,15.664911,12.325077],
-      e2eTps: [1280.955811,1511.517456,1422.351318,1527.042358,1524.001221,1587.159546,1628.989014,1539.817749,1222.158447,1572.172363,1654.12146,1554.872314,1520.390503,1498.040283,1501.199463,1559.484863,1486.586548,1577.442993,1220.980713],
-      policyTps: [3541.859863,3837.760986,4018.531982,4050.950928,3994.586182,4323.208984,4234.32959,4477.299316,4315.665039,3950.779053,4065.017578,4181.736816,4112.061035,4162.152344,3979.75,4013.230225,4223.895508,4116.367676,4079.721924],
-      logprobTps: [14180.397461,14221.387695,14899.599609,13281.024414,16232.671875,16097.827148,16345.268555,13368.445312,16264.40625,13323.46875,16779.197266,16477.591797,15948.15918,15358.469727,13536.675781,16003.660156,16283.998047,13644.456055,16487.302734],
-      reward: [0.490234,0.469727,0.522949,0.547852,0.579102,0.473145,0.426758,0.51123,0.598145,0.509766,0.549805,0.530273,0.470215,0.552246,0.54541,0.597656,0.617188,0.483887,0.514648],
-      tokenError: [1.022251,1.020869,1.02324,1.021068,1.022222,1.021559,101.656593,1.021848,1.023569,1.021781,1.021458,1.031159,1.021718,1.021537,1.02163,1.021156,1.023274,1.02243,1.021826]
+      e2e: [141.376434,151.491272,133.579269,134.744446,137.388199,140.701462,144.236023,133.960602,175.314621,131.006241,139.048737,130.969604,144.669266,133.973831,132.498688,126.287674,129.879333,131.602798,168.775055],
+      generationTime: [48.52092,48.471989,48.157646,51.020451,51.541775,52.348053,52.103336,52.203453,48.391014,48.724537,53.70533,51.312435,52.107052,50.82008,48.85112,50.702309,48.571468,51.462551,50.960423],
+      policyTime: [56.193157,55.229195,53.389847,50.706963,48.577499,52.229424,54.164383,47.160202,49.569061,53.865204,54.881214,51.828514,53.428535,47.732521,48.586777,50.343113,48.474304,52.311768,47.965942],
+      logprobTime: [13.950233,15.518492,14.163158,13.760005,12.041489,13.720075,13.45966,12.017689,15.824485,14.782405,12.951546,13.511565,13.736874,13.120312,14.975283,12.625915,14.547043,13.250062,12.946304],
+      e2eTps: [1451.549316,1436.449097,1515.105713,1532.186279,1422.213379,1573.356567,1559.722656,1434.585938,1150.158936,1551.924927,1540.839355,1646.279785,1531.041138,1496.83667,1502.238037,1607.625488,1528.690063,1622.44812,1204.967773],
+      generationTps: [4229.410156,4489.386719,4202.587402,4046.487061,3791.009277,4228.878418,4317.730957,3681.327393,4166.882812,4172.678711,3989.39502,4201.956543,4250.760254,3946.017822,4074.513672,4004.22168,4087.693115,4149.011719,3990.7146],
+      policyTps: [3651.955078,3940.117188,3790.734131,4071.503662,4022.342773,4238.483887,4153.434082,4075.003662,4067.853516,3774.456055,3903.918457,4160.115723,4145.623535,4201.26416,4096.681641,4032.791748,4095.886475,4081.657715,4239.852051],
+      logprobTps: [14710.499023,14022.59375,14289.65918,15003.889648,16226.841797,16135.011719,16714.255859,15991.260742,12742.258789,13753.637695,16542.564453,15957.634766,16124.09082,15284.463867,13291.540039,16079.886719,13648.496094,16114.544922,15708.614258],
+      reward: [0.492188,0.473633,0.517578,0.541504,0.580566,0.470703,0.423828,0.503418,0.595703,0.508301,0.541016,0.542969,0.473633,0.562012,0.556641,0.588379,0.620117,0.474121,0.508789],
+      loss: [0.01187215,0.00081601,0.01016372,-0.00407417,0.02570075,-0.00174248,0.01571645,0.00617216,0.00028207,-0.00018313,-0.01093547,0.00027856,0.00442182,0.00676935,0.00288285,-0.00506246,-0.00746387,0.00908179,-0.00161264]
     };
 
     function renderLineChart(id, series, options = {}) {
@@ -686,20 +743,22 @@
 
     renderLineChart("chart-step-time", [
       {name: "E2E", color: "#1769aa", values: qwen.e2e},
+      {name: "Generation", color: "#7a4fb5", values: qwen.generationTime},
       {name: "Policy", color: "#16896b", values: qwen.policyTime},
       {name: "Logprob", color: "#d47c0f", values: qwen.logprobTime}
     ], {format: value => `${value.toFixed(0)}s`});
     renderLineChart("chart-throughput", [
       {name: "E2E", color: "#1769aa", values: qwen.e2eTps},
+      {name: "Generation", color: "#7a4fb5", values: qwen.generationTps},
       {name: "Policy", color: "#16896b", values: qwen.policyTps},
       {name: "Logprob", color: "#d47c0f", values: qwen.logprobTps}
     ], {format: value => `${(value / 1000).toFixed(1)}k`});
     renderLineChart("chart-training-sanity", [
       {name: "Reward", color: "#7a4fb5", values: qwen.reward}
     ], {format: value => value.toFixed(2)});
-    renderLineChart("chart-token-error", [
-      {name: "Token mult-prob error", color: "#b33a3a", values: qwen.tokenError}
-    ], {log: true, format: value => value >= 10 ? value.toFixed(0) : value.toFixed(2)});
+    renderLineChart("chart-loss", [
+      {name: "Loss", color: "#b33a3a", values: qwen.loss}
+    ], {format: value => value.toFixed(3)});
   </script>
 </body>
 </html>
