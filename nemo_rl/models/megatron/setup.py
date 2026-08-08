@@ -807,6 +807,13 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         prepad_packed_inputs = config["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"
         )
+        if (
+            prepad_packed_inputs
+            and config["megatron_cfg"]["moe_token_dispatcher_type"] != "flex"
+        ):
+            raise ValueError(
+                "HybridEP input prepadding requires the flex token dispatcher."
+            )
         if prepad_packed_inputs and not sequence_packing_enabled:
             raise ValueError(
                 "HybridEP input prepadding requires sequence packing to be enabled."

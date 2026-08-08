@@ -287,6 +287,8 @@ def _get_hybridep_aligned_seq_len(
     target = torch.tensor([local_seq_len], dtype=torch.int64, device=device)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         group = get_expert_tensor_and_model_parallel_group(check_initialized=False)
+        if group is None:
+            raise RuntimeError("HybridEP alignment group is not initialized.")
         torch.distributed.all_reduce(
             target,
             op=torch.distributed.ReduceOp.MAX,
