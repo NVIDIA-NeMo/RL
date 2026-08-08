@@ -22,6 +22,9 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -41,10 +44,10 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": 4},
-        grpo={
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 4,
-        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
     )
@@ -74,21 +77,23 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         controller_cls(
             master_config=master_config,
             actor_args=actor_args,
+            setup_timing_metrics=SetupTimingMetrics(),
         )
 
 
-def test_logs_concrete_weight_synchronizer(
+def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
+    logger = MagicMock()
+    monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": 8},
-        grpo={
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 4,
-        },
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=1,
             max_buffered_rollouts=4,
@@ -114,11 +119,60 @@ def test_logs_concrete_weight_synchronizer(
     controller_cls(
         master_config=master_config,
         actor_args=actor_args,
+        setup_timing_metrics=SetupTimingMetrics(),
     )
 
+    logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
+
+
+def test_logs_setup_timing_metrics(monkeypatch) -> None:
+    """setup_timing_metrics is forwarded to Logger.log_metrics under timing/setup."""
+    logger = MagicMock()
+    monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 8},
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger={},
+    )
+    setup_metrics = SetupTimingMetrics(
+        generation_init_time_s=1.5, policy_init_time_s=2.5
+    )
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=FakeWeightSynchronizer(),
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        train_cluster=None,
+        inference_cluster=None,
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+
+    controller_cls(
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=setup_metrics,
+    )
+
+    logger.log_metrics.assert_called_once_with(
+        setup_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+    )
 
 
 @pytest.mark.parametrize(
@@ -237,10 +291,10 @@ def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._master_config = SimpleNamespace(
-        grpo={
-            "num_prompts_per_step": 2,
-            "max_num_steps": 1,
-        }
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            max_num_steps=1,
+        )
     )
     ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
     ctrl._advantage_cfg = AdvantageConfig()

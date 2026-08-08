@@ -61,44 +61,42 @@ RLVR policy itself serves as the general teacher:
 
 ## Container
 
-Ultra runs on the stock NeMo RL container. The vLLM version is whatever `pyproject.toml` pins (currently the upstream
-aarch64 wheel), so the only requirement is an **aarch64 (arm64)** image for
-GB200 NVL72 nodes.
-
-The quickest option is to pull a prebuilt nightly image from
-[NGC](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags) and
-skip the build entirely:
-
-```bash
-docker pull nvcr.io/nvidia/nemo-rl:<nightly-tag>
-```
-
-To build it yourself instead, from the root of the repo:
+Ultra uses vLLM and requires an **aarch64 (arm64)** image for GB200 NVL72
+nodes. Prebake the NeMo Gym virtual environments used by the recipes to avoid
+building them when each training job starts. From the root of the repository,
+build the image with the Gym virtual environments for the Ultra recipes:
 
 ```bash
 docker buildx build \
+  --platform linux/arm64 \
   --progress=plain \
   -f docker/Dockerfile \
   --target release \
-  -t nemo-rl-ultra:arm64 \
+  -t <your-registry>/nemo-rl:main-ultra-prefetched-venvs \
+  --push \
   --build-context nemo-rl=. \
   --build-arg MAX_JOBS=8 \
   --build-arg SKIP_SGLANG_BUILD=1 \
+  --build-arg SKIP_TRTLLM_BUILD=1 \
+  --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_ultra_all_envs.yaml" \
   .
 ```
 
 Build args:
+- `NEMO_GYM_PREFETCH_CONFIGS` — space-separated union configs whose Gym virtual
+  environments are baked into the image.
 - `SKIP_SGLANG_BUILD=1` — Ultra runs on vLLM; skip the SGLang build.
+- `SKIP_TRTLLM_BUILD=1` — Ultra does not use TensorRT-LLM; skip its build.
 - `MAX_JOBS` — parallel build jobs; tune to your machine.
 - `--build-context nemo-rl=.` — build from your local checkout (otherwise the
   Dockerfile pulls `NVIDIA-NeMo/RL.git#main`).
-
 
 To run on the cluster with Slurm, convert the image to a squashfs (`.sqsh`)
 with [enroot](https://github.com/NVIDIA/enroot):
 
 ```bash
-enroot import -o nemo-rl-container.sqsh dockerd://nemo-rl-ultra:arm64
+enroot import -o nemo-rl-container.sqsh \
+  docker://<your-registry>/nemo-rl:main-ultra-prefetched-venvs
 ```
 
 Pass the resulting image as `CONTAINER` in every launch command below (shown as
@@ -205,13 +203,16 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 | `NL2BASH_JUDGE_MODEL` | NL2Bash / general-purpose judge: HF repo id or local path. Default judge is `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`. |
 | `SAFETY_JUDGE_MODEL` | Content-safety judge: HF repo id or local path. Default is [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B). |
 
-> **Serving GenRM as a standalone service.** The GenRM judge does not have to run
-> inside the training job. You can bring it up separately — any OpenAI-compatible
-> vLLM endpoint, or the external-GenRM service launcher under `tools/external_genrm/`
-> (runs the judge fleet in a second Slurm hetgroup behind a load balancer) — and
-> point the run at it with `GENRM_BASE_URL=http://<host>:<port>/v1`. Judging is then
-> routed to that endpoint instead of being served from the gym pool, which frees
-> those GPUs and lets one GenRM deployment back many training runs.
+> **Serving GenRM outside Gym.** For a separately deployed OpenAI-compatible
+> endpoint, set `GENRM_BASE_URL=http://<host>:<port>/v1`. Judging is then routed
+> to that endpoint instead of being served from the Gym pool, allowing one
+> deployment to back multiple training runs.
+>
+> To co-schedule dedicated model servers with training in one Slurm
+> heterogeneous allocation, use the
+> [external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md).
+> They place the server fleet in a second hetgroup, start load balancers on the
+> training component, and inject the resolved endpoints into the driver command.
 
 Optional knobs:
 

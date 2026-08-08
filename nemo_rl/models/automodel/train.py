@@ -51,7 +51,11 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
-from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
+from nemo_rl.models.automodel.data import (
+    ProcessedInputs,
+    ProcessedMicrobatch,
+    filter_multimodal_kwargs_for_model,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -118,7 +122,9 @@ def model_forward(
 
     # Add VLM kwargs if applicable
     if processed_inputs.is_multimodal:
-        model_args.update(processed_inputs.vlm_kwargs)
+        model_args.update(
+            filter_multimodal_kwargs_for_model(model, processed_inputs.vlm_kwargs)
+        )
         # flash_attn_kwargs is not supported for multimodal
         if "flash_attn_kwargs" in model_args:
             del model_args["flash_attn_kwargs"]

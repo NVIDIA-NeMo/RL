@@ -13,7 +13,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 16
   num_generations_per_prompt: 32
-  num_val_generations_per_prompt: 1
+  val_num_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_epochs: 100
   max_num_steps: 1000000
@@ -27,6 +27,10 @@ grpo:
   val_at_end: false
   overlong_filtering: true
   max_val_samples: null
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
 
@@ -215,6 +219,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
