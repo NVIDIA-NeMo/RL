@@ -57,7 +57,6 @@ class FP8Config:
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
-    refit_batched_moe_shuffle: bool = True
 
 
 @dataclass()
@@ -220,10 +219,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
-        if "refit_batched_moe_shuffle" in vllm_cfg:
-            fp8_config_kwargs["refit_batched_moe_shuffle"] = vllm_cfg[
-                "refit_batched_moe_shuffle"
-            ]
         if vllm_cfg.get("pow2_weight_scaling_factors") is False:
             raise ValueError("only pow2 weight scaling factors are supported for MXFP8")
         if vllm_cfg.get("pow2_activation_scaling_factors") is False:
@@ -1048,11 +1043,18 @@ def _shuffle_mxfp8_moe_per_expert(
 def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
     from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         swap_w13_to_w31,
     )
     from vllm.model_executor.parameter import ModelWeightParameter
     from vllm.model_executor.utils import set_weight_attrs
+
+    if self.mxfp8_backend != Fp8MoeBackend.FLASHINFER_TRTLLM:
+        raise NotImplementedError(
+            "MXFP8 MoE refit layout conversion only supports FLASHINFER_TRTLLM; "
+            f"got {self.mxfp8_backend}."
+        )
 
     epilogue_tile_m = 128
     is_gated = self.moe.is_act_and_mul
@@ -1072,26 +1074,15 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     else:
         w2_scale = layer.w2_weight_scale_from_checkpoint.data
 
-    assert global_fp8_config is not None
-    if global_fp8_config.refit_batched_moe_shuffle:
-        shuffled = _shuffle_mxfp8_moe_batched(
-            layer,
-            w13_weight,
-            w2_weight,
-            w13_scale,
-            w2_scale,
-            is_gated,
-            epilogue_tile_m,
-        )
-    else:
-        shuffled = _shuffle_mxfp8_moe_per_expert(
-            w13_weight,
-            w2_weight,
-            w13_scale,
-            w2_scale,
-            is_gated,
-            epilogue_tile_m,
-        )
+    shuffled = _shuffle_mxfp8_moe_batched(
+        layer,
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        is_gated,
+        epilogue_tile_m,
+    )
     (
         w13_weight_shuffled,
         w2_weight_shuffled,
