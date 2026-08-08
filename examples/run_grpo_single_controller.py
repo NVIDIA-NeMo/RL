@@ -122,10 +122,14 @@ def main() -> None:
     if bool(config.env.get("should_use_nemo_gym")):
         setup_nemo_gym_config(config, tokenizer)
 
-    actor_args = setup_single_controller(config, tokenizer)
+    actor_args, setup_timing_metrics = setup_single_controller(config, tokenizer)
 
     print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(master_config=config, actor_args=actor_args)
+    sc = SingleControllerActor.remote(
+        master_config=config,
+        actor_args=actor_args,
+        setup_timing_metrics=setup_timing_metrics,
+    )
     try:
         result = ray.get(sc.run.remote())
         print(f"SC run complete: {result}")

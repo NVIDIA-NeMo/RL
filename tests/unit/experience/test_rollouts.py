@@ -357,6 +357,9 @@ base_vllm_test_config: VllmConfig = {
     "temperature": 0.01,  # Near-greedy
     "top_p": 1.0,
     "top_k": None,
+    "val_temperature": 0.01,
+    "val_top_p": 1.0,
+    "val_top_k": None,
     "stop_token_ids": None,
     "stop_strings": None,
     "vllm_cfg": {
@@ -1188,6 +1191,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "top_k": None,
                 "temperature": 1.0,
                 "top_p": 1.0,
+                "val_temperature": 1.0,
+                "val_top_p": 1.0,
+                "val_top_k": None,
                 "max_new_tokens": 32,
             },
             num_generations=2,

@@ -1,0 +1,55 @@
+defaults: ../../vlm_grpo_3B_megatron.yaml
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_megatron
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  train_global_batch_size: 8
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: '9.0'
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    bias_activation_fusion: false
+    activation_checkpointing: true
+  generation:
+    max_new_tokens: 4096
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    vllm_cfg:
+      tensor_parallel_size: 8
+      enforce_eager: true
+      max_model_len: 8192
+      cap_max_tokens_to_context: true
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+      logprobs_mode: raw_logprobs
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 2
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: float32
+      skip_mm_profiling: true
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: triton
+data:
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+logger:
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-megatron
+cluster:
+  gpus_per_node: 8

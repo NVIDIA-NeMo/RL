@@ -140,10 +140,13 @@ class DistributedLogprob(torch.autograd.Function):
 
         vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
 
-        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
-        softmax_output = log_probs.exp()
+        full_log_probs = _compute_distributed_log_softmax(
+            vocab_parallel_logits, group=group
+        )
 
-        log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+        log_probs = torch.gather(
+            full_log_probs, -1, masked_target.unsqueeze(-1)
+        ).squeeze(-1)
         log_probs[target_mask] = 0.0
 
         torch.distributed.all_reduce(
@@ -153,8 +156,11 @@ class DistributedLogprob(torch.autograd.Function):
         )
 
         if not inference_only:
-            # only save for backward when we have inference only=False
-            ctx.save_for_backward(softmax_output, target_mask, masked_target)
+            # only save for backward when we have inference only=False. The
+            # softmax is materialized here rather than next to the log_softmax
+            # so the inference path does not pay for a [B, S, V_local] tensor
+            # it never reads (same placement as ChunkedDistributedLogprob).
+            ctx.save_for_backward(full_log_probs.exp(), target_mask, masked_target)
 
         return log_probs
 
