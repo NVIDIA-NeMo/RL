@@ -54,7 +54,7 @@ policy:
 #     async trainer builds the in-memory ReplayBuffer (grpo.py:3898), not the
 #     TQ-backed TQReplayBuffer (async_utils/replay_buffer.py:638).
 #   run_grpo_nemo_gym.py + async_grpo.enabled=false -> honoured by grpo_train_sync
-#     (see nano_swe_teacher_sync_tq.yaml).
+#     (sync path; this recipe uses the SingleController below).
 #   run_grpo_single_controller.py                   -> honoured, and REQUIRED
 #     (the entrypoint raises when data_plane.enabled is false). This is the
 #     async + TQ combination — see nano_swe_teacher_sc.yaml.
