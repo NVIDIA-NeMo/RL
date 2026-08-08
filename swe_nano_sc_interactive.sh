@@ -4,7 +4,7 @@
 # HONOURED TransferQueue data plane. This is the VERIFIED recipe (see
 # docs/guides/nano-swe-transferqueue.md).
 #
-# Same 6-node nano shape as swe_nano_interactive.sh (train 4 / gen 2), but:
+# 6-node nano shape (train 4 / gen 2):
 #   entrypoint  examples/run_grpo_single_controller.py   (NOT run_grpo_nemo_gym.py)
 #   config      examples/configs/ultra/nano_swe_teacher_sc.yaml
 #

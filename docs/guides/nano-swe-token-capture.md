@@ -23,7 +23,7 @@ Run on 6 GB200 NVL72 nodes:
 | Config | `examples/configs/ultra/nano_swe_teacher_sc.yaml` |
 | Model | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` |
 | Shape | train 4 nodes (TP2·PP2·CP4, EP1) / gen 2 nodes (vLLM TP2 → 4 engines) |
-| Capture flags | `+token_capture.enabled=true` (hydra append), `NG_TIC_FP_CANONICAL=1` |
+| Capture flags | `token_capture.enabled=true`, `NG_TIC_FP_CANONICAL=1` |
 | Outcome | 15/15 steps, `token_in_rate ≈ 0.9999`, zero `empty_manifest`, zero `capture_failed`, `valid_seqs = GBS` |
 | Launched via | `swe_nano_sc_capture.sh` (batch) / `swe_nano_sc_capture_interactive.sh` (attach + iterate) |
 
@@ -163,7 +163,7 @@ its absence broke a run:
 
 | Setting | Without it |
 |---|---|
-| `+token_capture.enabled=true` (hydra append) | Capture never engages. It is a `+` append because no yaml in the nano chain defines the key; a plain override is rejected. |
+| `token_capture.enabled=true` | Capture never engages. The `token_capture` block (with `enabled: false` and all defaults documented) lives in `nano_swe_teacher_sc.yaml`; the launcher flips the one flag. |
 | `NG_TIC_FP_CANONICAL=1` | Token-in silently degrades to ~0: reasoning models echo history with `<think>` blocks stripped, the gate's fingerprint of the served turn never matches, and every call falls back to text mode. With it, `token_in_rate ≈ 0.9999`. |
 | `NRL_DRIVER_PYTHONPATH=/opt/nemo-rl/3rdparty/Gym-workspace/Gym` | Driver `ModuleNotFoundError: nemo_gym` — the driver imports the staging record schema, and the baked driver venv has no nemo_gym. |
 | `NRL_DRIVER_PIP_INSTALL=orjson` | Driver `ModuleNotFoundError: orjson` — Gym's `token_id_capture/__init__` eagerly imports the store. |

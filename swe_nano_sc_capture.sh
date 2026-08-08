@@ -43,6 +43,6 @@ fi
 set +a
 
 bash "${HERE}/ultra_launch.sh" \
-  +token_capture.enabled=true \
+  token_capture.enabled=true \
   +env.nemo_gym.rollout_max_attempts_to_avoid_lp_nan=1 \
   "$@"

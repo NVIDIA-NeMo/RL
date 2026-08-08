@@ -67,12 +67,6 @@ whenever you expect to change anything:
 ```bash
 # async GRPO via SingleController + honoured TransferQueue  (the verified recipe)
 bash swe_nano_sc_interactive.sh
-
-# sync GRPO + honoured TransferQueue  (simplest data-plane smoke)
-bash swe_nano_tq_interactive.sh
-
-# async GRPO, no data plane  (baseline)
-bash swe_nano_interactive.sh
 ```
 
 The batch and interactive paths build the identical driver command; batch just
@@ -131,9 +125,6 @@ nano_swe_teacher_sc.yaml            SingleController + TQ  (the recipe)
         ├── swe_teacher.yaml        the Ultra SWE stage (rewards, data, optimizer)
         └── _nano_smoke_gb200.yaml.inc  Nano/GB200 mesh + smoke sizing
 ```
-
-`nano_swe_teacher_sync_tq.yaml` is the sync variant, branching off
-`nano_swe_teacher_qwen3mesh.yaml`.
 
 ### Why each SingleController-specific setting is there
 
