@@ -803,10 +803,28 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         sequence_packing_enabled = config.get("sequence_packing", {}).get(
             "enabled", False
         )
+        prepad_packed_inputs = config["megatron_cfg"].get(
+            "moe_hybridep_prepad_packed_inputs", False
+        )
+        if prepad_packed_inputs and not sequence_packing_enabled:
+            raise ValueError(
+                "HybridEP input prepadding requires sequence packing to be enabled."
+            )
+        if (
+            prepad_packed_inputs
+            and config["megatron_cfg"].get("pipeline_model_parallel_size", 1) != 1
+        ):
+            raise ValueError(
+                "HybridEP input prepadding currently requires pipeline parallel size 1."
+            )
+        if prepad_packed_inputs and config["megatron_cfg"].get("mtp_num_layers", 0):
+            raise ValueError(
+                "HybridEP input prepadding currently requires MTP disabled."
+            )
         # Packed inputs are aligned once in NeMo-RL before forward. Repeating the
         # scalar MAX collective inside each MoE layer can interleave with expert
         # parameter all-gathers on the same EP communicator.
-        model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = not sequence_packing_enabled
+        model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = not prepad_packed_inputs
         ep_size = model_cfg.expert_model_parallel_size
 
         # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
