@@ -93,6 +93,20 @@ ppo:
 
   # GAE with VAPO decoupled lambdas (defaults match the validated 7B math PPO
   # run: lambda_value=1.0, length-adaptive lambda_policy with alpha=0.05).
+  #
+  # name: "gae"      -> token-level GAE (the historical path, unchanged).
+  # name: "turn_gae" -> TURN-level GAE: one assistant message is one action,
+  #   V(s_k) is read at that turn's first token (the value head is right-shifted,
+  #   so that position has seen the whole preceding observation and none of the
+  #   action), the advantage is constant across the turn's tokens, and the critic
+  #   is supervised at one anchor per turn. Only the turn_gae_* keys apply.
+  #
+  #   Why it exists: at the token level lambda has effective horizon 1/(1-lambda)
+  #   TOKENS, so on a ~45k-token SWE rollout anything below 1 severs the terminal
+  #   reward — which is why length_adaptive_alpha pushes lambda to 1 - 1.5e-5 and
+  #   GAE degenerates to the pure baseline A_t = R - V(s_t) with no temporal
+  #   credit assignment at all. Over ~92 turns, lambda=0.97 is a 33-turn horizon.
+  #   See research/ppo/turn_level_critic_plan.md.
   adv_estimator:
     name: "gae"
     gae_lambda: 1.0
@@ -102,6 +116,22 @@ ppo:
     gae_lambda_policy: 1
     # Length-adaptive lambda_policy = 1 - 1/(alpha*l). 0 = disabled.
     length_adaptive_alpha: null
+
+    # --- turn-level GAE (used only when name: "turn_gae") ---
+    # All three lambdas/gamma are required in that mode and are never silently
+    # defaulted, so a sweep cannot appear to have run when it did not.
+    turn_gae_gamma: 1.0
+    # lambda_value=1.0 keeps the critic's target Monte-Carlo (G_k == R): the same
+    # target it regresses on today, just at ~92 anchors instead of ~45k tokens.
+    # Lower it only deliberately — bootstrapped targets feed the critic's own
+    # (still weak) estimates back into its own supervision.
+    turn_gae_lambda_value: 1.0
+    # lambda_policy is THE knob. 1.0 reproduces today's A_k = R - V(s_k);
+    # 0.99 ~ 100-turn horizon, 0.97 ~ 33 turns, 0.95 ~ 20 turns.
+    turn_gae_lambda_policy: 1.0
+    # The critic is supervised at ONE anchor per turn, every turn weighted
+    # equally (under token weighting the longest decile of turns owns ~43% of
+    # the critic loss).
 
   reward_shaping:
     enabled: false

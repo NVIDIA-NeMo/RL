@@ -20,6 +20,13 @@ engines, no gym. Each step mirrors the async PPO loop's critic path exactly
 so with the production SWE config (``gae_lambda_value=1``, ``gae_gamma=1``,
 KL=0) one offline epoch is the same optimization as the online critic warmup.
 
+Turn-level mode (``ppo.adv_estimator.name=turn_gae``) changes what a "position"
+means here: the critic is supervised at ONE anchor per assistant turn (the turn's
+first token, where the right-shifted value head reads ``V(s_k)``) with turn-level
+GAE returns, instead of at all ~45k response tokens. Stage C must run with the
+same setting — a token-level critic and a turn-level one are not interchangeable
+warm starts. See research/ppo/turn_level_critic_plan.md.
+
 Extras the online warmup cannot provide:
   * a held-out shard split (``dataset_idx % heldout_mod == 0``) with
     explained-variance / calibration / terminal-AUC eval on unseen rollouts;
@@ -315,17 +322,22 @@ def _forward_values_and_returns(
     repeated_batch: BatchedDataDict,
     tokenizer: Any,
     master_config: Any,
-) -> Optional[BatchedDataDict]:
+) -> tuple[Optional[BatchedDataDict], Optional[Any]]:
     """Populate train_data['values'/'returns'] in place.
 
-    Returns the privileged critic batch (with its own values/returns/token_mask)
-    when the privileged critic is enabled, else None.
+    Returns ``(critic_batch, turn_spans)``: the batch the critic should actually
+    train on when that differs from ``train_data`` (the privileged critic's
+    answer-augmented batch, or the turn-level anchor batch) else None, and the
+    turn structure (None on the token-level path) so callers can score metrics
+    at the positions the critic is actually supervised at.
 
     Mirrors async_ppo_train steps 3 (value inference, incl. the privileged
     answer-conditioned remap) and 6 (GAE returns; logprobs=None is valid for
     the critic path since KL-in-reward is the only consumer of logprobs).
     """
     from nemo_rl.algorithms.grpo import extract_initial_prompt_messages
+    from nemo_rl.algorithms.ppo import build_turn_spans_for_batch
+    from nemo_rl.algorithms.turn_level import build_turn_value_batch
     from nemo_rl.algorithms.privileged_critic import (
         build_privileged_value_inputs,
         remap_by_response_mask,
@@ -335,6 +347,11 @@ def _forward_values_and_returns(
     if privileged_critic_cfg is not None and not privileged_critic_cfg.get("enabled"):
         privileged_critic_cfg = None
     critic_batch = None
+
+    # Turn structure (None on the token-level path). Stage B must build this the
+    # same way stage C does, or the pretrained critic is supervised at positions
+    # PPO never reads.
+    turn_spans = build_turn_spans_for_batch(master_config, repeated_batch, train_data)
 
     value_model.prepare_for_inference()
     if privileged_critic_cfg is not None:
@@ -367,24 +384,32 @@ def _forward_values_and_returns(
         initial_prompt_message_logs,
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
-    advantages, returns = adv_estimator.compute_advantage(
+    adv_kwargs = dict(
         prompt_ids=prompt_batched_flat["token_ids"],
         rewards=train_data["rewards"],
         mask=train_data["token_mask"],
         values=train_data["values"],
         reference_logprobs=None,
         logprobs=None,
+        sample_mask=train_data["sample_mask"],
     )
+    if turn_spans is not None:
+        adv_kwargs["turn_spans"] = turn_spans
+    advantages, returns = adv_estimator.compute_advantage(**adv_kwargs)
     del advantages  # critic pretraining has no actor; only returns are used
     train_data["returns"] = returns
-    if critic_batch is not None:
+    if turn_spans is not None:
+        # One supervised position per turn, equally weighted (swapping token_mask
+        # for the anchor mask is what makes MseValueLossFn a per-turn mean).
+        critic_batch = build_turn_value_batch(train_data, turn_spans)
+    elif critic_batch is not None:
         critic_batch["returns"] = remap_by_response_mask(
             returns,
             train_data["token_mask"],
             critic_batch["token_mask"],
         )
         critic_batch["sample_mask"] = train_data["sample_mask"]
-    return critic_batch
+    return critic_batch, turn_spans
 
 
 def _heldout_metrics(
@@ -394,19 +419,29 @@ def _heldout_metrics(
     tokenizer: Any,
     master_config: Any,
 ) -> dict[str, float]:
-    """Critic quality on held-out rollouts: EV, positional EV/ECE, terminal AUC."""
+    """Critic quality on held-out rollouts: EV, positional EV/ECE, terminal AUC.
+
+    On the turn-level path every metric is scored at the positions the critic is
+    actually supervised at (turn anchors) — scoring an anchor-layout return
+    tensor over the full response mask would average each real target against
+    ~270 structural zeros — and the per-turn metrics from the estimator are
+    merged in.
+    """
     from nemo_rl.algorithms.ppo import _positional_value_metrics
 
     groups = [load_group(p) for p in heldout_files]
     train_data, repeated_batch = build_value_train_data(
         groups, tokenizer, master_config
     )
-    _forward_values_and_returns(
+    _, turn_spans = _forward_values_and_returns(
         value_model, adv_estimator, train_data, repeated_batch, tokenizer,
         master_config,
     )
     values, returns = train_data["values"], train_data["returns"]
-    mask = train_data["token_mask"].bool()
+    scored_mask = (
+        turn_spans.anchor_mask if turn_spans is not None else train_data["token_mask"]
+    )
+    mask = scored_mask.bool()
     metrics: dict[str, float] = {}
     if int(mask.sum()) >= 2:
         v, r = values[mask].float(), returns[mask].float()
@@ -417,12 +452,13 @@ def _heldout_metrics(
             else 0.0
         )
         metrics["critic/mse"] = ((r - v) ** 2).mean().item()
-    metrics.update(
-        _positional_value_metrics(values, returns, train_data["token_mask"])
-    )
+    metrics.update(_positional_value_metrics(values, returns, scored_mask))
+    # Scored on `scored_mask`: in turn mode the last RESPONSE token carries an
+    # untrained value, while the last anchor is the supervised V(s_K).
     metrics["critic/terminal_auc"] = terminal_value_reward_auc(
-        values, train_data["rewards"], train_data["token_mask"]
+        values, train_data["rewards"], scored_mask
     )
+    metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
     metrics["reward"] = train_data["rewards"].float().mean().item()
     metrics["num_heldout_samples"] = float(train_data["input_ids"].shape[0])
     return metrics
@@ -443,6 +479,13 @@ def _dump_heldout_values(
     Values/returns are packed over response tokens; per-message spans (with
     decoded text for the first ``dump_text_groups`` groups) let offline
     analysis align value movements to agent/tool behavior in the trajectory.
+
+    In turn-level mode ``returns`` is an ANCHOR-layout tensor: it is the turn
+    return at each turn's first token and structurally 0 at the other ~270
+    tokens of the turn. Averaging it over all stored tokens is meaningless, so
+    the payload carries ``credit_level`` and a per-token ``is_anchor`` flag
+    (format_version 3) and consumers must filter on it. Values are per-token in
+    both modes.
     """
     dump_dir.mkdir(parents=True, exist_ok=True)
     for gi, path in enumerate(heldout_files):
@@ -450,7 +493,7 @@ def _dump_heldout_values(
         train_data, repeated_batch = build_value_train_data(
             [g], tokenizer, master_config
         )
-        _forward_values_and_returns(
+        _, turn_spans = _forward_values_and_returns(
             value_model, adv_estimator, train_data, repeated_batch, tokenizer,
             master_config,
         )
@@ -481,10 +524,15 @@ def _dump_heldout_values(
                             tokenizer.decode([int(t)]) for t in m["token_ids"]
                         ]
             samples_msgs.append(spans)
+        anchor_mask = turn_spans.anchor_mask if turn_spans is not None else None
         payload = {
-            "format_version": 2,
+            "format_version": 3,
             "dataset_idx": g["dataset_idx"],
             "source_file": str(path),
+            # "token": returns are per-token. "turn": returns are the turn
+            # return at anchors and structurally 0 elsewhere — filter on
+            # is_anchor before averaging or computing EV.
+            "credit_level": "turn" if anchor_mask is not None else "token",
             "rewards": train_data["rewards"].float().cpu(),
             "sample_mask": train_data["sample_mask"].float().cpu(),
             "token_sample_index": coords[:, 0].to(torch.int32),
@@ -495,6 +543,8 @@ def _dump_heldout_values(
             "has_text": with_text,
             "render_samples": render_samples,
         }
+        if anchor_mask is not None:
+            payload["is_anchor"] = anchor_mask[mask].bool().cpu()
         out = dump_dir / f"valuedump_{g['dataset_idx']:08d}.pt"
         torch.save(payload, out)
         if (gi + 1) % 10 == 0 or gi + 1 == len(heldout_files):
@@ -792,7 +842,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
 
         print("▶ Computing values...")
-        critic_batch = _forward_values_and_returns(
+        critic_batch, turn_spans = _forward_values_and_returns(
             value_model, adv_estimator, train_data, repeated_batch, tokenizer,
             master_config,
         )
@@ -814,9 +864,14 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 metrics[k] = np.sum(v).item()
         metrics.update(
             _positional_value_metrics(
-                train_data["values"], train_data["returns"], train_data["token_mask"]
+                train_data["values"],
+                train_data["returns"],
+                turn_spans.anchor_mask
+                if turn_spans is not None
+                else train_data["token_mask"],
             )
         )
+        metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
         metrics["reward"] = train_data["rewards"].float().mean().item()
         metrics["num_samples"] = float(train_data["input_ids"].shape[0])
         metrics["total_step_time"] = time.perf_counter() - step_start

@@ -20,6 +20,7 @@ This module provides different advantage estimation strategies:
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
+- TurnLevelGeneralizedAdvantageEstimator: GAE over agent TURNS instead of tokens
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -508,6 +509,160 @@ class GeneralizedAdvantageEstimator:
 
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
+        return advantages, returns
+
+
+class TurnLevelGeneralizedAdvantageEstimator:
+    """GAE over agent turns instead of tokens (see nemo_rl.algorithms.turn_level).
+
+    The turn MDP treats one assistant message as one action:
+
+        δ_k = r_k + γ V(s_{k+1}) - V(s_k),   A_k = δ_k + γλ A_{k+1},   G_k = A_k + V(s_k)
+
+    with ``V(s_k)`` read at the FIRST token of assistant message k (the value
+    head is right-shifted, so that position sees the whole preceding observation
+    and none of the action) and ``V(s_{K+1}) = 0``.
+
+    Why not just run the token-level estimator: at the token level λ has
+    effective horizon 1/(1-λ) TOKENS, so on a 45k-token rollout any λ that is not
+    ≈1 severs the terminal reward entirely — which is exactly why the production
+    config lands at λ = 1 - 1.5e-5 and GAE collapses to the pure baseline
+    ``A_t = R - V(s_t)`` with no temporal credit assignment at all. Over ~92
+    turns, λ=0.97 is a 33-turn horizon: a usable knob.
+
+    A second, structural benefit: at λ<1 the advantage is built from TD
+    increments, in which any constant per-trajectory offset cancels identically.
+    The critic's measured weakness on this workload is precisely the constant
+    part (it cannot read task difficulty from the prompt); the part it is good at
+    is the terminal ``δ_K = R - V(s_K)``, which is what survives.
+
+    Outputs:
+        advantages: ``[B, S]``, constant across the tokens of one assistant
+            message (the standard treatment of a multi-token action).
+        returns: ``[B, S]``, ``G_k`` placed at the turn ANCHOR only, zero
+            elsewhere — paired with ``token_mask = anchor_mask`` in the critic's
+            batch so the value loss is an equal-weighted mean over decision
+            points instead of a token-count-weighted one.
+
+    Requires ``turn_spans`` (a :class:`~nemo_rl.algorithms.turn_level.TurnSpans`)
+    in ``compute_advantage``; the caller builds it once per step from the batch's
+    message logs.
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
+        # No silent defaults: a λ that quietly falls back to 1.0 would make a
+        # sweep look like it ran when it did not.
+        for key in ("turn_gae_gamma", "turn_gae_lambda_value", "turn_gae_lambda_policy"):
+            if estimator_config.get(key) is None:
+                raise ValueError(
+                    f"adv_estimator.{key} must be set explicitly when "
+                    "adv_estimator.name='turn_gae' (no default is assumed). "
+                    "See research/ppo/turn_level_critic_plan.md."
+                )
+        self.gamma = float(estimator_config["turn_gae_gamma"])
+        self.lambda_value = float(estimator_config["turn_gae_lambda_value"])
+        self.lambda_policy = float(estimator_config["turn_gae_lambda_policy"])
+        self.normalize_advantages = estimator_config["normalize_advantages"]
+
+        self.use_kl_in_reward = loss_config.use_kl_in_reward
+        self.kl_coef = loss_config.reference_policy_kl_penalty
+        self.kl_type = loss_config.reference_policy_kl_type
+
+        self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        values,
+        turn_spans=None,
+        reference_logprobs=None,
+        logprobs=None,
+        sample_mask=None,
+        **kwargs,
+    ):
+        """Compute turn-level GAE advantages and critic targets.
+
+        Args:
+            prompt_ids: unused (kept for interface parity).
+            rewards: ``[B]`` terminal reward per sample.
+            mask: ``[B, S]`` response token mask.
+            values: ``[B, S]`` per-token values from a fresh critic forward.
+            turn_spans: :class:`TurnSpans` for this batch (required).
+            reference_logprobs / logprobs: ``[B, S]``, only used when
+                ``use_kl_in_reward`` is on; the per-token penalty is summed into
+                its turn's reward.
+            sample_mask: ``[B]``, used for metrics only.
+
+        Returns:
+            ``(advantages, returns)``, both ``[B, S]``.
+        """
+        from nemo_rl.algorithms.turn_level import (
+            build_turn_rewards,
+            gather_turn_values,
+            scatter_turns_to_anchors,
+            scatter_turns_to_tokens,
+            turn_gae,
+            turn_level_metrics,
+        )
+
+        if turn_spans is None:
+            raise ValueError(
+                "TurnLevelGeneralizedAdvantageEstimator requires turn_spans; "
+                "build it with nemo_rl.algorithms.turn_level.build_turn_spans() "
+                "from the batch's message logs."
+            )
+
+        seq_len = mask.shape[1]
+        turn_values = gather_turn_values(values, turn_spans)
+
+        token_penalty = None
+        if (
+            self.use_kl_in_reward
+            and self.kl_coef > 0
+            and logprobs is not None
+            and reference_logprobs is not None
+        ):
+            kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
+            token_penalty = -self.kl_coef * kl * mask
+        turn_rewards = build_turn_rewards(rewards, turn_spans, token_penalty)
+
+        # Decoupled λ (VAPO-style): critic targets and policy advantages may use
+        # different horizons. Skip the second pass when they agree.
+        _, turn_returns = turn_gae(
+            turn_values,
+            turn_rewards,
+            turn_spans.turn_valid,
+            self.gamma,
+            self.lambda_value,
+        )
+        if self.lambda_policy == self.lambda_value:
+            turn_advantages = turn_returns - turn_values
+        else:
+            turn_advantages, _ = turn_gae(
+                turn_values,
+                turn_rewards,
+                turn_spans.turn_valid,
+                self.gamma,
+                self.lambda_policy,
+            )
+
+        advantages = scatter_turns_to_tokens(turn_advantages, turn_spans, seq_len)
+        # Anchor layout, matched by token_mask=anchor_mask in the critic's batch
+        # (build_turn_value_batch). The two MUST agree: returns placed anywhere
+        # the critic's mask does not cover are silently discarded.
+        returns = scatter_turns_to_anchors(turn_returns, turn_spans, seq_len)
+
+        if self.normalize_advantages:
+            adv_mean = masked_mean(advantages, mask)
+            adv_var = masked_var(advantages, mask, adv_mean)
+            advantages = (advantages - adv_mean) * torch.rsqrt(adv_var + 1e-8)
+        advantages = torch.masked_fill(advantages, ~(mask.bool()), 0)
+
+        self.last_metrics = turn_level_metrics(
+            turn_values, turn_advantages, turn_spans, sample_mask
+        )
         return advantages, returns
 
 

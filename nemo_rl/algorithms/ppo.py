@@ -31,6 +31,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
+    TurnLevelGeneralizedAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
@@ -182,9 +183,9 @@ class AsyncPPOConfig(TypedDict):
 
 
 class AdvEstimatorConfig(TypedDict):
-    """Configuration for PPO advantage estimator (GAE or raw_reward)."""
+    """Configuration for PPO advantage estimator (GAE, turn-level GAE, or raw_reward)."""
 
-    name: str  # "gae" or "raw_reward"
+    name: str  # "gae", "turn_gae", or "raw_reward"
     # GAE-specific (only used when name="gae")
     gae_lambda: NotRequired[float]
     gae_gamma: NotRequired[float]
@@ -194,6 +195,13 @@ class AdvEstimatorConfig(TypedDict):
     gae_lambda_policy: NotRequired[Optional[float]]
     # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
     length_adaptive_alpha: NotRequired[float]
+    # Turn-level GAE (only used when name="turn_gae"). One assistant message is
+    # one action; λ is measured in TURNS, where a value below 1 is finally
+    # usable (at the token level a 45k-token rollout forces λ ≈ 1). All three
+    # are required when name="turn_gae" — no silent defaults.
+    turn_gae_gamma: NotRequired[Optional[float]]
+    turn_gae_lambda_value: NotRequired[Optional[float]]
+    turn_gae_lambda_policy: NotRequired[Optional[float]]
 
 
 class PPOConfig(TypedDict):
@@ -1394,15 +1402,16 @@ def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
     PPO's training loop consumes a `(advantages, returns)` pair from a
-    value-model-based estimator, so only `gae` and `raw_reward` are supported
-    here. Group-relative estimators like GRPO / Reinforce++ are not compatible
-    with PPO's loop and live in `grpo.py`.
+    value-model-based estimator, so only `gae`, `turn_gae` and `raw_reward` are
+    supported here. Group-relative estimators like GRPO / Reinforce++ are not
+    compatible with PPO's loop and live in `grpo.py`.
 
     Args:
         master_config: The master configuration dictionary.
 
     Returns:
-        A `GeneralizedAdvantageEstimator` or `RawRewardAdvantageEstimator` instance.
+        A `GeneralizedAdvantageEstimator`, `TurnLevelGeneralizedAdvantageEstimator`
+        or `RawRewardAdvantageEstimator` instance.
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -1418,16 +1427,82 @@ def _create_advantage_estimator(master_config: MasterConfig):
         gae_lambda = adv_estimator_config["gae_lambda"]
         gae_gamma = adv_estimator_config["gae_gamma"]
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
+    elif adv_estimator_name == "turn_gae":
+        _raise_if_turn_gae_unsupported(master_config)
+        adv_estimator = TurnLevelGeneralizedAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
+        print(
+            "  ✓ Using TURN-level GAE advantage estimator "
+            f"(γ={adv_estimator.gamma}, λ_value={adv_estimator.lambda_value}, "
+            f"λ_policy={adv_estimator.lambda_policy}); the critic is supervised "
+            "at one anchor per assistant turn"
+        )
     elif adv_estimator_name == "raw_reward":
         adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
     else:
         raise ValueError(
             f"Invalid adv_estimator name for PPO: {adv_estimator_name!r}. "
-            f"PPO only supports 'gae' or 'raw_reward'."
+            f"PPO only supports 'gae', 'turn_gae' or 'raw_reward'."
         )
 
     return adv_estimator
+
+
+def _raise_if_turn_gae_unsupported(master_config: MasterConfig) -> None:
+    """Reject turn-level GAE combined with features that assume a token-level critic."""
+    # getattr: this factory is shared with grpo_sync, whose configs have no
+    # `value:` section at all.
+    value_config = getattr(master_config, "value", None) or {}
+    privileged_critic = value_config.get("privileged_critic")
+    if privileged_critic is not None and privileged_critic.get("enabled"):
+        raise NotImplementedError(
+            "adv_estimator.name='turn_gae' with value.privileged_critic.enabled "
+            "is not supported: the privileged critic scores an answer-augmented "
+            "sequence whose token layout differs from the policy's, so turn "
+            "anchors computed on the policy layout would land on the wrong "
+            "positions. Disable one of the two."
+        )
+
+
+def build_turn_spans_for_batch(
+    master_config: MasterConfig,
+    repeated_batch: BatchedDataDict[DatumSpec],
+    train_data: BatchedDataDict[Any],
+) -> Optional[Any]:
+    """Locate the batch's agent turns, or None when running token-level GAE.
+
+    Shared by both PPO loops and by offline critic pretraining so all three see
+    identical turn structure. Validates on the way out rather than letting a
+    misaligned anchor silently attribute a turn's credit to the wrong tokens.
+    """
+    if master_config.ppo["adv_estimator"]["name"] != "turn_gae":
+        return None
+
+    from nemo_rl.algorithms.turn_level import build_turn_spans, validate_turn_spans
+
+    spans = build_turn_spans(
+        repeated_batch["message_log"],
+        seq_len=train_data["token_mask"].shape[1],
+        mask_dtype=train_data["token_mask"].dtype,
+    )
+    validate_turn_spans(spans, train_data["token_mask"], train_data["sample_mask"])
+    return spans
+
+
+def _value_metric_mask(
+    train_data: BatchedDataDict[Any], turn_spans: Optional[Any]
+) -> torch.Tensor:
+    """Positions the critic is actually supervised at, for value diagnostics.
+
+    Token-level runs supervise every response token; turn-level anchor runs
+    supervise one position per turn, and scoring them over the full response
+    mask would average a real target against ~270 structural zeros.
+    """
+    if turn_spans is None:
+        return train_data["token_mask"]
+    return turn_spans.anchor_mask
 
 
 def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
@@ -1568,6 +1643,7 @@ def _build_ppo_rollout_dump_payload(
     prompt_lengths: torch.Tensor,
     content: list[str],
     repeated_batch: BatchedDataDict[DatumSpec],
+    turn_spans: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Build the packed per-token rollout dump payload for torch.save.
 
@@ -1587,6 +1663,12 @@ def _build_ppo_rollout_dump_payload(
         content: Per-sample decoded conversation text.
         repeated_batch: Rollout batch; optional per-sample metadata
             (``task_name``, ``idx``, ``truncated``) is copied when present.
+        turn_spans: Turn structure when running turn-level GAE, else None. In
+            that mode ``returns`` is anchor-layout — the turn return at each
+            turn's first token, structurally 0 at the other ~270 tokens of the
+            turn — so the payload records ``credit_level`` and a per-token
+            ``is_anchor`` flag, and consumers MUST filter on it before averaging
+            returns or computing explained variance.
 
     Returns:
         Payload dict of packed per-token tensors, per-sample arrays, and
@@ -1616,7 +1698,10 @@ def _build_ppo_rollout_dump_payload(
     sample_indices = torch.arange(batch_size, dtype=torch.int32)
 
     payload: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": 2,
+        # "token": returns are per-token. "turn": returns are the turn return at
+        # anchors and structurally 0 elsewhere — filter on is_anchor first.
+        "credit_level": "turn" if turn_spans is not None else "token",
         "description": (
             "Packed response-token PPO rollout dump. Per-token tensors are "
             "flattened over token_mask; entry i belongs to sample "
@@ -1650,6 +1735,10 @@ def _build_ppo_rollout_dump_payload(
     }
     if "returns" in train_data:
         payload["returns"] = _pack_float("returns")
+    if turn_spans is not None:
+        payload["is_anchor"] = (
+            turn_spans.anchor_mask.detach().bool().cpu()[token_mask]
+        )
     if "reference_policy_logprobs" in train_data:
         payload["reference_policy_logprobs"] = _pack_float("reference_policy_logprobs")
 
@@ -2012,6 +2101,13 @@ def ppo_train(
 
                     metrics_logging_data["content"] = flat_messages["content"]
 
+                    # Turn structure for turn-level credit assignment (None on
+                    # the token-level path). Built here, before any GPU work, so
+                    # a malformed batch fails before the expensive forwards.
+                    turn_spans = build_turn_spans_for_batch(
+                        master_config, repeated_batch, train_data
+                    )
+
                 memory_tracker.snapshot_start_of_stage("Value inference", dir())
                 print("▶ Computing values...", flush=True)
                 with timer.time("value_inference"):
@@ -2148,9 +2244,12 @@ def ppo_train(
                         mask=train_data["token_mask"],
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
+                        sample_mask=train_data["sample_mask"],
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
+                    if turn_spans is not None:
+                        adv_kwargs["turn_spans"] = turn_spans
                     result = adv_estimator.compute_advantage(**adv_kwargs)
                     if isinstance(result, tuple):
                         advantages, returns = result
@@ -2161,10 +2260,20 @@ def ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                        # Turn-level: the critic trains on one anchor per turn,
+                        # so it needs its own batch (same sequences, anchor mask).
+                        if turn_spans is not None:
+                            from nemo_rl.algorithms.turn_level import (
+                                build_turn_value_batch,
+                            )
+
+                            critic_batch = build_turn_value_batch(
+                                train_data, turn_spans
+                            )
                         # Privileged critic trains on the answer-augmented sequence:
                         # scatter the (original-layout) GAE returns onto the augmented
                         # response positions. Same response tokens => exact mapping.
-                        if critic_batch is not None:
+                        elif critic_batch is not None:
                             critic_batch["returns"] = remap_by_response_mask(
                                 returns,
                                 train_data["token_mask"],
@@ -2187,6 +2296,7 @@ def ppo_train(
                             prompt_lengths=repeated_batch["length"],
                             content=flat_messages["content"],
                             repeated_batch=repeated_batch,
+                            turn_spans=turn_spans,
                         )
                         torch.save(rollout_dump_payload, rollout_dump_path)
                         print(f"  📝 Dumped rollout data to {rollout_dump_path}")
@@ -2351,9 +2461,13 @@ def ppo_train(
                             _positional_value_metrics(
                                 train_data["values"],
                                 train_data["returns"],
-                                train_data["token_mask"],
+                                _value_metric_mask(train_data, turn_spans),
                             )
                         )
+                    # Turn-level counterparts (per-turn EV/bias, last-turn AUC,
+                    # turn counts). The token-level versions above are dominated
+                    # by the longest turns; these weight every decision equally.
+                    metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
@@ -3220,6 +3334,13 @@ def async_ppo_train(
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
 
+                    # Turn structure for turn-level credit assignment (None on
+                    # the token-level path). Built here, before any GPU work, so
+                    # a malformed batch fails before the expensive forwards.
+                    turn_spans = build_turn_spans_for_batch(
+                        master_config, repeated_batch, train_data
+                    )
+
                 # ---- 3. Value forward (critic on GPU, then offloaded) ----
                 # GPU state entering here: policy OFF, value OFF (see refit/step
                 # end below). Load value only.
@@ -3326,9 +3447,12 @@ def async_ppo_train(
                         mask=train_data["token_mask"],
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
+                        sample_mask=train_data["sample_mask"],
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
+                    if turn_spans is not None:
+                        adv_kwargs["turn_spans"] = turn_spans
                     result = adv_estimator.compute_advantage(**adv_kwargs)
                     if isinstance(result, tuple):
                         advantages, returns = result
@@ -3338,10 +3462,20 @@ def async_ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                        # Turn-level: the critic trains on one anchor per turn,
+                        # so it needs its own batch (same sequences, anchor mask).
+                        if turn_spans is not None:
+                            from nemo_rl.algorithms.turn_level import (
+                                build_turn_value_batch,
+                            )
+
+                            critic_batch = build_turn_value_batch(
+                                train_data, turn_spans
+                            )
                         # Privileged critic trains on the answer-augmented sequence:
                         # scatter the (policy-layout) GAE returns onto the augmented
                         # response positions. Same response tokens => exact mapping.
-                        if critic_batch is not None:
+                        elif critic_batch is not None:
                             critic_batch["returns"] = remap_by_response_mask(
                                 returns,
                                 train_data["token_mask"],
@@ -3544,9 +3678,13 @@ def async_ppo_train(
                             _positional_value_metrics(
                                 train_data["values"],
                                 train_data["returns"],
-                                train_data["token_mask"],
+                                _value_metric_mask(train_data, turn_spans),
                             )
                         )
+                    # Turn-level counterparts (per-turn EV/bias, last-turn AUC,
+                    # turn counts). The token-level versions above are dominated
+                    # by the longest turns; these weight every decision equally.
+                    metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
 
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
@@ -3731,6 +3869,7 @@ def async_ppo_train(
                         prompt_lengths=repeated_batch["length"],
                         content=flat_messages_content,
                         repeated_batch=repeated_batch,
+                        turn_spans=turn_spans,
                     )
                     torch.save(rollout_dump_payload, rollout_dump_path)
                     print(f"  📝 Dumped rollout data to {rollout_dump_path}")
