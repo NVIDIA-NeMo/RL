@@ -14,8 +14,8 @@
 """Generation for masked diffusion language models (dLLMs).
 
 Masked diffusion models decode by iteratively unmasking a fixed-width canvas
-rather than by appending tokens, so they cannot use the KV-cache-based
-autoregressive engines (vLLM, SGLang, TRT-LLM). Generation instead runs on the
+rather than by appending tokens. SGLang can serve LLaDA2.0 and SDAR through
+``--dllm-algorithm``; LLaDA-8B is served by no engine. Generation here runs on the
 training weights, in the same spirit as the ``megatron_generation`` backend.
 """
 

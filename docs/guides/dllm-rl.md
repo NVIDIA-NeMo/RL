@@ -80,9 +80,15 @@ a wrong value silently corrupts the likelihood rather than failing.
 ## Generation
 
 Masked diffusion models decode a fixed-width canvas by iteratively unmasking
-positions, so there is no KV cache and none of the autoregressive inference engines
-(vLLM, SGLang, TRT-LLM) can serve them. The `dllm` backend instead denoises inside
-the training workers, which means:
+positions, so there is no KV cache for the autoregressive engines to manage.
+
+SGLang does serve some diffusion models: since 0.5.12 it ships `--dllm-algorithm`
+with low-confidence and joint-threshold remasking, covering `LLaDA2MoeModelLM`
+(LLaDA2.0) and `SDARForCausalLM`. It does not cover LLaDA-8B (`LLaDAModelLM`),
+which is the model the GDPO recipe uses, and vLLM and TRT-LLM have no diffusion
+support at all.
+
+The `dllm` backend therefore denoises inside the training workers, which means:
 
 - Generation is **colocated by construction** and reads the live training weights,
   so there is no refit step.
@@ -132,4 +138,4 @@ train against the wrong likelihood:
 | `router_replay` | Assumes one stable token-to-expert map per rollout; a dLLM re-routes every position on every denoising step. |
 | `dtensor_cfg.context_parallel_size > 1` | Shards the sequence, but the ELBO masks positions across the whole sequence. |
 | `logprob_batch_size != train_micro_batch_size` | Masks are drawn from a seeded generator over the microbatch shape, so differing sizes would compare ELBOs taken at different masks. |
-| Autoregressive generation backends | No KV cache exists to serve. |
+| Autoregressive generation backends | The ELBO path needs the in-worker denoiser. SGLang can serve LLaDA2.0 and SDAR for inference, but wiring that into RL rollouts is not implemented yet. |

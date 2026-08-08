@@ -125,7 +125,8 @@ def _validate_dllm_generation(generation_cfg: Any, dllm_cfg: Any) -> None:
         raise ValueError(
             f"policy.generation.backend is '{backend}', but policy.dllm.enabled "
             "is true. Masked diffusion models decode a fixed-width canvas and "
-            "have no KV cache, so the autoregressive engines cannot serve them. "
+            "have no KV cache. SGLang serves LLaDA2.0 and SDAR, but not "
+            "LLaDA-8B, and vLLM and TRT-LLM serve no diffusion models. "
             "Set policy.generation.backend='dllm'."
         )
 

@@ -34,8 +34,9 @@ class DllmGeneration(GenerationInterface):
     """Generation interface that denoises on the training policy's own weights.
 
     Masked diffusion models decode by iteratively unmasking a fixed-width canvas
-    rather than by appending tokens, so none of the KV-cache inference engines
-    (vLLM, SGLang, TRT-LLM) can serve them. Rollouts instead run in the training
+    rather than by appending tokens. SGLang serves some of them (LLaDA2.0 and
+    SDAR, via ``--dllm-algorithm``), but not LLaDA-8B, and vLLM and TRT-LLM
+    serve none of them. Rollouts here instead run in the training
     workers, which makes this backend colocated by construction: there are no
     separate inference weights, so there is nothing to refit and no collective
     to initialize.
