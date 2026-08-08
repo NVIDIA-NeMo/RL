@@ -1165,6 +1165,8 @@ class TestGetMicrobatchIterator:
                 "sequence_parallel": False,
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
             },
             "make_sequence_length_divisible_by": 1,
         }
@@ -1188,6 +1190,10 @@ class TestGetMicrobatchIterator:
         # With sequence packing, micro_batch_size should be 1
         assert micro_batch_size == 1
         assert data_iterator_len == 10
+        assert (
+            mock_make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
+            is True
+        )
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
@@ -1618,6 +1624,89 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
     for pad_pos in range(int(seq_lengths[0]), seq0_padded_len):
         for layer in range(num_layers):
             assert torch.equal(routed_packed[0, pad_pos, layer], expected_route)
+
+
+@pytest.mark.mcore
+@patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+@patch("nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2)
+@patch(
+    "nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices",
+    return_value=torch.tensor([0, 3, 4, 5, 10, 11]),
+)
+@patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
+    mock_pack, mock_indices, mock_cp_world, mock_cp_rank
+):
+    """HybridEP masks fake tokens without adding NeMo-level dispatch padding."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.megatron.data import process_microbatch
+
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32)
+    input_ids = torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]])
+    input_ids_cp_sharded = input_ids[:, [0, 3, 4, 5, 10, 11]]
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        qkv_format="thd",
+        total_tokens=input_ids_cp_sharded.shape[1],
+    )
+    mock_pack.return_value = (
+        input_ids,
+        input_ids_cp_sharded,
+        packed_seq_params,
+        cu_seqlens,
+        cu_seqlens_padded,
+    )
+    data_dict = {
+        "input_ids": torch.tensor([[11, 12, 13, 0, 0], [21, 22, 23, 24, 25]]),
+        "input_lengths": torch.tensor([3, 5]),
+    }
+
+    result = process_microbatch(
+        data_dict,
+        seq_length_key="input_lengths",
+        pack_sequences=True,
+        create_packed_seq_padding_mask=True,
+        straggler_timer=MagicMock(),
+    )
+
+    assert torch.equal(result.input_ids, input_ids)
+    assert torch.equal(result.input_ids_cp_sharded, input_ids_cp_sharded)
+    assert torch.equal(result.cu_seqlens_padded, cu_seqlens_padded)
+    assert torch.equal(
+        result.padding_mask,
+        torch.tensor([[False, True, False, False, True, True]]),
+    )
+    mock_indices.assert_called_once_with(
+        packed_seq_params,
+        total_tokens=input_ids.shape[1],
+        cp_size=2,
+        cp_rank=0,
+        device=input_ids.device,
+    )
+
+
+@pytest.mark.mcore
+def test_hybridep_padding_mask_rejects_model_owned_cp_slicing():
+    """Do not silently drop the mask in models that own CP input slicing."""
+    from nemo_rl.models.megatron.data import process_microbatch
+
+    with pytest.raises(
+        NotImplementedError,
+        match="context-parallel input slicing internally",
+    ):
+        process_microbatch(
+            {},
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            create_packed_seq_padding_mask=True,
+        )
 
 
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"

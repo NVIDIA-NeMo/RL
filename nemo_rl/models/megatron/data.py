@@ -48,6 +48,7 @@ class ProcessedInputs:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
 
@@ -70,6 +71,7 @@ class ProcessedMicrobatch:
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
         mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
             None when MTP is disabled or token/sample masks are absent.
+        padding_mask: Packed-sequence padding mask for MoE routing.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
     """
@@ -82,6 +84,7 @@ class ProcessedMicrobatch:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
 
@@ -97,6 +100,7 @@ def make_processed_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    create_packed_seq_padding_mask: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -111,6 +115,7 @@ def make_processed_microbatch_iterator(
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
+        create_packed_seq_padding_mask: Whether to mask packed padding from MoE routing
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -133,6 +138,7 @@ def make_processed_microbatch_iterator(
             delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
+            create_packed_seq_padding_mask=create_packed_seq_padding_mask,
         )
 
         yield ProcessedMicrobatch(
@@ -144,6 +150,7 @@ def make_processed_microbatch_iterator(
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
             mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            padding_mask=processed_inputs.padding_mask,
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
         )
@@ -183,6 +190,7 @@ def get_microbatch_iterator(
     pad_factor = 1
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
+    create_packed_seq_padding_mask = False
 
     _, seq_dim_size = get_and_validate_seqlen(data)
 
@@ -194,6 +202,9 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
+        create_packed_seq_padding_mask = _uses_hybridep_flex_dispatcher(
+            cfg["megatron_cfg"]
+        )
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -221,6 +232,7 @@ def get_microbatch_iterator(
         pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
+        create_packed_seq_padding_mask=create_packed_seq_padding_mask,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
@@ -250,6 +262,32 @@ def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
     return _impl(*args, **kwargs)
 
 
+def _uses_hybridep_flex_dispatcher(megatron_cfg: dict[str, Any]) -> bool:
+    return (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    )
+
+
+def _get_packed_seq_padding_mask(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    total_tokens: int,
+) -> torch.Tensor:
+    """Return a mask whose true entries are physical THD padding tokens."""
+    token_positions = torch.arange(
+        total_tokens,
+        dtype=cu_seqlens_padded.dtype,
+        device=cu_seqlens_padded.device,
+    )
+    sequence_indices = torch.searchsorted(
+        cu_seqlens_padded[1:].contiguous(), token_positions, right=True
+    )
+    padded_starts = cu_seqlens_padded[:-1].index_select(0, sequence_indices)
+    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).index_select(0, sequence_indices)
+    return ((token_positions - padded_starts) >= valid_lengths).unsqueeze(0)
+
+
 def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
@@ -261,8 +299,14 @@ def process_microbatch(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    create_packed_seq_padding_mask: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
+    if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
+        raise NotImplementedError(
+            "HybridEP padding masks are not supported for models that perform "
+            "context-parallel input slicing internally."
+        )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
         input_ids = data_dict["input_ids"]
@@ -286,6 +330,7 @@ def process_microbatch(
         cu_seqlens = None
         cu_seqlens_padded = None
         mtp_loss_mask = None
+        padding_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -413,6 +458,32 @@ def process_microbatch(
                     input_ids_cp_sharded = input_ids
                 else:
                     input_ids_cp_sharded = local_input_ids
+                if create_packed_seq_padding_mask:
+                    full_padding_mask = _get_packed_seq_padding_mask(
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_padded=cu_seqlens_padded,
+                        total_tokens=input_ids.shape[1],
+                    )
+                    if (
+                        model_slices_context_parallel_inputs
+                        or get_context_parallel_world_size() == 1
+                    ):
+                        padding_mask = full_padding_mask
+                    else:
+                        cp_partition_indices = get_packed_seq_cp_partition_indices(
+                            packed_seq_params,
+                            total_tokens=input_ids.shape[1],
+                            cp_size=get_context_parallel_world_size(),
+                            cp_rank=get_context_parallel_rank(),
+                            device=input_ids.device,
+                        )
+                        padding_mask = full_padding_mask.index_select(
+                            1, cp_partition_indices
+                        ).contiguous()
+                    assert padding_mask.shape == input_ids_cp_sharded.shape, (
+                        f"padding_mask shape {padding_mask.shape} must match "
+                        f"model input shape {input_ids_cp_sharded.shape}."
+                    )
                 # routed_experts and the R3 trace token identity ride the SAME
                 # per-seq zigzag CP sharding as input_ids, re-derived from
                 # cu_seqlens_padded.
@@ -556,6 +627,7 @@ def process_microbatch(
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
         mtp_loss_mask=mtp_loss_mask,
+        padding_mask=padding_mask,
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
     )
