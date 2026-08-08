@@ -4895,19 +4895,13 @@ def async_grpo_train(
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Collect generation logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )
-                        # Log generation telemetry to wandb BEFORE the weight-sync
-                        # refit. refit_policy_generation broadcasts the full policy
-                        # and can OOM on under-provisioned training nodes; emitting
-                        # the metrics we just collected here ensures the per-worker
-                        # inflight-batch-size figure reaches wandb even if the
-                        # subsequent refit fails. The post-step logging below is
-                        # skipped once this fires to avoid a duplicate log.
+                        # Log before refit_policy_generation, which can OOM; ensures
+                        # metrics reach wandb even if refit fails. The post-step log
+                        # is skipped (generation_metrics_logged_early) to avoid duplicate.
                         _early_gen_metrics_interval = resolve_generation_metrics_logger(
                             master_config.policy["generation"]
                         )
@@ -4915,28 +4909,6 @@ def async_grpo_train(
                             _early_gen_metrics_interval is not None
                             and generation_logger_metrics
                         ):
-                            # Console summary (wandb-independent proof that the
-                            # per-worker inflight-batch-size telemetry was collected).
-                            _ifb = generation_logger_metrics.get(
-                                "inflight_batch_sizes", {}
-                            )
-                            print(
-                                "  • Generation Logger Metrics (pre-refit) — "
-                                f"Inflight Batch Sizes per worker (step {step + 1}):"
-                            )
-                            for _dp_idx in sorted(_ifb.keys()):
-                                _series = _ifb[_dp_idx]
-                                if _series:
-                                    print(
-                                        f"    - Generation Worker {_dp_idx:3d}: "
-                                        f"n={len(_series)} peak={max(_series)} "
-                                        f"mean={sum(_series) / len(_series):.2f} "
-                                        f"last={_series[-1]}"
-                                    )
-                                else:
-                                    print(
-                                        f"    - Generation Worker {_dp_idx:3d}: (empty)"
-                                    )
                             log_generation_metrics(
                                 generation_logger_metrics,
                                 step + 1,

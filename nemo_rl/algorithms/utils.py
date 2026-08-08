@@ -664,8 +664,6 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    # Backend-agnostic: fires for whichever generation backend (vLLM or
-    # TRT-LLM) has its in-flight batching telemetry enabled.
     metrics_logger_interval = resolve_generation_metrics_logger(
         master_config.policy["generation"]
     )
@@ -916,15 +914,7 @@ def print_performance_metrics(
 def resolve_generation_metrics_logger(
     generation_cfg: dict[str, Any],
 ) -> Optional[float]:
-    """Return the metrics-logger poll interval for the active backend.
-
-    Resolves to the configured interval if the backend has in-flight batching
-    telemetry enabled (async engine only), else None.
-
-    Backend-agnostic: covers both vLLM (vllm_cfg.enable_vllm_metrics_logger)
-    and TRT-LLM (trtllm_cfg.enable_trtllm_metrics_logger) so downstream
-    console/wandb visualization fires for whichever backend is active.
-    """
+    """Return the metrics-logger poll interval for the active backend, or None if disabled."""
     backend = generation_cfg.get("backend")
 
     if backend == "vllm":
