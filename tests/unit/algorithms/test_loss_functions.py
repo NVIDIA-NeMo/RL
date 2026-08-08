@@ -16,6 +16,8 @@ import itertools
 import pytest
 import torch
 
+import nemo_rl.algorithms.loss.utils as loss_utils
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -41,6 +43,33 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
+
+
+def test_prepare_loss_input_excludes_filtered_neg_inf_logprobs(monkeypatch):
+    """The caller must persist the narrowed mask used by the actor loss."""
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 3]]),
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    filtered_logprobs = torch.tensor([[-0.5, float("-inf"), -1.5]])
+    monkeypatch.setattr(
+        loss_utils,
+        "get_next_token_logprobs_from_logits",
+        lambda **_: filtered_logprobs,
+    )
+
+    loss_input, updated_data = prepare_loss_input(
+        torch.empty(1, 4, 4),
+        data,
+        ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0)),
+        sampling_params=TrainingSamplingParams(top_k=1),
+    )
+
+    assert loss_input["next_token_logprobs"].tolist() == [[-0.5, 0.0, -1.5]]
+    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 0.0, 1.0]]
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
