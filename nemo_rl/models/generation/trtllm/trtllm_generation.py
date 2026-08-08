@@ -444,8 +444,6 @@ class TrtllmGeneration(GenerationInterface):
         ``{metric_name: {dp_idx: list[...]}}`` with ``inflight_batch_sizes`` and
         ``num_pending_samples`` keys. Mirrors vLLM's get_vllm_logger_metrics.
         """
-        if not self.async_engine:
-            return {}
         if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return {}
         if not self.worker_group or not self.worker_group.workers:
@@ -484,8 +482,6 @@ class TrtllmGeneration(GenerationInterface):
         return logger_metrics
 
     def clear_logger_metrics(self) -> None:
-        if not self.async_engine:
-            return
         if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return
         if not self.worker_group or not self.worker_group.workers:
@@ -509,7 +505,7 @@ class TrtllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             return
         futures = self.worker_group.run_all_workers_single_data(
-            "start_gpu_profiling_async" if self.async_engine else "start_gpu_profiling",
+            "start_gpu_profiling_async",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)
@@ -519,7 +515,7 @@ class TrtllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             return
         futures = self.worker_group.run_all_workers_single_data(
-            "stop_gpu_profiling_async" if self.async_engine else "stop_gpu_profiling",
+            "stop_gpu_profiling_async",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)
