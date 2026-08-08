@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 10:54 PDT</span>
+        <span>Updated 2026-08-08 11:43 PDT</span>
         <span>Validation source a028b33b</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>20 steps per workload</span>
@@ -268,8 +268,8 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Qwen pair passed · Super queued</span></div>
-        <p>Qwen HybridEP 505735 and all-to-all baseline 506133 both completed 20/20 with Slurm exit 0. The fixed DeepEP wheel passed forced two-node dispatch/combine in 506083; canonical 32 × 8 Super job 506100 is queued for 20 steps.</p>
+        <div class="value"><span class="pill pending">Qwen pair passed · large models running</span></div>
+        <p>Qwen HybridEP 505735 and all-to-all baseline 506133 both completed 20/20 with Slurm exit 0. The fixed DeepEP wheel passed forced two-node dispatch/combine in 506083; canonical Super jobs 506100/506123 and Qwen3-235B jobs 506219/506220 are running.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -290,7 +290,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 10:54 PDT. The controlled Qwen3-30B-A3B pair completed, two-node inter-node traffic validation passed, Qwen3-235B HybridEP is initializing, and canonical Super retry 506100 is pending resources.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 11:43 PDT. The controlled Qwen3-30B-A3B pair completed and two-node inter-node traffic validation passed. Canonical Super and Qwen3-235B baseline/HybridEP pairs are running with an official 90-minute model-initialization reaper exemption.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -378,17 +378,24 @@
         </article>
         <article class="job">
           <div class="job-head">
-            <h3>506121 / 506122 · Qwen3-235B pair</h3>
-            <span class="pill pending">HybridEP initializing</span>
+            <h3>506121 / 506122 / 506202 · Qwen3-235B startup isolation</h3>
+            <span class="pill ready">vLLM root cause isolated</span>
           </div>
-          <p>Both use the canonical <code>grpo-qwen3-235b-16n8g.yaml</code> at 16 × 8 GPUs. Baseline 506121 was externally cancelled after 30 minutes by the occupied-idle reaper while 120/128 GPUs waited for sequential colocated vLLM initialization; no model exception or OOM occurred. HybridEP 506122 is warming the same runtime path before a controlled baseline retry.</p>
+          <p>All use the canonical <code>grpo-qwen3-235b-16n8g.yaml</code> at 16 × 8 GPUs. Baseline and HybridEP both hung before the policy dispatcher: cross-node vLLM TP=16 auto-selected FlashInfer MNNVL all-reduce, one worker spun on failed socket <code>accept()</code>, and every engine reported unavailable shared-memory broadcast blocks. This is dispatcher-independent, not a HybridEP or PR #2964 failure.</p>
         </article>
         <article class="job">
           <div class="job-head">
-            <h3>506100 · Canonical Super 20-step retry</h3>
-            <span class="pill pending">Pending resources</span>
+            <h3>506219 / 506220 · Qwen3-235B controlled retry</h3>
+            <span class="pill pending">Running</span>
           </div>
-          <p>Uses <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, 32 nodes × 8 B200 GPUs, the validated wheel SHA <code>f181085d…47f559d</code>, and the same generation compatibility overrides as retry 505736.</p>
+          <p>The baseline and HybridEP sides receive the same two generation-only compatibility settings: vLLM custom all-reduce is disabled and <code>fuse_allreduce_rms=false</code>. CUDA graphs and the performance recipe remain otherwise unchanged; only the policy dispatcher differs.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>506100 / 506123 · Canonical Super 20-step pair</h3>
+            <span class="pill pending">Running</span>
+          </div>
+          <p>Both use <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, 32 nodes × 8 B200 GPUs, the validated wheel SHA <code>f181085d…47f559d</code>, and identical generation compatibility overrides. HybridEP 506100 has initialized all vLLM workers and is loading all 256 policy ranks; baseline 506123 is in cluster startup.</p>
         </article>
       </div>
     </section>
@@ -429,10 +436,10 @@
             </tr>
             <tr>
               <td><strong>Qwen3-235B-A22B</strong><br><code>grpo-qwen3-235b-16n8g.yaml</code></td>
-              <td>baseline 506121<br>HybridEP 506122</td>
+              <td>baseline 506219<br>HybridEP 506220</td>
               <td>16 × 8 B200</td>
               <td>Initializing</td>
-              <td class="metric">Baseline was externally reaped during vLLM initialization; HybridEP is running. No training-step metric yet.</td>
+              <td class="metric">Controlled retries are running after disabling the cross-node FlashInfer all-reduce paths on both sides. No training-step metric yet.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -442,10 +449,10 @@
             </tr>
             <tr>
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
-              <td>505091 / 505208 / 505245 / 505265<br>DMA-BUF retry: 505736<br>fixed retry: 506100</td>
+              <td>baseline 506123<br>HybridEP 506100</td>
               <td>32 × 8 B200</td>
-              <td>No completed step</td>
-              <td class="metric">506083 inter-node dispatch/combine passed; canonical 506100 is pending. No Super training-step metric yet.</td>
+              <td>Step 1 running</td>
+              <td class="metric">506083 inter-node dispatch/combine passed; canonical HybridEP 506100 entered Step 1 and baseline 506123 is initializing. No completed training-step metric yet.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -609,7 +616,7 @@
         </li>
         <li>
           <h3>Actual inter-node traffic passed</h3>
-          <p>Job 506083 forced 128 tokens to experts on the other B200 node with probabilities enabled. Both ranks used the DMA-BUF fallback; buffer creation, dispatch, and combine completed before Slurm exit <code>0:0</code>. Canonical 32 × 8 Super retry 506100 is pending resources.</p>
+          <p>Job 506083 forced 128 tokens to experts on the other B200 node with probabilities enabled. Both ranks used the DMA-BUF fallback; buffer creation, dispatch, and combine completed before Slurm exit <code>0:0</code>. Canonical 32 × 8 Super retry 506100 initialized all 256 vLLM and policy ranks and entered Step 1.</p>
         </li>
       </ol>
       <div class="callout">
@@ -619,7 +626,7 @@
         Qwen job 505735 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means 0.0033 and 0.5250, respectively. Final validation accuracy is 0.5312. These checks establish execution stability but do not by themselves prove zero numerical regression against a controlled baseline.
       </div>
       <div class="callout">
-        Current conclusion: PR #2964 still supplies the NeMo RL side of the THD contract: it enables MCore's unequal-rank input padding, creates the physical THD padding mask, and aligns that mask with the model's sequence-parallel layout. MCore PR #5008 then equalizes dispatcher input sizes and rounds them to 64 tokens. The former custom MCore fork additionally removed pre-existing THD padding tokens from the actual routing map; official MCore <code>6513e3e2</code> uses the mask for auxiliary-loss and expert-bias accounting but does not perform that route removal. This difference is not the Super crash, but it remains a controlled performance-overhead comparison. Super's failure was in DeepEP inter-node GPUDirect RDMA: GCP-NRT rejects legacy GPU <code>ibv_reg_mr</code>, and the first DMA-BUF fallback conflated MR base and CUDA buffer base. The corrected address handling passes real dispatch and combine. End-to-end Super correctness and performance remain pending job 506100.
+        Current conclusion: PR #2964 still supplies the NeMo RL side of the THD contract: it enables MCore's unequal-rank input padding, creates the physical THD padding mask, and aligns that mask with the model's sequence-parallel layout. MCore PR #5008 then equalizes dispatcher input sizes and rounds them to 64 tokens. The former custom MCore fork additionally removed pre-existing THD padding tokens from the actual routing map; official MCore <code>6513e3e2</code> uses the mask for auxiliary-loss and expert-bias accounting but does not perform that route removal. This difference is not the Super crash, but it remains a controlled performance-overhead comparison. Super's failure was in DeepEP inter-node GPUDirect RDMA: GCP-NRT rejects legacy GPU <code>ibv_reg_mr</code>, and the first DMA-BUF fallback conflated MR base and CUDA buffer base. The corrected address handling passes real dispatch and combine; end-to-end Super correctness and performance remain under validation in jobs 506100/506123.
       </div>
     </section>
 
