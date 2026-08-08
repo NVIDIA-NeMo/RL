@@ -19,7 +19,6 @@ from typing import Any, Optional
 
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -596,6 +595,8 @@ class AsyncNemoGymRolloutImpl:
         agent_name: str,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
+        from wandb import Table
+
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
         turn_count = [
