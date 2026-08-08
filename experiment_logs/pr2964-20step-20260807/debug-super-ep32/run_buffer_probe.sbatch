@@ -13,14 +13,14 @@ debug_root=/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sn
 container=/lustre/fsw/portfolios/coreai/projects/coreai_chef_posttrain/users/sna/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh
 wheel=${DEEPEP_WHEEL:?DEEPEP_WHEEL must identify the wheel under test}
 wheel_sha256=${DEEPEP_WHEEL_SHA256:?DEEPEP_WHEEL_SHA256 must be set}
-overlay=/tmp/hybridep-buffer-probe-${SLURM_JOB_ID}
+overlay=${debug_root}/overlays/${SLURM_JOB_ID}
 
 test "$(sha256sum "${wheel}" | cut -d' ' -f1)" = "${wheel_sha256}"
 export wheel overlay
 
 srun \
-  --nodes=4 \
-  --ntasks-per-node=1 \
+  --nodes=1 \
+  --ntasks=1 \
   --container-image="${container}" \
   --container-mounts=/lustre:/lustre \
   --no-container-mount-home \
