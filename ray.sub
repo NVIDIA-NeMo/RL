@@ -596,6 +596,12 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   else
     SANDBOX_EXPECTED=1
   fi
+  # Gate the driver on a quorum rather than every instance. At ~1500 nodes the
+  # slowest sandbox reliably trails the rest, and requiring all of them lets one
+  # node abort a run that is otherwise healthy. Nodes below quorum still serve
+  # rollouts through the cluster-wide nginx balancer, so a small shortfall costs
+  # sandbox capacity, not correctness. Ceil-divide so small jobs still need all.
+  SANDBOX_MIN_READY=$(( (SANDBOX_EXPECTED * 995 + 999) / 1000 ))
 fi
 
 # First we start the head of the ray cluster on one of the physical nodes
@@ -799,17 +805,17 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     fi
     if [[ "\$sandbox_ready" -eq 0 ]]; then
       ready_count=\$(ls -1 "$SANDBOX_PORTS_DIR"/SANDBOX_READY_* 2>/dev/null | wc -l)
-      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$SANDBOX_EXPECTED nodes..."
-      if [[ "\$ready_count" -ge "$SANDBOX_EXPECTED" ]]; then
+      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$SANDBOX_EXPECTED nodes (quorum $SANDBOX_MIN_READY)..."
+      if [[ "\$ready_count" -ge "$SANDBOX_MIN_READY" ]]; then
         sandbox_ready=1
-        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All $SANDBOX_EXPECTED sandbox instances ready."
+        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox quorum reached: \$ready_count/$SANDBOX_EXPECTED instances ready."
       fi
     fi
     if [[ "\$workers_ready" -eq 1 ]] && [[ "\$sandbox_ready" -eq 1 ]]; then
       break
     fi
     if [[ "\$sandbox_ready" -eq 0 ]] && (( SECONDS > SANDBOX_DEADLINE )); then
-      echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$SANDBOX_EXPECTED after 20 min)"
+      echo "[ERROR] Timed out waiting for sandbox quorum (\$ready_count/$SANDBOX_MIN_READY of $SANDBOX_EXPECTED after 20 min)"
       touch "$LOG_DIR/ENDED"
       exit 1
     fi
@@ -1031,8 +1037,8 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --mpi=pmix \
     -A "$SLURM_JOB_ACCOUNT" \
     -p "$SLURM_JOB_PARTITION" \
-    --wait=60 \
-    --kill-on-bad-exit=1 \
+    --wait=0 \
+    --kill-on-bad-exit=0 \
     --overlap \
     "${SANDBOX_SRUN_EXCLUDE[@]}" \
     --nodes="$SANDBOX_EXPECTED" \
@@ -1041,14 +1047,16 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     bash -xc '
       ('"$SANDBOX_COMMAND"') &
       SANDBOX_PID=$!
-      deadline=$((SECONDS + 300))
+      # 5 min is too tight at ~1500 nodes: every instance proxies to one elected
+      # nginx master, so the tail of the fleet comes up well after the median.
+      deadline=$((SECONDS + 900))
       while ! (echo > /dev/tcp/localhost/'"$SANDBOX_PORT"') 2>/dev/null; do
         if ! kill -0 $SANDBOX_PID 2>/dev/null; then
           echo "[ERROR] Sandbox process died before becoming ready on $(hostname)"
           exit 1
         fi
         if (( SECONDS > deadline )); then
-          echo "[ERROR] Sandbox not ready on $(hostname) after 5 min"
+          echo "[ERROR] Sandbox not ready on $(hostname) after 15 min"
           exit 1
         fi
         sleep 2
