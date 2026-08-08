@@ -221,6 +221,9 @@ def test_vllm_kv_quant_refit(cluster, recipe, monkeypatch):
     quant_cfg = str((_QUANT_CFG_DIR / recipe).resolve())
     tokenizer = get_tokenizer({"name": _MODEL_NAME})
     vllm_config = _make_vllm_config(tokenizer, quant_cfg=quant_cfg)
+    # This test validates refit state, while the preceding test covers compiled
+    # startup. Avoid reusing its AOT graph with a different quantizer layout.
+    vllm_config["vllm_cfg"]["enforce_eager"] = True
     megatron_config = _make_megatron_config(vllm_config, quant_cfg=quant_cfg)
 
     vllm_policy = None
