@@ -37,7 +37,7 @@ def main() -> None:
         )
 
     hidden_dim = 1024 if probe_mode == "dispatch" else 4096
-    num_local_experts = 1 if probe_mode == "dispatch" else 16
+    num_local_experts = 4 if probe_mode == "dispatch" else 16
     buffer = HybridEPBuffer(
         group=dist.group.WORLD,
         hidden_dim=hidden_dim,
@@ -53,7 +53,7 @@ def main() -> None:
 
     if probe_mode == "dispatch":
         num_tokens = min(max_tokens, 128)
-        num_experts = world_size
+        num_experts = world_size * num_local_experts
         hidden = torch.full(
             (num_tokens, hidden_dim),
             rank + 1,
@@ -62,7 +62,7 @@ def main() -> None:
         )
         topk_idx = torch.full(
             (num_tokens, 1),
-            (rank + 1) % world_size,
+            ((rank + 1) % world_size) * num_local_experts,
             dtype=torch.int64,
             device="cuda",
         )
