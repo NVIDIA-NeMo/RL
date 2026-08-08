@@ -586,6 +586,9 @@ TOPO_PROBE_EOF
 # extra mounts are supported via SANDBOX_EXTRA_MOUNTS (e.g. a shared temp dir).
 SANDBOX_PORTS_DIR=""
 SANDBOX_EXPECTED=0
+# Interpolated into the head script unconditionally, so it has to exist even
+# when no sandbox is configured and the readiness branch is skipped entirely.
+SANDBOX_MIN_READY=0
 if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
   mkdir -p "$SANDBOX_PORTS_DIR"
