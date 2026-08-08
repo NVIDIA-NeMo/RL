@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 07:26 PDT</span>
+        <span>Updated 2026-08-08 07:58 PDT</span>
         <span>Validation source a028b33b</span>
         <span>DeepEP 17cfb817 + f725d296 diagnostics</span>
         <span>20 steps per workload</span>
@@ -268,8 +268,8 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Full-workload retry running</span></div>
-        <p>Qwen previously completed 20/20. The Super RDMA crash is fixed in isolated 2-node and 4-node × 8-GPU probes; canonical Qwen and Super 20-step retries are running.</p>
+        <div class="value"><span class="pill failed">Super inter-node RDMA blocked</span></div>
+        <p>Qwen previously completed 20/20 and retry 505735 reached Step 12 without a fatal error. Super retry 505736 passed generation but failed in its first EP=32 inter-node dispatch; it was cancelled after the fatal worker exits to release 256 GPUs.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -278,8 +278,8 @@
       </article>
       <article class="card">
         <div class="label">Runtime artifact</div>
-        <div class="value"><span class="pill ready">Fallback validated</span></div>
-        <p>DeepEP <code>17cfb817</code> plus the guarded CUDA DMA-BUF fallback passes the previously crashing inter-node constructor at 2 nodes and 4 × 8 GPUs.</p>
+        <div class="value"><span class="pill failed">Constructor only</span></div>
+        <p>The guarded CUDA DMA-BUF fallback prevents the null-MR constructor segfault, but the first real inter-node transfer receives a negative DOCA CQ status. It is not an end-to-end fix.</p>
       </article>
       <article class="card">
         <div class="label">Measurements</div>
@@ -290,7 +290,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 07:26 PDT. Root-cause and constructor-fix validation are complete; canonical 20-step model retries are still running.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 07:58 PDT. Qwen retry 505735 is running; Super retry 505736 exposed a second, traffic-time RDMA failure after constructor registration.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -337,16 +337,16 @@
         <article class="job">
           <div class="job-head">
             <h3>505698 / 505700 / 505713 · DMA-BUF fallback</h3>
-            <span class="pill ready">Passed</span>
+            <span class="pill pending">Constructor passed</span>
           </div>
-          <p>Job 505698 built DeepEP <code>17cfb817</code> with the guarded fallback. Jobs 505700 (2 × 1 GPU) and 505713 (4 × 8 GPUs) observed legacy <code>EFAULT</code>, switched to <code>ibv_reg_dmabuf_mr</code>, constructed the buffer, and exited <code>0:0</code>.</p>
+          <p>Job 505698 built DeepEP <code>17cfb817</code> with the guarded fallback. Jobs 505700 (2 × 1 GPU) and 505713 (4 × 8 GPUs) observed legacy <code>EFAULT</code>, switched to <code>ibv_reg_dmabuf_mr</code>, constructed the buffer, and exited <code>0:0</code>. These probes did not send RDMA traffic.</p>
         </article>
         <article class="job">
           <div class="job-head">
             <h3>505735 / 505736 · Canonical 20-step retries</h3>
-            <span class="pill pending">Running</span>
+            <span class="pill failed">Mixed</span>
           </div>
-          <p>Qwen job 505735 has entered Step 1 reference logprob. Super job 505736 initialized all 256 vLLM actors and is initializing 256 Megatron policy workers. No fatal error is present at this snapshot.</p>
+          <p>Qwen job 505735 reached Step 12/20 with generation, logprob, and policy training active. Super job 505736 initialized all 256 vLLM and policy workers, completed Step 1 generation/reward/advantage, then failed at <code>hybrid_ep_backend.cuh:1187</code> when <code>doca_gpu_dev_verbs_poll_cq()</code> returned a negative status during the first inter-node reference-logprob dispatch.</p>
         </article>
       </div>
     </section>
@@ -387,8 +387,8 @@
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
               <td>505091 / 505208 / 505245 / 505265<br>fixed retry: 505736</td>
               <td>32 × 8 B200</td>
-              <td>Retry running</td>
-              <td class="metric">Old attempt: Step 1 RDMA segfault. Fixed retry: policy initialization at this snapshot.</td>
+              <td>No completed step</td>
+              <td class="metric">505736: Step 1 generation passed; first reference-logprob inter-node dispatch failed at DOCA CQ polling.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -506,7 +506,15 @@
         </li>
         <li>
           <h3>Canonical model validation resumed</h3>
-          <p>Jobs 505735 and 505736 use the repository performance recipes with 20 steps and explicit HybridEP topology. Qwen reached Step 1 logprob; Super completed all 256 vLLM actor initializations and is progressing through Megatron policy setup.</p>
+          <p>Jobs 505735 and 505736 use the repository performance recipes with 20 steps and explicit HybridEP topology. Qwen reached Step 12 with generation, logprob, and policy training active. Super completed all 256 vLLM and policy-worker initializations plus Step 1 generation, rewards, and advantages.</p>
+        </li>
+        <li>
+          <h3>Super exposed a traffic-time RDMA completion failure</h3>
+          <p>At the first reference-logprob dispatch, all ranks selected the DMA-BUF fallback and began inter-node traffic. The DOCA dispatch kernel then failed at <code>hybrid_ep_backend.cuh:1187</code> because <code>doca_gpu_dev_verbs_poll_cq()</code> returned a negative status. The later Transformer Engine grouped-GEMM launch errors were downstream symptoms of the device-side assertion. Job 505736 was cancelled only after the driver was terminal, avoiding 256 idle GPUs.</p>
+        </li>
+        <li>
+          <h3>Minimal transfer reproduction launched</h3>
+          <p>Job 505820 uses two nodes and one GPU per node, forces every token to an expert on the other node, and exercises dispatch plus combine without model weights. This closes the gap in the earlier constructor-only probes and will determine whether a DeepEP MR/address correction is sufficient or the cluster needs a GPUDirect RDMA capability change.</p>
         </li>
       </ol>
       <div class="callout">
@@ -516,7 +524,7 @@
         Qwen correctness sanity: all logged loss, reward, gradient, and KL values are finite; mean generation KL is 0.00190; median token multiplied-probability error is 1.022 and the final-step value is 1.022, both within the repository's large-model gates. Step 8 is a disclosed outlier at 101.66, so this run proves execution stability but is not sufficient by itself to claim zero numerical regression.
       </div>
       <div class="callout">
-        Current conclusion: the previous NeMo RL patch remains necessary and functional for THD unequal-dispatch padding, but it cannot repair an RDMA registration failure below the model/data path. On GCP B200, legacy <code>ibv_reg_mr</code> returns <code>EFAULT</code> because <code>nvidia_peermem</code> is not loaded. The guarded DeepEP fallback preserves the legacy path where it works and uses CUDA DMA-BUF only after failure; it now passes both inter-node constructor scales tested. Full Super validation is pending job 505736 crossing Step 1 reference logprob and completing its 20 steps.
+        Current conclusion: the previous NeMo RL patch remains necessary and functional for THD unequal-dispatch padding; Qwen's real training path continues to validate it. Super's EP=32 topology additionally requires inter-node GPUDirect RDMA. On GCP B200, legacy <code>ibv_reg_mr</code> returns <code>EFAULT</code> and the node has no <code>nvidia_peermem</code> module. CUDA DMA-BUF makes registration and construction succeed, but job 505736 proves that the current fallback is insufficient for actual DOCA RDMA traffic. No Super performance metric is valid until the CQ failure is resolved.
       </div>
     </section>
 

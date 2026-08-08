@@ -34,6 +34,13 @@ srun \
       --python /opt/nemo_rl_venv/bin/python \
       --target "${overlay}" \
       --reinstall --no-deps --no-index "${wheel}"
+    if [[ "${ENABLE_CQ_DEBUG:-0}" == 1 ]]; then
+      verbs_def=${overlay}/deep_ep/backend/nccl/include/common/doca_gpunetio_verbs_def.h
+      sed -i \
+        's/^#define DOCA_GPUNETIO_VERBS_ENABLE_DEBUG 0$/#define DOCA_GPUNETIO_VERBS_ENABLE_DEBUG 1/' \
+        "${verbs_def}"
+      grep -qx '#define DOCA_GPUNETIO_VERBS_ENABLE_DEBUG 1' "${verbs_def}"
+    fi
     if [[ "${TRACE_IBVERBS:-0}" == 1 ]]; then
       gcc -shared -fPIC -O2 \
         -o "${trace_library}" "${debug_root}/trace_ibverbs.c" -ldl
