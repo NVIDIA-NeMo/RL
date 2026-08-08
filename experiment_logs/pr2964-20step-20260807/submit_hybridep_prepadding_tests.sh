@@ -29,7 +29,7 @@ export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
 export BASE_LOG_DIR="${run_root}/ray"
 export GPUS_PER_NODE=8
-export PYTHONPATH="${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+export PYTHONPATH="${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
 
 cd "${repo}"
 sbatch "${submit_mode[@]}" \
