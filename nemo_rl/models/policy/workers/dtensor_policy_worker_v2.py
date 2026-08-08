@@ -546,6 +546,14 @@ class DTensorPolicyWorkerV2Impl(
                     train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    # Masked diffusion policies are trained against the same
+                    # ELBO they are scored by, so the training forward has to
+                    # accumulate the quadrature points too -- a single forward
+                    # would make the policy ratio compare two different
+                    # quantities.
+                    elbo_scorer=self._dllm_train_elbo_scorer(sequence_dim)
+                    if self.dllm_estimator is not None
+                    else None,
                 )
 
                 # Extract losses and metrics from results
@@ -676,6 +684,42 @@ class DTensorPolicyWorkerV2Impl(
             seed=seed,
             score_fn=score_fn,
         )
+
+    def _dllm_train_elbo_scorer(self, sequence_dim: int) -> Any:
+        """Builds the differentiable ELBO scorer used by the training forward.
+
+        ``get_logprobs`` accumulates the ELBO under ``no_grad`` to produce the
+        old and reference likelihoods. Training needs the same quantity with
+        gradients attached, so the policy ratio compares like with like -- the
+        reference implementation likewise calls its estimator inside
+        ``compute_loss`` (https://arxiv.org/abs/2510.08554).
+
+        Args:
+            sequence_dim: Sequence dimension of the microbatch tensors.
+
+        Returns:
+            A callable mapping a ``ProcessedMicrobatch`` to the ``[batch,
+            seq_len]`` per-position ELBO contributions, with autograd history
+            spanning every quadrature point.
+        """
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+        )
+
+        def score(processed_mb: Any) -> torch.Tensor:
+            return self._dllm_elbo_logprobs(
+                processed_mb=processed_mb,
+                post_processing_fn=logprobs_post_processor,
+                sequence_dim=sequence_dim,
+            )
+
+        return score
 
     @torch.no_grad()
     def generate(
