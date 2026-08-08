@@ -52,7 +52,12 @@ def main() -> None:
         print("probe-buffer-created", flush=True)
 
     if probe_mode == "dispatch":
-        num_tokens = min(max_tokens, 128)
+        num_tokens = int(os.environ.get("PROBE_NUM_TOKENS", min(max_tokens, 128)))
+        with_probs = os.environ.get("PROBE_WITH_PROBS", "1") == "1"
+        if not 0 < num_tokens <= max_tokens:
+            raise ValueError(
+                f"PROBE_NUM_TOKENS must be in [1, {max_tokens}], got {num_tokens}"
+            )
         num_experts = world_size * num_local_experts
         hidden = torch.full(
             (num_tokens, hidden_dim),
@@ -73,13 +78,13 @@ def main() -> None:
             print(
                 "probe-dispatch-start "
                 f"tokens={num_tokens} hidden_dim={hidden_dim} "
-                f"num_experts={num_experts}",
+                f"num_experts={num_experts} with_probs={with_probs}",
                 flush=True,
             )
         dispatched, _, _, handle = buffer.dispatch(
             hidden=hidden,
             topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_weights=topk_weights if with_probs else None,
             num_of_experts=num_experts,
         )
         torch.cuda.synchronize()
