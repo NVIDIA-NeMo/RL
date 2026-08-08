@@ -1627,22 +1627,14 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
 
 
 @pytest.mark.mcore
-@patch(
-    "nemo_rl.models.megatron.data.get_expert_tensor_and_model_parallel_group",
-    return_value=MagicMock(),
-)
-@patch("nemo_rl.models.megatron.data.torch.distributed.all_reduce")
-def test_hybridep_prepads_packed_inputs_before_model_forward(
-    mock_all_reduce, mock_get_group
-):
+def test_hybridep_prepads_packed_inputs_before_model_forward():
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    from nemo_rl.models.megatron.data import _pad_packed_seq_for_hybridep
+    from nemo_rl.models.megatron import data as megatron_data
 
     def set_group_max(target, **_kwargs):
         target.fill_(14)
 
-    mock_all_reduce.side_effect = set_group_max
     input_ids = torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]])
     cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32)
     packed_seq_params = PackedSeqParams(
@@ -1657,6 +1649,16 @@ def test_hybridep_prepads_packed_inputs_before_model_forward(
     )
 
     with (
+        patch.object(
+            megatron_data,
+            "get_expert_tensor_and_model_parallel_group",
+            return_value=MagicMock(),
+        ) as mock_get_group,
+        patch.object(
+            megatron_data.torch.distributed,
+            "all_reduce",
+            side_effect=set_group_max,
+        ) as mock_all_reduce,
         patch(
             "nemo_rl.models.megatron.data.torch.distributed.is_available",
             return_value=True,
@@ -1671,7 +1673,7 @@ def test_hybridep_prepads_packed_inputs_before_model_forward(
             padded_local_input_ids,
             padded_params,
             padded_cu_seqlens,
-        ) = _pad_packed_seq_for_hybridep(
+        ) = megatron_data._pad_packed_seq_for_hybridep(
             input_ids=input_ids,
             input_ids_cp_sharded=input_ids,
             packed_seq_params=packed_seq_params,
