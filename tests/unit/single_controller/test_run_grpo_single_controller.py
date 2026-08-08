@@ -19,13 +19,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from examples import run_grpo_single_controller
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 
 @pytest.fixture
 def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     generation_config = {"backend": "vllm"}
-    config = SimpleNamespace(
+    config = MasterConfig.model_construct(
         policy={
             "tokenizer": {},
             "generation": generation_config,
@@ -36,6 +38,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         data_plane={"enabled": True},
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
+        grpo=GRPOConfig(async_grpo=None),
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
     configure_generation = MagicMock(return_value=configured_generation)
