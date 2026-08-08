@@ -769,6 +769,40 @@ class TestMegatronForwardBackward:
         call_kwargs = mock_fb_func.call_args[1]
         assert call_kwargs["forward_only"] is True
 
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_megatron_forward_backward_clones_iterator_for_model_chunks(
+        self, mock_get_fb
+    ):
+        """VPP model chunks should receive independent iterators over the same data."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        consumed_by_chunk = []
+
+        def fake_forward_backward_func(**kwargs):
+            data_iterators = kwargs["data_iterator"]
+            consumed_by_chunk.extend([list(iterator) for iterator in data_iterators])
+            return {"loss": torch.tensor(0.5)}
+
+        mock_get_fb.return_value = fake_forward_backward_func
+        cfg = {"sequence_packing": {"enabled": False}}
+        post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
+        microbatches = [object(), object(), object()]
+        model_chunks = [MagicMock(), MagicMock()]
+
+        megatron_forward_backward(
+            model=model_chunks,
+            data_iterator=iter(microbatches),
+            num_microbatches=len(microbatches),
+            seq_length=64,
+            mbs=1,
+            post_processing_fn=post_processor,
+        )
+
+        assert consumed_by_chunk == [microbatches, microbatches]
+
 
 class TestLossPostProcessor:
     """Tests for LossPostProcessor class."""
