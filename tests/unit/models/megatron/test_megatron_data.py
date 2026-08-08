@@ -1628,9 +1628,7 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
 
 @pytest.mark.mcore
 @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
-@patch(
-    "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
-)
+@patch("nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2)
 @patch(
     "nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices",
     return_value=torch.tensor([0, 3, 4, 7]),
@@ -1666,9 +1664,7 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
         cu_seqlens_padded,
     )
     data_dict = {
-        "input_ids": torch.tensor(
-            [[11, 12, 13, 0, 0], [21, 22, 23, 24, 25]]
-        ),
+        "input_ids": torch.tensor([[11, 12, 13, 0, 0], [21, 22, 23, 24, 25]]),
         "input_lengths": torch.tensor([3, 5]),
     }
 

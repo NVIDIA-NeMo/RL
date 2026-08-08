@@ -284,9 +284,7 @@ def _get_packed_seq_padding_mask(
         cu_seqlens_padded[1:].contiguous(), token_positions, right=True
     )
     padded_starts = cu_seqlens_padded[:-1].index_select(0, sequence_indices)
-    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).index_select(
-        0, sequence_indices
-    )
+    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).index_select(0, sequence_indices)
     return ((token_positions - padded_starts) >= valid_lengths).unsqueeze(0)
 
 
