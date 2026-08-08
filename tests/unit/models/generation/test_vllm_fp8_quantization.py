@@ -64,7 +64,6 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
             "kv_cache_dtype": "auto",
             "async_engine": False,
             "is_mx": True,
-            "refit_batched_moe_shuffle": False,
             "use_deep_gemm": True,
         },
         "dummy-model",
@@ -78,32 +77,8 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
-    assert fp8.global_fp8_config.refit_batched_moe_shuffle is False
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
-
-
-def test_init_fp8_defaults_to_batched_moe_shuffle(fp8_module, monkeypatch):
-    fp8 = fp8_module
-    monkeypatch.setattr(
-        fp8.AutoConfig,
-        "from_pretrained",
-        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
-    )
-    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
-
-    fp8.init_fp8(
-        {
-            "precision": "fp8",
-            "kv_cache_dtype": "auto",
-            "async_engine": False,
-            "is_mx": True,
-        },
-        "dummy-model",
-        model_parallel_size=1,
-    )
-
-    assert fp8.global_fp8_config.refit_batched_moe_shuffle is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -173,17 +148,17 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
-@pytest.mark.parametrize("use_batched", [True, False])
 @pytest.mark.parametrize("is_gated", [True, False])
-def test_process_mxfp8_moe_refit_uses_configured_shuffle(
-    fp8_module, monkeypatch, use_batched, is_gated
+def test_process_mxfp8_moe_refit_uses_batched_flashinfer_shuffle(
+    fp8_module, monkeypatch, is_gated
 ):
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
     fp8 = fp8_module
     fp8.global_fp8_config = fp8.FP8Config(
         use_fp8_weights=True,
         model_parallel_size=1,
         is_mx=True,
-        refit_batched_moe_shuffle=use_batched,
     )
 
     w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
@@ -210,6 +185,7 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
         moe=types.SimpleNamespace(is_act_and_mul=is_gated),
         moe_kernel=moe_kernel,
         moe_quant_config=moe_quant_config,
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
     )
     shuffled = (
         torch.full_like(w13_weight, 1),
@@ -223,12 +199,7 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
         calls.append(("batched", args))
         return shuffled
 
-    def per_expert_shuffle(*args):
-        calls.append(("per_expert", args))
-        return shuffled
-
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", batched_shuffle)
-    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", per_expert_shuffle)
 
     from vllm.model_executor.layers.quantization.utils import flashinfer_utils
 
@@ -263,10 +234,9 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
 
     assert len(calls) == 1
     selected_path, args = calls[0]
-    assert selected_path == ("batched" if use_batched else "per_expert")
-    if use_batched:
-        assert args[0] is layer
-        args = args[1:]
+    assert selected_path == "batched"
+    assert args[0] is layer
+    args = args[1:]
     assert args[0].data_ptr() == w13_weight.data_ptr()
     assert args[1].data_ptr() == w2_weight.data_ptr()
     assert args[2].data_ptr() == w13_scale_from_checkpoint.data_ptr()
@@ -295,13 +265,26 @@ def test_process_mxfp8_moe_refit_uses_configured_shuffle(
     assert quant_method.moe_quant_config is moe_quant_config
 
 
+def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    quant_method = types.SimpleNamespace(mxfp8_backend=Fp8MoeBackend.DEEPGEMM)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="MXFP8 MoE refit layout conversion only supports FLASHINFER_TRTLLM",
+    ):
+        fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
+
+
 def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
     fp8 = fp8_module
     fp8.global_fp8_config = fp8.FP8Config(
         use_fp8_weights=True,
         model_parallel_size=1,
         is_mx=True,
-        refit_batched_moe_shuffle=True,
     )
 
     layer = torch.nn.Module()
@@ -328,7 +311,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     quant_method = types.SimpleNamespace(
         moe=moe_config,
         moe_kernel=None,
-        mxfp8_backend="flashinfer_trtllm",
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
         experts_cls=experts_cls,
         get_fused_moe_quant_config=get_quant_config,
     )
@@ -389,7 +372,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     assert kernel_calls[0] == {
         "moe_quant_config": quant_config,
         "moe_config": moe_config,
-        "fp8_backend": "flashinfer_trtllm",
+        "fp8_backend": Fp8MoeBackend.FLASHINFER_TRTLLM,
         "experts_cls": experts_cls,
         "routing_tables": (None, None, None),
         "layer": layer,
