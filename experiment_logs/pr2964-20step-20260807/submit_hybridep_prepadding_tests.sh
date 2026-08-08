@@ -16,12 +16,13 @@ container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-cw-fallb
 test -n "${VALIDATION_HEAD_OVERRIDE:-}"
 run_root=${experiment_root}/runs/hybridep-prepadding-${VALIDATION_HEAD_OVERRIDE:0:12}
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"30","reason":"other","description":"Focused NeMo-RL HybridEP pre-padding tests"}}'
+policy_python=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
 
 test "$(git -C "${repo}" rev-parse HEAD)" = "${VALIDATION_HEAD_OVERRIDE}"
 test -r "${container}"
 mkdir -p "${run_root}/ray"
 
-COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m pytest --mcore-only -q \
+COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ${policy_python} -m pytest --mcore-only -q \
   ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
   ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_preserves_existing_cp_local_layout \
   ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_rejects_model_owned_cp_slicing \
