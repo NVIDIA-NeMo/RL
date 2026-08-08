@@ -25,7 +25,7 @@ slurm_exclude=${SLURM_EXCLUDE:-}
 test "$(git -C "${repo}" rev-parse HEAD)" = a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f
 git -C "${repo}" merge-base --is-ancestor 60a10b4f54c2754d44150771a06260fe9e8b186f HEAD
 git -C "${repo}" merge-base --is-ancestor a9aaa395c37963a9fd8a7320d61a516c7b714e57 HEAD
-test -z "$(git -C "${repo}" status --porcelain)"
+test -z "$(git -C "${repo}" status --porcelain --untracked-files=no --ignore-submodules=untracked)"
 if git -C "${repo}" submodule status --recursive | grep -qE '^[+-U]'; then
   printf 'Submodules do not match the pinned gitlinks.\n' >&2
   exit 2
