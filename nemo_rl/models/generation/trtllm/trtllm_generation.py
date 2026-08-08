@@ -132,9 +132,7 @@ class TrtllmGeneration(GenerationInterface):
         # broadcast; colocated shares the policy's NCCL group so don't touch it.
         env_vars: dict[str, str] = {}
         if not self.colocated_enabled:
-            env_vars["NCCL_CUMEM_ENABLE"] = os.environ.get(
-                "NRL_GEN_NCCL_CUMEM_ENABLE", "1"
-            )
+            env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
         if self.model_parallel_size > 1:
             node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
@@ -438,11 +436,9 @@ class TrtllmGeneration(GenerationInterface):
             return False
 
     def get_logger_metrics(self) -> dict[str, Any]:
-        """Collect in-flight batching telemetry from the DP-leader workers.
+        """Collect in-flight batching telemetry from DP-leader workers.
 
-        Returns the same shape the consumer (algorithms/utils.py) asserts on:
-        ``{metric_name: {dp_idx: list[...]}}`` with ``inflight_batch_sizes`` and
-        ``num_pending_samples`` keys. Mirrors vLLM's get_vllm_logger_metrics.
+        Returns ``{metric_name: {dp_idx: list[...]}}``; mirrors vLLM's get_vllm_logger_metrics.
         """
         if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return {}

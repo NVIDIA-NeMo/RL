@@ -125,8 +125,6 @@ class TrtllmAsyncGenerationWorkerImpl:
         # KV-cache utilization as a 0-1 fraction (mirrors vLLM's
         # kv_cache_usage_perc) so both backends' figures are comparable.
         self.kv_cache_usage_perc: list[float] = []
-        self._kv_stats_keys_logged = False
-
         if not self.is_model_owner:
             return
 
@@ -144,12 +142,7 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         self.TrtSamplingParams = TrtSamplingParams
 
-        # Install the sync `fetch_stats_serialized` worker method BEFORE AsyncLLM
-        # spawns its RayGPUWorker engine processes, so they import the patched
-        # BaseWorker. See _ifb_stats_patch for the full rationale (the metric can
-        # only be read from the real engine via collective_rpc, which needs a sync
-        # picklable fetch). Applied here in-process + via a .pth drop so the
-        # separate worker processes also run it.
+        # Must run before AsyncLLM spawns RayGPUWorker processes.
         if self._trtllm_metrics_enabled:
             self._install_ifb_stats_patch()
 
@@ -245,10 +238,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             )
             llm_kwargs["per_worker_gpu_share"] = self._fraction_of_gpus
 
-        # Enable per-iteration performance stats so get_stats_async() yields
-        # inflightBatchingStats (the TRT-LLM analog of vLLM's
-        # vllm:num_requests_running). Set before the extra-kwargs spread so the
-        # user can still override it via trtllm_kwargs.
+        # Set before extra-kwargs spread so the user can still override via trtllm_kwargs.
         if self._trtllm_metrics_enabled:
             llm_kwargs["enable_iter_perf_stats"] = True
 
@@ -303,11 +293,7 @@ class TrtllmAsyncGenerationWorkerImpl:
 
     @staticmethod
     def _get_stat_field(obj: Any, *keys: str) -> Any:
-        """Read a nested field from a dict-like or attribute-like stats record.
-
-        TRT-LLM has returned both shapes across versions. Returns None if any
-        level is missing.
-        """
+        """Read a nested field from dict-like or attribute-like stats; None if missing."""
         cur = obj
         for k in keys:
             if cur is None:
@@ -321,18 +307,8 @@ class TrtllmAsyncGenerationWorkerImpl:
     def _install_ifb_stats_patch(self) -> None:
         """Expose a sync ``fetch_stats_serialized`` on TRT-LLM's BaseWorker.
 
-        This is Ray-picklable, so the drain can read iteration stats via
-        collective_rpc.
-
-        The metric can only be read from the real engine worker via
-        collective_rpc (the RPC-client get_stats path hits a stats-less engine);
-        collective_rpc returns unpicklable IterationStats objects and the
-        built-in serialized fetches are async (unusable through the sync
-        RayGPUWorker.call_worker_method). We add a plain sync serializing method.
-        Applied both in this actor's process and — because the engine runs in
-        separate RayGPUWorker processes that do not import nemo_rl — by appending
-        a module-level patch to the shared-venv base_worker.py source those
-        processes import. See _ifb_stats_patch for the full rationale.
+        Applied in-process and via base_worker.py source append for the
+        separate RayGPUWorker processes. See _ifb_stats_patch for rationale.
         """
         try:
             from nemo_rl.models.generation.trtllm import _ifb_stats_patch
@@ -394,14 +370,8 @@ class TrtllmAsyncGenerationWorkerImpl:
         _err_logged = 0
         while True:
             try:
-                # Read iteration stats from the real engine workers via
-                # collective_rpc("fetch_stats_serialized") — a sync serializing
-                # method injected onto TRT-LLM's BaseWorker (see
-                # _install_ifb_stats_patch). On the _torch AsyncLLM Ray backend the
-                # RPC-proxy get_stats()/get_stats_async() reach a stats-less engine
-                # (always empty), and raw collective_rpc("fetch_stats") returns
-                # unpicklable IterationStats objects; fetch_stats_serialized returns
-                # JSON strings (camelCase inflightBatchingStats.numScheduledRequests).
+                # fetch_stats_serialized is a sync serializing method injected onto
+                # BaseWorker — see _ifb_stats_patch for why this RPC is needed.
                 try:
                     rank_results = await self.llm.collective_rpc(
                         "fetch_stats_serialized"
@@ -415,23 +385,16 @@ class TrtllmAsyncGenerationWorkerImpl:
                             f"collective_rpc(fetch_stats_serialized) error: {e!r}",
                             flush=True,
                         )
-                # Every TP rank of an engine accumulates the SAME per-iteration
-                # stats, so take a single rank (the first non-empty one) to avoid
-                # double-counting the timeline.
+                # All TP ranks carry identical stats; read only the first
+                # non-empty rank to avoid double-counting.
                 records: list[Any] = []
                 for _rank_res in rank_results or []:
                     if _rank_res:
                         records = _rank_res
                         break
-                # Append EXACTLY ONE sample per drain interval to mirror vLLM's
-                # _logger_loop (which samples a single gauge value per interval).
-                # The plot's x-axis assumes one point per interval (x = index *
-                # timeline_interval), so appending every per-iteration engine
-                # record (tens of thousands/step) would both over-densify the
-                # series and massively overstate wall-clock. Take the LAST drained
-                # record as the instantaneous sample; when the engine is idle and
-                # no records are returned, append 0 to both (mirrors vLLM logging
-                # the current 0-gauge) so every interval yields one point.
+                # One sample per interval: the plot's x-axis assumes index * interval.
+                # Take the last drained record; append 0 when idle so every
+                # interval yields a point (mirrors vLLM's gauge sampling).
                 ifb_sample = 0
                 ctx_sample = 0
                 kv_sample = 0.0
@@ -454,27 +417,9 @@ class TrtllmAsyncGenerationWorkerImpl:
                         # queued/pending prefill work. Keep the same two-series
                         # shape the consumer asserts on.
                         ctx_sample = int(ctx) if ctx is not None else 0
-                        # KV-cache utilization as a 0-1 fraction, mirroring
-                        # vLLM's kv_cache_usage_perc. TRT-LLM's serialized
-                        # IterationStats exposes a kvCacheStats sub-object with
-                        # block counts (usedNumBlocks / maxNumBlocks /
-                        # freeNumBlocks) — not a ready percent — so derive it:
-                        #   kv = usedNumBlocks / maxNumBlocks
-                        # (fallback 1 - freeNumBlocks/maxNumBlocks), guarded for
-                        # maxNumBlocks == 0 -> 0.0. One-time log of the observed
-                        # kvCacheStats keys to ease field-name debugging.
+                        # kv = usedNumBlocks/maxNumBlocks (fallback: 1 - freeNumBlocks/maxNumBlocks),
+                        # guarded for maxNumBlocks == 0.
                         kv_stats = self._get_stat_field(stats, "kvCacheStats")
-                        if kv_stats is not None and not self._kv_stats_keys_logged:
-                            self._kv_stats_keys_logged = True
-                            _keys = (
-                                list(kv_stats.keys())
-                                if isinstance(kv_stats, dict)
-                                else dir(kv_stats)
-                            )
-                            print(
-                                f"📋[TRT-LLM Metric Logger] kvCacheStats keys: {_keys}",
-                                flush=True,
-                            )
                         max_blocks = self._get_stat_field(kv_stats, "maxNumBlocks")
                         used_blocks = self._get_stat_field(kv_stats, "usedNumBlocks")
                         free_blocks = self._get_stat_field(kv_stats, "freeNumBlocks")
@@ -504,10 +449,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                         f"⚠️[TRT-LLM Metric Logger] stats drain error: {e}",
                         flush=True,
                     )
-            # Always back off between drain cycles, not just on error. get_stats()
-            # already blocks up to `interval` collecting queued records; this extra
-            # sleep guards against a tight loop if it ever returns immediately
-            # (e.g. before prompts are submitted) so we never busy-spin.
+            # Back off between cycles to avoid busy-spinning when the engine returns immediately.
             await asyncio.sleep(interval)
 
     def get_trtllm_logger_metrics(self) -> dict[str, Any]:
