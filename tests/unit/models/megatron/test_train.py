@@ -120,6 +120,27 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["packed_seq_params"] == mock_packed_seq_params
 
+    def test_model_forward_passes_padding_mask(self):
+        """Packed fake-token positions are forwarded to the MCore MoE router."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 4, 100))
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {}
+        padding_mask = torch.tensor([[False, False, True, True]])
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 0, 0]]),
+            position_ids=None,
+            attention_mask=None,
+            packed_seq_params=MagicMock(),
+            padding_mask=padding_mask,
+        )
+
+        assert torch.equal(mock_model.call_args.kwargs["padding_mask"], padding_mask)
+
     def test_model_forward_with_defer_fp32_logits(self):
         """Test model_forward passes fp32_output when defer_fp32_logits is True."""
         from nemo_rl.models.megatron.train import model_forward
