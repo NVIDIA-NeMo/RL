@@ -36,10 +36,13 @@ srun \
       --reinstall --no-deps --no-index "${wheel}"
     if [[ "${ENABLE_CQ_DEBUG:-0}" == 1 ]]; then
       verbs_def=${overlay}/deep_ep/backend/nccl/include/common/doca_gpunetio_verbs_def.h
+      verbs_include=${overlay}/deep_ep/backend/nccl/include
       sed -i \
         "s/^#define DOCA_GPUNETIO_VERBS_ENABLE_DEBUG 0$/#define DOCA_GPUNETIO_VERBS_ENABLE_DEBUG 1/" \
         "${verbs_def}"
       grep -qx "#define DOCA_GPUNETIO_VERBS_ENABLE_DEBUG 1" "${verbs_def}"
+      patch --batch --forward -d "${verbs_include}" -p1 \
+        < "${debug_root}/cq_poll_all.patch"
     fi
     if [[ "${TRACE_IBVERBS:-0}" == 1 ]]; then
       gcc -shared -fPIC -O2 \

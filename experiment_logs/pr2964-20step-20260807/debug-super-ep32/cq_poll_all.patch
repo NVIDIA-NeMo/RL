@@ -1,0 +1,22 @@
+diff --git a/device/doca_gpunetio_dev_verbs_cq.cuh b/device/doca_gpunetio_dev_verbs_cq.cuh
+--- a/device/doca_gpunetio_dev_verbs_cq.cuh
++++ b/device/doca_gpunetio_dev_verbs_cq.cuh
+@@ -258,10 +258,14 @@ template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode =
+           enum doca_gpu_dev_verbs_qp_type qp_type = DOCA_GPUNETIO_VERBS_QP_SQ>
+ __device__ static __forceinline__ int doca_gpu_dev_verbs_poll_cq(struct doca_gpu_dev_verbs_cq *cq,
+                                                                  uint32_t count) {
+-    uint64_t cons_index =
+-        doca_gpu_dev_verbs_atomic_add<uint64_t, resource_sharing_mode>(&cq->cqe_rsvd, count) +
+-        count - 1;
+-    return doca_gpu_dev_verbs_poll_cq_at<resource_sharing_mode, qp_type>(cq, cons_index);
++    uint64_t first_cons_index =
++        doca_gpu_dev_verbs_atomic_add<uint64_t, resource_sharing_mode>(&cq->cqe_rsvd, count);
++    for (uint32_t offset = 0; offset < count; ++offset) {
++        int status = doca_gpu_dev_verbs_poll_cq_at<resource_sharing_mode, qp_type>(
++            cq, first_cons_index + offset);
++        if (status < 0) return status;
++    }
++    return 0;
+ }
+ 
+ /**
