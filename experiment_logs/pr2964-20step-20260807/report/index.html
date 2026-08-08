@@ -258,8 +258,8 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 12:23 PDT</span>
-        <span>Base a028b33b · Super fix validation 33f43461</span>
+        <span>Updated 2026-08-08 13:41 PDT</span>
+        <span>Base a028b33b · Super fix validation 37c195f4</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore padding-mask fix 340af84f</span>
         <span>20 steps per workload</span>
@@ -270,7 +270,7 @@
       <article class="card">
         <div class="label">Overall status</div>
         <div class="value"><span class="pill pending">Qwen 30B passed · large models running</span></div>
-        <p>Qwen3-30B-A3B baseline 506133 and HybridEP 505735 completed 20/20. Qwen3-235B baseline/HybridEP reached Steps 5/4. Super baseline reached Step 3; fixed HybridEP retry 506276 is starting after the MCore regression test passed.</p>
+        <p>Qwen3-30B-A3B baseline 506133 and HybridEP 505735 completed 20/20. Qwen3-235B baseline/HybridEP reached Steps 18/17. Super baseline reached Step 8; external-prepadding HybridEP retry 506397 is queued behind currently occupied B200 nodes.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -291,7 +291,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 12:23 PDT. The controlled Qwen3-30B-A3B pair completed. Qwen3-235B and Super baseline are advancing; Super HybridEP retry 506276 uses the minimal MCore padding-mask fix and the official 90-minute initialization exemption.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 13:41 PDT. The controlled Qwen3-30B-A3B pair completed. Qwen3-235B and Super baseline are advancing. Super retry 506276 exposed a collective-ordering bug caused by per-layer padding; replacement 506397 restores one-time input prepadding before model collectives.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -389,7 +389,7 @@
             <h3>506219 / 506220 · Qwen3-235B controlled retry</h3>
             <span class="pill pending">Running</span>
           </div>
-          <p>The baseline and HybridEP sides receive the same two generation-only compatibility settings: vLLM custom all-reduce is disabled and <code>fuse_allreduce_rms=false</code>. They have reached Steps 5 and 4, respectively; only the policy dispatcher differs.</p>
+          <p>The baseline and HybridEP sides receive the same two generation-only compatibility settings: vLLM custom all-reduce is disabled and <code>fuse_allreduce_rms=false</code>. They have reached Steps 18 and 17, respectively; only the policy dispatcher differs.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -400,10 +400,10 @@
         </article>
         <article class="job">
           <div class="job-head">
-            <h3>506123 / 506276 · Canonical Super pair</h3>
-            <span class="pill pending">Running</span>
+            <h3>506123 / 506276 / 506397 · Canonical Super pair</h3>
+            <span class="pill pending">Baseline running · retry queued</span>
           </div>
-          <p>Baseline 506123 reached Step 3. HybridEP 506276 uses the same <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, 32 × 8 B200 topology, DeepEP wheel, and generation overrides, plus MCore fix <code>340af84f</code>; it is in startup.</p>
+          <p>Baseline 506123 reached Step 8. HybridEP 506276 passed generation and full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather on the shared EP communicator during the first policy backward. Retry 506397 uses the same canonical recipe and 32 × 8 topology, but performs that alignment once before forward and disables the per-layer padding collective for packed inputs.</p>
         </article>
       </div>
     </section>
@@ -446,7 +446,7 @@
               <td><strong>Qwen3-235B-A22B</strong><br><code>grpo-qwen3-235b-16n8g.yaml</code></td>
               <td>baseline 506219<br>HybridEP 506220</td>
               <td>16 × 8 B200</td>
-              <td>Steps 5 / 4</td>
+              <td>Steps 18 / 17</td>
               <td class="metric">Both controlled retries are advancing after disabling the same cross-node FlashInfer all-reduce paths. Final Steps 2–20 aggregates are pending.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -457,10 +457,10 @@
             </tr>
             <tr>
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
-              <td>baseline 506123<br>HybridEP 506276</td>
+              <td>baseline 506123<br>HybridEP 506397</td>
               <td>32 × 8 B200</td>
-              <td>Step 3 / startup</td>
-              <td class="metric">Baseline reached Step 3. The original HybridEP retry proved full reference logprob but exposed an MCore expert-bias mask bug; fixed retry 506276 is starting. Final metrics are pending.</td>
+              <td>Step 8 / queued</td>
+              <td class="metric">Baseline is advancing. Two earlier HybridEP retries proved full inter-node reference LogProb and isolated the expert-bias broadcast and per-layer collective-ordering bugs. External-prepadding retry 506397 is pending resources. Final metrics are pending.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -628,7 +628,11 @@
         </li>
         <li>
           <h3>Super exposed and verified a separate MCore mask bug</h3>
-          <p>During activation recomputation, official MCore applied a flattened token mask directly to a two-dimensional expert routing map. This failed only when gradients and Super's expert-bias bookkeeping were active. Regression job 506260 reproduced the shape mismatch; fix <code>340af84f</code> broadcasts the mask over the expert axis, and job 506272 passed the focused 8-GPU test. Canonical fixed retry 506276 is running.</p>
+          <p>During activation recomputation, official MCore applied a flattened token mask directly to a two-dimensional expert routing map. This failed only when gradients and Super's expert-bias bookkeeping were active. Regression job 506260 reproduced the shape mismatch; fix <code>340af84f</code> broadcasts the mask over the expert axis, and job 506272 passed the focused 8-GPU test.</p>
+        </li>
+        <li>
+          <h3>Super exposed a separate per-layer collective-ordering bug</h3>
+          <p>After the broadcast fix, job 506276 passed generation and the full 256-rank HybridEP LogProb phase. During the first policy backward, ranks entered different collectives at the same sequence number on the expert communicator: MCore's per-layer one-element MAX for uneven-input padding versus a 32-rank expert-parameter all-gather. The watchdog timeout is therefore a deterministic ordering mismatch, not slow initialization. Validation branch <code>37c195f4</code> restores the earlier NeMo RL strategy: align packed inputs once before forward, then set <code>moe_hybridep_pad_uneven_dispatch_inputs=false</code> for sequence-packed HybridEP. Job 506397 validates this path.</p>
         </li>
       </ol>
       <div class="callout">
@@ -638,7 +642,7 @@
         Qwen job 505735 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means 0.0033 and 0.5250, respectively. Final validation accuracy is 0.5312. These checks establish execution stability but do not by themselves prove zero numerical regression against a controlled baseline.
       </div>
       <div class="callout">
-        Current conclusion: PR #2964 still supplies the NeMo RL side of the THD contract: it enables MCore's unequal-rank input padding, creates the physical THD padding mask, and aligns that mask with the model's sequence-parallel layout. MCore PR #5008 equalizes dispatcher input sizes and rounds them to 64 tokens. Two independent downstream bugs blocked Super: DeepEP's first DMA-BUF fallback conflated MR base and CUDA buffer base, and MCore applied a flattened token mask without an expert-axis broadcast during expert-bias recomputation. The former is fixed by <code>a9d657d2</code>; the latter is fixed and unit-tested by <code>340af84f</code>. Neither failure shows that the earlier NeMo RL padding patch was ineffective. End-to-end Super correctness and performance are now under validation in baseline 506123 and fixed HybridEP 506276.
+        Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for sequence-packed HybridEP. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's expert-bias mask broadcast fix <code>340af84f</code> remain necessary for this GCP-NRT Super path. End-to-end validation is running in baseline 506123 and queued HybridEP 506397.
       </div>
     </section>
 
