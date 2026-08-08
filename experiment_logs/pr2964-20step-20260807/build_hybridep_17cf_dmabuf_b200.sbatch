@@ -15,7 +15,7 @@ script_path=${experiment_root}/scripts/build_hybridep_17cf_dmabuf_b200.sbatch
 patch_path=${experiment_root}/patches/deepep_17cf_dmabuf_fallback.patch
 output_root=${experiment_root}/deepep-wheels
 deepep_base_commit=17cfb817bccec3a9c247013360cc550c2bac441e
-deepep_fix_commit=71aa3e95232ef62cec098b7e499a7b37fd319b48
+deepep_fix_commit=6d11d654e965b1c967f72adfcec95dbc82043643
 
 if [[ "${HYBRID_EP_BUILD_STAGE:-host}" != container ]]; then
   mkdir -p "${output_root}"

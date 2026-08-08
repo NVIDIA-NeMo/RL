@@ -1,5 +1,5 @@
 diff --git a/csrc/hybrid_ep/buffer/internode_doca.cu b/csrc/hybrid_ep/buffer/internode_doca.cu
-index e2be012..3107841 100644
+index e2be012..56db853 100644
 --- a/csrc/hybrid_ep/buffer/internode_doca.cu
 +++ b/csrc/hybrid_ep/buffer/internode_doca.cu
 @@ -2,9 +2,13 @@
@@ -16,7 +16,7 @@ index e2be012..3107841 100644
  
  // Functions realted to get RDMA context.
  ibv_device *ctx_find_dev(const char *ib_devname) {
-@@ -380,6 +384,109 @@ void RDMACoordinator::init(
+@@ -380,6 +384,127 @@ void RDMACoordinator::init(
    rdma_initialized = true;
  }
  
@@ -64,11 +64,26 @@ index e2be012..3107841 100644
 +    throw std::runtime_error(message.str());
 +  }
 +
++  const long host_page_size = sysconf(_SC_PAGESIZE);
++  if (host_page_size <= 0) {
++    throw std::runtime_error("HybridEP failed to query the host page size");
++  }
++  const auto page_size = static_cast<size_t>(host_page_size);
++  const size_t dmabuf_length = (length + page_size - 1) & ~(page_size - 1);
++  if (allocation_base % page_size != 0) {
++    std::ostringstream message;
++    message << "HybridEP CUDA allocation is not page aligned for DMA-BUF "
++            << "registration: label=" << label << ", allocation="
++            << reinterpret_cast<void *>(allocation_base) << ", page_size="
++            << page_size;
++    throw std::runtime_error(message.str());
++  }
++
 +  int dmabuf_fd = -1;
 +  const CUresult export_result = cuMemGetHandleForAddressRange(
 +      &dmabuf_fd,
 +      allocation_base,
-+      allocation_size,
++      dmabuf_length,
 +      CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
 +      0);
 +  if (export_result != CUDA_SUCCESS) {
@@ -86,8 +101,8 @@ index e2be012..3107841 100644
 +  mr = ibv_reg_dmabuf_mr(
 +      ib_pd,
 +      0,
-+      allocation_size,
-+      allocation_base,
++      dmabuf_length,
++      0,
 +      dmabuf_fd,
 +      mr_access_flag);
 +  const int dmabuf_errno = errno;
@@ -108,7 +123,8 @@ index e2be012..3107841 100644
 +        stderr,
 +        "[HybridEP] ibv_reg_mr failed with errno=%d; using CUDA DMA-BUF "
 +        "registration fallback (rank=%d, local_rank=%d, label=%s, "
-+        "requested=%p/%zu, registered=%p/%zu, mr_addr=%p)\n",
++        "requested=%p/%zu, allocation=%p/%zu, registered_iova=%p/%zu, "
++        "mr_addr=%p)\n",
 +        legacy_errno,
 +        node_rank * buffer_config.num_of_ranks_per_node + local_rank,
 +        local_rank,
@@ -117,6 +133,8 @@ index e2be012..3107841 100644
 +        length,
 +        reinterpret_cast<void *>(allocation_base),
 +        allocation_size,
++        nullptr,
++        dmabuf_length,
 +        mr->addr);
 +    dmabuf_fallback_logged = true;
 +  }
@@ -126,7 +144,7 @@ index e2be012..3107841 100644
  void RDMACoordinator::allocate_dispatch_buffers(){
    dispatch_buffers.data_type = buffer_config.token_data_type;
    size_t sizeof_token_data_type = get_token_data_type_size(dispatch_buffers.data_type);
-@@ -432,22 +517,38 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -432,22 +557,38 @@ void RDMACoordinator::allocate_dispatch_buffers(){
    CUDA_CHECK(cudaMemset(dispatch_buffers.expected_rdma_flag_value, 0, sizeof(uint64_t)));
  
    // Allocate memory region
@@ -181,7 +199,7 @@ index e2be012..3107841 100644
  
    // Set dispatch queue pair attributes.
    int num_of_dispatch_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_dispatch_api;
-@@ -591,18 +692,30 @@ void RDMACoordinator::allocate_combine_buffers(){
+@@ -591,18 +732,30 @@ void RDMACoordinator::allocate_combine_buffers(){
    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.expected_rdma_flag_value, sizeof(uint64_t)));
    CUDA_CHECK(cudaMemset(combine_buffers.expected_rdma_flag_value, 0, sizeof(uint64_t)));
  
@@ -224,7 +242,7 @@ index e2be012..3107841 100644
  
    // Set combine queue pair attributes.
    int num_of_combine_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_combine_api;
-@@ -830,4 +943,4 @@ RDMACoordinator::~RDMACoordinator() {
+@@ -830,4 +983,4 @@ RDMACoordinator::~RDMACoordinator() {
  
    rdma_initialized = false;
    buffer_allocated = false;
@@ -251,69 +269,3 @@ index 04f061d..a4a9794 100644
  
      struct ibv_mr *attn_input_token_mr = nullptr;
      struct ibv_mr *dispatch_rdma_inter_node_group_token_mr = nullptr;
-diff --git a/tests/test_hybrid_ep_buffer_init.py b/tests/test_hybrid_ep_buffer_init.py
-new file mode 100644
-index 0000000..79d1781
---- /dev/null
-+++ b/tests/test_hybrid_ep_buffer_init.py
-@@ -0,0 +1,60 @@
-+# SPDX-License-Identifier: MIT
-+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved
-+
-+"""Multi-node HybridEP buffer-construction regression test.
-+
-+Launch this module with one process per GPU. The test intentionally requires
-+more ranks than the configured NVLink domain so it exercises inter-node GPU
-+memory registration rather than only the intra-node transport.
-+"""
-+
-+import os
-+
-+import torch
-+import torch.distributed as dist
-+
-+
-+def _required_int(name: str) -> int:
-+    return int(os.environ[name])
-+
-+
-+def main() -> None:
-+    rank = _required_int("SLURM_PROCID")
-+    local_rank = _required_int("SLURM_LOCALID")
-+    world_size = _required_int("SLURM_NTASKS")
-+    ranks_per_nvlink_domain = _required_int(
-+        "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"
-+    )
-+    if world_size <= ranks_per_nvlink_domain:
-+        raise RuntimeError(
-+            "This regression test requires an inter-node HybridEP group: "
-+            f"world_size={world_size}, ranks_per_nvlink_domain="
-+            f"{ranks_per_nvlink_domain}"
-+        )
-+
-+    visible_devices = torch.cuda.device_count()
-+    device_index = 0 if visible_devices == 1 else local_rank
-+    torch.cuda.set_device(device_index)
-+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-+
-+    from deep_ep import HybridEPBuffer
-+
-+    buffer = HybridEPBuffer(
-+        group=dist.group.WORLD,
-+        hidden_dim=4096,
-+        max_num_of_tokens_per_rank=2048,
-+        num_local_experts=16,
-+        use_fp8=False,
-+        num_sms_dispatch_api=32,
-+        num_sms_combine_api=32,
-+    )
-+    dist.barrier()
-+    if rank == 0:
-+        print("hybridep-inter-node-buffer-init: PASS", flush=True)
-+    del buffer
-+    dist.barrier()
-+    dist.destroy_process_group()
-+
-+
-+if __name__ == "__main__":
-+    main()
