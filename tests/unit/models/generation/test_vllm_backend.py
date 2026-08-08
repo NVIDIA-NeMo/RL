@@ -119,16 +119,29 @@ def _make_mtp_refit_extension(
     return ext, drafter_model
 
 
+def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        UnquantizedMoeBackend,
+    )
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+    quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
+    module = SimpleNamespace(quant_method=quant_method)
+    return SimpleNamespace(modules=lambda: [module])
+
+
 @pytest.mark.vllm
 def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     call_order = []
-    model = object()
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
     model_config = object()
     vllm_config = SimpleNamespace(
-        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+        kernel_config=SimpleNamespace(moe_backend="auto"), quant_config=None
     )
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -140,7 +153,6 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
     ext._maybe_process_fp8_kv_cache = MagicMock()
 
-    monkeypatch.setattr(fp8, "is_fp8_model", lambda config: False)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     @contextlib.contextmanager
@@ -216,14 +228,38 @@ def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_layerwise_reload_preserves_weight_load_error(monkeypatch, caplog):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    load_error = RuntimeError("load failed")
+    model = SimpleNamespace(load_weights=MagicMock(side_effect=load_error))
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    ext._nrl_layerwise_reload_active = True
+    monkeypatch.setattr(
+        vllm_backend,
+        "_detach_pending_layerwise_weights",
+        MagicMock(side_effect=RuntimeError("detach failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="load failed") as exc_info:
+        ext._load_full_hf_weights([("model.weight", torch.ones(1))])
+
+    assert exc_info.value is load_error
+    assert "Failed to detach deferred weights" in caplog.text
+
+
+@pytest.mark.vllm
 def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     model = object()
     model_config = object()
     vllm_config = SimpleNamespace(
-        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
     )
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
@@ -234,7 +270,6 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     ext._maybe_process_mtp_drafter_after_loading = MagicMock()
     ext._maybe_process_fp8_kv_cache = MagicMock()
 
-    monkeypatch.setattr(fp8, "is_fp8_model", lambda config: True)
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
@@ -257,58 +292,77 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_extension_capability_can_disable_unquantized_reload(monkeypatch):
+def test_extension_capability_can_disable_unquantized_reload():
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
+        model=object(),
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
-        )
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
     )
     ext._supports_unquantized_flashinfer_trtllm_refit = lambda: False
-    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
 
     assert ext._uses_unquantized_flashinfer_trtllm() is False
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize("moe_backend", ["auto", "triton", None])
-def test_other_moe_backends_keep_existing_refit_lifecycle(monkeypatch, moe_backend):
+def test_realized_moe_backend_controls_native_refit_lifecycle():
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("TRITON"),
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend=moe_backend)
-        )
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
     )
-    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+    ext.model_runner.model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    ext.model_runner.vllm_config.kernel_config.moe_backend = "auto"
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+
+@pytest.mark.vllm
+def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(quant_config=object()),
+    )
 
     assert ext._uses_unquantized_flashinfer_trtllm() is False
 
 
 @pytest.mark.vllm
-def test_unquantized_reload_rejects_cotrained_mtp_during_prepare(monkeypatch):
+def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
-        )
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
     )
     ext._mtp_drafter_refit_enabled = lambda: True
-    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
 
     with pytest.raises(RuntimeError, match="co-trained MTP drafter"):
         ext.prepare_refit_info({"model.weight": object()})
@@ -319,21 +373,20 @@ def test_unquantized_reload_rejects_cotrained_mtp_during_prepare(monkeypatch):
 @pytest.mark.vllm
 def test_failed_unquantized_reload_marks_worker_unusable(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(),
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm")
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
         ),
     )
     ext.model_config = object()
     ext.device = torch.device("cpu")
     ext._mtp_drafter_refit_enabled = lambda: False
-    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
@@ -579,6 +632,54 @@ def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
         "model.layers.2.embed_tokens.weight",
     }
     process_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
+    tmp_path, monkeypatch
+):
+    """TRTLLM draft weights reload into their preserved runtime storage."""
+    model_dir = tmp_path / "ckpt"
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00001.safetensors": {
+                "model.layers.2.mlp.up_proj.weight": torch.randn(4, 4),
+            }
+        },
+    )
+    ext = _make_extension_with_drafter(mtp_start_layer_idx=2, num_mtp_layers=1)
+    draft_model = ext._get_drafter_model()
+    draft_model.modules = _make_unquantized_moe_model("FlashInfer TRTLLM").modules
+    call_order = []
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda model: call_order.append(("initialize", model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda model, config: call_order.append(("finalize", model, config)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_: pytest.fail("TRTLLM draft reload must use the layerwise path"),
+    )
+    ext._load_draft_weights.side_effect = lambda _: call_order.append("load")
+
+    assert ext.load_mtp_weights_from_disk(str(model_dir)) is True
+    assert call_order == [
+        ("initialize", draft_model),
+        "load",
+        (
+            "finalize",
+            draft_model,
+            ext.model_runner.vllm_config.speculative_config.draft_model_config,
+        ),
+    ]
 
 
 @pytest.mark.vllm
