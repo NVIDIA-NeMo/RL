@@ -112,7 +112,7 @@ It contains `rlvr.jsonl` and `fill_placeholders.py`. Math rows originating from
 `BytedTsinghua-SIA/DAPO-Math-17k` and `Skywork/Skywork-OR1-RL-Data` are
 represented by placeholders; the bundled script restores them from the
 original datasets on Hugging Face. This is the same general preparation flow
-used by the [Nemotron 3 Nano recipe](nemotron-3-nano.md#download-and-prepare-the-data).
+used by the [Nemotron 3 Ultra recipe](nemotron-3-ultra.md#download-and-prepare-the-data).
 
 ```bash
 export DATA_DIR=/path/to/lightning/data
@@ -221,5 +221,5 @@ EXTERNAL_VLLM_SHARED_ROOT=$SHARED_ROOT \
 EXTRA_MOUNTS=$SHARED_ROOT:$SHARED_ROOT \
 SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
-bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh rlvr
+bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh
 ```

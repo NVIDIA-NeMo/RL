@@ -7,8 +7,9 @@
 # Default launcher allocation (86 nodes total):
 #   - Training:        32 nodes (128 GPUs)
 #   - Policy vLLM:     32 nodes (128 GPUs)
-#   - Gym local judges: 6 nodes ( 24 GPUs; NL2Bash + safety)
+#   - Gym safety judge: 2 nodes (  8 GPUs; TP=4, DP=2)
 #   - External GenRM:  16 nodes ( 64 GPUs; eight TP=8 replicas)
+#   - External NL2Bash: 4 nodes ( 16 GPUs; four TP=4 replicas)
 #
 # Effective Lightning training parallelism:
 #   - TP: 4
@@ -34,7 +35,7 @@ cluster:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/lightning_v3_5_rlvr"
-  metric_name: "val:total_reward/mean"
+  metric_name: null
   higher_is_better: true
   keep_top_k: 1000000
   save_period: 10
@@ -51,7 +52,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 512
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 2
+  val_num_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 100000
@@ -300,6 +301,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
@@ -373,9 +377,9 @@ env:
   nemo_gym:
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
-    # GenRM is served outside the training Ray cluster. These nodes host only
-    # the Gym-managed NL2Bash and safety judges.
-    num_gpu_nodes: 6
+    # GenRM and NL2Bash run in external pools. These nodes host only the
+    # Gym-managed safety judge.
+    num_gpu_nodes: 2
     effort_levels:
       low_string: "{reasoning effort: efficient}"
       low_weight: 0.1
@@ -383,22 +387,9 @@ env:
       low_ub: 15000
     port_range_low: 5000
     port_range_high: 5999
-    gzip_responses_enabled: true
-    gzip_responses_minimum_size: 4096
-    gzip_responses_compresslevel: 1
     global_aiohttp_client_request_debug: true
     global_aiohttp_connector_limit: 4096
     global_aiohttp_connector_limit_per_host: 4096
-    global_aiohttp_keepalive_timeout_seconds: 2.0
-    uvicorn_timeout_keep_alive_seconds: 15
-    run_response_cache_enabled: true
-    run_response_cache_max_entries: 8192
-    run_response_cache_ttl_seconds: 7200
-    run_response_cache_max_response_bytes: 67108864
-    run_response_cache_max_total_bytes: 8589934592
-    run_response_cache_body_read_retries: 4
-    run_response_cache_retry_delay_seconds: 0.25
-    run_response_cache_log_interval: 1000
     invalid_tool_call_patterns:
       - "<tool_call>"
       - "</tool_call>"
@@ -509,7 +500,8 @@ env:
               cudagraph_capture_sizes: [1,2,4,8,16,32,64,128,256]
 
 
-    # nl2bash / General Judge: TP=4 on GB200 192GB
+    # NL2Bash is served by the external TP=4 pool. This local-vLLM block is
+    # retained for Gym schema compatibility and is inactive when base_url is set.
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
@@ -571,7 +563,7 @@ env:
           judge_responses_create_params:
             max_output_tokens: 8192
 
-    # GenRM: TP=4 on GB200 192GB
+    # GenRM comparison reward server.
     genrm_compare_resources_server:
       resources_servers:
         genrm_compare:
@@ -598,10 +590,9 @@ env:
           default_ranking: 3.5
           genrm_parse_retries: 1
 
-    # External GenRM. The launcher adds base_url after the load balancer is
-    # healthy and keeps the served model name fixed at "model". The local vLLM
-    # settings support the Gym-native TP=4, DP=16 deployment but are not
-    # launched when base_url is present.
+    # GenRM is served by the external TP=8 pool. The local-vLLM settings below
+    # are retained for Gym schema compatibility and are inactive when base_url
+    # is set by the launcher.
     genrm_model:
       responses_api_models:
         genrm_model:
@@ -613,7 +604,6 @@ env:
           debug: true
           ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
           vllm_serve_env_vars:
-            # Keep each TP=4 replica on one four-GPU GB200 node.
             VLLM_RAY_DP_PACK_STRATEGY: strict
             NCCL_MNNVL_ENABLE: "1"
             VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
