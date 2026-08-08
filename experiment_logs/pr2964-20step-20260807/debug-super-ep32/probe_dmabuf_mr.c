@@ -28,7 +28,8 @@ int main(void) {
 
   CUDA_CHECK(cuInit(0));
   CUDA_CHECK(cuDeviceGet(&device, 0));
-  CUDA_CHECK(cuCtxCreate(&cuda_context, 0, device));
+  CUDA_CHECK(cuDevicePrimaryCtxRetain(&cuda_context, device));
+  CUDA_CHECK(cuCtxSetCurrent(cuda_context));
   CUDA_CHECK(cuMemAlloc(&pointer, length));
   CUDA_CHECK(cuMemGetAddressRange(&allocation_base, &allocation_size, pointer));
   CUDA_CHECK(cuMemGetHandleForAddressRange(
@@ -79,6 +80,6 @@ int main(void) {
   ibv_free_device_list(devices);
   close(dmabuf_fd);
   cuMemFree(pointer);
-  cuCtxDestroy(cuda_context);
+  cuDevicePrimaryCtxRelease(device);
   return mr == NULL ? 5 : 0;
 }
