@@ -69,6 +69,7 @@ from nemo_rl.models.generation.dllm.denoise import (
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
+    verify_right_padding,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.dllm import (
@@ -752,6 +753,19 @@ class DTensorPolicyWorkerV2Impl(
         assert generation_cfg is not None, (
             "policy.generation must be configured to generate."
         )
+
+        # build_canvas re-aligns right-padded prompts against the generation
+        # region, so left padding here would silently produce a wrong canvas
+        # rather than fail. Same check the other generation backends run.
+        is_right_padded, error_msg = verify_right_padding(
+            data, pad_value=self.tokenizer.pad_token_id
+        )
+        if not is_right_padded:
+            warnings.warn(
+                f"Input to the dllm generation worker is not properly "
+                f"right-padded: {error_msg}"
+            )
+
         device = torch.cuda.current_device()
         mask_id = self.dllm_estimator.mask_id
         pad_id = generation_cfg.get("_pad_token_id", self.tokenizer.pad_token_id)
