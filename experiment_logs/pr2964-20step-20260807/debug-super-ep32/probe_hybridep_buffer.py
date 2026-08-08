@@ -13,7 +13,9 @@ def main() -> None:
     world_size = int(os.environ["SLURM_NTASKS"])
     max_tokens = int(os.environ["PROBE_MAX_TOKENS"])
 
-    torch.cuda.set_device(local_rank)
+    visible_device_count = torch.cuda.device_count()
+    device_index = 0 if visible_device_count == 1 else local_rank
+    torch.cuda.set_device(device_index)
     dist.init_process_group(
         backend="nccl",
         rank=rank,
@@ -26,6 +28,7 @@ def main() -> None:
         print(
             "probe-start "
             f"host={socket.gethostname()} world_size={world_size} "
+            f"visible_devices={visible_device_count} device_index={device_index} "
             f"max_tokens={max_tokens} combine_chunk="
             f"{os.environ.get('NUM_OF_TOKENS_PER_CHUNK_COMBINE_API')} "
             f"deepep={__import__('deep_ep').__file__}",
