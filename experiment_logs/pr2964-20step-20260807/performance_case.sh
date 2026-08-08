@@ -62,6 +62,11 @@ render_case() {
       return 2
       ;;
   esac
+  if [[ "${dispatcher}" == "hybridep" && "${model}" != "qwen3-235b" ]]; then
+    dispatcher_overrides+=(
+      ++policy.megatron_cfg.moe_hybridep_prepad_packed_inputs=true
+    )
+  fi
 
   wandb_name=$(basename "${run_root}")
   driver_args=(
