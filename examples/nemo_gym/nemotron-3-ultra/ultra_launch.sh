@@ -352,6 +352,18 @@ SLURM_QOS="${SLURM_QOS:-}"
 SLURM_RESERVATION="${SLURM_RESERVATION:-}"
 EXCLUDE_NODES="${EXCLUDE_NODES:-}"
 
+# OccupiedIdleGPUsJobReaper exemption for the training submissions. GPUs are
+# idle through container pull, Ray init, model load and vLLM warmup, and the
+# reaper counts that against the job. The nano pipeclean took 56 minutes to
+# reach its first optimizer step and was reaped at 60 (job 5965796) despite
+# being healthy. In-job judge pools push it further, since every GenRM replica
+# loads a 438 GB checkpoint before the trainer does anything. 120 matches what
+# this repo's own 6-node GRPO suite already claims for the same reason.
+JOB_REAPER_EXEMPT_MINS="${JOB_REAPER_EXEMPT_MINS:-120}"
+if [[ -z "${JOB_REAPER_COMMENT:-}" ]]; then
+  JOB_REAPER_COMMENT=$(printf '{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"%s","reason":"disproportionate_resource_requirement","description":"long GPU-idle phases during Ray init, model load and vLLM warmup"}}' "${JOB_REAPER_EXEMPT_MINS}")
+fi
+
 slurm_walltime_seconds() {
   local value="$1"
   local days=0
@@ -1090,7 +1102,7 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+    --comment="${JOB_REAPER_COMMENT}" \
     : \
     --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
     --account="${SLURM_ACCOUNT}" \
@@ -1122,7 +1134,7 @@ else
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+    --comment="${JOB_REAPER_COMMENT}" \
     "${BATCH_SCRIPT}")
 fi
 
