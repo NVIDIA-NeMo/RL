@@ -64,8 +64,11 @@ export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 
 # Must carry vLLM 0.25.1 in the RL venvs to match this branch's code; a
 # pre-bump image fails at import with "cannot import name ServingTokenization".
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:nightly-20260806-sandbox.squashfs}"
-export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
+#
+# Striped copies — see the identical block in launch_6k_pipeclean_sc.sh for why
+# the upstream 8-OST images cause a pyxis read storm at ~1500 nodes.
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/nemo-rl-nightly-20260806-sandbox.squashfs}"
+export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/nemo-skills-sandbox-dc43f3e.sqsh}"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre:/lustre}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/${USER}/.cache/nemotron_ultra}"
 export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/llmservice/users/${USER}/hf_home}"
@@ -93,11 +96,19 @@ export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 # EXCLUDE_NODES. They are left unset because a reservation you do not hold
 # makes sbatch fail outright; see ultra_launch.sh for the variable names.
 
-# Preserve the non-judge Gym capacity after moving 18 judge nodes out of Gym,
-# then round up to a segment-compatible 48-node Ray allocation.
+# Gym is sized to its only GPU consumer. With GenRM and NL2Bash served from the
+# external hetgroup, that is the safety judge at TP=4 x DP=2: 8 GPUs, or 2 nodes.
+# Nothing else needs this pool to be larger — the nemo-skills sandbox runs on
+# every node in the allocation (ray.sub expects SLURM_JOB_NUM_NODES - 1 ready
+# instances), and Gym's resource servers are CPU-requesting Ray actors that
+# schedule wherever CPUs are free.
+#
+# Only the total is constrained: ultra_launch.sh requires train + gen + gym to be
+# a multiple of SEGMENT_SIZE=16, so generation takes the remainder. 1006 is even,
+# so it still divides into TP=8 instances (1006 x 4 GPUs / 8 = 503).
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-512}"
-export NUM_GEN_NODES="${NUM_GEN_NODES:-960}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-48}"
+export NUM_GEN_NODES="${NUM_GEN_NODES:-1006}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
 
 # CP=16 is baked into pipeclean_6k.yaml; allow an override for memory experiments.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-16}"

@@ -78,8 +78,19 @@ export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 
 # Must carry vLLM 0.25.1 in the RL venvs to match this branch's code; a
 # pre-bump image fails at import with "cannot import name ServingTokenization".
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:nightly-20260806-sandbox.squashfs}"
-export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
+#
+# Both images are Lustre-striped copies (lfs setstripe -c -1 -S 16M, 350 OSTs)
+# of the upstream squashfs files. The originals sit on 8 OSTs, and ~1500 nodes
+# extracting an 87 GB image from 8 OSTs is a read storm: pyxis fails with
+# "failed to create container filesystem" / "could not wait for child:
+# Interrupted system call" in the thousands, and the job dies before the Ray
+# head comes up. Striping cut that to a handful of failures. Refresh the copies
+# when the upstream image changes:
+#   mkdir -p <dir> && lfs setstripe -c -1 -S 16M <dir> && cp <upstream> <dir>/
+# The sandbox copy pins the dc43f3e build that nemo-skills-sandbox-latest.sqsh
+# resolved to, so the sandbox version no longer drifts between runs.
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/nemo-rl-nightly-20260806-sandbox.squashfs}"
+export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/nemo-skills-sandbox-dc43f3e.sqsh}"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre:/lustre}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/${USER}/.cache/nemotron_ultra}"
 export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/llmservice/users/${USER}/hf_home}"
