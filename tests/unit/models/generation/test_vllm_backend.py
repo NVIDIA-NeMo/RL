@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -68,7 +68,9 @@ def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
         mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers
     )
     ext.model_runner = MagicMock()
-    ext.model_runner.drafter.model = SimpleNamespace(model=predictor)
+    draft_model = torch.nn.Module()
+    setattr(draft_model, "model", predictor)
+    ext.model_runner.drafter.model = draft_model
     # Isolate this test from _load_draft_weights internals.
     ext._load_draft_weights = MagicMock()
     return ext
@@ -415,7 +417,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
     call_order = []
     process_calls = []
-    draft_model = object() if with_mtp else None
+    draft_model = torch.nn.Module() if with_mtp else None
     draft_model_config = object() if with_mtp else None
 
     def process_weights_after_loading(model, model_config, device):
