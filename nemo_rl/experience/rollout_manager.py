@@ -15,7 +15,6 @@
 import asyncio
 import copy
 import json
-import os
 from typing import Any, Optional
 
 import torch
@@ -44,23 +43,25 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
-_FAULT_INJECT_ENV_VAR = "NRL_FAULT_INJECT_EVERY_NTH_PROMPT"
-
-
-def _maybe_inject_rollout_fault(input_sample: DatumSpec) -> None:
+def _maybe_inject_rollout_fault(input_sample: DatumSpec, every: int) -> None:
     """Fail this prompt's rollout when fault injection is enabled.
 
     Validation scaffolding for the SingleController's rollout fault tolerance,
-    inert unless NRL_FAULT_INJECT_EVERY_NTH_PROMPT is a positive integer. Gym
-    surfaces env-server 500s and truncated response bodies to the caller rather
-    than retrying them, and reproducing those naturally needs the connection
-    pressure of a 56-node run.
+    inert unless ``every`` is positive. Gym surfaces env-server 500s and
+    truncated response bodies to the caller rather than retrying them, and
+    reproducing those naturally needs the connection pressure of a 56-node run.
+
+    ``every`` arrives through async_rl config rather than an environment
+    variable because this runs inside SingleControllerActor, which Ray creates
+    with no runtime_env: its worker inherits the raylet's environment, not the
+    driver's, so an exported variable reaches the process that prints the
+    banner and not the one that would act on it. Config is serialized into the
+    actor with everything else, and shows up in the run's logged config.
 
     Keyed on the prompt index rather than a counter so a cursed prompt fails on
     every attempt. That is what exercises the drop path; a prompt that failed
     once and then succeeded would only prove the retry.
     """
-    every = int(os.environ.get(_FAULT_INJECT_ENV_VAR, "0"))
     if every <= 0:
         return
 
@@ -68,7 +69,7 @@ def _maybe_inject_rollout_fault(input_sample: DatumSpec) -> None:
     if prompt_idx % every == 0:
         raise RuntimeError(
             f"injected rollout fault for prompt {prompt_idx} "
-            f"({_FAULT_INJECT_ENV_VAR}={every})"
+            f"(fault_inject_every_nth_prompt={every})"
         )
 
 
@@ -711,6 +712,7 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
         tq_buffer: Optional[TQReplayBuffer] = None,
+        fault_inject_every_nth_prompt: int = 0,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -743,13 +745,15 @@ class RolloutManager:
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
 
-        # Say so up front, so a run whose env var never reached the actor is
-        # obvious in the first minute instead of looking like a clean pipeclean.
-        every = int(os.environ.get(_FAULT_INJECT_ENV_VAR, "0"))
-        if every > 0:
+        self._fault_inject_every_nth_prompt = int(fault_inject_every_nth_prompt)
+
+        # Say so up front, so a misconfigured arm is obvious in the first minute
+        # instead of looking like a clean pipeclean.
+        if self._fault_inject_every_nth_prompt > 0:
             print(
-                f"rollout_manager: fault injection ARMED, every {every}th prompt "
-                f"index will fail every attempt ({_FAULT_INJECT_ENV_VAR}={every})",
+                f"rollout_manager: fault injection ARMED, every "
+                f"{self._fault_inject_every_nth_prompt}th prompt index will fail "
+                f"every attempt",
                 flush=True,
             )
 
@@ -762,7 +766,9 @@ class RolloutManager:
         self._weight_version = int(version)
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
-        _maybe_inject_rollout_fault(input_sample)
+        _maybe_inject_rollout_fault(
+            input_sample, self._fault_inject_every_nth_prompt
+        )
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(

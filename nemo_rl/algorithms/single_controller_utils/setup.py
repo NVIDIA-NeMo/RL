@@ -441,6 +441,7 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         tq_buffer=tq_buffer,
+        fault_inject_every_nth_prompt=master_config.async_rl.fault_inject_every_nth_prompt,
     )
 
     return SingleControllerActorArgs(

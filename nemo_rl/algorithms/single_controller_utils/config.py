@@ -59,6 +59,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_consecutive_rollout_failures: int = 32
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Fail every Nth prompt index deliberately, to exercise the retry and drop
+    # paths above without needing the connection pressure that produces real
+    # rollout faults. 0, the default, is inert; only a validation run sets it.
+    fault_inject_every_nth_prompt: int = 0
 
 
 class MasterConfig(BaseModel, extra="allow"):
