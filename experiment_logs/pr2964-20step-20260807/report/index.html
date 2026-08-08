@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 06:40 PDT</span>
+        <span>Updated 2026-08-08 07:26 PDT</span>
         <span>Validation source a028b33b</span>
         <span>DeepEP 17cfb817 + f725d296 diagnostics</span>
         <span>20 steps per workload</span>
@@ -268,8 +268,8 @@
     <div class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill gated">Root cause confirmed</span></div>
-        <p>Qwen completed 20/20 with exit 0. Super is blocked by legacy GPU-memory MR registration on GCP B200; CUDA DMA-BUF registration is verified as the software fallback.</p>
+        <div class="value"><span class="pill pending">Full-workload retry running</span></div>
+        <p>Qwen previously completed 20/20. The Super RDMA crash is fixed in isolated 2-node and 4-node × 8-GPU probes; canonical Qwen and Super 20-step retries are running.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -278,8 +278,8 @@
       </article>
       <article class="card">
         <div class="label">Runtime artifact</div>
-        <div class="value"><span class="pill ready">A/B reproduced</span></div>
-        <p>Both <code>17cfb817</code> and newer <code>f725d296</code> SM100 wheels fail in the same inter-node constructor; this is not a single-commit regression.</p>
+        <div class="value"><span class="pill ready">Fallback validated</span></div>
+        <p>DeepEP <code>17cfb817</code> plus the guarded CUDA DMA-BUF fallback passes the previously crashing inter-node constructor at 2 nodes and 4 × 8 GPUs.</p>
       </article>
       <article class="card">
         <div class="label">Measurements</div>
@@ -290,7 +290,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Final snapshot at 2026-08-08 06:40 PDT. Qwen metrics are final; Super root-cause diagnostics are final, while the software fallback still requires implementation validation.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 07:26 PDT. Root-cause and constructor-fix validation are complete; canonical 20-step model retries are still running.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -334,6 +334,20 @@
           </div>
           <p>Trace job 505626 recorded every GPU-memory <code>ibv_reg_mr_iova2</code> call returning <code>NULL</code> with <code>errno=14 (EFAULT)</code>. Job 505651 confirmed <code>nvidia_peermem</code> is not loaded. Job 505660 registered the same CUDA allocation through DMA-BUF successfully with <code>errno=0</code>.</p>
         </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505698 / 505700 / 505713 · DMA-BUF fallback</h3>
+            <span class="pill ready">Passed</span>
+          </div>
+          <p>Job 505698 built DeepEP <code>17cfb817</code> with the guarded fallback. Jobs 505700 (2 × 1 GPU) and 505713 (4 × 8 GPUs) observed legacy <code>EFAULT</code>, switched to <code>ibv_reg_dmabuf_mr</code>, constructed the buffer, and exited <code>0:0</code>.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>505735 / 505736 · Canonical 20-step retries</h3>
+            <span class="pill pending">Running</span>
+          </div>
+          <p>Qwen job 505735 has entered Step 1 reference logprob. Super job 505736 initialized all 256 vLLM actors and is initializing 256 Megatron policy workers. No fatal error is present at this snapshot.</p>
+        </article>
       </div>
     </section>
 
@@ -371,10 +385,10 @@
             </tr>
             <tr>
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
-              <td>505091 / 505208 / 505245 / 505265</td>
+              <td>505091 / 505208 / 505245 / 505265<br>fixed retry: 505736</td>
               <td>32 × 8 B200</td>
-              <td>0 completed</td>
-              <td class="metric">Reached Step 1 reference logprob; HybridEP RDMA buffer-allocation segfault on 256/256 ranks</td>
+              <td>Retry running</td>
+              <td class="metric">Old attempt: Step 1 RDMA segfault. Fixed retry: policy initialization at this snapshot.</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
               <td class="metric">—</td>
@@ -486,6 +500,14 @@
           <h3>DMA-BUF fallback feasibility passed</h3>
           <p>Job 505660 exported a 16 MiB CUDA allocation with <code>cuMemGetHandleForAddressRange</code> and registered it on <code>rocep145s0</code> with <code>ibv_reg_dmabuf_mr</code>. The result was non-null with <code>errno=0</code>, proving a software fallback is available on the same nightly and hardware.</p>
         </li>
+        <li>
+          <h3>Guarded fallback built and validated</h3>
+          <p>Job 505698 built the exact requested DeepEP base <code>17cfb817</code> with a helper that preserves the legacy <code>ibv_reg_mr</code> fast path and falls back only after registration failure. Jobs 505700 and 505713 passed the inter-node buffer-construction test at 2 × 1 GPU and 4 × 8 GPUs, respectively.</p>
+        </li>
+        <li>
+          <h3>Canonical model validation resumed</h3>
+          <p>Jobs 505735 and 505736 use the repository performance recipes with 20 steps and explicit HybridEP topology. Qwen reached Step 1 logprob; Super completed all 256 vLLM actor initializations and is progressing through Megatron policy setup.</p>
+        </li>
       </ol>
       <div class="callout">
         W&amp;B is configured in offline mode by both launchers. Local Slurm, Ray, training, and TensorBoard artifacts are therefore the authoritative result sources. Current MCore keeps original and padded HybridEP token counts internally but does not log them; THD sequence-packing efficiency is distinct and will not be presented as HybridEP dispatch-padding overhead.
@@ -494,7 +516,7 @@
         Qwen correctness sanity: all logged loss, reward, gradient, and KL values are finite; mean generation KL is 0.00190; median token multiplied-probability error is 1.022 and the final-step value is 1.022, both within the repository's large-model gates. Step 8 is a disclosed outlier at 101.66, so this run proves execution stability but is not sufficient by itself to claim zero numerical regression.
       </div>
       <div class="callout">
-        Current conclusion: PR #2964 plus DeepEP <code>17cfb817</code> is validated for Qwen3-30B-A3B EP=8 on B200, including THD packing and 20 training steps. Nemotron3 Super uses the canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code> shape: 32 nodes × 8 GPUs, TP=4, EP=32, GBS=256, MBS=1, and sequence length 8192. Its failure is below NeMo RL's padding path: the GCP B200 nodes do not load <code>nvidia_peermem</code>, legacy <code>ibv_reg_mr</code> returns <code>EFAULT</code>, and DeepEP dereferences the null MR. Repeating the unchanged 256-GPU command is not expected to help. The verified remediation is a guarded CUDA DMA-BUF MR fallback or, operationally, loading <code>nvidia_peermem</code> on the nodes.
+        Current conclusion: the previous NeMo RL patch remains necessary and functional for THD unequal-dispatch padding, but it cannot repair an RDMA registration failure below the model/data path. On GCP B200, legacy <code>ibv_reg_mr</code> returns <code>EFAULT</code> because <code>nvidia_peermem</code> is not loaded. The guarded DeepEP fallback preserves the legacy path where it works and uses CUDA DMA-BUF only after failure; it now passes both inter-node constructor scales tested. Full Super validation is pending job 505736 crossing Step 1 reference logprob and completing its 20 steps.
       </div>
     </section>
 
