@@ -80,6 +80,12 @@ export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NRL_FORCE_REBUILD_VENVS=false
 export NRL_IGNORE_VERSION_MISMATCH=1
 export PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+if [[ "${dispatcher}" == "hybridep" ]]; then
+  export NEMO_RL_HYBRIDEP_LOG_PACKING=1
+  export NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS=32
+  export NEMO_RL_HYBRIDEP_LOG_PACKING_RANKS=0
+  export NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE=1
+fi
 
 slurm_args=(
   "${submit_mode[@]}"
