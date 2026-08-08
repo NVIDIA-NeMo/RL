@@ -18,6 +18,8 @@ import os
 import threading
 import time
 import warnings
+from collections.abc import MutableMapping
+from dataclasses import is_dataclass
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -647,6 +649,12 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
+    # Apply the generic escape hatch last so it can override provider attributes
+    # that also have first-class NeMo-RL config fields.
+    model_overrides = config["megatron_cfg"].get("model_overrides")
+    if model_overrides is not None:
+        _apply_model_overrides(model_cfg, model_overrides)
+
     # Validate chunking configuration
     _validate_chunking_config(config)
 
@@ -695,6 +703,54 @@ def setup_model_config(
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
 
     return megatron_cfg, model_cfg
+
+
+def _apply_model_overrides(
+    target: Any,
+    overrides: dict[str, Any],
+    path: str = "policy.megatron_cfg.model_overrides",
+) -> None:
+    """Recursively apply user overrides to a Megatron Bridge model config.
+
+    Object attributes are validated so misspelled model-provider fields fail
+    before workers are launched. Mapping-valued fields are merged recursively;
+    their keys are not restricted because such fields may intentionally have an
+    open-ended schema.
+
+    Args:
+        target: Model provider, nested config object, or mutable mapping to update.
+        overrides: YAML-derived override hierarchy.
+        path: User-facing config path used in error messages.
+
+    Raises:
+        AttributeError: If an override does not match an object attribute.
+    """
+    for name, value in overrides.items():
+        override_path = f"{path}.{name}"
+
+        if isinstance(target, MutableMapping):
+            current_value = target.get(name)
+            if isinstance(value, dict) and isinstance(current_value, MutableMapping):
+                _apply_model_overrides(current_value, value, override_path)
+            else:
+                target[name] = value
+            continue
+
+        if not hasattr(target, name):
+            raise AttributeError(
+                f"{override_path} does not match an attribute on "
+                f"Megatron Bridge config {type(target).__name__}."
+            )
+
+        current_value = getattr(target, name)
+        if isinstance(value, dict) and (
+            isinstance(current_value, MutableMapping)
+            or is_dataclass(current_value)
+            or hasattr(current_value, "__dict__")
+        ):
+            _apply_model_overrides(current_value, value, override_path)
+        else:
+            setattr(target, name, value)
 
 
 def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
