@@ -46,6 +46,8 @@ policy:
       tensor_parallel_size: 8
       enforce_eager: true
       max_model_len: 8192
+      cap_max_tokens_to_context: true
+      logprobs_mode: raw_logprobs
       gpu_memory_utilization: 0.5
       enable_prefix_caching: false
     vllm_kwargs:

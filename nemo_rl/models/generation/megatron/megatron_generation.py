@@ -36,7 +36,35 @@ class MegatronGeneration(GenerationInterface):
     """Generation interface backed by Megatron (colocated or non-colocated)."""
 
     @staticmethod
+    def effective_megatron_cfg(config: PolicyConfig) -> dict[str, Any]:
+        """The megatron_cfg the generation workers actually run with.
+
+        Colocated generation shares the training model, so the training
+        values apply; non-colocated builds a dedicated policy with
+        mcore_generation_config merged on top. Always returns a fresh dict.
+        """
+        megatron_cfg = config["megatron_cfg"]
+        if config["generation"]["colocated"]["enabled"]:
+            return dict(megatron_cfg)
+        return {
+            **megatron_cfg,
+            **config["generation"].get("mcore_generation_config", {}),
+        }
+
+    @classmethod
+    def nvlink_domain_span(cls, config: PolicyConfig) -> int:
+        """Largest GPU group requiring full NVLink connectivity."""
+        megatron_cfg = cls.effective_megatron_cfg(config)
+        return max(
+            megatron_cfg["tensor_model_parallel_size"]
+            * megatron_cfg["context_parallel_size"],
+            megatron_cfg.get("expert_tensor_parallel_size", 1)
+            * megatron_cfg.get("expert_model_parallel_size", 1),
+        )
+
+    @classmethod
     def init_cluster_placement_groups(
+        cls,
         cluster: RayVirtualCluster,
         config: PolicyConfig,
     ) -> None:
@@ -46,16 +74,10 @@ class MegatronGeneration(GenerationInterface):
             cluster: The inference `RayVirtualCluster`.
             config: The full `PolicyConfig` (megatron parallelism + colocation).
         """
-        megatron_cfg = config["megatron_cfg"]
-        model_parallel_size = (
-            megatron_cfg["tensor_model_parallel_size"]
-            * megatron_cfg["pipeline_model_parallel_size"]
-            * megatron_cfg["context_parallel_size"]
-        )
         colocated = config["generation"]["colocated"]["enabled"]
         cluster._init_placement_groups(
             strategy=None if colocated else "PACK",
-            use_unified_pg=model_parallel_size > cluster.num_gpus_per_node,
+            use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
     def __init__(
@@ -67,6 +89,7 @@ class MegatronGeneration(GenerationInterface):
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
+        skip_weight_load: bool = False,
     ):
         """Initialize a MegatronGeneration instance.
 
@@ -80,12 +103,16 @@ class MegatronGeneration(GenerationInterface):
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
+            skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
 
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
+        )
+        assert not (skip_weight_load and policy is not None), (
+            "skip_weight_load only applies to the dedicated inference policy."
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
@@ -106,7 +133,10 @@ class MegatronGeneration(GenerationInterface):
 
         # Stand up a dedicated inference-only policy.
         self._owns_policy = True
-        self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
+        self._policy_config = {
+            **config,
+            "megatron_cfg": self.effective_megatron_cfg(config),
+        }
         # Activation checkpointing is not compatible or useful in inference.
         self._policy_config["megatron_cfg"]["activation_checkpointing"] = False
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
@@ -120,6 +150,7 @@ class MegatronGeneration(GenerationInterface):
             init_optimizer=False,
             init_reference_model=False,
             weights_path=weights_path,
+            skip_weight_load=skip_weight_load,
         )
 
         # Start the persistent inference engine + HTTP server during construction.

@@ -349,3 +349,134 @@ def test_packedtensor_as_tensor_with_mixed_none_and_tensors():
     out = pt.as_tensor()
     expected = torch.cat([t1, t3], dim=0)
     assert torch.equal(out, expected)
+
+
+def test_packedtensor_pads_mixed_dynamic_resolution_images():
+    """Raw image batches pad spatial dimensions before packing on dim 0."""
+    first = torch.ones(1, 3, 2, 4)
+    second = 2 * torch.ones(1, 3, 4, 2)
+
+    packed = PackedTensor(
+        [first, second], dim_to_pack=0, pad_to_max_shape=True
+    ).as_tensor()
+
+    assert packed.shape == (2, 3, 4, 4)
+    torch.testing.assert_close(packed[0, :, :2, :4], first[0])
+    torch.testing.assert_close(packed[0, :, 2:, :], torch.zeros(3, 2, 4))
+    torch.testing.assert_close(packed[1, :, :4, :2], second[0])
+    torch.testing.assert_close(packed[1, :, :, 2:], torch.zeros(3, 4, 2))
+
+
+@pytest.mark.mcore
+def test_dynamic_resolution_padding_is_cropped_before_radio_patchification():
+    """Batch-shape padding must not become RADIO image content."""
+    from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
+        NemotronOmniModel,
+    )
+
+    generator = torch.Generator().manual_seed(2026)
+    small = torch.randn(1, 3, 32, 32, generator=generator)
+    large = torch.randn(1, 3, 64, 64, generator=generator)
+    imgs_sizes = torch.tensor([[32, 32], [64, 64]], dtype=torch.long)
+
+    padded = PackedTensor(
+        [small, large],
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    ).as_tensor()
+    # Use nonzero garbage so this test cannot pass merely because F.pad uses zero.
+    padded[0, :, 32:, :] = 123
+    padded[0, :, :, 32:] = -456
+
+    class _Patchifier:
+        patch_dim = 16
+
+    patchifier = _Patchifier()
+    packed_patches = NemotronOmniModel._patchify_dynamic_images(
+        patchifier,
+        padded,
+        imgs_sizes,
+    )
+    expected_patches = torch.cat(
+        [
+            NemotronOmniModel._patchify_dynamic_images(
+                patchifier,
+                small,
+                imgs_sizes[:1],
+            ),
+            NemotronOmniModel._patchify_dynamic_images(
+                patchifier,
+                large,
+                imgs_sizes[1:],
+            ),
+        ],
+        dim=1,
+    )
+
+    torch.testing.assert_close(packed_patches, expected_patches)
+
+
+@pytest.mark.parametrize(
+    ("first_shape", "second_shape", "expected_shape"),
+    [
+        ((1, 2, 3), (2, 4, 3), (3, 4, 3)),
+        ((1, 2, 3, 2, 4), (2, 4, 3, 4, 2), (3, 4, 3, 4, 4)),
+    ],
+)
+def test_packedtensor_pad_to_max_shape_supports_audio_and_video(
+    first_shape, second_shape, expected_shape
+):
+    """Padding is generic across non-packing dimensions and tensor ranks."""
+    first = torch.ones(first_shape)
+    second = 2 * torch.ones(second_shape)
+
+    packed = PackedTensor(
+        [first, second], dim_to_pack=0, pad_to_max_shape=True
+    ).as_tensor()
+
+    assert packed.shape == expected_shape
+    slices = (slice(0, first_shape[0]),) + tuple(
+        slice(0, size) for size in first_shape[1:]
+    )
+    torch.testing.assert_close(packed[slices], first)
+
+
+def test_pad_to_max_shape_rejects_mismatched_ranks():
+    with pytest.raises(ValueError, match="same rank"):
+        PackedTensor(
+            [torch.ones(1, 3, 4), torch.ones(1, 3)],
+            dim_to_pack=0,
+            pad_to_max_shape=True,
+        ).as_tensor()
+
+
+def test_pad_to_max_shape_rejects_out_of_range_dim():
+    with pytest.raises(IndexError, match="dim_to_pack=3 is invalid"):
+        PackedTensor(
+            [torch.ones(1, 3, 4), torch.ones(2, 3, 4)],
+            dim_to_pack=3,
+            pad_to_max_shape=True,
+        ).as_tensor()
+
+
+def test_pad_to_max_shape_supports_negative_pack_dim():
+    packed = PackedTensor(
+        [torch.ones(2, 3, 1), 2 * torch.ones(4, 3, 1)],
+        dim_to_pack=-3,
+        pad_to_max_shape=True,
+    ).as_tensor()
+
+    assert packed.shape == (6, 3, 1)
+
+
+def test_slice_preserves_pad_to_max_shape_flag():
+    packed = PackedTensor(
+        [torch.ones(1, 3, 2, 4), 2 * torch.ones(1, 3, 4, 2)],
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    )
+
+    sliced = packed.slice([0, 1])
+
+    assert sliced.pad_to_max_shape is True
+    assert sliced.as_tensor().shape == (2, 3, 4, 4)
