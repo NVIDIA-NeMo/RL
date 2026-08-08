@@ -14,7 +14,7 @@ repo=${work_root}/experiments/pr2964-20step-20260807/RL
 experiment_root=${work_root}/experiments/pr2964-20step-20260807
 run_name=${RUN_NAME_OVERRIDE:-nemotron3-super-120ba12b-32n8g-sync-hybridep-pr2964-vllm-triton-eager-20step}
 run_root=${experiment_root}/runs/${run_name}
-container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-20260807/nemo_rl_nightly_20260808_504915.sqsh}
+container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh}
 hf_home=${work_root}/.cache/huggingface
 wheel=${HYBRID_EP_WHEEL_OVERRIDE:-${experiment_root}/deepep-wheels/17cfb817bccec3a9c247013360cc550c2bac441e-sm100-504834/deep_ep-1.2.1+17cfb81-cp313-cp313-linux_x86_64.whl}
 wheel_sha256=${HYBRID_EP_WHEEL_SHA256_OVERRIDE:-82487725cc4a384374530fe7a031ef138d1737621d04a3850060b3271b9e5f99}
@@ -29,6 +29,7 @@ if git -C "${repo}" submodule status --recursive | grep -qE '^[+-U]'; then
   printf 'Submodules do not match the pinned gitlinks.\n' >&2
   exit 2
 fi
+test -r "${container}"
 printf '%s  %s\n' "${wheel_sha256}" "${wheel}" | sha256sum --check --status
 mkdir -p "${run_root}/ray" "${run_root}/training"
 
