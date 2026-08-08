@@ -1212,7 +1212,11 @@ def setup(
         )
         policy, policy_time = init_policy()
         setup_timing_metrics.policy_init_time_s = policy_time
+        # Wrapping the training policy is effectively free, but the timing
+        # summary looks up f"{backend}_init_time_s", so the key has to exist.
+        dllm_gen_t0 = time.perf_counter()
         policy_generation = DllmGeneration(config=policy_config, policy=policy)
+        setup_timing_metrics.dllm_init_time_s = time.perf_counter() - dllm_gen_t0
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
