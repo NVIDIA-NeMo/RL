@@ -791,6 +791,13 @@ def print_performance_metrics(
         )
         training_num_gpus = total_num_gpus - generation_num_gpus
 
+    # PATCH(PR-3 v0): with the shared-cluster mode (train + dedicated generation
+    # co-scheduled on the SAME GPUs), generation_num_gpus == total_num_gpus and the
+    # subtraction above yields 0 -> divide-by-zero -> inf throughputs. The GPU sets
+    # overlap fully, so the correct denominator is the full set.
+    if training_num_gpus <= 0:
+        training_num_gpus = total_num_gpus
+
     total_num_tokens = metrics.get("total_num_tokens", 0)
 
     e2e_samples_per_sec_per_gpu = (

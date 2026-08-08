@@ -124,6 +124,31 @@ class MegatronGeneration(GenerationInterface):
 
         if policy is not None:
             # Reuse the existing training policy.
+            # Fail fast: colocated generation reuses the TRAINING model, so
+            # model-side keys in mcore_generation_config are silently ignored
+            # (the megatron_cfg merge below only runs in the dedicated-Policy
+            # branch). Raise instead of no-opping.
+            _MODEL_SIDE_KEYS = (
+                "transformer_impl",
+                "inference_grouped_gemm_backend",
+                "inference_moe_token_dispatcher_type",
+                "tensor_model_parallel_size",
+                "pipeline_model_parallel_size",
+                "expert_model_parallel_size",
+                "expert_tensor_parallel_size",
+                "context_parallel_size",
+                "sequence_parallel",
+            )
+            _ignored = [
+                k for k in _MODEL_SIDE_KEYS if k in self.cfg["mcore_generation_config"]
+            ]
+            if _ignored:
+                raise ValueError(
+                    f"generation.colocated.enabled=true reuses the training model; "
+                    f"model-side keys {_ignored} in mcore_generation_config would be "
+                    f"silently ignored. Set generation.colocated.enabled=false to build "
+                    f"a dedicated inference model with these settings, or remove them."
+                )
             self._policy = policy
             self._owns_policy = False
             if self.cfg["mcore_generation_config"]["expose_http_server"]:

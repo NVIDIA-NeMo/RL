@@ -759,6 +759,37 @@ def setup(
             flush=True,
         )
 
+    elif os.environ.get("NRL_MINF_SHARED_CLUSTER") == "1":
+        # PATCH(PR-3 v0 / single-node dedicated megatron generation):
+        # colocated.enabled=false keeps the PROVEN non-colocated choreography
+        # (dedicated inference Policy + collective weight refit, validated at
+        # 2906-2981 tok/s/gpu on 2 nodes), but instead of splitting nodes we
+        # build ONE shared cluster with max_colocated_worker_groups=2 so the
+        # training and generation worker groups co-schedule on the SAME GPUs
+        # (fractional num_gpus, the same mechanism vLLM colocated uses).
+        # Memory: both models resident (train ~90GB/GPU + gen weights/KV
+        # ~35GB) — sized for 180GB B200s; OOM here means fall back to 2-node.
+        cluster = RayVirtualCluster(
+            name="grpo_shared_cluster",
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * total_nodes,
+            use_gpus=True,
+            num_gpus_per_node=cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=2,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+        )
+        train_cluster = cluster
+        inference_cluster = cluster
+        # Consumed later for the refit collective world size (setup() ~line 1119):
+        # the generation Policy spans the full shared cluster.
+        inference_nodes = total_nodes
+        inference_gpus_per_node = cluster_config["gpus_per_node"]
+        print(
+            f"  ✓ PR-3 v0 SHARED cluster: train + dedicated-gen co-scheduled on "
+            f"{total_nodes} node(s) x {cluster_config['gpus_per_node']} GPUs (fractional workers)",
+            flush=True,
+        )
     else:
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
