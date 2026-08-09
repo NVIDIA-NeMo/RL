@@ -22,7 +22,7 @@ test "$(git -C "${mcore}" rev-parse HEAD)" = "${MCORE_EXPECTED_COMMIT}"
 test -r "${container}"
 mkdir -p "${run_root}/ray"
 
-COMMAND="/opt/nemo_rl_venv/bin/torchrun --standalone --nproc-per-node=8 -m pytest ${mcore}/tests/unit_tests/transformer/moe/test_routers.py -q -k 'test_expert_bias_ignores_padding_tokens or test_router_with_padding_mask'"
+COMMAND="/opt/nemo_rl_venv/bin/torchrun --standalone --nproc-per-node=8 -m pytest ${mcore}/tests/unit_tests/transformer/moe/test_routers.py -q -k 'test_expert_bias_ignores_padding_tokens or test_expert_bias_token_counts_with_padding_mask or test_router_with_padding_mask or test_padding_mask_preserves_routes_outside_dropless_hybridep'"
 export COMMAND
 export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
