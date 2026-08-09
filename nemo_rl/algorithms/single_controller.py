@@ -75,6 +75,47 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Generous: a healthy step can wait several minutes on generation alone.
 _SELECT_STALL_WARN_SECONDS = 600.0
 
+# Cadence of the standalone engine-saturation report. Deliberately coarser than
+# ``vllm_metrics_logger_interval``: the workers keep sampling at that interval
+# regardless, so a slower poll still summarizes every sample while keeping the
+# cross-cluster ``ray.get`` fan-out (one call per DP leader) infrequent.
+_SATURATION_REPORT_SECONDS = 30.0
+
+
+def _summarize_generation_saturation(gen_metrics: dict[str, Any]) -> dict[str, float]:
+    """Pool per-engine vLLM samples into scalar saturation statistics.
+
+    Args:
+        gen_metrics: Metric name to ``{dp_idx: [samples]}``, as returned by
+            ``Generation.get_logger_metrics``.
+
+    Returns:
+        Scalar statistics, empty if no samples have been collected yet.
+    """
+
+    def pooled(name: str) -> list[float]:
+        per_worker: dict[int, list[Any]] = gen_metrics.get(name, {})
+        return [float(v) for samples in per_worker.values() for v in samples]
+
+    running = pooled("inflight_batch_sizes")
+    waiting = pooled("num_pending_samples")
+    kv_usage = pooled("kv_cache_usage_perc")
+
+    saturation: dict[str, float] = {}
+    if running:
+        saturation["requests_running_mean"] = sum(running) / len(running)
+        saturation["requests_running_max"] = max(running)
+    if waiting:
+        saturation["requests_waiting_mean"] = sum(waiting) / len(waiting)
+        saturation["requests_waiting_max"] = max(waiting)
+        saturation["queue_busy_frac"] = sum(1.0 for v in waiting if v > 0) / len(
+            waiting
+        )
+    if kv_usage:
+        saturation["kv_cache_usage_mean"] = sum(kv_usage) / len(kv_usage)
+        saturation["kv_cache_usage_max"] = max(kv_usage)
+    return saturation
+
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
@@ -207,29 +248,36 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
-        # Synchronize weights before starting the pumps
-        await self._sync_weights()
-
-        # Start the rollout and train pumps
-        rollout_task = asyncio.create_task(self._rollout_pump())
-        train_task = asyncio.create_task(self._train_pump())
+        # Started before the first weight sync so a run that stalls during
+        # setup still reports whether the engines are saturated.
+        saturation_task = asyncio.create_task(self._saturation_report_pump())
         try:
-            done, _ = await asyncio.wait(
-                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if rollout_task in done:
-                # Propagate rollout failures immediately. A normally exhausted
-                # rollout pump leaves the train pump to drain committed groups.
-                await rollout_task
-            await train_task
-        finally:
-            rollout_task.cancel()
-            train_task.cancel()
-            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            # Synchronize weights before starting the pumps
+            await self._sync_weights()
+
+            # Start the rollout and train pumps
+            rollout_task = asyncio.create_task(self._rollout_pump())
+            train_task = asyncio.create_task(self._train_pump())
             try:
-                self._weight_synchronizer.shutdown()
+                done, _ = await asyncio.wait(
+                    {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if rollout_task in done:
+                    # Propagate rollout failures immediately. A normally exhausted
+                    # rollout pump leaves the train pump to drain committed groups.
+                    await rollout_task
+                await train_task
             finally:
-                self._logger.finish()
+                rollout_task.cancel()
+                train_task.cancel()
+                await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+                try:
+                    self._weight_synchronizer.shutdown()
+                finally:
+                    self._logger.finish()
+        finally:
+            saturation_task.cancel()
+            await asyncio.gather(saturation_task, return_exceptions=True)
 
         return {
             "train_steps": self._train_steps,
@@ -748,6 +796,38 @@ class SingleControllerActor:
                 flush=True,
             )
 
+    async def _saturation_report_pump(self) -> None:
+        """Print engine saturation on a fixed cadence, independent of steps.
+
+        ``_report_generation_saturation`` only runs when a training step
+        closes, so a run that stalls before completing its first step emits no
+        engine telemetry at all — precisely the runs where knowing whether the
+        engines are saturated matters most. This pump closes that gap on
+        stdout. It never clears the accumulated samples, so the step-boundary
+        W&B reporting is unaffected.
+        """
+        while True:
+            await asyncio.sleep(_SATURATION_REPORT_SECONDS)
+            try:
+                # Collection does a blocking ray.get, so keep it off the event
+                # loop the rollout pump shares.
+                gen_metrics = await asyncio.to_thread(self._gen.get_logger_metrics)
+            except Exception as e:
+                # Telemetry must never abort a training run; the failure modes
+                # here are whatever Ray raises for an unreachable worker.
+                print(f"⚠️  engine saturation report failed: {e}", flush=True)
+                continue
+
+            saturation = _summarize_generation_saturation(gen_metrics)
+            if not saturation:
+                continue
+
+            summary = " ".join(f"{k}={v:.3f}" for k, v in saturation.items())
+            print(
+                f"🚦 engine saturation (train_step={self._train_steps}): {summary}",
+                flush=True,
+            )
+
     async def _report_generation_saturation(self) -> None:
         """Report vLLM queue depth and KV-cache use for the step just closed.
 
@@ -768,29 +848,9 @@ class SingleControllerActor:
         if not gen_metrics:
             return
 
-        def pooled(name: str) -> list[float]:
-            per_worker: dict[int, list[Any]] = gen_metrics.get(name, {})
-            return [float(v) for samples in per_worker.values() for v in samples]
-
-        running = pooled("inflight_batch_sizes")
-        waiting = pooled("num_pending_samples")
-        kv_usage = pooled("kv_cache_usage_perc")
-        if not (running or waiting or kv_usage):
+        saturation = _summarize_generation_saturation(gen_metrics)
+        if not saturation:
             return
-
-        saturation: dict[str, float] = {}
-        if running:
-            saturation["requests_running_mean"] = sum(running) / len(running)
-            saturation["requests_running_max"] = max(running)
-        if waiting:
-            saturation["requests_waiting_mean"] = sum(waiting) / len(waiting)
-            saturation["requests_waiting_max"] = max(waiting)
-            saturation["queue_busy_frac"] = sum(1.0 for v in waiting if v > 0) / len(
-                waiting
-            )
-        if kv_usage:
-            saturation["kv_cache_usage_mean"] = sum(kv_usage) / len(kv_usage)
-            saturation["kv_cache_usage_max"] = max(kv_usage)
 
         print("\n🚦 Generation saturation:")
         for name, value in saturation.items():
