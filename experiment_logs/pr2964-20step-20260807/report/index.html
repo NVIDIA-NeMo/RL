@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 22:07 PDT</span>
+        <span>Updated 2026-08-08 22:38 PDT</span>
         <span>Base a028b33b · Super fix validation 3d6d1324 · minimal PR candidate 734c5d8b</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore workload candidate c8cedc3d · exact Bridge-pin backport 788db41f</span>
@@ -270,7 +270,7 @@
       <article class="card">
         <div class="label">Overall status</div>
         <div class="value"><span class="pill pending">All three strict A/B pairs complete · official stack running</span></div>
-        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP pairs all completed 20/20 with exit <code>0:0</code>. Official-Bridge Q30 also completed 20/20; Super is running and Q235 is waiting for nodes.</p>
+        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP pairs all completed 20/20 with exit <code>0:0</code>. The submitted official-Bridge Q30 also completed 20/20; its Super run is at Step 7 and Q235 is waiting for nodes. A separate newest-Bridge matrix has started.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -291,7 +291,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 22:07 PDT. Final HybridEP jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. Official-Bridge Q30 507111 also completed 20/20. Official-Bridge Super 506895 has entered Step 5 with zero classified runtime fatals; Q235 507112 has cleared its dependency and is waiting for nodes. Hardened NeMo candidate 734c5d8b passed 10/10 focused tests; review-coverage commit e7d87801 passed 13/13 in job 506966.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 22:38 PDT. Final HybridEP jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. Official-Bridge Q30 507111 also completed 20/20. Official-Bridge Super 506895 has entered Step 7 with zero classified runtime fatals; Q235 507112 is waiting for nodes. Latest-Bridge ordering test 507231 passed, Q30 507239 is running, and dependency-gated Q235/Super jobs 507243/507242 are submitted.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -453,6 +453,13 @@
             <span class="pill pending">Q30 complete · Q235 waiting for nodes</span>
           </div>
           <p>Both jobs use NeMo candidate <code>4846673c</code>, official Megatron-Bridge <code>573e088c</code>, exact pinned-MCore routing backport <code>788db41f</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. Q30 507111 completed the canonical 4n8g recipe 20/20 in 59:58 with exit <code>0:0</code>. Its Steps 2–20 means are 137.70 s E2E, 50.13 s generation, 49.86 s policy, and 13.09 s LogProb. Q235 507112 uses the canonical 16n8g recipe; its dependency is cleared and it is waiting for nodes. Pending jobs consume no GPUs.</p>
+        </article>
+        <article class="job">
+          <div class="job-head">
+            <h3>507231 / 507239 / 507243 / 507242 · Newest Bridge validation</h3>
+            <span class="pill pending">Ordering test passed · Q30 running</span>
+          </div>
+          <p>Bridge main <code>fcbabe78</code> finalizes eager HybridEP by enabling layer-wise uneven-input padding. NeMo candidate <code>541413bd</code> now restores one-time-prepadding ownership after that finalization; focused job 507231 passed with exit <code>0:0</code>. Canonical Q30 4n8g job 507239 is running. Q235 16n8g job 507243 and Super 32n8g job 507242 are dependency-gated behind the corresponding submitted-stack runs. All use current MCore <code>14499ef0</code> plus the routing/broadcast fixes at <code>34b55f24</code>, DeepEP <code>17cfb817</code> plus the DMA-BUF fix, and a lockfile-rebuilt actor environment.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -755,7 +762,7 @@
         Dependency boundary: NeMo candidate <code>734c5d8b</code> alone is not sufficient because official Megatron-Bridge <code>573e088c</code> still pins unpatched MCore <code>6513e3e2</code>. Exact-pin validation backport <code>788db41f</code> combines merged-dev MCore PR #5542 with approved, open main PR #6114; its test-only precursor failed the two target tests in job 506870, then job 506884 passed 8 tests with one TE-dependent skip. Final integration must update Bridge/MCore to a revision containing both fixes; job 506895's external source override is validation-only, not a durable PR dependency. NeMo <code>734c5d8b</code> makes prepadding an explicit PP1/MTP0/NeMo-owned-packing opt-in and fails closed outside those boundaries. PP8 Qwen3-235B continues using MCore's internal padding. Job 506895 is now running the full 20-step official-Bridge validation.
       </div>
       <div class="callout">
-        Latest-main audit: Megatron-Bridge main advanced after the submitted jobs from <code>573e088c</code> to <code>fcbabe78</code>, pinning MCore <code>14499ef0</code>. Bridge commit <code>3ecb452a</code> now forces MCore's per-layer uneven-input padding on during model finalization. With the current NeMo one-time-prepadding candidate this can re-enable the flag after NeMo disables it, causing both padding paths to run for PP1 Qwen3-30B and Super. This is a real ordering delta, so the newest Bridge pin is being treated as a separate validation matrix rather than assumed equivalent. Qwen3-235B PP8 remains on MCore's internal path.
+        Latest-main audit: Megatron-Bridge main advanced after the submitted jobs from <code>573e088c</code> to <code>fcbabe78</code>, pinning MCore <code>14499ef0</code>. Bridge commit <code>3ecb452a</code> forces MCore's per-layer uneven-input padding on during model finalization. NeMo candidate <code>541413bd</code> therefore performs its override after <code>ConfigContainer.validate()</code>: PP1 Qwen3-30B and Super keep one-time NeMo-owned THD padding without the per-layer collective, while PP8 Qwen3-235B remains on MCore's internal path. TDD ordering job 507231 passed; full jobs 507239/507243/507242 provide the separate newest-Bridge validation matrix.
       </div>
     </section>
 
