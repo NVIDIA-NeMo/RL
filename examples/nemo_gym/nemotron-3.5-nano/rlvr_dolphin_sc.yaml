@@ -173,15 +173,20 @@ async_rl:
   # abort the whole run: jobs 5966951 and 5967263 died that way after one and
   # six steps while the legacy stack absorbed 400 of the same faults and kept
   # training.
-  rollout_retries: 1
-  # A dropped prompt leaves its batch a group short, and the in_order sampler
-  # only ever offers the trainer groups stamped for the current step, so that
-  # step can never close: job 5982927 wedged exactly this way after step 7 when
-  # two prompts hit 500s from a single sick env server, then sat idle for 104
-  # minutes. Re-dispatching after a wait is what keeps the batch whole; the
-  # trainer falls back to a shortened batch only if these also fail.
-  rollout_redispatch_attempts: 2
-  rollout_redispatch_backoff_seconds: 30.0
+  #
+  # Retrying matters more here than it does in v1. A dropped prompt leaves its
+  # batch a group short, and the in_order sampler only ever offers the trainer
+  # groups stamped for the current step, so that step can never close: job
+  # 5982927 wedged exactly this way after step 7 when two prompts hit 500s from
+  # a single sick env server, then sat idle for 104 minutes. Keeping the batch
+  # whole is worth waiting for; the trainer falls back to a shortened batch only
+  # once every attempt is gone.
+  #
+  # 3 retries with a 1s base gives 1s/2s/4s across four attempts, which is what
+  # v1's AsyncTrajectoryCollector does, so neither stack absorbs more than the
+  # other.
+  rollout_retries: 3
+  rollout_retry_backoff_base_seconds: 1.0
   # Consecutive drops that mean the environment servers or the generation
   # backend are down rather than one prompt being bad. Failing fast then beats
   # burning the rest of the allocation.

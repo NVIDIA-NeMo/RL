@@ -18,15 +18,13 @@ async_rl:
   max_inflight_prompts: ${grpo.num_prompts_per_step}
   # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
   max_buffered_rollouts: 64
-  # Re-dispatch attempts for a prompt whose rollout raised, before dropping it.
-  # 0 disables retry.
-  rollout_retries: 1
-  # Further attempts, spaced by the backoff, once the immediate retries are
-  # gone. A dropped prompt leaves its batch a group short, which a sampler that
-  # matches batches to steps exactly cannot close, so waiting out a sick server
-  # is what keeps the batch whole.
-  rollout_redispatch_attempts: 2
-  rollout_redispatch_backoff_seconds: 30.0
+  # Retries for a prompt whose rollout raised, before dropping it. A dropped
+  # prompt leaves its batch a group short, which a sampler that matches batches
+  # to steps exactly cannot close, so it is worth waiting out a sick server.
+  # 3 retries with a 1s base gives 1s/2s/4s across four attempts, matching v1's
+  # AsyncTrajectoryCollector. 0 disables retry.
+  rollout_retries: 3
+  rollout_retry_backoff_base_seconds: 1.0
   # Consecutive prompts that may exhaust their retries before the run aborts.
   max_consecutive_rollout_failures: 32
   # Enable per-rollout diagnostic prints (prompt content / completion previews).

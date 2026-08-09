@@ -48,19 +48,18 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
     max_buffered_rollouts: int = 64
-    # Re-dispatch attempts for a prompt whose rollout raised, before giving up on
-    # it. Gym retries dropped connections itself but surfaces HTTP 5xx and
-    # truncated bodies to us, and those are usually transient. 0 disables retry.
-    rollout_retries: int = 1
-    # Further attempts for the same prompt, spaced by the backoff below, once the
-    # immediate retries are gone. These exist because a dropped prompt leaves its
-    # batch one group short, and a sampler that matches batches to steps exactly
-    # (in_order) can then never close that step. Waiting out a sick environment
-    # server is what keeps the batch whole. 0 restores drop-on-first-exhaustion.
-    rollout_redispatch_attempts: int = 2
-    # Seconds to wait before each re-dispatch. Long enough for a failing server
-    # to restart or a load balancer to route around it, short relative to a step.
-    rollout_redispatch_backoff_seconds: float = 30.0
+    # Retries for a prompt whose rollout raised, before giving up on it. Gym
+    # retries dropped connections itself but surfaces HTTP 5xx and truncated
+    # bodies to us, and those are usually transient. 0 disables retry; 3 gives
+    # the four attempts v1's AsyncTrajectoryCollector makes
+    # (1 + _MAX_NEMO_GYM_STREAM_RETRIES), so both stacks absorb the same faults.
+    rollout_retries: int = 3
+    # Doubles per attempt, so the delays before attempts 2, 3 and 4 are 1s, 2s
+    # and 4s — v1's schedule, and the only measured evidence of how fast this
+    # fault class recovers. Retrying matters more here than in v1: a prompt that
+    # exhausts its attempts leaves its batch a group short, which the in_order
+    # sampler cannot close.
+    rollout_retry_backoff_base_seconds: float = 1.0
     # Consecutive prompts that may exhaust their retries before the run aborts.
     # Isolated rollout failures are normal and get dropped; this many in a row
     # means the environment servers or generation backend are down, not that one

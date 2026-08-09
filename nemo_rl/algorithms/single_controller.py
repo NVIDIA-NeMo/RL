@@ -271,9 +271,9 @@ class SingleControllerActor:
     ) -> bool:
         """Run one prompt, retrying transient failures. True if it committed.
 
-        Attempts run back to back first, then ``rollout_redispatch_attempts``
-        more with a backoff between them, so a prompt whose environment server
-        is briefly sick rejoins its own batch instead of vanishing from it.
+        The attempt count and the doubling backoff between them mirror v1's
+        AsyncTrajectoryCollector, so the two stacks retry the same fault the
+        same way and their throughput stays comparable.
 
         Returns False only when every attempt failed. That leaves the prompt's
         batch one group short, which a sampler matching batches to steps exactly
@@ -284,13 +284,15 @@ class SingleControllerActor:
         environment servers or the generation backend are down rather than one
         prompt being bad.
         """
-        immediate = 1 + self._async_cfg.rollout_retries
-        attempts = immediate + self._async_cfg.rollout_redispatch_attempts
+        attempts = 1 + self._async_cfg.rollout_retries
         for attempt in range(1, attempts + 1):
-            if attempt > immediate:
-                # Spacing is the point of a re-dispatch: an immediate replay
-                # would just hit the same unhealthy server.
-                await asyncio.sleep(self._async_cfg.rollout_redispatch_backoff_seconds)
+            if attempt > 1:
+                # An immediate replay would just hit the server that only just
+                # failed, so back off further on each successive attempt.
+                await asyncio.sleep(
+                    self._async_cfg.rollout_retry_backoff_base_seconds
+                    * (2 ** (attempt - 2))
+                )
             try:
                 await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
@@ -303,10 +305,13 @@ class SingleControllerActor:
                 name = type(e).__name__
                 self._rollout_failure_counts[name] += 1
                 if attempt < attempts:
-                    how = "retrying" if attempt < immediate else "re-dispatching"
+                    next_delay = self._async_cfg.rollout_retry_backoff_base_seconds * (
+                        2 ** (attempt - 1)
+                    )
                     print(
                         f"rollout_pump: prompt failed with {name}: {e} — "
-                        f"{how} ({attempt}/{attempts - 1})",
+                        f"retrying ({attempt}/{attempts - 1}) in "
+                        f"{next_delay:.1f}s",
                         flush=True,
                     )
                     continue
