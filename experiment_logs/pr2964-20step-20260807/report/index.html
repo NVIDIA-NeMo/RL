@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-09 03:37 PDT</span>
+        <span>Updated 2026-08-09 03:54 PDT</span>
         <span>NeMo RL main 0e687e6d · strict A/B candidate 3d6d1324 · Bridge-main candidate 541413bd</span>
         <span>PR #2964 remote eecfeeb0 · one-time padding path published · focused coverage 12/12 passed</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
@@ -292,7 +292,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-09 03:37 PDT. Final HybridEP candidate jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. NeMo-RL-main-pinned Bridge jobs 507111/507112/506895 also completed 20/20. PR #2964 is at <code>eecfeeb0</code>; B200 focused coverage job 507684 passed 12/12 against Bridge <code>fcbabe78</code> and stock MCore <code>14499ef0</code>. The relocated Fast-CI tests are projected to raise Codecov patch coverage from 42/111 (37.84%) to 98/111 (88.29%); actual Codecov remains the final gate. Latest-Bridge Q235 507274 is running without a strict fatal and has entered Step 1; Super 507275 remains scheduler-pending. Stock-MCore jobs 507501/507502 are chained after them.</p>
+      <p class="section-note">Live snapshot at 2026-08-09 03:54 PDT. Final HybridEP candidate jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. NeMo-RL-main-pinned Bridge jobs 507111/507112/506895 also completed 20/20. PR #2964 is at <code>eecfeeb0</code>; B200 focused coverage job 507684 passed 12/12 against Bridge <code>fcbabe78</code> and stock MCore <code>14499ef0</code>. The relocated Fast-CI tests are projected to raise Codecov patch coverage from 42/111 (37.84%) to 98/111 (88.29%); actual Codecov remains the final gate. Latest-Bridge Q235 507274 completed Step 2 and entered Step 3 without a strict fatal; Super 507275 remains scheduler-pending. Stock-MCore jobs 507501/507502 are chained after them. PR CI currently has 31 successful checks, 27 running, and no failures.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -834,7 +834,7 @@
         Latest-main audit: Megatron-Bridge main advanced after the submitted jobs from <code>573e088c</code> to <code>fcbabe78</code>, pinning MCore <code>14499ef0</code>. Bridge commit <code>3ecb452a</code> forces MCore's per-layer uneven-input padding on during model finalization. NeMo candidate <code>541413bd</code> therefore performs its override after <code>ConfigContainer.validate()</code>: PP1 Qwen3-30B and Super keep one-time NeMo-owned THD padding without the per-layer collective, while PP8 Qwen3-235B remains on MCore's internal path. TDD ordering job 507231 and PR-ready jobs 507481/507684 passed; clean-node Q30 507302 completed 20/20 with Bridge's stock MCore <code>14499ef0</code>. Q235 507274 is running after a clean first-five-minute audit; Super 507275 retains external routing candidate <code>34b55f24</code> and is scheduler-pending. Sequential stock-MCore jobs 507501/507502 determine whether that external dependency remains necessary.
       </div>
       <div class="callout">
-        PR-state boundary: GitHub PR #2964 now points to <code>eecfeeb0</code>. The remote branch contains the one-time NeMo padding path, fail-closed guards, post-Bridge-validation override, and Pyrefly project registration, while deliberately leaving the DeepEP pin to coupled PR #3436. Fast CI excludes the broad <code>test_megatron_data.py</code> file, which caused the prior Codecov patch failure even though focused tests passed. The head moves the five HybridEP tests unchanged into an included module. Job 507684 passed 12/12 against Bridge <code>fcbabe78</code> and stock MCore <code>14499ef0</code>; line-level union predicts 98/111 (88.29%) patch coverage versus the 80% target. The actual Codecov check and full stock-MCore workload gates remain in progress.
+        PR-state boundary: GitHub PR #2964 now points to <code>eecfeeb0</code>. The remote branch contains the one-time NeMo padding path, fail-closed guards, post-Bridge-validation override, and Pyrefly project registration, while deliberately leaving the DeepEP pin to coupled PR #3436. Fast CI excludes the broad <code>test_megatron_data.py</code> file, which caused the prior Codecov patch failure even though focused tests passed. The head moves the five HybridEP tests unchanged into an included module. Job 507684 passed 12/12 against Bridge <code>fcbabe78</code> and stock MCore <code>14499ef0</code>; line-level union predicts 98/111 (88.29%) patch coverage versus the 80% target. A full <code>nemo_rl/</code> tree diff and per-file blob audit found no production-code difference between PR head <code>eecfeeb0</code> and workload candidate <code>541413bd</code>; the candidate-only differences are experiment dependency pins and test/typing metadata. The actual Codecov check and full stock-MCore workload gates remain in progress.
       </div>
     </section>
 
