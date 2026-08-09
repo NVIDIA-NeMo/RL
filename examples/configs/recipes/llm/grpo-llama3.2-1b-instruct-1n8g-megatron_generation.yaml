@@ -1,0 +1,36 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 500
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron_generation
+  save_period: 100
+policy:
+  model_name: meta-llama/Llama-3.2-1B-Instruct
+  tokenizer:
+    name: meta-llama/Llama-3.2-1B-Instruct
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    scheduler:
+      lr_warmup_iters: 50
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    backend: megatron
+    max_new_tokens: 512
+    vllm_cfg:
+      max_model_len: 512
+data:
+  max_input_seq_length: 512
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n8g-megatron_generation
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-llama3.2-1b-instruct-1n8g-megatron_generation
+cluster:
+  gpus_per_node: 8
+

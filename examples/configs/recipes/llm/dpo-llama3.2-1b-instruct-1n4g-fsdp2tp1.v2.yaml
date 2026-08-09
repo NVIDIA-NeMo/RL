@@ -1,0 +1,10 @@
+defaults: ./dpo-llama3.2-1b-instruct-1n8g-fsdp2tp1.v2.yaml
+checkpointing:
+  checkpoint_dir: results/dpo-llama3.2-1b-instruct-1n4g-fsdp2tp1
+logger:
+  log_dir: logs/dpo-llama3.2-1b-instruct-1n4g-fsdp2tp1
+  wandb:
+    name: dpo-llama3.2-1b-instruct-1n4g-fsdp2tp1
+cluster:
+  gpus_per_node: 4
+

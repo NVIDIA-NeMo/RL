@@ -1,0 +1,13 @@
+defaults: ./grpo-nano-v2-12b-1n8g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v2-12b-1n4g-megatron
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+logger:
+  log_dir: logs/grpo-nano-v2-12b-1n4g-megatron
+  wandb:
+    name: grpo-nano-v2-12b-1n4g-megatron
+cluster:
+  gpus_per_node: 4
+

@@ -1,0 +1,9 @@
+defaults: ./sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml
+policy:
+  dtensor_cfg:
+    expert_parallel_size: 4
+checkpointing:
+  checkpoint_dir: results/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel
+cluster:
+  gpus_per_node: 4
+

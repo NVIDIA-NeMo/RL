@@ -473,7 +473,8 @@ def test_dailyomni_dataset():
 # ---------------------------------------------------------------------------
 # IntentTrain / IntentBench dataset (audio+video). The full content-shape
 # contract (one {type:video} + {type:audio} + text per prompt) is exercised
-# end to end by the audio-visual recipe in docs/guides/grpo-audio-visual.md
+# end to end by the recipe
+# tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.sh
 # (the unit-level video+audio check needs ffmpeg to fabricate an mp4). The
 # tests below cover the loader contracts that do not require the ~16 GB
 # archives or ffmpeg.

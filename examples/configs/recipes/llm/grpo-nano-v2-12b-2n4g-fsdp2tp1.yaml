@@ -1,0 +1,10 @@
+defaults: ./grpo-nano-v2-12b-2n8g-fsdp2tp1.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v2-12b-2n4g-fsdp2tp1
+logger:
+  log_dir: logs/grpo-nano-v2-12b-2n4g-fsdp2tp1
+  wandb:
+    name: grpo-nano-v2-12b-2n4g-fsdp2tp1
+cluster:
+  gpus_per_node: 4
+
