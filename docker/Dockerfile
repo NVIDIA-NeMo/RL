@@ -24,6 +24,7 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+ARG UV_VERSION=0.11.28
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -108,7 +109,7 @@ RUN GITHUB_ARTIFACTORY=github.com \
 # Install uv and Python outside /root so the image can also be used by an
 # arbitrary runtime UID. Keep the cache in /opt because the project venv uses
 # symlinks into it.
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION
 ARG PYTHON_VERSION=3.13.14
 ENV UV_CACHE_DIR=/opt/uv/cache
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
