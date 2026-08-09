@@ -826,7 +826,8 @@ def grpo_train_sync(
                     # writeback.
                     select_fields = ["generation_logprobs", "token_mask"]
                     if compute_prev:
-                        policy.get_logprobs_from_meta(meta, timer=timer)
+                        with timer.time("policy_logprobs"):
+                            policy.get_logprobs_from_meta(meta, timer=timer)
                         select_fields.append("prev_logprobs")
                     else:
                         print(
@@ -834,10 +835,11 @@ def grpo_train_sync(
                             flush=True,
                         )
                     if compute_ref:
-                        policy.get_reference_policy_logprobs_from_meta(
-                            meta,
-                            timer=timer,
-                        )
+                        with timer.time("reference_logprobs"):
+                            policy.get_reference_policy_logprobs_from_meta(
+                                meta,
+                                timer=timer,
+                            )
                         select_fields.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs

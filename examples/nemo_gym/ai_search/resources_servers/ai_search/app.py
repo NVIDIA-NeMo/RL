@@ -27,6 +27,7 @@ from nemo_gym.server_utils import SESSION_ID_KEY
 from resources_servers.ai_search.retrieval.batching import AsyncSearchBatcher
 from resources_servers.ai_search.retrieval.config import SearchRuntimeConfig
 from resources_servers.ai_search.retrieval.engine import DenseSearchEngine
+from resources_servers.ai_search.retrieval.http import HttpSearchProvider
 from resources_servers.ai_search.retrieval.types import SearchProvider
 
 
@@ -220,6 +221,8 @@ class AISearchResourcesServer(SimpleResourcesServer):
     @staticmethod
     def _build_search_provider(config: SearchRuntimeConfig) -> SearchProvider:
         """Build the default provider; subclasses can inject an inverted index."""
+        if config.provider == "http":
+            return HttpSearchProvider(config)
         return DenseSearchEngine(config)
 
     @staticmethod

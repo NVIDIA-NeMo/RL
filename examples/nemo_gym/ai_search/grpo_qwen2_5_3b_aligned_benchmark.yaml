@@ -1,0 +1,98 @@
+# Controlled Qwen2.5-3B-Instruct workload shared with Search-R1 and ZeroSearch.
+defaults: ../../configs/recipes/llm/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.yaml
+
+grpo:
+  max_num_epochs: 10
+  max_num_steps: 4
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_rollout_turns: 3
+  val_period: 1000
+  val_at_start: true
+  val_at_end: true
+  skip_reference_policy_logprobs_calculation: false
+  invalid_tool_call_advantage: null
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+    minus_baseline: true
+    reward_weights: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+
+policy:
+  model_name: Qwen/Qwen2.5-3B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-3B-Instruct
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+  generation:
+    max_new_tokens: 256
+    temperature: 1.0
+    top_p: 0.95
+    val_temperature: 1.0
+    val_top_p: 0.95
+    vllm_cfg:
+      gpu_memory_utilization: 0.5
+      tensor_parallel_size: 1
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+
+data:
+  shuffle: false
+  train:
+    data_path: examples/nemo_gym/ai_search/resources_servers/ai_search/data/aligned/train.jsonl
+  validation:
+    data_path: examples/nemo_gym/ai_search/resources_servers/ai_search/data/aligned/validation.jsonl
+
+env:
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/ai_search/configs/ai_search_aligned_benchmark.yaml
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-ai-search-qwen2.5-3b-aligned
+  keep_top_k: 1
+  save_period: 4
+  save_optimizer: true
+
+logger:
+  log_dir: logs/grpo-ai-search-qwen2.5-3b-aligned
+  num_val_samples_to_print: 2
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-ai-search-comparison
+    name: qwen2.5-3b-aligned
+
+cluster:
+  gpus_per_node: 4

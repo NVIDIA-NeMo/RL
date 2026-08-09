@@ -73,6 +73,9 @@ class RewardConfig(BaseModel):
 class SearchRuntimeConfig(BaseModel):
     """Configuration shared by the server, engine, and asynchronous batcher."""
 
+    provider: Literal["dense", "http"] = "dense"
+    http_url: str | None = None
+    http_timeout_s: float = Field(default=10.0, gt=0.0)
     corpus_path: Path
     embeddings_path: Path
     verify_artifact_hash: bool
@@ -93,4 +96,6 @@ class SearchRuntimeConfig(BaseModel):
     def validate_limits(self) -> "SearchRuntimeConfig":
         if self.default_top_k > self.max_top_k:
             raise ValueError("default_top_k cannot be greater than max_top_k")
+        if self.provider == "http" and not self.http_url:
+            raise ValueError("http_url is required when provider is http")
         return self

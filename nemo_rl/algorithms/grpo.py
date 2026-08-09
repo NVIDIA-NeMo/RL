@@ -3142,9 +3142,10 @@ def grpo_train(
                     )
 
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            logprob_data, timer=timer
-                        )["logprobs"]
+                        with timer.time("policy_logprobs"):
+                            train_data["prev_logprobs"] = policy.get_logprobs(
+                                logprob_data, timer=timer
+                            )["logprobs"]
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -3155,12 +3156,13 @@ def grpo_train(
                         )
 
                     if not skip_reference_logprobs:
-                        train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
-                                logprob_data,
-                                timer=timer,
-                            )["reference_logprobs"]
-                        )
+                        with timer.time("reference_logprobs"):
+                            train_data["reference_policy_logprobs"] = (
+                                policy.get_reference_policy_logprobs(
+                                    logprob_data,
+                                    timer=timer,
+                                )["reference_logprobs"]
+                            )
                     else:
                         print(
                             "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
@@ -4600,21 +4602,23 @@ def async_grpo_train(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            train_data, timer=timer
-                        )["logprobs"]
+                        with timer.time("policy_logprobs"):
+                            train_data["prev_logprobs"] = policy.get_logprobs(
+                                train_data, timer=timer
+                            )["logprobs"]
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
                         )
 
                     if not skip_reference_logprobs:
-                        train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
-                                train_data,
-                                timer=timer,
-                            )["reference_logprobs"]
-                        )
+                        with timer.time("reference_logprobs"):
+                            train_data["reference_policy_logprobs"] = (
+                                policy.get_reference_policy_logprobs(
+                                    train_data,
+                                    timer=timer,
+                                )["reference_logprobs"]
+                            )
                     else:
                         print(
                             "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",

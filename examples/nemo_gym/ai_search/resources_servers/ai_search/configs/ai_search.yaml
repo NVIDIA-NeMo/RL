@@ -8,6 +8,9 @@ ai_search:
       value: Train models to decide when and how to search a private corpus
       num_workers: 1
       search:
+        provider: dense
+        http_url: null
+        http_timeout_s: 10.0
         corpus_path: data/corpus.jsonl
         embeddings_path: data/index/e5-small-v2.embeddings.npy
         verify_artifact_hash: true

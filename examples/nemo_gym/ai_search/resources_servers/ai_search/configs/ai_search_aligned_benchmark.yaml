@@ -1,0 +1,76 @@
+ai_search:
+  resources_servers:
+    ai_search:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: Shared-retriever AI-search comparison environment
+      value: Compare training implementations with identical questions and retrieval
+      num_workers: 1
+      search:
+        provider: http
+        http_url: http://127.0.0.1:8100/retrieve
+        http_timeout_s: 10.0
+        # Dense-only fields remain schema-valid but are unused by the HTTP provider.
+        corpus_path: data/aligned/corpus.jsonl
+        embeddings_path: data/aligned/unused.npy
+        verify_artifact_hash: false
+        encoder:
+          kind: hash
+          model_name: unused-by-http-provider
+          device: cpu
+          dtype: float32
+          batch_size: 1
+          max_length: 8
+          dimension: 8
+          query_prefix: ""
+          passage_prefix: ""
+          normalize: true
+          trust_remote_code: false
+        index:
+          kind: numpy
+          algorithm: brute_force
+          metric: cosine
+          serialized_index_path: null
+          save_built_index: false
+          graph_degree: 2
+          intermediate_graph_degree: 2
+          build_algorithm: ivf_pq
+          search_width: 1
+          itopk_size: 2
+        default_top_k: 3
+        max_top_k: 3
+        max_query_chars: 512
+        max_passage_chars: 1800
+        max_search_calls: 3
+        batch_max_size: 64
+        batch_wait_ms: 2.0
+        query_cache_size: 0
+        include_scores: true
+        reward:
+          answer_weight: 1.0
+          retrieval_weight: 0.0
+          format_weight: 0.0
+          efficiency_weight: 0.0
+          answer_threshold_for_efficiency: 0.5
+
+ai_search_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: ai_search
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 3
+      datasets:
+      - name: train
+        type: train
+        jsonl_fpath: resources_servers/ai_search/data/aligned/train.jsonl
+        license: Apache 2.0
+      - name: validation
+        type: validation
+        jsonl_fpath: resources_servers/ai_search/data/aligned/validation.jsonl
+        license: Apache 2.0
