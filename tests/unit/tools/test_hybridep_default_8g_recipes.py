@@ -125,6 +125,22 @@ def test_moe_8g_canonical_recipes_default_to_x86_hybridep(
 
 
 @pytest.mark.parametrize("recipe_name", MOE_8G_RECIPES)
+def test_moe_8g_recipes_prepad_only_supported_pipeline_topologies(
+    recipe_name: str,
+) -> None:
+    megatron_cfg = _megatron_config(_resolve_recipe(recipe_name))
+
+    supports_one_time_prepadding = (
+        megatron_cfg["pipeline_model_parallel_size"] == 1
+        and megatron_cfg["mtp_num_layers"] == 0
+    )
+    assert (
+        megatron_cfg.get("moe_hybridep_prepad_packed_inputs", False)
+        is supports_one_time_prepadding
+    )
+
+
+@pytest.mark.parametrize("recipe_name", MOE_8G_RECIPES)
 def test_moe_8g_recipes_define_hybridep_directly_without_alltoall_peer(
     recipe_name: str,
 ) -> None:
