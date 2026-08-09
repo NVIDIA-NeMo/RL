@@ -16,6 +16,7 @@ bridge_source=${BRIDGE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspa
 mcore_source=${MCORE_SOURCE_OVERRIDE:-${bridge_source}/3rdparty/Megatron-LM}
 container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh}
 test_gpus_per_node=${TEST_GPUS_PER_NODE:-8}
+test_scope=${HYBRIDEP_TEST_SCOPE:-full}
 test -n "${VALIDATION_HEAD_OVERRIDE:-}"
 [[ "${test_gpus_per_node}" =~ ^[1-8]$ ]]
 run_root=${experiment_root}/runs/hybridep-prepadding-${VALIDATION_HEAD_OVERRIDE:0:12}
@@ -27,11 +28,18 @@ test -d "${mcore_source}/megatron/core"
 test -r "${container}"
 mkdir -p "${run_root}/ray"
 
-COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m pytest --mcore-only -q \
-  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_input_prepadding_wins_after_bridge_validation \
-  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_dispatch_padding_stays_enabled_without_input_prepadding \
-  ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
-  ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_explicitly_uses_input_prepadding"
+ordering_tests="${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_input_prepadding_wins_after_bridge_validation \
+${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_dispatch_padding_stays_enabled_without_input_prepadding"
+case "${test_scope}" in
+  ordering) pytest_targets="${ordering_tests}" ;;
+  full)
+    pytest_targets="${ordering_tests} \
+${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
+${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_explicitly_uses_input_prepadding"
+    ;;
+  *) printf 'HYBRIDEP_TEST_SCOPE must be ordering or full, got %s\n' "${test_scope}" >&2; exit 2 ;;
+esac
+COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m pytest --mcore-only -q ${pytest_targets}"
 export COMMAND
 export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
