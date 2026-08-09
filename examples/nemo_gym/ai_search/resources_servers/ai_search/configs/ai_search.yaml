@@ -47,6 +47,7 @@ ai_search:
         query_cache_size: 4096
         include_scores: true
         reward:
+          answer_metric: token_f1
           answer_weight: 1.0
           retrieval_weight: 0.25
           format_weight: 0.1

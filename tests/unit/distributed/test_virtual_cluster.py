@@ -211,6 +211,34 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_shutdown.call_count == 0
 
 
+@pytest.mark.parametrize(
+    ("dashboard_setting", "expected"),
+    [("0", False), ("1", True)],
+)
+def test_ray_dashboard_env_controls_new_local_cluster(
+    dashboard_setting: str, expected: bool
+):
+    """The dashboard can be disabled without changing the default behavior."""
+    with (
+        patch("ray.init", side_effect=[ConnectionError, None]) as mock_ray_init,
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value={"GPU": 1, "nrl_tag_0": 1}),
+        patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "NEMO_RL_RAY_DASHBOARD": dashboard_setting,
+            },
+            clear=False,
+        ),
+    ):
+        from nemo_rl.distributed.virtual_cluster import init_ray
+
+        init_ray()
+
+    assert mock_ray_init.call_args_list[-1].kwargs["include_dashboard"] is expected
+
+
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project

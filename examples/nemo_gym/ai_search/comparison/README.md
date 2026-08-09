@@ -5,8 +5,10 @@ Search-R1, and Alibaba ZeroSearch. It is a performance experiment, not a model
 quality benchmark.
 
 All three runs use Qwen2.5-3B-Instruct, BF16 full-parameter GRPO, four prompts
-per optimizer step, four trajectories per prompt, at most three model turns,
-top-3 retrieval, temperature 1.0, and the same 32-train/8-validation fixture.
+per optimizer step, four trajectories per prompt, at most three model calls
+(two searchable rounds plus one final answer), top-3 retrieval, normalized
+exact-match answer reward, temperature 1.0, and the same
+32-train/8-validation fixture.
 The first step warms caches; steps 2-4 are the measured window. A final
 validation and checkpoint are reported separately from core-step throughput.
 

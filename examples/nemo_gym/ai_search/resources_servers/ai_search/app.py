@@ -334,6 +334,12 @@ class AISearchResourcesServer(SimpleResourcesServer):
                 for answer in body.answers
             )
         )
+        reward_config = self.config.search.reward
+        answer_score = (
+            exact_match
+            if reward_config.answer_metric == "exact_match"
+            else answer_f1
+        )
 
         retrieved_doc_ids = list(
             dict.fromkeys(
@@ -358,15 +364,14 @@ class AISearchResourcesServer(SimpleResourcesServer):
         useful_call_budget = max(1, len(expected_support))
         search_efficiency = 0.0
         if (
-            answer_f1 >= self.config.search.reward.answer_threshold_for_efficiency
+            answer_score >= reward_config.answer_threshold_for_efficiency
             and num_search_calls > 0
         ):
             search_efficiency = min(1.0, useful_call_budget / num_search_calls)
 
         format_valid = float(format_valid_bool and bool(parsed_answer))
-        reward_config = self.config.search.reward
         reward_components = {
-            "answer": reward_config.answer_weight * answer_f1,
+            "answer": reward_config.answer_weight * answer_score,
             "efficiency": reward_config.efficiency_weight * search_efficiency,
             "format": reward_config.format_weight * format_valid,
             "retrieval": reward_config.retrieval_weight * retrieval_recall,

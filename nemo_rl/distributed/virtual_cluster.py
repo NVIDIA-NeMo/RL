@@ -328,7 +328,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     ray.init(
         log_to_driver=True,
-        include_dashboard=True,
+        include_dashboard=os.environ.get("NEMO_RL_RAY_DASHBOARD", "1") != "0",
         runtime_env=local_runtime_env,
         _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         resources={cvd_tag: 1},

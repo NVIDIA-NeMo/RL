@@ -73,8 +73,28 @@ def test_token_f1_allows_semantically_matching_short_answer() -> None:
     assert _token_f1("Rhea", "Rhea Coil") == pytest.approx(2.0 / 3.0)
 
 
+@pytest.mark.parametrize(
+    (
+        "answer_metric",
+        "response_text",
+        "expected_answer_reward",
+        "expected_efficiency_reward",
+        "expected_exact_match",
+    ),
+    [
+        ("token_f1", "Final Answer: Selka", 1.0, 0.05, 1.0),
+        ("exact_match", "Final Answer: Selka harbor", 0.0, 0.0, 0.0),
+    ],
+)
 @pytest.mark.asyncio
-async def test_verifier_combines_decomposed_reward(tmp_path) -> None:
+async def test_verifier_combines_decomposed_reward(
+    tmp_path,
+    answer_metric: str,
+    response_text: str,
+    expected_answer_reward: float,
+    expected_efficiency_reward: float,
+    expected_exact_match: float,
+) -> None:
     corpus_path = tmp_path / "corpus.jsonl"
     embeddings_path = tmp_path / "embeddings.npy"
     corpus_path.write_text(
@@ -149,6 +169,7 @@ async def test_verifier_combines_decomposed_reward(tmp_path) -> None:
         query_cache_size=8,
         include_scores=True,
         reward=RewardConfig(
+            answer_metric=answer_metric,
             answer_weight=1.0,
             retrieval_weight=0.25,
             format_weight=0.1,
@@ -197,18 +218,20 @@ async def test_verifier_combines_decomposed_reward(tmp_path) -> None:
             responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
                 input=[{"role": "user", "content": "Where was Mara Voss born?"}]
             ),
-            response=_make_response("Final Answer: Selka"),
+            response=_make_response(response_text),
         ),
     )
 
-    assert result.reward == pytest.approx(1.4)
+    assert result.reward == pytest.approx(
+        expected_answer_reward + expected_efficiency_reward + 0.1 + 0.25
+    )
     assert result.reward_components == {
-        "answer": 1.0,
-        "efficiency": 0.05,
+        "answer": expected_answer_reward,
+        "efficiency": expected_efficiency_reward,
         "format": 0.1,
         "retrieval": 0.25,
     }
-    assert result.exact_match == 1.0
+    assert result.exact_match == expected_exact_match
     assert result.retrieval_recall == 1.0
     assert result.num_search_calls == 1
     server._provider.close()

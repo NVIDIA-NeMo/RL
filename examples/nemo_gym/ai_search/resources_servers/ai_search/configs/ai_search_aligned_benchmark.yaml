@@ -48,6 +48,7 @@ ai_search:
         query_cache_size: 0
         include_scores: true
         reward:
+          answer_metric: exact_match
           answer_weight: 1.0
           retrieval_weight: 0.0
           format_weight: 0.0

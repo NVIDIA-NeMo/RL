@@ -52,6 +52,7 @@ def test_http_provider_converts_search_r1_response() -> None:
         query_cache_size=0,
         include_scores=True,
         reward=RewardConfig(
+            answer_metric="exact_match",
             answer_weight=1.0,
             retrieval_weight=0.0,
             format_weight=0.0,

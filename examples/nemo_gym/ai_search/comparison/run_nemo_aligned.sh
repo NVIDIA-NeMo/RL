@@ -28,5 +28,8 @@ export AI_SEARCH_CONFIG="${CONFIG_PATH}"
 export AI_SEARCH_MAX_STEPS="${AI_SEARCH_MAX_STEPS:-4}"
 export AI_SEARCH_NUM_PROMPTS="${AI_SEARCH_NUM_PROMPTS:-4}"
 export AI_SEARCH_NUM_GENERATIONS="${AI_SEARCH_NUM_GENERATIONS:-4}"
+# The dashboard is unrelated to training and can fail independently when its
+# metrics subprocess is unavailable on a batch node.
+export NEMO_RL_RAY_DASHBOARD=0
 
 exec bash "${PLUGIN_DIR}/run_ai_search.sh" "$@"
