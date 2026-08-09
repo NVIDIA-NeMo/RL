@@ -39,7 +39,7 @@ set -euo pipefail
 #   STREAM_MIN_GROUPS=32         # async_rl.min_groups_for_streaming_train
 #   MAX_LOOKAHEAD_VERSIONS=4     # async_rl.sampler.max_lookahead_versions
 #                                # 1 restores parity with the async-1 baseline
-#   NUM_STORAGE_UNITS=8          # data_plane.num_storage_units
+#   NUM_STORAGE_UNITS=16         # data_plane.num_storage_units
 #   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
 #
 # Extra positional args are forwarded as Hydra overrides, after ours, so they win.
@@ -59,12 +59,16 @@ export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc
 # The SC knobs worth sweeping without editing the config.
 #
 # STREAM_MIN_GROUPS starts the optimizer step earlier on partial cohorts.
-# NUM_STORAGE_UNITS is the untuned one at this data volume.
+# NUM_STORAGE_UNITS is the untuned one at this data volume. It is passed as a
+# Hydra override unconditionally below, so it beats the recipe and the value in
+# rlvr_dolphin_sc.yaml is never what runs — keep the two in step. It shards a
+# global pool rather than reserving per unit, so over-provisioning costs only a
+# CPU actor each; the windowed sweep's 14336 peak rows are 1.4% of capacity.
 # MAX_LOOKAHEAD_VERSIONS is the off-policyness ceiling; raising it also raises
 # the two capacity floors below, which validate_sampler_buffer_capacity
 # enforces (max_buffered_rollouts >= num_prompts_per_step * (lookahead + 1)).
 STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-32}"
-NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-8}"
+NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-16}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-4}"
 
 # Which selection policy the slack above configures. The two samplers spell it
