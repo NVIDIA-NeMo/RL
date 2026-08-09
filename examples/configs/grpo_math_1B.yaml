@@ -15,6 +15,9 @@ grpo:
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
+  # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
+  val_num_generations_per_prompt: 1
   # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
   stop_at_validation_metric: null
   # Required when stop_at_validation_metric is set.
@@ -310,6 +313,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
@@ -347,6 +351,10 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    # Validation-only sampling; defaults follow the train values above.
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     # null = topology default (IPC colocated, NCCL non-colocated).
@@ -385,6 +393,7 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP

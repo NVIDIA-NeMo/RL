@@ -22,9 +22,18 @@ from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
+from PIL import Image
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    encode_images_in_examples,
+    get_dim_to_pack_along,
+    get_multimodal_keys_from_processor,
+    resolve_to_image,
+    uses_image_placeholder,
+)
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
@@ -33,6 +42,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -112,6 +122,10 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
+    tokenizer_config: NotRequired[
+        Optional[TokenizerConfig]
+    ]  # For processor reconstruction inside the actor
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -174,12 +188,190 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     return is_invalid_tool_call, has_malformed_thinking
 
 
+########################################
+# Multimodal helpers
+########################################
+
+
+# WARNING: A function-call output beginning with HTTP(S) is accepted here and
+# passed to ``resolve_to_image``, which performs an outbound request during
+# postprocessing even when the tool result is not actually an image.
+_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
+
+
+def _looks_like_image_src(src: str) -> bool:
+    """True when ``src`` plausibly points at an image the loader can open.
+
+    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
+    click tool) that are strings but not image URLs. Without this, the
+    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
+    which treats it as a filesystem path and raises ``FileNotFoundError``.
+    """
+    return src.startswith(_IMAGE_SRC_PREFIXES)
+
+
+def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
+    """Pull PIL images out of a non-assistant Responses-API item.
+
+    Handles both content-list items (user / tool messages carrying
+    ``input_image``/``image``/``image_url`` parts) and ``function_call_output``
+    items whose ``output`` field is an image data URL. Tool outputs that are
+    non-image strings (e.g. structured JSON returned by tools like
+    ``click(x, y)``) contribute zero images to the bucket.
+    """
+    images: list[Image.Image] = []
+    if item.get("type") == "function_call_output":
+        src = item.get("output")
+        if isinstance(src, str) and _looks_like_image_src(src):
+            images.append(resolve_to_image(src))
+        return images
+    content = item.get("content") or []
+    if not isinstance(content, list):
+        return images
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in ("input_image", "image", "image_url"):
+            continue
+        src = part.get("image") or part.get("image_url") or part.get("url")
+        if src is None:
+            continue
+        if isinstance(src, dict):
+            src = src.get("url")
+        if src is None:
+            continue
+        images.append(resolve_to_image(src))
+    return images
+
+
+def _index_per_turn_images(
+    output: list[dict],
+    input_messages: list[dict] | None = None,
+) -> list[list[Image.Image]]:
+    """Bin server-returned images by the trainable turn that saw them.
+
+    Walks the Responses-API items in order and flushes ``pending`` into a
+    per-turn bucket each time it hits an item carrying truthy
+    ``generation_token_ids`` — matching the exact gate that
+    ``_postprocess_nemo_gym_to_nemo_rl_result`` uses to decide which items
+    become trainable turns. Every other item (user turns, tool messages,
+    ``function_call_output``, non-trainable reasoning) contributes its images
+    to ``pending`` for the next trainable turn. This ensures the returned list
+    has one entry per trainable turn, aligned with the postprocess loop's
+    ``turn_idx`` even when the trainable item's role is not ``assistant``
+    (e.g. a reasoning-only response, or a ``function_call``).
+
+    ``input_messages`` is the initial ``responses_create_params.input`` list —
+    images there (e.g. a single-shot user prompt for tool-based envs like
+    circle-click) are consumed by the first trainable turn's tokenized prompt
+    and must land in the first bucket. Agents like ``gym_v_agent`` that keep
+    ``input`` empty and inject observations as ``function_call_output`` items
+    are unaffected — the seed is a no-op when ``input_messages`` is empty.
+    """
+    per_turn: list[list[Image.Image]] = []
+    pending: list[Image.Image] = []
+    for item in input_messages or ():
+        if isinstance(item, dict) and item.get("role") != "assistant":
+            pending.extend(_extract_input_images_from_message(item))
+    for item in output:
+        if item.get(
+            "generation_token_ids"
+        ):  # trainable turn; empty generation_token_ids is skipped by the postprocess loop and must not consume a bucket
+            per_turn.append(pending)
+            pending = []
+        elif item.get("role") != "assistant":
+            pending.extend(_extract_input_images_from_message(item))
+    return per_turn
+
+
+def _attach_multimodal_data_to_user_message(
+    user_message: dict,
+    *,
+    images: list[Image.Image],
+    processor: Any,
+) -> None:
+    """Attach per-turn multimodal tensors to ``user_message``.
+
+    The processor is only invoked to extract multimodal tensors (pixel_values,
+    imgs_sizes, num_patches, etc.); its text output is discarded — vLLM's
+    tokens remain the trajectory. We therefore feed it the minimal placeholder
+    text it needs to count image regions: one ``processor.image_token`` per
+    image. Passing the vLLM-decoded text does not work because that text
+    already contains expanded ``<img>...<image>*N...</img>`` regions, and the
+    processor would try to re-expand every embedded ``<image>``.
+    """
+    if not images or processor is None:
+        return
+    image_token = getattr(processor, "image_token", "<image>")
+    processed = processor(
+        text=image_token * len(images),
+        images=images,
+        return_tensors="pt",
+    )
+    uses_placeholder = uses_image_placeholder(processor)
+    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
+    # Historical checkpoints may emit dynamic image tiles without imgs_sizes.
+    # Mirror the media-metadata handling in vlm_hf_data_processor.
+    if (
+        uses_placeholder
+        and "pixel_values" in processed
+        and "imgs_sizes" not in processed
+        and processed["pixel_values"].ndim == 4
+    ):
+        pixel_values = processed["pixel_values"]
+        num_tiles, _, height, width = pixel_values.shape
+        processed["imgs_sizes"] = torch.tensor(
+            [[height, width]] * num_tiles, dtype=torch.long
+        )
+
+    # imgs_sizes / num_frames are not always declared in model_input_names by
+    # bundled image processors. RADIO uses temporal patching even for still
+    # images and requires one num_frames=1 entry per image/tile.
+    if "imgs_sizes" in processed and "imgs_sizes" not in multimodal_keys:
+        multimodal_keys.append("imgs_sizes")
+    if "imgs_sizes" in processed and "num_frames" not in processed:
+        processed["num_frames"] = torch.ones(
+            len(processed["imgs_sizes"]), dtype=torch.long
+        )
+    if "num_frames" in processed and "num_frames" not in multimodal_keys:
+        multimodal_keys.append("num_frames")
+    for key in multimodal_keys:
+        if key not in processed:
+            continue
+        value = processed[key]
+        if key == "imgs_sizes":
+            value = value.to(dtype=torch.int32)
+        user_message[key] = PackedTensor(
+            value,
+            dim_to_pack=get_dim_to_pack_along(processor, key),
+            pad_to_max_shape=uses_placeholder and key == "pixel_values",
+        )
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        # Reconstruct the processor inside the actor (rather than serializing it
+        # per rollout call) for full-trajectory multimodal postprocessing.
+        self._processor: Optional[Any] = None
+        tokenizer_config = cfg.get("tokenizer_config")
+        if tokenizer_config:
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self._processor = get_tokenizer(tokenizer_config, get_processor=True)
+            # _attach_multimodal_data_to_user_message assumes a placeholder-style
+            # processor (imgs_sizes / num_frames reconstruction + pad_to_max_shape
+            # PackedTensor build). A non-placeholder VLM would silently produce
+            # wrong multimodal tensors — fail at actor construction instead.
+            assert uses_image_placeholder(self._processor), (
+                "NemoGym multimodal path assumes a placeholder-style processor "
+                "(see _PLACEHOLDER_STYLE_PROCESSOR_NAMES in nemo_rl/data/multimodal_utils.py); "
+                f"got {type(self._processor).__name__}. Update "
+                "_attach_multimodal_data_to_user_message before enabling."
+            )
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -293,6 +485,11 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
+        # For multimodal runs, replace local filesystem image paths in the
+        # examples with base64 data URLs before shipping to vLLM. No-op when
+        # examples carry no `input_image` items (text-only case).
+        encode_images_in_examples(nemo_gym_examples)
+
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
@@ -350,11 +547,26 @@ Depending on your data shape, you may want to change these values."""
             yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
-        self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
+        self,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
+
+        processor = getattr(self, "_processor", None)
+        per_turn_images = (
+            _index_per_turn_images(
+                nemo_gym_result["response"]["output"],
+                input_messages=nemo_gym_result.get("responses_create_params", {}).get(
+                    "input"
+                ),
+            )
+            if processor is not None
+            else []
+        )
+        turn_idx = 0
 
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
@@ -378,6 +590,7 @@ Depending on your data shape, you may want to change these values."""
             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
 """
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
@@ -417,6 +630,13 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "with enable_return_routed_experts."
                 )
 
+            # The next prompt prefill supplies the real route for the previous
+            # turn's final token, whose decode route was padded.
+            if routed_experts is not None and seen_token_ids:
+                previous_routes = nemo_rl_message_log[-1].get("routed_experts")
+                if isinstance(previous_routes, torch.Tensor):
+                    previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
+
             prompt_start = len(seen_token_ids)
             prompt_end = len(prompt_token_ids)
             generation_start = prompt_end
@@ -430,6 +650,16 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
+
+            if processor is not None:
+                images_this_turn = (
+                    per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
+                )
+                _attach_multimodal_data_to_user_message(
+                    user_message,
+                    images=images_this_turn,
+                    processor=processor,
+                )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -464,6 +694,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             batch_decode_items.append(
                 (output_item_dict, prompt_token_ids, generation_token_ids)
             )
+            turn_idx += 1
 
         if batch_decode_items:
             prompt_strs = tokenizer.batch_decode(
@@ -609,10 +840,17 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
+    # For VLM runs, plumb the tokenizer config into the gym env config so the
+    # NemoGym actor can reconstruct the processor inside itself (needed for
+    # multi-turn multimodal postprocessing).
+    if config.policy.get("is_vlm"):
+        env_cfg = config.env.setdefault("nemo_gym", {})
+        env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
+
 
 def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
-    base_urls: list[Optional[str]],
+    base_urls: list[str],
     model_name: str,
     *,
     enable_router_replay: bool,
@@ -646,6 +884,7 @@ def spinup_nemo_gym_actor(
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+    tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -661,6 +900,7 @@ def spinup_nemo_gym_actor(
         base_urls=base_urls,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
+        tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,

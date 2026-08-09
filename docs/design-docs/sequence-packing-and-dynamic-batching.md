@@ -348,8 +348,16 @@ class SequencePackingArgs(TypedDict):
     input_key: str                     # Input tensor key
     input_lengths_key: str             # Sequence lengths key
     algorithm: str                     # Packing algorithm name
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: int  # CP/TP alignment factor
 ```
+
+`microbatch_order` controls only the execution order of bins already assigned to
+each data-parallel rank. `packer` (and an omitted value for backward compatibility)
+preserves the packer's order. `largest_first` executes each rank's bins by
+nonincreasing padded-token count, allowing smaller microbatches to reuse allocator
+segments established by the largest shape. It does not change bin contents, rank
+assignment, or total padded tokens.
 
 ## Integration with Training Pipeline
 
@@ -377,6 +385,7 @@ policy:
     train_mb_tokens: 2048  # Target tokens per microbatch
     logprob_mb_tokens: 2048
     algorithm: "modified_first_fit_decreasing"  # Best algorithm
+    microbatch_order: "packer"  # Or "largest_first" to reduce allocator shape churn
     sequence_length_round: 64  # Hardware alignment
   
   dynamic_batching:

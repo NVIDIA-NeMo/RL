@@ -8,11 +8,9 @@ GPUS_PER_NODE=8
 STEPS_PER_RUN=8
 MAX_STEPS=8
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-# ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus
-# ~63 min for 8 async steps left no headroom at 90 min, so the driver finished
-# but Slurm SIGKILLed teardown/metric-dump at the wall-clock limit (CI mislabels
-# the exit-137 as OOM). 120 min leaves margin for teardown + metrics.
-NUM_MINUTES=120
+# ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus ~130 min for 8 steps
+# 180 min leaves margin for teardown + metric-dump within the 4 h job allocation.
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -62,11 +60,9 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Smoke-level threshold; tighten after observing real runs.
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
-        'max(data["train/reward"]) > 0.0'
+uv run tests/check_metrics.py $JSON_METRICS \
+    'median(data["train/gen_kl_error"]) < 1.3' \
+    'max(data["train/reward"]) > 0.0'
 
-    # Clean up checkpoint directory after successful run to save space.
-    rm -rf "$CKPT_DIR"
-fi
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"

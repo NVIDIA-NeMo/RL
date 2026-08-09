@@ -17,7 +17,9 @@ from typing import (
     Any,
     Generic,
     Iterator,
+    Literal,
     Mapping,
+    NotRequired,
     Optional,
     Sequence,
     Type,
@@ -51,6 +53,8 @@ class SequencePackingArgs(TypedDict):
     input_key: str
     input_lengths_key: str
     algorithm: str
+    # Omit to preserve the packer's execution order.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
@@ -447,6 +451,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 data[k] = sorted_v
 
         elif sequence_packing_args is not None:
+            microbatch_order = sequence_packing_args.get("microbatch_order")
+            if microbatch_order not in {None, "packer", "largest_first"}:
+                raise ValueError(
+                    "sequence packing microbatch_order must be 'packer' or "
+                    f"'largest_first', got {microbatch_order!r}"
+                )
             bin_packer = get_packer(
                 algorithm=sequence_packing_args["algorithm"],
                 bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
@@ -467,6 +477,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
+            all_chunk_padded_seqlens = []
 
             # Process each chunk separately to respect chunk boundaries
             for chunk_idx in range(num_chunks):
@@ -484,6 +495,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     sequence_lengths=chunk_padded_seqlens_list,
                 )
                 all_chunk_bin_assignments.append(chunk_bin_assignments)
+                all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
             # create shards with the packed bins
             sharded_data: list[list[dict]] = [[] for _ in range(shards)]
@@ -499,33 +511,43 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     [] for _ in range(shards)
                 ]
 
-                num_bins = len(all_chunk_bin_assignments[chunk_idx])
                 chunk_start = chunk_idx * batch_size
-                for bin_idx in range(num_bins):
-                    shard_idx = bin_idx % shards
-                    bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
-                    global_bin_indices = [i + chunk_start for i in bin_indices]
-                    sharded_data[shard_idx].append(
-                        self.select_indices(global_bin_indices)
-                    )
-                    global_indices_per_shard[shard_idx].extend(global_bin_indices)
-                    bin_seqlen = sum(
-                        [
-                            _get_padded_seqlen(input_lens[i].item())
-                            for i in global_bin_indices
-                        ]
-                    )
+                chunk_padded_seqlens = all_chunk_padded_seqlens[chunk_idx]
+                for shard_idx in range(shards):
+                    # Keep the packer's round-robin bin-to-rank assignment.
+                    # Only execution order within each rank is configurable.
+                    shard_bin_assignments = all_chunk_bin_assignments[chunk_idx][
+                        shard_idx::shards
+                    ]
+                    if microbatch_order == "largest_first":
+                        # Establish the largest token-scaled allocations first so
+                        # smaller microbatches can reuse their cached segments.
+                        shard_bin_assignments = sorted(
+                            shard_bin_assignments,
+                            key=lambda bin_indices: sum(
+                                chunk_padded_seqlens[i] for i in bin_indices
+                            ),
+                            reverse=True,
+                        )
 
-                    if chunk_sharded_micro_indices[shard_idx] == []:
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [0, len(bin_indices)]
+                    for bin_indices in shard_bin_assignments:
+                        global_bin_indices = [i + chunk_start for i in bin_indices]
+                        sharded_data[shard_idx].append(
+                            self.select_indices(global_bin_indices)
                         )
-                    else:
-                        prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [prev_bin_end, prev_bin_end + len(bin_indices)]
-                        )
-                    chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
+                        global_indices_per_shard[shard_idx].extend(global_bin_indices)
+                        bin_seqlen = sum(chunk_padded_seqlens[i] for i in bin_indices)
+
+                        if chunk_sharded_micro_indices[shard_idx] == []:
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [0, len(bin_indices)]
+                            )
+                        else:
+                            prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [prev_bin_end, prev_bin_end + len(bin_indices)]
+                            )
+                        chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
 
                 for shard_idx in range(shards):
                     sharded_micro_indices[shard_idx].append(
