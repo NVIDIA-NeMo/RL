@@ -64,12 +64,15 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 # nightly is the largest consumer of the fleet by a wide margin even though a
 # single release run is far more expensive than a single nightly run.
 #
-# `runs_per_week` mirrors the nemo-ci pipeline schedules (dl/JoC/nemo-ci). Keep
-# these in sync if a schedule changes:
-#   "NeMo RL Nightly tests"               0 2 * * *  -> nightly, nightly_gb200
-#   "NeMo RL Nightly MBridge Bump tests"  0 2 * * *  -> nightly_mcore(_gb200)
-#   "NeMo RL Weekly Release Tests"        0 4 * * 6  -> release(_gb200)
-#   "NeMo RL Weekly Perf Tests"           0 4 * * 6  -> performance(_gb200)
+# `runs_per_week` mirrors the nemo-ci pipeline schedules. Keep these in sync if
+# a schedule changes:
+#   "NeMo RL Nightly tests"          0 2 * * *  -> nightly, nightly_gb200
+#   "NeMo RL Weekly Release Tests"   0 4 * * 6  -> release(_gb200)
+#   "NeMo RL Weekly Perf Tests"      0 4 * * 6  -> performance(_gb200)
+#
+# The nightly_mcore lanes are deliberately absent. They are subsets of the
+# nightly lanes, so bounding nightly bounds them transitively; giving them their
+# own ceiling would mean two numbers to retune every time a nightly test lands.
 #
 # Budgets are per SKU because H100 and GB200 capacity are separate pools and
 # cannot be traded against one another. Ceilings sit roughly 15% above current
@@ -84,8 +87,6 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 SUITE_BUDGETS = {
     ("nightly", "h100"): {"runs_per_week": 7, "max_gpu_hours_per_week": 26_500},
     ("nightly", "gb200"): {"runs_per_week": 7, "max_gpu_hours_per_week": 2_600},
-    ("nightly_mcore", "h100"): {"runs_per_week": 7, "max_gpu_hours_per_week": 3_800},
-    ("nightly_mcore", "gb200"): {"runs_per_week": 7, "max_gpu_hours_per_week": 400},
     ("release", "h100"): {"runs_per_week": 1, "max_gpu_hours_per_week": 7_400},
     ("release", "gb200"): {"runs_per_week": 1, "max_gpu_hours_per_week": 3_100},
     ("performance", "h100"): {"runs_per_week": 1, "max_gpu_hours_per_week": 13_800},
