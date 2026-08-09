@@ -305,6 +305,7 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
+guides/models/muse-glimmer.md
 guides/models/qwen/index.md
 guides/models/qwen/qwen3-5.md
 model-quirks.md

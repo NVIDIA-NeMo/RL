@@ -10,6 +10,9 @@ For the full list of supported models, see
 
 ## Families
 
+- **[Muse Glimmer](muse-glimmer.md)** — 29B DAPO recipes on the AutoModel backend,
+  with context-parallel variants at 4k, 8k and 16k and the memory budgeting that
+  makes them fit.
 - **[Qwen](qwen/index.md)** — Qwen3.5 LLM and VLM recipes (dense and MoE) on the
   Megatron and AutoModel backends, including thinking-mode generation-length
   guidance.
