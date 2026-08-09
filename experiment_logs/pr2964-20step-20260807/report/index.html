@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 23:20 PDT</span>
+        <span>Updated 2026-08-08 23:28 PDT</span>
         <span>Base a028b33b · Super fix validation 3d6d1324 · latest-Bridge candidate 541413bd</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore workload candidate c8cedc3d · latest-Bridge routing candidate 34b55f24</span>
@@ -270,7 +270,7 @@
       <article class="card">
         <div class="label">Overall status</div>
         <div class="value"><span class="pill pending">All three strict A/B pairs complete · official stack running</span></div>
-        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP pairs all completed 20/20 with exit <code>0:0</code>. The submitted official-Bridge Q30 also completed 20/20; Super is at Step 10 and Q235 is at Step 2 with zero classified runtime fatals. A frozen-environment newest-Bridge matrix has started.</p>
+        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP pairs all completed 20/20 with exit <code>0:0</code>. The submitted official-Bridge Q30 also completed 20/20; Super is at Step 10 and Q235 is at Step 2 with zero classified runtime fatals. A log-preserving newest-Bridge Q30 retry is running.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -291,7 +291,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 23:20 PDT. Final HybridEP jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. Official-Bridge Q30 507111 also completed 20/20. Official-Bridge Super 506895 has entered Step 10 and Q235 507112 has entered Step 2, both with zero classified runtime fatals. Latest-Bridge ordering test 507231 passed. First Q30 integration attempt 507239 lost a vLLM subprocess before Step 1; frozen-venv retry 507273 is running, and dependency-gated Q235/Super replacements 507274/507275 are submitted.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 23:28 PDT. Final HybridEP jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. Official-Bridge Q30 507111 also completed 20/20. Official-Bridge Super 506895 has entered Step 10 and Q235 507112 has entered Step 2, both with zero classified runtime fatals. Latest-Bridge ordering test 507231 passed. Q30 attempts 507239/507273 each lost a vLLM subprocess before Step 1 on different nodes; log-preserving retry 507294 is running, and dependency-gated Q235/Super replacements 507274/507275 are submitted.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -456,10 +456,10 @@
         </article>
         <article class="job">
           <div class="job-head">
-            <h3>507231 / 507239 / 507273 / 507274 / 507275 · Newest Bridge validation</h3>
-            <span class="pill pending">Ordering test passed · frozen retry running</span>
+            <h3>507231 / 507239 / 507273 / 507294 / 507274 / 507275 · Newest Bridge validation</h3>
+            <span class="pill pending">Ordering test passed · diagnostic retry running</span>
           </div>
-          <p>Bridge main <code>fcbabe78</code> finalizes eager HybridEP by enabling layer-wise uneven-input padding. NeMo candidate <code>541413bd</code> restores one-time-prepadding ownership after that finalization; focused job 507231 passed with exit <code>0:0</code>. First canonical Q30 attempt 507239 lost one vLLM native subprocess during engine/KV-cache initialization before Step 1, with no CUDA OOM, NCCL, illegal-access, or HybridEP evidence. Superseded pending jobs 507242/507243 were cancelled before allocation. Frozen actor-venv Q30 retry 507273 is running; Q235 507274 and Super 507275 are dependency-gated behind their official-stack validations. All use MCore <code>34b55f24</code>, DeepEP <code>17cfb817</code> plus the DMA-BUF fix, <code>UV_FROZEN=1</code>, and no runtime rebuild.</p>
+          <p>Bridge main <code>fcbabe78</code> finalizes eager HybridEP by enabling layer-wise uneven-input padding. NeMo candidate <code>541413bd</code> restores one-time-prepadding ownership after that finalization; focused job 507231 passed with exit <code>0:0</code>. Canonical Q30 attempts 507239 and 507273 each lost one vLLM native subprocess during engine/KV-cache initialization before Step 1 on different nodes, with no CUDA OOM, NCCL, illegal-access, or HybridEP evidence. Superseded pending jobs 507242/507243 were cancelled before allocation. Retry 507294 adds five-second Ray log preservation for native-worker diagnosis; Q235 507274 and Super 507275 are dependency-gated behind their official-stack validations. All use frozen actor venvs, MCore <code>34b55f24</code>, DeepEP <code>17cfb817</code> plus the DMA-BUF fix, <code>UV_FROZEN=1</code>, and no runtime rebuild.</p>
         </article>
         <article class="job">
           <div class="job-head">
