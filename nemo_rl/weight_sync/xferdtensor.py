@@ -95,6 +95,105 @@ def _use_python_api() -> bool:
     )
 
 
+def _require_real_op() -> bool:
+    """Whether ``NRL_XFERDTENSOR_REQUIRE_M2N`` makes a silent downgrade fatal."""
+    return os.environ.get("NRL_XFERDTENSOR_REQUIRE_M2N", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _format_downgrade_banner() -> str:
+    """Render the one-shot warning for an unrequested downgrade to Python."""
+    rule = "=" * 78
+    return "\n".join(
+        (
+            "",
+            rule,
+            "REFIT TRANSPORT DOWNGRADE - the configured transport is unavailable",
+            rule,
+            "  requested : policy.generation.refit_transport=nccl_reshard",
+            "  in use    : xferdtensor_python (Python exact-transfer reshard)",
+            "  reason    : 'nccl.m2n.reshard' is not importable here - the",
+            "              installed nccl4py ships no m2n submodule.",
+            "  impact    : the refit is functionally correct, but it does NOT",
+            "              use the NCCL M2N reshard kernel. This is a silent",
+            "              PERFORMANCE downgrade, and its cost grows with the",
+            "              number of generation ranks.",
+            "  fix       : use a container whose nccl4py provides nccl.m2n, or",
+            "              set policy.generation.refit_transport=null to use",
+            "              the collective broadcast transport.",
+            "  silence   : set NRL_XFERDTENSOR_PYTHON=1 to choose this path",
+            "              deliberately.",
+            "  fail fast : set NRL_XFERDTENSOR_REQUIRE_M2N=1 to raise instead",
+            "              of warning.",
+            rule,
+            "",
+        )
+    )
+
+
+def _check_reshard_path(
+    process_group,
+    *,
+    use_golden: bool,
+    use_python: bool,
+) -> None:
+    """Announce the selected reshard path, once per process.
+
+    ``policy.generation.refit_transport=nccl_reshard`` is only reachable when
+    it is set explicitly, so an absent ``nccl.m2n.reshard`` means the run is
+    not using the transport it asked for.  That downgrade additionally emits a
+    banner from a single rank: the per-rank path line is repeated once per
+    rank, which is how the downgrade went unnoticed until now.  Warning rather
+    than raising is deliberate -- the Python reshard is exact, so aborting a
+    run that would otherwise succeed is the worse failure mode.
+
+    Args:
+        process_group: Bulk-path process group; only its ``rank`` is read, to
+            keep the banner to one line per run rather than one per rank.
+        use_golden: Whether ``NRL_XFERDTENSOR_GOLDEN`` forces the golden path.
+        use_python: Whether ``NRL_XFERDTENSOR_PYTHON`` forces the Python path.
+
+    Raises:
+        RuntimeError: if the real op is missing and ``NRL_XFERDTENSOR_REQUIRE_M2N``
+            opted this run into failing fast.
+    """
+    global _XFERDTENSOR_PATH_LOGGED
+    # A forced path was asked for, so falling into it is not a downgrade.
+    downgraded = _reshard is None and not use_python and not use_golden
+    if downgraded and _require_real_op():
+        raise RuntimeError(
+            "policy.generation.refit_transport='nccl_reshard' was requested "
+            "and NRL_XFERDTENSOR_REQUIRE_M2N is set, but 'nccl.m2n.reshard' "
+            "is not importable: the installed nccl4py ships no m2n submodule. "
+            "Unset NRL_XFERDTENSOR_REQUIRE_M2N to fall back to "
+            "xferdtensor_python with a warning, or set "
+            "policy.generation.refit_transport=null."
+        )
+
+    if _XFERDTENSOR_PATH_LOGGED:
+        return
+    _XFERDTENSOR_PATH_LOGGED = True
+
+    if use_golden:
+        path = "golden (broadcast)"
+    elif use_python or _reshard is None:
+        path = "xferdtensor_python (exact-transfer)"
+    else:
+        path = "real nccl.m2n.reshard"
+    print(
+        f"[xferdtensor] reshard path: {path} "
+        f"(real_op_available={_reshard is not None}, "
+        f"force_golden={use_golden}, force_python={use_python})",
+        flush=True,
+    )
+    if downgraded and int(process_group.rank) == 0:
+        logging.warning(_format_downgrade_banner())
+
+
 def xferdtensor(
     src_tensor,
     src_mesh,
@@ -106,23 +205,9 @@ def xferdtensor(
     stream=None,
 ):
     """Public XferDTensor entry point used by all external callers."""
-    global _XFERDTENSOR_PATH_LOGGED
     use_golden = _use_golden_api()
     use_python = _use_python_api()
-    if not _XFERDTENSOR_PATH_LOGGED:
-        if use_golden:
-            path = "golden (broadcast)"
-        elif use_python or _reshard is None:
-            path = "xferdtensor_python (exact-transfer)"
-        else:
-            path = "real nccl.m2n.reshard"
-        print(
-            f"[xferdtensor] reshard path: {path} "
-            f"(real_op_available={_reshard is not None}, "
-            f"force_golden={use_golden}, force_python={use_python})",
-            flush=True,
-        )
-        _XFERDTENSOR_PATH_LOGGED = True
+    _check_reshard_path(process_group, use_golden=use_golden, use_python=use_python)
 
     if not use_golden and (use_python or _reshard is None):
         # Default when the real op is absent: Python exact-transfer reshard
