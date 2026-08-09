@@ -1,0 +1,170 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  batch_multiplier: 3
+  val_period: 5
+  # Measure the untrained policy before step 1. Without it the first datapoint
+  # is step 5 and there is no baseline to say whether training helped.
+  val_at_start: true
+  max_val_samples: 960
+  val_batch_size: 960
+  use_leave_one_out_baseline: false
+  use_dynamic_sampling: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 1536
+    max_response_length: 15360
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k
+  save_period: 5
+  # Asynchronous checkpointing. Stated explicitly rather than left to the worker
+  # default, because the value is load-bearing and easy to get wrong in both
+  # directions.
+  #
+  # It only became safe once the finalize_async_save wait was added. Without it,
+  # tmp_step_N is renamed to step_N while dcp.async_save is still writing from a
+  # separate process; that process addresses files by path, so it re-creates
+  # tmp_step_N and step_N is left with weights but no optimizer state.
+  #
+  # Worth having: this model stages roughly 423 GB per checkpoint (111 GB
+  # weights plus 312 GB optimizer), and a synchronous save blocks training for
+  # all of it.
+  #
+  # Setting the key is required, not decorative. DTensorPolicyWorkerV2 hardcodes
+  # is_async=True at worker init with no config path, so an unset key silently
+  # gives async regardless of the documented default of False. Being explicit
+  # means the intent survives if that worker default ever changes.
+  is_async: true
+policy:
+  # Point these at your local Muse Glimmer checkpoint directory. See
+  # docs/guides/models/muse-glimmer.md.
+  model_name: /path/to/muse-glimmer-29b
+  tokenizer:
+    name: /path/to/muse-glimmer-29b
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 16384 with context_parallel_size=8, i.e. 2048 tokens per rank. This is the
+  # recommended default.
+  #
+  # The head is unusually memory-hungry: vocab is 202048 and the final soft cap
+  # in Automodel's Onyx model.py runs
+  #     logits = soft_cap * tanh(logits.float() * multiplier / soft_cap)
+  # which materializes roughly four full-vocab fp32 tensors, about 4.67 GiB each
+  # at ~6.2k tokens. Without context parallelism the training backward OOMs at
+  # both 8192 and 16384: under FSDP2 the per-GPU peak is set by tokens in the
+  # largest microbatch, a single sequence cannot be split across ranks, and
+  # sharding only shrinks params and optimizer state.
+  #
+  # Context parallelism is the lever that does work, but it is not memory
+  # neutral: Transformer Engine's ring-attention backward keeps per-CP-step
+  # dq/dk/dv buffers, roughly cp_size copies. Budget about half the per-rank
+  # tokens you would use at cp=1 -- cp4 at 16384 (4096 tokens/rank, the load
+  # that fits without CP) OOMs in fused_attn_bwd. All three published recipes
+  # sit at 2048 tokens/rank for that reason.
+  #
+  # Context length is the single biggest quality lever for this model. At 4k
+  # more than half of all rollouts are truncated, so the policy spends its
+  # learning on dodging DAPO's overlong penalty rather than solving problems;
+  # train/truncation_rate at step 5 falls 0.553 / 0.231 / 0.076 across the 4k /
+  # 8k / 16k recipes. The throughput cost is real -- roughly 8 steps/hour here
+  # versus 25 at cp4/8k.
+  max_total_sequence_length: 16384
+  logprob_chunk_size: 4096
+  offload_optimizer_for_logprob: true
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    activation_checkpointing: true
+    # Splits a single sequence across ranks, which FSDP2 cannot do. Rejected for
+    # VLMs and for sequence packing, and forces attn_implementation=sdpa (which
+    # this recipe already sets).
+    context_parallel_size: 8
+    automodel_kwargs:
+      # Onyx's native Automodel implementation accepts backend.attn of te, sdpa
+      # or eager only. Mirrors Automodel's own
+      # examples/llm_finetune/onyx/onyx_29b_tulu3_te_tp2_cp32_packed_256k.yaml:
+      # attn_implementation stays sdpa so HF config validation passes, while the
+      # native language attention runs on Transformer Engine.
+      attn_implementation: sdpa
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+      # Automodel's Onyx recipes set this false; only Gemma4 turns it on.
+      use_liger_kernel: false
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  sequence_packing:
+    # Must stay off: context parallelism rejects packed sequences.
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  # Deliberately 1, not the ${mul:...context_parallel_size} form other CP recipes
+  # use. This is what the validated runs exercised, and it is safe here because
+  # sequence packing is off and dynamic batching is on.
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 15360
+    vllm_cfg:
+      # TP4 is validated for this checkpoint. Onyx has 2 KV heads, and vLLM's
+      # OnyxAttention allows tp_size % num_kv_heads == 0 (replicating KV heads),
+      # so TP4 is legal even though 4 does not divide 2.
+      tensor_parallel_size: 4
+      # 0.6: the KV cache needs more room at 16384, and CP has already cut the
+      # per-rank training footprint.
+      gpu_memory_utilization: 0.6
+    vllm_kwargs:
+      # The Muse Glimmer vLLM build is text-only; it warns and skips the vision
+      # tower.
+      language_model_only: true
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
