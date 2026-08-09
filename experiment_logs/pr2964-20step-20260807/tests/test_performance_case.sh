@@ -92,6 +92,7 @@ assert_contains "${submit_script}" "import megatron.core; print(megatron.core.__
 assert_contains "${submit_script}" 'mcore_source=%s\nmcore_commit=%s\n'
 assert_contains "${submit_script}" 'force_rebuild_venvs=${NRL_FORCE_REBUILD_VENVS_OVERRIDE:-false}'
 assert_contains "${submit_script}" 'export NRL_FORCE_REBUILD_VENVS="${force_rebuild_venvs}"'
+assert_contains "${submit_script}" 'export UV_FROZEN=1'
 assert_contains "${submit_script}" 'nrl_force_rebuild_venvs=%s\n'
 
 printf 'performance-case-tests-pass\n'

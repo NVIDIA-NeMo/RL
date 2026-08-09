@@ -85,6 +85,7 @@ export NEMO_RL_PY_EXECUTABLES_SYSTEM=0
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NRL_FORCE_REBUILD_VENVS="${force_rebuild_venvs}"
 export NRL_IGNORE_VERSION_MISMATCH=1
+export UV_FROZEN=1
 export PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${mcore_source}"
 if [[ "${dispatcher}" == "hybridep" ]]; then
   export NEMO_RL_HYBRIDEP_LOG_PACKING=1
