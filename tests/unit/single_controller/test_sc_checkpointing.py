@@ -434,6 +434,7 @@ def _make_actor_args(
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
+    data_plane_checkpoint_load_seconds: Optional[float] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -454,6 +455,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        data_plane_checkpoint_load_seconds=data_plane_checkpoint_load_seconds,
     )
 
 
@@ -688,6 +690,48 @@ class TestSaveTrigger:
 
 
 class TestDataPlaneCheckpoint:
+    def test_logs_native_tq_load_duration(self, tmp_path):
+        logger = MagicMock()
+        mc = _actor_master_config(tmp_path)
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.Logger",
+            return_value=logger,
+        ):
+            _ACTOR_CLS(
+                mc,
+                _make_actor_args(data_plane_checkpoint_load_seconds=1.25),
+            )
+
+        logger.log_metrics.assert_called_once_with(
+            {"tq_load_seconds": 1.25},
+            step=0,
+            prefix="timing/checkpoint",
+        )
+
+    def test_logs_native_tq_save_duration(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            data_plane_checkpoint=True,
+        )
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(dp_client=_FakeDPClient()),
+        )
+        actor._logger = MagicMock()
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.monotonic",
+            side_effect=[10.0, 12.5],
+        ):
+            asyncio.run(actor._save_data_plane_checkpoint(str(tmp_path / "tmp")))
+
+        actor._logger.log_metrics.assert_called_once_with(
+            {"tq_save_seconds": pytest.approx(2.5)},
+            step=0,
+            prefix="timing/checkpoint",
+        )
+
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path
     ):

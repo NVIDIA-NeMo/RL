@@ -25,6 +25,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any, Optional, cast
 
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -100,6 +101,15 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None
+    data_plane_checkpoint_load_seconds: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class NativeDataPlaneCheckpointRestore:
+    """Validated native data-plane restore result and its TQ I/O duration."""
+
+    metadata: dict[str, Any]
+    load_seconds: float
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -109,7 +119,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
-) -> Optional[dict[str, Any]]:
+) -> Optional[NativeDataPlaneCheckpointRestore]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
     The metadata-only replay sidecar is the format marker. Checkpoints without
@@ -141,7 +151,18 @@ def _maybe_restore_native_data_plane_checkpoint(
         )
 
     print(f"📦 Restoring native TQ checkpoint: {data_plane_path}", flush=True)
-    metadata = policy.load_data_plane_checkpoint(data_plane_path)
+    started = monotonic()
+    try:
+        metadata = policy.load_data_plane_checkpoint(data_plane_path)
+    except Exception as error:
+        print(
+            "native TQ checkpoint load failed: "
+            f"{data_plane_path} ({monotonic() - started:.2f}s; "
+            f"{type(error).__name__}: {error})",
+            flush=True,
+        )
+        raise
+    load_seconds = monotonic() - started
     if not isinstance(metadata, dict):
         raise TypeError(
             "Native TQ checkpoint load must return a metadata dictionary, "
@@ -184,10 +205,13 @@ def _maybe_restore_native_data_plane_checkpoint(
         )
     print(
         "📦 Native TQ checkpoint restored and validated: "
-        f"groups={group_count}",
+        f"groups={group_count}, tq_load_seconds={load_seconds:.2f}",
         flush=True,
     )
-    return metadata
+    return NativeDataPlaneCheckpointRestore(
+        metadata=metadata,
+        load_seconds=load_seconds,
+    )
 
 
 def _build_clusters(
@@ -540,12 +564,17 @@ def setup_single_controller(
 
     # Native TQ restore must run through the bootstrap client before the SC
     # client is created and before any rollout/train data-plane operation.
-    data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
+    data_plane_checkpoint_restore = _maybe_restore_native_data_plane_checkpoint(
         policy,
         last_checkpoint_path=last_checkpoint_path,
         save_state=save_state,
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
+    )
+    data_plane_checkpoint_metadata = (
+        data_plane_checkpoint_restore.metadata
+        if data_plane_checkpoint_restore is not None
+        else None
     )
 
     # ==========================
@@ -630,4 +659,9 @@ def setup_single_controller(
         save_state=save_state,
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        data_plane_checkpoint_load_seconds=(
+            data_plane_checkpoint_restore.load_seconds
+            if data_plane_checkpoint_restore is not None
+            else None
+        ),
     )

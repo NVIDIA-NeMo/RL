@@ -40,6 +40,7 @@ import sys
 import time
 import warnings
 from functools import partial
+from time import monotonic
 from typing import Any, Optional, Union
 
 import ray
@@ -158,6 +159,15 @@ class SingleControllerActor:
         self._data_plane_checkpoint_metadata: Optional[dict[str, Any]] = (
             actor_args.data_plane_checkpoint_metadata
         )
+        self._data_plane_checkpoint_load_seconds = (
+            actor_args.data_plane_checkpoint_load_seconds
+        )
+        if self._data_plane_checkpoint_load_seconds is not None:
+            self._logger.log_metrics(
+                {"tq_load_seconds": self._data_plane_checkpoint_load_seconds},
+                step=actor_args.save_state["current_step"],
+                prefix="timing/checkpoint",
+            )
         self._consumed_samples: int = actor_args.save_state["consumed_samples"]
         self._total_valid_tokens: int = actor_args.save_state.get(
             "total_valid_tokens", 0
@@ -474,7 +484,7 @@ class SingleControllerActor:
                     "replay_group_count": len(replay_metadata["groups"]),
                 }
             )
-        started = time.monotonic()
+        started = monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
             await call_data_plane(
@@ -491,10 +501,16 @@ class SingleControllerActor:
                 flush=True,
             )
             raise
+        save_seconds = monotonic() - started
         print(
             "data-plane checkpoint save completed: "
-            f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
+            f"{checkpoint_dir} ({save_seconds:.2f}s)",
             flush=True,
+        )
+        self._logger.log_metrics(
+            {"tq_save_seconds": save_seconds},
+            step=self._train_steps,
+            prefix="timing/checkpoint",
         )
 
     # ── the three pumps + the inline advantage stage ───────────────────────

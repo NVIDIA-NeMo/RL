@@ -550,6 +550,7 @@ class TestNativeTQRecoverySetup:
 
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+        assert actor_args.data_plane_checkpoint_load_seconds is not None
 
     def test_loads_authoritative_tq_checkpoint_when_metadata_sidecar_exists(
         self, tmp_path
@@ -565,15 +566,18 @@ class TestNativeTQRecoverySetup:
             "current_epoch": 1,
         }
 
-        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
-            last_checkpoint_path=str(checkpoint_path),
-            save_state=save_state,
-            partition_id="rollout_data",
-            sampler_name="in_order",
-        )
+        with patch.object(sc_setup_mod, "monotonic", side_effect=[10.0, 12.5]):
+            restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                policy,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=save_state,
+                partition_id="rollout_data",
+                sampler_name="in_order",
+            )
 
-        assert restored == metadata
+        assert restored is not None
+        assert restored.metadata == metadata
+        assert restored.load_seconds == pytest.approx(2.5)
         policy.load_data_plane_checkpoint.assert_called_once_with(
             checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
         )
@@ -598,7 +602,8 @@ class TestNativeTQRecoverySetup:
             sampler_name="in_order",
         )
 
-        assert restored == metadata
+        assert restored is not None
+        assert restored.metadata == metadata
 
     def test_legacy_replay_checkpoint_is_rejected(self, tmp_path):
         checkpoint_path = tmp_path / "step_3"
