@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ################################################################################
-# List the test scripts belonging to a suite, by reading the SUITE / GATES / SKU
+# List the test scripts belonging to a suite, by reading the SUITE / TAGS / SKU
 # declarations in each driver's CONFIG block.
 #
 # Output is one script path per line, sorted, and nothing else -- a drop-in
@@ -21,7 +21,7 @@
 #
 #   tools/list-suites nightly
 #   tools/list-suites nightly_gb200
-#   tools/list-suites nightly_mcore          # SUITE=nightly and GATES contains mcore
+#   tools/list-suites nightly_mcore          # SUITE=nightly and TAGS contains mcore
 #   tools/list-suites --gpu-hours release    # per-test and total GPU hours
 #   tools/list-suites --suites               # every suite name this understands
 #
@@ -70,9 +70,10 @@ if ! printf '%s\n' "${KNOWN_SUITES[@]}" | grep -qx -- "$REQUESTED"; then
     exit 2
 fi
 
-# Decompose the requested name into the axes a driver declares. `disabled` has
-# no _gb200 counterpart, so it must not be filtered by SKU or its GB200 entries
-# would silently disappear.
+# Decompose the requested name into the axes a driver declares: a cadence, a
+# hardware SKU, and optionally a tag naming a slice of that cadence. `disabled`
+# has no _gb200 counterpart, so it must not be filtered by SKU or its GB200
+# entries would silently disappear.
 NAME="$REQUESTED"
 WANT_SKU=""
 if [[ "$NAME" == *_gb200 ]]; then
@@ -81,15 +82,15 @@ if [[ "$NAME" == *_gb200 ]]; then
 elif [[ "$NAME" != disabled ]]; then
     WANT_SKU=h100
 fi
-WANT_GATE=""
+WANT_TAG=""
 if [[ "$NAME" == nightly_mcore ]]; then
-    WANT_GATE=mcore
+    WANT_TAG=mcore
     NAME=nightly
 fi
 WANT_SUITE="$NAME"
 
 # Read one variable out of a driver's CONFIG block. Done in awk rather than a
-# sed|grep pipeline so that a key which is simply absent (GATES on most drivers)
+# sed|grep pipeline so that a key which is simply absent (TAGS on most drivers)
 # is an empty result rather than a pipeline failure under `set -o pipefail`.
 cfg_value() {
     awk -v key="$2" '
@@ -117,9 +118,9 @@ while IFS= read -r script; do
         [[ "${sku:-h100}" == "$WANT_SKU" ]] || continue
     fi
 
-    if [[ -n "$WANT_GATE" ]]; then
-        gates=" $(cfg_value "$script" GATES) "
-        [[ "$gates" == *" $WANT_GATE "* ]] || continue
+    if [[ -n "$WANT_TAG" ]]; then
+        tags=" $(cfg_value "$script" TAGS) "
+        [[ "$tags" == *" $WANT_TAG "* ]] || continue
     fi
 
     rel="${script#"$PROJECT_ROOT"/}"
