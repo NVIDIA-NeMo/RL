@@ -101,4 +101,9 @@ assert_not_contains "${focused_test_script}" 'tests/unit/models/megatron/test_me
 assert_contains "${focused_test_script}" 'HYBRIDEP_ENABLE_COVERAGE'
 assert_contains "${focused_test_script}" 'coverage.json'
 
+report_html=$(<"${experiment_dir}/report/index.html")
+assert_contains "${report_html}" 'assets/step-time-improvement.png'
+assert_contains "${report_html}" 'assets/throughput-improvement.png'
+assert_contains "${report_html}" 'Positive bars mean HybridEP improved the metric'
+
 printf 'performance-case-tests-pass\n'
