@@ -41,8 +41,7 @@ def test_ci_image_runtime_dependencies_are_readable_by_non_root_users():
     )
     assert (
         "curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | "
-        "XDG_BIN_HOME=/usr/local/bin sh"
-        in dockerfile
+        "XDG_BIN_HOME=/usr/local/bin sh" in dockerfile
     )
     assert "ENV UV_CACHE_DIR=/opt/uv/cache" in dockerfile
     assert "ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python" in dockerfile
