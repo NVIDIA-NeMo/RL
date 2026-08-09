@@ -41,9 +41,11 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
+from dataclasses import dataclass
 from typing import (
     Annotated,
     Callable,
+    Iterable,
     Literal,
     Optional,
     Protocol,
@@ -58,6 +60,68 @@ from nemo_rl.data_plane import KVBatchMeta
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
+
+
+@dataclass(frozen=True)
+class GroupLengthStats:
+    """Sequence-length totals over a set of prompt groups.
+
+    ``groups`` counts every group looked at; ``measured_groups`` counts only
+    those carrying usable ``KVBatchMeta.sequence_lengths``. The two differ when
+    a slot is unready or its metadata is malformed, so a reader can tell a
+    genuine zero from an unmeasured pass.
+    """
+
+    groups: int
+    measured_groups: int
+    samples: int
+    tokens: int
+
+    @property
+    def mean_tokens_per_group(self) -> float:
+        """Mean tokens per measured group; ``0.0`` when nothing was measured."""
+        if self.measured_groups == 0:
+            return 0.0
+        return self.tokens / self.measured_groups
+
+
+def summarize_group_lengths(
+    metas: Iterable[Optional[KVBatchMeta]],
+) -> GroupLengthStats:
+    """Total the sequence lengths carried by ``metas``.
+
+    Instrumentation helper: a group whose metadata is absent (an unready slot
+    holds ``None``) or unparseable is counted in ``groups`` but skipped for the
+    token totals rather than raising, because the callers run inside the train
+    pump where an exception would end the run.
+
+    Args:
+        metas: Per-group metadata, possibly containing ``None`` entries.
+
+    Returns:
+        Totals over the groups that had usable ``sequence_lengths``.
+    """
+    groups = 0
+    measured_groups = 0
+    samples = 0
+    tokens = 0
+    for meta in metas:
+        groups += 1
+        if meta is None or not meta.sequence_lengths:
+            continue
+        try:
+            group_tokens = sum(int(length) for length in meta.sequence_lengths)
+        except (TypeError, ValueError):
+            continue
+        measured_groups += 1
+        samples += len(meta.sequence_lengths)
+        tokens += group_tokens
+    return GroupLengthStats(
+        groups=groups,
+        measured_groups=measured_groups,
+        samples=samples,
+        tokens=tokens,
+    )
 
 
 @runtime_checkable
@@ -118,6 +182,11 @@ class BaseSampler(abc.ABC):
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
+        # Run-cumulative selection-side totals. Kept so an eviction line can
+        # state, within one run, whether the groups being dropped are longer
+        # than the ones actually trained on.
+        self._selected_groups: int = 0
+        self._selected_tokens: int = 0
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -149,14 +218,21 @@ class BaseSampler(abc.ABC):
             for i, weight in enumerate(self._buffer.start_weight_list)
             if weight < min_valid_version and self._buffer.ready_list[i]
         ]
-        if not stale_idxs:
-            return 0
-        return await self._buffer.remove(stale_idxs, remove_in_dp=True)
+        return await self._evict_idxs(
+            stale_idxs, current_train_weight=current_train_weight
+        )
 
     # ── derived facts ────────────────────────────────────────────────────
     @property
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
+
+    @property
+    def selected_mean_tokens_per_group(self) -> float:
+        """Mean tokens per selected group so far; ``0.0`` before any selection."""
+        if self._selected_groups == 0:
+            return 0.0
+        return self._selected_tokens / self._selected_groups
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
@@ -165,6 +241,57 @@ class BaseSampler(abc.ABC):
     def _eviction_window(self) -> int:
         """Weight-version span kept selectable; drives the default ``evict``."""
         return 0
+
+    async def _evict_idxs(
+        self, stale_idxs: list[int], *, current_train_weight: int
+    ) -> int:
+        """Report then drop ``stale_idxs``; shared by every policy's ``evict``.
+
+        Args:
+            stale_idxs: Buffer indices to drop, from a key the policy's
+                ``select`` agrees with.
+            current_train_weight: Trainer version driving this evict pass.
+
+        Returns:
+            Number of groups removed from the buffer.
+        """
+        if not stale_idxs:
+            return 0
+        self._report_eviction(stale_idxs, current_train_weight=current_train_weight)
+        return await self._buffer.remove(stale_idxs, remove_in_dp=True)
+
+    def _report_eviction(
+        self, stale_idxs: list[int], *, current_train_weight: int
+    ) -> None:
+        """Print evicted-vs-selected sequence lengths for one evict pass.
+
+        Answers, from the log alone, whether the groups a policy discards are
+        the long ones: a windowed policy keys ``select`` on the *dispatch*-time
+        weight, so a slow rollout can commit too late to ever be selected and
+        is dropped here instead. Runs before ``remove`` while ``meta_list`` is
+        still populated, and is synchronous so no ``commit`` can interleave.
+        """
+        stats = summarize_group_lengths(self._buffer.meta_list[i] for i in stale_idxs)
+        evicted_mean = stats.mean_tokens_per_group
+        selected_mean = self.selected_mean_tokens_per_group
+        ratio = (
+            f"{evicted_mean / selected_mean:.2f}x"
+            if evicted_mean > 0 and selected_mean > 0
+            else "n/a"
+        )
+        print(
+            f"♻️  eviction lengths (train_weight={current_train_weight}): "
+            f"evicted_groups={stats.groups} "
+            f"measured_groups={stats.measured_groups} "
+            f"evicted_samples={stats.samples} "
+            f"evicted_tokens={stats.tokens} "
+            f"evicted_mean_tokens_per_group={evicted_mean:.1f} "
+            f"selected_groups={self._selected_groups} "
+            f"selected_tokens={self._selected_tokens} "
+            f"selected_mean_tokens_per_group={selected_mean:.1f} "
+            f"evicted_over_selected={ratio}",
+            flush=True,
+        )
 
     @staticmethod
     def _validate_group_bounds(min_prompt_groups: int, max_prompt_groups: int) -> None:
@@ -193,6 +320,11 @@ class BaseSampler(abc.ABC):
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
+        # Same statistic the eviction line reports, over the same field, so the
+        # two are comparable within a run rather than across runs.
+        selected_stats = summarize_group_lengths(selected_metas)
+        self._selected_groups += selected_stats.measured_groups
+        self._selected_tokens += selected_stats.tokens
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
         return (
             selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
@@ -393,9 +525,9 @@ class InOrderSampler(_GatedSampler):
             and target < current_train_weight
             and self._buffer.ready_list[i]
         ]
-        if not stale_idxs:
-            return 0
-        return await self._buffer.remove(stale_idxs, remove_in_dp=True)
+        return await self._evict_idxs(
+            stale_idxs, current_train_weight=current_train_weight
+        )
 
 
 # ── config + factory ────────────────────────────────────────────────────────
