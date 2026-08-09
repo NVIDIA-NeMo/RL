@@ -30,6 +30,7 @@ validation_head=${VALIDATION_HEAD_OVERRIDE:-a028b33bcde0ef8aeb9fcc626a2e0c57fb56
 mcore_source=${MCORE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}
 mcore_commit=${MCORE_EXPECTED_COMMIT_OVERRIDE:-$(git -C "${mcore_source}" rev-parse HEAD)}
 hybridep_dependency_ancestor=${HYBRIDEP_DEPENDENCY_ANCESTOR_OVERRIDE:-a9aaa395c37963a9fd8a7320d61a516c7b714e57}
+force_rebuild_venvs=${NRL_FORCE_REBUILD_VENVS_OVERRIDE:-false}
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"NeMo-RL performance recipe model initialization and colocated vLLM startup"}}'
 
 render_case "${model}" "${dispatcher}" "${run_root}"
@@ -82,7 +83,7 @@ export WANDB_MODE=offline
 export NCCL_NVLS_ENABLE=0
 export NEMO_RL_PY_EXECUTABLES_SYSTEM=0
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
-export NRL_FORCE_REBUILD_VENVS=false
+export NRL_FORCE_REBUILD_VENVS="${force_rebuild_venvs}"
 export NRL_IGNORE_VERSION_MISMATCH=1
 export PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${mcore_source}"
 if [[ "${dispatcher}" == "hybridep" ]]; then
@@ -121,13 +122,13 @@ printf '%s\n' "${job_output}"
 
 if [[ "${mode}" == submit ]]; then
   printf -v rendered_command '%q ' "${driver_args[@]}"
-  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\nhybridep_dependency_ancestor=%s\nmcore_source=%s\nmcore_commit=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\njob_reaper_comment=%s\ncommand=%s\n' \
+  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\nhybridep_dependency_ancestor=%s\nmcore_source=%s\nmcore_commit=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\nnrl_force_rebuild_venvs=%s\njob_reaper_comment=%s\ncommand=%s\n' \
     "${job_output}" "${run_name}" "${model}" "${dispatcher}" "${driver_args[3]}" \
     "${num_nodes}" "$(git rev-parse HEAD)" \
     60a10b4f54c2754d44150771a06260fe9e8b186f \
     "${hybridep_dependency_ancestor}" \
     "${mcore_source}" "${mcore_commit}" \
     17cfb817bccec3a9c247013360cc550c2bac441e "${wheel}" "${wheel_sha256}" \
-    "${container}" "${job_dependency}" "${slurm_exclude}" "${job_reaper_comment}" "${rendered_command}" \
+    "${container}" "${job_dependency}" "${slurm_exclude}" "${force_rebuild_venvs}" "${job_reaper_comment}" "${rendered_command}" \
     > "${run_root}/submission.env"
 fi

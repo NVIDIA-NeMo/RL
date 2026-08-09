@@ -90,5 +90,8 @@ assert_contains "${submit_script}" 'git -C "${repo}" merge-base --is-ancestor "$
 assert_contains "${submit_script}" 'PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${mcore_source}"'
 assert_contains "${submit_script}" "import megatron.core; print(megatron.core.__file__)"
 assert_contains "${submit_script}" 'mcore_source=%s\nmcore_commit=%s\n'
+assert_contains "${submit_script}" 'force_rebuild_venvs=${NRL_FORCE_REBUILD_VENVS_OVERRIDE:-false}'
+assert_contains "${submit_script}" 'export NRL_FORCE_REBUILD_VENVS="${force_rebuild_venvs}"'
+assert_contains "${submit_script}" 'nrl_force_rebuild_venvs=%s\n'
 
 printf 'performance-case-tests-pass\n'
