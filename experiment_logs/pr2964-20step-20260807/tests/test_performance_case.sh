@@ -84,7 +84,9 @@ assert_contains "${submit_script}" 'validation_head=${VALIDATION_HEAD_OVERRIDE:-
 assert_contains "${submit_script}" 'test "$(git -C "${repo}" rev-parse HEAD)" = "${validation_head}"'
 assert_contains "${submit_script}" 'mcore_source=${MCORE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}'
 assert_contains "${submit_script}" 'mcore_commit=${MCORE_EXPECTED_COMMIT_OVERRIDE:-$(git -C "${mcore_source}" rev-parse HEAD)}'
+assert_contains "${submit_script}" 'hybridep_dependency_ancestor=${HYBRIDEP_DEPENDENCY_ANCESTOR_OVERRIDE:-a9aaa395c37963a9fd8a7320d61a516c7b714e57}'
 assert_contains "${submit_script}" 'test "$(git -C "${mcore_source}" rev-parse HEAD)" = "${mcore_commit}"'
+assert_contains "${submit_script}" 'git -C "${repo}" merge-base --is-ancestor "${hybridep_dependency_ancestor}" HEAD'
 assert_contains "${submit_script}" 'PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${mcore_source}"'
 assert_contains "${submit_script}" 'mcore_source=%s\nmcore_commit=%s\n'
 

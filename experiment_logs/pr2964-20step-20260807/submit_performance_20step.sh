@@ -29,6 +29,7 @@ slurm_exclude=${SLURM_EXCLUDE:-}
 validation_head=${VALIDATION_HEAD_OVERRIDE:-a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f}
 mcore_source=${MCORE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}
 mcore_commit=${MCORE_EXPECTED_COMMIT_OVERRIDE:-$(git -C "${mcore_source}" rev-parse HEAD)}
+hybridep_dependency_ancestor=${HYBRIDEP_DEPENDENCY_ANCESTOR_OVERRIDE:-a9aaa395c37963a9fd8a7320d61a516c7b714e57}
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"NeMo-RL performance recipe model initialization and colocated vLLM startup"}}'
 
 render_case "${model}" "${dispatcher}" "${run_root}"
@@ -42,7 +43,7 @@ esac
 test "$(git -C "${repo}" rev-parse HEAD)" = "${validation_head}"
 test "$(git -C "${mcore_source}" rev-parse HEAD)" = "${mcore_commit}"
 git -C "${repo}" merge-base --is-ancestor 60a10b4f54c2754d44150771a06260fe9e8b186f HEAD
-git -C "${repo}" merge-base --is-ancestor a9aaa395c37963a9fd8a7320d61a516c7b714e57 HEAD
+git -C "${repo}" merge-base --is-ancestor "${hybridep_dependency_ancestor}" HEAD
 test -z "$(git -C "${repo}" status --porcelain --untracked-files=no --ignore-submodules=untracked)"
 if git -C "${repo}" submodule status --recursive | grep -qE '^[+-U]'; then
   printf 'Submodules do not match the pinned gitlinks.\n' >&2
@@ -120,11 +121,11 @@ printf '%s\n' "${job_output}"
 
 if [[ "${mode}" == submit ]]; then
   printf -v rendered_command '%q ' "${driver_args[@]}"
-  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\npr3436_head=%s\nmcore_source=%s\nmcore_commit=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\njob_reaper_comment=%s\ncommand=%s\n' \
+  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\nhybridep_dependency_ancestor=%s\nmcore_source=%s\nmcore_commit=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\njob_reaper_comment=%s\ncommand=%s\n' \
     "${job_output}" "${run_name}" "${model}" "${dispatcher}" "${driver_args[3]}" \
     "${num_nodes}" "$(git rev-parse HEAD)" \
     60a10b4f54c2754d44150771a06260fe9e8b186f \
-    a9aaa395c37963a9fd8a7320d61a516c7b714e57 \
+    "${hybridep_dependency_ancestor}" \
     "${mcore_source}" "${mcore_commit}" \
     17cfb817bccec3a9c247013360cc550c2bac441e "${wheel}" "${wheel_sha256}" \
     "${container}" "${job_dependency}" "${slurm_exclude}" "${job_reaper_comment}" "${rendered_command}" \
