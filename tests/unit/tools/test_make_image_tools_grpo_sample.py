@@ -31,3 +31,15 @@ def test_build_sample_creates_runnable_rows(tmp_path: Path) -> None:
 
     with Path(result["validation"]).open() as source:
         assert sum(1 for _ in source) == 1
+
+
+def test_default_sample_prompt_advertises_requested_tool(tmp_path: Path) -> None:
+    result = build_sample(tmp_path / "sample")
+
+    with Path(result["train"]).open() as source:
+        row = json.loads(next(source))
+    system_prompt = row["responses_create_params"]["input"][0]["content"]
+    user_prompt = row["responses_create_params"]["input"][1]["content"][0]["text"]
+
+    assert "<name>count_objects_tool</name>" in system_prompt
+    assert "count_objects_tool" in user_prompt
