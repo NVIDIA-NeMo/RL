@@ -66,7 +66,7 @@ mkdir -p "\${overlay}"
 unset UV_CONFIG_FILE
 UV_NO_CONFIG=1 uv pip install --python /opt/nemo_rl_venv/bin/python --target "\${overlay}" --reinstall --no-deps --no-index "\${wheel}"
 PYTHONPATH="\${overlay}" /opt/nemo_rl_venv/bin/python -c 'import deep_ep, deep_ep_cpp, hybrid_ep_cpp; print(deep_ep.__file__); print(deep_ep_cpp.__file__); print(hybrid_ep_cpp.__file__)'
-PYTHONPATH=${mcore_source} /opt/nemo_rl_venv/bin/python -c 'import megatron; print(megatron.__file__)'
+PYTHONPATH=${mcore_source} /opt/nemo_rl_venv/bin/python -c 'import megatron.core; print(megatron.core.__file__)'
 EOF
 
 export COMMAND SETUP_COMMAND

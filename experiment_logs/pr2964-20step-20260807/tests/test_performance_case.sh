@@ -88,6 +88,7 @@ assert_contains "${submit_script}" 'hybridep_dependency_ancestor=${HYBRIDEP_DEPE
 assert_contains "${submit_script}" 'test "$(git -C "${mcore_source}" rev-parse HEAD)" = "${mcore_commit}"'
 assert_contains "${submit_script}" 'git -C "${repo}" merge-base --is-ancestor "${hybridep_dependency_ancestor}" HEAD'
 assert_contains "${submit_script}" 'PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${mcore_source}"'
+assert_contains "${submit_script}" "import megatron.core; print(megatron.core.__file__)"
 assert_contains "${submit_script}" 'mcore_source=%s\nmcore_commit=%s\n'
 
 printf 'performance-case-tests-pass\n'
