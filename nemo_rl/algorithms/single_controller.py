@@ -47,6 +47,7 @@ import warnings
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from time import monotonic
 from typing import Any, Optional, Union
 
 import ray
@@ -195,6 +196,9 @@ class SingleControllerActor:
         self._data_plane_checkpoint_metadata: Optional[dict[str, Any]] = (
             actor_args.data_plane_checkpoint_metadata
         )
+        self._rollout_checkpoint_load_seconds = (
+            actor_args.rollout_checkpoint_load_seconds
+        )
         self._consumed_samples: int = actor_args.save_state["consumed_samples"]
         self._total_valid_tokens: int = actor_args.save_state.get(
             "total_valid_tokens", 0
@@ -311,7 +315,24 @@ class SingleControllerActor:
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
+        replay_restore_started = monotonic()
         restored_replay_groups = await self._maybe_restore_replay_buffer()
+        if self._rollout_checkpoint_load_seconds is not None:
+            total_load_seconds = (
+                self._rollout_checkpoint_load_seconds
+                + monotonic()
+                - replay_restore_started
+            )
+            self._logger.log_metrics(
+                {"total_load_seconds": total_load_seconds},
+                step=self._train_steps,
+                prefix="timing/rollout_checkpoint",
+            )
+            print(
+                "rollout checkpoint load completed: "
+                f"{total_load_seconds:.2f}s",
+                flush=True,
+            )
         await self._maybe_restore_rollout_recovery(
             restored_replay_groups=restored_replay_groups
         )
@@ -910,6 +931,7 @@ class SingleControllerActor:
             ):
                 return False
 
+            save_started = monotonic()
             await asyncio.to_thread(self._checkpointer.finalize_pending)
             if self._train_steps == 0:
                 if self._trainer_version != 0:
@@ -1012,12 +1034,19 @@ class SingleControllerActor:
 
             self._last_rollout_snapshot_mutation_version = cut.mutation_version
             self._last_missing_rollout_snapshot_anchor = None
+            total_save_seconds = monotonic() - save_started
+            self._logger.log_metrics(
+                {"total_save_seconds": total_save_seconds},
+                step=expected_train_step,
+                prefix="timing/rollout_checkpoint",
+            )
             print(
                 "rollout checkpoint save completed: "
                 f"{final_path} "
                 f"(step={expected_train_step}, "
                 f"trainer_version={expected_trainer_version}, "
-                f"ledger_groups={cut.rollout_recovery_group_count or 0})",
+                f"ledger_groups={cut.rollout_recovery_group_count or 0}, "
+                f"total_save_seconds={total_save_seconds:.2f})",
                 flush=True,
             )
             return True

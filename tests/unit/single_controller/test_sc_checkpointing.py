@@ -517,6 +517,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
     rollout_manager: Optional[_FakeRolloutManager] = None,
     bootstrap_fingerprint: Optional[str] = None,
+    rollout_checkpoint_load_seconds: Optional[float] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -540,6 +541,7 @@ def _make_actor_args(
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_fingerprint=bootstrap_fingerprint,
+        rollout_checkpoint_load_seconds=rollout_checkpoint_load_seconds,
     )
 
 
@@ -922,6 +924,57 @@ class TestPeriodicRolloutCheckpoint:
         assert manifest["base_train_step"] == 0
         assert manifest["trainer_version"] == 0
         assert manifest["bootstrap_fingerprint"] == "bootstrap-v1"
+
+    def test_logs_total_snapshot_save_duration(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.monotonic",
+            side_effect=[10.0, 17.0],
+        ):
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+
+        actor._logger.log_metrics.assert_called_once_with(
+            {"total_save_seconds": pytest.approx(7.0)},
+            step=0,
+            prefix="timing/rollout_checkpoint",
+        )
+
+    def test_logs_total_snapshot_load_duration(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(rollout_checkpoint_load_seconds=2.0),
+        )
+        actor._logger = MagicMock()
+
+        async def _no_op() -> None:
+            return None
+
+        async def _no_replay() -> int:
+            return 0
+
+        async def _no_recovery(*, restored_replay_groups: int) -> None:
+            assert restored_replay_groups == 0
+
+        actor._sync_weights = _no_op
+        actor._maybe_restore_replay_buffer = _no_replay
+        actor._maybe_restore_rollout_recovery = _no_recovery
+        actor._rollout_pump = _no_op
+        actor._train_pump = _no_op
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.monotonic",
+            side_effect=[20.0, 20.5],
+        ):
+            asyncio.run(actor.run())
+
+        actor._logger.log_metrics.assert_called_once_with(
+            {"total_load_seconds": pytest.approx(2.5)},
+            step=0,
+            prefix="timing/rollout_checkpoint",
+        )
 
     def test_unchanged_state_is_not_saved_twice(self, tmp_path):
         actor, _, _ = self._make_periodic_actor(tmp_path)

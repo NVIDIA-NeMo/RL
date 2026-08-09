@@ -27,6 +27,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any, Optional, cast
 
 import torch
@@ -113,6 +114,7 @@ class SingleControllerActorArgs:
     last_checkpoint_path: Optional[str]
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None
     bootstrap_fingerprint: Optional[str] = None
+    rollout_checkpoint_load_seconds: Optional[float] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -815,6 +817,18 @@ def setup_single_controller(
 
     # Native TQ restore must run through the bootstrap client before the SC
     # client is created and before any rollout/train data-plane operation.
+    recovery_path = (
+        Path(recovery_checkpoint_path)
+        if recovery_checkpoint_path is not None
+        else None
+    )
+    has_rollout_checkpoint_payload = recovery_path is not None and (
+        (recovery_path / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+    )
+    rollout_checkpoint_load_started = (
+        monotonic() if has_rollout_checkpoint_payload else None
+    )
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         policy,
         last_checkpoint_path=recovery_checkpoint_path,
@@ -827,6 +841,11 @@ def setup_single_controller(
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         token_capture_enabled=token_capture_cfg.enabled,
         expected_staging_partition=token_capture_cfg.staging_partition,
+    )
+    rollout_checkpoint_load_seconds = (
+        monotonic() - rollout_checkpoint_load_started
+        if rollout_checkpoint_load_started is not None
+        else None
     )
 
     # ==========================
@@ -976,4 +995,5 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_fingerprint=bootstrap_digest,
+        rollout_checkpoint_load_seconds=rollout_checkpoint_load_seconds,
     )
