@@ -53,5 +53,16 @@ slurm_args=(
 )
 if [[ "${test_gpus_per_node}" -eq 8 ]]; then
   slurm_args+=(--exclusive)
+  sbatch "${slurm_args[@]}" ray.sub
+else
+  printf -v wrapped_command '%q ' \
+    srun \
+    --nodes=1 \
+    --ntasks=1 \
+    --no-container-mount-home \
+    --container-mounts="${MOUNTS}" \
+    --container-image="${CONTAINER}" \
+    --container-workdir="${repo}" \
+    bash -lc "${COMMAND}"
+  sbatch "${slurm_args[@]}" --wrap="${wrapped_command}"
 fi
-sbatch "${slurm_args[@]}" ray.sub
