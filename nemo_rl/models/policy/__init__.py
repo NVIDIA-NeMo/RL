@@ -571,4 +571,13 @@ class PolicyConfig(TypedDict):
     # Megatron QAT only.
     quant_fold_frozen_weight_snap: NotRequired[bool]
 
+    # Cache each weight's fake-quantized value across the gradient-accumulation
+    # microbatches of one training global batch (weights only change at the
+    # optimizer step, which runs after all of them). The cached forward keeps the
+    # quantizer in the autograd graph and replicates ModelOpt's backward exactly,
+    # so forward and gradients are bit-identical to the uncached path. Costs one
+    # cached copy of each quantized weight shard per window. Absent/False =
+    # disabled. Megatron QAT only.
+    quant_cache_train_weight_snap: NotRequired[bool]
+
     is_vlm: NotRequired[bool]

@@ -67,6 +67,31 @@ simply do not benefit.
 The option costs one temporary copy of each folded weight shard, held only for the
 duration of the pass.
 
+## Frozen-Weight Training Optimization
+
+The same redundancy exists inside training: within one global batch, the
+gradient-accumulation microbatches all run forwards against identical weights (the
+optimizer steps once, after all of them), yet each forward re-quantizes every
+weight. Set `policy.quant_cache_train_weight_snap: true` to fake-quantize each
+weight once per global batch instead; it defaults to `false`.
+
+Folding cannot be reused here: training needs the weight quantizer in the autograd
+graph, because ModelOpt's backward is straight-through estimation that can carry an
+amax clip mask (`pass_through_bwd: false`). Instead, each enabled weight quantizer
+is patched for the duration of one `megatron_forward_backward` call to replay a
+precomputed quantized weight, with a backward that replicates ModelOpt's exactly —
+pass-through by default, or `where(|w| <= amax, grad, 0)` when the config disables
+pass-through. Forward outputs and gradients are bit-identical to the uncached
+path. The cache is rebuilt from fresh weights for every global batch, so it can
+never span an optimizer step.
+
+Parameters and quantizer state are never mutated. Quantizers whose forward chain
+this replica cannot reproduce exactly (smoothquant `pre_quant_scale`, rotation,
+static block quantization, bias quantization, calibration mode) and any call with
+a tensor other than the module's weight fall back to the original quantizer —
+correct, just not accelerated. The option costs one cached copy of each quantized
+weight shard, held for the duration of one global batch.
+
 ## Quantization-Aware GRPO (QA-GRPO)
 
 ### Configuration
@@ -349,6 +374,7 @@ These parameters are added under the `policy` section:
 | `quant_batch_size` | Batch size during calibration |
 | `quant_sequence_length` | Sequence length for calibration data |
 | `quant_fold_frozen_weight_snap` | Optional boolean, default `false`. During frozen-weight logprob passes, fold each enabled fake-quantized weight into its parameter once (ModelOpt's fold formula) instead of re-quantizing every microbatch. Weights and quantizers are restored afterwards. Safe for any format, including activation-quantized recipes such as W4A4. |
+| `quant_cache_train_weight_snap` | Optional boolean, default `false`. During training, fake-quantize each weight once per global batch and replay the cached value across the gradient-accumulation microbatches, with a backward replicating ModelOpt's exactly. Forward and gradients are bit-identical to the uncached path; the cache is rebuilt after every optimizer step. |
 
 The `policy.generation.quant_cfg` should match `policy.quant_cfg` to ensure consistent quantization between training and generation.
 
