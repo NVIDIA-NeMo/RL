@@ -258,10 +258,10 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 22:38 PDT</span>
-        <span>Base a028b33b · Super fix validation 3d6d1324 · minimal PR candidate 734c5d8b</span>
+        <span>Updated 2026-08-08 23:20 PDT</span>
+        <span>Base a028b33b · Super fix validation 3d6d1324 · latest-Bridge candidate 541413bd</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
-        <span>MCore workload candidate c8cedc3d · exact Bridge-pin backport 788db41f</span>
+        <span>MCore workload candidate c8cedc3d · latest-Bridge routing candidate 34b55f24</span>
         <span>20-step target per workload</span>
       </div>
     </header>
@@ -270,7 +270,7 @@
       <article class="card">
         <div class="label">Overall status</div>
         <div class="value"><span class="pill pending">All three strict A/B pairs complete · official stack running</span></div>
-        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP pairs all completed 20/20 with exit <code>0:0</code>. The submitted official-Bridge Q30 also completed 20/20; its Super run is at Step 7 and Q235 is waiting for nodes. A separate newest-Bridge matrix has started.</p>
+        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP pairs all completed 20/20 with exit <code>0:0</code>. The submitted official-Bridge Q30 also completed 20/20; Super is at Step 10 and Q235 is at Step 2 with zero classified runtime fatals. A frozen-environment newest-Bridge matrix has started.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -291,7 +291,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 22:38 PDT. Final HybridEP jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. Official-Bridge Q30 507111 also completed 20/20. Official-Bridge Super 506895 has entered Step 7 with zero classified runtime fatals; Q235 507112 is waiting for nodes. Latest-Bridge ordering test 507231 passed, Q30 507239 is running, and dependency-gated Q235/Super jobs 507243/507242 are submitted.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 23:20 PDT. Final HybridEP jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. Official-Bridge Q30 507111 also completed 20/20. Official-Bridge Super 506895 has entered Step 10 and Q235 507112 has entered Step 2, both with zero classified runtime fatals. Latest-Bridge ordering test 507231 passed. First Q30 integration attempt 507239 lost a vLLM subprocess before Step 1; frozen-venv retry 507273 is running, and dependency-gated Q235/Super replacements 507274/507275 are submitted.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -436,9 +436,9 @@
         <article class="job">
           <div class="job-head">
             <h3>506895 · Default Megatron-Bridge full Super validation</h3>
-            <span class="pill pending">Running · Step 5/20</span>
+            <span class="pill pending">Running · Step 10/20</span>
           </div>
-          <p>Started after the canonical Super baseline completed, connected all 256 GPUs, and completed Steps 1–4 with zero classified runtime fatals; Step 5 is in progress. Step 4 recorded 794.27 s E2E, 758.97 s generation, 5.40 s policy, and 6.72 s LogProb. It uses canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, official Megatron-Bridge <code>573e088c</code>, its exact MCore pin plus routing fix <code>788db41f</code>, NeMo prepadding candidate <code>4846673c</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix.</p>
+          <p>Started after the canonical Super baseline completed, connected all 256 GPUs, and completed Steps 1–9 with zero classified runtime fatals; Step 10 is in progress. Step 9 recorded 833.78 s E2E, 804.65 s generation, 4.43 s policy, and 4.25 s LogProb. It uses canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, official Megatron-Bridge <code>573e088c</code>, its exact MCore pin plus routing fix <code>788db41f</code>, NeMo prepadding candidate <code>4846673c</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -450,16 +450,16 @@
         <article class="job">
           <div class="job-head">
             <h3>507111 / 507112 · Default Megatron-Bridge Qwen validation</h3>
-            <span class="pill pending">Q30 complete · Q235 waiting for nodes</span>
+            <span class="pill pending">Q30 complete · Q235 Step 2/20</span>
           </div>
-          <p>Both jobs use NeMo candidate <code>4846673c</code>, official Megatron-Bridge <code>573e088c</code>, exact pinned-MCore routing backport <code>788db41f</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. Q30 507111 completed the canonical 4n8g recipe 20/20 in 59:58 with exit <code>0:0</code>. Its Steps 2–20 means are 137.70 s E2E, 50.13 s generation, 49.86 s policy, and 13.09 s LogProb. Q235 507112 uses the canonical 16n8g recipe; its dependency is cleared and it is waiting for nodes. Pending jobs consume no GPUs.</p>
+          <p>Both jobs use NeMo candidate <code>4846673c</code>, official Megatron-Bridge <code>573e088c</code>, exact pinned-MCore routing backport <code>788db41f</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. Q30 507111 completed the canonical 4n8g recipe 20/20 in 59:58 with exit <code>0:0</code>. Its Steps 2–20 means are 137.70 s E2E, 50.13 s generation, 49.86 s policy, and 13.09 s LogProb. Q235 507112 uses the canonical 16n8g recipe and is in Step 2 after completing its warm-up step; strict fatal count remains zero.</p>
         </article>
         <article class="job">
           <div class="job-head">
-            <h3>507231 / 507239 / 507243 / 507242 · Newest Bridge validation</h3>
-            <span class="pill pending">Ordering test passed · Q30 running</span>
+            <h3>507231 / 507239 / 507273 / 507274 / 507275 · Newest Bridge validation</h3>
+            <span class="pill pending">Ordering test passed · frozen retry running</span>
           </div>
-          <p>Bridge main <code>fcbabe78</code> finalizes eager HybridEP by enabling layer-wise uneven-input padding. NeMo candidate <code>541413bd</code> now restores one-time-prepadding ownership after that finalization; focused job 507231 passed with exit <code>0:0</code>. Canonical Q30 4n8g job 507239 is running. Q235 16n8g job 507243 and Super 32n8g job 507242 are dependency-gated behind the corresponding submitted-stack runs. All use current MCore <code>14499ef0</code> plus the routing/broadcast fixes at <code>34b55f24</code>, DeepEP <code>17cfb817</code> plus the DMA-BUF fix, and a lockfile-rebuilt actor environment.</p>
+          <p>Bridge main <code>fcbabe78</code> finalizes eager HybridEP by enabling layer-wise uneven-input padding. NeMo candidate <code>541413bd</code> restores one-time-prepadding ownership after that finalization; focused job 507231 passed with exit <code>0:0</code>. First canonical Q30 attempt 507239 lost one vLLM native subprocess during engine/KV-cache initialization before Step 1, with no CUDA OOM, NCCL, illegal-access, or HybridEP evidence. Superseded pending jobs 507242/507243 were cancelled before allocation. Frozen actor-venv Q30 retry 507273 is running; Q235 507274 and Super 507275 are dependency-gated behind their official-stack validations. All use MCore <code>34b55f24</code>, DeepEP <code>17cfb817</code> plus the DMA-BUF fix, <code>UV_FROZEN=1</code>, and no runtime rebuild.</p>
         </article>
         <article class="job">
           <div class="job-head">
