@@ -15,7 +15,9 @@ repo=${VALIDATION_REPO_OVERRIDE:-${experiment_root}/RL}
 bridge_source=${BRIDGE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}
 mcore_source=${MCORE_SOURCE_OVERRIDE:-${bridge_source}/3rdparty/Megatron-LM}
 container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh}
+test_gpus_per_node=${TEST_GPUS_PER_NODE:-8}
 test -n "${VALIDATION_HEAD_OVERRIDE:-}"
+[[ "${test_gpus_per_node}" =~ ^[1-8]$ ]]
 run_root=${experiment_root}/runs/hybridep-prepadding-${VALIDATION_HEAD_OVERRIDE:0:12}
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"30","reason":"other","description":"Focused NeMo-RL HybridEP pre-padding tests"}}'
 
@@ -33,19 +35,23 @@ export COMMAND
 export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
 export BASE_LOG_DIR="${run_root}/ray"
-export GPUS_PER_NODE=8
+export GPUS_PER_NODE="${test_gpus_per_node}"
 export PYTHONPATH="${repo}:${bridge_source}/src:${mcore_source}"
 
 cd "${repo}"
-sbatch "${submit_mode[@]}" \
-  --export=ALL \
-  --nodes=1 \
-  --gpus-per-node=8 \
-  --exclusive \
-  --account=coreai_chef_posttrain \
-  --partition=batch \
-  --time=00:20:00 \
-  --job-name=coreai_chef_posttrain.hybridep-prepadding-test \
-  --output="${run_root}/slurm-%j.out" \
-  --comment="${job_reaper_comment}" \
-  ray.sub
+slurm_args=(
+  "${submit_mode[@]}"
+  --export=ALL
+  --nodes=1
+  --gpus-per-node="${test_gpus_per_node}"
+  --account=coreai_chef_posttrain
+  --partition=batch
+  --time=00:20:00
+  --job-name=coreai_chef_posttrain.hybridep-prepadding-test
+  --output="${run_root}/slurm-%j.out"
+  --comment="${job_reaper_comment}"
+)
+if [[ "${test_gpus_per_node}" -eq 8 ]]; then
+  slurm_args+=(--exclusive)
+fi
+sbatch "${slurm_args[@]}" ray.sub
