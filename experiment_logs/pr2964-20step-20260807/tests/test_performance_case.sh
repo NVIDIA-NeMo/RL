@@ -95,4 +95,10 @@ assert_contains "${submit_script}" 'export NRL_FORCE_REBUILD_VENVS="${force_rebu
 assert_contains "${submit_script}" 'export UV_FROZEN=1'
 assert_contains "${submit_script}" 'nrl_force_rebuild_venvs=%s\n'
 
+focused_test_script=$(<"${experiment_dir}/submit_hybridep_prepadding_tests.sh")
+assert_contains "${focused_test_script}" 'tests/unit/models/megatron/test_hybridep_data.py::test_hybridep_prepads_packed_inputs_before_model_forward'
+assert_not_contains "${focused_test_script}" 'tests/unit/models/megatron/test_megatron_data.py::test_hybridep_'
+assert_contains "${focused_test_script}" 'HYBRIDEP_ENABLE_COVERAGE'
+assert_contains "${focused_test_script}" 'coverage.json'
+
 printf 'performance-case-tests-pass\n'

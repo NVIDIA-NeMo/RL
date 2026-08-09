@@ -18,9 +18,12 @@ container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-cw-fallb
 policy_site_packages=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.13/site-packages
 test_gpus_per_node=${TEST_GPUS_PER_NODE:-8}
 test_scope=${HYBRIDEP_TEST_SCOPE:-full}
+enable_coverage=${HYBRIDEP_ENABLE_COVERAGE:-false}
 test -n "${VALIDATION_HEAD_OVERRIDE:-}"
 [[ "${test_gpus_per_node}" =~ ^[1-8]$ ]]
+[[ "${enable_coverage}" == "true" || "${enable_coverage}" == "false" ]]
 run_root=${experiment_root}/runs/hybridep-prepadding-${VALIDATION_HEAD_OVERRIDE:0:12}
+coverage_json=${run_root}/coverage.json
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"30","reason":"other","description":"Focused NeMo-RL HybridEP pre-padding tests"}}'
 
 test "$(git -C "${repo}" rev-parse HEAD)" = "${VALIDATION_HEAD_OVERRIDE}"
@@ -35,11 +38,11 @@ case "${test_scope}" in
   ordering) pytest_targets="${ordering_tests}" ;;
   full)
     pytest_targets="${ordering_tests} \
-${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
-${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepadding_rejects_missing_alignment_group \
-${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepadding_preserves_cp_zigzag_layout \
-${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_preserves_existing_cp_local_layout \
-${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_rejects_model_owned_cp_slicing \
+${repo}/tests/unit/models/megatron/test_hybridep_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
+${repo}/tests/unit/models/megatron/test_hybridep_data.py::test_hybridep_prepadding_rejects_missing_alignment_group \
+${repo}/tests/unit/models/megatron/test_hybridep_data.py::test_hybridep_prepadding_preserves_cp_zigzag_layout \
+${repo}/tests/unit/models/megatron/test_hybridep_data.py::test_hybridep_padding_mask_preserves_existing_cp_local_layout \
+${repo}/tests/unit/models/megatron/test_hybridep_data.py::test_hybridep_padding_mask_rejects_model_owned_cp_slicing \
 ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_without_opt_in_keeps_dispatch_padding \
 ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_explicitly_uses_input_prepadding \
 ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_input_prepadding_requires_flex_dispatcher \
@@ -47,8 +50,13 @@ ${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::t
     ;;
   *) printf 'HYBRIDEP_TEST_SCOPE must be ordering or full, got %s\n' "${test_scope}" >&2; exit 2 ;;
 esac
-COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m pytest --mcore-only -q ${pytest_targets}"
+if [[ "${enable_coverage}" == "true" ]]; then
+  COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m coverage run --source=nemo_rl.models.megatron.data -m pytest --mcore-only -q ${pytest_targets} && /opt/nemo_rl_venv/bin/python -m coverage report --show-missing && /opt/nemo_rl_venv/bin/python -m coverage json -o ${coverage_json}"
+else
+  COMMAND="PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/nemo_rl_venv/bin/python -m pytest --mcore-only -q ${pytest_targets}"
+fi
 export COMMAND
+export COVERAGE_FILE="${run_root}/.coverage"
 export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
 export BASE_LOG_DIR="${run_root}/ray"
