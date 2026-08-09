@@ -1,0 +1,4 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu
