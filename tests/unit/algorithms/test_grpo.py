@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import (
     dynamic_sampling,
     grpo_train,
     refit_policy_generation,
+    setup,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -269,6 +270,7 @@ def mock_grpo_components():
                 max_rollout_turns=1,
                 val_period=100,
                 val_start_at=-1,
+                val_num_generations_per_prompt=1,
                 val_batch_size=1,
                 val_at_start=False,
                 val_at_end=False,
@@ -305,6 +307,9 @@ def mock_grpo_components():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": True},  # Support async mode
@@ -3772,6 +3777,141 @@ class TestValidateFunction:
         # Verify metrics are returned correctly
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
+
+    def test_grouped_validation_reports_pass_k(self, mock_grpo_components):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 2
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_num_generations_per_prompt = 4
+
+        def run_rollout(_policy, repeated_batch, *_args, **_kwargs):
+            # Each prompt is repeated k=4 times, contiguously.
+            assert repeated_batch["idx"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+            # Prompt 0 passes once out of 4; prompt 1 never passes.
+            repeated_batch["total_reward"] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            )
+            return repeated_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=run_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        # accuracy stays the plain mean over all 8 rollouts; pass@4 counts
+        # prompts with at least one passing rollout (1 of 2).
+        assert val_metrics["accuracy"] == pytest.approx(0.125)
+        assert val_metrics["pass_k"] == pytest.approx(0.5)
+
+    def test_validation_uses_val_sampling_params_on_gym_path(
+        self, mock_grpo_components
+    ):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 2
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_num_generations_per_prompt = 2
+        # Train samples at 1.0/1.0; validation runs near-greedy.
+        mock_config.policy["generation"].update(
+            {"val_temperature": 0.1, "val_top_p": 0.9, "val_top_k": None}
+        )
+        mock_config.logger.update({"wandb_enabled": False, "wandb": {}})
+        mock_config.env = {}
+
+        def run_gym_rollout(**kwargs):
+            repeated_batch = kwargs["input_batch"]
+            # 2 prompts x k=2 validation rollouts, contiguous per prompt.
+            assert repeated_batch["idx"].tolist() == [0, 0, 1, 1]
+            repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+            return MagicMock(
+                final_batch=repeated_batch,
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            )
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+                side_effect=run_gym_rollout,
+            ) as mock_rollout,
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        sampling_params = mock_rollout.call_args.kwargs["sampling_params"]
+        assert sampling_params.temperature == pytest.approx(0.1)
+        assert sampling_params.top_p == pytest.approx(0.9)
+        assert sampling_params.top_k is None
+        assert val_metrics["accuracy"] == pytest.approx(0.25)
+        assert val_metrics["pass_k"] == pytest.approx(0.5)
+
+    def test_setup_rejects_val_sampling_outside_gym_vllm_path(
+        self, mock_grpo_components
+    ):
+        master_config = mock_grpo_components["master_config"]
+        # Non-gym rollouts (env has no nemo_gym) with validation sampling
+        # different from training must be rejected at setup time.
+        master_config.policy["generation"].update(
+            {"backend": "megatron", "val_temperature": 0.1}
+        )
+        master_config.env = {}
+
+        with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
+            setup(master_config, MagicMock(), MagicMock(), None)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
