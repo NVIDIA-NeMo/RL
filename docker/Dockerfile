@@ -110,11 +110,16 @@ RUN GITHUB_ARTIFACTORY=github.com \
 # arbitrary runtime UID. Keep the cache in /opt because the project venv uses
 # symlinks into it.
 ARG UV_VERSION
+ARG UV_INSTALLER_SHA256=b7b3fe80cad1142a2a5794050b7db7b3291d1bac1423b0732571dd9366e8ca8b
 ARG PYTHON_VERSION=3.13.14
 ENV UV_CACHE_DIR=/opt/uv/cache
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh && \
-    uv python install --no-bin ${PYTHON_VERSION}
+RUN curl --retry 3 --retry-delay 2 -fsSL \
+        -o /tmp/uv-install.sh https://astral.sh/uv/${UV_VERSION}/install.sh \
+    && echo "${UV_INSTALLER_SHA256}  /tmp/uv-install.sh" | sha256sum --check --strict - \
+    && XDG_BIN_HOME=/usr/local/bin sh /tmp/uv-install.sh \
+    && rm /tmp/uv-install.sh \
+    && uv python install --no-bin ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.

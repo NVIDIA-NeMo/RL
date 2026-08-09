@@ -39,10 +39,16 @@ def test_ci_image_runtime_dependencies_are_readable_by_non_root_users():
     assert dockerfile.index("ARG UV_VERSION=0.11.28") < dockerfile.index(
         "FROM scratch AS nemo-rl"
     )
+    assert "ARG UV_INSTALLER_SHA256=" in dockerfile
     assert (
-        "curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | "
-        "XDG_BIN_HOME=/usr/local/bin sh" in dockerfile
+        "-o /tmp/uv-install.sh https://astral.sh/uv/${UV_VERSION}/install.sh"
+        in dockerfile
     )
+    assert (
+        '"${UV_INSTALLER_SHA256}  /tmp/uv-install.sh" | sha256sum --check --strict -'
+        in dockerfile
+    )
+    assert "XDG_BIN_HOME=/usr/local/bin sh /tmp/uv-install.sh" in dockerfile
     assert "ENV UV_CACHE_DIR=/opt/uv/cache" in dockerfile
     assert "ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python" in dockerfile
     assert "/root/.local/bin" not in dockerfile
