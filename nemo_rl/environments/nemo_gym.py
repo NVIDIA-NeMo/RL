@@ -32,6 +32,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.environments.gym_errors import to_picklable_gym_error
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -310,7 +311,16 @@ Depending on your data shape, you may want to change these values."""
                             error.response_content,
                             file=sys.stderr,
                         )
-                    raise
+                    # This method is a Ray actor boundary, and aiohttp's
+                    # ClientResponseError cannot be pickled, so Ray would
+                    # replace it with a generic RayTaskError and cost the
+                    # caller its per-error-type failure breakdown.
+                    picklable_error = to_picklable_gym_error(error)
+                    if picklable_error is error:
+                        raise
+                    # Not chained: the original is what cannot be pickled, and
+                    # its fields are already carried across as primitives.
+                    raise picklable_error from None
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
