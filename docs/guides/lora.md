@@ -191,7 +191,7 @@ See the [DPO guide](dpo.md) for the full DPO workflow.
 
 ## Example Recipes
 
-Ready-to-run LoRA recipes live under `examples/configs/recipes/llm/`:
+Ready-to-run LoRA recipes live under `examples/configs/recipes/<model-family>/`:
 
 | Recipe | Algorithm | Backend |
 | --- | --- | --- |

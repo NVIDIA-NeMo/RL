@@ -19,7 +19,7 @@ NeMo RL ships three recipes out of the box, but the pieces are independent and c
 | 7B (StrongAC + Gemini CoT) | Qwen2.5-Omni-7B | [Harland/AudioMCQ-StrongAC-GeminiCoT](https://huggingface.co/datasets/Harland/AudioMCQ-StrongAC-GeminiCoT) | `examples/configs/recipes/qwen2.5/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml` |
 | 30B MoE (Qwen3-Omni) | Qwen3-Omni-30B-A3B-Instruct | Harland/AudioMCQ-StrongAC-GeminiCoT | `examples/configs/recipes/qwen3/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.yaml` |
 
-The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML needed); the 7B and 30B recipes live under `examples/configs/recipes/vlm/` and inherit non-audio defaults from `grpo_math_1B_megatron.yaml`, redeclaring the audio-specific blocks inline. The 30B recipe targets the Qwen3-Omni MoE thinker on 4 × 8 H100/H200. You can swap models and datasets independently.
+The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML needed); the 7B and 30B recipes live under `examples/configs/recipes/qwen2.5/` and inherit non-audio defaults from `grpo_math_1B_megatron.yaml`, redeclaring the audio-specific blocks inline. The 30B recipe targets the Qwen3-Omni MoE thinker on 4 × 8 H100/H200. You can swap models and datasets independently.
 
 ## 1. Datasets
 
