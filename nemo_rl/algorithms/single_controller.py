@@ -58,6 +58,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import log_generation_metrics_to_wandb
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
@@ -638,9 +639,9 @@ class SingleControllerActor:
 
             # TODO: checkpointing (save_period/top-k metric_name,
             #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
-            #   pretty-print "Training Results" block, print_performance_metrics.
+            # TODO: per-step train_data jsonl dump, histogram log,
+            #   rollout_metrics, seq_logprob_error_metrics, pretty-print
+            #   "Training Results" block, print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
@@ -648,6 +649,7 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
+            await self._report_generation_saturation()
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -659,6 +661,74 @@ class SingleControllerActor:
                 f"lag={lag}  ",
                 flush=True,
             )
+
+    async def _report_generation_saturation(self) -> None:
+        """Report vLLM queue depth and KV-cache use for the step just closed.
+
+        Separates a generation fleet that is compute-bound from one that is
+        merely under-subscribed.  Both look identical as ``exposed_generation``
+        from the trainer's side, but only the latter can be improved by
+        admitting more in-flight prompts, so this is what decides whether a
+        deeper lag setting can buy throughput.  ``num_pending_samples`` is
+        vLLM's ``num_requests_waiting``: a queue that is busy for most of the
+        step means the engines are the ceiling.
+
+        No-ops on backends that do not collect these metrics, and on vLLM
+        unless ``enable_vllm_metrics_logger`` is set.
+        """
+        # Collection does a blocking ray.get, so keep it off the event loop the
+        # rollout pump shares.
+        gen_metrics = await asyncio.to_thread(self._gen.get_logger_metrics)
+        if not gen_metrics:
+            return
+
+        def pooled(name: str) -> list[float]:
+            per_worker: dict[int, list[Any]] = gen_metrics.get(name, {})
+            return [float(v) for samples in per_worker.values() for v in samples]
+
+        running = pooled("inflight_batch_sizes")
+        waiting = pooled("num_pending_samples")
+        kv_usage = pooled("kv_cache_usage_perc")
+        if not (running or waiting or kv_usage):
+            return
+
+        saturation: dict[str, float] = {}
+        if running:
+            saturation["requests_running_mean"] = sum(running) / len(running)
+            saturation["requests_running_max"] = max(running)
+        if waiting:
+            saturation["requests_waiting_mean"] = sum(waiting) / len(waiting)
+            saturation["requests_waiting_max"] = max(waiting)
+            saturation["queue_busy_frac"] = sum(1.0 for v in waiting if v > 0) / len(
+                waiting
+            )
+        if kv_usage:
+            saturation["kv_cache_usage_mean"] = sum(kv_usage) / len(kv_usage)
+            saturation["kv_cache_usage_max"] = max(kv_usage)
+
+        print("\n🚦 Generation saturation:")
+        for name, value in saturation.items():
+            print(f"  • {name}: {value:.3f}")
+        print(
+            f"  • engines sampled: {len(gen_metrics.get('inflight_batch_sizes', {}))}",
+            flush=True,
+        )
+        self._logger.log_metrics(
+            saturation, step=self._train_steps, prefix="generation"
+        )
+
+        if self._master_config.logger["wandb_enabled"]:
+            await asyncio.to_thread(
+                log_generation_metrics_to_wandb,
+                gen_metrics,
+                self._train_steps,
+                self._master_config.policy["generation"]["vllm_cfg"][
+                    "vllm_metrics_logger_interval"
+                ],
+                self._logger,
+            )
+
+        await asyncio.to_thread(self._gen.clear_logger_metrics)
 
     async def _sync_weights(
         self,

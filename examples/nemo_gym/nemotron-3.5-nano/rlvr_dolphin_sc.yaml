@@ -108,6 +108,24 @@ policy:
     # recoverable here once a reshard run is confirmed healthy; left alone so
     # the two recipes differ only in the transport.
 
+    vllm_cfg:
+      # -----------------------------------------------------------------------
+      # Samples vllm:num_requests_running / num_requests_waiting /
+      # kv_cache_usage_perc off each engine so a step's exposed_generation can
+      # be attributed. Every run so far shows generation as the binding
+      # constraint (0.18 groups/s produced against a 0.26 groups/s trainer
+      # appetite) without showing why: a compute-bound fleet and an
+      # under-subscribed one are indistinguishable from the trainer's side, and
+      # only the second gets faster when max_inflight_prompts rises. A waiting
+      # queue that is busy most of the step means the engines are the ceiling
+      # and deeper lag cannot help.
+      #
+      # Matches the nemotron-3-ultra recipes, which all enable this. Costs one
+      # Prometheus snapshot per engine every 0.5 s on a daemon thread.
+      # -----------------------------------------------------------------------
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+
 # =============================================================================
 # SingleController async RL — required by MasterConfig
 # =============================================================================
