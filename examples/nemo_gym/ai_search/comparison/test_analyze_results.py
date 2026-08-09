@@ -37,6 +37,7 @@ def test_parse_verl_log_uses_model_tokens_and_excludes_checkpoint(
 
     assert step["core_step_s"] == 25.0
     assert step["generated_tokens"] == 120.0
+    assert step["generated_tokens_per_sample"] == 30.0
     assert step["response_tokens_including_observations"] == 200.0
     assert step["stages_s"]["generation"] == 10.0
     assert step["checkpoint_s"] == 5.0
@@ -67,6 +68,7 @@ def test_parse_nemo_log_ignores_nested_logprob_aggregate(tmp_path: Path) -> None
 
     assert step["core_step_s"] == 18.0
     assert step["generated_tokens"] == 40.0
+    assert step["generated_tokens_per_sample"] == 10.0
     assert step["stages_s"]["policy_logprob"] == 2.0
     assert step["stages_s"]["reference_logprob"] == 3.0
     assert step["stages_s"]["other"] == pytest.approx(1.7)

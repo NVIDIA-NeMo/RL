@@ -48,6 +48,8 @@ def _summarize(steps: list[dict[str, Any]]) -> dict[str, Any]:
     scalar_keys = (
         "core_step_s",
         "generated_tokens",
+        "generated_tokens_per_sample",
+        "response_tokens_including_observations",
         "generation_output_tokens_per_s",
         "e2e_output_tokens_per_s",
         "reward",
@@ -132,6 +134,7 @@ def parse_verl_log(path: Path, samples_per_step: int) -> list[dict[str, Any]]:
                 "raw_step_s": metrics["timing_s/step"],
                 "checkpoint_s": checkpoint_s,
                 "generated_tokens": generated_tokens,
+                "generated_tokens_per_sample": generated_tokens / samples_per_step,
                 "response_tokens_including_observations": response_tokens,
                 "generation_output_tokens_per_s": generated_tokens / generation_s,
                 "e2e_output_tokens_per_s": generated_tokens / core_step_s,
@@ -220,6 +223,7 @@ def parse_nemo_log(path: Path, samples_per_step: int) -> list[dict[str, Any]]:
                 "raw_step_s": raw_step_s,
                 "checkpoint_s": checkpoint_s,
                 "generated_tokens": generated_tokens,
+                "generated_tokens_per_sample": mean_generation_length,
                 "generation_output_tokens_per_s": generated_tokens / generation_s,
                 "e2e_output_tokens_per_s": generated_tokens / core_step_s,
                 "reward": _extract_float(

@@ -26,6 +26,10 @@ different: NeMo Gym uses structured tool calls; Search-R1 and ZeroSearch use
 `<search>`/`<answer>` tags. Reports must therefore include actual token counts
 and token-normalized throughput beside wall time.
 
+The measured 4x A100 result and bottleneck analysis are in
+[`PERFORMANCE.md`](PERFORMANCE.md). Machine-readable aggregates and per-step
+records are in `a100_sxm4_4x_20260809.json`.
+
 Generate the fixture with:
 
 ```bash

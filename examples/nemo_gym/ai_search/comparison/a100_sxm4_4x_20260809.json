@@ -1,0 +1,396 @@
+{
+  "implementations": {
+    "NeMo RL AI-search": {
+      "measured_mean": {
+        "core_step_s": 16.94333333333333,
+        "e2e_output_tokens_per_s": 77.54244095454814,
+        "generated_tokens": 1313.0,
+        "generated_tokens_per_sample": 82.0625,
+        "generation_output_tokens_per_s": 450.73743707734235,
+        "reward": 0.9166666666666666,
+        "stage_shares": {
+          "actor_update": 0.08498917961833564,
+          "advantage": 0.0,
+          "generation": 0.17332284084202246,
+          "logprob_prep": 0.09876057446389927,
+          "other": 0.0051150895140664576,
+          "policy_logprob": 0.015542002754278972,
+          "reference_logprob": 0.04249458980916782,
+          "reward": 0.000590202636238442,
+          "training_prep": 0.13968129057643125,
+          "weight_sync": 0.43950422978555975
+        },
+        "stages_s": {
+          "actor_update": 1.4400000000000002,
+          "advantage": 0.0,
+          "generation": 2.936666666666667,
+          "logprob_prep": 1.6733333333333331,
+          "other": 0.086666666666666,
+          "policy_logprob": 0.26333333333333336,
+          "reference_logprob": 0.7200000000000001,
+          "reward": 0.01,
+          "training_prep": 2.3666666666666667,
+          "weight_sync": 7.446666666666666
+        },
+        "step_stdev_s": 0.8277882176821153
+      },
+      "steps": [
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 18.89,
+          "e2e_output_tokens_per_s": 69.77236633139226,
+          "generated_tokens": 1318.0,
+          "generated_tokens_per_sample": 82.375,
+          "generation_output_tokens_per_s": 361.09589041095893,
+          "raw_step_s": 18.89,
+          "reward": 0.875,
+          "stages_s": {
+            "actor_update": 2.76,
+            "advantage": 0.0,
+            "generation": 3.65,
+            "logprob_prep": 1.68,
+            "other": 0.240000000000002,
+            "policy_logprob": 0.82,
+            "reference_logprob": 4.62,
+            "reward": 0.01,
+            "training_prep": 0.51,
+            "weight_sync": 4.6
+          },
+          "step": 1
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 17.88,
+          "e2e_output_tokens_per_s": 75.83892617449665,
+          "generated_tokens": 1356.0,
+          "generated_tokens_per_sample": 84.75,
+          "generation_output_tokens_per_s": 402.37388724035605,
+          "raw_step_s": 17.88,
+          "reward": 0.875,
+          "stages_s": {
+            "actor_update": 1.42,
+            "advantage": 0.0,
+            "generation": 3.37,
+            "logprob_prep": 1.66,
+            "other": 0.08999999999999986,
+            "policy_logprob": 0.28,
+            "reference_logprob": 0.73,
+            "reward": 0.01,
+            "training_prep": 1.86,
+            "weight_sync": 8.46
+          },
+          "step": 2
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 16.64,
+          "e2e_output_tokens_per_s": 78.125,
+          "generated_tokens": 1300.0,
+          "generated_tokens_per_sample": 81.25,
+          "generation_output_tokens_per_s": 469.3140794223827,
+          "raw_step_s": 16.64,
+          "reward": 0.875,
+          "stages_s": {
+            "actor_update": 1.42,
+            "advantage": 0.0,
+            "generation": 2.77,
+            "logprob_prep": 1.7,
+            "other": 0.08999999999999986,
+            "policy_logprob": 0.25,
+            "reference_logprob": 0.71,
+            "reward": 0.01,
+            "training_prep": 2.86,
+            "weight_sync": 6.83
+          },
+          "step": 3
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 16.31,
+          "e2e_output_tokens_per_s": 78.66339668914777,
+          "generated_tokens": 1283.0,
+          "generated_tokens_per_sample": 80.1875,
+          "generation_output_tokens_per_s": 480.5243445692884,
+          "raw_step_s": 16.31,
+          "reward": 1.0,
+          "stages_s": {
+            "actor_update": 1.48,
+            "advantage": 0.0,
+            "generation": 2.67,
+            "logprob_prep": 1.66,
+            "other": 0.0799999999999983,
+            "policy_logprob": 0.26,
+            "reference_logprob": 0.72,
+            "reward": 0.01,
+            "training_prep": 2.38,
+            "weight_sync": 7.05
+          },
+          "step": 4
+        }
+      ]
+    },
+    "Search-R1": {
+      "measured_mean": {
+        "core_step_s": 27.534000000000002,
+        "e2e_output_tokens_per_s": 81.83089306324833,
+        "generated_tokens": 2245.6666666666665,
+        "generated_tokens_per_sample": 140.35416666666666,
+        "generation_output_tokens_per_s": 87.26595554842633,
+        "response_tokens_including_observations": 6749.3386666666665,
+        "reward": 0.292,
+        "search_calls": 31.0,
+        "stage_shares": {
+          "actor_update": 0.04907871480109441,
+          "advantage": 3.631873320258589e-05,
+          "generation": 0.9371564853151255,
+          "other": 7.263746640521754e-05,
+          "policy_logprob": 0.0062105033776421875,
+          "reference_logprob": 0.006125759666836153,
+          "reward": 0.0001936999104137914,
+          "search": 0.0011258807292801626
+        },
+        "stages_s": {
+          "actor_update": 1.3513333333333335,
+          "advantage": 0.001,
+          "generation": 25.80366666666667,
+          "other": 0.00200000000000126,
+          "policy_logprob": 0.171,
+          "reference_logprob": 0.16866666666666666,
+          "reward": 0.005333333333333333,
+          "search": 0.031
+        },
+        "step_stdev_s": 1.0845999262400863
+      },
+      "separate_checkpoint_s": 33.229,
+      "steps": [
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 27.664,
+          "e2e_output_tokens_per_s": 71.24783111625217,
+          "generated_tokens": 1971.0,
+          "generated_tokens_per_sample": 123.1875,
+          "generation_output_tokens_per_s": 82.43068043996486,
+          "raw_step_s": 27.664,
+          "response_tokens_including_observations": 6476.992,
+          "reward": 0.25,
+          "search_calls": 31.0,
+          "stages_s": {
+            "actor_update": 3.362,
+            "advantage": 0.001,
+            "generation": 23.888,
+            "other": 0.0030000000000001137,
+            "policy_logprob": 0.163,
+            "reference_logprob": 0.219,
+            "reward": 0.005,
+            "search": 0.023
+          },
+          "step": 1
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 26.297,
+          "e2e_output_tokens_per_s": 93.24257519869187,
+          "generated_tokens": 2452.0,
+          "generated_tokens_per_sample": 153.25,
+          "generation_output_tokens_per_s": 100.00815727220817,
+          "raw_step_s": 26.297,
+          "response_tokens_including_observations": 7110.0,
+          "reward": 0.188,
+          "search_calls": 32.0,
+          "stages_s": {
+            "actor_update": 1.401,
+            "advantage": 0.001,
+            "generation": 24.496000000000002,
+            "other": 0.0019999999999988916,
+            "policy_logprob": 0.185,
+            "reference_logprob": 0.185,
+            "reward": 0.005,
+            "search": 0.022
+          },
+          "step": 2
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 28.322,
+          "e2e_output_tokens_per_s": 72.52312689781795,
+          "generated_tokens": 2054.0,
+          "generated_tokens_per_sample": 128.375,
+          "generation_output_tokens_per_s": 77.04137129139941,
+          "raw_step_s": 28.322,
+          "response_tokens_including_observations": 6559.008,
+          "reward": 0.5,
+          "search_calls": 31.0,
+          "stages_s": {
+            "actor_update": 1.327,
+            "advantage": 0.001,
+            "generation": 26.611,
+            "other": 0.0019999999999988916,
+            "policy_logprob": 0.163,
+            "reference_logprob": 0.163,
+            "reward": 0.005,
+            "search": 0.05
+          },
+          "step": 3
+        },
+        {
+          "checkpoint_s": 33.229,
+          "core_step_s": 27.983000000000004,
+          "e2e_output_tokens_per_s": 79.72697709323516,
+          "generated_tokens": 2231.0,
+          "generated_tokens_per_sample": 139.4375,
+          "generation_output_tokens_per_s": 84.74833808167142,
+          "raw_step_s": 61.212,
+          "response_tokens_including_observations": 6579.008,
+          "reward": 0.188,
+          "search_calls": 30.0,
+          "stages_s": {
+            "actor_update": 1.326,
+            "advantage": 0.001,
+            "generation": 26.304,
+            "other": 0.002000000000005997,
+            "policy_logprob": 0.165,
+            "reference_logprob": 0.158,
+            "reward": 0.006,
+            "search": 0.021
+          },
+          "step": 4
+        }
+      ]
+    },
+    "ZeroSearch": {
+      "measured_mean": {
+        "core_step_s": 28.768,
+        "e2e_output_tokens_per_s": 87.61243855165368,
+        "generated_tokens": 2521.3333333333335,
+        "generated_tokens_per_sample": 157.58333333333334,
+        "generation_output_tokens_per_s": 93.28666694582842,
+        "response_tokens_including_observations": 5946.325333333334,
+        "reward": 0.2916666666666667,
+        "search_calls": 30.333333333333332,
+        "stage_shares": {
+          "actor_update": 0.049093900630330006,
+          "advantage": 3.476084538375974e-05,
+          "generation": 0.9351478494623656,
+          "other": 5.793474230621354e-05,
+          "policy_logprob": 0.005608083055246571,
+          "reference_logprob": 0.005944104560622916,
+          "reward": 0.00020856507230255846,
+          "search": 0.0039048016314423436
+        },
+        "stages_s": {
+          "actor_update": 1.4123333333333334,
+          "advantage": 0.001,
+          "generation": 26.90233333333333,
+          "other": 0.0016666666666651508,
+          "policy_logprob": 0.16133333333333333,
+          "reference_logprob": 0.171,
+          "reward": 0.006000000000000001,
+          "search": 0.11233333333333333
+        },
+        "step_stdev_s": 0.7994354257849708
+      },
+      "separate_checkpoint_s": 32.798,
+      "steps": [
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 29.252,
+          "e2e_output_tokens_per_s": 71.27717762888008,
+          "generated_tokens": 2085.0,
+          "generated_tokens_per_sample": 130.3125,
+          "generation_output_tokens_per_s": 80.95829774015687,
+          "raw_step_s": 29.252,
+          "response_tokens_including_observations": 5558.0,
+          "reward": 0.188,
+          "search_calls": 31.0,
+          "stages_s": {
+            "actor_update": 3.175,
+            "advantage": 0.001,
+            "generation": 25.657,
+            "other": 0.0019999999999988916,
+            "policy_logprob": 0.151,
+            "reference_logprob": 0.163,
+            "reward": 0.006,
+            "search": 0.097
+          },
+          "step": 1
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 28.08,
+          "e2e_output_tokens_per_s": 79.45156695156696,
+          "generated_tokens": 2231.0,
+          "generated_tokens_per_sample": 139.4375,
+          "generation_output_tokens_per_s": 84.27136058019188,
+          "raw_step_s": 28.08,
+          "response_tokens_including_observations": 5748.992,
+          "reward": 0.188,
+          "search_calls": 31.0,
+          "stages_s": {
+            "actor_update": 1.25,
+            "advantage": 0.001,
+            "generation": 26.364,
+            "other": 0.0019999999999988916,
+            "policy_logprob": 0.155,
+            "reference_logprob": 0.192,
+            "reward": 0.006,
+            "search": 0.11
+          },
+          "step": 2
+        },
+        {
+          "checkpoint_s": 0.0,
+          "core_step_s": 28.579,
+          "e2e_output_tokens_per_s": 97.06427796633892,
+          "generated_tokens": 2774.0,
+          "generated_tokens_per_sample": 173.375,
+          "generation_output_tokens_per_s": 102.9886764432894,
+          "raw_step_s": 28.579,
+          "response_tokens_including_observations": 6124.992,
+          "reward": 0.375,
+          "search_calls": 30.0,
+          "stages_s": {
+            "actor_update": 1.291,
+            "advantage": 0.001,
+            "generation": 26.816,
+            "other": 0.0010000000000012221,
+            "policy_logprob": 0.178,
+            "reference_logprob": 0.167,
+            "reward": 0.006,
+            "search": 0.119
+          },
+          "step": 3
+        },
+        {
+          "checkpoint_s": 32.798,
+          "core_step_s": 29.644999999999996,
+          "e2e_output_tokens_per_s": 86.32147073705517,
+          "generated_tokens": 2559.0,
+          "generated_tokens_per_sample": 159.9375,
+          "generation_output_tokens_per_s": 92.59996381400397,
+          "raw_step_s": 62.443,
+          "response_tokens_including_observations": 5964.992,
+          "reward": 0.312,
+          "search_calls": 30.0,
+          "stages_s": {
+            "actor_update": 1.696,
+            "advantage": 0.001,
+            "generation": 27.527,
+            "other": 0.001999999999995339,
+            "policy_logprob": 0.151,
+            "reference_logprob": 0.154,
+            "reward": 0.006,
+            "search": 0.108
+          },
+          "step": 4
+        }
+      ]
+    }
+  },
+  "measured_steps": [
+    2,
+    3,
+    4
+  ],
+  "samples_per_step": 16,
+  "schema_version": 1
+}
