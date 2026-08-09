@@ -14,7 +14,7 @@ tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang.s
 tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-2n8g-fsdp2tp1-sglang.sh
 
 # Dtensor (moonshotai/Moonlight-16B-A3B-Instruct)
-tests/test_suites/moonlight/grpo-moonlight-16b-automodel-1n8g-ep8.sh
+tests/test_suites/moonlight/grpo-moonlight-16b-1n8g-automodel-ep8.sh
 
 # Megatron
 tests/test_suites/llama3.2/grpo-llama3.2-1b-instruct-1n8g-megatron.sh
@@ -69,7 +69,7 @@ tests/test_suites/reproduce/grpo-gspo-deepscaler-1.5b-8K.sh
 # tests/test_suites/llama3.3-nemotron-super/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-8n8g-fsdp2tp8cp4.sh
 
 # GRPO math test run (32K context mcore)
-tests/test_suites/qwen3/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
+tests/test_suites/qwen3/grpo-math-qwen3-30ba3b-4n8g-megatrontp4-32k.sh
 tests/test_suites/qwen3/grpo-qwen3-30ba3b-4n8g-megatron-qa-nvfp4.sh
 
 # CISPO async lag-1 high-off-policy run (Qwen3-30B-A3B, Megatron + non-colocated vLLM)
@@ -86,10 +86,10 @@ tests/test_suites/qwen3/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-as
 tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3.sh
 tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.sh
 tests/test_suites/moonlight/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e.sh
-tests/test_suites/qwen3/grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron.sh
+tests/test_suites/qwen3/grpo-qwen3-8b-base-1n8g-megatrontp4-fp8-kvcache.sh
 
 # ModelOpt quant rollout convergence tests
-tests/test_suites/qwen3/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.sh
+tests/test_suites/qwen3/grpo-qwen3-8b-base-dapo-2n8g-megatrontp4-long-qa-nvfp4-w4a16.sh
 
 # Non-colocated
 tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
@@ -101,7 +101,7 @@ tests/test_suites/qwen3/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncoloc
 #tests/test_suites/llama3.3-nemotron-super/grpo-math-llama-nemotron-super-49b-v.5-4n8g-fsdp2tp8.sh
 
 # Nano-v3
-tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-1n8g-fsdp2.sh
 tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.sh
 tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-lora.sh
 tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.sh
@@ -147,12 +147,12 @@ tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp-tq_sim
 # TQ-mooncake (backend=mooncake_cpu)
 tests/test_suites/qwen3/grpo-qwen3-1.7b-1n8g-megatron-eagle3-tq_mooncake.sh
 tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e-tq_mooncake.sh
-tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2-tq_mooncake.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-1n8g-fsdp2-tq_mooncake.sh
 tests/test_suites/qwen3/grpo-qwen3-8B-base-1n8g-fsdp2-lora-tq_mooncake.sh
 tests/test_suites/qwen2.5/prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2-tq_mooncake.sh
 
 # Single Controller (SC)
-tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-megatron-async-1off-single-controller-streaming2.sh
 tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.sh
 
 ########
@@ -191,7 +191,7 @@ tests/test_suites/qwen3/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs.sh
 # tests/test_suites/llama3.3-nemotron-super/sft-nemotron-super-49b-8n8g-fsdp2tp4cp8-tulu-v3.sh
 
 # Nemotron 3 Nano 30B A3B Base BF16 tests
-tests/test_suites/nemotron3-nano/sft-nanov3-30BA3B-2n8g-fsdp2.sh
+tests/test_suites/nemotron3-nano/sft-nanov3-30BA3B-1n8g-fsdp2.sh
 tests/test_suites/nemotron3-nano/sft-nanov3-30BA3B-2n8g-fsdp2-lora.sh
 
 # Yarn
@@ -262,4 +262,4 @@ tests/test_suites/qwen2.5/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2
 # reward_components -> reward/<name> bridge -> GDPO with per-reward weights. Replaces the
 # native-rollout reward-weights nightly (that path is already covered on main; the
 # reward_weights math itself is covered by unit tests).
-tests/test_suites/qwen2.5/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.sh
+tests/test_suites/qwen2.5/gdpo-qwen2.5-1.5b-1n8g-fsdp2tp1-gym-multireward.sh

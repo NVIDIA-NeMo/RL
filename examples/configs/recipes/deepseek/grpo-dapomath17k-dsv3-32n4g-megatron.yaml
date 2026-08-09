@@ -1,4 +1,4 @@
-defaults: ./grpo-dapomath17k-dsv3-megatron.yaml
+defaults: ./grpo-dapomath17k-dsv3-32n8g-megatron.yaml
 policy:
   megatron_cfg:
     tensor_model_parallel_size: 4

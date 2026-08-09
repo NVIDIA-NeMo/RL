@@ -132,7 +132,7 @@ The command to generate the Muon results is:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/qwen2.5/dapo-qwen2.5-7b.v2.yaml \
+  --config examples/configs/recipes/qwen2.5/dapo-qwen2.5-7b-16n8g-fsdp2cp4.v2.yaml \
   policy.megatron_cfg.enabled=true \
   policy.dtensor_cfg.enabled=false \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \

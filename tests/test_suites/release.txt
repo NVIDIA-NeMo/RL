@@ -9,7 +9,7 @@ tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-long.v3.sh
 tests/test_suites/qwen3/grpo-qwen3-30ba3b-8n8g-megatron.sh
 
 # DAPO 4h run
-tests/test_suites/qwen2.5/dapo-qwen2.5-7b.v2.sh
+tests/test_suites/qwen2.5/dapo-qwen2.5-7b-16n8g-fsdp2cp4.v2.sh
 
 # Qwen3.5-35B DAPO GRPO run
 tests/test_suites/qwen3.5/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.sh
@@ -29,7 +29,7 @@ tests/test_suites/gemma4/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.sh
 tests/test_suites/gemma4/dapo-gemma4-31b-it-4n8g-fsdp2-automodel.sh
 
 # Deepseek-V3 on DAPO dataset
-tests/test_suites/deepseek/grpo-dapomath17k-dsv3-megatron.sh
+tests/test_suites/deepseek/grpo-dapomath17k-dsv3-32n8g-megatron.sh
 
 #######
 # SFT #
