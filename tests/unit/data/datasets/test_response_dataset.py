@@ -21,6 +21,7 @@ from datasets import Dataset
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
 from nemo_rl.data.datasets.response_datasets import aime as aime_module
+from nemo_rl.data.datasets.response_datasets import gsm8k as gsm8k_module
 from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
 from nemo_rl.data.datasets.response_datasets.intent import (
@@ -172,6 +173,54 @@ def test_response_dataset_gsm8k_with_subset():
     assert first_example["messages"][1]["content"][:20] == "Natalia sold 48/2 = "
 
 
+def _patch_gsm8k_load_dataset(monkeypatch, captured):
+    def fake_load_dataset(path, name=None, **kwargs):
+        captured["path"] = path
+        captured["name"] = name
+        return {
+            "train": Dataset.from_list(
+                [{"question": "What is 2 + 2?", "answer": "2 + 2 = 4\n#### 4"}]
+            )
+        }
+
+    monkeypatch.setattr(gsm8k_module, "load_dataset", fake_load_dataset)
+
+
+def test_gsm8k_subset_selects_hf_config(monkeypatch):
+    """``openai/gsm8k`` ships both a "main" and a "socratic" config, so a
+    configured ``subset`` must reach ``load_dataset`` instead of being ignored."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    dataset = load_response_dataset(
+        {"dataset_name": "gsm8k", "subset": "socratic", "split": "train"}
+    )
+
+    assert captured == {"path": "openai/gsm8k", "name": "socratic"}
+    assert dataset.dataset[0]["messages"][1]["content"] == "4"
+
+
+def test_gsm8k_subset_none_falls_back_to_main(monkeypatch):
+    """`subset: null` is the documented config default, and openai/gsm8k has no
+    implicit default config, so None must resolve to "main"."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    load_response_dataset({"dataset_name": "gsm8k", "subset": None, "split": "train"})
+
+    assert captured["name"] == "main"
+
+
+def test_gsm8k_subset_defaults_to_main(monkeypatch):
+    """Unset ``subset`` keeps the previous behavior (the "main" config)."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    load_response_dataset({"dataset_name": "gsm8k", "split": "train"})
+
+    assert captured["name"] == "main"
+
+
 def test_helpsteer3_dataset():
     # load the dataset
     data_config = {"dataset_name": "HelpSteer3"}
@@ -293,6 +342,7 @@ def test_build_in_dataset(dataset_name, tokenizer):
     [
         ("OpenMathInstruct-2", "expected_answer"),
         ("OpenMathInstruct-2", "generated_solution"),
+        ("NuminaMath-1.5", None),
         ("OpenR1-Math-220k", None),
         ("tulu3_sft_mixture", None),
     ],
@@ -322,6 +372,14 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
         elif output_key == "generated_solution":
             assert (
                 first_example["messages"][1]["content"][:20] == "Let's denote the poi"
+            )
+    elif dataset_name == "NuminaMath-1.5":
+        # The default filters drop the non-verifiable sentinel answers, so no
+        # surviving row (train or val) may carry one.
+        for example in (first_example, first_val_example):
+            assert example["messages"][1]["content"].strip().lower() not in (
+                "proof",
+                "notfound",
             )
     elif dataset_name == "OpenR1-Math-220k":
         assert first_example["messages"][1]["content"][:20] == " (n, k) = (5, 2) "

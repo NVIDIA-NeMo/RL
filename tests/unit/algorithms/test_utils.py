@@ -18,7 +18,8 @@ from datetime import datetime
 import pytest
 import torch
 
-from nemo_rl.algorithms.grpo import AsyncGRPOConfig, MasterConfig
+from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -241,7 +242,27 @@ def _base_master_config(colocated: bool):
                 },
             }
         },
-        grpo={"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
+    )
+
+
+def _base_ppo_master_config(colocated: bool):
+    return PPOMasterConfig.model_construct(
+        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        policy={
+            "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
+                "colocated": {
+                    "enabled": colocated,
+                    "resources": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            }
+        },
+        ppo={"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
     )
 
 
@@ -272,7 +293,13 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        include_training_worker_idle_ratio=False,
     )
 
     # Validate key throughput metrics
@@ -341,7 +368,13 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        include_training_worker_idle_ratio=False,
     )
 
     assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
@@ -352,7 +385,9 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config.grpo["async_grpo"] = AsyncGRPOConfig(enabled=True)
+    master_config.grpo.async_grpo = AsyncGRPOConfig(
+        enabled=True, max_trajectory_age_steps=1
+    )
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,
@@ -371,8 +406,16 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        include_training_worker_idle_ratio=True,
     )
+
+    assert "training_worker_idle_time_ratio" in perf
 
     # Throughput checks
     assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
@@ -423,7 +466,13 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        include_training_worker_idle_ratio=False,
     )
 
     # Core metrics exist
@@ -455,13 +504,45 @@ def test_empty_per_worker_token_counts_skips_imbalance(capsys):
         "per_worker_token_counts": {},
     }
 
-    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        include_training_worker_idle_ratio=False,
+    )
 
     assert "average_token_imbalance" not in perf
 
     out = capsys.readouterr().out
     assert "No per-worker generation load data available." in out
     assert "Throughputs (per GPU)" in out
+
+
+def test_async_ppo_metrics_do_not_access_grpo_config():
+    master_config = _base_ppo_master_config(colocated=False)
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "exposed_generation": 2.0,
+        "prepare_for_generation/total": 1.0,
+    }
+    metrics = {"total_num_tokens": 6050.0}
+
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        include_training_worker_idle_ratio=False,
+    )
+
+    assert "training_worker_idle_time_ratio" not in perf
 
 
 # ============================================================================

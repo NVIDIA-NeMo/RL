@@ -523,7 +523,9 @@ class TQPolicy(Policy):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = replace(
             meta,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            ),
             task_name="train",
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():

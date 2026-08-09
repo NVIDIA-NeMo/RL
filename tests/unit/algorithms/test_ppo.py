@@ -29,6 +29,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -701,84 +702,9 @@ def test_create_advantage_estimator_requires_adv_estimator_key():
         _create_advantage_estimator(master_config)
 
 
-# ============================================================================
-# Tests for PPO train/generation logprob mismatch handling
-# ============================================================================
-
-
-def _make_logprob_mismatch_data() -> BatchedDataDict:
-    return BatchedDataDict(
-        {
-            "token_mask": torch.ones(3, 4),
-            "sample_mask": torch.tensor([1.0, 1.0, 0.0]),
-            "prev_logprobs": torch.zeros(3, 4),
-            "generation_logprobs": torch.tensor(
-                [
-                    [0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.6931472, 0.6931472, 0.6931472],
-                    [0.0, 1.0986123, 1.0986123, 1.0986123],
-                ]
-            ),
-        }
-    )
-
-
-def test_ppo_seq_logprob_error_metrics_do_not_mask_without_threshold():
-    from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
-
-    train_data = _make_logprob_mismatch_data()
-    advantage_mask, metrics = _apply_ppo_seq_logprob_error_masking(
-        train_data=train_data,
-        rewards=torch.tensor([0.0, 1.0, 1.0]),
-        seq_logprob_error_threshold=None,
-    )
-
-    expected_sample_mask = torch.tensor([1.0, 1.0, 0.0])
-    torch.testing.assert_close(train_data["sample_mask"], expected_sample_mask)
-    torch.testing.assert_close(
-        advantage_mask,
-        train_data["token_mask"] * expected_sample_mask.unsqueeze(-1),
-    )
-    assert metrics["num_masked_seqs_by_logprob_error"] == 0
-    assert "num_masked_seqs" not in metrics
-    assert metrics["max_seq_mult_prob_error"] == pytest.approx(2.0)
-
-
-def test_ppo_seq_logprob_error_mask_returns_combined_advantage_mask():
-    from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
-
-    train_data = _make_logprob_mismatch_data()
-    advantage_mask, metrics = _apply_ppo_seq_logprob_error_masking(
-        train_data=train_data,
-        rewards=torch.tensor([0.0, 1.0, 1.0]),
-        seq_logprob_error_threshold=1.5,
-    )
-
-    expected_sample_mask = torch.tensor([1.0, 0.0, 0.0])
-    torch.testing.assert_close(train_data["sample_mask"], expected_sample_mask)
-    torch.testing.assert_close(
-        advantage_mask,
-        train_data["token_mask"] * expected_sample_mask.unsqueeze(-1),
-    )
-    assert metrics["num_masked_seqs_by_logprob_error"] == 1
-
-
-def test_ppo_seq_logprob_error_mask_rejects_all_masked_batch():
-    from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
-
-    train_data = _make_logprob_mismatch_data()
-    with pytest.raises(
-        RuntimeError,
-        match="no valid response tokens after filtering",
-    ):
-        _apply_ppo_seq_logprob_error_masking(
-            train_data=train_data,
-            rewards=torch.tensor([0.0, 1.0, 1.0]),
-            seq_logprob_error_threshold=0.5,
-        )
-
-
-def _make_ppo_loop_batch() -> BatchedDataDict:
+def _make_ppo_loop_batch(
+    truncated_samples: tuple[bool, bool] = (False, False),
+) -> BatchedDataDict:
     return BatchedDataDict(
         {
             "message_log": [
@@ -809,7 +735,7 @@ def _make_ppo_loop_batch() -> BatchedDataDict:
             ],
             "total_reward": torch.tensor([0.0, 1.0]),
             "loss_multiplier": torch.ones(2),
-            "truncated": torch.zeros(2, dtype=torch.bool),
+            "truncated": torch.tensor(truncated_samples, dtype=torch.bool),
             "length": torch.ones(2, dtype=torch.int32),
         }
     )
@@ -822,6 +748,8 @@ def _run_mock_ppo_train(
     ppo_epochs: int,
     seq_logprob_error_threshold: float | None,
     policy_training_start_step: int = 0,
+    overlong_filtering: bool = False,
+    truncated_samples: tuple[bool, bool] = (False, False),
 ):
     """Run the real PPO loop with deterministic in-process collaborators."""
     from nemo_rl.algorithms import ppo as ppo_mod
@@ -945,7 +873,9 @@ def _run_mock_ppo_train(
     monkeypatch.setattr(ppo_mod, "TimeoutChecker", DummyTimeoutChecker)
     monkeypatch.setattr(ppo_mod, "MemoryTracker", DummyMemoryTracker)
     monkeypatch.setattr(ppo_mod, "maybe_gpu_profile_step", lambda *_args: None)
-    monkeypatch.setattr(ppo_mod, "print_performance_metrics", lambda *_args: {})
+    monkeypatch.setattr(
+        ppo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
     monkeypatch.setattr(ppo_mod, "scale_rewards", lambda batch, _config: batch)
     monkeypatch.setattr(ppo_mod, "_should_use_nemo_gym", lambda _config: False)
     monkeypatch.setattr(ppo_mod, "_should_use_async_rollouts", lambda _config: False)
@@ -970,11 +900,11 @@ def _run_mock_ppo_train(
             "max_rollout_turns": 1,
             "num_prompts_per_step": 2,
             "num_generations_per_prompt": 1,
-            "overlong_filtering": False,
+            "overlong_filtering": overlong_filtering,
             "policy_training_start_step": policy_training_start_step,
             "ppo_epochs": ppo_epochs,
             "reward_scaling": {"enabled": False},
-            "reward_shaping": {"enabled": False},
+            "reward_shaping": RewardShapingConfig(enabled=False),
             "seq_logprob_error_threshold": seq_logprob_error_threshold,
             "val_at_start": False,
             "val_at_end": False,
@@ -1002,7 +932,9 @@ def _run_mock_ppo_train(
     logger = MagicMock()
     checkpointer = MagicMock()
     checkpointer.save_optimizer = False
-    dataloader = DummyLoader([_make_ppo_loop_batch() for _ in range(max_num_steps)])
+    dataloader = DummyLoader(
+        [_make_ppo_loop_batch(truncated_samples) for _ in range(max_num_steps)]
+    )
     tokenizer = SimpleNamespace(pad_token_id=0)
 
     ppo_mod.ppo_train(
@@ -1089,6 +1021,37 @@ def test_ppo_train_critic_warmup_reuses_generation_until_policy_update(monkeypat
         "generation_prepare",
         "rollout",
     ]
+
+
+def test_ppo_train_excludes_overlong_samples_from_advantage(monkeypatch):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+        overlong_filtering=True,
+        truncated_samples=(False, True),
+    )
+
+    expected_advantage_mask = torch.tensor([[0.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
+    torch.testing.assert_close(
+        harness.advantage_estimator.masks[0], expected_advantage_mask
+    )
+
+
+def test_ppo_train_rejects_all_masked_batch(monkeypatch):
+    with pytest.raises(
+        RuntimeError,
+        match="no valid response tokens after filtering",
+    ):
+        _run_mock_ppo_train(
+            monkeypatch,
+            max_num_steps=1,
+            ppo_epochs=1,
+            seq_logprob_error_threshold=None,
+            overlong_filtering=True,
+            truncated_samples=(True, True),
+        )
 
 
 def test_ppo_train_wires_logprob_mask_to_advantage_training_and_metrics(monkeypatch):
@@ -1331,6 +1294,40 @@ def _run_noncolocated_setup(monkeypatch, config):
     )
 
 
+@pytest.mark.parametrize(
+    ("refit_transport", "error_match"),
+    [
+        (
+            "vllm_s3_sparse",
+            "Remote sparse refit is currently supported only by GRPO",
+        ),
+        (
+            "nixl",
+            "PPO refits over the default collective path.*Set "
+            "policy.generation.refit_transport=null",
+        ),
+    ],
+)
+def test_ppo_rejects_explicit_vllm_refit_transport_before_cluster_creation(
+    monkeypatch,
+    refit_transport,
+    error_match,
+):
+    """PPO uses its default collective refit path for both cluster layouts."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["refit_transport"] = refit_transport
+
+    with pytest.raises(ValueError, match=error_match):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_noncolocated_sglang_is_rejected_before_cluster_creation(monkeypatch):
     """SGLang has no cross-cluster refit path, so setup must reject it early."""
     from unittest.mock import MagicMock
@@ -1341,8 +1338,29 @@ def test_noncolocated_sglang_is_rejected_before_cluster_creation(monkeypatch):
     config = _make_noncolocated_setup_config(backend="sglang")
 
     with pytest.raises(
-        AssertionError,
+        NotImplementedError,
         match="Non-colocated PPO generation currently supports only vLLM",
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_must_leave_training_gpus_single_node(monkeypatch):
+    """A single-node split must reserve at least one GPU for policy and value."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_gpus_per_node=8,
+        inference_gpus_per_node=8,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Not enough GPUs for PPO training after reserving",
     ):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
 
@@ -1371,6 +1389,54 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     cluster_cls.assert_not_called()
 
 
+def test_noncolocated_inference_rejects_multiple_nodes_single_node(monkeypatch):
+    """A single-node split cannot allocate multiple rollout nodes."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=1,
+        total_gpus_per_node=8,
+        inference_nodes=2,
+        inference_gpus_per_node=2,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="policy.generation.colocated.resources.num_nodes must be 1 or set to null",
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_requires_explicit_num_nodes_multi_node(monkeypatch):
+    """A multi-node split must state how many full nodes belong to rollout."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=2,
+        inference_nodes=None,
+        inference_gpus_per_node=8,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "policy.generation.colocated.resources.num_nodes must be > 0 "
+            "when cluster.num_nodes > 1"
+        ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     monkeypatch,
 ):
@@ -1392,6 +1458,55 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
             "policy.generation.colocated.resources.gpus_per_node must be "
             "explicitly set and equal to cluster.gpus_per_node"
         ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_requires_full_node_gpus_multi_node(monkeypatch):
+    """A multi-node rollout allocation cannot reserve a partial physical node."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=2,
+        total_gpus_per_node=8,
+        inference_nodes=1,
+        inference_gpus_per_node=4,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "policy.generation.colocated.resources.gpus_per_node must be "
+            "explicitly set and equal to cluster.gpus_per_node"
+        ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_must_leave_training_nodes_multi_node(monkeypatch):
+    """A multi-node split must leave at least one node for policy and value."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=2,
+        total_gpus_per_node=8,
+        inference_nodes=2,
+        inference_gpus_per_node=8,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Non-colocated PPO requires both training and inference resources",
     ):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
 
@@ -1528,12 +1643,62 @@ def test_noncolocated_multi_node_inference_topology_constraints(monkeypatch):
     )
 
 
+def test_noncolocated_skips_nondivisible_inference_topology_constraints(
+    monkeypatch,
+    capsys,
+):
+    """Non-divisible inference instances fall back to unconstrained placement."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    monkeypatch.setattr(
+        ppo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "node-0": ("domain-0", 0),
+            "node-1": ("domain-0", 1),
+            "node-2": ("domain-1", 0),
+            "node-3": ("domain-1", 1),
+            "node-4": ("domain-1", 2),
+        },
+    )
+    config = _make_noncolocated_setup_config(
+        total_nodes=5,
+        total_gpus_per_node=8,
+        inference_nodes=3,
+        inference_gpus_per_node=8,
+        segment_size=2,
+        tensor_parallel_size=16,
+    )
+
+    result, _, _, _, _, _, generation_factory, _ = _run_noncolocated_setup(
+        monkeypatch, config
+    )
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["node_resource_constraints"] == [
+        {"domain-0": 0.001},
+        {"domain-0": 0.001},
+    ]
+    assert inference_cluster.kwargs["node_resource_constraints"] is None
+    assert inference_cluster.kwargs["segment_size"] is None
+    generation_factory.init_cluster_placement_groups.assert_not_called()
+    assert (
+        "inference_nodes=3 is not divisible by nodes_per_instance=2"
+        in capsys.readouterr().out
+    )
+
+
 def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
-    """Policy/value share two slots while rollout gets a separate one-slot cluster."""
+    """Verify separate-cluster construction and collective call wiring only.
+
+    The AutoModel and Megatron functional tests cover the real collective handshake.
+    """
     config = _make_noncolocated_setup_config(
         total_gpus_per_node=8,
         inference_gpus_per_node=2,
     )
+    config.cluster["master_port_range_low"] = 1400
+    config.cluster["master_port_range_high"] = 1999
     (
         result,
         cluster_calls,
@@ -1552,8 +1717,12 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     ]
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [6]
     assert train_cluster.kwargs["max_colocated_worker_groups"] == 2
+    assert train_cluster.kwargs["port_range_low"] == 1400
+    assert train_cluster.kwargs["port_range_high"] == 1999
     assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [2]
     assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
+    assert inference_cluster.kwargs["port_range_low"] == 1400
+    assert inference_cluster.kwargs["port_range_high"] == 1999
     assert policy_factory.call_args.kwargs["cluster"] is train_cluster
     assert value_factory.call_args.kwargs["cluster"] is train_cluster
     assert generation_factory.call_args.kwargs["cluster"] is inference_cluster
@@ -1686,7 +1855,9 @@ def test_noncolocated_reward_model_node_leaves_shared_train_inference_node(
 
 
 def _make_async_ppo_config() -> SimpleNamespace:
+    from nemo_rl.algorithms.grpo import RewardScalingConfig
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
+    from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 
     return SimpleNamespace(
         policy={
@@ -1705,8 +1876,8 @@ def _make_async_ppo_config() -> SimpleNamespace:
             "policy_training_start_step": 0,
             "ppo_epochs": 1,
             "use_dynamic_sampling": False,
-            "reward_scaling": {"enabled": False},
-            "reward_shaping": {"enabled": False},
+            "reward_scaling": RewardScalingConfig(),
+            "reward_shaping": RewardShapingConfig(),
         },
         data={"use_multiple_dataloader": False},
         env={},
@@ -1789,11 +1960,11 @@ def test_async_ppo_entry_guards(mutate, message):
             "Dynamic sampling",
         ),
         (
-            lambda cfg: cfg.ppo["reward_scaling"].update(enabled=True),
+            lambda cfg: setattr(cfg.ppo["reward_scaling"], "enabled", True),
             "Reward scaling",
         ),
         (
-            lambda cfg: cfg.ppo["reward_shaping"].update(enabled=True),
+            lambda cfg: setattr(cfg.ppo["reward_shaping"], "enabled", True),
             "Reward shaping",
         ),
         (
@@ -1819,16 +1990,16 @@ def test_async_ppo_rejects_fp8_kv_scale_sync():
         _call_async_ppo_until_guard(config, requires_kv_scale_sync=True)
 
 
-def test_async_ppo_config_allows_cache_recompute_without_in_flight_updates():
+def test_async_ppo_config_rejects_invalid_kv_cache_settings():
+    from pydantic import ValidationError
+
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
-    config = AsyncPPOConfig(
-        in_flight_weight_updates=False,
-        recompute_kv_cache_after_weight_updates=True,
-    )
-
-    assert config.in_flight_weight_updates is False
-    assert config.recompute_kv_cache_after_weight_updates is True
+    with pytest.raises(ValidationError, match="in_flight_weight_updates"):
+        AsyncPPOConfig(
+            in_flight_weight_updates=False,
+            recompute_kv_cache_after_weight_updates=True,
+        )
 
 
 def test_async_ppo_config_warmup_age_defaults_to_training_age():

@@ -37,6 +37,7 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
@@ -138,16 +139,65 @@ def _model_self_packs_for_cp(model: Any) -> bool:
 
     Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
     forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
-    pre-packing + CP-sharding itself. The only such model today is mbridge's
-    Qwen3VL, which is also the only mbridge VLM that supports context
-    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    pre-packing + CP-sharding itself. New wrappers advertise the capability
+    through ``model_owns_packing``. The Qwen3VL type check remains as a
+    compatibility fallback until that upstream model exposes the capability.
     """
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+    return any(
+        bool(getattr(chunk, "model_owns_packing", False))
+        or isinstance(chunk, Qwen3VLModel)
+        for chunk in chunks
+    )
+
+
+def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
+    """Whether a self-packing model also aligns and CP-shards MTP masks."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
+        for chunk in chunks
+    )
+
+
+def _model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in chunks
+    )
+
+
+def _estimate_refit_tensor_size_in_bytes(
+    param: torch.Tensor,
+    *,
+    export_dtype: torch.dtype,
+    tp_size: int,
+    ep_size: int,
+) -> int:
+    """Estimate the gathered tensor size produced by Bridge export.
+
+    Floating-point model weights are exported at the policy dtype. Integral
+    state (for example BatchNorm ``num_batches_tracked`` buffers) keeps its
+    original dtype and must not be looked up in a floating-point-only table.
+    """
+    element_size = (
+        torch.empty((), dtype=export_dtype).element_size()
+        if param.is_floating_point()
+        else param.element_size()
+    )
+    return param.numel() * tp_size * ep_size * element_size
 
 
 @contextmanager
@@ -206,6 +256,7 @@ class MegatronPolicyWorkerImpl(
     # ``self._train_step_state = None`` after finish/abort type-checks.
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
+    _async_checkpoint_cuda_cache_active: bool = False
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -317,6 +368,7 @@ class MegatronPolicyWorkerImpl(
         init_reference_model: bool = True,
         *,
         worker_sharding_annotations: NamedSharding,
+        skip_weight_load: bool = False,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -438,11 +490,16 @@ class MegatronPolicyWorkerImpl(
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
+        assert not (skip_weight_load and (init_optimizer or init_reference_model)), (
+            "skip_weight_load is only valid for inference-only policies "
+            "(init_optimizer=False, init_reference_model=False)."
+        )
         model_and_optimizer_state = setup_model_and_optimizer(
             config,
             self.megatron_cfg,
             init_optimizer,
             pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
+            load_weights=not skip_weight_load,
         )
 
         self.mcore_state = model_and_optimizer_state.state
@@ -499,6 +556,41 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+        self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
+            self.model
+        )
+        assert (
+            not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
+        ), "A model cannot own MTP-mask packing without owning sequence packing"
+        self.model_slices_context_parallel_inputs = (
+            _model_slices_context_parallel_inputs(self.model)
+        )
+        if self.model_slices_context_parallel_inputs:
+            if self.delegate_pack_to_model:
+                raise RuntimeError(
+                    "A model cannot both own sequence packing and consume caller-packed "
+                    "full THD inputs."
+                )
+            model_config = self._get_model_config()
+            mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+            if mtp_num_layers is not None and mtp_num_layers > 0:
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
+                    "Disable MTP for the Nano image/text path."
+                )
+            if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not support "
+                    "use_fused_linear_logprobs=true."
+                )
+            virtual_pipeline_size = self.cfg["megatron_cfg"].get(
+                "virtual_pipeline_model_parallel_size"
+            )
+            if virtual_pipeline_size not in (None, 1):
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not yet support "
+                    "virtual pipeline parallelism."
+                )
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -701,6 +793,8 @@ class MegatronPolicyWorkerImpl(
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                     delegate_pack_to_model=self.delegate_pack_to_model,
+                    delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -793,9 +887,15 @@ class MegatronPolicyWorkerImpl(
                     # (MTP params are tagged only when mtp_detach_heads=True, on the last
                     # pipeline stage). grad_norms_by_group always exists after step().
                     mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
+                    # Draft params are tagged with their own grad-norm group
+                    # (see build_draft_model) and clipped separately from the
+                    # policy so their large early gradients don't shrink the
+                    # policy update. None when no draft model is attached.
+                    draft_grad_norm = self.optimizer.grad_norms_by_group.get("draft")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
                     mtp_grad_norm = None
+                    draft_grad_norm = None
 
                 pg_collection = get_pg_collection(self.model)
 
@@ -816,6 +916,11 @@ class MegatronPolicyWorkerImpl(
                 # non-last-PP-stage ranks, where it is None) has the MTP grad norm.
                 mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
                     mtp_grad_norm, mp_group=pg_collection.mp
+                )
+                # Same for the draft grad norm: the draft model lives on a single
+                # PP stage, so other ranks see None until reduced.
+                draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+                    draft_grad_norm, mp_group=pg_collection.mp
                 )
                 if (
                     not eval_mode
@@ -920,6 +1025,8 @@ class MegatronPolicyWorkerImpl(
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
         self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
@@ -1520,6 +1627,8 @@ class MegatronPolicyWorkerImpl(
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -1737,6 +1846,8 @@ class MegatronPolicyWorkerImpl(
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -1959,18 +2070,11 @@ class MegatronPolicyWorkerImpl(
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
             else:
-                # Calculate size for this parameter
-                prec_to_bytes = {
-                    torch.bfloat16: 2,
-                    torch.float16: 2,
-                    torch.float32: 4,
-                    torch.float8_e4m3fn: 1,
-                    torch.float8_e5m2: 1,
-                    torch.uint8: 1,
-                }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
-                size_in_bytes = (
-                    param.element_size() * param.numel() * tp_size * ep_size * scale
+                size_in_bytes = _estimate_refit_tensor_size_in_bytes(
+                    param,
+                    export_dtype=self.dtype,
+                    tp_size=tp_size,
+                    ep_size=ep_size,
                 )
 
             # Broadcast size_in_bytes across pipeline parallel ranks
@@ -2650,6 +2754,12 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
+        # An in-flight async checkpoint keeps references to the CUDA tensors in
+        # its sharded state dict until the write is finalized. Offloading swaps
+        # those tensors for CPU storage, so the checkpoint references would keep
+        # the old CUDA storage alive and defeat the offload.
+        self.finalize_async_save()
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -2741,6 +2851,11 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
         """Offload as much as possible on the CPU."""
+        # Finalize before replacing model-buffer storage. With cached NVRx async
+        # saves, the persistent writer otherwise retains CUDA IPC handles to the
+        # old storage after the model is moved to CPU.
+        self.finalize_async_save()
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
@@ -2851,6 +2966,10 @@ class MegatronPolicyWorkerImpl(
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save
+        if is_async and self._requires_nvrx_cuda_cache_release():
+            # Set this before saving so an exception path can still tear down a
+            # writer that may already have received CUDA IPC handles.
+            self._async_checkpoint_cuda_cache_active = True
 
         try:
             # Block until any previous async save is fully written to disk.
@@ -2908,17 +3027,57 @@ class MegatronPolicyWorkerImpl(
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
 
-    def finalize_async_save(self):
-        """Block until the in-flight async write completes and run finalize_fns.
+    def _requires_nvrx_cuda_cache_release(self) -> bool:
+        """Whether checkpoint finalization must also drop cached CUDA IPC handles."""
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
+        generation_cfg = self.cfg.get("generation") or {}
+        colocated_cfg = generation_cfg.get("colocated") or {}
+        return bool(
+            ckpt_cfg.async_save
+            and getattr(ckpt_cfg, "async_strategy", "nvrx") == "nvrx"
+            and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
+            and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
+            and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
+            and colocated_cfg.get("enabled", False)
+        )
 
-        Safe to call when async_save is disabled (no-op).
-        Does NOT terminate the persistent worker — it stays alive for the next save.
+    def finalize_async_save(self):
+        """Finalize an async write and release unsafe colocated CUDA IPC caches.
+
+        NVRx constant-structure saves cache CUDA tensor handles in the persistent
+        writer. That is safe while model/optimizer storage stays fixed, but a
+        colocated policy replaces that storage during CPU offload. In that case,
+        close the completed writer and invalidate its training-side cache; NVRx
+        starts a fresh persistent writer lazily for the next checkpoint.
         """
+        release_cuda_cache = bool(
+            self._async_checkpoint_cuda_cache_active
+            and self._requires_nvrx_cuda_cache_release()
+        )
         maybe_finalize_async_save(
             self.mcore_state,
             ckpt_cfg=self.mcore_state.cfg.checkpoint,
             blocking=True,
+            terminate=release_cuda_cache,
         )
+        if release_cuda_cache:
+            _, async_modules = get_async_strategy(
+                self.mcore_state.cfg.checkpoint.async_strategy
+            )
+            writer_cls = async_modules["FileSystemWriterAsync"]
+            cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
+            if cleanup_tensor_caches is not None:
+                cleanup_tensor_caches()
+            else:
+                # Compatibility with older NVRx versions that predate the
+                # public cleanup helper.
+                cached_identifiers = getattr(writer_cls, "_cached_identifiers", None)
+                if cached_identifiers is not None:
+                    cached_identifiers.clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+            self._async_checkpoint_cuda_cache_active = False
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

@@ -1,6 +1,8 @@
 # Nemotron 3 Nano Omni
 
-This guide explains how to post-train the Nemotron 3 Nano Omni vision-language model with GRPO using NeMo RL on the AutoModel backend.
+This guide explains how to post-train the Nemotron 3 Nano Omni vision-language model with GRPO using NeMo RL. Both the AutoModel and Megatron backends are supported for image-and-text training.
+
+## AutoModel backend
 
 It covers two recipes:
 
@@ -9,7 +11,7 @@ It covers two recipes:
 
 Both share the same checkpoint, model code, and reward pipeline; they differ only in the dataset, reward functions, and node count.
 
-## Recipe 1 — CLEVR-CoGenT (single-node)
+### Recipe 1 — CLEVR-CoGenT (single-node)
 
 The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
 
@@ -47,7 +49,7 @@ uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-n
     cluster.gpus_per_node=8 cluster.num_nodes=1
 ```
 
-## Recipe 2 — MMPR-Tiny (4-node Slurm)
+### Recipe 2 — MMPR-Tiny (4-node Slurm)
 
 The MMPR-Tiny recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml). Differences vs. the CLEVR recipe:
 
@@ -109,3 +111,37 @@ sbatch \
 ```
 
 To run on a different node count, change `NUM_NODES` and the `--nodes` flag.
+
+## Megatron backend
+
+The Megatron backend uses a dedicated `NemotronOmniModel` supplied by Megatron Bridge. The Hugging Face processor expands each image placeholder into the complete media-token sequence before the batch reaches the model. NeMo RL passes that expanded sequence and the image tensors to the model; `NemotronOmniModel` replaces the media-token positions with RADIO encoder outputs and then performs sequence packing and context-parallel sharding.
+
+This is the same model-owned packing boundary used by maintained Megatron VLM integrations. It differs from the historical Nemotron Omni `LLaVAModel` path, which collapsed the expanded media-token sequence before packing and expanded it again inside the model. The dedicated model removes that extra representation change and allows the integration to use Megatron Bridge and Megatron-LM from their maintained main branches.
+
+The current Megatron recipes cover Nano image-and-text GRPO. Super, video, and audio training are follow-up work and are not enabled by these recipes.
+
+### Checkpoint compatibility
+
+Use the `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` Hugging Face checkpoint or a checkpoint converted with the dedicated `NemotronOmniModel` integration. Legacy Megatron checkpoints whose parameter names use an `llava_model` prefix are not compatible with this model definition. Reconvert those checkpoints from the original Hugging Face checkpoint instead of loading them directly.
+
+### Maintained recipes
+
+| Workload | Recipe | Topology |
+|---|---|---|
+| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml) | 1 node, 8 GPUs, TP=8, EP=8 |
+| MMPR-Tiny | [`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml) | 4 nodes, 8 GPUs per node, TP=8, EP=16, vLLM TP=2 |
+
+Launch the single-node Megatron recipe from inside the container on an 8-GPU node:
+
+```bash
+uv run examples/run_vlm_grpo.py \
+    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
+```
+
+For a four-node Slurm run, use the `ray.sub` example above with the following configuration path and omit the AutoModel-specific `PYTHONPATH` addition:
+
+```bash
+CONFIG_PATH=examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml
+```
+
+The recipes keep sequence packing enabled because the model owns the packing step after multimodal embedding insertion. They also request raw generation log probabilities so that vLLM and the Megatron policy compare the same pre-processor probability values when generation constraints such as `bad_words` are active. The generation context cap prevents the processor-expanded image prompt plus generated response from exceeding the configured 8192-token context length.

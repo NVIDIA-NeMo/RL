@@ -68,6 +68,7 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
     get_ray_cluster_topology,
@@ -122,13 +123,21 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     warmup_max_trajectory_age_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = True
-    # Invalidates and rebuilds the generation KV cache after a weight update.
+    # Invalidates and rebuilds the generation KV cache after an in-flight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Regenerates a partial replay-buffer frontier after resume.
     drop_incomplete_targets_on_restore: bool = True
 
     @model_validator(mode="after")
     def validate_settings(self) -> "AsyncPPOConfig":
+        if (
+            self.recompute_kv_cache_after_weight_updates
+            and not self.in_flight_weight_updates
+        ):
+            raise ValueError(
+                "recompute_kv_cache_after_weight_updates requires "
+                "in_flight_weight_updates=true"
+            )
         if (
             self.warmup_max_trajectory_age_steps is not None
             and self.warmup_max_trajectory_age_steps < self.max_trajectory_age_steps
@@ -232,13 +241,14 @@ def _apply_ppo_seq_logprob_error_masking(
     rewards: torch.Tensor,
     seq_logprob_error_threshold: float | None,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
-    """Apply optional mismatch masking and return the GAE mask and metrics."""
+    """Apply optional mismatch masking and return the advantage mask and metrics."""
     metrics = compute_and_apply_seq_logprob_error_masking(
         train_data=train_data,
         rewards=rewards,
         seq_logprob_error_threshold=seq_logprob_error_threshold,
     )
     metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
+
     advantage_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
     if not advantage_mask.bool().any():
         raise RuntimeError(
@@ -246,6 +256,7 @@ def _apply_ppo_seq_logprob_error_masking(
             "filtering and ppo.seq_logprob_error_threshold to avoid an optimizer "
             "step with an empty batch."
         )
+
     return advantage_mask, metrics
 
 
@@ -327,10 +338,10 @@ def setup(
             )
         if refit_transport is not None:
             raise ValueError(
-                "Checkpoint-engine refit requires non-colocated generation, but "
-                "PPO currently requires colocated generation. Non-colocated PPO "
-                "support is tracked in "
-                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+                f"policy.generation.refit_transport={refit_transport!r} is not yet "
+                "supported by PPO (colocated or non-colocated); PPO refits over the "
+                "default collective path. Set policy.generation.refit_transport=null. "
+                "Tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
@@ -473,8 +484,8 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
-    if not colocated_inference:
-        assert backend == "vllm", (
+    if not colocated_inference and backend != "vllm":
+        raise NotImplementedError(
             "Non-colocated PPO generation currently supports only vLLM; "
             f"got backend={backend!r}. SGLang does not yet implement the "
             "cross-cluster collective weight update path."
@@ -607,11 +618,32 @@ def setup(
                 )
             )
             if node_resource_constraints is not None:
-                vllm_cfg = cast(VllmConfig, generation_config)["vllm_cfg"]
-                gpus_per_instance = (
-                    vllm_cfg["tensor_parallel_size"]
-                    * vllm_cfg["pipeline_parallel_size"]
-                )
+                training_node_ids = set(topology) - set(remaining_node_ids)
+                nodes_missing_topo_rank = [
+                    nid
+                    for nid in training_node_ids
+                    if topology[nid][1] == TOPO_RANK_UNKNOWN
+                ]
+                if nodes_missing_topo_rank:
+                    print(
+                        f"  ⚠ {len(nodes_missing_topo_rank)} selected training nodes have NVLink domain "
+                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
+                        flush=True,
+                    )
+
+                if generation_config["backend"] == "vllm":
+                    vllm_cfg = generation_config.get("vllm_cfg", {})
+                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                        "pipeline_parallel_size", 1
+                    )
+                elif generation_config["backend"] == "trtllm":
+                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
+                    gpus_per_instance = trtllm_cfg[
+                        "tensor_parallel_size"
+                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                else:
+                    sglang_cfg = generation_config.get("sglang_cfg", {})
+                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node
@@ -1407,9 +1439,10 @@ def ppo_train(
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.ppo["reward_scaling"]
                 )
-                if master_config.ppo["reward_shaping"]["enabled"]:
+                reward_shaping_config = master_config.ppo["reward_shaping"]
+                if reward_shaping_config.enabled:
                     repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config.ppo["reward_shaping"]
+                        repeated_batch, reward_shaping_config
                     )
 
                 # Process rewards and build training data
@@ -1933,6 +1966,11 @@ def ppo_train(
                 metrics,
                 timing_metrics,
                 master_config,
+                num_prompts_per_step=master_config.ppo["num_prompts_per_step"],
+                num_generations_per_prompt=master_config.ppo[
+                    "num_generations_per_prompt"
+                ],
+                include_training_worker_idle_ratio=False,
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
@@ -2091,9 +2129,9 @@ def async_ppo_train(
         raise NotImplementedError("NeMo Gym rollout is not supported for async PPO")
     if master_config.ppo["use_dynamic_sampling"]:
         raise NotImplementedError("Dynamic sampling is not supported for async PPO")
-    if master_config.ppo["reward_scaling"]["enabled"]:
+    if master_config.ppo["reward_scaling"].enabled:
         raise NotImplementedError("Reward scaling is not supported for async PPO")
-    if master_config.ppo["reward_shaping"]["enabled"]:
+    if master_config.ppo["reward_shaping"].enabled:
         raise NotImplementedError("Reward shaping is not supported for async PPO")
     if master_config.data["use_multiple_dataloader"]:
         raise NotImplementedError(
@@ -2988,6 +3026,11 @@ def async_ppo_train(
                 metrics,
                 timing_metrics,
                 master_config,
+                num_prompts_per_step=master_config.ppo["num_prompts_per_step"],
+                num_generations_per_prompt=master_config.ppo[
+                    "num_generations_per_prompt"
+                ],
+                include_training_worker_idle_ratio=False,
             )
 
             collector_efficiency = ray.get(

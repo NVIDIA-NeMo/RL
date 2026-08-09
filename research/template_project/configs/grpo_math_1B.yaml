@@ -8,10 +8,17 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
+  # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  val_num_generations_per_prompt: 1
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -281,6 +288,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:

@@ -772,6 +772,41 @@ def test_batched_message_log_to_flat_message_with_packed_images() -> None:
     assert torch.equal(input_lengths, torch.tensor([4, 5], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("image_first", [True, False])
+def test_batched_message_log_to_flat_message_with_image_free_sample(
+    image_first: bool,
+) -> None:
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    image = torch.randn(1, 3, 4, 4)
+    image_log: LLMMessageLogType = [
+        {
+            "role": "user",
+            "token_ids": torch.tensor([1, 2]),
+            "pixel_values": PackedTensor(image, dim_to_pack=0),
+        }
+    ]
+    image_free_log: LLMMessageLogType = [
+        {"role": "user", "token_ids": torch.tensor([3, 4])}
+    ]
+    batch_logs = (
+        [image_log, image_free_log] if image_first else [image_free_log, image_log]
+    )
+
+    batched, _ = batched_message_log_to_flat_message(batch_logs)
+
+    pixel_values = batched["pixel_values"]
+    assert isinstance(pixel_values, PackedTensor)
+    assert len(pixel_values) == 2
+    expected = [image, None] if image_first else [None, image]
+    for actual, expected_value in zip(pixel_values.tensors, expected):
+        if expected_value is None:
+            assert actual is None
+        else:
+            assert torch.equal(actual, expected_value)
+    assert "pixel_values" in batched.get_multimodal_dict()
+
+
 @pytest.mark.hf_gated
 def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")

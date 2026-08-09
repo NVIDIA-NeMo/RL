@@ -139,7 +139,7 @@ def test_config_v2_same_as_v1(config_file):
 
     config_v2 = master_config_class(**config_v1)
     if "grpo" in config_v1 and "async_grpo" in config_v1["grpo"]:
-        assert isinstance(config_v2.grpo["async_grpo"], AsyncGRPOConfig)
+        assert isinstance(config_v2.grpo.async_grpo, AsyncGRPOConfig)
     if "ppo" in config_v1 and "async_ppo" in config_v1["ppo"]:
         assert isinstance(config_v2.ppo["async_ppo"], AsyncPPOConfig)
     config_v2 = config_v2.model_dump()

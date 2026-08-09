@@ -217,6 +217,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
@@ -247,6 +248,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
@@ -262,6 +266,7 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -402,6 +407,7 @@ value:
     train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
 
   max_grad_norm: 1.0
 
@@ -471,3 +477,9 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

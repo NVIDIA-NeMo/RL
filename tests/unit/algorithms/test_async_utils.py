@@ -39,6 +39,7 @@ from nemo_rl.algorithms.async_utils import (
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
+    GRPOConfig,
     MasterConfig,
     _get_next_nemo_gym_task_index,
     add_grpo_token_loss_masks_and_generation_logprobs,
@@ -1240,24 +1241,23 @@ class TestAsyncTrajectoryCollector:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        config = {
-            "grpo": {
-                "num_prompts_per_step": 2,
-                "num_generations_per_prompt": 3,
-                "max_rollout_turns": 1,
-                "async_grpo": AsyncGRPOConfig(max_trajectory_age_steps=2),
-            },
-            "policy": {
+        return MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=3,
+                max_rollout_turns=1,
+                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=2),
+            ),
+            policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
-            "env": {"should_use_nemo_gym": False},
-            "logger": {
+            env={"should_use_nemo_gym": False},
+            logger={
                 "wandb_enabled": False,
                 "wandb": {"log_nemo_gym_full_result_tables": False},
             },
-        }
-        return MasterConfig.model_construct(**config)
+        )
 
     def test_collector_selects_ppo_config(self):
         """The shared collector derives PPO settings from its master config."""
@@ -1271,8 +1271,6 @@ class TestAsyncTrajectoryCollector:
         async_config = AsyncPPOConfig(
             max_trajectory_age_steps=3,
             warmup_max_trajectory_age_steps=5,
-            in_flight_weight_updates=False,
-            recompute_kv_cache_after_weight_updates=True,
         )
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},
@@ -1295,10 +1293,6 @@ class TestAsyncTrajectoryCollector:
         assert collector.algorithm_config is master_config.ppo
         assert collector.async_config is async_config
         assert collector.async_config.max_trajectory_age_steps == 3
-
-        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
-        collector.resume_after_refit()
-        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
 
         collector.set_generation_window(
             weight_version=2,
@@ -1462,8 +1456,9 @@ class TestAsyncTrajectoryCollector:
     def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
         """Test resume after refit invalidates cache without in-flight updates."""
         collector = self.create_local_collector()
-        collector.async_config.in_flight_weight_updates = False
-        collector.async_config.recompute_kv_cache_after_weight_updates = True
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = True
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
         collector.resume_after_refit()
@@ -1473,8 +1468,9 @@ class TestAsyncTrajectoryCollector:
     def test_resume_after_refit_skips_cache_invalidation_when_recompute_disabled(self):
         """Test resume after refit skips cache invalidation when recompute is disabled."""
         collector = self.create_local_collector()
-        collector.async_config.in_flight_weight_updates = True
-        collector.async_config.recompute_kv_cache_after_weight_updates = False
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = False
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
         collector.resume_after_refit()
@@ -2019,19 +2015,18 @@ class TestAsyncUtilsIntegration:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        config = {
-            "grpo": {
-                "num_prompts_per_step": 2,
-                "num_generations_per_prompt": 2,
-                "max_rollout_turns": 1,
-                "async_grpo": AsyncGRPOConfig(max_trajectory_age_steps=1),
-            },
-            "policy": {
+        return MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=2,
+                max_rollout_turns=1,
+                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=1),
+            ),
+            policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
-        }
-        return MasterConfig.model_construct(**config)
+        )
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
