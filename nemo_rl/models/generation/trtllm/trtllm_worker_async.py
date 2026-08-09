@@ -408,6 +408,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             sampling_config={
                 "temperature": self.cfg["temperature"],
                 "top_p": self.cfg["top_p"],
+                "top_k": self.cfg["top_k"],
             },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.engine_cfg.get(
