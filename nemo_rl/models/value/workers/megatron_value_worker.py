@@ -62,6 +62,7 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.hybridep import validate_megatron_config
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -354,7 +355,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
         # Validate configuration
-        self.megatron_cfg.validate()
+        validate_megatron_config(self.megatron_cfg, self._policy_like_cfg)
 
         assert self.megatron_cfg.model.virtual_pipeline_model_parallel_size in (
             None,

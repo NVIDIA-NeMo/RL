@@ -63,6 +63,7 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.hybridep import validate_megatron_config
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -487,7 +488,7 @@ class MegatronPolicyWorkerImpl(
             self.megatron_cfg.rerun_state_machine.check_for_nan_in_loss = False
 
         # Validate configuration
-        self.megatron_cfg.validate()
+        validate_megatron_config(self.megatron_cfg, self.cfg)
 
         # Step 4: Setup Megatron model and components
         assert not (skip_weight_load and (init_optimizer or init_reference_model)), (
