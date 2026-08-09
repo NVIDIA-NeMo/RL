@@ -40,10 +40,10 @@ def test_ci_image_runtime_dependencies_are_readable_by_non_root_users():
         "FROM scratch AS nemo-rl"
     )
     assert (
-        "FROM ghcr.io/astral-sh/uv:${UV_VERSION}@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa AS uv"
+        "curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | "
+        "XDG_BIN_HOME=/usr/local/bin sh"
         in dockerfile
     )
-    assert "COPY --from=uv /uv /uvx /usr/local/bin/" in dockerfile
     assert "ENV UV_CACHE_DIR=/opt/uv/cache" in dockerfile
     assert "ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python" in dockerfile
     assert "/root/.local/bin" not in dockerfile
