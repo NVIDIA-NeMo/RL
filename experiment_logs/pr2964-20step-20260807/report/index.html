@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -258,7 +258,7 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-08 20:42 PDT</span>
+        <span>Updated 2026-08-08 21:03 PDT</span>
         <span>Base a028b33b · Super fix validation 3d6d1324 · minimal PR candidate 734c5d8b</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore workload candidate c8cedc3d · exact Bridge-pin backport 788db41f</span>
@@ -266,11 +266,11 @@
       </div>
     </header>
 
-    <div class="cards" aria-label="Validation status summary">
+    <section class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Both Qwen models passed · Super running</span></div>
-        <p>Final Qwen3-30B-A3B job 506437, Qwen3-235B job 506438, and Nemotron Super HybridEP job 506434 all completed 20/20 with exit <code>0:0</code>. Exact-source Q30 baseline 507045 also completed 20/20 with exit <code>0:0</code>; Q235 has entered Step 9 and Super is on its final Step 20 with zero strict runtime fatals.</p>
+        <div class="value"><span class="pill pending">Strict Q30/Super A/B complete · official stack running</span></div>
+        <p>Final Qwen3-30B-A3B job 506437, Qwen3-235B job 506438, Nemotron Super HybridEP job 506434, Q30 baseline 507045, and Super baseline 506464 all completed 20/20 with exit <code>0:0</code>. Q235 baseline is on Step 12. Official-Bridge Q30 is on Step 8; Super connected all 256 GPUs and entered model setup.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -285,13 +285,13 @@
       <article class="card">
         <div class="label">Measurements</div>
         <div class="value"><span class="pill ready">Two completed Qwen comparisons</span></div>
-        <p>Final strict same-source Q30 Steps 2–20 show 3.55%/13.61%/9.42% lower E2E/LogProb/policy time and 3.85%/15.89%/10.29% higher throughput. The Q235 strict baseline is on Step 9. Super's matched Steps 2–19 window shows 1.00%/10.50%/45.39% lower time.</p>
+        <p>Final strict same-source Q30 Steps 2–20 show 3.55%/13.61%/9.42% lower E2E/LogProb/policy time and 3.85%/15.89%/10.29% higher throughput. Final Super Steps 2–20 show 1.37%/9.50%/44.00% lower time and −1.82%/+8.90%/+69.91% E2E/LogProb/policy throughput changes. Q235 final strict results await its baseline.</p>
       </article>
-    </div>
+    </section>
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-08 20:42 PDT. Final Qwen3-30B-A3B job 506437, Qwen3-235B job 506438, and Nemotron Super HybridEP job 506434 completed 20/20 with exit <code>0:0</code>. Exact-source Q30 baseline 507045 also completed 20/20 with exit <code>0:0</code>; Q235 baseline 507046 has entered Step 9 and Super baseline 506464 is on final Step 20 with zero strict runtime fatals. Official-Bridge Q30 job 507111 passed its first-five-minute gate; Q235 507112 and Super 506895 are dependency-pending. Hardened NeMo candidate 734c5d8b passed 10/10 focused tests; review-coverage commit e7d87801 passed 13/13 in job 506966.</p>
+      <p class="section-note">Live snapshot at 2026-08-08 21:03 PDT. Final Qwen3-30B-A3B job 506437, Qwen3-235B job 506438, Nemotron Super HybridEP job 506434, exact-source Q30 baseline 507045, and Super baseline 506464 completed 20/20 with exit <code>0:0</code>. Q235 baseline 507046 is on Step 12 with zero classified runtime fatals. Official-Bridge Q30 507111 is on Step 8; Super 506895 connected all 256 GPUs and entered model setup; Q235 507112 is dependency-pending. Hardened NeMo candidate 734c5d8b passed 10/10 focused tests; review-coverage commit e7d87801 passed 13/13 in job 506966.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -401,16 +401,16 @@
         <article class="job">
           <div class="job-head">
             <h3>506123 / 506276 / 506397 / 506434 / 506464 · Canonical Super pair</h3>
-            <span class="pill pending">HybridEP complete · baseline Step 18</span>
+            <span class="pill ready">Strict A/B complete</span>
           </div>
-          <p>Baseline 506123 completed 14 steps and entered Step 15 before its intentionally superseded four-hour allocation timed out; no runtime fatal occurred. Like-for-like eight-hour replacement 506464 has entered final Step-20 validation with the canonical 32n8g recipe. HybridEP 506276 passed full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather during the first policy backward. Retry 506397 aligned once before forward and completed seven clean steps before intentional cancellation. Final job 506434 additionally excludes padding rows from expert dispatch and completed all 20 steps in 5:14:20 with exit <code>0:0</code>.</p>
+          <p>Baseline 506123 completed 14 steps and entered Step 15 before its intentionally superseded four-hour allocation timed out; no runtime fatal occurred. Like-for-like eight-hour replacement 506464 completed all 20 steps in 5:18:25 with exit <code>0:0</code>. HybridEP 506276 passed full 256-rank LogProb, then mismatched an MCore per-layer scalar MAX with an expert-parameter all-gather during the first policy backward. Retry 506397 aligned once before forward and completed seven clean steps before intentional cancellation. Final job 506434 additionally excludes padding rows from expert dispatch and completed all 20 steps in 5:14:20 with exit <code>0:0</code>.</p>
         </article>
         <article class="job">
           <div class="job-head">
             <h3>506437 / 506438 · Final Qwen regression matrix</h3>
             <span class="pill ready">Both completed · exit 0</span>
           </div>
-          <p>Qwen3-30B-A3B uses <code>grpo-qwen3-30ba3b-4n8g.yaml</code> on 4 × 8 B200; Qwen3-235B uses <code>grpo-qwen3-235b-16n8g.yaml</code> on 16 × 8 B200. Both final HybridEP arms use the custom MCore routing/broadcast candidate and completed all 20 training steps plus Step-20 validation with Slurm exit <code>0:0</code>. Their all-to-all baselines use official Bridge/MCore. Shutdown-only CuMem, SIGTERM, and socket warnings occurred after successful teardown; no training task crashed.</p>
+          <p>Qwen3-30B-A3B uses <code>grpo-qwen3-30ba3b-4n8g.yaml</code> on 4 × 8 B200; Qwen3-235B uses <code>grpo-qwen3-235b-16n8g.yaml</code> on 16 × 8 B200. Both final HybridEP arms use the same routing/broadcast candidate source stack as exact baselines 507045/507046 and completed all 20 training steps plus Step-20 validation with Slurm exit <code>0:0</code>. Shutdown-only CuMem, SIGTERM, and socket warnings occurred after successful teardown; no training task crashed.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -436,23 +436,23 @@
         <article class="job">
           <div class="job-head">
             <h3>506895 · Default Megatron-Bridge full Super validation</h3>
-            <span class="pill pending">Dependency-pending</span>
+            <span class="pill pending">Running · 256/256 connected</span>
           </div>
-          <p>Queued behind the canonical Super pair to avoid oversubscribing 256 GPUs. It uses canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, 32 × 8 B200, official Megatron-Bridge <code>573e088c</code>, its exact MCore pin plus routing fix <code>788db41f</code>, NeMo prepadding candidate <code>4846673c</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. The NeMo production files in <code>4846673c</code> are byte-identical to candidate <code>734c5d8b</code>; only <code>pyproject.toml</code> and <code>uv.lock</code> add the validated DeepEP dependency pin, while <code>e7d87801</code> adds tests only. Superseded job 506861 was cancelled while dependency-pending with zero nodes and zero elapsed time.</p>
+          <p>Started after the canonical Super baseline completed, connected all 256 GPUs, launched its driver, and entered model setup with zero classified runtime fatals. It uses canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, official Megatron-Bridge <code>573e088c</code>, its exact MCore pin plus routing fix <code>788db41f</code>, NeMo prepadding candidate <code>4846673c</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. The NeMo production files in <code>4846673c</code> are byte-identical to candidate <code>734c5d8b</code>; only <code>pyproject.toml</code> and <code>uv.lock</code> add the validated DeepEP dependency pin, while <code>e7d87801</code> adds tests only.</p>
         </article>
         <article class="job">
           <div class="job-head">
             <h3>507034 / 507045 / 507046 · Exact-source Qwen baselines</h3>
             <span class="pill pending">Q30 complete · Q235 Step 9</span>
           </div>
-          <p>These all-to-all baselines use the exact source stack of HybridEP jobs 506437/506438: NeMo RL <code>3d6d1324</code>, Bridge <code>372b8f03</code>, and MCore <code>c8cedc3d</code>. Job 507034 lost one vLLM native child on <code>pool0-0337</code> during CUDA-graph startup without CPU/GPU OOM, NCCL, illegal-access, or HybridEP evidence. Retry 507045 excluded that node and completed 20/20 in 1:01:09 with exit <code>0:0</code>; strict Steps 2–20 show 3.55% lower E2E time, 9.42% lower policy time, and 13.61% lower LogProb time. Q235 retry 507046 has entered Step 9 with zero strict runtime fatals.</p>
+          <p>These all-to-all baselines use the exact source stack of HybridEP jobs 506437/506438: NeMo RL <code>3d6d1324</code>, Bridge <code>372b8f03</code>, and MCore <code>c8cedc3d</code>. Job 507034 lost one vLLM native child on <code>pool0-0337</code> during CUDA-graph startup without CPU/GPU OOM, NCCL, illegal-access, or HybridEP evidence. Retry 507045 excluded that node and completed 20/20 in 1:01:09 with exit <code>0:0</code>; strict Steps 2–20 show 3.55% lower E2E time, 9.42% lower policy time, and 13.61% lower LogProb time. Q235 retry 507046 has entered Step 12 with zero classified runtime fatals.</p>
         </article>
         <article class="job">
           <div class="job-head">
             <h3>507111 / 507112 · Default Megatron-Bridge Qwen validation</h3>
             <span class="pill pending">Q30 running · Q235 dependency-pending</span>
           </div>
-          <p>Both jobs use NeMo candidate <code>4846673c</code>, official Megatron-Bridge <code>573e088c</code>, exact pinned-MCore routing backport <code>788db41f</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. Q30 507111 uses the canonical 4n8g performance recipe and passed its first-five-minute gate with all 32 vLLM workers initialized. Q235 507112 uses the canonical 16n8g recipe and waits for strict baseline 507046 to release its dependency; pending jobs consume no GPUs.</p>
+          <p>Both jobs use NeMo candidate <code>4846673c</code>, official Megatron-Bridge <code>573e088c</code>, exact pinned-MCore routing backport <code>788db41f</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix. Q30 507111 uses the canonical 4n8g performance recipe, passed its first-five-minute gate with all 32 vLLM workers initialized, and reached Step 8 without a classified runtime fatal. Q235 507112 uses the canonical 16n8g recipe and waits for strict baseline 507046 to release its dependency; pending jobs consume no GPUs.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -515,8 +515,8 @@
               <td><strong>NVIDIA Nemotron 3 Super 120B-A12B</strong><br><code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code></td>
               <td>baseline 506123 / 506464<br>hang-fix 506397<br>final HybridEP 506434</td>
               <td>32 × 8 B200</td>
-              <td>historical baseline 14 / replacement 19 + final validation / prepad retry 7 / final HybridEP 20</td>
-              <td class="metric">Final HybridEP 506434 completed 20/20 in 5:14:20 with exit 0 and no strict runtime fatal. Baseline 506464 is on final Step-20 validation. Matched Steps 2–19 show directional E2E/policy/LogProb time reductions of 1.00%/45.39%/10.50%; final paired Steps 2–20 metrics await baseline exit.</td>
+              <td>historical baseline 14 / replacement baseline 20 / prepad retry 7 / final HybridEP 20</td>
+              <td class="metric">Baseline 506464 and final HybridEP 506434 both completed 20/20 with exit 0 and no strict runtime fatal. Strict Steps 2–20 show E2E/policy/LogProb time reductions of 1.37%/44.00%/9.50%.</td>
               <td class="metric">893.03 ± 246.57 s</td>
               <td class="metric">782.13 ± 16.75 s</td>
               <td class="metric">5.34 ± 1.20 s</td>
@@ -576,27 +576,27 @@
       </div>
       <div class="callout">Correctness sanity: mean reward is 0.58378 baseline vs 0.58326 HybridEP; every measured step has 512 valid samples. Step-10 and Step-20 validation accuracies are identical at 0.6667 and 0.7333, respectively. Offline W&amp;B IDs are <code>ywy8ymxi</code> (baseline) and <code>3loify6c</code> (HybridEP). No HybridEP padding telemetry was emitted because PP8 Qwen3-235B intentionally uses MCore's internal padding path, so alignment overhead is not inferred as zero.</div>
 
-      <h3>Nemotron 3 Super · completed HybridEP arm and live comparison</h3>
-      <p class="section-note">GCP-NRT B200 · canonical 32n8g performance recipe. HybridEP 506434 completed Steps 2–20 (n=19); the live table compares matched Steps 2–19 (n=18) while baseline 506464 runs final Step-20 validation.</p>
+      <h3>Nemotron 3 Super · strict same-source dispatcher A/B</h3>
+      <p class="section-note">GCP-NRT B200 · canonical 32n8g performance recipe · arithmetic mean ± sample standard deviation over matched Steps 2–20 (n=19). Both arms completed 20/20 with exit <code>0:0</code>.</p>
       <div class="table-wrap">
         <table>
           <thead>
             <tr><th>Metric</th><th>All-to-all · 506464</th><th>HybridEP · 506434</th><th>Directional delta</th></tr>
           </thead>
           <tbody>
-            <tr><td>E2E step time</td><td>862.90 ± 185.85 s</td><td>854.25 ± 184.70 s</td><td class="metric">1.00% faster</td></tr>
-            <tr><td>Generation time</td><td>784.89 ± 18.59 s</td><td>783.56 ± 15.98 s</td><td class="metric">0.17% faster</td></tr>
-            <tr><td>Logprob time</td><td>5.63 ± 1.16 s</td><td>5.04 ± 1.08 s</td><td class="metric">10.50% faster</td></tr>
-            <tr><td>Policy-training time</td><td>9.67 ± 2.60 s</td><td>5.28 ± 1.21 s</td><td class="metric">45.39% faster</td></tr>
-            <tr><td>E2E throughput</td><td>3.79 ± 0.81</td><td>3.72 ± 0.83</td><td class="metric">1.83% lower</td></tr>
-            <tr><td>Generation throughput</td><td>4.03 ± 0.63</td><td>3.93 ± 0.68</td><td class="metric">2.56% lower</td></tr>
-            <tr><td>Logprob throughput</td><td>577.97 ± 128.76</td><td>636.00 ± 171.66</td><td class="metric">10.04% higher</td></tr>
-            <tr><td>Policy-training throughput</td><td>347.12 ± 102.48</td><td>605.27 ± 136.18</td><td class="metric">74.37% higher</td></tr>
+            <tr><td>E2E step time</td><td>905.40 ± 258.72 s</td><td>893.03 ± 246.57 s</td><td class="metric">1.37% faster</td></tr>
+            <tr><td>Generation time</td><td>785.98 ± 18.68 s</td><td>782.13 ± 16.75 s</td><td class="metric">0.49% faster</td></tr>
+            <tr><td>Logprob time</td><td>5.63 ± 1.13 s</td><td>5.10 ± 1.07 s</td><td class="metric">9.50% faster</td></tr>
+            <tr><td>Policy-training time</td><td>9.53 ± 2.59 s</td><td>5.34 ± 1.20 s</td><td class="metric">44.00% faster</td></tr>
+            <tr><td>E2E throughput</td><td>3.68 ± 0.91</td><td>3.62 ± 0.92</td><td class="metric">1.82% lower</td></tr>
+            <tr><td>Generation throughput</td><td>4.02 ± 0.62</td><td>3.92 ± 0.66</td><td class="metric">2.43% lower</td></tr>
+            <tr><td>Logprob throughput</td><td>575.80 ± 125.49</td><td>627.04 ± 171.34</td><td class="metric">8.90% higher</td></tr>
+            <tr><td>Policy-training throughput</td><td>351.22 ± 101.18</td><td>596.76 ± 137.44</td><td class="metric">69.91% higher</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="callout">Completed HybridEP 506434 Steps 2–20 (n=19): E2E 893.03 ± 246.57 s, generation 782.13 ± 16.75 s, policy 5.34 ± 1.20 s, and LogProb 5.10 ± 1.07 s. Direct throughput is 3.62 / 3.92 / 596.76 / 627.04 tok/s/GPU for E2E / generation / policy / LogProb. Offline W&amp;B ID: <code>5321e23i</code>. Mean loss/reward/KL are 0.01666 / 0.57010 / 0.00318; validation accuracy is 0.6133 at Step 10 and 0.6211 at Step 20. Final paired deltas remain pending until baseline 506464 completes.</div>
-      <div class="callout">All 32 logged Super alignment calls had zero padding: 8,192 → 8,192 local tokens and 262,144 → 262,144 group tokens. Calls 5–32 occurred during Steps 2–8 and each added one telemetry-only group SUM on the HybridEP side. This establishes zero added-token overhead in those 32 calls; peak GPU-memory and persistent-storage overhead were not separately measured. A telemetry-free secondary Steps 9–15 window is only n=7: E2E is 0.52% slower, generation is 1.30% slower, policy training is 39.41% faster, and LogProb is 8.79% slower; corresponding throughput changes are −2.17%, −2.48%, +65.98%, and −6.73%. These small-sample values are not conclusions. The pair also started at different times on different physical node sets, so small deltas remain sensitive to cluster variance. The telemetry-free default-Bridge validation job 506895 will provide the cleaner follow-up.</div>
+      <div class="callout">Correctness sanity: mean loss is 0.01325 baseline vs 0.01666 HybridEP; reward is 0.56682 vs 0.57010; KL is 0.00303 vs 0.00318. Step-10 validation accuracy is 0.6094 vs 0.6133 and Step-20 is 0.6133 vs 0.6211. No accuracy or reward regression signal is present. Offline W&amp;B IDs are <code>kv68ur20</code> (baseline) and <code>5321e23i</code> (HybridEP).</div>
+      <div class="callout">All 32 logged Super alignment calls had zero padding: 8,192 → 8,192 local tokens and 262,144 → 262,144 group tokens. Calls 5–32 occurred during Steps 2–8 and each added one experiment-only telemetry SUM on the HybridEP side. This establishes zero added-token overhead in those calls; peak GPU-memory and persistent-storage overhead were not separately measured. As a sensitivity check, telemetry-free Steps 9–20 (n=12) show E2E/generation/policy/LogProb time changes of −0.88%/−0.09%/−36.64%/+5.43%, and throughput changes of −3.33%/−3.49%/+53.35%/−6.33%. The primary predeclared window remains Steps 2–20; small E2E and LogProb differences are sensitive to rollout and node variance.</div>
     </section>
 
     <section aria-labelledby="historical-title">
@@ -627,23 +627,23 @@
 
     <section aria-labelledby="charts-title">
       <h2 id="charts-title">Metric charts</h2>
-      <p class="section-note">Qwen3-30B-A3B · GCP-NRT B200 · Steps 2–20. Super does not yet have a completed 20-step result and is intentionally absent.</p>
+      <p class="section-note">Qwen3-30B-A3B · GCP-NRT B200 · Steps 2–20. The charts retain the detailed Qwen traces; the completed Super A/B is summarized in the tables above.</p>
       <div class="chart-grid">
         <article class="chart-card">
           <h3>End-to-end and phase step time</h3>
-          <div id="chart-step-time" class="chart-slot" aria-label="Qwen per-step timing chart"></div>
+          <div id="chart-step-time" class="chart-slot" role="img" aria-label="Qwen per-step timing chart"></div>
         </article>
         <article class="chart-card">
           <h3>End-to-end and phase throughput</h3>
-          <div id="chart-throughput" class="chart-slot" aria-label="Qwen per-step throughput chart"></div>
+          <div id="chart-throughput" class="chart-slot" role="img" aria-label="Qwen per-step throughput chart"></div>
         </article>
         <article class="chart-card">
           <h3>Reward stability</h3>
-          <div id="chart-training-sanity" class="chart-slot" aria-label="Qwen per-step reward chart"></div>
+          <div id="chart-training-sanity" class="chart-slot" role="img" aria-label="Qwen per-step reward chart"></div>
         </article>
         <article class="chart-card">
           <h3>Training loss stability</h3>
-          <div id="chart-loss" class="chart-slot" aria-label="Qwen per-step training loss chart"></div>
+          <div id="chart-loss" class="chart-slot" role="img" aria-label="Qwen per-step training loss chart"></div>
         </article>
       </div>
     </section>
@@ -747,10 +747,10 @@
         Qwen job 506437 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means −0.00034 and 0.52542, respectively. Strict same-source baseline 507045 has mean reward 0.52431. HybridEP validation accuracy is 0.5547 versus 0.5469 at Step 10 and 0.5508 versus 0.5352 at Step 20. These checks establish execution stability and show no numerical-regression signal in this sample.
       </div>
       <div class="callout">
-        Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for explicitly supported sequence-packed HybridEP cases. Hardened candidate <code>734c5d8b</code> passed 10/10 server tests; review-coverage commit <code>e7d87801</code> passed 13/13 in job 506966, including both CP=2 ranks and the real <code>process_microbatch</code> preprocessing path. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's routing-mask fix <code>788db41f</code> remain necessary for this GCP-NRT Super path. HybridEP 506397 completed seven clean steps beyond the former hang before intentional cancellation; final candidate 506434 completed all 20 steps with exit <code>0:0</code>, while baseline 506464 is running final Step-20 validation without strict runtime fatals.
+        Current conclusion: the earlier NeMo RL prepadding concept was correct. Delegating unequal-rank alignment to every MCore MoE layer simplified the code and works for Qwen EP=8, but Super EP=32 exposed a collective-ordering collision with distributed-optimizer parameter all-gathers. The corrected NeMo RL path creates the physical THD padding mask, aligns packed inputs once before model collectives, updates <code>PackedSeqParams</code>, and disables MCore's per-layer padding collective for explicitly supported sequence-packed HybridEP cases. Hardened candidate <code>734c5d8b</code> passed 10/10 server tests; review-coverage commit <code>e7d87801</code> passed 13/13 in job 506966, including both CP=2 ranks and the real <code>process_microbatch</code> preprocessing path. DeepEP's DMA-BUF CUDA-address fix <code>a9d657d2</code> and MCore's routing-mask fix <code>788db41f</code> remain necessary for this GCP-NRT Super path. HybridEP 506397 completed seven clean steps beyond the former hang before intentional cancellation; final candidate 506434 and strict baseline 506464 both completed all 20 steps with exit <code>0:0</code> and zero strict runtime fatals.
       </div>
       <div class="callout">
-        Dependency boundary: NeMo candidate <code>734c5d8b</code> alone is not sufficient because official Megatron-Bridge <code>573e088c</code> still pins unpatched MCore <code>6513e3e2</code>. Exact-pin validation backport <code>788db41f</code> combines merged-dev MCore PR #5542 with approved, open main PR #6114; its test-only precursor failed the two target tests in job 506870, then job 506884 passed 8 tests with one TE-dependent skip. Final integration must update Bridge/MCore to a revision containing both fixes; job 506895's external source override is validation-only, not a durable PR dependency. NeMo <code>734c5d8b</code> makes prepadding an explicit PP1/MTP0/NeMo-owned-packing opt-in and fails closed outside those boundaries. PP8 Qwen3-235B continues using MCore's internal padding. Job 506895 remains dependency-pending behind the active canonical Super pair.
+        Dependency boundary: NeMo candidate <code>734c5d8b</code> alone is not sufficient because official Megatron-Bridge <code>573e088c</code> still pins unpatched MCore <code>6513e3e2</code>. Exact-pin validation backport <code>788db41f</code> combines merged-dev MCore PR #5542 with approved, open main PR #6114; its test-only precursor failed the two target tests in job 506870, then job 506884 passed 8 tests with one TE-dependent skip. Final integration must update Bridge/MCore to a revision containing both fixes; job 506895's external source override is validation-only, not a durable PR dependency. NeMo <code>734c5d8b</code> makes prepadding an explicit PP1/MTP0/NeMo-owned-packing opt-in and fails closed outside those boundaries. PP8 Qwen3-235B continues using MCore's internal padding. Job 506895 is now running the full 20-step official-Bridge validation.
       </div>
     </section>
 
@@ -767,7 +767,7 @@
         </article>
         <article class="provenance-item">
           <h3>Pending default-Bridge validation stack</h3>
-          <p>NeMo RL: <code>4846673cf66cb47fc1eecf0ea22d17c1bead8f75</code><br>Official Megatron-Bridge: <code>573e088c9c6740082c39744e03dc5b009e730ed4</code><br>Exact-pin MCore validation backport: <code>788db41fedf7d4bb7dd7a6989ef47c6ba1960479</code><br>DeepEP: <code>17cfb817</code> + DMA-BUF fix<br>Job: <code>506895</code> · dependency-pending</p>
+          <p>NeMo RL: <code>4846673cf66cb47fc1eecf0ea22d17c1bead8f75</code><br>Official Megatron-Bridge: <code>573e088c9c6740082c39744e03dc5b009e730ed4</code><br>Exact-pin MCore validation backport: <code>788db41fedf7d4bb7dd7a6989ef47c6ba1960479</code><br>DeepEP: <code>17cfb817</code> + DMA-BUF fix<br>Job: <code>506895</code> · running</p>
         </article>
         <article class="provenance-item">
           <h3>HybridEP topology</h3>
