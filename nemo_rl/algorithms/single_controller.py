@@ -50,6 +50,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.rollout_timing import (
+    NemoGymRolloutTiming,
+)
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
@@ -75,11 +78,11 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Generous: a healthy step can wait several minutes on generation alone.
 _SELECT_STALL_WARN_SECONDS = 600.0
 
-# Cadence of the standalone engine-saturation report. Deliberately coarser than
+# Cadence of the step-independent telemetry report. Deliberately coarser than
 # ``vllm_metrics_logger_interval``: the workers keep sampling at that interval
 # regardless, so a slower poll still summarizes every sample while keeping the
 # cross-cluster ``ray.get`` fan-out (one call per DP leader) infrequent.
-_SATURATION_REPORT_SECONDS = 30.0
+_TELEMETRY_REPORT_SECONDS = 30.0
 
 
 def _summarize_generation_saturation(gen_metrics: dict[str, Any]) -> dict[str, float]:
@@ -235,6 +238,10 @@ class SingleControllerActor:
             "sequence_lengths": [],
         }
 
+        # NeMo-Gym rollout phase times pooled over the groups committed so far.
+        # Reset once the step they cover has been reported.
+        self._rollout_timing = NemoGymRolloutTiming()
+
         print(
             f"SingleControllerActor: "
             f"sampler={self._async_cfg.sampler.name} "
@@ -250,7 +257,7 @@ class SingleControllerActor:
         """Main entry point. Runs until max_train_steps is reached."""
         # Started before the first weight sync so a run that stalls during
         # setup still reports whether the engines are saturated.
-        saturation_task = asyncio.create_task(self._saturation_report_pump())
+        telemetry_task = asyncio.create_task(self._telemetry_report_pump())
         try:
             # Synchronize weights before starting the pumps
             await self._sync_weights()
@@ -276,8 +283,8 @@ class SingleControllerActor:
                 finally:
                     self._logger.finish()
         finally:
-            saturation_task.cancel()
-            await asyncio.gather(saturation_task, return_exceptions=True)
+            telemetry_task.cancel()
+            await asyncio.gather(telemetry_task, return_exceptions=True)
 
         return {
             "train_steps": self._train_steps,
@@ -342,7 +349,7 @@ class SingleControllerActor:
                     * (2 ** (attempt - 2))
                 )
             try:
-                await self._rollout_manager.generate_and_push(
+                rollout_metrics = await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
                 )
             except asyncio.CancelledError:
@@ -394,6 +401,7 @@ class SingleControllerActor:
                     ) from e
                 return False
             else:
+                self._rollout_timing.add(rollout_metrics)
                 self._consecutive_rollout_failures = 0
                 return True
 
@@ -784,6 +792,7 @@ class SingleControllerActor:
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
             await self._report_generation_saturation()
+            await self._report_rollout_postprocess()
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -796,18 +805,34 @@ class SingleControllerActor:
                 flush=True,
             )
 
-    async def _saturation_report_pump(self) -> None:
-        """Print engine saturation on a fixed cadence, independent of steps.
+    async def _telemetry_report_pump(self) -> None:
+        """Print engine and rollout telemetry on a fixed cadence, independent of steps.
 
-        ``_report_generation_saturation`` only runs when a training step
-        closes, so a run that stalls before completing its first step emits no
-        engine telemetry at all — precisely the runs where knowing whether the
-        engines are saturated matters most. This pump closes that gap on
-        stdout. It never clears the accumulated samples, so the step-boundary
-        W&B reporting is unaffected.
+        The step-boundary reporters only run when a training step closes, so a
+        run that stalls before completing its first step emits no telemetry at
+        all — precisely the runs where it matters most. This pump closes that
+        gap on stdout. It clears nothing, so the step-boundary W&B reporting is
+        unaffected.
         """
         while True:
-            await asyncio.sleep(_SATURATION_REPORT_SECONDS)
+            await asyncio.sleep(_TELEMETRY_REPORT_SECONDS)
+
+            # Reported first, and unconditionally: these totals are local
+            # state, so unlike engine saturation they survive a generation
+            # fleet that is unreachable or not collecting metrics at all.
+            rollout_summary = self._rollout_timing.summarize()
+            if rollout_summary:
+                print(
+                    f"🧵 rollout phases (train_step={self._train_steps}): "
+                    f"await_results={rollout_summary['await_results']:.2f}s "
+                    f"postprocess_results="
+                    f"{rollout_summary['postprocess_results']:.2f}s "
+                    f"postprocess_results_pct="
+                    f"{rollout_summary['postprocess_results_pct']:.2f} "
+                    f"groups={int(rollout_summary['groups'])}",
+                    flush=True,
+                )
+
             try:
                 # Collection does a blocking ray.get, so keep it off the event
                 # loop the rollout pump shares.
@@ -827,6 +852,37 @@ class SingleControllerActor:
                 f"🚦 engine saturation (train_step={self._train_steps}): {summary}",
                 flush=True,
             )
+
+    async def _report_rollout_postprocess(self) -> None:
+        """Report NeMo-Gym rollout phase times for the step just closed.
+
+        ``NemoGym.run_rollouts`` postprocesses each completed rollout inline on
+        the Gym actor's event loop — pure CPU work with no await points — so
+        the share of rollout time it takes is what decides whether moving that
+        call off the loop would buy anything.
+
+        No-ops on the native async rollout path, which has no such phase.
+        """
+        summary = self._rollout_timing.summarize()
+        if not summary:
+            return
+
+        print("\n🧵 NeMo-Gym rollout phases:")
+        print(f"  • await_results: {summary['await_results']:.2f}s")
+        print(f"  • postprocess_results: {summary['postprocess_results']:.2f}s")
+        print(
+            f"  • postprocess_results_pct: {summary['postprocess_results_pct']:.2f}%",
+        )
+        print(f"  • groups: {int(summary['groups'])}", flush=True)
+
+        # W&B can block on the network; the rollout pump shares this loop.
+        await asyncio.to_thread(
+            self._logger.log_metrics,
+            summary,
+            step=self._train_steps,
+            prefix="timing/rollout",
+        )
+        self._rollout_timing.reset()
 
     async def _report_generation_saturation(self) -> None:
         """Report vLLM queue depth and KV-cache use for the step just closed.

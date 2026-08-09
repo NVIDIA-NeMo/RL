@@ -773,12 +773,16 @@ class RolloutManager:
 
     async def generate_and_push(
         self, input_sample: DatumSpec, *, target_step: Optional[int] = None
-    ) -> None:
+    ) -> dict[str, Any]:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+
+        Returns:
+            The group's rollout metrics. The buffer keeps only the tensors, so
+            returning them is the caller's one chance to report on the rollout.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
@@ -796,6 +800,7 @@ class RolloutManager:
                 start_weight_version=start_version,
                 end_weight_version=end_version,
             )
+            return record.rollout_metrics
         except BaseException:
             # A failed rollout must not leave an unready slot that can block an
             # in-order sampler. commit() rolls back any DataPlane rows it wrote.
