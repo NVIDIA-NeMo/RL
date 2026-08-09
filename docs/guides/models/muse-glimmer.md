@@ -49,18 +49,29 @@ and vLLM must come from local sources.
 
 ### 1. Clone the sources into `3rdparty/`
 
+Sources:
+
+- **AutoModel** — a git submodule on this branch, pinned to the branch carrying the
+  Onyx training path. The repository is private, cloned over SSH; make sure your key
+  is loaded (`ssh-add -l`) first. See
+  [Experiment with Custom vLLM](../use-custom-vllm.md#ssh-setup-for-private-repositories)
+  if you need to set up an agent.
+- **vLLM** — [main branch](https://github.com/vllm-project/vllm), where Muse Glimmer
+  support is merged.
+
 ```bash
-# AutoModel is a git submodule on this branch, pinned to the Onyx training branch.
-# The repository is private -- you need access to clone it.
 git submodule update --init 3rdparty/Automodel-workspace/Automodel
 
-# vLLM is not a submodule. Clone the branch carrying Muse Glimmer support.
 mkdir -p 3rdparty/vLLM-workspace
-git clone <muse-glimmer vLLM source> 3rdparty/vLLM-workspace/vllm
+git clone https://github.com/vllm-project/vllm.git 3rdparty/vLLM-workspace/vllm
 ```
 
 `pyproject.toml` installs vLLM from `3rdparty/vLLM-workspace/vllm` as an editable
 source, so `uv sync` fails if that directory is empty.
+
+If you check out a vLLM revision other than the one `uv.lock` was resolved against,
+re-run `uv lock` and keep the `flashinfer-*` and `nvidia-cutlass-dsl` pins in the
+`vllm` extra in sync with that revision's `requirements/cuda.txt`.
 
 ### 2. Force a worker-venv rebuild
 
@@ -70,6 +81,21 @@ AutoModel and vLLM sources unless you ask for a rebuild:
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 ```
+
+> [!IMPORTANT]
+> **Budget hours for the first run, and put the venvs on node-local disk.** This
+> branch is on torch 2.13, which no prebuilt `flash-attn` wheel targets, so
+> `flash-attn`, Transformer Engine, `mamba-ssm`, `causal-conv1d` and
+> `nv-grouped-gemm` all compile from source — and vLLM itself is an editable source
+> install, so it compiles too. On a shared filesystem this is pathologically slow:
+> measured throughput on Lustre was ~0.4 MB/s, against 257 packages in 16 s on
+> node-local disk. Point `UV_PROJECT_ENVIRONMENT` at local disk (or run inside a
+> writable container, where `/opt/ray_venvs` is already node-local) and keep
+> `UV_CACHE_DIR` on the shared filesystem so built wheels persist across jobs.
+>
+> Once a run has built the venvs, save the container so later jobs reuse them
+> instead of rebuilding — `_env_builder` early-returns when the venv's `python`
+> already exists, so a baked container skips this step entirely.
 
 > [!WARNING]
 > Keep the **policy** worker venv on whatever `nemo-automodel` pins for
