@@ -20,13 +20,15 @@ Covers:
   - save trigger + write path through _train_pump with fakes (period
     boundary, last step, timeout, disabled);
   - async-save finalization (rename deferred until finalize_async_save,
-    background failure re-raised at the next save);
+    background failure re-raised at the next save and, for the last save,
+    at shutdown);
   - metric_name behavior (non-"train:" rejected at config validation,
     train:* value recorded);
   - dataloader state: train_dataloader.pt written at save, position
     round-trip through a real StatefulDataLoader, dataset-swap guard,
     setup restore wiring + missing-file corruption check;
-  - replay buffer persistence (restore skipped on a sampler_name mismatch);
+  - replay buffer persistence (restore skipped on a sampler_name mismatch,
+    restored permits released by a live train pump);
   - setup_single_controller resume-path wiring (get_resume_paths forwarded
     to the trainer factory, save_state loaded from training_info.json).
 """
@@ -413,6 +415,28 @@ def _run_actor_run(mc: MasterConfig, actor_args: SingleControllerActorArgs):
     return asyncio.run(_main())
 
 
+def _run_restore_then_train_pump(
+    mc: MasterConfig, actor_args: SingleControllerActorArgs
+):
+    """Restore the replay buffer, then drive a live _train_pump.
+
+    Composes what _run_actor_run (max_num_steps=0) and _run_train_pump (no
+    restore) each cover in isolation: the permits taken by the restore must be
+    released by a running pump. The wait_for bounds a stalled pump.
+    """
+
+    async def _main():
+        actor = _ACTOR_CLS(mc, actor_args)
+        await actor._maybe_restore_replay_buffer()
+        actor._sampler = _FakeSampler()
+        with patch("ray.cluster_resources", return_value={"GPU": 0}):
+            await asyncio.wait_for(actor._train_pump(), timeout=60.0)
+        actor._checkpointer.shutdown()
+        return actor
+
+    return asyncio.run(_main())
+
+
 def _step_dir_names(ckpt_dir: Path) -> set[str]:
     if not ckpt_dir.exists():
         return set()
@@ -638,6 +662,23 @@ class TestAsyncSaveFinalization:
 
         with pytest.raises(RuntimeError, match="finalization failed"):
             _run_train_pump(mc, _make_actor_args(trainer=trainer), flush=False)
+
+    def test_failed_background_finalization_raises_at_shutdown(self, tmp_path):
+        # Companion to the test above for the *last* save: nothing after it
+        # calls finalize_pending, so the only thing that can surface the
+        # failure is run()'s exit path, which goes through shutdown().
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        trainer = _FailingFinalizeTrainer()
+
+        actor = _run_train_pump(mc, _make_actor_args(trainer=trainer), flush=False)
+
+        # The rename never happened: the checkpoint is still a tmp dir.
+        ckpt_dir = tmp_path / "checkpoints"
+        assert (ckpt_dir / "tmp_step_2").is_dir()
+        assert not (ckpt_dir / "step_2").exists()
+
+        with pytest.raises(RuntimeError, match="finalization failed"):
+            actor._checkpointer.shutdown()
 
 
 # ── metric_name behavior ─────────────────────────────────────────────────────
@@ -1024,16 +1065,20 @@ class TestReplayBufferPersistence:
         assert actor._buffer_capacity._value == 4 - 3
         assert result["train_steps"] == 0
 
-    def test_run_restore_at_full_capacity_does_not_hang(self, tmp_path):
-        # K == max_buffered_rollouts: the acquisitions must all complete
-        # without waiting (no pump is running yet to release permits).
+    def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
+        # The restore takes one capacity permit per group; a running pump must
+        # give them all back. Every other restore test uses max_num_steps=0,
+        # so the pump body never runs and a regression that leaks restored
+        # permits (starving the rollout pump) would go unnoticed.
+        # K == max_buffered_rollouts here, which also covers the full-capacity
+        # acquisition shape.
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
         torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
-        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
         buffer = _FakeTQBuffer(load_return=4)
 
-        actor, result = _run_actor_run(
+        actor = _run_restore_then_train_pump(
             mc,
             _make_actor_args(
                 tq_buffer=buffer,
@@ -1043,8 +1088,10 @@ class TestReplayBufferPersistence:
         )
 
         assert len(buffer.load_calls) == 1
-        assert actor._buffer_capacity._value == 0
-        assert result["train_steps"] == 0
+        assert actor._train_steps == 2
+        # Restore drained the semaphore to 0; the pump released one permit per
+        # selected group (2 steps x 2 prompt groups), so all 4 came back.
+        assert actor._buffer_capacity._value == 4
 
     def test_run_missing_replay_buffer_file_starts_empty(self, tmp_path, monkeypatch):
         # Resuming from a checkpoint that predates replay-buffer persistence:
