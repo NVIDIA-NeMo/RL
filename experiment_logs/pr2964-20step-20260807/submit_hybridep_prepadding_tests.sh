@@ -15,6 +15,7 @@ repo=${VALIDATION_REPO_OVERRIDE:-${experiment_root}/RL}
 bridge_source=${BRIDGE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}
 mcore_source=${MCORE_SOURCE_OVERRIDE:-${bridge_source}/3rdparty/Megatron-LM}
 container=${CONTAINER_OVERRIDE:-${work_root}/containers/nemo-rl-nightly-cw-fallback-20260808/nemo_rl_nightly_20260805_15171871.sqsh}
+policy_site_packages=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.13/site-packages
 test_gpus_per_node=${TEST_GPUS_PER_NODE:-8}
 test_scope=${HYBRIDEP_TEST_SCOPE:-full}
 test -n "${VALIDATION_HEAD_OVERRIDE:-}"
@@ -52,7 +53,7 @@ export CONTAINER="${container}"
 export MOUNTS=/lustre:/lustre
 export BASE_LOG_DIR="${run_root}/ray"
 export GPUS_PER_NODE="${test_gpus_per_node}"
-export PYTHONPATH="${repo}:${bridge_source}/src:${mcore_source}"
+export PYTHONPATH="${repo}:${bridge_source}/src:${mcore_source}:${policy_site_packages}"
 
 cd "${repo}"
 slurm_args=(
