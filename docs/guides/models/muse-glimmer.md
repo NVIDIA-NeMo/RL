@@ -80,18 +80,39 @@ AutoModel and vLLM sources unless you ask for a rebuild:
 
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
+
+# Skip vLLM's CUDA build. Without this the editable install runs cmake, whose
+# FetchContent step clones cutlass from GitHub -- which fails on compute nodes
+# with no external network ("Failed to clone repository"). Stage the wheel on a
+# shared filesystem first; a URL only works if the compute nodes can reach it.
+export VLLM_USE_PRECOMPILED=1
+export VLLM_PRECOMPILED_WHEEL_LOCATION=/path/to/vllm-<version>-cp38-abi3-manylinux_2_28_x86_64.whl
+
+# Multi-node only. Every node's venv builder contends on one lock in the shared
+# uv cache while vLLM's metadata is built; uv's default 300 s lock timeout is
+# shorter than that takes, and the waiting nodes die with "Failed to acquire
+# lock on the distribution cache".
+export UV_LOCK_TIMEOUT=3600
 ```
 
+Skipping the CUDA build is safe because Muse Glimmer support is pure Python on
+top of upstream vLLM — `git diff` of `csrc/`, `CMakeLists.txt` and `cmake/`
+against the upstream base commit is empty, and that base already requires torch
+2.13, so the prebuilt extensions link the same ABI. Take the wheel for the
+upstream base commit from `https://wheels.vllm.ai/<commit>/`, and re-stage it
+whenever you move the vLLM checkout.
+
 > [!IMPORTANT]
-> **Budget hours for the first run, and put the venvs on node-local disk.** This
-> branch is on torch 2.13, which no prebuilt `flash-attn` wheel targets, so
-> `flash-attn`, Transformer Engine, `mamba-ssm`, `causal-conv1d` and
-> `nv-grouped-gemm` all compile from source — and vLLM itself is an editable source
-> install, so it compiles too. On a shared filesystem this is pathologically slow:
-> measured throughput on Lustre was ~0.4 MB/s, against 257 packages in 16 s on
-> node-local disk. Point `UV_PROJECT_ENVIRONMENT` at local disk (or run inside a
-> writable container, where `/opt/ray_venvs` is already node-local) and keep
-> `UV_CACHE_DIR` on the shared filesystem so built wheels persist across jobs.
+> **The first rebuild is slow on a cold cache, and the venvs belong on
+> node-local disk.** This branch is on torch 2.13, which no prebuilt
+> `flash-attn` wheel targets, so `flash-attn`, Transformer Engine, `mamba-ssm`,
+> `causal-conv1d` and `nv-grouped-gemm` compile from source the first time. On a
+> shared filesystem that is pathologically slow: measured throughput on Lustre
+> was ~0.4 MB/s, against 257 packages in 16 s on node-local disk. Point
+> `UV_PROJECT_ENVIRONMENT` at local disk (or run inside a writable container,
+> where `/opt/ray_venvs` is already node-local) and keep `UV_CACHE_DIR` on the
+> shared filesystem so the built wheels persist across jobs. With a warm cache a
+> full 4-node rebuild plus two training steps takes about 15 minutes.
 >
 > Once a run has built the venvs, save the container so later jobs reuse them
 > instead of rebuilding — `_env_builder` early-returns when the venv's `python`
@@ -228,8 +249,20 @@ never exercises the policy path.
 
 ## Reference Results
 
-*Placeholder — reference training curves and validation numbers will be added once
-long-run results on the released checkpoint are available.*
+Smoke run on the released checkpoint, 4 nodes x 8 GPUs, the 4k CP2 recipe, 2 steps,
+worker venvs rebuilt from this branch:
+
+| Metric | Value |
+| --- | --- |
+| `train/gen_kl_error` | 5.43e-04 |
+| `train/token_mult_prob_error` | 1.025 |
+| `train/truncation_rate` (4k) | 0.471 |
+
+`gen_kl_error` at 5.43e-04 is the number that matters: it says the policy and the
+generation stack agree, so training is optimising against meaningful logprobs.
+
+*Long-run training curves and validation accuracy will be added once a full run on
+the released checkpoint completes.*
 
 ## Known Issues
 
