@@ -44,6 +44,7 @@ from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDatas
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
     NemotronCascade2SFTMathDataset,
 )
+from nemo_rl.data.datasets.response_datasets.numinamath import NuminaMath15Dataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -84,6 +85,7 @@ DATASET_REGISTRY = {
     "megatron_sft_packed": MegatronSFTPackedDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
+    "NuminaMath-1.5": NuminaMath15Dataset,
     "OpenR1-Math-220k": OpenR1Math220KDataset,
     "refcoco": RefCOCODataset,
     "squad": SquadDataset,
@@ -166,6 +168,7 @@ __all__ = [
     "OasstDataset",
     "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
+    "NuminaMath15Dataset",
     "OpenR1Math220KDataset",
     "RefCOCODataset",
     "ResponseDataset",

@@ -5,3 +5,11 @@
 # grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2 run hangs the same way on main,
 # so this is the pre-existing Qwen3.5 + Megatron + EP hang.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
+
+# First multimodal NeMo-Gym recipe (circle_click at the pinned Gym). Disabled on
+# landing for two reasons: the recipe has not been run end to end yet, so its
+# reward threshold is an unvalidated smoke bound; and nightly.txt is at 3755 of
+# its 3800 GPU-hour budget, which this run's 32 GPU-hours would leave only 13 to
+# spare. Move to nightly.txt once a real run confirms it converges and the
+# budget has room.
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.sh
