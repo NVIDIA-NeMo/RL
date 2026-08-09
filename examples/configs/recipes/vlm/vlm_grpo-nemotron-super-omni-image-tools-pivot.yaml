@@ -1,0 +1,75 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+# PivotRL: replay an SFT trajectory prefix verbatim and train one image-tool
+# decision against the demonstrated action. The Gym verifier supplies binary
+# reward using tool identity, image target, and tool-family-specific arguments.
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  val_num_generations_per_prompt: 1
+  max_num_epochs: 1000
+  max_num_steps: 250
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-image-tools-pivot
+  save_period: 10
+
+policy:
+  train_global_batch_size: 1024
+  max_total_sequence_length: 49152
+  megatron_cfg:
+    context_parallel_size: 4
+    mtp_num_layers: 0
+    scheduler:
+      lr_warmup_iters: 10
+  generation:
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 12
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/image_tools_pivot/data/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/image_tools_pivot/data/validation.jsonl
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    pad_dynamic_image_shapes: true
+    sanitize_image_placeholders: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/image_tools_pivot/configs/image_tools_pivot.yaml
+    image_tools_pivot:
+      resources_servers:
+        image_tools_pivot:
+          reward_mode: binary
+          argument_threshold: 0.5
+          enable_target_match: true
+          unify_region_inspect_tools: true
+
+logger:
+  log_dir: logs/nemotron-super-omni-image-tools-pivot
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: grpo-super-omni-image-tools
+    name: nemotron-super-omni-image-tools-pivot
+
+# Kept explicit because the Super launcher reads this value without resolving
+# the defaults chain.
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
