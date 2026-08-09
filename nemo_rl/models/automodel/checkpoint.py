@@ -256,6 +256,24 @@ class AutomodelCheckpointManager:
         if self.checkpointer.config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
 
+    def finalize_async_save(self) -> None:
+        """Block until in-flight async checkpoint writes have landed on disk.
+
+        With ``is_async=True`` the Automodel Checkpointer hands both the model
+        and optimizer state to ``dcp.async_save``, which stages them and uploads
+        from a separate process. Those writes address files by path, so the
+        caller must not rename ``tmp_step_N`` to ``step_N`` until they finish --
+        otherwise the writer re-creates ``tmp_step_N`` and the promoted
+        checkpoint is missing its optimizer shards and ``.metadata``.
+
+        Safe to call when async saving is off or no save is in flight; both
+        underlying calls are no-ops in that case.
+        """
+        if self.checkpointer is None:
+            return
+        self.checkpointer.maybe_wait_for_staging()
+        self.checkpointer.async_wait()
+
     def save_checkpoint(
         self,
         model: nn.Module,
