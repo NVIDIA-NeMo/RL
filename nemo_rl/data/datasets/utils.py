@@ -209,7 +209,6 @@ def warn_on_unsupported_dataset_config_keys(
     The dataset dispatchers instantiate with ``dataset_class(**data_config)``
     and every built-in dataset accepts ``**kwargs``, so a config key the class
     does not actually support is swallowed without any feedback — e.g.
-    ``subset`` on ``GSM8KDataset`` (which hardcodes the ``main`` config) or
     ``split_validation_size`` on datasets that never call
     ``split_train_validation``. For the keys in
     ``_BEHAVIORAL_DATASET_CONFIG_KEYS``, warn when the resolved class does not
@@ -302,14 +301,13 @@ def extract_necessary_env_names(data_config: dict) -> list[str]:
         The necessary environment names.
     """
     necessary_env_names = set()
-    keys = ["train", "validation", "default"]
-    for key in keys:
-        if (
-            key in data_config
-            and data_config[key] is not None
-            and "env_name" in data_config[key]
-        ):
-            necessary_env_names.add(data_config[key]["env_name"])
+    for key in ("train", "validation", "default"):
+        configs = data_config.get(key)
+        if not isinstance(configs, list):
+            configs = [configs]
+        for config in configs:
+            if isinstance(config, dict) and "env_name" in config:
+                necessary_env_names.add(config["env_name"])
     return list(necessary_env_names)
 
 

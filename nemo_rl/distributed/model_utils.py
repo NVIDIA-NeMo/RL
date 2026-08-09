@@ -140,10 +140,13 @@ class DistributedLogprob(torch.autograd.Function):
 
         vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
 
-        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
-        softmax_output = log_probs.exp()
+        full_log_probs = _compute_distributed_log_softmax(
+            vocab_parallel_logits, group=group
+        )
 
-        log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+        log_probs = torch.gather(
+            full_log_probs, -1, masked_target.unsqueeze(-1)
+        ).squeeze(-1)
         log_probs[target_mask] = 0.0
 
         torch.distributed.all_reduce(
@@ -153,8 +156,11 @@ class DistributedLogprob(torch.autograd.Function):
         )
 
         if not inference_only:
-            # only save for backward when we have inference only=False
-            ctx.save_for_backward(softmax_output, target_mask, masked_target)
+            # only save for backward when we have inference only=False. The
+            # softmax is materialized here rather than next to the log_softmax
+            # so the inference path does not pay for a [B, S, V_local] tensor
+            # it never reads (same placement as ChunkedDistributedLogprob).
+            ctx.save_for_backward(full_log_probs.exp(), target_mask, masked_target)
 
         return log_probs
 
@@ -1473,6 +1479,53 @@ def vocab_parallel_full_log_softmax(
             sharded_log_probs, group=tp_group
         )
     return torch.log_softmax(scaled, dim=-1)
+
+
+def vocab_parallel_gather_columns(
+    logits: torch.Tensor,
+    column_indices: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Gather a shared set of vocab columns from (possibly TP-sharded) logits.
+
+    Differentiable w.r.t. ``logits``. For callers that only need a fixed
+    ``[K]`` subset of vocab columns (e.g. the same-vocab top-k KD loss, whose
+    subset renormalization cancels the full-vocab partition function), this
+    avoids materializing the all-gathered full-vocab ``[B, T, V]`` tensor that
+    :func:`vocab_parallel_full_log_softmax` produces — the working set drops to
+    ``[B, T, K]``.
+
+    Args:
+        logits: ``[B, T, V]`` (``tp_group`` None or world 1) or
+            ``[B, T, V_local]`` vocab-sharded logits. DTensor inputs are
+            unwrapped to their local shard.
+        column_indices: 1-D ``[K]`` global vocab ids, shared by every position.
+        tp_group: optional tensor-parallel group. Uniform mcore vocab sharding
+            is assumed (rank ``r`` owns ``[r * V_local, (r + 1) * V_local)``),
+            matching :func:`vocab_parallel_full_log_softmax`.
+
+    Returns:
+        ``[B, T, K]`` fp32 logits at the requested columns (upcast matches the
+        fp32 working precision of the surrounding loss paths).
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    if tp_group is None or torch.distributed.get_world_size(tp_group) == 1:
+        return logits[..., column_indices].float()
+
+    rank = torch.distributed.get_rank(tp_group)
+    v_local = logits.shape[-1]
+    vocab_start_index = rank * v_local
+    batch_size, seq_len, _ = logits.shape
+    expanded_indices = column_indices.view(1, 1, -1).expand(batch_size, seq_len, -1)
+    return gather_logits_at_global_indices(
+        logits,
+        expanded_indices,
+        tp_group=tp_group,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_start_index + v_local,
+    )
 
 
 def vocab_parallel_argmax(

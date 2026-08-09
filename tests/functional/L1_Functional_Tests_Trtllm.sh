@@ -20,11 +20,25 @@ PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
 cd ${PROJECT_ROOT}
 
+# run_test [fast] <command...>
+# - "run_test fast <cmd>" = always runs (both fast and full modes)
+# - "run_test <cmd>"      = only runs in full mode; skipped when FAST=1
+run_test() {
+    if [[ "$1" == "fast" ]]; then
+        shift
+        time "$@"
+    elif [[ "${FAST:-0}" == "1" ]]; then
+        echo "FAST: Skipping: $*"
+    else
+        time "$@"
+    fi
+}
+
 # All TRT-LLM tests use the async engine. These scenarios deliberately cover
 # the supported axes without creating a full backend/deployment-mode matrix.
-time uv run --no-sync bash ./tests/functional/grpo_trtllm_fsdp2_colocated.sh
-time uv run --no-sync bash ./tests/functional/grpo_trtllm_mcore_colocated.sh
-time uv run --no-sync bash ./tests/functional/grpo_trtllm_mcore_non_colocated_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_fsdp2_colocated.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_mcore_colocated.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_mcore_non_colocated_async.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

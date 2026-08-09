@@ -678,9 +678,38 @@ class VllmAsyncGenerationWorkerImpl(
             request.top_k = -1
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # If they do not match, the inference will be off policy and destroy training
+            # stability. Validation rollouts are the one exception: they are stamped with
+            # the validation sampling profile (generation.val_temperature / val_top_p),
+            # which is metric-only and safe to serve — grpo.validate() is the only
+            # caller that constructs a non-train GenerationSamplingParams. Multi-turn
+            # agents issue their own requests, so this server-side check is the one
+            # chokepoint they all pass.
+            # vLLM resolves an unset top_p from the model's generation_config.json
+            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
+            # request omitting it would sample off-policy while passing this check.
+            assert request.top_p is not None, (
+                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+                "resolved by vLLM from the model's generation_config.json and would "
+                "bypass the on-policy sampling check."
+            )
+            request_top_p = request.top_p
+            is_train_sampling = (
+                request.temperature == generation_config["temperature"]
+                and request_top_p == generation_config["top_p"]
+            )
+            is_val_sampling = (
+                request.temperature == generation_config["val_temperature"]
+                and request_top_p == generation_config["val_top_p"]
+            )
+            assert is_train_sampling or is_val_sampling, (
+                f"request sampling (temperature={request.temperature}, "
+                f"top_p={request.top_p}) matches neither the train sampling params "
+                f"(temperature={generation_config['temperature']}, "
+                f"top_p={generation_config['top_p']}) nor the validation sampling "
+                f"params (val_temperature={generation_config['val_temperature']}, "
+                f"val_top_p={generation_config['val_top_p']})"
+            )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -954,10 +983,20 @@ class VllmAsyncGenerationWorkerImpl(
                 [per_sample_stop_strings] if per_sample_stop_strings else None
             )
 
-            remaining_ctx = (
-                self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
-            )
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            remaining_ctx = max_model_len - current_input_actual_length
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+
+            spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+            spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+            if allowed_new_tokens > 0 and spec_lookahead > 0:
+                allowed_new_tokens = self._request_max_new_tokens(
+                    configured_max_new_tokens=allowed_new_tokens,
+                    input_length=current_input_actual_length,
+                    max_model_len=max_model_len,
+                    cap_to_context=False,
+                    spec_lookahead=spec_lookahead,
+                )
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:

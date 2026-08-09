@@ -22,6 +22,7 @@ from typing import Any, Optional, Union
 
 import requests
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import PreTrainedTokenizerBase
 from transformers.audio_utils import load_audio
@@ -43,6 +44,13 @@ DEFAULT_MEDIA_EXTENSIONS = {
     "video-audio": ["mp4"],
     "audio": ["wav", "flac", "mp3"],
 }
+
+_PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
+    {
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    }
+)
 
 
 # different media namings maybe used in the raw dataset,
@@ -66,6 +74,19 @@ MEDIA_TAG_PATTERN = re.compile(
 logger = logging.getLogger(__name__)
 
 
+def uses_image_placeholder(processor: Any) -> bool:
+    """Return whether a processor requires explicit image placeholders.
+
+    Args:
+        processor: Multimodal processor to classify.
+
+    Returns:
+        Whether the processor expands image placeholders through ``__call__``
+        rather than tokenized ``apply_chat_template``.
+    """
+    return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
+
+
 class PackedTensor:
     """Wrapper around a list of torch tensors and a dimension along which to pack the tensors.
 
@@ -81,7 +102,18 @@ class PackedTensor:
         self,
         tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
         dim_to_pack: int,
+        *,
+        pad_to_max_shape: bool = False,
     ) -> None:
+        """Wrap per-item tensors for concatenation along ``dim_to_pack``.
+
+        Args:
+            tensors: A tensor or list of per-item tensors. List entries may be
+                ``None`` for items without this modality.
+            dim_to_pack: Dimension along which ``as_tensor`` concatenates.
+            pad_to_max_shape: Pad every non-packing dimension to its batch-wide
+                maximum before concatenating. All tensors must have the same rank.
+        """
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
         if isinstance(tensors, torch.Tensor):
@@ -96,6 +128,7 @@ class PackedTensor:
                 f"Unsupported type for input tensors to PackedTensor: {type(tensors)}"
             )
         self.dim_to_pack = dim_to_pack
+        self.pad_to_max_shape = pad_to_max_shape
 
     def as_tensor(
         self, device: Optional[torch.device] = None
@@ -108,8 +141,51 @@ class PackedTensor:
         non_none_tensors = [t for t in self.tensors if t is not None]
         if len(non_none_tensors) == 0:
             return None
-        else:
-            return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
+
+        # Some multimodal processors produce a different shape per prompt,
+        # such as dynamic-resolution images, variable-frame videos, or audio
+        # feature sequences. Concatenation already permits the packing
+        # dimension to vary; when explicitly requested, pad every other
+        # dimension to the largest size in the batch.
+        if self.pad_to_max_shape:
+            ranks = {tensor.ndim for tensor in non_none_tensors}
+            if len(ranks) != 1:
+                raise ValueError(
+                    "pad_to_max_shape requires tensors with the same rank, "
+                    f"but received ranks {sorted(ranks)}"
+                )
+
+            rank = ranks.pop()
+            pack_dim = (
+                self.dim_to_pack if self.dim_to_pack >= 0 else rank + self.dim_to_pack
+            )
+            if not 0 <= pack_dim < rank:
+                raise IndexError(
+                    f"dim_to_pack={self.dim_to_pack} is invalid for tensors with rank {rank}"
+                )
+            max_shape = [
+                max(tensor.shape[dim] for tensor in non_none_tensors)
+                for dim in range(rank)
+            ]
+
+            def pad_to_batch_shape(tensor: torch.Tensor) -> torch.Tensor:
+                padding = []
+                for dim in reversed(range(rank)):
+                    padding.extend(
+                        (
+                            0,
+                            0
+                            if dim == pack_dim
+                            else max_shape[dim] - tensor.shape[dim],
+                        )
+                    )
+                return F.pad(tensor, padding)
+
+            non_none_tensors = [
+                pad_to_batch_shape(tensor) for tensor in non_none_tensors
+            ]
+
+        return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
 
     def __len__(self) -> int:
         # this is the number of tensors in this data wrapper
@@ -124,12 +200,20 @@ class PackedTensor:
     def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedTensor":
         idx = indices.tolist() if isinstance(indices, torch.Tensor) else indices
         tensors = [self.tensors[i] for i in idx]
-        return PackedTensor(tensors, self.dim_to_pack)
+        return PackedTensor(
+            tensors,
+            self.dim_to_pack,
+            pad_to_max_shape=self.pad_to_max_shape,
+        )
 
     @classmethod
     def empty_like(cls, other: "PackedTensor") -> "PackedTensor":
         """Return a new PackedTensor with same length and dim_to_pack as `other`, with all entries None."""
-        return cls([None] * len(other.tensors), other.dim_to_pack)
+        return cls(
+            [None] * len(other.tensors),
+            other.dim_to_pack,
+            pad_to_max_shape=other.pad_to_max_shape,
+        )
 
     @classmethod
     def concat(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
@@ -157,12 +241,20 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
+        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
+        assert len(set(pad_to_max_shapes)) == 1, (
+            "All packed tensors must have the same pad_to_max_shape setting"
+        )
         # concatenate the tensors
         tensors = []
         for packed_tensor in from_packed_tensors:
             tensors.extend(packed_tensor.tensors)
         dim_to_pack = dim_to_packs[0]
-        return cls(tensors, dim_to_pack)
+        return cls(
+            tensors,
+            dim_to_pack,
+            pad_to_max_shape=pad_to_max_shapes[0],
+        )
 
     @classmethod
     def flattened_concat(
@@ -194,8 +286,16 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
+        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
+        assert len(set(pad_to_max_shapes)) == 1, (
+            "All packed tensors must have the same pad_to_max_shape setting"
+        )
         tensors = [p.as_tensor() for p in from_packed_tensors]
-        return cls(tensors, from_packed_tensors[0].dim_to_pack)
+        return cls(
+            tensors,
+            from_packed_tensors[0].dim_to_pack,
+            pad_to_max_shape=pad_to_max_shapes[0],
+        )
 
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
@@ -296,9 +396,77 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         header, encoded = image_path_or_image.split(",", 1)
         image_data = base64.b64decode(encoded)
         return Image.open(BytesIO(image_data)).convert("RGB")
+    elif image_path_or_image.startswith("file://"):
+        return Image.open(image_path_or_image.removeprefix("file://")).convert("RGB")
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
+
+
+def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
+    """Encode a PIL Image as a base64 ``data:`` URL.
+
+    Args:
+        image: PIL image to encode.
+        fmt: PIL image format used for serialization (e.g. ``"PNG"``, ``"JPEG"``).
+            The value is also lowercased and embedded in the MIME type of the
+            returned URL.
+
+    Returns:
+        A ``data:image/<fmt>;base64,<payload>`` URL suitable for embedding in
+        an OpenAI Responses ``input_image`` content part.
+    """
+    buf = BytesIO()
+    image.save(buf, format=fmt)
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/{fmt.lower()};base64,{encoded}"
+
+
+def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
+    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+
+    Walks each example's ``responses_create_params.input[].content[]`` items
+    and rewrites any ``input_image`` part whose ``image_url`` is a local path
+    (or ``file://`` URL) into a base64 ``data:`` URL via
+    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
+    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
+    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
+    without raising.
+
+    The examples are mutated in place; the same list is also returned for
+    convenience so callers can chain the call.
+
+    Args:
+        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
+            expected to contain a ``responses_create_params`` mapping with an
+            ``input`` list of Responses API messages.
+
+    Returns:
+        The same ``nemo_gym_examples`` list, with local image references
+        rewritten to base64 data URLs in place.
+    """
+    for example in nemo_gym_examples:
+        input_items = example.get("responses_create_params", {}).get("input", [])
+        if not isinstance(input_items, list):
+            continue
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "input_image":
+                    continue
+                url = part.get("image_url", "")
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if not isinstance(url, str) or not url:
+                    continue
+                if url.startswith(("http://", "https://", "data:")):
+                    continue
+                part["image_url"] = image_to_data_url(resolve_to_image(url))
+    return nemo_gym_examples
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
