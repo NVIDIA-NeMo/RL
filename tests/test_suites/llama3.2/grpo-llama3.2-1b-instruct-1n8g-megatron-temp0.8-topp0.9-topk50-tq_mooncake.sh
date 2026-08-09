@@ -2,6 +2,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=h100
+DISABLED_REASON="Transfer-queue wrappers"
 # Mirrors grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.sh (delegated base).
 NUM_NODES=1
 STEPS_PER_RUN=500

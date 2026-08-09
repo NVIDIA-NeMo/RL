@@ -5,6 +5,9 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # https://github.com/NVIDIA-NeMo/RL/issues/263
 
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=h100
+DISABLED_REASON="Superseded by a surviving recipe"
 NUM_NODES=2
 STEPS_PER_RUN=80  # step_time ~ 29sec
 MAX_STEPS=80

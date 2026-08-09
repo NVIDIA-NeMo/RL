@@ -5,6 +5,8 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 export NCCL_NVLS_ENABLE=0
 
 # ===== BEGIN CONFIG =====
+SUITE=performance
+SKU=gb200
 NUM_NODES=16
 GPUS_PER_NODE=4
 SEGMENT_SIZE=16

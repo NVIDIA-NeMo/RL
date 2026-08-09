@@ -2,6 +2,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=h100
+DISABLED_REASON="Still hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of https://github.com/vllm-project/vllm/issues/36237, which..."
 NUM_NODES=2
 STEPS_PER_RUN=20
 MAX_STEPS=20

@@ -6,6 +6,8 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # See examples/configs/recipes/qwen3/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml.
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 NUM_NODES=3
 STEPS_PER_RUN=10
 MAX_STEPS=10

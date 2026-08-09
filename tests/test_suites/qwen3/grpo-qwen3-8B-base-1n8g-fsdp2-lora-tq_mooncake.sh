@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors grpo-qwen3-8B-base-1n8g-fsdp2-lora.sh (delegated base).
 NUM_NODES=1
 STEPS_PER_RUN=20

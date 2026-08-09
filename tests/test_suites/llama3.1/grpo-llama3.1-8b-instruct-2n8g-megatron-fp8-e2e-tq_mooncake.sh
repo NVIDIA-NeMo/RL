@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.sh (delegated base).
 NUM_NODES=2
 STEPS_PER_RUN=100

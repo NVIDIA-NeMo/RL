@@ -2,6 +2,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=h100
+DISABLED_REASON="Model retired by the inventory"
 NUM_NODES=1
 STEPS_PER_RUN=50
 MAX_STEPS=50

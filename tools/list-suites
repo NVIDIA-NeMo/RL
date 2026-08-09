@@ -1,0 +1,149 @@
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+# List the test scripts belonging to a suite, by reading the SUITE / GATES / SKU
+# declarations in each driver's CONFIG block.
+#
+# Output is one script path per line, sorted, and nothing else -- a drop-in
+# replacement for reading tests/test_suites/<suite>.txt.
+#
+#   tools/list-suites nightly
+#   tools/list-suites nightly_gb200
+#   tools/list-suites nightly_mcore          # SUITE=nightly and GATES contains mcore
+#   tools/list-suites --gpu-hours release    # per-test and total GPU hours
+#   tools/list-suites --suites               # every suite name this understands
+#
+# Deliberately plain bash with no dependencies: it is called to build a job list
+# before any Python environment exists, so a `uv sync` failure must not be able
+# to make a suite look empty.
+################################################################################
+set -euo pipefail
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd)
+SUITES_DIR="$PROJECT_ROOT/tests/test_suites"
+
+KNOWN_SUITES=(
+    nightly nightly_gb200
+    nightly_mcore nightly_mcore_gb200
+    release release_gb200
+    performance performance_gb200
+    disabled
+)
+
+usage() {
+    sed -n '16,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+SHOW_GPU_HOURS=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpu-hours) SHOW_GPU_HOURS=1; shift ;;
+        --suites) printf '%s\n' "${KNOWN_SUITES[@]}"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) echo "[ERROR]: unknown option: $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 2
+fi
+REQUESTED="$1"
+
+if ! printf '%s\n' "${KNOWN_SUITES[@]}" | grep -qx -- "$REQUESTED"; then
+    echo "[ERROR]: unknown suite: $REQUESTED" >&2
+    echo "[ERROR]: known suites: ${KNOWN_SUITES[*]}" >&2
+    exit 2
+fi
+
+# Decompose the requested name into the axes a driver declares. `disabled` has
+# no _gb200 counterpart, so it must not be filtered by SKU or its GB200 entries
+# would silently disappear.
+NAME="$REQUESTED"
+WANT_SKU=""
+if [[ "$NAME" == *_gb200 ]]; then
+    WANT_SKU=gb200
+    NAME="${NAME%_gb200}"
+elif [[ "$NAME" != disabled ]]; then
+    WANT_SKU=h100
+fi
+WANT_GATE=""
+if [[ "$NAME" == nightly_mcore ]]; then
+    WANT_GATE=mcore
+    NAME=nightly
+fi
+WANT_SUITE="$NAME"
+
+# Read one variable out of a driver's CONFIG block. Done in awk rather than a
+# sed|grep pipeline so that a key which is simply absent (GATES on most drivers)
+# is an empty result rather than a pipeline failure under `set -o pipefail`.
+cfg_value() {
+    awk -v key="$2" '
+        /^# ==* BEGIN CONFIG/ { inblock = 1; next }
+        /^# ==* END CONFIG/   { inblock = 0 }
+        inblock && index($0, key "=") == 1 {
+            v = substr($0, length(key) + 2)
+            sub(/[[:space:]]*#.*$/, "", v)
+            gsub(/["'"'"']/, "", v)
+            sub(/^[[:space:]]+/, "", v)
+            sub(/[[:space:]]+$/, "", v)
+            print v
+            exit
+        }
+    ' "$1"
+}
+
+total_gpu_hours=0
+while IFS= read -r script; do
+    suite=$(cfg_value "$script" SUITE)
+    [[ "$suite" == "$WANT_SUITE" ]] || continue
+
+    if [[ -n "$WANT_SKU" ]]; then
+        sku=$(cfg_value "$script" SKU)
+        [[ "${sku:-h100}" == "$WANT_SKU" ]] || continue
+    fi
+
+    if [[ -n "$WANT_GATE" ]]; then
+        gates=" $(cfg_value "$script" GATES) "
+        [[ "$gates" == *" $WANT_GATE "* ]] || continue
+    fi
+
+    rel="${script#"$PROJECT_ROOT"/}"
+    if [[ "$SHOW_GPU_HOURS" -eq 1 ]]; then
+        nodes=$(cfg_value "$script" NUM_NODES)
+        gpn=$(cfg_value "$script" GPUS_PER_NODE)
+        minutes=$(cfg_value "$script" NUM_MINUTES)
+        max_steps=$(cfg_value "$script" MAX_STEPS)
+        steps_per_run=$(cfg_value "$script" STEPS_PER_RUN)
+        : "${gpn:=8}" "${nodes:=1}" "${minutes:=0}" "${max_steps:=0}" "${steps_per_run:=0}"
+        runs=1
+        if [[ "$steps_per_run" -gt 0 ]]; then
+            runs=$(( (max_steps + steps_per_run - 1) / steps_per_run ))
+            (( runs > 0 )) || runs=1
+        fi
+        # Same integer arithmetic as tools/launch, so the numbers agree.
+        gpu_hours=$(( runs * nodes * gpn * minutes / 60 ))
+        total_gpu_hours=$(( total_gpu_hours + gpu_hours ))
+        printf '%8d GPUhrs  %s\n' "$gpu_hours" "$rel"
+    else
+        printf '%s\n' "$rel"
+    fi
+done < <(find "$SUITES_DIR" -name '*.sh' | sort)
+
+if [[ "$SHOW_GPU_HOURS" -eq 1 ]]; then
+    printf '[INFO]: Total GPU hours: %d\n' "$total_gpu_hours"
+fi

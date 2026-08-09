@@ -5,6 +5,8 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 export NCCL_NVLS_ENABLE=0
 
 # ===== BEGIN CONFIG =====
+SUITE=release
+SKU=gb200
 NUM_NODES=32
 GPUS_PER_NODE=4
 STEPS_PER_RUN=10

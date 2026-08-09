@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors grpo-nanov3-30BA3B-2n8g-fsdp2.sh (delegated base).
 NUM_NODES=1
 GPUS_PER_NODE=8

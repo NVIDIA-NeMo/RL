@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors grpo-moonlight-16ba3b-4n8g-megatron.sh (delegated base).
 NUM_NODES=4
 STEPS_PER_RUN=30

@@ -6,6 +6,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 NUM_NODES=4
 GPUS_PER_NODE=8
 STEPS_PER_RUN=1

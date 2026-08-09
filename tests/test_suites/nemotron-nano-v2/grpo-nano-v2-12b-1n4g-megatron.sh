@@ -2,6 +2,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=gb200
+DISABLED_REASON="GB200 mirrors of a retired H100 recipe"
 NUM_NODES=1
 GPUS_PER_NODE=4
 STEPS_PER_RUN=30
