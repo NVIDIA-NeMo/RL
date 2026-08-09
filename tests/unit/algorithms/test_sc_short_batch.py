@@ -102,13 +102,19 @@ async def _drain_step(
     trainer_version: int,
     shortfall: Counter[int],
     max_iterations: int = 64,
+    start_dispatched: int = 0,
 ) -> tuple[int, bool]:
     """Run the pump's selection loop for one step.
 
     Returns the groups it collected and whether the step closed, rather than
     spinning forever the way the real pump does when the batch cannot fill.
+
+    ``start_dispatched`` resumes a step a previous call left open. The pump
+    holds its count for the whole step, so a second call that restarted at zero
+    against an already-drained buffer would be measuring this helper rather than
+    the sampler.
     """
-    groups_dispatched = 0
+    groups_dispatched = start_dispatched
     for _ in range(max_iterations):
         groups_wanted = NUM_PROMPTS_PER_STEP - shortfall[trainer_version]
         if groups_dispatched >= groups_wanted:
@@ -173,14 +179,19 @@ def test_shortfall_recorded_after_the_step_opens_still_closes() -> None:
     buffer.commit(target_step=0, count=NUM_PROMPTS_PER_STEP - 2)
     shortfall: Counter[int] = Counter()
 
-    _, closed = asyncio.run(
+    collected, closed = asyncio.run(
         _drain_step(sampler, trainer_version=0, shortfall=shortfall, max_iterations=4)
     )
     assert not closed
 
     shortfall[0] = 2
     _, closed = asyncio.run(
-        _drain_step(sampler, trainer_version=0, shortfall=shortfall)
+        _drain_step(
+            sampler,
+            trainer_version=0,
+            shortfall=shortfall,
+            start_dispatched=collected,
+        )
     )
 
     assert closed
