@@ -21,9 +21,11 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Optional, cast
+from functools import partial
+from typing import Any, Callable, Optional, cast
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -37,6 +39,10 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    SetupTimingMetrics,
+    print_setup_timing_summary,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
@@ -164,19 +170,41 @@ def _build_clusters(
 def _build_generation(
     inference_cluster: RayVirtualCluster,
     master_config: MasterConfig,
-):
-    """Spin up the generation backend (vLLM or SGLang)."""
+    *,
+    defer_model_load: bool = False,
+) -> tuple[Any, float]:
+    """Spin up the generation backend (vLLM or SGLang).
+
+    Args:
+        inference_cluster: Ray virtual cluster the generation workers run on.
+        master_config: SC MasterConfig.
+        defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later.
+
+    Returns:
+        A tuple of (generation object, wall time spent in this call). The
+        generation object is a VllmGeneration or SGLangGeneration.
+    """
+    t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
     generation_config["model_name"] = master_config.policy["model_name"]
     backend = generation_config["backend"]
+
     if backend == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
         vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
             master_config.policy.get("hf_config_overrides", {})
         )
         configure_vllm_for_router_replay(master_config.policy)
-        gen = VllmGeneration(cluster=inference_cluster, config=vllm_config)
+        gen = VllmGeneration(
+            cluster=inference_cluster,
+            config=vllm_config,
+            defer_model_load=defer_model_load,
+        )
+
     elif backend == "sglang":
+        assert not defer_model_load, (
+            "defer_model_load is only supported for the vllm backend"
+        )
         sglang_config = cast(SGLangConfig, generation_config)
         sglang_config["sglang_cfg"].setdefault(
             "model_path", master_config.policy["model_name"]
@@ -185,12 +213,31 @@ def _build_generation(
             cluster=inference_cluster,
             sglang_cfg=sglang_config,
         )
+
     else:
         raise ValueError(
             f"single_controller_utils.setup only supports vllm or sglang generation; got {backend!r}"
         )
-    gen.finish_generation()
-    return gen
+
+    if not defer_model_load:
+        gen.finish_generation()
+
+    return gen, time.perf_counter() - t0
+
+
+def _finish_deferred_generation(generation: Any) -> tuple[Any, float]:
+    """Finish loading and starting the deferred generation.
+
+    Args:
+        generation: The deferred generation object.
+
+    Returns:
+        A tuple of (finished generation object, wall time spent in this call).
+    """
+    t0 = time.perf_counter()
+    generation.load_and_start()
+    generation.finish_generation()
+    return generation, time.perf_counter() - t0
 
 
 def _build_trainer(
@@ -198,17 +245,22 @@ def _build_trainer(
     master_config: MasterConfig,
     tokenizer,
     processor,
-):
+) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
-    Driver-side on purpose: instantiating TQPolicy inside another Ray
-    actor nests runtime_envs and triggers Ray's
-    get_accelerator_ids_for_accelerator_resource IndexError. Keep this
-    here until PolicyTrainerActor (PR #2692) lands.
+    Args:
+        train_cluster: Ray virtual cluster the trainer workers run on.
+        master_config: SC MasterConfig.
+        tokenizer: Tokenizer used by the policy.
+        processor: Optional AutoProcessor for VLM paths.
+
+    Returns:
+        A tuple of (TQPolicy trainer, wall time spent in this call).
     """
+    t0 = time.perf_counter()
     loss_config = master_config.loss_fn
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
-    return TQPolicy(
+    trainer = TQPolicy(
         cluster=train_cluster,
         config=master_config.policy,
         tokenizer=tokenizer,
@@ -219,6 +271,37 @@ def _build_trainer(
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
     )
+    return trainer, time.perf_counter() - t0
+
+
+def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any, float]:
+    """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
+
+    Args:
+        master_config: SC MasterConfig.
+        base_urls: Reserved vLLM OpenAI server URLs.
+
+    Returns:
+        A tuple of (NeMo-Gym actor, wall time spent in this call).
+    """
+    t0 = time.perf_counter()
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
+    enable_router_replay = router_replay_enabled(policy_config)
+    routed_experts_dtype = (
+        resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
+        if enable_router_replay
+        else "int16"
+    )
+    actor = spinup_nemo_gym_actor(
+        env_configs=master_config.env,
+        base_urls=base_urls,
+        model_name=generation_config["model_name"],
+        enable_router_replay=enable_router_replay,
+        routed_experts_dtype=routed_experts_dtype,
+        use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+    )
+    return actor, time.perf_counter() - t0
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -267,7 +350,7 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
-) -> SingleControllerActorArgs:
+) -> tuple[SingleControllerActorArgs, SetupTimingMetrics]:
     """Build the full SC actor args driver-side.
 
     Args:
@@ -277,7 +360,8 @@ def setup_single_controller(
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
-        SingleControllerActorArgs ready to be passed to SingleControllerActor.
+        A tuple of (pre-built SC actor args, driver-side per-phase timings
+        logged by the SC actor).
     """
     validate_single_controller_config(master_config)
 
@@ -356,46 +440,119 @@ def setup_single_controller(
     # ==========================
     # Setup Clusters & Workers
     # ==========================
+    setup_start_time = time.perf_counter()
+    setup_timing_metrics = SetupTimingMetrics()
+
+    # Create clusters
     train_cluster, inference_cluster = _build_clusters(master_config)
     colocated = generation_config["colocated"]["enabled"]
-    if colocated:
-        # Colocated: vLLM prefers a clean GPU at load time, so generation
-        # comes up before the policy.
-        generation = _build_generation(inference_cluster, master_config)
-        policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
-    else:
-        # Non-colocated: generation + policy run on disjoint GPUs, so
-        # bring them up in parallel.
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            gen_future = executor.submit(
-                _build_generation, inference_cluster, master_config
-            )
-            policy_future = executor.submit(
-                _build_trainer, train_cluster, master_config, tokenizer, processor
-            )
-            generation = gen_future.result()
-            policy = policy_future.result()
 
-    # ==========================
-    # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
-    # ==========================
+    # Create build tasks for generation / trainer / (nemo-gym) workers
+    build_tasks: dict[str, Callable[[], Any]] = {}
+    generation = None
+    defer_generation_model_load = False
+    gen_reserve_time = 0.0
+
+    def _build_generation_then_trainer(
+        defer_generation_model_load: bool, generation=None
+    ) -> tuple[Any, Any, dict[str, float]]:
+        """Build generation then trainer serially.
+
+        Args:
+            defer_generation_model_load: If True, generation is a pre-reserved handle and this call
+                finishes its model load; if False, builds generation from scratch.
+            generation: Pre-reserved generation handle when defer_generation_model_load=True; None otherwise.
+
+        Returns:
+            A tuple of (finalized generation object, TQPolicy trainer,
+            per-phase wall times keyed as "gen_time" and "trainer_time").
+        """
+        time_metrics = {}
+
+        # generation
+        if defer_generation_model_load:
+            generation, time_metrics["gen_time"] = _finish_deferred_generation(
+                generation
+            )
+        else:
+            generation, time_metrics["gen_time"] = _build_generation(
+                inference_cluster, master_config
+            )
+
+        # trainer
+        trainer, time_metrics["trainer_time"] = _build_trainer(
+            train_cluster, master_config, tokenizer, processor
+        )
+
+        return generation, trainer, time_metrics
+
     if use_nemo_gym:
-        # TODO(#2625): Mirror GRPO's deferred vLLM load so NeMo-Gym spinup
-        # overlaps model loading instead of running serially afterward.
-        enable_router_replay = router_replay_enabled(policy_config)
-        routed_experts_dtype = (
-            resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
-            if enable_router_replay
-            else "int16"
+        # defer generation, only get base_urls for nemo_gym spinup
+        generation, gen_reserve_time = _build_generation(
+            inference_cluster,
+            master_config=master_config,
+            defer_model_load=True,
         )
-        env_handles["nemo_gym"] = spinup_nemo_gym_actor(
-            env_configs=master_config.env,
+        defer_generation_model_load = True
+        # add nemo_gym spinup task
+        build_tasks["nemo_gym"] = partial(
+            _spinup_gym,
+            master_config=master_config,
             base_urls=generation.dp_openai_server_base_urls,
-            model_name=generation_config["model_name"],
-            enable_router_replay=enable_router_replay,
-            routed_experts_dtype=routed_experts_dtype,
-            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
+
+    if colocated:
+        # Colocated: vLLM prefers a clean GPU at load time, so generation comes up before the trainer.
+        build_tasks["generation_trainer"] = partial(
+            _build_generation_then_trainer,
+            defer_generation_model_load=defer_generation_model_load,
+            generation=generation,
+        )
+    else:
+        # Non-colocated: generation + trainer run on disjoint GPUs, so bring them up in parallel.
+        if defer_generation_model_load:
+            build_tasks["generation"] = partial(
+                _finish_deferred_generation,
+                generation=generation,
+            )
+        else:
+            build_tasks["generation"] = partial(
+                _build_generation,
+                inference_cluster=inference_cluster,
+                master_config=master_config,
+            )
+        build_tasks["trainer"] = partial(
+            _build_trainer,
+            train_cluster=train_cluster,
+            master_config=master_config,
+            tokenizer=tokenizer,
+            processor=processor,
+        )
+
+    # Submit build tasks and get results
+    with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
+        submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+        results = {k: f.result() for k, f in submitted.items()}
+
+    if colocated:
+        generation, trainer, time_metrics = results["generation_trainer"]
+        gen_load_time = time_metrics["gen_time"]
+        setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
+    else:
+        generation, gen_load_time = results["generation"]
+        trainer, trainer_time = results["trainer"]
+        setup_timing_metrics.policy_init_time_s = trainer_time
+    setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
+
+    if use_nemo_gym:
+        env_handles["nemo_gym"], gym_time = results["nemo_gym"]
+        setup_timing_metrics.nemo_gym_init_time_s = gym_time
+        # the two fields are only meaningful when use_nemo_gym enabled
+        setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
+        setup_timing_metrics.generation_init_load_time_s = gen_load_time
+
+    worker_setup_time = time.perf_counter() - setup_start_time
+    setup_timing_metrics.worker_setup_time_s = worker_setup_time
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
@@ -403,17 +560,18 @@ def setup_single_controller(
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
 
-    backend = generation_config["backend"]
+    t0 = time.perf_counter()
     weight_synchronizer = create_weight_synchronizer(
-        policy=policy,
+        policy=trainer,
         generation=generation,
-        generation_backend=backend,
+        generation_backend=generation_config["backend"],
         colocated=colocated,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
     )
     weight_synchronizer.init_communicator()
+    setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 
     # ==========================
     # Setup Algorithm + Rollout Wiring
@@ -443,9 +601,16 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
     )
 
-    return SingleControllerActorArgs(
+    # Print setup timing metrics
+    total_setup_time = time.perf_counter() - setup_start_time
+    setup_timing_metrics.total_setup_time_s = total_setup_time
+    setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
+    print_setup_timing_summary(setup_timing_metrics)
+
+    # Build actor args and return
+    actor_args = SingleControllerActorArgs(
         gen_handle=generation,
-        trainer_handle=policy,
+        trainer_handle=trainer,
         env_handles=env_handles,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
@@ -458,3 +623,4 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
         partition_id=partition_id,
     )
+    return actor_args, setup_timing_metrics

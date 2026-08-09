@@ -27,8 +27,9 @@ import os
 import socket
 import subprocess
 import time
+import warnings
 from importlib import resources
-from typing import Any
+from typing import Any, cast
 
 import torch
 import transfer_queue as tq
@@ -39,6 +40,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
 )
+from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -171,27 +173,28 @@ def _patch_tq_actor_runtime_env() -> None:
         cls.options = patched  # type: ignore[method-assign]
         return True
 
-    patched_any = False
+    unpatched_classes: list[str] = []
     try:
-        from transfer_queue.storage.simple_backend import SimpleStorageUnit
+        from transfer_queue.storage.simple_storage import SimpleStorageUnit
 
-        patched_any |= _install(SimpleStorageUnit)
+        if not _install(SimpleStorageUnit):
+            unpatched_classes.append("SimpleStorageUnit")
     except ImportError:
-        pass
+        unpatched_classes.append("SimpleStorageUnit")
     try:
         from transfer_queue.controller import TransferQueueController
 
-        patched_any |= _install(TransferQueueController)
+        if not _install(TransferQueueController):
+            unpatched_classes.append("TransferQueueController")
     except ImportError:
-        pass
+        unpatched_classes.append("TransferQueueController")
 
-    if not patched_any:
+    if unpatched_classes:
         # Soft-fail: TQ may have moved its actor classes. The driver will
         # still work; multi-node TQ may need the per-node `uv sync` workaround.
-        import warnings
-
         warnings.warn(
-            "Could not patch TQ actor classes for runtime_env injection. "
+            "Could not patch every TQ actor class for runtime_env injection: "
+            f"unpatched={unpatched_classes}. "
             "Multi-node TQ may fail with ModuleNotFoundError: 'transfer_queue' "
             "on worker nodes. Workaround: run `uv sync` inside each node's "
             "container before the driver runs.",
@@ -322,19 +325,23 @@ def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
 
 
 def _promote_1d_leaves(td: TensorDict) -> TensorDict:
-    """Unsqueeze 1D tensor leaves to ``(N, 1)`` — mooncake_cpu KV-path workaround.
+    """Promote declared scalar leaves to ``(N, 1)`` for Mooncake.
 
-    Works around TQ's ``KVStorageManager`` 1D schema/data mismatch;
-    :func:`_from_wire` squeezes the trailing 1 back on read. Symmetric
-    with `_from_wire` — callers gate on ``self._promote_1d``.
-    ``NonTensorStack`` / ``NonTensorData`` leaves pass through.
+    The authoritative field list lives in
+    :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`. Declared fields must
+    arrive as dense ``(N,)`` tensors. Any other dense 1D tensor is rejected so
+    it cannot silently encounter TQ v0.1.9's schema/data mismatch.
+    ``NonTensorStack`` and ``NonTensorData`` leaves pass through.
 
     Args:
-        td: ``TensorDict`` whose 1D tensor leaves should be promoted.
+        td: TensorDict to validate and encode for the Mooncake wire format.
 
     Returns:
-        ``TensorDict`` with 1D tensor leaves unsqueezed to ``(N, 1)``;
-        all other leaves pass through unchanged.
+        TensorDict with declared scalar leaves promoted to ``(N, 1)``.
+
+    Raises:
+        ValueError: If a declared field is not a dense 1D tensor, or an
+            undeclared field is a dense 1D tensor.
     """
     # td.keys() (top-level) includes NonTensorData / NonTensorStack leaves.
     # keys(include_nested=True, leaves_only=True) enumerates tensor leaves
@@ -343,9 +350,23 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     changed = False
     for k in td.keys():
         v = td.get(k)
-        if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+        field_name = str(k)
+        if field_name in PROMOTE_1D_FIELDS:
+            if not isinstance(v, torch.Tensor) or v.is_nested or v.dim() != 1:
+                shape = tuple(v.shape) if isinstance(v, torch.Tensor) else None
+                raise ValueError(
+                    f"Mooncake scalar field {field_name!r} must be a dense "
+                    f"1D tensor with shape (N,), got {type(v).__name__} "
+                    f"with shape {shape}."
+                )
             new_dict[str(k)] = v.unsqueeze(-1).contiguous()
             changed = True
+        elif isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+            raise ValueError(
+                f"Mooncake field {field_name!r} is a dense 1D tensor but is "
+                "not declared in data_plane.schema.PROMOTE_1D_FIELDS. Add "
+                "the field to the schema if it is a per-sample scalar."
+            )
         else:
             new_dict[str(k)] = v
     if not changed:
@@ -356,23 +377,45 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
+    """Normalize TQ reads and invert :func:`_promote_1d_leaves` when needed.
+
+    Both TQ v0.1.9 storage managers reconstruct every non-scalar field as a
+    nested tensor, including fields whose rows all have the same shape.
+    Densify those uniform nested tensors first so regular batched inputs retain
+    their dense representation. Truly ragged fields remain nested. Finally,
+    squeeze only singleton dimensions declared in
+    :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`.
+    """
     # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
     # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
     new_dict: dict[str, Any] = {}
     changed = False
     for k in td.keys():
         v = td.get(k)
-        if (
-            isinstance(v, torch.Tensor)
-            and not v.is_nested
-            and v.dim() >= 2
-            and v.shape[-1] == 1
-        ):
-            new_dict[str(k)] = v.squeeze(-1).contiguous()
-            changed = True
+        field_name = str(k)
+        if isinstance(v, torch.Tensor) and v.is_nested:
+            rows = list(v.unbind())
+            if rows and all(row.shape == rows[0].shape for row in rows[1:]):
+                v = torch.stack(rows)
+                changed = True
+        if field_name in PROMOTE_1D_FIELDS:
+            if not isinstance(v, torch.Tensor) or v.is_nested:
+                raise ValueError(
+                    f"Mooncake scalar field {field_name!r} could not be "
+                    "restored as a dense tensor."
+                )
+            if v.dim() == 1:
+                new_dict[field_name] = v
+            elif v.dim() == 2 and v.shape[-1] == 1:
+                new_dict[field_name] = v.squeeze(-1).contiguous()
+                changed = True
+            else:
+                raise ValueError(
+                    f"Mooncake scalar field {field_name!r} must decode as "
+                    f"(N,) or (N, 1), got shape {tuple(v.shape)}."
+                )
         else:
-            new_dict[str(k)] = v
+            new_dict[field_name] = v
     if not changed:
         return td
     new_td = TensorDict(new_dict, batch_size=td.batch_size)
@@ -583,9 +626,9 @@ class TQDataPlaneClient(DataPlaneClient):
             return KVBatchMeta(
                 partition_id=partition_id, task_name=None, sample_ids=[], fields=None
             )
-        if tags is None:
-            tags = [{} for _ in sample_ids]
-
+        user_tags = (
+            [{} for _ in sample_ids] if tags is None else [dict(tag) for tag in tags]
+        )
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
@@ -594,17 +637,21 @@ class TQDataPlaneClient(DataPlaneClient):
             # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
             # itself, so the call here was redundant for tensors and
             # destructive for non-tensors.
-            wire_fields = fields.detach()  # type: ignore[bad-assignment,missing-argument]
+            detached_fields = cast(
+                TensorDict,
+                fields.detach(),  # type: ignore[missing-argument]
+            )
             if self._promote_1d:
-                wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
-            field_names = list(wire_fields.keys())
+                detached_fields = _promote_1d_leaves(detached_fields)
+            wire_fields = detached_fields
+            field_names = [str(key) for key in detached_fields.keys()]
 
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
             keys=list(sample_ids),
             partition_id=partition_id,
             fields=wire_fields,
-            tags=tags,
+            tags=user_tags,
         )
 
         return KVBatchMeta(
@@ -612,7 +659,7 @@ class TQDataPlaneClient(DataPlaneClient):
             task_name=None,
             sample_ids=list(sample_ids),
             fields=field_names,
-            tags=[dict(t) for t in tags] if tags else None,
+            tags=user_tags if user_tags else None,
         )
 
     def get_samples(
@@ -623,15 +670,12 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not sample_ids:
             return TensorDict({}, batch_size=(0,))
-        # TQ's wire vocabulary is `keys=` — translation point.
         td = tq.kv_batch_get(
             keys=list(sample_ids),
             partition_id=partition_id,
             select_fields=select_fields,
         )
-        if self._promote_1d:
-            td = _from_wire(td)
-        return td
+        return _from_wire(td)
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None

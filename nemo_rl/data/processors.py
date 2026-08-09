@@ -464,6 +464,7 @@ def vlm_hf_data_processor(
         get_multimodal_default_settings_from_processor,
         get_multimodal_keys_from_processor,
         resolve_to_image,
+        uses_image_placeholder,
     )
 
     # depending on the task, format the data differently
@@ -555,13 +556,9 @@ def vlm_hf_data_processor(
     # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
     # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
     # so we must use processor(text=..., images=...) directly.
-    _PLACEHOLDER_STYLE_PROCESSORS = (
-        "NemotronNanoVLV2Processor",
-        "NemotronH_Nano_Omni_Reasoning_V3Processor",
-    )
-    _uses_image_placeholder = type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSORS
+    uses_placeholder = uses_image_placeholder(processor)
 
-    if _uses_image_placeholder and images:
+    if uses_placeholder and images:
         # Convert content list to <image> placeholder text format
         image_token = getattr(processor, "image_token", "<image>")
         text_parts = []
@@ -582,27 +579,25 @@ def vlm_hf_data_processor(
     else:
         user_message_for_chat_template = user_message_for_tokenize
 
-    # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
         [user_message_for_chat_template],
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    # this is the id-tokenized and image processed conversation template for the policy
-    if _uses_image_placeholder and images:
+    if uses_placeholder and images:
         # Dynamic-resolution path: keep pixel_values in float32 to match vLLM's
         # DynamicResolutionImageTiler bit-for-bit. vLLM stores/normalizes in
         # float32 and only casts at the vision_model boundary; matching that
         # rounding order tightens rollout/train logprob agreement. The model
         # forward dispatches on imgs_sizes and handles the bf16 cast.
-        message: dict = processor(
+        message = processor(
             text=string_formatted_dialog,
             images=images,
             return_tensors="pt",
         )
     else:
-        message: dict = processor.apply_chat_template(
+        message = processor.apply_chat_template(
             [user_message_for_tokenize],
             tokenize=True,
             add_generation_prompt=True,
@@ -620,7 +615,7 @@ def vlm_hf_data_processor(
     # the Nemotron Omni path can patchify it and preserve the processor's exact
     # placeholder count.
     if (
-        _uses_image_placeholder
+        uses_placeholder
         and "pixel_values" in message
         and "imgs_sizes" not in message
         and message["pixel_values"].ndim == 4
@@ -646,7 +641,7 @@ def vlm_hf_data_processor(
             user_message[key] = PackedTensor(
                 message[key],
                 dim_to_pack=get_dim_to_pack_along(processor, key),
-                pad_to_max_shape=_uses_image_placeholder and key == "pixel_values",
+                pad_to_max_shape=uses_placeholder and key == "pixel_values",
             )
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
@@ -789,7 +784,12 @@ def nemo_gym_data_processor(
     max_seq_length: int | None,
     idx: int,
 ) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym.
+
+    NeMo-Gym builds the real cumulative prompt server-side. Both LLM and VLM
+    rows therefore use a placeholder here; VLM inputs are processed once after
+    the complete rollout has been collected.
+    """
     output: DatumSpec = {
         # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
         "extra_env_info": json.loads(datum_dict["extra_env_info"]),
