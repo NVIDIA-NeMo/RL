@@ -161,12 +161,16 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservi
 
 # -----------------------------------------------------------------------------
 # Containers
-# Built from public main on 2026-07-26 with prebaked venvs + NCCL 2.30.4.
-# Its dependency baseline matches HEAD on ray 2.56.1 / torch 2.11.0+cu130 /
-# vllm 0.20.0 / transformers 5.5.0; the only drift is ~20 additive pure-Python
-# packages from 8b58d05d4, which uv resyncs cheaply at startup.
+# Built from public main on 2026-07-30 with prebaked venvs, on vllm 0.25.1.
+#
+# The 2026-07-26 image that used to be the default here carries vllm 0.20.0,
+# which no longer satisfies HEAD: vllm_worker_async.py imports
+# ServingTokenization from vllm.entrypoints.serve.tokenize.serving, added in
+# 0.25.x. Missing it kills every generation worker at engine init, and it does
+# so ~25 minutes in, after the judges and the Megatron workers have already
+# loaded. Jobs 5942981 and 5981739 both died that way.
 # -----------------------------------------------------------------------------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:main_ultra_recipes_prebaked_venvs_nccl2304_20260726_b.squashfs}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:main_ultra_recipes_prebaked_venvs_20260730.squashfs}"
 
 # -----------------------------------------------------------------------------
 # Sandbox process DISABLED — this is what killed jobs 5726250 and 5732681.
