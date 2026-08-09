@@ -13,3 +13,25 @@ tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 # spare. Move to nightly.txt once a real run confirms it converges and the
 # budget has room.
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.sh
+
+# Retained as proof of model support, not run.
+#
+# Every recipe for these models was marked P1 in the test-suite inventory, so
+# deleting them all would leave the repo with no config for the model at all --
+# and for Qwen2.5-32B, GPT-OSS and DeepSeek-R1-Distill the docs still describe
+# support we would no longer be able to show. One representative recipe per
+# model is kept here: it costs no compute (nothing schedules disabled.txt) but
+# stays schema-validated by test_all_config_files_have_required_keys and
+# path-checked by test_all_tests_can_find_config_if_dryrun, so it cannot rot.
+#
+# The remaining recipes for these models were deleted. These become
+# SUITE=disabled with a structured reason when the manifests are retired.
+tests/test_suites/llm/grpo-minimax-m27-dapo-8n8g-automodel.sh
+tests/test_suites/llm/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt-long.v3.sh
+tests/test_suites/llm/ppo-dsr1-7b-math-8n8g-megatron.sh
+tests/test_suites/llm/grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.sh
+tests/test_suites/llm/sft-llama3.1-70b-8n8g-tp4pp2-long-megatron.sh
+tests/test_suites/llm/dapo-mistral-medium-3.5-128b-16n8g-fsdp2-automodel.sh
+tests/test_suites/llm/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long.sh
+tests/test_suites/llm/grpo-nano-v2-12b-1n8g-megatron.sh
+tests/test_suites/llm/grpo-gptoss-20b-8n8g-megatron.sh

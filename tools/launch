@@ -121,9 +121,12 @@ for SCRIPT in $SCRIPTS; do
         exit 1
     fi
     # Reset optional per-script config vars so a value from a previous script in
-    # the loop does not leak into a script that omits it.
+    # the loop does not leak into a script that omits it. GPUS_PER_NODE must be
+    # reset too: it is exported below, so without this a 4-GPU (GB200) script
+    # would silently bill every subsequent 8-GPU script at 4 GPUs per node.
     SEGMENT_SIZE=""
     JOB_REAPER_COMMENT=""
+    GPUS_PER_NODE=""
     eval "$config"
 
     # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
