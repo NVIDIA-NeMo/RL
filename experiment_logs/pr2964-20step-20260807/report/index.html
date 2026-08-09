@@ -258,9 +258,9 @@
         using canonical 8-GPU performance recipes and explicit x86 HybridEP topology.
       </p>
       <div class="header-meta">
-        <span>Updated 2026-08-09 01:19 PDT</span>
+        <span>Updated 2026-08-09 01:35 PDT</span>
         <span>NeMo RL main 0e687e6d · strict A/B candidate 3d6d1324 · Bridge-main candidate 541413bd</span>
-        <span>PR #2964 remote 60a10b4f · PR-ready padding-only candidate 4d6c3227</span>
+        <span>PR #2964 remote 4d6c3227 · one-time padding path now published</span>
         <span>DeepEP 17cfb817 + DMA-BUF fix a9d657d2</span>
         <span>MCore workload candidate c8cedc3d · Bridge-main Q30 stock MCore 14499ef0 · pending routing candidate 34b55f24</span>
         <span>20-step target per workload</span>
@@ -270,8 +270,8 @@
     <section class="cards" aria-label="Validation status summary">
       <article class="card">
         <div class="label">Overall status</div>
-        <div class="value"><span class="pill pending">Validation-candidate A/B complete · PR remote update required</span></div>
-        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP candidate pairs all completed 20/20 with exit <code>0:0</code>. The passing Super result is not PR #2964 remote head alone: it includes the restored one-time NeMo prepadding and external MCore/DeepEP fixes. Clean-node Bridge-main Q30 job 507302 and NeMo-RL-main-pinned Bridge Q235 job 507112 also completed 20/20 with exit <code>0:0</code>; Super 506895 is at Step 18 with zero classified runtime fatals.</p>
+        <div class="value"><span class="pill pending">Validation-candidate A/B complete · PR updated · CI running</span></div>
+        <p>Strict same-source Qwen3-30B-A3B, Qwen3-235B, and Nemotron Super baseline/HybridEP candidate pairs all completed 20/20 with exit <code>0:0</code>. PR #2964 now points to <code>4d6c3227</code> and contains the restored one-time NeMo prepadding path. The passing Super workload additionally includes external MCore/DeepEP fixes whose stock dependency boundary is being measured. Clean-node Bridge-main Q30 job 507302 and NeMo-RL-main-pinned Bridge Q235 job 507112 also completed 20/20 with exit <code>0:0</code>; Super 506895 entered Step 19 with zero classified runtime fatals.</p>
       </article>
       <article class="card">
         <div class="label">Validation matrix</div>
@@ -292,7 +292,7 @@
 
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Execution chain</h2>
-      <p class="section-note">Live snapshot at 2026-08-09 01:19 PDT. Final HybridEP candidate jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. NeMo-RL-main-pinned Bridge Qwen jobs 507111/507112 also completed 20/20; Super 506895 is at Step 18 with zero classified application fatals. Bridge-main ordering test 507231 and PR-ready focused test 507481 passed. Diagnostic reproduction 507294 isolated CUDA symmetric-memory multicast allocation failures to node 0167; clean-node Q30 retry 507302 completed 20/20 in 59:21 with exit <code>0:0</code>. Latest-Bridge Q235/Super routing-candidate jobs 507274/507275 are submitted; stock-MCore jobs 507501/507502 are chained after them.</p>
+      <p class="section-note">Live snapshot at 2026-08-09 01:35 PDT. Final HybridEP candidate jobs 506437/506438/506434 and exact-source baselines 507045/507046/506464 all completed 20/20 with exit <code>0:0</code> and zero classified application fatals. NeMo-RL-main-pinned Bridge Qwen jobs 507111/507112 also completed 20/20; Super 506895 entered Step 19 with zero classified application fatals. Bridge-main ordering test 507231 and PR-ready focused test 507481 passed. PR #2964 has been fast-forwarded to padding commit <code>4d6c3227</code> and CI:Lfast is running. Diagnostic reproduction 507294 isolated CUDA symmetric-memory multicast allocation failures to node 0167; clean-node Q30 retry 507302 completed 20/20 in 59:21 with exit <code>0:0</code>. Latest-Bridge Q235/Super routing-candidate jobs 507274/507275 are submitted; stock-MCore jobs 507501/507502 are chained after them.</p>
       <div class="job-grid">
         <article class="job">
           <div class="job-head">
@@ -437,9 +437,9 @@
         <article class="job">
           <div class="job-head">
             <h3>506895 · NeMo-RL-main-pinned Bridge + external MCore backport · Super</h3>
-            <span class="pill pending">Running · Step 18/20</span>
+            <span class="pill pending">Running · Step 19/20</span>
           </div>
-          <p>Started after the canonical Super baseline completed, connected all 256 GPUs, completed Step 17, and entered Step 18 with zero classified runtime fatals. Step 10 recorded 1691.56 s total including 822.92 s validation, 826.47 s generation, 4.29 s policy, and 5.13 s LogProb; validation accuracy was 63.67% over 256 samples. Step 17 recorded 795.40 s total, 769.61 s generation, 7.34 s policy, and 4.13 s LogProb. It uses canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, official Megatron-Bridge <code>573e088c</code>, its exact MCore pin plus routing fix <code>788db41f</code>, NeMo prepadding candidate <code>4846673c</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix.</p>
+          <p>Started after the canonical Super baseline completed, connected all 256 GPUs, completed Step 18, and entered Step 19 with zero classified runtime fatals. Step 10 recorded 1691.56 s total including 822.92 s validation, 826.47 s generation, 4.29 s policy, and 5.13 s LogProb; validation accuracy was 63.67% over 256 samples. Step 18 recorded 789.14 s total, 762.79 s generation, 4.56 s policy, and 6.28 s LogProb. It uses canonical <code>grpo-nemotron3-super-120BA12B-32n8g.yaml</code>, official Megatron-Bridge <code>573e088c</code>, its exact MCore pin plus routing fix <code>788db41f</code>, NeMo prepadding candidate <code>4846673c</code>, and DeepEP <code>17cfb817</code> plus the DMA-BUF fix.</p>
         </article>
         <article class="job">
           <div class="job-head">
@@ -812,7 +812,7 @@
         Latest-main audit: Megatron-Bridge main advanced after the submitted jobs from <code>573e088c</code> to <code>fcbabe78</code>, pinning MCore <code>14499ef0</code>. Bridge commit <code>3ecb452a</code> forces MCore's per-layer uneven-input padding on during model finalization. NeMo candidate <code>541413bd</code> therefore performs its override after <code>ConfigContainer.validate()</code>: PP1 Qwen3-30B and Super keep one-time NeMo-owned THD padding without the per-layer collective, while PP8 Qwen3-235B remains on MCore's internal path. TDD ordering job 507231 and PR-ready job 507481 passed; clean-node Q30 507302 completed 20/20 with Bridge's stock MCore <code>14499ef0</code>. Q235/Super jobs 507274/507275 retain external routing candidate <code>34b55f24</code>; sequential stock-MCore jobs 507501/507502 determine whether that external dependency remains necessary.
       </div>
       <div class="callout">
-        PR-state boundary: GitHub PR #2964 still points to <code>60a10b4f</code>. That remote head creates routing masks and enables MCore's per-layer uneven-input padding, but it does not contain the restored one-time NeMo prepadding path and must not yet be described as Super-safe. PR-ready descendant <code>4d6c3227</code> contains only the additional NeMo padding path, guards, and post-validation override; it deliberately leaves the DeepEP pin to coupled PR #3436. Job 507481 passed 12/12 focused tests against latest Bridge and stock MCore. The branch will be pushed to the actual PR after the remaining 20-step completion gates.
+        PR-state boundary: GitHub PR #2964 now points to <code>4d6c3227</code>. The remote branch contains the one-time NeMo padding path, fail-closed guards, and post-Bridge-validation override, while deliberately leaving the DeepEP pin to coupled PR #3436. Job 507481 passed 12/12 focused tests against latest Bridge and stock MCore. The existing <code>CI:Lfast</code> label was preserved and CI for the new head was requested with <code>/ok to test 4d6c3227…</code>; full stock-MCore workload gates remain in progress.
       </div>
     </section>
 
@@ -833,11 +833,11 @@
         </article>
         <article class="provenance-item">
           <h3>NeMo-RL-main-pinned Bridge validation stack</h3>
-          <p>NeMo RL: <code>4846673cf66cb47fc1eecf0ea22d17c1bead8f75</code><br>Official Megatron-Bridge: <code>573e088c9c6740082c39744e03dc5b009e730ed4</code><br>Exact-pin MCore validation backport: <code>788db41fedf7d4bb7dd7a6989ef47c6ba1960479</code><br>DeepEP: <code>17cfb817</code> + DMA-BUF fix<br>Q30 507111 and Q235 507112: completed 20/20 · Super 506895: Step 18/20</p>
+          <p>NeMo RL: <code>4846673cf66cb47fc1eecf0ea22d17c1bead8f75</code><br>Official Megatron-Bridge: <code>573e088c9c6740082c39744e03dc5b009e730ed4</code><br>Exact-pin MCore validation backport: <code>788db41fedf7d4bb7dd7a6989ef47c6ba1960479</code><br>DeepEP: <code>17cfb817</code> + DMA-BUF fix<br>Q30 507111 and Q235 507112: completed 20/20 · Super 506895: Step 19/20</p>
         </article>
         <article class="provenance-item">
           <h3>PR and dependency heads</h3>
-          <p>NeMo RL main: <code>0e687e6d07623d780a4174310e92382ce738a8a2</code><br>PR #2964 remote: <code>60a10b4f54c2754d44150771a06260fe9e8b186f</code> · mergeable, blocked by <code>codecov/patch</code><br>PR #3436 HybridEP dependency: <code>a9aaa395c37963a9fd8a7320d61a516c7b714e57</code><br>Integration candidate including the dependency pin: <code>cd65e57834411c5d51dd2270f30d7de4c6a1d29a</code><br>PR-ready padding-only descendant: <code>4d6c3227edd092bc49762bb9fb51889f9b8cee9b</code> · job 507481: 12/12 passed</p>
+          <p>NeMo RL main: <code>0e687e6d07623d780a4174310e92382ce738a8a2</code><br>PR #2964 remote: <code>4d6c3227edd092bc49762bb9fb51889f9b8cee9b</code> · <code>CI:Lfast</code> running<br>PR #3436 HybridEP dependency: <code>a9aaa395c37963a9fd8a7320d61a516c7b714e57</code><br>Integration candidate including the dependency pin: <code>cd65e57834411c5d51dd2270f30d7de4c6a1d29a</code><br>Published padding-only PR head: <code>4d6c3227edd092bc49762bb9fb51889f9b8cee9b</code> · job 507481: 12/12 passed</p>
         </article>
         <article class="provenance-item">
           <h3>Bridge-main compatibility stack</h3>
