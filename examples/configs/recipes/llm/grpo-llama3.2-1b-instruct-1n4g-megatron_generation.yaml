@@ -1,0 +1,10 @@
+defaults: ./grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n4g-megatron_generation
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n4g-megatron_generation
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n4g-megatron_generation
+cluster:
+  gpus_per_node: 4
+
