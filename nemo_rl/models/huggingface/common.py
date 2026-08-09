@@ -57,8 +57,38 @@ class ModelFlag(Enum):
                 raise ValueError(f"Unknown ModelFlag: {self}")
 
 
+def load_hf_config(model_name: str):
+    """Load a model's HF config, falling back to vLLM's config registry.
+
+    Some architectures are not in the installed `transformers`. vLLM ships its
+    own config class for several of them and registers it into `AutoConfig`, but
+    only from inside its own loader — so a bare `AutoConfig.from_pretrained`
+    raises `ValueError: ... model type X but Transformers does not recognize this
+    architecture` before any vLLM machinery has run.
+
+    Muse Glimmer (Onyx architecture) is one such model:
+    `vllm.transformers_utils.configs.onyx` exists, but the installed transformers
+    has no `onyx`. The training-side workers are unaffected because
+    `nemo_automodel` registers its custom configs on import; the vLLM worker venv
+    has no automodel.
+
+    Falls back only when vLLM is importable, and re-raises the original
+    transformers error otherwise so non-vLLM callers get the clearer message.
+    """
+    try:
+        return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except (OSError, ValueError):
+        try:
+            # get_config consults vLLM's _CONFIG_REGISTRY and registers the class
+            # into AutoConfig, so later bare lookups in this process succeed too.
+            from vllm.transformers_utils.config import get_config
+        except ImportError:
+            raise
+        return get_config(model_name, trust_remote_code=True)
+
+
 def is_gemma_model(model_name: str) -> bool:
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    hf_config = load_hf_config(model_name)
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "gemma2",
         "gemma3",
@@ -67,7 +97,7 @@ def is_gemma_model(model_name: str) -> bool:
 
 
 def is_nano_nemotron_vl_model(model_name: str) -> bool:
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    hf_config = load_hf_config(model_name)
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "NemotronH_Nano_VL_V2",
         "NemotronH_Nano_Omni_Reasoning_V3",

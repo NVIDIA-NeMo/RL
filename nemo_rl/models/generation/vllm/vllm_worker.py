@@ -53,7 +53,7 @@ from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
-from nemo_rl.models.huggingface.common import ModelFlag
+from nemo_rl.models.huggingface.common import ModelFlag, load_hf_config
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -62,6 +62,21 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# vLLM treats *ForConditionalGeneration architectures as multimodal and initializes
+# the VL processor pipeline, which needs a tokenizer. NeMo-RL defaults
+# skip_tokenizer_init=True, so these architectures must opt back out or vLLM crashes
+# with "'NoneType' object has no attribute 'convert_tokens_to_ids'".
+# See https://github.com/NVIDIA-NeMo/RL/issues/1681.
+TOKENIZER_INIT_REQUIRED_ARCHS = (
+    "Gemma3ForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
+    "Mistral3ForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+    # Onyx is the architecture backing Muse Glimmer.
+    "OnyxForConditionalGeneration",
+)
 
 
 def _context_capped_max_new_tokens(
@@ -489,7 +504,7 @@ class BaseVllmGenerationWorker:
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        hf_config = load_hf_config(self.model_name)
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )
@@ -502,25 +517,12 @@ class BaseVllmGenerationWorker:
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
         elif any(
             arch in getattr(hf_config, "architectures", [])
-            for arch in (
-                "Gemma3ForConditionalGeneration",
-                "Gemma4ForConditionalGeneration",
-                "Mistral3ForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            )
+            for arch in TOKENIZER_INIT_REQUIRED_ARCHS
         ):
             detected_arch = [
                 arch
                 for arch in getattr(hf_config, "architectures", [])
-                if arch
-                in (
-                    "Gemma3ForConditionalGeneration",
-                    "Gemma4ForConditionalGeneration",
-                    "Mistral3ForConditionalGeneration",
-                    "Qwen3_5ForConditionalGeneration",
-                    "Qwen3_5MoeForConditionalGeneration",
-                )
+                if arch in TOKENIZER_INIT_REQUIRED_ARCHS
             ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
