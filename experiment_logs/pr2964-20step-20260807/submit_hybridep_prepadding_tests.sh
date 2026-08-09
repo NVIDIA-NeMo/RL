@@ -35,7 +35,14 @@ case "${test_scope}" in
   full)
     pytest_targets="${ordering_tests} \
 ${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepads_packed_inputs_before_model_forward \
-${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_explicitly_uses_input_prepadding"
+${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepadding_rejects_missing_alignment_group \
+${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_prepadding_preserves_cp_zigzag_layout \
+${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_preserves_existing_cp_local_layout \
+${repo}/tests/unit/models/megatron/test_megatron_data.py::test_hybridep_padding_mask_rejects_model_owned_cp_slicing \
+${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_without_opt_in_keeps_dispatch_padding \
+${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_sequence_packing_explicitly_uses_input_prepadding \
+${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_input_prepadding_requires_flex_dispatcher \
+${repo}/tests/unit/models/megatron/test_megatron_setup.py::TestApplyMoeConfig::test_hybridep_input_prepadding_rejects_unsupported_layouts"
     ;;
   *) printf 'HYBRIDEP_TEST_SCOPE must be ordering or full, got %s\n' "${test_scope}" >&2; exit 2 ;;
 esac
