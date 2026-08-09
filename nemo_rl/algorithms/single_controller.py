@@ -377,7 +377,19 @@ class SingleControllerActor:
                         trainer_version_fn=lambda: self._trainer_version
                     )
 
-                    for prompt_idx in range(prompt_batch.size):
+                    num_prompts = prompt_batch.size
+                    if target_step is not None:
+                        buffered = self._buffer.count_for_target_step(target_step)
+                        if buffered:
+                            num_prompts = max(0, prompt_batch.size - buffered)
+                            print(
+                                f"  target_step={target_step}: {buffered} group(s) "
+                                f"already buffered; dispatching {num_prompts} of "
+                                f"{prompt_batch.size} prompt(s), dropping the rest",
+                                flush=True,
+                            )
+
+                    for prompt_idx in range(num_prompts):
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }

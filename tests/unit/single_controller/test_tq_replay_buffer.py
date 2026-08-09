@@ -426,6 +426,19 @@ class TestTQReplayBufferSize:
         assert buf.size() == 1
         assert len(buf) == 1
 
+    def test_count_for_target_step_includes_reserved_slots(self):
+        # The rollout pump uses this to size the top-up of a restored target
+        # step, so in-flight (reserved, not yet committed) slots must count.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0, target_step=5)
+        _add_group(buf, weight=0, target_step=6)
+        buf.reserve(weight_version=0, target_step=5)
+
+        assert buf.count_for_target_step(5) == 2
+        assert buf.count_for_target_step(6) == 1
+        assert buf.count_for_target_step(7) == 0
+
 
 # ── state_dict / load_state_dict (checkpointing) ─────────────────────────────
 
@@ -703,3 +716,50 @@ class TestTQReplayBufferLoadTruncation:
         put_sample_ids = [sid for c in dp.put_calls for sid in c["sample_ids"]]
         assert "g1_g0" not in put_sample_ids and "g1_g1" not in put_sample_ids
         assert any("capacity changed" in line for line in printed)
+
+    def test_over_capacity_target_stamped_groups_raise(self):
+        # start_weight and target_step are both monotonic for the InOrder
+        # family, so freshest-first would keep the far-future targets and drop
+        # the near-term ones. InOrderSampler.evict only drops
+        # target < current_train_weight, so those permits are never released:
+        # rollout blocks on capacity while the train pump waits for a target
+        # that can no longer be filled. Fail loudly instead of truncating.
+        state = _make_envelope(
+            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2, 3)],
+            saved_capacity=8,
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        with pytest.raises(ValueError, match="max_buffered_rollouts >= 3"):
+            _load(buf, state, max_groups=2)
+
+        # Preflight semantics: nothing reached the DataPlane or the buffer.
+        assert dp.put_calls == []
+        assert buf.size() == 0
+
+    def test_over_capacity_mixed_stamps_raise(self):
+        # One target-stamped group is enough to make truncation unsafe.
+        state = _make_envelope(
+            [
+                _make_group_entry("g1", weight=1),
+                _make_group_entry("g2", weight=2),
+                _make_group_entry("g3", weight=3, target_step=3),
+            ],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        with pytest.raises(ValueError, match="target_step stamps"):
+            _load(buf, state, max_groups=2)
+
+    def test_target_stamped_groups_within_capacity_load_fine(self):
+        # The guard is scoped to the over-capacity case only.
+        state = _make_envelope(
+            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2)],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, state, max_groups=2) == 2
+        assert buf.target_step_list == [1, 2]

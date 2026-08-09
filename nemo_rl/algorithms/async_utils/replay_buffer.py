@@ -910,7 +910,9 @@ class TQReplayBuffer:
         precedent: validate, then truncate):
           1. Validate the envelope and raise ValueError on malformed state.
           2. Truncate to ``max_groups``, keeping the freshest groups, so the
-             restored count can never exceed the buffer's capacity.
+             restored count can never exceed the buffer's capacity. Groups
+             carrying a ``target_step`` are never truncated — an over-capacity
+             in-order checkpoint raises instead (see Raises).
 
         Staleness is intentionally NOT handled here — load only loads. The
         train pump's first ``sampler.evict`` drops any restored group that is
@@ -933,7 +935,7 @@ class TQReplayBuffer:
         Raises:
             ValueError: If the envelope is malformed (missing keys, partition
                 mismatch, misaligned or wrongly sized groups, duplicate
-                sample_ids).
+                sample_ids), or if target-stamped groups exceed ``max_groups``.
         """
         required_keys = {"partition_id", "saved_capacity", "groups"}
         missing_keys = required_keys - set(state)
@@ -993,6 +995,17 @@ class TQReplayBuffer:
             )
         num_truncated = 0
         if len(groups) > max_groups:
+            if any(group["target_step"] is not None for group in groups):
+                raise ValueError(
+                    f"Replay buffer checkpoint holds {len(groups)} group(s) "
+                    f"but async_rl.max_buffered_rollouts is {max_groups}. "
+                    "These groups carry target_step stamps (in-order "
+                    "sampling) and are selected as whole per-step batches, so "
+                    "dropping any of them would deadlock the resumed run. "
+                    "Resume with async_rl.max_buffered_rollouts >= "
+                    f"{len(groups)}, or delete replay_buffer.pt from the "
+                    "checkpoint to resume with an empty buffer."
+                )
             num_truncated = len(groups) - max_groups
             # Keep the freshest max_groups groups, preserving original order.
             prioritized = sorted(
@@ -1023,6 +1036,10 @@ class TQReplayBuffer:
             summary += f"; truncated {num_truncated} group(s) over capacity"
         print(summary, flush=True)
         return len(groups)
+
+    def count_for_target_step(self, target_step: int) -> int:
+        """Return how many slots are stamped with ``target_step``."""
+        return sum(1 for target in self.target_step_list if target == target_step)
 
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""
