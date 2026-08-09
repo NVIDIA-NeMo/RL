@@ -21,6 +21,12 @@ async_rl:
   # Re-dispatch attempts for a prompt whose rollout raised, before dropping it.
   # 0 disables retry.
   rollout_retries: 1
+  # Further attempts, spaced by the backoff, once the immediate retries are
+  # gone. A dropped prompt leaves its batch a group short, which a sampler that
+  # matches batches to steps exactly cannot close, so waiting out a sick server
+  # is what keeps the batch whole.
+  rollout_redispatch_attempts: 2
+  rollout_redispatch_backoff_seconds: 30.0
   # Consecutive prompts that may exhaust their retries before the run aborts.
   max_consecutive_rollout_failures: 32
   # Enable per-rollout diagnostic prints (prompt content / completion previews).

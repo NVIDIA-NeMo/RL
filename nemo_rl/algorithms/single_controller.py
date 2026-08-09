@@ -71,6 +71,10 @@ from nemo_rl.utils.timer import Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
+# How long the train pump may go without selecting a group before it says so.
+# Generous: a healthy step can wait several minutes on generation alone.
+_SELECT_STALL_WARN_SECONDS = 600.0
+
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
@@ -164,6 +168,12 @@ class SingleControllerActor:
         self._dropped_rollouts: int = 0
         self._consecutive_rollout_failures: int = 0
         self._rollout_failure_counts: Counter[str] = Counter()
+
+        # Groups a batch will never receive, keyed by the target_step it was
+        # stamped with. A sampler that matches batches to steps exactly hands
+        # the train pump nothing once the survivors are consumed, so the pump
+        # subtracts this from the group count it waits for.
+        self._batch_shortfall: Counter[int] = Counter()
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
@@ -261,17 +271,26 @@ class SingleControllerActor:
     ) -> bool:
         """Run one prompt, retrying transient failures. True if it committed.
 
-        Returns False when the prompt is dropped, which is deliberately not an
-        error: generate_and_push already rolled back its buffer slot and its
-        DataPlane rows, and the train pump waits on ready groups rather than a
-        fixed batch, so the step simply fills from the next prompts.
+        Attempts run back to back first, then ``rollout_redispatch_attempts``
+        more with a backoff between them, so a prompt whose environment server
+        is briefly sick rejoins its own batch instead of vanishing from it.
+
+        Returns False only when every attempt failed. That leaves the prompt's
+        batch one group short, which a sampler matching batches to steps exactly
+        cannot close on its own, so the shortfall is recorded here for the train
+        pump to subtract from its target.
 
         Raises only when prompts keep failing back to back, which means the
         environment servers or the generation backend are down rather than one
         prompt being bad.
         """
-        attempts = 1 + self._async_cfg.rollout_retries
+        immediate = 1 + self._async_cfg.rollout_retries
+        attempts = immediate + self._async_cfg.rollout_redispatch_attempts
         for attempt in range(1, attempts + 1):
+            if attempt > immediate:
+                # Spacing is the point of a re-dispatch: an immediate replay
+                # would just hit the same unhealthy server.
+                await asyncio.sleep(self._async_cfg.rollout_redispatch_backoff_seconds)
             try:
                 await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
@@ -284,20 +303,25 @@ class SingleControllerActor:
                 name = type(e).__name__
                 self._rollout_failure_counts[name] += 1
                 if attempt < attempts:
+                    how = "retrying" if attempt < immediate else "re-dispatching"
                     print(
                         f"rollout_pump: prompt failed with {name}: {e} — "
-                        f"retrying ({attempt}/{attempts - 1})",
+                        f"{how} ({attempt}/{attempts - 1})",
                         flush=True,
                     )
                     continue
 
+                if target_step is not None:
+                    self._batch_shortfall[target_step] += 1
                 self._dropped_rollouts += 1
                 self._consecutive_rollout_failures += 1
                 print(
                     f"rollout_pump: dropping prompt after {attempts} attempt(s), "
                     f"last error {name}: {e} "
                     f"(dropped {self._dropped_rollouts} total, "
-                    f"{self._consecutive_rollout_failures} in a row)",
+                    f"{self._consecutive_rollout_failures} in a row; "
+                    f"step {target_step} now expects "
+                    f"{self._batch_shortfall[target_step]} fewer group(s))",
                     flush=True,
                 )
                 if (
@@ -456,8 +480,30 @@ class SingleControllerActor:
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
 
+            # Prompts dropped from this step's batch are never coming, so
+            # waiting for the full count would spin forever against a sampler
+            # that only offers groups stamped for this step. Re-read rather than
+            # snapshot: a re-dispatch can still be in backoff when the step
+            # opens, so the shortfall may grow while we are already waiting.
+            announced_shortfall = 0
+            last_progress = time.monotonic()
+            stall_warnings = 0
+
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg.num_prompts_per_step:
+                while True:
+                    shortfall = self._batch_shortfall[version_during_step]
+                    if shortfall > announced_shortfall:
+                        print(
+                            f"train_pump: step {version_during_step} lost "
+                            f"{shortfall} prompt(s) to rollout failures; "
+                            f"training on "
+                            f"{grpo_cfg.num_prompts_per_step - shortfall} groups",
+                            flush=True,
+                        )
+                        announced_shortfall = shortfall
+                    groups_wanted = grpo_cfg.num_prompts_per_step - shortfall
+                    if groups_dispatched >= groups_wanted:
+                        break
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -475,9 +521,7 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
 
                         # Select a batch
-                        max_prompt_groups = (
-                            grpo_cfg.num_prompts_per_step - groups_dispatched
-                        )
+                        max_prompt_groups = groups_wanted - groups_dispatched
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
@@ -502,10 +546,28 @@ class SingleControllerActor:
                                 raise RuntimeError(
                                     "rollout exhausted before a complete training "
                                     f"step was assembled: dispatched "
-                                    f"{groups_dispatched}/"
-                                    f"{grpo_cfg.num_prompts_per_step} prompt "
+                                    f"{groups_dispatched}/{groups_wanted} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
+                                )
+                            # A step legitimately waits minutes on generation,
+                            # but never without the buffer or the in-flight set
+                            # moving. Silence here cost a run 104 minutes once,
+                            # so say something rather than spin invisibly.
+                            stalled_for = time.monotonic() - last_progress
+                            if stalled_for > _SELECT_STALL_WARN_SECONDS * (
+                                stall_warnings + 1
+                            ):
+                                stall_warnings += 1
+                                print(
+                                    f"train_pump: no group selected for "
+                                    f"{stalled_for / 60:.1f} min on step "
+                                    f"{version_during_step} — "
+                                    f"{groups_dispatched}/{groups_wanted} groups, "
+                                    f"{len(self._buffer)} buffered, "
+                                    f"{self._inflight_rollouts} rollouts in flight, "
+                                    f"{self._dropped_rollouts} dropped",
+                                    flush=True,
                                 )
                             await asyncio.sleep(0.005)
                             continue
@@ -592,6 +654,18 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
+                    last_progress = time.monotonic()
+                    stall_warnings = 0
+
+                # Only reachable if the shortfall consumed the whole batch, in
+                # which case no microbatch ever opened the step and there is
+                # nothing for finish_train_step to close.
+                if groups_dispatched == 0:
+                    raise RuntimeError(
+                        f"step {version_during_step} lost all "
+                        f"{grpo_cfg.num_prompts_per_step} of its prompts to "
+                        f"rollout failures; nothing to train on"
+                    )
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
@@ -602,6 +676,7 @@ class SingleControllerActor:
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
 
+                self._batch_shortfall.pop(version_during_step, None)
                 self._trainer_version += 1
                 self._train_steps += 1
                 with self._timer.time("weight_sync"):

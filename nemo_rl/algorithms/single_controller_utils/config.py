@@ -52,6 +52,15 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # it. Gym retries dropped connections itself but surfaces HTTP 5xx and
     # truncated bodies to us, and those are usually transient. 0 disables retry.
     rollout_retries: int = 1
+    # Further attempts for the same prompt, spaced by the backoff below, once the
+    # immediate retries are gone. These exist because a dropped prompt leaves its
+    # batch one group short, and a sampler that matches batches to steps exactly
+    # (in_order) can then never close that step. Waiting out a sick environment
+    # server is what keeps the batch whole. 0 restores drop-on-first-exhaustion.
+    rollout_redispatch_attempts: int = 2
+    # Seconds to wait before each re-dispatch. Long enough for a failing server
+    # to restart or a load balancer to route around it, short relative to a step.
+    rollout_redispatch_backoff_seconds: float = 30.0
     # Consecutive prompts that may exhaust their retries before the run aborts.
     # Isolated rollout failures are normal and get dropped; this many in a row
     # means the environment servers or generation backend are down, not that one
