@@ -512,7 +512,7 @@ Run the checked-in ZeroMQ recipe with:
 
 ```bash
 uv run python examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml
+  --config examples/configs/recipes/qwen3/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml
 ```
 
 For a diagnostic run, enable bounded transmitted-delta sampling through the
@@ -520,7 +520,7 @@ logged config:
 
 ```bash
 uv run python examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml \
+  --config examples/configs/recipes/qwen3/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml \
   policy.generation.refit_cfg.sparse.verify_samples_per_payload=32
 ```
 

@@ -22,7 +22,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run $PROJECT_ROOT/examples/run_dpo.py \
-    --config $PROJECT_ROOT/examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.v2.yaml \
+    --config $PROJECT_ROOT/examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatron.v2.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
     dpo.max_num_steps=3 \
     dpo.val_batches=1 \

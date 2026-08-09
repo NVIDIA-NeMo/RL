@@ -3995,7 +3995,7 @@ def async_grpo_train(
             "entrypoint is supported only when data_plane.enabled=false. For "
             "async + TransferQueue, use the SingleController entrypoint: "
             "examples/run_grpo_single_controller.py with e.g. "
-            "examples/configs/recipes/llm/"
+            "examples/configs/recipes/qwen3/"
             "grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml"
         )
 

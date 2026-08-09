@@ -17,7 +17,7 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 POLICY_MODEL=${NRL_EAGLE3_POLICY_MODEL:-Qwen/Qwen3-1.7B}
 DRAFT_MODEL=${NRL_EAGLE3_DRAFT_MODEL:-AngelSlim/Qwen3-1.7B_eagle3}
-CONFIG_PATH=$PROJECT_ROOT/examples/configs/recipes/llm/grpo-qwen3-1.7b-1n4g-megatron-eagle3.yaml
+CONFIG_PATH=$PROJECT_ROOT/examples/configs/recipes/qwen3/grpo-qwen3-1.7b-1n4g-megatron-eagle3.yaml
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR

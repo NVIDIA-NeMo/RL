@@ -24,7 +24,7 @@
 #     nvidia.com/gpu.clique as a placement key.
 #
 # Usage:
-#   RECIPE=examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+#   RECIPE=examples/configs/recipes/qwen3/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
 #   INFRA=infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
 #
 #   # One-shot with auto-teardown (default):
@@ -137,7 +137,7 @@ launch:
     mkdir -p "\${LOG_DIR}"
 
     python -u examples/run_grpo.py \
-      --config examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml \
+      --config examples/configs/recipes/qwen3/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml \
       grpo.max_num_steps=5 \
       grpo.val_period=5 \
       checkpointing.save_period=5 \

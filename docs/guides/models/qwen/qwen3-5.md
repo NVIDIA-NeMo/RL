@@ -60,13 +60,13 @@ authoritative settings.
 
 | Model | Modality | Algorithm | Backend | Scale | Recipe |
 |---|---|---|---|---|---|
-| Qwen3.5-9B-Base | LLM | GRPO | Megatron | 1n8g | [`grpo-qwen3.5-9b-1n8g-megatron.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml) |
-| Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml) |
-| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml) |
-| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
-| Qwen3.5-397B-A17B | LLM | GRPO | Megatron | 32n8g | [`grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml) |
-| Qwen3.5-35B-A3B-Base | VLM | GRPO | Megatron | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml) |
-| Qwen3.5-35B-A3B-Base | VLM | GRPO | AutoModel | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml) |
+| Qwen3.5-9B-Base | LLM | GRPO | Megatron | 1n8g | [`grpo-qwen3.5-9b-1n8g-megatron.yaml`](../../../../examples/configs/recipes/qwen3.5/grpo-qwen3.5-9b-1n8g-megatron.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml`](../../../../examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
+| Qwen3.5-397B-A17B | LLM | GRPO | Megatron | 32n8g | [`grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml`](../../../../examples/configs/recipes/qwen3.5/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml) |
+| Qwen3.5-35B-A3B-Base | VLM | GRPO | Megatron | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml`](../../../../examples/configs/recipes/qwen3.5/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml) |
+| Qwen3.5-35B-A3B-Base | VLM | GRPO | AutoModel | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/qwen3.5/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml) |
 
 > [!NOTE]
 > Qwen3.5 thinking-mode and long-reasoning runs need a large generation budget. If
@@ -85,7 +85,7 @@ checkpointing.
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml
+  --config examples/configs/recipes/qwen3.5/grpo-qwen3.5-9b-1n8g-megatron.yaml
 ```
 
 ### 35B-A3B GRPO (Megatron or AutoModel)
@@ -96,18 +96,18 @@ the 35B-A3B LLM; Megatron additionally supports Tensor Parallel.
 ```sh
 # Megatron (EP16 TP2 CP2)
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml
+  --config examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml
 
 # AutoModel (EP16)
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml
+  --config examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml
 ```
 
 For long-reasoning tasks, override the generation length explicitly:
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml \
+  --config examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml \
   policy.max_total_sequence_length=9216 \
   policy.generation.max_new_tokens=8192 \
   policy.generation.vllm_cfg.max_model_len=9216
@@ -121,7 +121,7 @@ suitable starting point for long-reasoning runs.
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml \
+  --config examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml \
   grpo.use_dynamic_sampling=true \
   grpo.batch_multiplier=3 \
   grpo.max_val_samples=960 \
@@ -159,7 +159,7 @@ The 397B-A17B Megatron recipe targets 32 nodes (256 GPUs) with TP8, PP8, and EP3
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml
+  --config examples/configs/recipes/qwen3.5/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml
 ```
 
 ### VLM (Geo3K)
@@ -169,7 +169,7 @@ The VLM recipes target the Geo3K task. They train the vision tower according to 
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml
+  --config examples/configs/recipes/qwen3.5/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml
 ```
 
 ## `flash-linear-attention` Performance

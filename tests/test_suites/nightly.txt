@@ -3,255 +3,255 @@
 ########
 
 # Short 1N/1B runs (go past 200 steps - usually divergence happens by now) -- going to 4 nodes doesn't help that much
-tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.sh
-tests/test_suites/llm/grpo-gemma3-1b-it-1n8g-fsdp2tp1.sh
+tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.sh
+tests/test_suites/gemma3/grpo-gemma3-1b-it-1n8g-fsdp2tp1.sh
 
 # ProRLv2 convergence test
-tests/test_suites/llm/prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2.sh
+tests/test_suites/qwen2.5/prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2.sh
 
 # SGLang backend
-tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang.sh
-tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-2n8g-fsdp2tp1-sglang.sh
+tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang.sh
+tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-2n8g-fsdp2tp1-sglang.sh
 
 # Dtensor (moonshotai/Moonlight-16B-A3B-Instruct)
-tests/test_suites/llm/grpo-moonlight-16b-automodel-1n8g-ep8.sh
+tests/test_suites/moonlight/grpo-moonlight-16b-automodel-1n8g-ep8.sh
 
 # Megatron
-tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron.sh
-tests/test_suites/llm/grpo-qwen3-1.7b-1n8g-megatron-eagle3.sh
+tests/test_suites/llama3.2/grpo-llama3.2-1b-instruct-1n8g-megatron.sh
+tests/test_suites/qwen3/grpo-qwen3-1.7b-1n8g-megatron-eagle3.sh
 
 # Functional moonlight run
-tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron.sh
+tests/test_suites/moonlight/grpo-moonlight-16ba3b-4n8g-megatron.sh
 
 # Functional Qwen3.5-9B run (text-only task)
-tests/test_suites/llm/grpo-qwen3.5-9b-1n8g-megatron.sh
+tests/test_suites/qwen3.5/grpo-qwen3.5-9b-1n8g-megatron.sh
 
 # Functional Qwen3.5-35B run (text-only task)
 # Re-enabled with the vLLM 0.25.1 bump: the AutoModel variant no longer hits the
 # hang from https://github.com/vllm-project/vllm/issues/36237.
-tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
-tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.sh
+tests/test_suites/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
+tests/test_suites/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.sh
 
 # Functional VLM run
-tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1.sh
-tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1.sh
-tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.sh
-tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.sh
-tests/test_suites/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.sh
+tests/test_suites/qwen2.5/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1.sh
+tests/test_suites/qwen2.5/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1.sh
+tests/test_suites/qwen2.5/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.sh
+tests/test_suites/qwen2.5/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.sh
+tests/test_suites/qwen3/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.sh
 
 # Functional Nemotron-Omni 30B-A3B VLM GRPO runs (AutoModel EP=8)
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.sh
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.sh
+tests/test_suites/nemotron3-nano-omni/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.sh
+tests/test_suites/nemotron3-nano-omni/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.sh
 
 # Functional Nemotron-Omni 30B-A3B VLM GRPO runs (Megatron)
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.sh
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.sh
+tests/test_suites/nemotron3-nano-omni/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.sh
+tests/test_suites/nemotron3-nano-omni/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.sh
 
 # Functional Qwen3.5-35B VLM GRPO run
 # The AutoModel variant is re-enabled with the vLLM 0.25.1 bump (no longer hits
 # https://github.com/vllm-project/vllm/issues/36237). The Megatron variant still
 # hangs in sample_tokens and stays disabled -- see disabled.txt.
-tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
+tests/test_suites/qwen3.5/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
 
 # Removing this until this issue is resolved: https://github.com/huggingface/transformers/issues/41190
-# tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh
+# tests/test_suites/smolvlm2/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh
 
 # Deepscaler (short tests)
-tests/test_suites/llm/grpo-deepscaler-1.5b-16K.sh
-tests/test_suites/llm/grpo-deepscaler-1.5b-24K.sh
-tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh
+tests/test_suites/reproduce/grpo-deepscaler-1.5b-16K.sh
+tests/test_suites/reproduce/grpo-deepscaler-1.5b-24K.sh
+tests/test_suites/reproduce/grpo-deepscaler-1.5b-8K.sh
 
 # Deepscaler (GSPO)
-tests/test_suites/llm/grpo-gspo-deepscaler-1.5b-8K.sh
+tests/test_suites/reproduce/grpo-gspo-deepscaler-1.5b-8K.sh
 
 # HelpSteer3 tests
 # Issue with details: https://github.com/NVIDIA-NeMo/RL/issues/1571
-# tests/test_suites/llm/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-8n8g-fsdp2tp8cp4.sh
+# tests/test_suites/llama3.3-nemotron-super/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-8n8g-fsdp2tp8cp4.sh
 
 # GRPO math test run (32K context mcore)
-tests/test_suites/llm/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
-tests/test_suites/llm/grpo-qwen3-30ba3b-4n8g-megatron-qa-nvfp4.sh
+tests/test_suites/qwen3/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-4n8g-megatron-qa-nvfp4.sh
 
 # CISPO async lag-1 high-off-policy run (Qwen3-30B-A3B, Megatron + non-colocated vLLM)
-tests/test_suites/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.sh
+tests/test_suites/qwen3/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.sh
 
 # R3 router replay regression guards (Qwen3-30B-A3B, Megatron CP2 + EP4)
-tests/test_suites/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.sh
-tests/test_suites/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple.sh
-tests/test_suites/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.sh
-tests/test_suites/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.sh
-tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym.sh
 
 # FP8
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3.sh
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.sh
-tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e.sh
-tests/test_suites/llm/grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.sh
+tests/test_suites/moonlight/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e.sh
+tests/test_suites/qwen3/grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron.sh
 
 # ModelOpt quant rollout convergence tests
-tests/test_suites/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.sh
+tests/test_suites/qwen3/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.sh
 
 # Non-colocated
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
-tests/test_suites/llm/grpo-llama3.2-1b-instruct-2n8g-megatron_generation-noncolocated.sh
-tests/test_suites/llm/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
+tests/test_suites/llama3.2/grpo-llama3.2-1b-instruct-2n8g-megatron_generation-noncolocated.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.sh
 
 # Nemotron Super 49B
 #https://github.com/NVIDIA-NeMo/RL/issues/1374
-#tests/test_suites/llm/grpo-math-llama-nemotron-super-49b-v.5-4n8g-fsdp2tp8.sh
+#tests/test_suites/llama3.3-nemotron-super/grpo-math-llama-nemotron-super-49b-v.5-4n8g-fsdp2tp8.sh
 
 # Nano-v3
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-fsdp2.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-lora.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron_generation.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym.sh
 
 # Nemotron 3 Super pipeline sanity checks (RLVR / SWE1 / RLHF environments)
 # Data paths and genrm model path require cluster-specific TODO items in each YAML.
-# See examples/configs/recipes/llm/grpo-qwen3-1.7b-*-megatron-super-*.yaml
-tests/test_suites/llm/grpo-qwen3-1.7b-6n8g-megatron-super-rlvr.sh
-tests/test_suites/llm/grpo-qwen3-1.7b-1n8g-megatron-super-swe1.sh
-tests/test_suites/llm/grpo-qwen3-1.7b-2n8g-megatron-super-rlhf.sh
+# See examples/configs/recipes/nemotron3-super/grpo-qwen3-1.7b-*-megatron-super-*.yaml
+tests/test_suites/nemotron3-super/grpo-qwen3-1.7b-6n8g-megatron-super-rlvr.sh
+tests/test_suites/nemotron3-super/grpo-qwen3-1.7b-1n8g-megatron-super-swe1.sh
+tests/test_suites/nemotron3-super/grpo-qwen3-1.7b-2n8g-megatron-super-rlhf.sh
 
 # Nemotron 3 Super 120B-A12B math tests (Megatron and DTensor backends)
-tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-megatron.sh
-tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.sh
+tests/test_suites/nemotron3-super/grpo-nemotron3-super-120BA12B-16n8g-megatron.sh
+tests/test_suites/nemotron3-super/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.sh
 
 # Lora
-tests/test_suites/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.sh
-tests/test_suites/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.sh
+tests/test_suites/qwen3/grpo-qwen3-8B-base-1n8g-fsdp2-lora.sh
+tests/test_suites/qwen3/grpo-qwen3-8b-base-1n8g-megatron-lora.sh
 
 # Sampling (temperature, top-p, top-k)
-tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50.sh
-tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.sh
+tests/test_suites/llama3.2/grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50.sh
+tests/test_suites/llama3.2/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.sh
 
 # Yarn
-tests/test_suites/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.sh
+tests/test_suites/qwen2.5/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.sh
 
 # Transfer Queue (TQ) coverage — overrides base recipes via common-tq.env to
 # exercise data_plane.backend={simple, mooncake_cpu}. Only grpo-, dapo-, and
 # prorlv2- recipes are supported (enforced at runtime by common-tq.env).
-# To add a recipe: create tests/test_suites/llm/<recipe>-tq_{simple,mooncake}.sh
+# To add a recipe: create tests/test_suites/<family>/<recipe>-tq_{simple,mooncake}.sh
 # (see existing scripts for the template) and append its path below.
 #
 # TQ-simple (backend=simple)
-tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3-tq_simple.sh
-tests/test_suites/llm/grpo-deepscaler-1.5b-8K-tq_simple.sh
-tests/test_suites/llm/grpo-gspo-deepscaler-1.5b-8K-tq_simple.sh
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3-tq_simple.sh
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated-tq_simple.sh
-tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron-tq_simple.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp-tq_simple.sh
+tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3-tq_simple.sh
+tests/test_suites/reproduce/grpo-deepscaler-1.5b-8K-tq_simple.sh
+tests/test_suites/reproduce/grpo-gspo-deepscaler-1.5b-8K-tq_simple.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3-tq_simple.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated-tq_simple.sh
+tests/test_suites/moonlight/grpo-moonlight-16ba3b-4n8g-megatron-tq_simple.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp-tq_simple.sh
 # TQ-mooncake (backend=mooncake_cpu)
-tests/test_suites/llm/grpo-qwen3-1.7b-1n8g-megatron-eagle3-tq_mooncake.sh
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e-tq_mooncake.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-tq_mooncake.sh
-tests/test_suites/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora-tq_mooncake.sh
-tests/test_suites/llm/prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2-tq_mooncake.sh
+tests/test_suites/qwen3/grpo-qwen3-1.7b-1n8g-megatron-eagle3-tq_mooncake.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e-tq_mooncake.sh
+tests/test_suites/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2-tq_mooncake.sh
+tests/test_suites/qwen3/grpo-qwen3-8B-base-1n8g-fsdp2-lora-tq_mooncake.sh
+tests/test_suites/qwen2.5/prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2-tq_mooncake.sh
 
 # Single Controller (SC)
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.sh
-tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.sh
+tests/test_suites/llama3.1/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.sh
+tests/test_suites/qwen2.5/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.sh
 
 ########
 # DAPO #
 ########
 
 # Gemma 4 functional runs
-tests/test_suites/llm/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.sh
+tests/test_suites/gemma4/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.sh
 
 # Functional Gemma 4 E4B VLM GRPO run
-tests/test_suites/vlm/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh
+tests/test_suites/gemma4/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh
 #######
 # SFT #
 #######
 
 # 2N 1B HSDP test
-tests/test_suites/llm/sft-llama3.2-1b-2n8g-hsdp.sh
+tests/test_suites/llama3.2/sft-llama3.2-1b-2n8g-hsdp.sh
 
 # Dtensor (8B)
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
+tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 # dynamic batching
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp4-dynamicbatch.sh
+tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-fsdp2tp4-dynamicbatch.sh
 # lora
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.sh
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron-lora.sh
+tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.sh
+tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-megatron-lora.sh
 
 # Megatron
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron.sh
+tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-megatron.sh
 # sequence packing
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron-seqpack.sh
+tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-megatron-seqpack.sh
 # chunked linear CE loss
-tests/test_suites/llm/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs.sh
+tests/test_suites/qwen3/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs.sh
 
 # Nemotron Super 49B SFT tests
 # Issue with details: https://github.com/NVIDIA-NeMo/RL/issues/1571
-# tests/test_suites/llm/sft-nemotron-super-49b-8n8g-fsdp2tp4cp8-tulu-v3.sh
+# tests/test_suites/llama3.3-nemotron-super/sft-nemotron-super-49b-8n8g-fsdp2tp4cp8-tulu-v3.sh
 
 # Nemotron 3 Nano 30B A3B Base BF16 tests
-tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2.sh
-tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.sh
+tests/test_suites/nemotron3-nano/sft-nanov3-30BA3B-2n8g-fsdp2.sh
+tests/test_suites/nemotron3-nano/sft-nanov3-30BA3B-2n8g-fsdp2-lora.sh
 
 # Yarn
-tests/test_suites/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.sh
+tests/test_suites/qwen3/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.sh
 
 #######
 # DPO #
 #######
 
 # Short dtensor + automodel EP
-tests/test_suites/llm/dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.sh
+tests/test_suites/nemotron3-nano/dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.sh
 
 # Short megatron
-tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.sh
+tests/test_suites/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.sh
 
 ################
 # Distillation #
 ################
 
 # Distillation tests
-tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-fsdp2tp1.v1.sh
+tests/test_suites/qwen3/distillation-qwen3-32b-to-1.7b-base-1n8g-fsdp2tp1.v1.sh
 
 # Short megatron
-tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-megatron-tp2pp2cp2-pack.sh
+tests/test_suites/qwen3/distillation-qwen3-32b-to-1.7b-base-1n8g-megatron-tp2pp2cp2-pack.sh
 
 # Quantization-Aware Distillation (NVFP4) - low-cost signal that the QAT
 # integration (Megatron student + co-located vLLM both NVFP4-quantized) stays
 # healthy. Self-distill Qwen3-1.7B-Base, ~20 min on 1n8g.
-tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
+tests/test_suites/qwen3/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
 
 # MOPD (on-policy distillation via nemo_gym, non-colocated teacher). Dense
 # Qwen3-1.7B self-distill: student == teacher so the OPD loss stays ~0.
 # Sequence packing on, 3 nodes (1 policy + 1 vLLM + 1 teacher). Requires
 # NRL_TRAIN_PATH / NRL_VAL_PATH (nemo_gym jsonl) in the environment.
-tests/test_suites/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.sh
+tests/test_suites/qwen3/mopd-qwen3-1.7b-3n8g-megatron-pack.sh
 
 # Cross-tokenizer off-policy distillation (xtoken): Qwen3-4B -> Llama-3.2-1B P-KL, student TP4xCP2 <- teacher TP2xCP2, guards sharded-loss parallelism-invariance.
-tests/test_suites/llm/distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+tests/test_suites/llama3.2/distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
 
 # Multi-teacher cross-tokenizer off-policy distillation (xtoken): Qwen3-4B (cross-tok P-KL) + Llama-3.2-3B (same-vocab direct KL) -> Llama-3.2-1B, kd_loss_mode=sum, student TP4xCP2 <- teachers TP2xCP2, guards multi-teacher aggregation + per-teacher CP-buffer sharding.
-tests/test_suites/llm/distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+tests/test_suites/llama3.2/distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
 
 #######
 # PPO #
 #######
 
 # DTensor PPO with value sequence parallelism (TP2+SP) (Qwen2.5-1.5B, GSM8K)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.sh
+tests/test_suites/qwen2.5/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.sh
 
 # Non-colocated AutoModel PPO with vLLM on a dedicated GPU split (Qwen2.5-1.5B, GSM8K)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-noncolocated.sh
+tests/test_suites/qwen2.5/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-noncolocated.sh
 
 # Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching (Qwen2.5-1.5B, GSM8K)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
+tests/test_suites/qwen2.5/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
 
 # Non-colocated Megatron PPO with dedicated training and vLLM nodes (Qwen2.5-1.5B, GSM8K)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated.sh
+tests/test_suites/qwen2.5/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated.sh
 
 # Megatron PPO with value SP + pipeline + context parallelism + sequence packing (TP2+SP+PP2+CP2) (Qwen2.5-1.5B, GSM8K)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack.sh
+tests/test_suites/qwen2.5/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack.sh
 
 ########
 # GDPO #
@@ -262,4 +262,4 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pac
 # reward_components -> reward/<name> bridge -> GDPO with per-reward weights. Replaces the
 # native-rollout reward-weights nightly (that path is already covered on main; the
 # reward_weights math itself is covered by unit tests).
-tests/test_suites/llm/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.sh
+tests/test_suites/qwen2.5/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.sh

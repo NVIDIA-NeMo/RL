@@ -211,7 +211,7 @@ policy:
 ```
 
 For a complete example, see:
-- **Configuration**: `examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation.yaml`
+- **Configuration**: `examples/configs/recipes/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron_generation.yaml`
 - **Test Script**: `tests/functional/grpo_megatron_generation.sh`
 
 ## Extend with New Backends

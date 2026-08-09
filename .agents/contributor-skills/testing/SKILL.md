@@ -31,11 +31,11 @@ When adding support for a new model, add a corresponding nightly test consisting
 
 ### 1. Recipe YAML under `examples/configs/recipes/`
 
-Place in the appropriate domain subdirectory (`examples/configs/recipes/llm/` or `examples/configs/recipes/vlm/`). Name it following the recipe naming rules below.
+Place it in the model family's directory, `examples/configs/recipes/<family>/` (e.g. `qwen3/`, `llama3.1/`). The family is the model generation, taken from the resolved `policy.model_name`. Performance recipes go in `<family>/performance/`. Name it following the recipe naming rules below.
 
 ### 2. Driver script under `tests/test_suites/`
 
-Create a shell script in the matching domain (`tests/test_suites/llm/` or `tests/test_suites/vlm/`). Source any common environment (e.g., `common.env`) and invoke the training entrypoint with `uv run ... --config <path-to-yaml>`. Match the driver script filename to the YAML base name with `.sh`.
+Create a shell script at the mirrored path, `tests/test_suites/<family>/`. Source the shared environment with `source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"` and invoke the training entrypoint with `uv run ... --config $CONFIG_PATH`. Match the driver script filename to the YAML base name with `.sh`.
 
 ### 3. Add to nightly list
 
@@ -74,11 +74,13 @@ vlm_<algo>-<model>-<nodes>n<gpus>g-<strategy>[-modifiers][.vN].(yaml|sh)
 
 ```
 examples/configs/recipes/
-  llm/<name>.yaml
-  vlm/<name>.yaml
+  <family>/<name>.yaml
+  <family>/performance/<name>.yaml
+  reproduce/<name>.yaml
 
 tests/test_suites/
-  llm/<name>.sh
-  vlm/<name>.sh
+  common.env
+  <family>/<name>.sh
+  <family>/performance/<name>.sh
   nightly.txt
 ```
