@@ -207,13 +207,22 @@ data_plane:
   impl: transfer_queue
   backend: "simple"
   storage_capacity: 1000000
-  # UNVALIDATED AT THIS SHAPE. This recipe pushes 2048 rows/step at 73728
-  # tokens, and the lookahead of 4 keeps up to 640 groups (10240 rows) resident
-  # at once. 8 is what the 6K recipe's 64 scales to, and per-step volume and
-  # peak resident volume happen to agree on that number; it is also generous,
-  # since 6K rows are 131072 tokens against our 73728. Not measured, though —
-  # raise it first if the TQ storage actors bottleneck or OOM.
-  num_storage_units: 8
+  # Sharding only — storage_capacity above is global and TQ splits it, as
+  # ceil(total_storage_size / num_data_storage_units), so this trades unit count
+  # against per-unit size and reserves nothing extra. Raising it costs one CPU
+  # actor each and buys read/write fan-out.
+  #
+  # 16 is headroom, not a fix for anything measured. The windowed sweep sizes
+  # the buffer as num_prompts_per_step * (staleness + 1), so the arms hold 256 /
+  # 384 / 640 / 896 groups resident — up to 14336 rows at staleness 6, which is
+  # 40% past the 10240 the previous value of 8 was reasoned against. Peak
+  # resident is still only ~1.4% of the 1000000-row global capacity, so the
+  # concern is the actors' aggregate throughput rather than their space. Held
+  # identical across arms deliberately: varying it would confound the staleness
+  # comparison the sweep exists to make.
+  num_storage_units: 16
   claim_meta_poll_interval_s: 0.5
+  # Mooncake-only: _init_tq reads these solely on the mooncake_cpu branch, and
+  # this recipe is backend "simple". Inert here, kept for backend switches.
   global_segment_size: 549755813888  # 512 GiB
   local_buffer_size:   68719476736   # 64 GiB
