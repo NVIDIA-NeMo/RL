@@ -751,6 +751,32 @@ class TestApplyMoeConfig:
 
         assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
 
+    def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
+        from nemo_rl.models.megatron.setup import validate_megatron_config
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+        )
+        megatron_cfg = SimpleNamespace(model=model_cfg)
+
+        def bridge_validate():
+            model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = True
+
+        megatron_cfg.validate = MagicMock(side_effect=bridge_validate)
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=True,
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=0,
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        validate_megatron_config(megatron_cfg, config)
+
+        megatron_cfg.validate.assert_called_once_with()
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
+
     def test_hybridep_input_prepadding_requires_flex_dispatcher(self, monkeypatch):
         from nemo_rl.models.megatron.setup import _apply_moe_config
 
