@@ -26,7 +26,7 @@ export TRAIN_PATH
 export VAL_PATH
 
 export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/smohsenitahe/workspace/output/sft_super_omni_toolcalls_32k_rep2_0719/checkpoints/tp_1_hf/iter_0000276/mcore_to_hf}"
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/smohsenitahe/sqsh/super-omni-vllm20-super-vlm2-20260507-0905b74.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/smohsenitahe/images/nemo-rl-main-20260807-super-ultra-omni-prefetched.sqsh}"
 export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice/users/igitman/images/nemo-skills-sandbox-latest.sqsh}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/smohsenitahe/cache/rl-v2-image-tools}"
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_omni_vision}"
