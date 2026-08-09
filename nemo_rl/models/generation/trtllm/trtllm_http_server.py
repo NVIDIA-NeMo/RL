@@ -248,9 +248,9 @@ def create_app(
         # for sampling params.
         for key in ("temperature", "top_p", "top_k"):
             if body.get(key) is not None:
-                assert body[key] == sampling_config[key], (
+                assert body[key] == sampling_config.get(key), (
                     f"request {key} {body[key]!r} must match the "
-                    f"NeMo-RL generation config ({sampling_config[key]})"
+                    f"NeMo-RL generation config ({sampling_config.get(key)})"
                 )
 
         # Request kwargs override server defaults.
