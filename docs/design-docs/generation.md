@@ -325,7 +325,7 @@ policy:
 ```
 
 For a complete example, see
-`examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`.
+`examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym.yaml`.
 
 ## Extend with New Backends
 
