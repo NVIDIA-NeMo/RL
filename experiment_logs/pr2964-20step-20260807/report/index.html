@@ -697,7 +697,7 @@
         </li>
       </ol>
       <div class="callout">
-        W&amp;B is configured in offline mode by both launchers. Local Slurm, Ray, training, and TensorBoard artifacts are therefore the authoritative result sources. The final NeMo candidate logs raw and aligned group-token counts before model entry when telemetry is enabled; THD sequence-packing efficiency remains distinct from HybridEP alignment overhead.
+        W&amp;B is configured in offline mode by both launchers. Local Slurm, Ray, training, and TensorBoard artifacts are therefore the authoritative result sources. The telemetry-enabled workload candidate used by job 506434 logs raw and aligned group-token counts before model entry; the minimal NeMo PR candidate intentionally omits this experiment-only logging. THD sequence-packing efficiency remains distinct from HybridEP alignment overhead.
       </div>
       <div class="callout">
         Qwen job 506437 correctness sanity: all 20 steps completed; Steps 2–20 have finite loss and reward with means −0.00034 and 0.52542, respectively. Final validation accuracy is 0.5508, versus 0.5547 for the all-to-all baseline. These checks establish execution stability and show no numerical-regression signal in this sample.
