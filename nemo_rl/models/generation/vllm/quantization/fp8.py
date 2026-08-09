@@ -14,6 +14,7 @@
 
 import os
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -912,6 +913,26 @@ def process_weights_after_loading_moe(self, layer) -> None:
         )
 
 
+def _initialize_mxfp8_moe_kernel(self: Any, layer: Any) -> None:
+    """Initialize the vLLM MXFP8 MoE kernel once after weights are loaded."""
+    if self.moe_kernel is not None:
+        return
+
+    from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
+
+    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+    assert self.moe_quant_config is not None
+    assert self.experts_cls is not None
+    self.moe_kernel = make_fp8_moe_kernel(
+        moe_quant_config=self.moe_quant_config,
+        moe_config=self.moe,
+        fp8_backend=self.mxfp8_backend,
+        experts_cls=self.experts_cls,
+        routing_tables=layer._expert_routing_tables(),
+        layer=layer,
+    )
+
+
 def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
     from flashinfer import (
@@ -1037,6 +1058,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         layer.w2_weight_scale.copy_(torch.stack(w2_scale_shuffled).contiguous())
     layer.w13_weight.copy_(torch.stack(w13_weight_shuffled).contiguous())
     layer.w2_weight.copy_(torch.stack(w2_weight_shuffled).contiguous())
+    _initialize_mxfp8_moe_kernel(self, layer)
 
 
 def process_weights_after_loading_kv(self, layer) -> None:

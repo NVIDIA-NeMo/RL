@@ -196,6 +196,56 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
+def test_initialize_mxfp8_moe_kernel_once(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    layer = types.SimpleNamespace(
+        _expert_routing_tables=lambda: ("logical", "physical", "replicated")
+    )
+    moe_config = object()
+    quant_config = object()
+    experts_cls = object()
+    kernel = object()
+    quant_config_calls = []
+    kernel_calls = []
+
+    def get_quant_config(candidate_layer):
+        quant_config_calls.append(candidate_layer)
+        return quant_config
+
+    quant_method = types.SimpleNamespace(
+        moe=moe_config,
+        moe_kernel=None,
+        mxfp8_backend="flashinfer_trtllm",
+        experts_cls=experts_cls,
+        get_fused_moe_quant_config=get_quant_config,
+    )
+
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    def make_kernel(**kwargs):
+        kernel_calls.append(kwargs)
+        return kernel
+
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+
+    fp8._initialize_mxfp8_moe_kernel(quant_method, layer)
+    fp8._initialize_mxfp8_moe_kernel(quant_method, layer)
+
+    assert quant_method.moe_kernel is kernel
+    assert quant_method.moe_quant_config is quant_config
+    assert quant_config_calls == [layer]
+    assert kernel_calls == [
+        {
+            "moe_quant_config": quant_config,
+            "moe_config": moe_config,
+            "fp8_backend": "flashinfer_trtllm",
+            "experts_cls": experts_cls,
+            "routing_tables": ("logical", "physical", "replicated"),
+            "layer": layer,
+        }
+    ]
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
