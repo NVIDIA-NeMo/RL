@@ -33,6 +33,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -353,7 +354,9 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
     )
     ctrl = SingleControllerActor.remote(
-        master_config=master_config, actor_args=actor_args
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=SetupTimingMetrics(),
     )
 
     vllm_generation.prepare_for_generation()
