@@ -515,7 +515,7 @@
               <td class="metric">5.34 ± 1.20 s</td>
               <td class="metric">5.10 ± 1.07 s</td>
               <td class="metric">3.62 E2E · 3.92 generation · 596.76 policy · 627.04 logprob <small>tok/s/GPU</small></td>
-              <td class="metric">loss 0.01666 mean · reward 0.57010 mean · KL 0.00318 mean</td>
+              <td class="metric">loss 0.01666 mean · reward 0.57010 mean · KL 0.00318 mean · final validation accuracy 0.6211</td>
             </tr>
           </tbody>
         </table>
@@ -587,7 +587,7 @@
           </tbody>
         </table>
       </div>
-      <div class="callout">Completed HybridEP 506434 Steps 2–20 (n=19): E2E 893.03 ± 246.57 s, generation 782.13 ± 16.75 s, policy 5.34 ± 1.20 s, and LogProb 5.10 ± 1.07 s. Direct throughput is 3.62 / 3.92 / 596.76 / 627.04 tok/s/GPU for E2E / generation / policy / LogProb. Offline W&amp;B ID: <code>5321e23i</code>. Mean loss/reward/KL are 0.01666 / 0.57010 / 0.00318. Final paired deltas remain pending until baseline 506464 completes.</div>
+      <div class="callout">Completed HybridEP 506434 Steps 2–20 (n=19): E2E 893.03 ± 246.57 s, generation 782.13 ± 16.75 s, policy 5.34 ± 1.20 s, and LogProb 5.10 ± 1.07 s. Direct throughput is 3.62 / 3.92 / 596.76 / 627.04 tok/s/GPU for E2E / generation / policy / LogProb. Offline W&amp;B ID: <code>5321e23i</code>. Mean loss/reward/KL are 0.01666 / 0.57010 / 0.00318; validation accuracy is 0.6133 at Step 10 and 0.6211 at Step 20. Final paired deltas remain pending until baseline 506464 completes.</div>
       <div class="callout">All 32 logged Super alignment calls had zero padding: 8,192 → 8,192 local tokens and 262,144 → 262,144 group tokens. Calls 5–32 occurred during Steps 2–8 and each added one telemetry-only group SUM on the HybridEP side. This establishes zero added-token overhead in those 32 calls; peak GPU-memory and persistent-storage overhead were not separately measured. A telemetry-free secondary Steps 9–15 window is only n=7: E2E is 0.52% slower, generation is 1.30% slower, policy training is 39.41% faster, and LogProb is 8.79% slower; corresponding throughput changes are −2.17%, −2.48%, +65.98%, and −6.73%. These small-sample values are not conclusions. The pair also started at different times on different physical node sets, so small deltas remain sensitive to cluster variance. The telemetry-free default-Bridge validation job 506895 will provide the cleaner follow-up.</div>
     </section>
 
