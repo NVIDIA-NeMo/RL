@@ -27,6 +27,8 @@ overlay=/tmp/nemo-rl-hybridep-17cf
 job_dependency=${JOB_DEPENDENCY:-}
 slurm_exclude=${SLURM_EXCLUDE:-}
 validation_head=${VALIDATION_HEAD_OVERRIDE:-a028b33bcde0ef8aeb9fcc626a2e0c57fb568d2f}
+mcore_source=${MCORE_SOURCE_OVERRIDE:-${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}
+mcore_commit=${MCORE_EXPECTED_COMMIT_OVERRIDE:-$(git -C "${mcore_source}" rev-parse HEAD)}
 job_reaper_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"NeMo-RL performance recipe model initialization and colocated vLLM startup"}}'
 
 render_case "${model}" "${dispatcher}" "${run_root}"
@@ -38,6 +40,7 @@ case "${model}" in
 esac
 
 test "$(git -C "${repo}" rev-parse HEAD)" = "${validation_head}"
+test "$(git -C "${mcore_source}" rev-parse HEAD)" = "${mcore_commit}"
 git -C "${repo}" merge-base --is-ancestor 60a10b4f54c2754d44150771a06260fe9e8b186f HEAD
 git -C "${repo}" merge-base --is-ancestor a9aaa395c37963a9fd8a7320d61a516c7b714e57 HEAD
 test -z "$(git -C "${repo}" status --porcelain --untracked-files=no --ignore-submodules=untracked)"
@@ -62,6 +65,7 @@ mkdir -p "\${overlay}"
 unset UV_CONFIG_FILE
 UV_NO_CONFIG=1 uv pip install --python /opt/nemo_rl_venv/bin/python --target "\${overlay}" --reinstall --no-deps --no-index "\${wheel}"
 PYTHONPATH="\${overlay}" /opt/nemo_rl_venv/bin/python -c 'import deep_ep, deep_ep_cpp, hybrid_ep_cpp; print(deep_ep.__file__); print(deep_ep_cpp.__file__); print(hybrid_ep_cpp.__file__)'
+PYTHONPATH=${mcore_source} /opt/nemo_rl_venv/bin/python -c 'import megatron; print(megatron.__file__)'
 EOF
 
 export COMMAND SETUP_COMMAND
@@ -79,7 +83,7 @@ export NEMO_RL_PY_EXECUTABLES_SYSTEM=0
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NRL_FORCE_REBUILD_VENVS=false
 export NRL_IGNORE_VERSION_MISMATCH=1
-export PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+export PYTHONPATH="${overlay}:${repo}:${repo}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${mcore_source}"
 if [[ "${dispatcher}" == "hybridep" ]]; then
   export NEMO_RL_HYBRIDEP_LOG_PACKING=1
   export NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS=32
@@ -116,11 +120,12 @@ printf '%s\n' "${job_output}"
 
 if [[ "${mode}" == submit ]]; then
   printf -v rendered_command '%q ' "${driver_args[@]}"
-  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\npr3436_head=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\njob_reaper_comment=%s\ncommand=%s\n' \
+  printf 'job_id=%s\nrun_name=%s\nmodel=%s\ndispatcher=%s\nrecipe=%s\nnum_nodes=%s\ngpus_per_node=8\nvalidation_head=%s\npr2964_head=%s\npr3436_head=%s\nmcore_source=%s\nmcore_commit=%s\ndeepep_commit=%s\ndeepep_wheel=%s\ndeepep_wheel_sha256=%s\ncontainer=%s\njob_dependency=%s\nslurm_exclude=%s\njob_reaper_comment=%s\ncommand=%s\n' \
     "${job_output}" "${run_name}" "${model}" "${dispatcher}" "${driver_args[3]}" \
     "${num_nodes}" "$(git rev-parse HEAD)" \
     60a10b4f54c2754d44150771a06260fe9e8b186f \
     a9aaa395c37963a9fd8a7320d61a516c7b714e57 \
+    "${mcore_source}" "${mcore_commit}" \
     17cfb817bccec3a9c247013360cc550c2bac441e "${wheel}" "${wheel_sha256}" \
     "${container}" "${job_dependency}" "${slurm_exclude}" "${job_reaper_comment}" "${rendered_command}" \
     > "${run_root}/submission.env"
