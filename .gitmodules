@@ -12,12 +12,18 @@
 	# Every nemo_automodel symbol NeMo-RL imports resolves on this base, and its
 	# distributed/ layer already carries MeshContext + DistributedSetup.
 	#
-	# SSH because the repo is private. Cloning this submodule requires access.
+	# Points at the author's repo, which is where huiyingl/feat/onyx-training and
+	# 90da1dec actually live. SSH because the repo is private -- cloning this
+	# submodule requires access to it.
+	#
+	# shallow is off: a --depth 1 clone of the branch head cannot serve an older
+	# pinned commit, and `git submodule update --init` then fails with
+	# "upload-pack: not our ref".
+	#
 	# TODO: repoint at https://github.com/NVIDIA-NeMo/Automodel.git once Muse
 	# Glimmer support lands there; this pin blocks a public upstream PR.
-	url = git@github.com:sharonyu-115/Automodel-day0.git
+	url = git@github.com:HuiyingLi/Automodel-day0.git
 	branch = huiyingl/feat/onyx-training
-	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
