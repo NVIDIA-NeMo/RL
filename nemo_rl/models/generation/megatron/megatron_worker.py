@@ -22,6 +22,7 @@ from typing import AsyncGenerator, Optional
 
 import requests
 import torch
+from megatron.core import parallel_state
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -58,6 +59,11 @@ class MegatronGenerationMixin:
      - megatron_tokenizer: tokenizer for inference.
      - is_generation_colocated: Whether colocated or distributed.
     """
+
+    @staticmethod
+    def _is_dp_inference_client_rank() -> bool:
+        """True on the rank that may talk to this replica's mcore DP coordinator."""
+        return parallel_state.get_data_parallel_rank() == 0
 
     def _init_inference_engine_state(self) -> None:
         """Reset all inference-engine attributes to their uninitialized state."""
@@ -204,7 +210,7 @@ class MegatronGenerationMixin:
             inference_coordinator_port=None,
             launch_inference_coordinator=True,
         )
-        if torch.distributed.get_rank() == 0:
+        if self._is_dp_inference_client_rank():
             from megatron.core.inference.inference_client import InferenceClient
 
             self.inference_client = InferenceClient(
@@ -229,11 +235,11 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
-        if torch.distributed.get_rank() == 0:
+        if self._is_dp_inference_client_rank():
             self.inference_client.pause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
 
-        if torch.distributed.get_rank() == 0:
+        if self._is_dp_inference_client_rank():
             self.inference_client.suspend_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
@@ -250,11 +256,11 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] resumed inference engine")
 
     async def _wake_engine(self):
-        if torch.distributed.get_rank() == 0:
+        if self._is_dp_inference_client_rank():
             self.inference_client.resume_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
 
-        if torch.distributed.get_rank() == 0:
+        if self._is_dp_inference_client_rank():
             self.inference_client.unpause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
@@ -334,7 +340,7 @@ class MegatronGenerationMixin:
 
         if (
             self.cfg["generation"]["mcore_generation_config"]["expose_http_server"]
-            and torch.distributed.get_rank() == 0
+            and self._is_dp_inference_client_rank()
         ):
             print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
             self.base_url = self._setup_openai_api_server()
@@ -644,8 +650,8 @@ class MegatronGenerationMixin:
         from megatron.core.inference.inference_request import DynamicInferenceRequest
 
         dist_rank = torch.distributed.get_rank()
-        assert dist_rank == 0, (
-            "Only rank 0 creates a client to communicate with the coordinator"
+        assert self._is_dp_inference_client_rank(), (
+            "Only the DP-coordinator leader rank may submit inference requests"
         )
 
         print(

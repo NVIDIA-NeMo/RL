@@ -245,6 +245,7 @@ def _assert_valid_generation_output(outputs, input_data, require_generation=True
 
 async def _generate_async(mg, tokenizer, test_input_data, greedy=False):
     """Drive ``generate_async`` over single-sample microbatches and reassemble in order."""
+    dp_leaders = set(mg._policy.worker_group.dp_leader_worker_indices)
     collected = []
     for single_item_input in test_input_data.make_microbatch_iterator(
         microbatch_size=1
@@ -252,8 +253,10 @@ async def _generate_async(mg, tokenizer, test_input_data, greedy=False):
         async for original_idx, single_item_output in mg.generate_async(
             single_item_input, greedy=greedy
         ):
-            # The mcore coordinator only accepts requests on DP rank 0.
-            assert single_item_output["gen_leader_worker_idx"] == [0]
+            leader_idx = single_item_output["gen_leader_worker_idx"][0]
+            assert leader_idx in dp_leaders, (
+                f"gen_leader_worker_idx {leader_idx} is not a DP leader"
+            )
             collected.append((original_idx, single_item_output))
 
     collected.sort(key=lambda x: x[0])
