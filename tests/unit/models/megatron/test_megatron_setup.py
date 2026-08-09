@@ -752,7 +752,7 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
-        from nemo_rl.models.megatron.setup import validate_megatron_config
+        from nemo_rl.models.megatron.hybridep import validate_megatron_config
 
         model_cfg = SimpleNamespace(
             moe_hybridep_pad_uneven_dispatch_inputs=False,
