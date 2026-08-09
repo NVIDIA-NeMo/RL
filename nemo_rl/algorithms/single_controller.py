@@ -316,17 +316,23 @@ class SingleControllerActor:
                     )
                     continue
 
-                if target_step is not None:
-                    self._batch_shortfall[target_step] += 1
                 self._dropped_rollouts += 1
                 self._consecutive_rollout_failures += 1
+                # Only a sampler that stamps batches has a step to shorten;
+                # windowed selection backfills from whatever else is ready.
+                shortfall_note = ""
+                if target_step is not None:
+                    self._batch_shortfall[target_step] += 1
+                    shortfall_note = (
+                        f"; step {target_step} now expects "
+                        f"{self._batch_shortfall[target_step]} fewer group(s)"
+                    )
                 print(
                     f"rollout_pump: dropping prompt after {attempts} attempt(s), "
                     f"last error {name}: {e} "
                     f"(dropped {self._dropped_rollouts} total, "
-                    f"{self._consecutive_rollout_failures} in a row; "
-                    f"step {target_step} now expects "
-                    f"{self._batch_shortfall[target_step]} fewer group(s))",
+                    f"{self._consecutive_rollout_failures} in a row"
+                    f"{shortfall_note})",
                     flush=True,
                 )
                 if (

@@ -23,7 +23,21 @@ import asyncio
 from collections import Counter
 from typing import Optional
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+import pytest
+from pydantic import TypeAdapter
+
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    InOrderSamplerConfig,
+    SamplerConfig,
+    WindowedSampler,
+    WindowedSamplerConfig,
+    required_buffer_capacity_for_config,
+)
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    validate_sampler_buffer_capacity,
+)
 
 NUM_PROMPTS_PER_STEP = 128
 MIN_GROUPS_FOR_STREAMING_TRAIN = 32
@@ -52,6 +66,14 @@ class _FakeBuffer:
             self.target_step_list.append(target_step)
             self.ready_list.append(True)
 
+    def commit_unstamped(self, weight: int, count: int) -> None:
+        """Commit the way a non-gated sampler does: no target_step stamp."""
+        for _ in range(count):
+            self.meta_list.append(_FakeMeta())
+            self.start_weight_list.append(weight)
+            self.target_step_list.append(None)
+            self.ready_list.append(True)
+
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         for i in sorted(idxs, reverse=True):
             del self.meta_list[i]
@@ -64,6 +86,14 @@ class _FakeBuffer:
 def _make_sampler() -> tuple[InOrderSampler, _FakeBuffer]:
     buffer = _FakeBuffer()
     return InOrderSampler(buffer, max_lookahead_versions=1), buffer  # type: ignore[arg-type]
+
+
+def _make_windowed(staleness: int = 1) -> tuple[WindowedSampler, _FakeBuffer]:
+    buffer = _FakeBuffer()
+    return (
+        WindowedSampler(buffer, max_staleness_versions=staleness),  # type: ignore[arg-type]
+        buffer,
+    )
 
 
 async def _drain_step(
@@ -144,9 +174,7 @@ def test_shortfall_recorded_after_the_step_opens_still_closes() -> None:
     shortfall: Counter[int] = Counter()
 
     _, closed = asyncio.run(
-        _drain_step(
-            sampler, trainer_version=0, shortfall=shortfall, max_iterations=4
-        )
+        _drain_step(sampler, trainer_version=0, shortfall=shortfall, max_iterations=4)
     )
     assert not closed
 
@@ -176,3 +204,137 @@ def test_shortfall_does_not_leak_into_the_next_step() -> None:
 
     assert closed
     assert collected == NUM_PROMPTS_PER_STEP
+
+
+# ── windowed selection ──────────────────────────────────────────────────────
+
+
+def test_windowed_does_not_stamp_a_target_step() -> None:
+    """No stamp means no batch identity, hence nothing for a drop to shorten."""
+    sampler, _ = _make_windowed()
+
+    target_step = asyncio.run(sampler.admit(trainer_version_fn=lambda: 0))
+
+    assert target_step is None
+
+
+def test_windowed_closes_a_step_that_lost_prompts() -> None:
+    """The wedge is specific to in_order: windowed backfills from the window.
+
+    Two prompts are lost from what would have been this step's batch and no
+    shortfall is ever recorded, because ``target_step`` is None. Groups from a
+    later dispatch fill the gap, so the step still closes at the full count.
+    """
+    sampler, buffer = _make_windowed(staleness=1)
+    buffer.commit_unstamped(weight=0, count=NUM_PROMPTS_PER_STEP - 2)
+    buffer.commit_unstamped(weight=0, count=2)
+
+    collected, closed = asyncio.run(
+        _drain_step(sampler, trainer_version=0, shortfall=Counter())
+    )
+
+    assert closed
+    assert collected == NUM_PROMPTS_PER_STEP
+
+
+def test_windowed_selects_across_the_staleness_window() -> None:
+    sampler, buffer = _make_windowed(staleness=1)
+    buffer.commit_unstamped(weight=0, count=64)
+    buffer.commit_unstamped(weight=1, count=64)
+
+    collected, closed = asyncio.run(
+        _drain_step(sampler, trainer_version=1, shortfall=Counter())
+    )
+
+    assert closed
+    assert collected == NUM_PROMPTS_PER_STEP
+
+
+def test_windowed_ignores_groups_older_than_the_window() -> None:
+    sampler, buffer = _make_windowed(staleness=1)
+    buffer.commit_unstamped(weight=0, count=NUM_PROMPTS_PER_STEP)
+
+    _, num_groups = asyncio.run(
+        sampler.select(
+            current_train_weight=2,
+            min_prompt_groups=1,
+            max_prompt_groups=NUM_PROMPTS_PER_STEP,
+        )
+    )
+
+    assert num_groups == 0
+
+
+# ── capacity validation ─────────────────────────────────────────────────────
+
+
+def test_windowed_declares_a_capacity_floor() -> None:
+    """Without a floor the validation skips windowed and a too-small buffer
+    presents as a silent hang instead of a config error."""
+    required = required_buffer_capacity_for_config(
+        WindowedSamplerConfig(max_staleness_versions=4), NUM_PROMPTS_PER_STEP
+    )
+
+    assert required == NUM_PROMPTS_PER_STEP
+
+
+def test_windowed_capacity_validation_rejects_a_too_small_buffer() -> None:
+    cfg = WindowedSamplerConfig(max_staleness_versions=4)
+    required = required_buffer_capacity_for_config(cfg, NUM_PROMPTS_PER_STEP)
+
+    with pytest.raises(ValueError, match="max_buffered_rollouts"):
+        validate_sampler_buffer_capacity(
+            AsyncRLConfig(max_buffered_rollouts=64),
+            required_capacity=required,
+            sampler_name="windowed",
+        )
+
+
+def test_windowed_capacity_validation_accepts_the_sweep_setting() -> None:
+    cfg = WindowedSamplerConfig(max_staleness_versions=4)
+
+    validate_sampler_buffer_capacity(
+        AsyncRLConfig(max_buffered_rollouts=640),
+        required_capacity=required_buffer_capacity_for_config(
+            cfg, NUM_PROMPTS_PER_STEP
+        ),
+        sampler_name="windowed",
+    )
+
+
+def test_gated_capacity_floor_is_unchanged() -> None:
+    """The windowed floor must not weaken the gated samplers' requirement."""
+    required = required_buffer_capacity_for_config(
+        InOrderSamplerConfig(max_lookahead_versions=1), NUM_PROMPTS_PER_STEP
+    )
+
+    assert required == NUM_PROMPTS_PER_STEP * 2
+
+
+# ── sampler selection from config ───────────────────────────────────────────
+
+
+def test_windowed_staleness_override_takes_effect() -> None:
+    cfg = TypeAdapter(SamplerConfig).validate_python(
+        {"name": "windowed", "max_staleness_versions": 4}
+    )
+
+    assert isinstance(cfg, WindowedSamplerConfig)
+    assert cfg.max_staleness_versions == 4
+
+
+def test_windowed_silently_ignores_the_lookahead_key() -> None:
+    """Guards a sweep-invalidating footgun.
+
+    Both sampler configs are ``extra="allow"``, and windowed spells its slack
+    ``max_staleness_versions``. Handing it the gated samplers'
+    ``max_lookahead_versions`` is accepted without complaint and leaves the
+    staleness at its default, so every arm of a sweep would run identically.
+    The launcher emits the key matching the chosen sampler for this reason.
+    """
+    cfg = TypeAdapter(SamplerConfig).validate_python(
+        {"name": "windowed", "max_lookahead_versions": 6}
+    )
+
+    assert isinstance(cfg, WindowedSamplerConfig)
+    assert cfg.max_staleness_versions == 1

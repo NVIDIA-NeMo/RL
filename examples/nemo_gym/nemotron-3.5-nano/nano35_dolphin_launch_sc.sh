@@ -67,6 +67,34 @@ STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-32}"
 NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-8}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-4}"
 
+# Which selection policy the slack above configures. The two samplers spell it
+# differently — in_order counts dispatch batches of lookahead, windowed counts
+# weight versions of staleness — and both configs are extra="allow", so passing
+# the wrong key is accepted and silently ignored, leaving every arm of a sweep
+# sitting at the default. Emitting only the key that matches SAMPLER is what
+# stops a sweep from quietly running four copies of the same configuration.
+SAMPLER="${SAMPLER:-in_order}"
+case "${SAMPLER}" in
+  in_order)
+    _SAMPLER_OVERRIDES=(
+      "async_rl.sampler.name=in_order"
+      "async_rl.sampler.max_lookahead_versions=${MAX_LOOKAHEAD_VERSIONS}"
+    )
+    ;;
+  windowed)
+    # The recipe declares the in_order key, and Hydra runs in struct mode, so
+    # this one has to be added rather than overridden.
+    _SAMPLER_OVERRIDES=(
+      "async_rl.sampler.name=windowed"
+      "+async_rl.sampler.max_staleness_versions=${MAX_LOOKAHEAD_VERSIONS}"
+    )
+    ;;
+  *)
+    echo "SAMPLER must be in_order or windowed, got '${SAMPLER}'" >&2
+    exit 1
+    ;;
+esac
+
 # Shard-to-shard weight refit, on by default in this variant. It is still
 # experimental, so keep the escape hatch one env var away: REFIT_TRANSPORT=null
 # restores the full-tensor broadcast that rlvr_dolphin.yaml uses.
@@ -82,14 +110,15 @@ echo "  Entrypoint : ${TRAIN_ENTRYPOINT}"
 echo "  Config     : ${CONFIG_PATH}"
 echo "  Refit      : ${REFIT_TRANSPORT}"
 echo "  Streaming  : min ${STREAM_MIN_GROUPS} of ${_NUM_PROMPTS_PER_STEP} groups per dispatch"
-echo "  Lookahead  : ${MAX_LOOKAHEAD_VERSIONS} (buffer ${_BUFFER_CAPACITY} groups)"
+echo "  Sampler    : ${SAMPLER} (slack ${MAX_LOOKAHEAD_VERSIONS})"
+echo "  Capacity   : buffer ${_BUFFER_CAPACITY} groups, ${_BUFFER_CAPACITY} in flight"
 echo "  TQ units   : ${NUM_STORAGE_UNITS}"
 echo "================================================================"
 echo ""
 
 exec bash "${SCRIPT_DIR}/nano35_dolphin_launch.sh" \
   "async_rl.min_groups_for_streaming_train=${STREAM_MIN_GROUPS}" \
-  "async_rl.sampler.max_lookahead_versions=${MAX_LOOKAHEAD_VERSIONS}" \
+  "${_SAMPLER_OVERRIDES[@]}" \
   "async_rl.max_inflight_prompts=${_BUFFER_CAPACITY}" \
   "async_rl.max_buffered_rollouts=${_BUFFER_CAPACITY}" \
   "data_plane.num_storage_units=${NUM_STORAGE_UNITS}" \

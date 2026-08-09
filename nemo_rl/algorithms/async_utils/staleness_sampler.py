@@ -228,6 +228,15 @@ class WindowedSampler(BaseSampler):
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
 
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        # One full batch, not the gated samplers' batch-per-version: windowed
+        # needs no lookahead residency, it just has to be able to hold enough
+        # for `select` to reach min_prompt_groups. Below that the train pump
+        # waits on a batch the buffer is too small to ever offer, and without a
+        # floor here validate_sampler_buffer_capacity skips this sampler
+        # entirely and the misconfiguration presents as a silent hang.
+        return groups_per_step
+
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         # Over-sampled: dispatch is bounded by buffer capacity, not by version.
         return None
@@ -448,6 +457,10 @@ def required_buffer_capacity_for_config(
             groups_per_step,
             gate_window=cfg.max_lookahead_versions,
         )
+    if isinstance(cfg, WindowedSamplerConfig):
+        # Keep in step with WindowedSampler.required_buffer_capacity: one batch,
+        # since windowed carries no lookahead residency requirement.
+        return groups_per_step
     return None
 
 
