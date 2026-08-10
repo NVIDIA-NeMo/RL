@@ -16,7 +16,6 @@ import gc
 from copy import deepcopy
 
 import pytest
-import ray
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -26,6 +25,9 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.weight_sync.megatron_weight_synchronizer import (
+    MegatronWeightSynchronizer,
+)
 
 model_name = "Qwen/Qwen3-0.6B"
 
@@ -476,22 +478,16 @@ def test_megatron_generation_non_colocated_refit(
             skip_weight_load=skip_weight_load,
         )
 
-        # init the refit collective on both sides.
-        ip, port = policy_cluster_separate.get_master_address_and_port()
-        train_world_size = policy_cluster_separate.world_size()
-        world_size = train_world_size + generation_cluster.world_size()
-        refit_backend = config["generation"]["mcore_generation_config"]["refit_backend"]
-        futures_train = policy.init_collective_mcore_generation(
-            ip, port, world_size, rank_offset=0, refit_backend=refit_backend
+        # Wire the refit collective the way grpo.setup does: through the
+        # weight synchronizer, which refit_policy_generation dispatches to.
+        mg.weight_synchronizer = MegatronWeightSynchronizer(
+            policy,
+            mg,
+            colocated=False,
+            train_cluster=policy_cluster_separate,
+            inference_cluster=generation_cluster,
         )
-        futures_inference = mg.init_collective(
-            ip,
-            port,
-            world_size,
-            train_world_size=train_world_size,
-            refit_backend=refit_backend,
-        )
-        ray.get(futures_train + futures_inference)
+        mg.weight_synchronizer.init_communicator()
 
         # refit the inference engine from the training weights, then generate
         refit_policy_generation(policy, mg, False)
