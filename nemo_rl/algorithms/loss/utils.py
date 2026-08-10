@@ -177,17 +177,13 @@ def prepare_loss_input(
             "cp_group": cp_group,
         }
         if cp_sharder is not None:
-            next_token_logprobs = get_cp_sharded_next_token_logprobs(
-                logits,
-                data["input_ids"],
-                cp_sharder,
-                chunk_size=chunk_size,
-            )
-            loss_input.update(
-                student_next_token_logprobs=next_token_logprobs,
-                student_next_token_mask=data["token_mask"][:, 1:]
-                .to(next_token_logprobs.device)
-                .contiguous(),
+            loss_input["student_next_token_logprobs"] = (
+                get_cp_sharded_next_token_logprobs(
+                    logits,
+                    data["input_ids"],
+                    cp_sharder,
+                    chunk_size=chunk_size,
+                )
             )
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
