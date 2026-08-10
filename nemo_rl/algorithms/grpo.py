@@ -1530,7 +1530,9 @@ def setup(
             flush=True,
         )
     else:
-        if not (nccl_reshard_refit_enabled and not colocated_inference):
+        if backend != "megatron" and not (
+            nccl_reshard_refit_enabled and not colocated_inference
+        ):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
