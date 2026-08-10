@@ -160,7 +160,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         # Set instance attributes from distributed manager
         self.rank = torch.distributed.get_rank()
         self.device_mesh = distributed_manager.device_mesh
-        self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]

@@ -212,17 +212,22 @@ def test_standard_distillation_statistics_follow_automodel_sequence_layout() -> 
     teacher_topk_logits = torch.randn(1, 4, 2)
     canonical_student_logits = torch.randn(1, 4, 5)
     local_student_logits = canonical_student_logits.index_select(1, order)
+    legacy_cp_group = object()
 
-    student_logprobs, teacher_logprobs, entropy = (
-        get_distillation_topk_logprobs_from_logits(
-            student_logits=local_student_logits,
-            teacher_topk_logits=teacher_topk_logits,
-            teacher_topk_indices=teacher_topk_indices,
-            zero_outside_topk=True,
-            calculate_entropy=True,
-            cp_sharder=layout,
+    with patch("torch.distributed.get_world_size") as get_world_size:
+        student_logprobs, teacher_logprobs, entropy = (
+            get_distillation_topk_logprobs_from_logits(
+                student_logits=local_student_logits,
+                teacher_topk_logits=teacher_topk_logits,
+                teacher_topk_indices=teacher_topk_indices,
+                zero_outside_topk=True,
+                calculate_entropy=True,
+                context_parallel_group=legacy_cp_group,
+                cp_sharder=layout,
+            )
         )
-    )
+
+    get_world_size.assert_not_called()
 
     canonical_student_logprobs = torch.log_softmax(
         canonical_student_logits.float(), dim=-1
