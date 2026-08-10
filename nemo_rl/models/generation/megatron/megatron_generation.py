@@ -15,11 +15,15 @@
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    _get_node_ip_and_free_port,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -90,6 +94,58 @@ class MegatronGeneration(GenerationInterface):
             use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
+    @classmethod
+    def reserve_http_server_address(
+        cls,
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> tuple[str, int]:
+        """Reserve the OpenAI server address before any generation worker exists.
+
+        Args:
+            cluster: The cluster the generation workers will run on.
+            config: The full `PolicyConfig`.
+
+        Returns:
+            Tuple of (server base URL, reserved port).
+        """
+        mcore_generation_config = config["generation"]["mcore_generation_config"]
+        port_range_low = mcore_generation_config["http_server_port_range_low"]
+        port_range_high = mcore_generation_config["http_server_port_range_high"]
+        assert port_range_low < port_range_high, (
+            f"http_server_port_range_low ({port_range_low}) must be < "
+            f"http_server_port_range_high ({port_range_high})."
+        )
+
+        if config["generation"]["colocated"]["enabled"]:
+            # Colocated generation shares the training policy's cluster; trigger
+            # the same (idempotent) default placement-group init Policy would.
+            cluster.get_placement_groups()
+        else:
+            cls.init_cluster_placement_groups(cluster, config)
+
+        # Distributed rank 0 lands on the first bundle handed to the worker
+        # group: sorted-first for a unified placement group, else bundle 0 of
+        # the first group (mirrors Policy's worker-group construction).
+        placement_groups = cluster.get_placement_groups()
+        rank0_bundle_index = (
+            cluster._sorted_bundle_indices[0]
+            if cluster._sorted_bundle_indices is not None
+            else 0
+        )
+        node_ip, port = ray.get(
+            _get_node_ip_and_free_port.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=placement_groups[0],
+                    placement_group_bundle_index=rank0_bundle_index,
+                ),
+                # Explicitly 0 so the probe stays schedulable when all bundle
+                # CPUs are already claimed.
+                num_cpus=0,
+            ).remote(port_range_low, port_range_high)
+        )
+        return f"http://{node_ip}:{port}/v1", port
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -100,6 +156,7 @@ class MegatronGeneration(GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
     ):
         """Initialize a MegatronGeneration instance.
 
@@ -114,6 +171,7 @@ class MegatronGeneration(GenerationInterface):
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
+            reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
@@ -123,6 +181,10 @@ class MegatronGeneration(GenerationInterface):
         )
         assert not (skip_weight_load and policy is not None), (
             "skip_weight_load only applies to the dedicated inference policy."
+        )
+        assert not (reserved_http_server_port is not None and policy is not None), (
+            "reserved_http_server_port only applies to the dedicated inference "
+            "policy; when colocated, pass it to the training policy instead."
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
@@ -161,6 +223,7 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             weights_path=weights_path,
             skip_weight_load=skip_weight_load,
+            reserved_http_server_port=reserved_http_server_port,
         )
 
         # Start the persistent inference engine + HTTP server during construction.
