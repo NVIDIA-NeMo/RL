@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from examples import run_grpo_single_controller
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 
 
 @pytest.fixture
@@ -77,7 +78,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller,
         "setup_single_controller",
-        lambda *_args: actor_args,
+        lambda *_args: (actor_args, SetupTimingMetrics()),
     )
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
