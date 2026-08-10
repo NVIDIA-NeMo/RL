@@ -698,10 +698,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
 
         if batch_decode_items:
             prompt_strs = tokenizer.batch_decode(
-                [item[1] for item in batch_decode_items]
+                [item[1] for item in batch_decode_items],
+                clean_up_tokenization_spaces=False,
             )
             generation_strs = tokenizer.batch_decode(
-                [item[2] for item in batch_decode_items]
+                [item[2] for item in batch_decode_items],
+                clean_up_tokenization_spaces=False,
             )
 
             for (output_item_dict, _, _), prompt_str, generation_str in zip(

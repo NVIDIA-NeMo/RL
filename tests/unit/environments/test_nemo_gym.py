@@ -265,7 +265,8 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         def __init__(self):
             self.batch_decode_calls = []
 
-        def batch_decode(self, batch):
+        def batch_decode(self, batch, *, clean_up_tokenization_spaces):
+            assert clean_up_tokenization_spaces is False
             self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
             return [" ".join(map(str, token_ids)) for token_ids in batch]
 
