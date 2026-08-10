@@ -43,6 +43,7 @@ from nemo_rl.models.generation.profiling import (
     ROLLOUT_PROFILER_CLASS_ENV,
     RolloutProfiler,
     load_rollout_profiler,
+    validate_rollout_profiler_topology,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
@@ -401,22 +402,16 @@ class BaseVllmGenerationWorker:
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
         self._rollout_profiler = None
-        if self.is_model_owner and os.environ.get(ROLLOUT_PROFILER_CLASS_ENV):
-            if (
-                self.tensor_parallel_size != 1
-                or self.pipeline_parallel_size != 1
-                or self.expert_parallel_size != 1
-            ):
-                raise ValueError(
-                    "Synchronous rollout profiling currently requires "
-                    "tensor_parallel_size=1, pipeline_parallel_size=1, and "
-                    "expert_parallel_size=1"
-                )
-            if self.cfg["vllm_cfg"]["async_engine"]:
-                raise ValueError(
-                    "Synchronous rollout profiling currently requires "
-                    "async_engine=false"
-                )
+        rollout_profiler_class = os.environ.get(ROLLOUT_PROFILER_CLASS_ENV, "")
+        if self.is_model_owner:
+            validate_rollout_profiler_topology(
+                class_path=rollout_profiler_class,
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                async_engine=self.cfg["vllm_cfg"]["async_engine"],
+            )
+        if self.is_model_owner and rollout_profiler_class:
             try:
                 rollout_rank = int(os.environ["RANK"])
             except (KeyError, ValueError) as exc:
@@ -793,23 +788,20 @@ class BaseVllmGenerationWorker:
             if profiler is not None:
                 profiler.end_engine_initialization(engine_token)
 
-    def begin_rollout_profile(self, *, step_id: int | str) -> bool:
+    def begin_rollout_profile(self, *, step_id: int | str) -> None:
         """Open one complete synchronous rollout profile window."""
         if self._rollout_profiler is not None:
             self._rollout_profiler.begin_rollout(step_id=step_id)
-        return True
 
-    def finish_rollout_profile(self) -> bool:
+    def finish_rollout_profile(self) -> None:
         """Close a successful synchronous rollout profile window."""
         if self._rollout_profiler is not None:
             self._rollout_profiler.finish_rollout()
-        return True
 
-    def abort_rollout_profile(self, *, reason: str) -> bool:
+    def abort_rollout_profile(self, *, reason: str) -> None:
         """Abort a synchronous rollout profile window after an error."""
         if self._rollout_profiler is not None:
             self._rollout_profiler.abort_rollout(reason=reason)
-        return True
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
