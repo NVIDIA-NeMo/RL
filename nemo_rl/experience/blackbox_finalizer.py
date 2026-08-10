@@ -69,6 +69,7 @@ class FinalizedGroup:
     group_min_wv: int
     group_max_wv: int
     staging_keys: list[str]
+    canonical_output_tokens: int
     metrics: dict[str, float] = field(default_factory=dict)
     # True when min_valid_fraction_per_group rejected the whole group; the
     # caller aborts the slot instead of committing it.
@@ -280,6 +281,7 @@ class BlackboxFinalizer:
                 group_min_wv=group_min_wv,
                 group_max_wv=group_max_wv,
                 staging_keys=staging_keys,
+                canonical_output_tokens=0,
                 metrics=metrics,
                 dropped=True,
             )
@@ -347,6 +349,9 @@ class BlackboxFinalizer:
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
             staging_keys=staging_keys,
+            canonical_output_tokens=sum(
+                int(mask) for row in valid_rows for mask in row.token_mask
+            ),
             metrics=metrics,
         )
 

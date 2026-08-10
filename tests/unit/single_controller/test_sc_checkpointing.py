@@ -98,6 +98,19 @@ _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 _PARTITION_ID = "rollout_data"
 
 
+class _SteppingClock:
+    """Monotonic test clock that never couples a test to call count."""
+
+    def __init__(self, *, start: float = 0.0, step: float = 1.0) -> None:
+        self._next = start
+        self._step = step
+
+    def __call__(self) -> float:
+        value = self._next
+        self._next += self._step
+        return value
+
+
 # ── fakes ────────────────────────────────────────────────────────────────────
 
 
@@ -294,6 +307,12 @@ class _FakeRolloutManager:
         self._recovery_ledger = recovery_ledger
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self.recovered_group_ids: list[str] = []
+        self._telemetry = {
+            "canonical_groups_finalized": 0,
+            "canonical_output_tokens": 0,
+            "recovery_siblings_reused": 0,
+            "recovery_siblings_redispatched": 0,
+        }
 
     @property
     def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
@@ -306,6 +325,9 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        return dict(self._telemetry)
 
     async def recover_group(self, group_id: str) -> bool:
         self.recovered_group_ids.append(group_id)
@@ -433,6 +455,11 @@ class _FakeDataloader(list):
         return dict(self._state)
 
 
+class _FakeGeneration:
+    def get_logger_metrics(self) -> dict[str, Any]:
+        return {}
+
+
 # ── builders ─────────────────────────────────────────────────────────────────
 
 
@@ -454,6 +481,7 @@ def _actor_master_config(
     data_plane_checkpoint: bool = False,
     token_capture: bool = False,
     rollout_checkpoint_interval_s: Optional[float] = None,
+    rollout_telemetry_interval_s: Optional[float] = None,
     rollout_checkpoint_keep_latest_k: int = 2,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
@@ -516,6 +544,7 @@ def _actor_master_config(
         ),
         rollout_checkpointing=RolloutCheckpointConfig(
             interval_s=rollout_checkpoint_interval_s,
+            telemetry_interval_s=rollout_telemetry_interval_s,
             keep_latest_k=rollout_checkpoint_keep_latest_k,
         ),
     )
@@ -534,9 +563,10 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
     rollout_manager: Optional[_FakeRolloutManager] = None,
     bootstrap_fingerprint: Optional[str] = None,
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
@@ -557,6 +587,7 @@ def _make_actor_args(
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_fingerprint=bootstrap_fingerprint,
+        rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
     )
 
 
@@ -943,6 +974,243 @@ class TestPeriodicRolloutCheckpoint:
         assert manifest["base_train_step"] == 0
         assert manifest["trainer_version"] == 0
         assert manifest["bootstrap_fingerprint"] == "bootstrap-v1"
+
+    def test_logs_snapshot_phase_durations(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = 0.0
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.time.monotonic",
+            new=_SteppingClock(),
+        ):
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["snapshot_sequence"] == 1.0
+        assert logged["total_save_seconds"] > 0
+        assert 0 <= logged["barrier_wait_seconds"] <= logged["total_save_seconds"]
+        assert 0 <= logged["tq_save_seconds"] <= logged["exclusive_hold_seconds"]
+        assert (
+            logged["barrier_wait_seconds"] + logged["exclusive_hold_seconds"]
+            <= logged["total_save_seconds"]
+        )
+        assert logged["replay_groups"] == 0.0
+        assert logged["ledger_groups"] == 1.0
+        assert actor._logger.log_metrics.call_args.kwargs == {
+            "step": 1,
+            "prefix": "timing/rollout_checkpoint",
+            "step_metric": "telemetry/wall_time_seconds",
+        }
+
+    def test_logs_rollout_checkpoint_load_duration(self, tmp_path):
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path, max_num_steps=0),
+            _make_actor_args(
+                rollout_checkpoint_load_metrics={"tq_load_seconds": 1.5}
+            ),
+        )
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = 0.0
+
+        async def _no_op() -> None:
+            return None
+
+        async def _restore_replay() -> int:
+            return 0
+
+        async def _prepare_recovery(*, restored_replay_groups: int) -> list[Any]:
+            assert restored_replay_groups == 0
+            return []
+
+        async def _no_throughput(*, emit: bool = True) -> None:
+            return None
+
+        actor._sync_weights = _no_op
+        actor._maybe_restore_replay_buffer = _restore_replay
+        actor._prepare_rollout_recovery = _prepare_recovery
+        actor._log_rollout_throughput_metrics = _no_throughput
+        actor._rollout_pump = _no_op
+        actor._train_pump = _no_op
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.time.monotonic",
+            new=_SteppingClock(start=20.0, step=0.5),
+        ):
+            asyncio.run(actor.run())
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["tq_load_seconds"] == pytest.approx(1.5)
+        assert logged["replay_metadata_load_seconds"] > 0
+        assert logged["recovery_prepare_seconds"] > 0
+        assert logged["total_load_seconds"] == pytest.approx(
+            logged["tq_load_seconds"]
+            + logged["replay_metadata_load_seconds"]
+            + logged["recovery_prepare_seconds"]
+        )
+        assert actor._logger.log_metrics.call_args.kwargs == {
+            "step": 1,
+            "prefix": "timing/rollout_checkpoint",
+            "step_metric": "telemetry/wall_time_seconds",
+        }
+
+    def test_logs_raw_and_canonical_rollout_throughput(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = 0.0
+        rollout_snapshots = iter(
+            [
+                {
+                    "canonical_groups_finalized": 0,
+                    "canonical_output_tokens": 0,
+                    "recovery_siblings_reused": 0,
+                    "recovery_siblings_redispatched": 0,
+                },
+                {
+                    "canonical_groups_finalized": 2,
+                    "canonical_output_tokens": 40,
+                    "recovery_siblings_reused": 1,
+                    "recovery_siblings_redispatched": 3,
+                },
+            ]
+        )
+        actor._rollout_manager.telemetry_snapshot = lambda: next(rollout_snapshots)
+        generation_snapshots = iter(
+            [
+                {"generation_tokens": {0: [60], 1: [40]}},
+                {
+                    "generation_tokens": {0: [180], 1: [120]},
+                    "inflight_batch_sizes": {0: [2], 1: [1]},
+                    "num_pending_samples": {0: [1], 1: [3]},
+                    "kv_cache_usage_perc": {0: [0.5], 1: [0.7]},
+                },
+            ]
+        )
+
+        class _Generation:
+            def get_logger_metrics(self):
+                return next(generation_snapshots)
+
+        actor._gen = _Generation()
+
+        async def _sample_twice() -> None:
+            await actor._log_rollout_throughput_metrics(emit=False)
+            actor._rollout_completion_durations_s.extend([2.0, 4.0])
+            actor._rollout_queue_wait_durations_s.extend([1.0, 3.0])
+            await actor._log_rollout_throughput_metrics()
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.time.monotonic",
+            new=_SteppingClock(start=10.0, step=10.0),
+        ):
+            asyncio.run(_sample_twice())
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["vllm_output_tokens_per_second"] == pytest.approx(20.0)
+        assert logged["canonical_output_tokens_per_second"] == pytest.approx(4.0)
+        assert logged["canonical_groups_per_second"] == pytest.approx(0.2)
+        assert logged["vllm_requests_running"] == 3
+        assert logged["vllm_requests_waiting"] == 4
+        assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
+        assert logged["group_completion_samples"] == 2
+        assert logged["group_completion_seconds_mean"] == pytest.approx(3.0)
+        assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
+        assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
+        assert logged["group_queue_wait_seconds_mean"] == pytest.approx(2.0)
+        assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
+        assert actor._logger.log_metrics.call_args.kwargs == {
+            "step": 1,
+            "prefix": "rollout/throughput",
+            "step_metric": "telemetry/wall_time_seconds",
+        }
+
+    def test_rollout_telemetry_pump_uses_independent_interval(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._master_config.rollout_checkpointing.telemetry_interval_s = 0.001
+        sampled = asyncio.Event()
+
+        async def _sample(*, emit: bool = True) -> None:
+            assert emit
+            sampled.set()
+
+        actor._log_rollout_throughput_metrics = _sample
+
+        async def _exercise() -> None:
+            task = asyncio.create_task(actor._rollout_telemetry_pump())
+            await asyncio.wait_for(sampled.wait(), timeout=5)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(_exercise())
+
+    def test_logs_parallel_recovery_duration_and_reuse(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = 0.0
+        counter_snapshots = iter(
+            [
+                {
+                    "recovery_siblings_reused": 1,
+                    "recovery_siblings_redispatched": 2,
+                },
+                {
+                    "recovery_siblings_reused": 4,
+                    "recovery_siblings_redispatched": 5,
+                },
+            ]
+        )
+        actor._rollout_manager.telemetry_snapshot = lambda: next(counter_snapshots)
+
+        async def _execute(_work_item, *, task_started_event, **_kwargs) -> bool:
+            task_started_event.set()
+            return True
+
+        actor._execute_rollout_work_item = _execute
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.time.monotonic",
+            new=_SteppingClock(start=10.0, step=2.0),
+        ):
+            asyncio.run(actor._recover_prepared_rollout_groups([object(), object()]))
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["total_seconds"] > 0
+        assert logged["groups"] == 2
+        assert logged["groups_per_second"] == pytest.approx(
+            logged["groups"] / logged["total_seconds"]
+        )
+        assert logged["siblings_reused"] == 3
+        assert logged["siblings_redispatched"] == 3
+        assert logged["siblings_per_second"] == pytest.approx(
+            (logged["siblings_reused"] + logged["siblings_redispatched"])
+            / logged["total_seconds"]
+        )
+        assert actor._logger.log_metrics.call_args.kwargs == {
+            "step": 1,
+            "prefix": "timing/rollout_recovery",
+            "step_metric": "telemetry/wall_time_seconds",
+        }
+
+    def test_checkpoint_outcome_records_skip_reason_and_elapsed_axis(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = 10.0
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.time.monotonic",
+            return_value=14.0,
+        ):
+            actor._log_rollout_checkpoint_outcome(
+                outcome="skipped",
+                attempt_duration_seconds=0.25,
+                skip_reason="trainer_checkpoint_not_durable",
+            )
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["skipped"] == 1
+        assert logged["skip_trainer_checkpoint_not_durable"] == 1
+        assert logged["telemetry/wall_time_seconds"] == pytest.approx(4.0)
+        assert logged["sample_index"] == 1
 
     def test_unchanged_state_is_not_saved_twice(self, tmp_path):
         actor, _, _ = self._make_periodic_actor(tmp_path)

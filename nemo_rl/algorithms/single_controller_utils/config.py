@@ -124,9 +124,15 @@ class RolloutCheckpointConfig(BaseModel, extra="allow"):
     ``checkpointing.enabled=true`` with either restoring mode requires
     ``data_plane.checkpointing_enabled=true``. Select ``none`` explicitly for
     trainer-only resume without native TQ checkpointing.
+
+    ``telemetry_interval_s`` enables independent rollout-throughput sampling.
+    It is intentionally separate from ``interval_s`` so checkpoint-disabled
+    baseline runs and checkpoint-enabled runs can use the same observation
+    cadence. Leave it unset outside benchmarking or diagnostics.
     """
 
     interval_s: Optional[float] = Field(default=None, gt=0)
+    telemetry_interval_s: Optional[float] = Field(default=None, gt=0)
     keep_latest_k: int = Field(default=2, ge=1)
     restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
 

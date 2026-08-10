@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,6 +116,7 @@ class SingleControllerActorArgs:
     last_checkpoint_path: Optional[str]
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None
     bootstrap_fingerprint: Optional[str] = None
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -767,6 +769,16 @@ def setup_single_controller(
             f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
             flush=True,
         )
+    recovery_path = (
+        Path(recovery_checkpoint_path) if recovery_checkpoint_path is not None else None
+    )
+    has_rollout_checkpoint_payload = recovery_path is not None and (
+        (recovery_path / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+    )
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
+        {} if has_rollout_checkpoint_payload else None
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -808,11 +820,16 @@ def setup_single_controller(
             print(
                 f"📦 Restoring dataloader state from checkpoint: {dataloader_state_path}"
             )
+            dataloader_load_started = time.monotonic()
             load_dataloader_state(
                 dataloader,
                 dataloader_checkpoint_path,
                 data_config,
             )
+            if rollout_checkpoint_load_metrics is not None:
+                rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                    time.monotonic() - dataloader_load_started
+                )
         else:
             print(
                 f"⚠️ No dataloader state found at {dataloader_state_path}. "
@@ -860,6 +877,7 @@ def setup_single_controller(
 
     # Native TQ restore must run through the bootstrap client before the SC
     # client is created and before any rollout/train data-plane operation.
+    data_plane_load_started = time.monotonic()
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         policy,
         last_checkpoint_path=recovery_checkpoint_path,
@@ -867,12 +885,21 @@ def setup_single_controller(
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
+    if rollout_checkpoint_load_metrics is not None:
+        rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+            time.monotonic() - data_plane_load_started
+        )
+    ledger_load_started = time.monotonic()
     recovery_ledger = _maybe_restore_rollout_recovery_ledger(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         token_capture_enabled=token_capture_cfg.enabled,
         expected_staging_partition=token_capture_cfg.staging_partition,
     )
+    if rollout_checkpoint_load_metrics is not None:
+        rollout_checkpoint_load_metrics["ledger_load_seconds"] = (
+            time.monotonic() - ledger_load_started
+        )
 
     # ==========================
     # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
@@ -1021,4 +1048,5 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_fingerprint=bootstrap_digest,
+        rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
     )

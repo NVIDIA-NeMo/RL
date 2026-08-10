@@ -250,10 +250,17 @@ class _FakeBuffer:
 
 
 class _FakeImpl:
-    """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
+    """Stand-in for AsyncRolloutImpl that returns a typed prompt-group record."""
 
     def __init__(self, record="sentinel-record", on_run=None) -> None:
-        self._record = record
+        self._record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info={},
+            metadata={"label": record},
+            completions=[],
+            rollout_metrics={},
+        )
         self._on_run = on_run
 
     async def run_rollout(self, input_sample):
@@ -273,6 +280,10 @@ def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
     mgr._recovery_ledger = None
     mgr._env_handles = {}
     mgr._weight_version = 0
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     return mgr
 
 
@@ -324,9 +335,10 @@ class TestGenerateAndPushFlow:
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
-        assert record == "r0"
+        assert record.metadata["label"] == "r0"
         assert start_v == 0
         assert end_v == 0
+        assert mgr.telemetry_snapshot()["canonical_groups_finalized"] == 1
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""
@@ -388,14 +400,7 @@ class TestGenerateAndPushFlow:
 
         first_mgr = _make_manager(buf, first_impl)
         # Share buffer across two managers (mimics two dispatches from one pump).
-        second_mgr = object.__new__(RolloutManager)
-        second_mgr._impl = second_impl
-        second_mgr._tokenizer = None
-        second_mgr._num_generations_per_prompt = 1
-        second_mgr._tq_buffer = buf
-        second_mgr._finalizer = None
-        second_mgr._env_handles = {}
-        second_mgr._weight_version = 0
+        second_mgr = _make_manager(buf, second_impl)
 
         async def _drive():
             t1 = asyncio.create_task(first_mgr.generate_and_push({"prompt": "p1"}))
@@ -1016,12 +1021,13 @@ def test_async_nemo_gym_rollout_manager_matches_original(
 
 
 class _FakeFinalizedGroup:
-    def __init__(self, *, dropped=False):
+    def __init__(self, *, dropped=False, canonical_output_tokens=0):
         self.meta = None if dropped else "meta-sentinel"
         self.fields = None if dropped else "fields-sentinel"
         self.group_min_wv = 3
         self.group_max_wv = 4
         self.staging_keys = ["stage-0"]
+        self.canonical_output_tokens = canonical_output_tokens
         self.metrics = {"finalize/invalid_row_rate": 0.0}
         self.dropped = dropped
 
@@ -1051,7 +1057,13 @@ class _FakeFinalizer:
                 canonical_sample_ids,
             )
         )
-        return _FakeFinalizedGroup(dropped=self._dropped)
+        # Model a finalizer-owned count that is deliberately independent of
+        # receipt delta_len, which includes prompt-side tokens in Gym.
+        canonical_output_tokens = sum(range(1, len(rollout_ids) + 1))
+        return _FakeFinalizedGroup(
+            dropped=self._dropped,
+            canonical_output_tokens=canonical_output_tokens,
+        )
 
 
 class _FakeCaptureBuffer(_FakeBuffer):
@@ -1148,6 +1160,10 @@ def _make_capture_manager(
     mgr._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
     mgr._weight_version = 7
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
 
     class _CaptureImpl(AsyncNemoGymRolloutImpl):
         def __init__(self):
@@ -1171,7 +1187,12 @@ def _make_capture_manager(
             receipts = [
                 {
                     "rollout_id": rollout_id,
-                    "manifest": [{"staging_key": f"stage-{logical_index}"}],
+                    "manifest": [
+                        {
+                            "staging_key": f"stage-{logical_index}",
+                            "delta_len": 1_000,
+                        }
+                    ],
                 }
                 for logical_index, rollout_id in zip(logical_indices, rollout_ids)
             ]
@@ -1287,9 +1308,7 @@ class TestGenerateAndFinalizeFlow:
                 gate_rollout_id=rollout_id,
                 receipt={
                     "rollout_id": rollout_id,
-                    "manifest": [
-                        {"staging_key": f"stage-{sibling.generation_index}"}
-                    ],
+                    "manifest": [{"staging_key": f"stage-{sibling.generation_index}"}],
                 },
                 reward=0.5,
             )
@@ -1326,7 +1345,12 @@ class TestGenerateAndFinalizeFlow:
                 gate_rollout_id=attempt.gate_rollout_id,
                 receipt={
                     "rollout_id": attempt.gate_rollout_id,
-                    "manifest": [{"staging_key": f"stage-{generation_index}"}],
+                    "manifest": [
+                        {
+                            "staging_key": f"stage-{generation_index}",
+                            "delta_len": 1_000,
+                        }
+                    ],
                 },
                 reward=float(generation_index),
             )
@@ -1351,6 +1375,12 @@ class TestGenerateAndFinalizeFlow:
         assert [receipt["rollout_id"] for receipt in receipts] == finalizer_ids
         assert rewards == [0.0, 0.5, 2.0]
         assert len(mgr.recovery_ledger) == 0
+        assert mgr.telemetry_snapshot() == {
+            "canonical_groups_finalized": 1,
+            "canonical_output_tokens": 6,
+            "recovery_siblings_reused": 2,
+            "recovery_siblings_redispatched": 1,
+        }
 
     def test_recovery_failure_preserves_old_and_newly_sealed_siblings(self):
         buf = _FakeCaptureBuffer()
@@ -1450,6 +1480,12 @@ class TestGenerateAndFinalizeFlow:
         # The legacy commit path was not used and nothing failed at the gate.
         assert buf.commit_calls == []
         assert mgr._env_handles["nemo_gym"].failed == []
+        assert mgr.telemetry_snapshot() == {
+            "canonical_groups_finalized": 1,
+            "canonical_output_tokens": 3,
+            "recovery_siblings_reused": 0,
+            "recovery_siblings_redispatched": 0,
+        }
         (recovery_group,) = observed_recovery_groups
         assert recovery_group.prompt_id == "42"
         assert recovery_group.target_step == 5

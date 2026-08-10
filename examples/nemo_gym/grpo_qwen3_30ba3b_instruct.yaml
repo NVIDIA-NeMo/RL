@@ -180,6 +180,9 @@ checkpointing:
 # so interval_s does not replace full-checkpoint triggers such as save_period.
 rollout_checkpointing:
   interval_s: null
+  # Optional fixed-cadence throughput sampling for checkpoint A/B benchmarks.
+  # Keep identical between checkpoint-enabled and checkpoint-disabled runs.
+  telemetry_interval_s: null
   keep_latest_k: 2
 
 # Gate-authoritative token capture (token-in/token-out via NeMo-Gym; see

@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import json
+import math
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
@@ -850,6 +851,13 @@ class RolloutManager:
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
         self._weight_version: int = 0
+        # Cumulative, controller-local counters. They are intentionally not
+        # checkpointed: restored work is counted when it is published again,
+        # and benchmark rates are scoped to the current process lifetime.
+        self._canonical_groups_finalized = 0
+        self._canonical_output_tokens = 0
+        self._recovery_siblings_reused = 0
+        self._recovery_siblings_redispatched = 0
 
     @property
     def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
@@ -873,6 +881,28 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        """Return cumulative canonical-publication and recovery counters."""
+        return {
+            "canonical_groups_finalized": self._canonical_groups_finalized,
+            "canonical_output_tokens": self._canonical_output_tokens,
+            "recovery_siblings_reused": self._recovery_siblings_reused,
+            "recovery_siblings_redispatched": self._recovery_siblings_redispatched,
+        }
+
+    def _record_canonical_publication(
+        self,
+        output_tokens: int,
+        *,
+        reused: int = 0,
+        redispatched: int = 0,
+    ) -> None:
+        """Record a group only after its canonical TQ commit succeeds."""
+        self._canonical_groups_finalized += 1
+        self._canonical_output_tokens += output_tokens
+        self._recovery_siblings_reused += reused
+        self._recovery_siblings_redispatched += redispatched
 
     def reserve_prompt_group(
         self, input_sample: DatumSpec, *, target_step: Optional[int] = None
@@ -1019,6 +1049,17 @@ class RolloutManager:
                 start_weight_version=start_version,
                 end_weight_version=end_version,
             )
+            mean_output_tokens = record.rollout_metrics.get(
+                "mean_gen_tokens_per_sample", 0
+            )
+            output_tokens = 0
+            if isinstance(mean_output_tokens, (int, float)):
+                total_output_tokens = float(mean_output_tokens) * len(
+                    record.completions
+                )
+                if math.isfinite(total_output_tokens):
+                    output_tokens = max(0, round(total_output_tokens))
+            self._record_canonical_publication(output_tokens)
         except BaseException:
             # A failed rollout must not leave an unready slot that can block an
             # in-order sampler. commit() rolls back any DataPlane rows it wrote.
@@ -1198,6 +1239,7 @@ class RolloutManager:
                 finalized.group_max_wv,
                 staging_keys=finalized.staging_keys,
             )
+            self._record_canonical_publication(finalized.canonical_output_tokens)
         except BaseException:
             self._tq_buffer.abort(group_id)
             if discard_recovery_group:
@@ -1243,8 +1285,7 @@ class RolloutManager:
             raise RuntimeError("prompt-group recovery requires a TQ replay buffer")
         if self._data_plane_checkpoint_barrier is None:
             raise RuntimeError(
-                "prompt-group recovery requires the SC data-plane "
-                "checkpoint barrier"
+                "prompt-group recovery requires the SC data-plane checkpoint barrier"
             )
 
         # Recovery now overlaps the periodic checkpoint pump. Minting physical
@@ -1253,8 +1294,8 @@ class RolloutManager:
         # complete replacement set, never a half-retried group.
         async with self._data_plane_checkpoint_barrier.mutation():
             group = self._recovery_ledger.get_group(group_id)
-            generation_indices = (
-                self._recovery_ledger.retryable_generation_indices(group_id)
+            generation_indices = self._recovery_ledger.retryable_generation_indices(
+                group_id
             )
             for generation_index in generation_indices:
                 self._recovery_ledger.retry_sibling(
@@ -1380,6 +1421,11 @@ class RolloutManager:
                 finalized.group_min_wv,
                 finalized.group_max_wv,
                 staging_keys=finalized.staging_keys,
+            )
+            self._record_canonical_publication(
+                finalized.canonical_output_tokens,
+                reused=group.expected_generations - len(generation_indices),
+                redispatched=len(generation_indices),
             )
         except BaseException:
             self._tq_buffer.abort(group.group_id)
