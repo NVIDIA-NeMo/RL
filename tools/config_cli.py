@@ -48,8 +48,11 @@ Example:
   # Minimize with explicit base (rebase to a different parent)
   tools/config_cli.py minimize examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml --base examples/configs/dpo.yaml --in-place
 
-  # Minimize all configs:
-  for recipe in examples/configs/recipes/{llm,vlm}/*.yaml; do
+  # Minimize all configs (recipes are nested under <family>/, so recurse;
+  # skip performance/, whose configs are hand-tuned and not minimized):
+  shopt -s globstar
+  for recipe in examples/configs/recipes/**/*.yaml; do
+    [[ "$recipe" == */performance/* ]] && continue
     if ! tools/config_cli.py minimize-check $recipe 2>/dev/null; then
       tools/config_cli.py minimize $recipe --in-place
     fi
