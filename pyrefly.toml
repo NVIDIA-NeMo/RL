@@ -238,6 +238,7 @@ project-includes = [
   "nemo_rl/weight_sync/http_weight_synchronizer.py",
   "nemo_rl/weight_sync/interfaces.py",
   "nemo_rl/weight_sync/ipc_weight_synchronizer.py",
+  "nemo_rl/weight_sync/megatron_weight_synchronizer.py",
   "nemo_rl/weight_sync/vllm_remote_sparse_weight_synchronizer.py",
   "nemo_rl/weight_sync/nccl_reshard_utils.py",
   "nemo_rl/weight_sync/nccl_reshard_weight_synchronizer.py",

@@ -31,11 +31,11 @@ from nemo_rl.weight_sync.http_weight_synchronizer import (
     HTTPWeightSynchronizer,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.megatron_weight_synchronizer import (
-    MegatronWeightSynchronizer,
-)
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
+)
+from nemo_rl.weight_sync.megatron_weight_synchronizer import (
+    MegatronWeightSynchronizer,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
