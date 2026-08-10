@@ -1161,9 +1161,13 @@ def setup(
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
-    def init_policy():
+    def init_policy(reserved_http_server_port: Optional[int] = None):
         """Initialize policy training workers."""
         t0 = time.perf_counter()
+        extra_policy_kwargs = {}
+        if reserved_http_server_port is not None:
+            # Colocated Megatron generation serves HTTP from the training workers.
+            extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1173,6 +1177,7 @@ def setup(
             optimizer_path=optimizer_path,
             init_optimizer=True,
             init_reference_model=init_reference_model,
+            **extra_policy_kwargs,
         )
         # Keep custom policy_factory call signatures backward compatible.
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
@@ -1200,7 +1205,9 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    def init_megatron_generation(policy=None):
+    def init_megatron_generation(
+        policy=None, reserved_http_server_port: Optional[int] = None
+    ):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
         mg = MegatronGeneration(
@@ -1211,6 +1218,7 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             skip_weight_load=not colocated_inference,
+            reserved_http_server_port=reserved_http_server_port,
         )
         return mg, time.perf_counter() - t0
 
@@ -1273,21 +1281,95 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        # Initialize training first so checkpoint conversion completes before inference starts.
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-
-        # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-        policy_generation, megatron_gen_time = init_megatron_generation(policy)
-        setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-
-        if enable_nemo_gym:
-            # The Megatron inference engine must be up before its server URLs exist.
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
+        mcore_generation_config = generation_config["mcore_generation_config"]
+        http_port_range_low = mcore_generation_config.get("http_server_port_range_low")
+        http_port_range_high = mcore_generation_config.get(
+            "http_server_port_range_high"
+        )
+        if (http_port_range_low is None) != (http_port_range_high is None):
+            raise ValueError(
+                "Set both policy.generation.mcore_generation_config."
+                "http_server_port_range_low and http_server_port_range_high "
+                f"(or neither); got low={http_port_range_low}, "
+                f"high={http_port_range_high}."
             )
+        overlap_nemo_gym_spinup = enable_nemo_gym and http_port_range_low is not None
+
+        if overlap_nemo_gym_spinup:
+            # ---- NeMo Gym: probe the rank-0 node for a free server port so the
+            # URL is known before any worker exists, then spin up NeMo Gym while
+            # the policy loads and the inference engine warms up.
+            print(
+                "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
+                flush=True,
+            )
+            reserved_url, reserved_http_server_port = (
+                MegatronGeneration.reserve_http_server_address(
+                    train_cluster if colocated_inference else inference_cluster,
+                    policy_config,
+                )
+            )
+            print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
+
+            def init_megatron_stack():
+                """Init policy then generation; rank 0 holds the reserved port."""
+                p, policy_t = init_policy(
+                    reserved_http_server_port=reserved_http_server_port
+                    if colocated_inference
+                    else None
+                )
+                pg, gen_t = init_megatron_generation(
+                    p,
+                    reserved_http_server_port=None
+                    if colocated_inference
+                    else reserved_http_server_port,
+                )
+                return p, policy_t, pg, gen_t
+
+            def init_nemo_gym():
+                """Spin up NeMo Gym servers against the reserved URL."""
+                return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
+
+            init_tasks = {
+                "megatron": init_megatron_stack,
+                "nemo_gym": init_nemo_gym,
+            }
+            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                results = {k: f.result() for k, f in submitted.items()}
+
+            policy, policy_time, policy_generation, megatron_gen_time = results[
+                "megatron"
+            ]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
+
+            served_urls = policy_generation.dp_openai_server_base_urls
+            if served_urls != [reserved_url]:
+                raise RuntimeError(
+                    "Megatron server came up at a different address than the one "
+                    f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+                )
+        else:
+            # Initialize training first so checkpoint conversion completes before inference starts.
+            policy, policy_time = init_policy()
+            setup_timing_metrics.policy_init_time_s = policy_time
+
+            # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
+            policy_generation, megatron_gen_time = init_megatron_generation(policy)
+            setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
+
+            if enable_nemo_gym:
+                # Without a reserved port the server URLs only exist once the
+                # inference engine is up, so NeMo Gym spinup runs serially here.
+                nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                    policy_generation.dp_openai_server_base_urls,
+                    generation_config["model_name"],
+                )
+                setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
