@@ -251,6 +251,18 @@ pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` /
 `GENRM_BASE_URL` or `NL2BASH_BASE_URL` by hand is rejected, since the wrapper
 supplies those.
 
+Each pool is registered only when its model variable is set, so set at least
+one of them. Stages declare only the judges they use — `rlhf_teacher` has no
+NL2Bash block, `reasoning_teacher` has no GenRM block, `swe_teacher` has
+neither — and setting a judge the stage does not declare makes the driver fail
+on an unknown config key.
+
+`BASE_LOG_DIR` and `EXTERNAL_VLLM_TOOLS_DIR_HOST` (the repo's
+`tools/external_gym_vllm`) must resolve under `EXTERNAL_VLLM_SHARED_ROOT`,
+because the wrapper bind-mounts that root into the service containers. Since
+`RESULTS_DIR` defaults to a path relative to the repo, pass an explicit
+`BASE_LOG_DIR` on the shared filesystem when the checkout lives elsewhere.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `EXTERNAL_JUDGES` | `0` | `1` serves GenRM and NL2Bash in a second hetgroup |
@@ -270,20 +282,31 @@ plugin, and `BASE_LOG_DIR` must live under `EXTERNAL_VLLM_SHARED_ROOT`
 (`/lustre` by default), which is mounted into the service containers.
 `INTERACTIVE=1` is not supported in this mode.
 
+Building on the [Phase 1](#phase-1--49k-context-128-steps) invocation, add:
+
 ```bash
 EXTERNAL_JUDGES=1 \
 GENRM_MODEL=/path/to/genrm-checkpoint \
-GENRM_REASONING_PARSER=/path/to/ultra_v3_reasoning_parser.py \
+GENRM_REASONING_PARSER=/lustre/path/to/ultra_v3_reasoning_parser.py \
 GENRM_REPLICAS=16 \
 NL2BASH_JUDGE_MODEL=/path/to/nl2bash-judge-checkpoint \
 NL2BASH_REPLICAS=4 \
-NUM_GYM_NODES=2 \
-# ... plus the required variables above
+NUM_TRAIN_NODES=64 \
+NUM_GEN_NODES=172 \
+NUM_GYM_NODES=4 \
+BASE_LOG_DIR=/lustre/path/to/ray_logs \
+EXP_NAME=... CONFIG_PATH=... MODEL_PATH=... TRAIN_PATH=... VAL_PATH=... \
+CONTAINER=... SANDBOX_CONTAINER=... PERSISTENT_CACHE=... \
+SLURM_PARTITION=$SLURM_PARTITION SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
-That example allocates 16 GenRM + 4 NL2Bash = 20 external nodes alongside the
-training component.
+That allocates 64 + 172 + 4 = 240 NeMo RL nodes (a multiple of `SEGMENT_SIZE`,
+with Gym now hosting only the safety judge) plus 16 GenRM + 4 NL2Bash = 20
+external nodes. Set only `GENRM_MODEL` or only `NL2BASH_JUDGE_MODEL` to move
+just that judge out of Gym — useful for the teacher stages, which declare only
+the judges they use.
 
 ## Stage 1 — Student RLVR
 

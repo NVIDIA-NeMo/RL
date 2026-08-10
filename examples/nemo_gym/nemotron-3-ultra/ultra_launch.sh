@@ -146,8 +146,14 @@ NUM_EXTERNAL_SERVICE_NODES=0
 # registration (re-exported with the other container settings below).
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
-  : "${GENRM_MODEL:?GENRM_MODEL is required when EXTERNAL_JUDGES=1}"
-  : "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required when EXTERNAL_JUDGES=1}"
+  # Stages declare only the judges they use: rlhf_teacher has no NL2Bash block,
+  # reasoning_teacher has no GenRM block, swe_teacher has neither. Each pool is
+  # registered only when its model is set, so a stage never receives an override
+  # for a judge its config does not declare.
+  if [[ -z "${GENRM_MODEL}" && -z "${NL2BASH_JUDGE_MODEL}" ]]; then
+    echo "ERROR: EXTERNAL_JUDGES=1 requires GENRM_MODEL, NL2BASH_JUDGE_MODEL, or both." >&2
+    exit 1
+  fi
   if [[ -n "${GENRM_BASE_URL}" ]]; then
     echo "ERROR: GENRM_BASE_URL and EXTERNAL_JUDGES=1 are mutually exclusive." >&2
     exit 1
@@ -157,6 +163,15 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
     exit 1
   fi
 
+  # Deployment-specific service definitions stay in this launcher; the
+  # allocation wrapper consumes only pools registered through this interface.
+  source "${PROJECT_ROOT}/tools/external_gym_vllm/pool_config.sh"
+  EXTERNAL_VLLM_POOLS=""
+  EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
+  EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
   GENRM_BASE_URL="__GENRM_BASE_URL__"
   GENRM_REPLICAS="${GENRM_REPLICAS:-4}"
   GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
@@ -174,6 +189,9 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
   GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":96}}"
 
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
   NL2BASH_BASE_URL="__NL2BASH_BASE_URL__"
   NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-4}"
   NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
@@ -182,22 +200,18 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   NL2BASH_VLLM_PORT="${NL2BASH_VLLM_PORT:-8000}"
   NL2BASH_LB_PORT="${NL2BASH_LB_PORT:-9214}"
   NL2BASH_STARTUP_TIMEOUT="${NL2BASH_STARTUP_TIMEOUT:-3600}"
-  NL2BASH_CONTAINER="${NL2BASH_CONTAINER:-${GENRM_CONTAINER}}"
-  NL2BASH_VLLM_PYTHON="${NL2BASH_VLLM_PYTHON:-${GENRM_VLLM_PYTHON}}"
+  # GenRM's values when that pool is also registered, else the shared defaults.
+  NL2BASH_CONTAINER="${NL2BASH_CONTAINER:-${GENRM_CONTAINER:-${CONTAINER}}}"
+  NL2BASH_VLLM_PYTHON="${NL2BASH_VLLM_PYTHON:-${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}}"
   NL2BASH_TOOL_CALL_PARSER="${NL2BASH_TOOL_CALL_PARSER:-hermes}"
   NL2BASH_ENABLE_EXPERT_PARALLEL="${NL2BASH_ENABLE_EXPERT_PARALLEL:-1}"
   NL2BASH_ATTENTION_BACKEND="${NL2BASH_ATTENTION_BACKEND:-TRITON_ATTN}"
   NL2BASH_MAX_MODEL_LEN="${NL2BASH_MAX_MODEL_LEN:-131072}"
   NL2BASH_COMPILATION_CONFIG="${NL2BASH_COMPILATION_CONFIG:-{\"cudagraph_capture_sizes\":[1,2,4,8,16,32,64,128,256]}}"
   NL2BASH_MODEL_LOADER_EXTRA_CONFIG="${NL2BASH_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":112}}"
+fi
 
-  # Deployment-specific service definitions stay in this launcher; the
-  # allocation wrapper consumes only pools registered through this interface.
-  source "${PROJECT_ROOT}/tools/external_gym_vllm/pool_config.sh"
-  EXTERNAL_VLLM_POOLS=""
-  EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
-  EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
-
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
   register_external_vllm_pool GENRM \
     --display-name GenRM \
     --model "${GENRM_MODEL}" \
@@ -231,7 +245,9 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   )
   [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
   external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
+fi
 
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
   register_external_vllm_pool NL2BASH \
     --display-name NL2Bash \
     --model "${NL2BASH_JUDGE_MODEL}" \
@@ -267,7 +283,9 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   )
   [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
   external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
+fi
 
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
   export EXTERNAL_VLLM_LB_PYTHON EXTERNAL_VLLM_POOLS EXTERNAL_VLLM_TOOLS_DIR_HOST
 fi
@@ -276,6 +294,9 @@ fi
 # skips the local deployment; otherwise Gym serves the model itself.
 GENRM_OVERRIDE=""
 if [[ -n "${GENRM_BASE_URL}" ]]; then
+  # Gym requires a model name even when it only proxies to base_url, so fall
+  # back to the checkpoint when the served name was not given explicitly.
+  GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_MODEL}}"
   GENRM_OVERRIDE="++env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=${GENRM_BASE_URL}"
   if [[ -n "${GENRM_API_MODEL_NAME}" ]]; then
     GENRM_OVERRIDE="${GENRM_OVERRIDE} env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=${GENRM_API_MODEL_NAME}"
@@ -285,6 +306,7 @@ elif [[ -n "${GENRM_MODEL}" ]]; then
 fi
 NL2BASH_OVERRIDE=""
 if [[ -n "${NL2BASH_BASE_URL}" ]]; then
+  NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-${NL2BASH_JUDGE_MODEL}}"
   NL2BASH_OVERRIDE="++env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.base_url=${NL2BASH_BASE_URL}"
   if [[ -n "${NL2BASH_API_MODEL_NAME}" ]]; then
     NL2BASH_OVERRIDE="${NL2BASH_OVERRIDE} env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_API_MODEL_NAME}"
@@ -304,20 +326,40 @@ JOB_NAME="${EXP_NAME}"
 # =============================================================================
 # Output directories
 # =============================================================================
-RESULTS_DIR="${RESULTS_DIR:-results/${EXP_NAME}}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}"
+# Resolved to absolute paths: the driver runs from ${CODE_ROOT} inside the
+# container, and the external-service wrapper rejects relative paths.
+RESULTS_DIR="$(realpath -m -s "${RESULTS_DIR:-results/${EXP_NAME}}")"
+CHECKPOINT_DIR="$(realpath -m -s "${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}")"
 
 # Per-submission dirs for logs and Slurm output (timestamped for history).
 RUN_DIR="${RESULTS_DIR}/runs/$(date +%Y%m%d-%H%M)"
 LOG_DIR="${RUN_DIR}/logs"
 SLURM_LOG_DIR="${RUN_DIR}/slurm"
+BASE_LOG_DIR="$(realpath -m -s "${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}")"
+
+# The wrapper bind-mounts EXTERNAL_VLLM_SHARED_ROOT into the service containers,
+# so both paths must resolve under it. Check before creating any directories.
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  _shared_root="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
+  for _var in BASE_LOG_DIR EXTERNAL_VLLM_TOOLS_DIR_HOST; do
+    _path="$(realpath -m -s "${!_var}")"
+    if [[ "${_path}" != "${_shared_root}" && "${_path}" != "${_shared_root}"/* ]]; then
+      echo "ERROR: ${_var}=${_path} must be under EXTERNAL_VLLM_SHARED_ROOT=${_shared_root} when EXTERNAL_JUDGES=1." >&2
+      echo "  Set ${_var} (or RESULTS_DIR) to a path on the shared filesystem, or set EXTERNAL_VLLM_SHARED_ROOT." >&2
+      exit 1
+    fi
+    printf -v "${_var}" '%s' "${_path}"
+  done
+  export EXTERNAL_VLLM_TOOLS_DIR_HOST
+fi
+
 mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${SLURM_LOG_DIR}"
-ln -sfn "$(realpath "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
+ln -sfn "${RUN_DIR}" "${RESULTS_DIR}/runs/latest"
 
 # ray.sub reads BASE_LOG_DIR and creates $BASE_LOG_DIR/$SLURM_JOB_ID-logs/ for
 # ray infrastructure logs (ray-head.log, ray-driver.log, ray-worker-*.log,
 # topology probes, attach scripts, etc.).
-export BASE_LOG_DIR="${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}"
+export BASE_LOG_DIR
 
 # =============================================================================
 # SLURM configuration
@@ -533,7 +575,7 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
   fi
   if (( NUM_EXTERNAL_SERVICE_NODES % EXTERNAL_VLLM_SEGMENT_SIZE != 0 )); then
     echo "ERROR: External service nodes=${NUM_EXTERNAL_SERVICE_NODES} is not divisible by EXTERNAL_VLLM_SEGMENT_SIZE=${EXTERNAL_VLLM_SEGMENT_SIZE}." >&2
-    echo "  GenRM=$((GENRM_REPLICAS * GENRM_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE)) + NL2Bash=$((NL2BASH_REPLICAS * NL2BASH_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE))" >&2
+    echo "  Registered pools: ${EXTERNAL_VLLM_POOLS}" >&2
     exit 1
   fi
 fi
@@ -880,8 +922,11 @@ echo "    Teachers:  ${NUM_TEACHER_NODES}  ($((NUM_TEACHER_NODES * GPUS_PER_NODE
 fi
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external-service nodes  (segment=${EXTERNAL_VLLM_SEGMENT_SIZE})"
-echo "      GenRM:    ${GENRM_REPLICAS} independent TP=${GENRM_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${GENRM_LB_PORT}"
-echo "      NL2Bash:  ${NL2BASH_REPLICAS} independent TP=${NL2BASH_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${NL2BASH_LB_PORT}"
+for _pool in ${EXTERNAL_VLLM_POOLS}; do
+  _replicas="${_pool}_REPLICAS"; _tp="${_pool}_TENSOR_PARALLEL_SIZE"; _lb="${_pool}_LB_PORT"
+  _label="${_pool}_DISPLAY_NAME"
+  echo "      ${!_label}: ${!_replicas} independent TP=${!_tp}, DP=1 servers; LB port=${!_lb}"
+done
 fi
 echo "  Walltime:    ${WALLTIME}"
 echo "  Batch script: ${BATCH_SCRIPT}"
