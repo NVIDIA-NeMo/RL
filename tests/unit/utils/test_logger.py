@@ -1665,6 +1665,34 @@ class TestLogger:
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_define_metric_only_targets_wandb(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        logger.define_metric(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+        mock_wandb_logger.return_value.define_metric.assert_called_once_with(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+        assert not mock_tb_logger.return_value.define_metric.called
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_log_hyperparams(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging hyperparameters to all enabled loggers."""
         cfg = {
