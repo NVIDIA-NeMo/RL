@@ -143,6 +143,13 @@ git submodule update --init --recursive --depth=1
 assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
+#   - drop PyNvVideoCodec. PyPI has no wheel in the pinned ~=2.1.0 range for
+#     aarch64/py3.13 (it jumps 2.0.5 -> 2.2.0), so build_wheel.py's
+#     `pip install -r requirements-dev.txt` aborts before cmake ever runs.
+#     Nothing in this build path decodes video. Not asserted: the pin only
+#     appeared after 1.3.0rc21, so older refs legitimately lack the line.
+sed -i '/^PyNvVideoCodec/d' requirements.txt
+
 # cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
 # which (a) requires a setup.py shim and (b) the `--user` flag is invalid
 # inside a venv. Rewrite the COMMAND to copy setup_library.py to setup.py
@@ -187,6 +194,15 @@ echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 show_ccache_status "before TRT-LLM build"
 ccache --zero-stats
 
+# With NIXL enabled the build emits tensorrt_llm_transfer_agent_binding, which
+# build_wheel.py imports to generate stubs. That module links torch but carries
+# no rpath to it, so the import fails on "libc10.so: cannot open shared object
+# file" and kills the build after the compile is already done. build_wheel.py
+# copies the ambient environment for the stub step, so exporting torch's lib
+# directory here is enough.
+TORCH_LIB_DIR="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+
 # Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
 TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)
 set +x
@@ -198,8 +214,24 @@ TRTLLM_BUILD_CMD=(
     --use_ccache
     --nvrtc_dynamic_linking
     --job_count "$JOBS"
-    -D "ENABLE_UCX=OFF"
+    # PD disaggregation's cache transceiver: ENABLE_UCX builds the UCX wrapper
+    # the engine dlopen()s, and it also gates find_package(NIXL) in
+    # cpp/CMakeLists.txt, so NIXL rides along with it. With UCX off, every
+    # non-MPI backend is compiled out and the engine aborts on the first KV
+    # transfer.
+    -D "ENABLE_UCX=ON"
 )
+# NIXL is what cache_transceiver_backend=DEFAULT resolves to, and it is
+# installed by docker/Dockerfile. Missing means the image is wrong, so fail here
+# rather than shipping a wheel whose default KV transport aborts at runtime.
+NIXL_ROOT_DIR="${NIXL_ROOT_DIR:-/opt/nvidia/nvda_nixl}"
+if [[ ! -f "${NIXL_ROOT_DIR}/include/nixl.h" ]]; then
+    echo "[ERROR] NIXL not found at ${NIXL_ROOT_DIR}. The image must install it" \
+         "(see the NIXL_VERSION block in docker/Dockerfile), or point" \
+         "NIXL_ROOT_DIR at an existing install." >&2
+    exit 1
+fi
+TRTLLM_BUILD_CMD+=(--nixl_root "${NIXL_ROOT_DIR}")
 set +e
 NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
     PYTHONUNBUFFERED=1 \
