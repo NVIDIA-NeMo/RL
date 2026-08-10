@@ -93,6 +93,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
+from nemo_rl.models.sequence_length import validate_sequence_length_divisibility
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -258,6 +259,23 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
+        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
+        if cp_size > 1 and tp_size > 1 and sequence_parallel_enabled:
+            raise ValueError(
+                "Context parallel cannot be used together with TP sequence parallel "
+                "in the DTensor backend. Please either set context_parallel_size=1 "
+                "or disable sequence_parallel. See "
+                "https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
+            )
+        validate_sequence_length_divisibility(
+            self.cfg["make_sequence_length_divisible_by"],
+            context_parallel_size=cp_size,
+            tensor_parallel_size=tp_size,
+            sequence_parallel=sequence_parallel_enabled,
+        )
+
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -288,6 +306,11 @@ class DTensorPolicyWorkerImpl(
                 f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
+
+        if cp_size > 1 and self.enable_seq_packing:
+            raise ValueError(
+                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
 
         hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
 
@@ -363,14 +386,7 @@ class DTensorPolicyWorkerImpl(
         if getattr(self.model.config, "pad_token_id", None) is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
-        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
-        if cp_size > 1 and self.enable_seq_packing:
-            raise ValueError(
-                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-            )
         dp_size = world_size // tp_size // cp_size
-        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
         assert world_size == dp_size * tp_size * cp_size, (
             f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
         )

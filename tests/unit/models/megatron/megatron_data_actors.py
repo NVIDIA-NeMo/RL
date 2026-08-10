@@ -617,7 +617,8 @@ class GetPackSequenceParametersTestActor:
             [2, True, 1, 1, 2, 1],  # tp
             [2, False, 1, 1, 1, 1],  # tp+sp
             [1, False, 1, 4, 8, 1],  # cp
-            [2, True, 1, 4, 16, 1],  # cp+tp+sp
+            [2, True, 1, 4, 8, 1],  # cp+tp+sp: lcm(8, 8)
+            [4, True, 1, 2, 8, 1],  # cp+tp+sp: lcm(4, 8)
             [1, False, 4, 1, 1, 1],  # pp
         ]:
             megatron_cfg = {
