@@ -30,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -343,6 +344,7 @@ def test_train_pump_drives_mcore_training_step(
             metric_log_handle=log,
             master_config=master_config,
             actor_args=actor_args,
+            setup_timing_metrics=SetupTimingMetrics(),
         )
 
         # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.

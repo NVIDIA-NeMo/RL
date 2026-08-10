@@ -84,11 +84,10 @@ dependencies = [
   # automatically include them. Removes the need for a `[data-plane]`
   # extra and the corresponding plumbing in the per-worker venv builder.
   "tensordict",
-  # Pinned to b266d39 (post-0.1.6, pre-0.1.7) for PR #77's MooncakeStore
-  # refactor: `clear` switched from unanchored `remove_by_regex` to
-  # exact-key `batch_remove`, which fixes a collateral-key-deletion bug
-  # that breaks DAPO + mooncake_cpu. Bump to the 0.1.7 tag when released.
-  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@b266d39",
+  # TransferQueue v0.1.9 adds full-system checkpoint save/load APIs and
+  # retains the exact-key MooncakeStore clear behavior required by DAPO.
+  # Pin the immutable release commit rather than the mutable version tag.
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@c51614308b68c8d7a87c9b3ef62d59e14c69bde2",
   # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
   # (in-process), but the mooncake_cpu path needs the `mooncake_master`
   # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
@@ -391,10 +390,9 @@ override-dependencies = [
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
   "langchain-core>=0.3.80", # Address CVE-2025-65106
-  # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
-  # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
-  # extra composes with mcore/automodel without version-mirroring TQ's
-  # requirements.txt. Forward-compatible across TQ minor bumps.
+  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap (resolves to
+  # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
+  # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
   "numpy>=2.1.0",
   # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
   # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it

@@ -47,6 +47,10 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    SetupTimingMetrics,
+    print_setup_timing_summary,
+)
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -996,18 +1000,21 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    gen_init_time_key = (
+        "megatron_generation_init_time_s"
+        if backend == "megatron"
+        else f"{backend}_init_time_s"
+    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     remote_transport = None
     remote_synchronizer_cls = None
     remote_baseline_init_refs: list[Any] = []
     checkpoint_engine_config = None
 
-    # Dictionary to store worker initialization timing stats for logging
-    worker_init_timing_metrics = {}
+    # Worker initialization timing stats — populated as each phase completes.
+    setup_timing_metrics = SetupTimingMetrics()
     if teacher_reservation_time:
-        worker_init_timing_metrics["teacher_reservation_time_s"] = (
-            teacher_reservation_time
-        )
+        setup_timing_metrics.teacher_reservation_time_s = teacher_reservation_time
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
@@ -1112,22 +1119,18 @@ def setup(
 
     def initialize_generation_with_policy(
         init_generation_fn,
-        generation_name: str,
-        init_time_key: str,
         colocated_inference: bool,
-        worker_init_timing_metrics: dict,
+        setup_timing_metrics: SetupTimingMetrics,
     ):
-        """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
+        """Initialize a generation engine along with policy, sequentially or in parallel.
 
         Args:
-            init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
-            generation_name: Name of the generation engine ("vLLM" or "SGLang")
-            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
-            colocated_inference: Whether inference is colocated with training
-            worker_init_timing_metrics: Dictionary to store timing metrics
+            init_generation_fn: Function that initializes the generation engine (init_vllm, ...).
+            colocated_inference: Whether inference is colocated with training.
+            setup_timing_metrics: SetupTimingMetrics to store timings on.
 
         Returns:
-            Tuple of (policy_generation, policy)
+            Tuple of (policy_generation, policy).
         """
         # Determine if parallel initialization is possible (non-colocated mode)
         use_parallel_init = not colocated_inference
@@ -1149,10 +1152,10 @@ def setup(
             parallel_wall_time = time.perf_counter() - parallel_start_time
 
             # Store timing metrics
-            worker_init_timing_metrics[init_time_key] = generation_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
+            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.parallel_wall_time_s = parallel_wall_time
+            setup_timing_metrics.parallel_init_enabled = 1.0
 
         else:
             # Sequential initialization: colocated mode (GPU memory requires generation engine first)
@@ -1163,11 +1166,11 @@ def setup(
 
             # Initialize generation engine first (clean GPU memory), then policy
             policy_generation, generation_time = init_generation_fn()
-            worker_init_timing_metrics[init_time_key] = generation_time
+            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
 
             policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.parallel_init_enabled = 0.0
 
         return policy_generation, policy
 
@@ -1175,13 +1178,11 @@ def setup(
     if backend == "megatron":
         # Initialize training first so checkpoint conversion completes before inference starts.
         policy, policy_time = init_policy()
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        setup_timing_metrics.policy_init_time_s = policy_time
 
         # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
         policy_generation, megatron_gen_time = init_megatron_generation(policy)
-        worker_init_timing_metrics["megatron_generation_init_time_s"] = (
-            megatron_gen_time
-        )
+        setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
 
         if enable_nemo_gym:
             # The Megatron inference engine must be up before its server URLs exist.
@@ -1189,7 +1190,7 @@ def setup(
                 policy_generation.dp_openai_server_base_urls,
                 generation_config["model_name"],
             )
-            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -1254,11 +1255,13 @@ def setup(
                 "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
                 flush=True,
             )
+            vllm_reserve_t0 = time.perf_counter()
             deferred_vllm = VllmGeneration(
                 cluster=inference_cluster,
                 config=generation_config,
                 defer_model_load=True,
             )
+            vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
             print(
                 f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
                 f"{deferred_vllm.dp_openai_server_base_urls}",
@@ -1303,23 +1306,21 @@ def setup(
                 results = {k: f.result() for k, f in submitted.items()}
 
             if colocated_inference:
-                policy_generation, vllm_time, policy, policy_time = results[
+                policy_generation, vllm_load_time, policy, policy_time = results[
                     "vllm_policy"
                 ]
             else:
-                policy_generation, vllm_time = results["vllm"]
+                policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:
             policy_generation, policy = initialize_generation_with_policy(
                 init_generation_fn=init_vllm,
-                generation_name="vLLM",
-                init_time_key="vllm_init_time_s",
                 colocated_inference=colocated_inference,
-                worker_init_timing_metrics=worker_init_timing_metrics,
+                setup_timing_metrics=setup_timing_metrics,
             )
 
         print(
@@ -1336,10 +1337,8 @@ def setup(
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
-            generation_name="SGLang",
-            init_time_key="sglang_init_time_s",
             colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
+            setup_timing_metrics=setup_timing_metrics,
         )
 
         # Capture rollout TP size on the policy once; refit calls no longer need it.
@@ -1362,10 +1361,8 @@ def setup(
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_trtllm,
-            generation_name="TRT-LLM",
-            init_time_key="trtllm_init_time_s",
             colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
+            setup_timing_metrics=setup_timing_metrics,
         )
 
         print(
@@ -1378,7 +1375,7 @@ def setup(
                 policy_generation.dp_openai_server_base_urls,
                 generation_config["model_name"],
             )
-            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
@@ -1457,7 +1454,8 @@ def setup(
                 ip, port, world_size, train_world_size=train_world_size
             )  # type: ignore
             ray.get(futures_train + futures_inference)
-        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+
     if remote_transport is not None:
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)
@@ -1475,7 +1473,7 @@ def setup(
             baseline_init_refs=remote_baseline_init_refs,
         )
         policy_generation.weight_synchronizer.init_communicator()
-        worker_init_timing_metrics[f"vllm_{remote_transport}_sparse_init_time_s"] = (
+        setup_timing_metrics.extras[f"vllm_{remote_transport}_sparse_init_time_s"] = (
             time.perf_counter() - t0
         )
     elif checkpoint_engine_config is not None:
@@ -1490,7 +1488,7 @@ def setup(
             inference_cluster=inference_cluster,
         )
         policy_generation.weight_synchronizer.init_communicator()
-        worker_init_timing_metrics["vllm_checkpoint_engine_init_time_s"] = (
+        setup_timing_metrics.vllm_checkpoint_engine_init_time_s = (
             time.perf_counter() - t0
         )
         print(
@@ -1520,46 +1518,25 @@ def setup(
             )
         )
         teacher_model_init_time = time.perf_counter() - t0
-        worker_init_timing_metrics["teacher_model_init_time_s"] = (
-            teacher_model_init_time
-        )
+        setup_timing_metrics.teacher_model_init_time_s = teacher_model_init_time
         # Preserve the existing metric's end-to-end meaning while exposing the
         # newly separated reservation and model-initialization phases.
-        worker_init_timing_metrics["teacher_init_time_s"] = (
+        setup_timing_metrics.teacher_init_time_s = (
             teacher_reservation_time + teacher_model_init_time
         )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
-    worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
+    setup_timing_metrics.total_setup_time_s = total_setup_time
+    setup_timing_metrics.other_setup_time_s = (
+        total_setup_time - worker_init_complete_time
+    )
 
     # Log worker initialization timing metrics to logger
-    if worker_init_timing_metrics:
-        print("\n▶ Worker Initialization Timing:")
-
-        vllm_time = worker_init_timing_metrics.get("vllm_init_time_s", 0)
-        policy_time = worker_init_timing_metrics.get("policy_init_time_s", 0)
-        total_setup = worker_init_timing_metrics.get("total_setup_time_s", 0)
-
-        if vllm_time:
-            print(f"  vLLM init: {vllm_time:.1f}s")
-
-        if policy_time:
-            print(f"  Policy init: {policy_time:.1f}s")
-
-        teacher_time = worker_init_timing_metrics.get("teacher_init_time_s", 0)
-        if teacher_time:
-            print(f"  Teacher init: {teacher_time:.1f}s")
-
-        # Calculate "other" time (time after worker init completes)
-        other_time = total_setup - worker_init_complete_time
-        worker_init_timing_metrics["other_setup_time_s"] = other_time
-        print(f"  Other setup: {other_time:.1f}s")
-
-        print(f"  Total setup: {total_setup:.1f}s")
-
-        # Log all metrics to the logger for analysis
-        logger.log_metrics(worker_init_timing_metrics, step=0, prefix="timing/setup")
+    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    logger.log_metrics(
+        setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+    )
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
