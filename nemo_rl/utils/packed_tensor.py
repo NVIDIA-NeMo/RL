@@ -36,6 +36,19 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
+def _sync_stream_for_group(group: Any, s: torch.cuda.Stream) -> None:
+    """Sync ``s`` using ``group.synchronize_or_abort`` if available, else plain sync.
+
+    Using the group's abortable sync means a peer dying mid-broadcast raises
+    immediately rather than wedging for the full NCCL heartbeat timeout.
+    """
+    abortable = getattr(group, "synchronize_or_abort", None)
+    if abortable is not None:
+        abortable(s)
+    else:
+        s.synchronize()
+
+
 def packed_broadcast_producer(iterator, group, src, post_iter_func):
     """Broadcast a list of tensors in a packed manner.
 
@@ -64,8 +77,8 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
-        streams[buffer_idx].synchronize()
+        # Synchronize the current stream (interruptible: raises if peer died).
+        _sync_stream_for_group(group, streams[buffer_idx])
         # Start tasks for the new buffer in a new stream
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             try:
@@ -103,12 +116,13 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
 
-    # Join all packing/broadcast side streams before returning. Without this,
-    # the caller may mutate or offload the source weights while the final
-    # broadcasts are still in flight on the side streams (vLLM >= 0.25's
-    # PyNcclCommunicator enqueues on the current stream without blocking).
+    # Drain any in-flight broadcasts on all streams. Without this, a peer
+    # dying during the last buffer's broadcast leaves its NCCL error enqueued
+    # on the stream; the error escapes silently and the caller returns True
+    # (success) for a partially-failed broadcast causing weight corruption.
+    # Uses synchronize_or_abort when available for fast peer-death detection.
     for s in streams:
-        s.synchronize()
+        _sync_stream_for_group(group, s)
 
 
 def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
@@ -173,8 +187,8 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
-        streams[buffer_idx].synchronize()
+        # Synchronize the current stream (interruptible: raises if peer died).
+        _sync_stream_for_group(group, streams[buffer_idx])
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             # Initialize the packing tensor meta data
             packing_tensor_meta_data[buffer_idx] = []

@@ -315,6 +315,7 @@ guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/fault-tolerant-generation.md
 guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md

@@ -158,6 +158,9 @@ policy: &POLICY_BASE
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
         vllm_kwargs: {}
+        fault_tolerance:
+            enabled: false
+            auto_recover: true
 
         colocated:
             # true: generation shares training GPUs

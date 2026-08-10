@@ -1501,6 +1501,13 @@ def setup(
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
 
+    # Fault injection for fault-tolerance testing. Launches background threads
+    # that kill/cordon shards at scheduled times according to the recipe config.
+    # No-op when fault_inject.enabled is absent or false.
+    if policy_generation is not None and hasattr(policy_generation, "_router"):
+        from nemo_rl.models.generation.fault_inject import maybe_launch_fault_injector
+        maybe_launch_fault_injector(generation_config, policy_generation)
+
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
     # cache (shared key when student == teacher) — both workers write to the
@@ -2265,6 +2272,13 @@ def refit_policy_generation(
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+
+    # Disagg fault-tolerance: if a vLLM DP shard was removed (or added) since
+    # the last refit, the train↔gen NCCL group is stale. Re-init both sides
+    # at the new world size before touching weights. No-op in steady state
+    # (when the world size hasn't changed) and in colocated mode.
+    if not colocated_inference and hasattr(policy_generation, "ensure_collective_synced"):
+        policy_generation.ensure_collective_synced(policy)
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
@@ -4745,7 +4759,40 @@ def async_grpo_train(
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        # Pass the latest worker state so the AC's stale
+                        # VllmGeneration copy learns about any recovery shards
+                        # added since it was last synced (fault tolerance).
+                        # Only include leaders of READY shards — joining shards
+                        # haven't been refitted yet so their weights are stale.
+                        _worker_sync_state = None
+                        if (
+                            not colocated_inference
+                            and policy_generation is not None
+                            and hasattr(policy_generation, "worker_group")
+                        ):
+                            _wg = policy_generation.worker_group
+                            _router = getattr(policy_generation, "_router", None)
+                            if _router is not None:
+                                _ready_leaders: set[int] = set()
+                                for _entry in _router._shards.values():
+                                    if _entry.status == "ready":
+                                        for _idx in _entry.worker_indices:
+                                            if _idx in _wg.dp_leader_worker_indices:
+                                                _ready_leaders.add(_idx)
+                                _dp_leaders_for_ac = [
+                                    _idx for _idx in _wg.dp_leader_worker_indices
+                                    if _idx in _ready_leaders
+                                ]
+                            else:
+                                _dp_leaders_for_ac = list(_wg.dp_leader_worker_indices)
+                            _worker_sync_state = (
+                                list(_wg.workers),
+                                _dp_leaders_for_ac,
+                                set(_wg._dead_indices),
+                            )
+                        trajectory_collector.resume_after_refit.remote(
+                            worker_sync_state=_worker_sync_state
+                        )
 
                     timer.stop("idle/refit_bubble")
 
@@ -4885,6 +4932,10 @@ def async_grpo_train(
                 # Speculative-decoding (MTP) acceptance metrics for this step.
                 if hasattr(policy_generation, "get_step_metrics"):
                     metrics.update(policy_generation.get_step_metrics())
+
+                # Generation worker shard health (fault-tolerance visibility).
+                if hasattr(policy_generation, "get_shard_health_metrics"):
+                    metrics.update(policy_generation.get_shard_health_metrics())
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config.grpo.num_prompts_per_step
