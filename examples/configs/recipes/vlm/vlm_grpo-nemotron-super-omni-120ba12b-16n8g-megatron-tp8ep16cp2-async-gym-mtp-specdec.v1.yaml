@@ -1,6 +1,212 @@
-defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.yaml
+# Self-contained recipe: Nemotron Super Omni 120B-A12B, async GRPO + NeMo-Gym,
+# Megatron TP8/EP16/CP2 on 16x8 GPUs, with MTP head training and MTP speculative
+# decoding.
+#
+# This file has NO `defaults:` key -- it is the fully resolved merge of what were
+# previously four layers:
+#   examples/nemo_gym/grpo_nanov3.yaml
+#     -> ...-async-gym.v1.yaml
+#       -> ...-async-gym-mtp.v1.yaml
+#         -> ...-async-gym-mtp-specdec.v1.yaml   (this file)
+# Comments were carried over from those layers; where a key was overridden, the
+# most-derived layer's value and comment win.
+#
+# `${...}` interpolations are intra-file references and still resolve normally.
+# Editing this file no longer affects, and is no longer affected by, the recipes
+# above.
+# GRPO Algorithm Configuration for training Super omni v3
+grpo:
+  num_prompts_per_step: 256
+  num_generations_per_prompt: 16
+  val_num_generations_per_prompt: 4
+  max_rollout_turns: 1  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+  max_num_epochs: 1
+  max_num_steps: 1000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_start_at: -1
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  max_val_samples: null
+
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
+  val_batch_size: 256
+  seed: 42
+  async_grpo:
+    enabled: true  # Set to true to enable async training mode
+
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  batch_multiplier: 1
+  use_dynamic_sampling: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  seq_logprob_error_threshold: 2
+
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
+  zero_variance_prompt_filtering: false
+loss_fn:
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: false
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.5
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/nemotron-super-omni-async-gym-mtp-specdec
+  metric_name: val:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 5
+  checkpoint_must_save_by: 00:03:45:00
+  save_optimizer: true
 policy:
+  model_name: /path/to/nemotron-super-omni-hf-checkpoint
+  tokenizer:
+    name: ${policy.model_name}  ## specify if you'd like to use a tokenizer different from the model's default
+    chat_template: ${policy.model_name}/chat_template.jinja
+  train_global_batch_size: 4096
+  train_micro_batch_size: 1
+  generation_batch_size: 64  # Only used when generating using HF backend
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
   megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+
+    # moe_router_dtype: "fp64"
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none  # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.001
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: true
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: false
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-06
+      min_lr: 2.0e-09
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.99
+      adam_eps: 1.0e-08
+
+      #sgd
+      sgd_momentum: 0.9
+      clip_grad: ${policy.max_grad_norm}
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    env_vars:
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+      NRL_REFIT_NUM_BUFFERS: '1'
+
+    # Multi-Token Prediction, matching the reference Super Omni recipe that
+    # runs MTP at context_parallel_size=2.
+    #
+    # The checkpoint ships one physical MTP layer (num_nextn_predict_layers: 1,
+    # mtp_hybrid_override_pattern: "*E"), so mtp_num_layers: 1 with
+    # use_repeated_layer: false maps directly onto it. Asking for more layers
+    # would require repeating that single layer.
+    #
+    # detach_heads keeps MTP gradients from flowing back into the backbone, so
+    # the main next-token objective is unchanged by the auxiliary head.
+    mtp_num_layers: 1
+    radio_force_cpe_eval_mode: true
+    freeze_vision_model: false
+    freeze_vision_projection: false
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+
     # Train the MTP head rather than merely carrying it. The MTP-only recipe
     # uses 0.0, which keeps the head present for speculative decoding without
     # adding its loss to the objective.
@@ -10,13 +216,157 @@ policy:
     # gradients are clipped jointly with the backbone. That is the known cause
     # of exploding grad_norm on Super with MTP. Watch train/grad_norm.
     mtp_loss_scaling_factor: 0.1
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md
+  # for more details on dynamic batching and sequence packing.
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: largest_first
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.context_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.tensor_model_parallel_size}}}
+  max_grad_norm: 1.0
+  optimizer: null  # remove default FSDP optimizer
+  scheduler: null
+  offload_optimizer_for_logprob: false
   generation:
+
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    stop_token_ids: null
+    stop_strings: null
+    mcore_generation_config:
+
+      # Scoped to generation workers only; training keeps its own defaults
+      # via the base yaml. The mcore_generation_config block is merged into
+      # megatron_cfg for inference workers before model setup runs.
+      max_model_len: ${policy.max_total_sequence_length}
+      transformer_impl: inference_optimized
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: block
+      activation_checkpointing: false
+      mamba_inference_ssm_states_dtype: float32
+      inference_moe_token_dispatcher_type: nccl  # Fall back to NCCL for now
+      inference_grouped_gemm_backend: vllm
+      moe_router_num_groups: null  # InferenceTopKRouter requires num_groups=None
+      moe_router_group_topk: null  # paired with moe_router_num_groups=null
+      pipeline_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: true
+      context_parallel_size: 1
+      tensor_model_parallel_size: 2
+      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes
+      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
+      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
+      enable_chunked_prefill: true
+      max_tokens: ${policy.max_total_sequence_length}
+      kv_cache_management_mode: persist  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: nvshmem  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
+      async_engine: true
+      expose_http_server: true
+      enable_prefix_caching: true
+      parsers:
+      - deepseek-r1-reasoning
+      - qwen3-coder-tool
+    vllm_cfg:
+
+      # NB: can re-enable prefix cache on vllm >= 0.11.2.
+      # enable_prefix_caching: false
+      async_engine: true
+      kv_cache_dtype: auto
+      precision: ${policy.precision}
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+
+      # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.backend=eager for better accuracy,
+      # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
+      # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+        chat_template: ${policy.tokenizer.chat_template}
+        chat_template_content_format: openai
+      load_format: auto
+
+      # Off for this configuration, matching the reference. Not the remedy for
+      # the MTP+bad_words cudagraph crash -- PIECEWISE above is.
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      logprobs_mode: raw_logprobs
+      env_vars:
+        NCCL_ALGO: Ring
+        NCCL_PROTO: Simple
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+        NRL_REFIT_NUM_BUFFERS: '1'
     vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+
       # FULL cudagraph replay reproduced CUDA illegal-instruction crashes with
       # SuperV3 MTP + bad_words upstream; PIECEWISE keeps cudagraph
       # acceleration while avoiding the captured full-forward replay path.
       compilation_config:
+
+        # when enforce_eager is False, set ++policy.generation.vllm_kwargs.compilation_config.backend=eager for better accuracy,
+        # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
+        # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
+        backend: eager
         cudagraph_mode: PIECEWISE
+
+      # Match the higher-throughput backend used by the earlier successful
+      # policy-serving runs. This must remain compatible with repeated refits.
+      moe_backend: flashinfer_cutlass
+      limit_mm_per_prompt:
+        image: 3
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 8480
+      max_num_seqs: 32
+      skip_mm_profiling: true
+      disable_custom_all_reduce: true
+      attention_backend: FLASH_ATTN
+      attention_config:
+        use_trtllm_attention: false
+
       # MTP speculative decoding. Only method and num_speculative_tokens are
       # set: this container's vLLM SpeculativeConfig has no attention_backend
       # field and rejects it, and the backend is already selected globally by
@@ -24,25 +374,126 @@ policy:
       speculative_config:
         method: mtp
         num_speculative_tokens: 5
+
       # Super is a hybrid Mamba model, so the recurrent SSM state must roll back
       # when draft tokens are rejected. MambaCacheMode defaults to "none";
       # "align" is what makes rejection correct for this model.
       mamba_cache_mode: align
       enable_chunked_prefill: true
-      max_num_batched_tokens: 8480
-    vllm_cfg:
-      # Off for this configuration, matching the reference. Not the remedy for
-      # the MTP+bad_words cudagraph crash -- PIECEWISE above is.
-      enable_prefix_caching: false
-checkpointing:
-  checkpoint_dir: results/nemotron-super-omni-async-gym-mtp-specdec
-  save_period: 5
+    colocated:
+
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: false
+
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: 8  # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: 8  # Decides number of nodes to be dedicated to generation
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+  is_vlm: true
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: /path/to/super-omni-gym-train.jsonl
+  validation:
+    data_path: /path/to/super-omni-gym-validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+
+  # true: skip expensive train_data_step*.jsonl; false: write full jsonl.
+  should_log_nemo_gym_responses: true
+
+  # false: ignore env mask_sample flags so the loss trains on every sample.
+  should_mask_flagged_samples: true
+  nemo_gym:
+
+    # Port range for Gym HTTP servers, kept below the OS ephemeral range
+    # (below the 9000 ephemeral floor on some GB200 nodes) and non-overlapping with NeMo
+    # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.
+    port_range_low: 5000
+    port_range_high: 5999
+
+    # Optional substrings/tags used to flag malformed assistant turns for advantage
+    # penalties (see grpo.invalid_tool_call_advantage / malformed_thinking_advantage).
+    # Omit to use the built-in defaults (DEFAULT_INVALID_TOOL_CALL_PATTERNS / DEFAULT_THINKING_TAGS).
+    # invalid_tool_call_patterns: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"]
+    # thinking_tags: ["<think>", "</think>"]
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
+    policy_max_input_tokens: ${policy.max_total_sequence_length}
+    skip_venv_if_present: true
+    pad_dynamic_image_shapes: true
+    sanitize_image_placeholders: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
 logger:
-  log_dir: logs/nemotron-super-omni-async-gym-mtp-specdec
+  log_dir: logs/nemotron-super-omni-async-gym-mtp-specdec  # Base directory for all logs
+  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false  # Disable MLflow logging
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  swanlab_enabled: false  # Disable SwanLab logging
   wandb:
+    project: grpo-superv3omni
     name: nemotron-super-omni-async-gym-mtp-specdec
+    log_nemo_gym_full_result_tables: false
+  tensorboard: {}
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: grpo-dev-logger
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
 # Repeated from the base recipe rather than inherited: super_launch.sh reads
 # cluster.num_nodes out of this file with awk and does not resolve `defaults:`.
 cluster:
+  gpus_per_node: 8
   num_nodes: 16
+  master_port_range_low: 1400
+  master_port_range_high: 1999
