@@ -682,6 +682,7 @@ class XtokenShardTestActor:
     def run_tp(self):
         from nemo_rl.algorithms.x_token.loss_utils import (
             project_student_to_teacher_vocab,
+            slice_sparse_projection_cols,
         )
         from nemo_rl.distributed.model_utils import (
             vocab_parallel_argmax,
@@ -731,6 +732,21 @@ class XtokenShardTestActor:
             )
             ref = (full_probs.reshape(-1, Vs) @ m.to_dense()).reshape(B, T, Vt)
             torch.testing.assert_close(proj, ref, rtol=1e-4, atol=1e-4)
+
+            # Column-slicing the projection must compose with the per-rank ROW
+            # slice that project_student_to_teacher_vocab does internally: the
+            # two act on different axes. _compute_p_kl relies on this to
+            # produce only the top-k teacher columns instead of all V_t.
+            cols = torch.tensor([1, 3, 5], device="cuda")
+            proj_sliced = project_student_to_teacher_vocab(
+                full_probs[:, :, sl].contiguous(),
+                slice_sparse_projection_cols(m, cols),
+                tp_group=tp,
+            )
+            torch.testing.assert_close(
+                proj_sliced, ref[..., cols], rtol=1e-4, atol=1e-4
+            )
+            assert proj_sliced.shape == (B, T, cols.numel())
             return {"success": True, "error": None}
         except Exception:
             return {"success": False, "error": traceback.format_exc()}
