@@ -101,6 +101,8 @@ for run_spec in "run1 1 1" "run2 2 2"; do
         'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
         'max(data["train/probs_ratio_clamped_max"]) < 1.29' \
         'max(data["train/token_mult_prob_error"]) < 1.05' \
+        'max(data["train/critic/loss"]) < 8.0' \
+        'min(data["train/critic/loss"]) >= 0' \
         "max(data[\"train/avg_trajectory_age\"]) <= ${expected_max_age}" \
         'len(data["validation/accuracy"]) == 1'
 done
