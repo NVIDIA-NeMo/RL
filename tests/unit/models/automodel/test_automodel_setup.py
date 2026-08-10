@@ -166,32 +166,6 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_with_vlm_is_allowed(
-        self,
-        mock_dynamo,
-        mock_resolve_class,
-        mock_autoconfig_class,
-        mock_config,
-        mock_autoconfig,
-    ):
-        """VLM CP is delegated to Automodel after configuration validation."""
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
-        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
-        mock_resolve_class.return_value = Mock
-
-        result = validate_and_prepare_config(
-            config=mock_config,
-            processor=MagicMock(),
-            rank=0,
-        )
-
-        assert isinstance(result, RuntimeConfig)
-        assert result.attn_impl == "sdpa"
-        mock_autoconfig_class.from_pretrained.assert_called_once()
-
-    @patch("nemo_rl.models.automodel.setup.AutoConfig")
-    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
-    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     @patch("nemo_rl.models.automodel.setup.NeMoAutoModelForSequenceClassification")
     def test_reward_model_bradley_terry(
         self,
@@ -1533,7 +1507,7 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
-    def test_setup_model_with_cp_allows_vlm(
+    def test_setup_model_with_cp_raises_for_vlm(
         self,
         mock_get_class,
         mock_get_rank,
@@ -1542,7 +1516,7 @@ class TestSetupModelAndOptimizer:
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
-        """Test that VLM context parallel setup is delegated to Automodel."""
+        """Test that context parallel with VLM raises AssertionError."""
         mock_get_rank.return_value = 0
         mock_fsdp2_config = MagicMock()
         mock_fsdp2_config.sequence_parallel = False
@@ -1563,18 +1537,17 @@ class TestSetupModelAndOptimizer:
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
 
-        result = setup_model_and_optimizer(
-            config=mock_config,
-            tokenizer=mock_tokenizer,
-            runtime_config=mock_runtime_config,
-            distributed_context=distributed_context,
-            checkpoint_manager=mock_checkpoint_manager,
-            is_vlm=True,
-            init_optimizer=False,
-        )
-
-        assert isinstance(result, ModelAndOptimizerState)
-        mock_runtime_config.model_class.from_pretrained.assert_called_once()
+        with pytest.raises(
+            AssertionError, match="Context parallel is yet not supported for VLM models"
+        ):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=mock_runtime_config,
+                distributed_context=distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+                is_vlm=True,
+            )
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")

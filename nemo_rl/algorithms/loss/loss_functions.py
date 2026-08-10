@@ -1621,7 +1621,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
         student_next_token_logprobs: Optional[torch.Tensor] = None,
-        student_next_token_mask: Optional[torch.Tensor] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1642,7 +1641,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             data,
             global_valid_toks,
             student_next_token_logprobs=student_next_token_logprobs,
-            student_next_token_mask=student_next_token_mask,
         )
 
         if self.kd_loss_mode == "sum":
@@ -2659,16 +2657,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
         *,
         student_next_token_logprobs: Optional[torch.Tensor] = None,
-        student_next_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers)."""
         if student_next_token_logprobs is not None:
-            assert student_next_token_mask is not None
-            label_mask = student_next_token_mask.to(
-                student_next_token_logprobs.dtype
-            ) * to_local_if_dtensor(data["sample_mask"]).to(
-                student_next_token_logprobs.device
-            ).unsqueeze(-1)
+            label_mask = ce_label_mask(
+                token_mask=data["token_mask"],
+                sample_mask=data["sample_mask"],
+                ce_seq_len=student_next_token_logprobs.shape[1],
+                dtype=student_next_token_logprobs.dtype,
+            ).to(student_next_token_logprobs.device)
             return masked_mean(
                 -student_next_token_logprobs,
                 label_mask,
