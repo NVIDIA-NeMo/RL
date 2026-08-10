@@ -580,6 +580,72 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_routed_experts_shard_dim(patch_logger)
+
+
+def _patch_vllm_routed_experts_shard_dim(logger) -> None:
+    """Fix MoE weight-refit sharding for grouped/3D experts (e.g. NemotronH).
+
+    vLLM's ``FusedMoE.weight_loader`` adds the leading-expert-dim offset (+1)
+    to ``shard_dim`` only when *loaded_weight* is 3D (``full_load``). During
+    NeMo-RL's in-memory weight refit ``expert_data`` can be 3D while
+    ``loaded_weight`` is 2D, so the +1 is skipped and ``shard_dim`` stays 0
+    (the expert dim). ``_get_hidden_dim`` then raises
+    ``ValueError: shard_dim=0 is not a valid data dimension for a 3D tensor``
+    and the collective refit aborts, so generation engines never receive
+    updated policy weights (rollouts stall, no training).
+
+    Derive the offset from ``expert_data``'s actual rank instead: its two data
+    dims are the last two, so ``shard_dim += expert_data.ndim - 2`` maps the
+    2D-convention shard dim (0/1) onto the real data dims. No-op for the normal
+    2D per-expert and 3D full-load cases; only corrects the grouped/3D case.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/routed_experts.py"
+        )
+    except RuntimeError:
+        logger.warning(
+            "Could not locate fused_moe/routed_experts.py for MoE refit "
+            "shard_dim patch (vLLM layout may have changed)."
+        )
+        return
+
+    old_snippet = (
+        "        full_load = len(loaded_weight.shape) == 3\n"
+        "        if full_load:\n"
+        "            shard_dim += 1\n"
+        "\n"
+        "        expert_data = param.data if full_load else param.data[expert_id]\n"
+    )
+    new_snippet = (
+        "        full_load = len(loaded_weight.shape) == 3\n"
+        "\n"
+        "        expert_data = param.data if full_load else param.data[expert_id]\n"
+        "        # NeMo-RL fix: derive the shard offset from expert_data's actual\n"
+        "        # rank so grouped/3D-expert refit (e.g. NemotronH MoE) shards a\n"
+        "        # valid data dim instead of the expert dim. No-op for the normal\n"
+        "        # 2D per-expert and 3D full-load cases.\n"
+        "        shard_dim += max(expert_data.ndim - 2, 0)\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "shard_dim += max(expert_data.ndim - 2, 0)" in content:
+            logger.info("MoE refit shard_dim patch already applied.")
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply MoE refit shard_dim patch: expected snippet "
+                "not found in %s. The vLLM version may have changed.",
+                file_to_patch,
+            )
+            return
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info(
+        "Successfully patched fused_moe routed_experts shard_dim for MoE refit."
+    )
 
 
 def _apply_vllm_patches(
@@ -634,3 +700,4 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_routed_experts_shard_dim(patch_logger)
