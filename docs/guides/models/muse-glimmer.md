@@ -5,7 +5,7 @@ built on the Onyx architecture. Use it to set up the environment, choose a start
 recipe, and understand the settings that are specific to this model.
 
 > [!IMPORTANT]
-> **Early access.** Muse Glimmer runs end-to-end in NeMo RL and short GRPO/DAPO runs
+> **Early access.** Muse Glimmer runs end-to-end in NeMo RL and short GRPO runs
 > have been numerically validated, but long-run convergence has not been established.
 > The AutoModel dependency is a private repository (see
 > [Build the Environment](#build-the-environment)), so this branch is not yet usable
@@ -109,14 +109,52 @@ whenever you move the vLLM checkout.
 > `causal-conv1d` and `nv-grouped-gemm` compile from source the first time. On a
 > shared filesystem that is pathologically slow: measured throughput on Lustre
 > was ~0.4 MB/s, against 257 packages in 16 s on node-local disk. Point
-> `UV_PROJECT_ENVIRONMENT` at local disk (or run inside a writable container,
-> where `/opt/ray_venvs` is already node-local) and keep `UV_CACHE_DIR` on the
-> shared filesystem so the built wheels persist across jobs. With a warm cache a
-> full 4-node rebuild plus two training steps takes about 15 minutes.
+> `NEMO_RL_VENV_DIR` at local disk and keep `UV_CACHE_DIR` on the shared
+> filesystem so the built wheels persist across jobs. Inside a writable
+> container there is nothing to do: the published images already set
+> `NEMO_RL_VENV_DIR=/opt/ray_venvs`, which is node-local. Do not reach for
+> `UV_PROJECT_ENVIRONMENT` — `create_local_venv` overwrites it unconditionally
+> (`nemo_rl/utils/venvs.py`), so setting it has no effect on where worker venvs
+> land. With a warm cache a full 4-node rebuild plus two training steps takes
+> about 15 minutes.
 >
 > Once a run has built the venvs, save the container so later jobs reuse them
 > instead of rebuilding — `_env_builder` early-returns when the venv's `python`
 > already exists, so a baked container skips this step entirely.
+
+#### Starting from a stock release container
+
+`NRL_FORCE_REBUILD_VENVS` only rebuilds the **worker** venvs. Two things about
+the container's own base environment have to line up first, and neither fails in
+a way that points at its own cause. Both were confirmed against
+`nemo-rl-0.7.0.sqsh`:
+
+- **The container's CPython must satisfy this branch's `requires-python`.** The
+  0.7.0 image ships 3.13.13; the branch requires `>=3.13.14`, and a compute node
+  cannot download one. `uv run` then dies with `No interpreter found for Python
+  3.13.14` before it does any venv work. The driver `srun` also passes
+  `--no-container-mount-home`, so uv cannot fall back to the host home's managed
+  installs. Stage the interpreter on the shared filesystem and point uv at it:
+
+  ```bash
+  export UV_PYTHON_INSTALL_DIR=/path/to/shared/uv-python   # holds cpython-3.13.14-linux-x86_64-gnu
+  ```
+
+- **Sync the base venv on every node before Ray starts.** `ray.sub` runs
+  `ray start` from the image's baked `/opt/nemo_rl_venv`, but the driver's
+  `uv run` re-syncs that same venv (it is `UV_PROJECT_ENVIRONMENT`) to this
+  branch's lock. If the branch moved Ray, `ray.init` then fails with
+  `Version mismatch: The cluster was started with Ray 2.55.1 / Python 3.13.13,
+  this process ... Ray 2.56.1 / Python 3.13.14`. `SETUP_COMMAND` runs on every
+  node before `ray start`, so sync there:
+
+  ```bash
+  SETUP_COMMAND="cd $PWD && uv sync --locked" \
+  CONTAINER=... MOUNTS=... sbatch ... ray.sub
+  ```
+
+A container built from this branch needs neither, because its baked base venv
+already matches the lock — which is the case the rest of this section assumes.
 
 > [!WARNING]
 > Keep the **policy** worker venv on whatever `nemo-automodel` pins for
@@ -134,61 +172,71 @@ directory:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.yaml \
-  policy.model_name=/your/path/to/muse-glimmer-29b \
-  policy.tokenizer.name=/your/path/to/muse-glimmer-29b
+  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml \
+  policy.model_name=/your/path/to/muse-glimmer-30b \
+  policy.tokenizer.name=/your/path/to/muse-glimmer-30b
 ```
 
 or edit `policy.model_name` and `policy.tokenizer.name` in the YAML directly.
 
 ## Example Recipes
 
-All three are DAPO on DAPO-Math-17K with AIME-2024 validation, AutoModel (DTensor)
-training with colocated vLLM generation. Recipe YAML files under
+Both are GRPO on DAPO-Math-17K with AIME-2024 validation, AutoModel (DTensor) training
+with colocated vLLM generation, on 4 nodes x 8 GPUs. Recipe YAML files under
 `examples/configs/recipes/` are the source of truth.
 
-| Seq | Nodes | CP | Tokens/rank | `max_new_tokens` | `gpu_memory_utilization` | Recipe |
-|---|---|---|---|---|---|---|
-| 4096 | 4 | 4 | 1024 | 2048 | 0.5 | [`…-29b-4n8g-fsdp2cp4-automodel-4k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp4-automodel-4k.yaml) |
-| 8192 | 4 | 8 | 1024 | 6144 | 0.5 | [`…-29b-4n8g-fsdp2cp8-automodel-8k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k.yaml) |
-| 16384 | 8 | 8 | 2048 | 14336 | 0.6 | [`…-29b-8n8g-fsdp2cp8-automodel-16k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.yaml) |
+| Seq | CP | Tokens/rank | `max_new_tokens` | Recipe |
+|---|---|---|---|---|
+| 6144 | 4 | 1536 | 4096 | [`…-30b-4n8g-fsdp2cp4-automodel-6k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml) |
+| 4096 | 1 | 4096 | 2048 | [`…-30b-4n8g-fsdp2-automodel-4k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml) |
+
+These are GRPO, not DAPO: no dynamic sampling, no overlong reward shaping, symmetric
+`ratio_clip` at 0.2, and sequence-level loss. The base config `grpo_math_1B.yaml`
+already defaults to all of that, so the recipes mostly just avoid overriding it —
+`loss_fn.token_level_loss: false` is the one value they state explicitly.
 
 > [!IMPORTANT]
-> `max_new_tokens` is `max_total_sequence_length - data.max_input_seq_length`
-> (2048), and `grpo.reward_shaping.max_response_length` matches it. Keep that
-> relationship if you change the sequence length. If `max_new_tokens` is larger
-> than the context leaves room for, vLLM silently caps generation per-sample at
-> `max_model_len - input_length`, so the effective budget varies with prompt
-> length and the longest prompts can be truncated *below* the overlong penalty
-> ramp `[max_response_length - overlong_buffer_length, max_response_length]` —
-> the DAPO penalty then never fires for exactly the samples it exists to shape.
-
-The 4k recipe additionally sets `grpo.overlong_filtering: true`, which zeroes the
-loss contribution of truncated rollouts rather than only docking their reward.
-That is a different objective from the other two; it exists because truncation at
-4k is high enough that penalising rather than dropping distorts training.
+> `max_new_tokens` is `max_total_sequence_length - data.max_input_seq_length` (2048).
+> Keep that relationship if you change the sequence length. If `max_new_tokens` is
+> larger than the context leaves room for, vLLM silently caps generation per-sample at
+> `max_model_len - input_length`, so the effective budget varies with prompt length
+> instead of being uniform.
 
 ## Choose a Recipe
 
-**Start with the 16k (cp8) recipe.** Context length is the single biggest quality
-lever for this model. Use 8k or 4k only when you do not have the GPU-hours: the
-throughput cost of 16k is real, roughly 8 steps/hour versus 25 at cp4/8k.
+**Start with the 6k (cp4) recipe.** It is better than the 4k variant on every measured
+axis — see [Reference Results](#reference-results): roughly 0.69 peak validation
+accuracy against 0.505, a `gen_kl_error` that stays flat instead of drifting upward,
+and entropy that recovers rather than collapsing.
+
+Use the 4k recipe when you want the shorter context or fewer moving parts. It runs
+without context parallelism, so there is no ring-attention communication and no
+per-CP-step `dq`/`dk`/`dv` copies — but it is the *tighter* of the two on memory, and
+it carries a caveat (below).
+
+> [!WARNING]
+> The 4k recipe's exact configuration has **not been run end to end**. The run its
+> curve comes from used the microbatch budget derived from the sequence length (4096
+> tokens/rank) and died of OOM at step 88. This recipe pins
+> `policy.dynamic_batching.train_mb_tokens: 2048`, which halves the dominant
+> allocation. The arithmetic is sound and gradient accumulation is exact, so the
+> optimization math is unchanged — but treat the fix as unverified until a clean run
+> confirms it. The 6k recipe has no such caveat.
 
 ### Why context length matters here
 
-Muse Glimmer produces long reasoning traces, and DAPO applies an overlong penalty to
-truncated rollouts. When the sequence budget binds, the policy learns to stop early
-rather than to reason better, and reward decouples from correctness.
-`train/truncation_rate` at step 5 falls **0.553 / 0.231 / 0.076** across the 4k / 8k /
-16k recipes — at 4k more than half of all rollouts are truncated.
+Muse Glimmer produces long reasoning traces. When the sequence budget binds, the policy
+learns to stop early rather than to reason better, and reward decouples from
+correctness. `train/truncation_rate` early in training runs around **0.6 at 4k** versus
+**0.34 at 6k**, and the accuracy gap follows.
 
 > [!NOTE]
 > Diagnose truncation pressure with `train/truncation_rate` and
-> `train/max_gen_tokens_per_sample`, **not** mean generation length. DAPO's overlong
-> penalty makes the mean generation length *fall* when the cap binds, which reads
-> like "the model does not need the tokens" and means the opposite.
+> `train/mean_gen_tokens_per_sample`, **not** mean generation length alone. When the cap
+> binds, mean generation length *falls*, which reads like "the model does not need the
+> tokens" and means the opposite.
 
-### Why the recipes run at 1024–2048 tokens per rank
+### Per-rank tokens are the memory budget
 
 The head is unusually memory-hungry: the vocabulary is 202048 entries and the final
 soft cap in AutoModel's Onyx `model.py` runs
@@ -197,22 +245,21 @@ soft cap in AutoModel's Onyx `model.py` runs
 logits = soft_cap * torch.tanh(logits.float() * multiplier / soft_cap)
 ```
 
-which materializes roughly four full-vocab fp32 tensors — about 4.67 GiB each at
-~6.2k tokens. Without context parallelism the training backward OOMs at both 8192 and
-16384, and **more nodes does not help**: under FSDP2 the per-GPU peak is set by tokens
-in the largest microbatch, a single sequence cannot be split across ranks, and
-sharding only shrinks parameters and optimizer state.
+which materializes roughly four full-vocab fp32 tensors. That is about **3.1 GB at 1024
+tokens** and **12.3 GB at 4096** — so per-rank token count, not parameter count, is what
+decides whether a configuration fits.
 
-Context parallelism is the lever that does work, because it splits a single sequence
-across ranks. But it is **not memory neutral**: Transformer Engine's ring-attention
-backward keeps per-CP-step `dq`/`dk`/`dv` buffers, roughly `cp_size` copies. `cp4` at
-16384 — 4096 tokens/rank, the same per-rank load that fits without CP — OOMs in
-`fused_attn_bwd`. Budget about **half** the per-rank tokens you would use at `cp=1`.
+Per-rank load is `max_total_sequence_length / cp_size`, independent of node count; the
+node count only sets how much data parallelism sits on top. Two ways to control it:
 
-In practice the published recipes run at **1024 tokens/rank at 4k and 8k** and
-**2048 at 16k**. Per-rank load is `max_total_sequence_length / cp_size` and is
-independent of node count; the node count sets how much data parallelism sits on
-top.
+- **Context parallelism** splits a single sequence across ranks, which FSDP2 cannot do.
+  It is **not memory neutral** — Transformer Engine's ring-attention backward keeps
+  roughly `cp_size` copies of `dq`/`dk`/`dv` — so budget about half the per-rank tokens
+  you would use at `cp=1`. This is how the 6k recipe reaches 1536 tokens/rank.
+- **`policy.dynamic_batching.train_mb_tokens`** caps tokens per microbatch directly. It
+  defaults to the sequence length, and lowering it is mathematically free: gradient
+  accumulation is exact, only the number of microbatches changes. This is how the 4k
+  recipe survives at `cp=1`.
 
 CP also constrains the rest of the config: it is rejected for VLMs and for sequence
 packing, and it forces `attn_implementation=sdpa`. The recipes already set
@@ -224,38 +271,37 @@ alone.
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 
-# 16k, CP8 -- recommended default
+# 6k, CP4 -- recommended default
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.yaml \
-  policy.model_name=/your/path/to/muse-glimmer-29b \
-  policy.tokenizer.name=/your/path/to/muse-glimmer-29b
+  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml \
+  policy.model_name=/your/path/to/muse-glimmer-30b \
+  policy.tokenizer.name=/your/path/to/muse-glimmer-30b
 
-# 8k, CP8 -- 4 nodes
+# 4k, no CP -- shorter context, tighter on memory
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k.yaml \
-  policy.model_name=/your/path/to/muse-glimmer-29b \
-  policy.tokenizer.name=/your/path/to/muse-glimmer-29b
-
-# 4k, CP4 -- low-memory fallback, and the only recipe with overlong filtering
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp4-automodel-4k.yaml \
-  policy.model_name=/your/path/to/muse-glimmer-29b \
-  policy.tokenizer.name=/your/path/to/muse-glimmer-29b
+  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml \
+  policy.model_name=/your/path/to/muse-glimmer-30b \
+  policy.tokenizer.name=/your/path/to/muse-glimmer-30b
 ```
 
 On Slurm, keep `cluster.num_nodes` in step with what you request from the scheduler.
 A mismatch wedges Ray placement rather than failing cleanly:
 
 ```bash
-uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=8
+uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=4
 ```
 
 ### Check the run is healthy before letting it run long
 
 `train/gen_kl_error` measures whether the policy and the generation stack agree on the
-same distribution. On a healthy run it sits around **5e-4** from step 1 and drifts
-only slowly. A value of **1 or more at step 1** means the very first refit disagreed:
-training is optimising against meaningless logprobs and will destroy the checkpoint.
+same distribution. On a healthy run it sits around **5e-4** from step 1. A value of
+**1 or more at step 1** means the very first refit disagreed: training is optimising
+against meaningless logprobs and will destroy the checkpoint.
+
+How it evolves is itself a signal. On the 6k recipe it stays flat near 5.5e-04 through
+70 steps; on the 4k recipe it climbs to 1.4e-03 over the same span as the policy moves
+further from the reference. Both are well under the 0.002 gate, but a rising trace is
+worth watching on long runs.
 
 Run 2 steps and read `train/gen_kl_error` after **any** container or dependency
 change. It takes minutes. A generation-only smoke test cannot catch this, because it
@@ -268,20 +314,62 @@ never exercises the policy path.
 
 ## Reference Results
 
-Smoke run on the released checkpoint, 4 nodes x 8 GPUs, the 4k CP2 recipe, 2 steps,
-worker venvs rebuilt from this branch:
+### Training curves
+
+Both runs use the released checkpoint on 4 nodes x 8 GPUs. Each curve covers roughly
+the first 70 steps of a 300-step target, so these are **partial runs**, not completed
+ones.
+
+**6k, CP4** — the recommended recipe.
+
+![Muse Glimmer 6k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_6k_grpo_curve.png)
+
+Validation accuracy rises from 0.42 to a peak near **0.69** by step 15 and holds
+0.63-0.67. `truncation_rate` falls from 0.34 to roughly 0.05-0.15. `gen_kl_error` is
+**flat** at ~5.5e-04 throughout. Entropy dips, then recovers to 0.68 around step 43
+before settling near 0.47 — the policy keeps exploring rather than collapsing.
+
+**4k, no CP** — shorter context.
+
+![Muse Glimmer 4k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_4k_grpo_curve.png)
+
+Validation accuracy rises from 0.22 to about **0.505** by step 55-60 and then flattens.
+`truncation_rate` starts near 0.6 — well above the 6k run — and settles around 0.15.
+`gen_kl_error` **climbs** from 5.5e-04 to 1.4e-03, and entropy falls monotonically from
+0.38 to 0.15.
+
+> [!NOTE]
+> The run behind the 4k curve is the one that OOM'd at step 88, which is why the
+> shipped 4k recipe pins `train_mb_tokens: 2048`. Everything else in that run matches
+> the recipe exactly.
+
+### Smoke-test fidelity
+
+Smoke run on the released checkpoint, 4 nodes x 8 GPUs, 2 steps, worker venvs rebuilt
+from this branch:
 
 | Metric | Value |
 | --- | --- |
 | `train/gen_kl_error` | 5.43e-04 |
 | `train/token_mult_prob_error` | 1.025 |
-| `train/truncation_rate` (4k) | 0.471 |
+| `train/truncation_rate` | 0.471 |
 
 `gen_kl_error` at 5.43e-04 is the number that matters: it says the policy and the
 generation stack agree, so training is optimising against meaningful logprobs.
 
-*Long-run training curves and validation accuracy will be added once a full run on
-the released checkpoint completes.*
+The same check against a **stock `nemo-rl-0.7.0` container** — no Muse Glimmer
+venvs baked in, every worker venv rebuilt from this branch's lock via
+`NRL_FORCE_REBUILD_VENVS=true` — reproduces it, 4 nodes x 8 GPUs, 2 steps:
+
+| Metric | Step 1 | Step 2 |
+| --- | --- | --- |
+| `train/gen_kl_error` | 4.99e-04 | 5.27e-04 |
+| `train/token_mult_prob_error` | 1.011 | 1.011 |
+| `train/truncation_rate` | 0.610 | 0.682 |
+
+End to end that job took 12 minutes on a warm `uv` cache, including the image
+import and the base-venv sync described in
+[Starting from a stock release container](#starting-from-a-stock-release-container).
 
 ## Known Issues
 

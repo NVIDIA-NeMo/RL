@@ -33,20 +33,22 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Thresholds anchored to standalone measurements on this checkpoint rather
-    # than copied from a sibling recipe:
+    # Thresholds anchored to measurements on this checkpoint rather than copied
+    # from a sibling recipe:
     #
     #   token_mult_prob_error - AutoModel (both te and sdpa) versus the vLLM
     #     teacher-forced baseline gave median |dlp| 6.086e-04, i.e. ~1.0006. The
     #     1.05 gate leaves ~80x headroom while still catching a real regression.
-    #   gen_kl_error - a DAPO-Math-17k rollout measured 5.543e-04 with NeMo-RL's
-    #     own k3 formula, so 0.002 is ~4x margin. This is the metric that
-    #     matters: values >= 1 mean the policy and generation stacks disagree
-    #     and training is optimising noise.
-    #   reward - gate the TREND, not the last step. DAPO reward is noisy enough
-    #     at this batch size that a single point says little; a
+    #   gen_kl_error - starts ~5.5e-04. It DRIFTS UPWARD as the policy leaves the
+    #     reference: the 4k reference run reached 1.4e-03 by step 70, so 0.002 is
+    #     only ~1.4x headroom over a long run, not the ~4x it looks like at step
+    #     20. Tighten at your peril; values >= 1 mean the policy and generation
+    #     stacks disagree outright and training is optimising noise.
+    #   reward - gate the TREND, not the last step. Reward is noisy enough at
+    #     this batch size that a single point says little; a
     #     `reward["20"] > 0.1` check failed on a run that plainly learned.
-    #     Compare the last five steps against the first five instead.
+    #     Compare the last five steps against the first five instead. The 6k
+    #     reference run went about +0.2 -> +0.6 over 70 steps.
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.05' \
         'mean(data["train/gen_kl_error"]) < 0.002' \

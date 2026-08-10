@@ -10,6 +10,5 @@ tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 # them. These recipes are exercised by hand; see
 # docs/guides/models/muse-glimmer.md. Move them into nightly.txt once the
 # checkpoint is downloadable.
-tests/test_suites/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp4-automodel-4k.sh
-tests/test_suites/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k.sh
-tests/test_suites/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.sh
+tests/test_suites/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.sh
+tests/test_suites/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.sh
