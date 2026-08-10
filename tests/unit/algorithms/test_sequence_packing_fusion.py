@@ -360,6 +360,7 @@ def _run_compare_sequence_packing_wrappers_with_sampling(
     )
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "cp_tp",
     [
@@ -391,6 +392,7 @@ def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
     distributed_test_runner(test_fn, world_size=world_size)
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "cp_tp",
     [

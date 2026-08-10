@@ -11,6 +11,9 @@ generation:
   temperature: 0.0
   top_p: 1.0
   top_k: -1
+  val_temperature: ${.temperature}
+  val_top_p: ${.top_p}
+  val_top_k: ${.top_k}
   num_prompts_per_step: -1
   model_name: "Qwen/Qwen2.5-Omni-3B"
   stop_token_ids: null

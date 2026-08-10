@@ -47,7 +47,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 2
+  val_num_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
@@ -305,6 +305,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
