@@ -17,9 +17,9 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Iterator, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -2306,6 +2306,43 @@ def _apply_configured_message_level_advantage_penalties(
     )
 
 
+@contextmanager
+def _profile_sync_vllm_rollout(
+    policy_generation: GenerationInterface,
+    *,
+    step_id: int | str,
+) -> Iterator[None]:
+    """Drive an optional profiler around one complete synchronous rollout."""
+    if not isinstance(policy_generation, VllmGeneration):
+        yield
+        return
+    if not policy_generation.rollout_profiler_enabled:
+        yield
+        return
+
+    if not policy_generation.begin_rollout_profile(step_id=step_id):
+        raise RuntimeError("Failed to begin rollout profiling on every worker")
+    try:
+        yield
+    except BaseException as rollout_error:
+        try:
+            profiler_aborted = policy_generation.abort_rollout_profile(
+                reason="grpo_rollout_error"
+            )
+        except Exception as profiler_error:
+            rollout_error.add_note(
+                f"Rollout profiler abort also failed: {profiler_error!r}"
+            )
+        else:
+            if not profiler_aborted:
+                rollout_error.add_note(
+                    "Rollout profiler abort did not succeed on every worker"
+                )
+        raise
+    if not policy_generation.finish_rollout_profile():
+        raise RuntimeError("Failed to finish rollout profiling on every worker")
+
+
 def _preserve_router_replay_routed_experts(
     target: BatchedDataDict,
     flat_messages: BatchedDataDict,
@@ -3144,6 +3181,13 @@ def grpo_train(
                         **{
                             "rl.num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
                         },
+                    ),
+                    _profile_sync_vllm_rollout(
+                        policy_generation,
+                        step_id=(
+                            f"step{total_steps + 1}/attempt"
+                            f"{dynamic_sampling_num_gen_batches}"
+                        ),
                     ),
                 ):
                     # Clear logger metrics for each generation step
