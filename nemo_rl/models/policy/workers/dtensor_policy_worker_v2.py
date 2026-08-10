@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import gc
+import os
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
 
 import ray
 import torch
+import torch.distributed as dist
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
@@ -26,7 +28,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -94,6 +96,76 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
+_MERGED_EXPERT_PARAM_SUFFIXES = (
+    ".mlp.experts.gate_and_up_projs",
+    ".mlp.experts.down_projs",
+)
+
+
+def _is_ep_sharded_merged_expert(name: str, tensor: torch.Tensor) -> bool:
+    """Return whether an adapter can split this DTensor before EP gathering."""
+    if not isinstance(tensor, DTensor) or not name.endswith(
+        _MERGED_EXPERT_PARAM_SUFFIXES
+    ):
+        return False
+
+    mesh_dim_names = tensor.device_mesh.mesh_dim_names
+    if "ep" not in mesh_dim_names:
+        return False
+    ep_dim = mesh_dim_names.index("ep")
+    placement = tensor.placements[ep_dim]
+    return isinstance(placement, Shard) and placement.dim == 0
+
+
+def _iter_ep_sharded_expert_tensors(
+    model: nn.Module,
+    name: str,
+    tensor: DTensor,
+    target_dtype: torch.dtype,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Gather one expert at a time instead of materializing the merged tensor.
+
+    AutoModel's MoE state-dict adapters can split an EP-sharded merged expert
+    DTensor using only its local shard. Each policy rank still has to stream all
+    experts to its colocated rollout worker, so gather corresponding local
+    experts across the EP group one at a time. This preserves the refit manifest
+    while avoiding a full merged tensor whose peak size is 16 GiB for DSV4.
+    """
+    local_tensors = _maybe_adapt_tensor_to_hf(model, name, tensor)
+    ep_mesh = tensor.device_mesh["ep"]
+    ep_group = ep_mesh.get_group()
+    ep_size = ep_mesh.size()
+    for local_name, local_tensor in local_tensors:
+        if isinstance(local_tensor, DTensor):
+            local_tensor = local_tensor.full_tensor()
+        local_tensor = local_tensor.to(target_dtype, non_blocking=True).contiguous()
+
+        gathered_names: list[Optional[str]] = [None] * ep_size
+        dist.all_gather_object(gathered_names, local_name, group=ep_group)
+
+        gathered_shape = (ep_size * local_tensor.shape[0], *local_tensor.shape[1:])
+        gathered_tensor = torch.empty(
+            gathered_shape,
+            dtype=local_tensor.dtype,
+            device=local_tensor.device,
+        )
+        dist.all_gather_into_tensor(
+            gathered_tensor,
+            local_tensor,
+            group=ep_group,
+        )
+
+        for gathered_name, expert_tensor in zip(
+            gathered_names, gathered_tensor.chunk(ep_size, dim=0)
+        ):
+            if gathered_name is None:
+                raise RuntimeError("EP expert refit gathered an empty parameter name")
+            yield gathered_name, expert_tensor
+
+        del gathered_tensor
+        del local_tensor
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -111,6 +183,14 @@ def dtensor_params_generator(
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            continue
+        if _is_ep_sharded_merged_expert(name, tensor):
+            yield from _iter_ep_sharded_expert_tensors(
+                model,
+                name,
+                tensor,
+                target_dtype,
+            )
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
@@ -301,7 +381,13 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                "is_async": True,
+                # Automodel's process-based async DCP cannot serialize the
+                # HF-adapted DeepSeek-V4 DTensor/view state. A failed upload also
+                # retains the staged CUDA state across training steps, which
+                # exhausts the memory needed for the next colocated refit. Keep
+                # Automodel checkpointing synchronous until its process stager
+                # supports these adapted state dicts.
+                "is_async": False,
             },
         )
 
@@ -378,6 +464,79 @@ class DTensorPolicyWorkerV2Impl(
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
+
+    def _maybe_offload_optimizer_for_train(self, eval_mode: bool) -> bool:
+        """Offload optimizer state while train forward/backward is in flight."""
+        should_offload = (
+            os.environ.get("NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN", "0") == "1"
+            and not eval_mode
+            and not self.cpu_offload
+            and self.optimizer is not None
+        )
+        if should_offload:
+            self.move_optimizer_to_device("cpu")
+        return should_offload
+
+    def _optimizer_state_is_cuda(self) -> bool:
+        """Return whether any resident optimizer state tensor is on CUDA."""
+        if self.optimizer is None:
+            return False
+
+        for state in self.optimizer.state.values():
+            for value in state.values():
+                if isinstance(value, DTensor):
+                    if value.to_local().device.type == "cuda":
+                        return True
+                elif isinstance(value, torch.Tensor) and value.device.type == "cuda":
+                    return True
+        return False
+
+    @contextmanager
+    def _temporarily_offload_optimizer_for_checkpoint(
+        self, optimizer_path: Optional[str]
+    ) -> Generator[None, None, None]:
+        """Keep FusedAdam state-dict conversion off GPU during checkpointing.
+
+        Transformer Engine materializes unscaled FP32 optimizer states inside
+        ``FusedAdam.state_dict()``. For large models this transient copy can OOM
+        even though training itself fits. Moving the resident state to CPU frees
+        checkpoint headroom; the instance patch installed by Automodel setup also
+        moves every converted state back to CPU immediately instead of retaining
+        the full checkpoint representation on CUDA. Restore the original CUDA
+        residency after the checkpoint manager finishes.
+        """
+        if optimizer_path is None or self.optimizer is None:
+            yield
+            return
+
+        restore_cuda = not self.cpu_offload and self._optimizer_state_is_cuda()
+        if restore_cuda:
+            self.move_optimizer_to_device("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Enable the CPU-safe FusedAdam state_dict even when the optimizer was
+        # already offloaded by the refit path. TE otherwise wraps each CPU local
+        # state back onto the parameter's CUDA mesh and accumulates the full
+        # unscaled checkpoint representation on-device.
+        had_checkpoint_flag = hasattr(
+            self.optimizer, "_nemo_rl_cpu_checkpoint_state_dict"
+        )
+        previous_checkpoint_flag = getattr(
+            self.optimizer, "_nemo_rl_cpu_checkpoint_state_dict", False
+        )
+        self.optimizer._nemo_rl_cpu_checkpoint_state_dict = True
+        try:
+            yield
+        finally:
+            if had_checkpoint_flag:
+                self.optimizer._nemo_rl_cpu_checkpoint_state_dict = (
+                    previous_checkpoint_flag
+                )
+            else:
+                del self.optimizer._nemo_rl_cpu_checkpoint_state_dict
+            if restore_cuda:
+                self.move_optimizer_to_device("cuda")
 
     def _autocast_context(self) -> AbstractContextManager[Any]:
         """Return the worker-owned precision context for one microbatch."""
@@ -470,6 +629,13 @@ class DTensorPolicyWorkerV2Impl(
 
                 self.optimizer.zero_grad()
 
+                # Step 1 has no optimizer state yet, so this is initially a no-op.
+                # On later steps, keep the resident state on CPU while FSDP
+                # all-gathers parameters and forward/backward materializes its
+                # temporary buffers. The state is restored immediately before the
+                # update, after FSDP has resharded the model.
+                offload_opt_train = self._maybe_offload_optimizer_for_train(eval_mode)
+
                 # Get microbatch iterator based on batching strategy
                 processed_iterator, iterator_len = get_microbatch_iterator(
                     batch,
@@ -537,6 +703,9 @@ class DTensorPolicyWorkerV2Impl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
                     warn_if_inf_grad_norm(grad_norm)
+
+                    if offload_opt_train:
+                        self.move_optimizer_to_device("cuda")
 
                     # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
@@ -1350,18 +1519,19 @@ class DTensorPolicyWorkerV2Impl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
-        self.checkpoint_manager.save_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
-            tokenizer=self.tokenizer if tokenizer_path else None,
-            tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
-            lora_enabled=self.lora_enabled,
-            peft_config=self.peft_config,
-        )
+        with self._temporarily_offload_optimizer_for_checkpoint(optimizer_path):
+            self.checkpoint_manager.save_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+                lora_enabled=self.lora_enabled,
+                peft_config=self.peft_config,
+            )
 
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
