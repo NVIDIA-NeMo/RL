@@ -14,8 +14,8 @@ grpo:
     target_min: -1.0
   reward_shaping:
     enabled: true
-    overlong_buffer_length: 384
-    max_response_length: 3072
+    overlong_buffer_length: 512
+    max_response_length: 6144
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
@@ -24,8 +24,10 @@ loss_fn:
   ratio_clip_max: 0.28
   ratio_clip_c: 10
 checkpointing:
-  checkpoint_dir: results/dapo-muse-glimmer-29b-8n8g-fsdp2cp2-automodel-4k
-  save_period: 5
+  checkpoint_dir: results/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k
+  save_period: 10
+  # 423 GB per checkpoint; keep fewer than the default 3.
+  keep_top_k: 2
   # Asynchronous checkpointing. Stated explicitly rather than left to the worker
   # default, because the value is load-bearing and easy to get wrong in both
   # directions.
@@ -52,7 +54,7 @@ policy:
     name: /path/to/muse-glimmer-29b
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  # 4096 with context_parallel_size=2, i.e. 2048 tokens per rank.
+  # 8192 with context_parallel_size=8, i.e. 1024 tokens per rank.
   #
   # The head is unusually memory-hungry: vocab is 202048 and the final soft cap
   # in Automodel's Onyx model.py runs
@@ -66,13 +68,10 @@ policy:
   # Context parallelism is the lever that does work, but it is not memory
   # neutral: Transformer Engine's ring-attention backward keeps per-CP-step
   # dq/dk/dv buffers, roughly cp_size copies. Budget about half the per-rank
-  # tokens you would use at cp=1. All three published recipes sit at 2048
-  # tokens/rank for that reason.
-  #
-  # This is the low-memory variant. 16k (cp8) gives markedly better validation
-  # accuracy because far fewer rollouts are truncated; prefer it when the GPUs
-  # are available.
-  max_total_sequence_length: 4096
+  # tokens you would use at cp=1 -- cp4 at 16384 (4096 tokens/rank, the load
+  # that fits without CP) OOMs in fused_attn_bwd. The published recipes run
+  # 1024 tokens/rank at 4k and 8k, and 2048 at 16k.
+  max_total_sequence_length: 8192
   logprob_chunk_size: 4096
   offload_optimizer_for_logprob: true
   optimizer:
@@ -101,7 +100,7 @@ policy:
     # Splits a single sequence across ranks, which FSDP2 cannot do. Rejected for
     # VLMs and for sequence packing, and forces attn_implementation=sdpa (which
     # this recipe already sets).
-    context_parallel_size: 2
+    context_parallel_size: 8
     automodel_kwargs:
       # Onyx's native Automodel implementation accepts backend.attn of te, sdpa
       # or eager only. Mirrors Automodel's own
@@ -128,14 +127,14 @@ policy:
   # sequence packing is off and dynamic batching is on.
   make_sequence_length_divisible_by: 1
   generation:
-    max_new_tokens: 3072
+    max_new_tokens: 6144
     vllm_cfg:
       # TP4 is validated for this checkpoint. Onyx has 2 KV heads, and vLLM's
       # OnyxAttention allows tp_size % num_kv_heads == 0 (replicating KV heads),
       # so TP4 is legal even though 4 does not divide 2.
       tensor_parallel_size: 4
-      # 0.5: at 4096 the KV cache is small, and leaving headroom matters more
-      # since the training backward is what OOMs.
+      # 0.5: leaving headroom matters more than KV-cache size, since the
+      # training backward is what OOMs.
       gpu_memory_utilization: 0.5
     vllm_kwargs:
       # The Muse Glimmer vLLM build is text-only; it warns and skips the vision
@@ -154,12 +153,12 @@ env:
     num_workers: 16
     math_verify_impl: dapo_math_verify
 logger:
-  log_dir: logs/dapo-muse-glimmer-29b-8n8g-fsdp2cp2-automodel-4k
+  log_dir: logs/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: dapo-muse-glimmer-29b-8n8g-fsdp2cp2-automodel-4k
+    name: dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k
 cluster:
   gpus_per_node: 8
-  num_nodes: 8
+  num_nodes: 4

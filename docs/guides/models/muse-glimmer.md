@@ -143,16 +143,30 @@ or edit `policy.model_name` and `policy.tokenizer.name` in the YAML directly.
 
 ## Example Recipes
 
-All three are DAPO on DAPO-Math-17K with AIME-2024 validation, 8 nodes x 8 GPUs,
-AutoModel (DTensor) training with colocated vLLM generation. They differ only in
-sequence length and context-parallel degree. Recipe YAML files under
+All three are DAPO on DAPO-Math-17K with AIME-2024 validation, AutoModel (DTensor)
+training with colocated vLLM generation. Recipe YAML files under
 `examples/configs/recipes/` are the source of truth.
 
-| Sequence length | CP | Tokens/rank | vLLM `gpu_memory_utilization` | Recipe |
-|---|---|---|---|---|
-| 4096 | 2 | 2048 | 0.5 | [`dapo-muse-glimmer-29b-8n8g-fsdp2cp2-automodel-4k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp2-automodel-4k.yaml) |
-| 8192 | 4 | 2048 | 0.5 | [`dapo-muse-glimmer-29b-8n8g-fsdp2cp4-automodel-8k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp4-automodel-8k.yaml) |
-| 16384 | 8 | 2048 | 0.6 | [`dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.yaml) |
+| Seq | Nodes | CP | Tokens/rank | `max_new_tokens` | `gpu_memory_utilization` | Recipe |
+|---|---|---|---|---|---|---|
+| 4096 | 4 | 4 | 1024 | 2048 | 0.5 | [`…-29b-4n8g-fsdp2cp4-automodel-4k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp4-automodel-4k.yaml) |
+| 8192 | 4 | 8 | 1024 | 6144 | 0.5 | [`…-29b-4n8g-fsdp2cp8-automodel-8k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k.yaml) |
+| 16384 | 8 | 8 | 2048 | 14336 | 0.6 | [`…-29b-8n8g-fsdp2cp8-automodel-16k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp8-automodel-16k.yaml) |
+
+> [!IMPORTANT]
+> `max_new_tokens` is `max_total_sequence_length - data.max_input_seq_length`
+> (2048), and `grpo.reward_shaping.max_response_length` matches it. Keep that
+> relationship if you change the sequence length. If `max_new_tokens` is larger
+> than the context leaves room for, vLLM silently caps generation per-sample at
+> `max_model_len - input_length`, so the effective budget varies with prompt
+> length and the longest prompts can be truncated *below* the overlong penalty
+> ramp `[max_response_length - overlong_buffer_length, max_response_length]` —
+> the DAPO penalty then never fires for exactly the samples it exists to shape.
+
+The 4k recipe additionally sets `grpo.overlong_filtering: true`, which zeroes the
+loss contribution of truncated rollouts rather than only docking their reward.
+That is a different objective from the other two; it exists because truncation at
+4k is high enough that penalising rather than dropping distorts training.
 
 ## Choose a Recipe
 
@@ -174,7 +188,7 @@ rather than to reason better, and reward decouples from correctness.
 > penalty makes the mean generation length *fall* when the cap binds, which reads
 > like "the model does not need the tokens" and means the opposite.
 
-### Why every recipe sits at 2048 tokens per rank
+### Why the recipes run at 1024–2048 tokens per rank
 
 The head is unusually memory-hungry: the vocabulary is 202048 entries and the final
 soft cap in AutoModel's Onyx `model.py` runs
@@ -195,6 +209,11 @@ backward keeps per-CP-step `dq`/`dk`/`dv` buffers, roughly `cp_size` copies. `cp
 16384 — 4096 tokens/rank, the same per-rank load that fits without CP — OOMs in
 `fused_attn_bwd`. Budget about **half** the per-rank tokens you would use at `cp=1`.
 
+In practice the published recipes run at **1024 tokens/rank at 4k and 8k** and
+**2048 at 16k**. Per-rank load is `max_total_sequence_length / cp_size` and is
+independent of node count; the node count sets how much data parallelism sits on
+top.
+
 CP also constrains the rest of the config: it is rejected for VLMs and for sequence
 packing, and it forces `attn_implementation=sdpa`. The recipes already set
 `policy.sequence_packing.enabled: false` and `attn_implementation: sdpa`; leave both
@@ -211,15 +230,15 @@ uv run examples/run_grpo.py \
   policy.model_name=/your/path/to/muse-glimmer-29b \
   policy.tokenizer.name=/your/path/to/muse-glimmer-29b
 
-# 8k, CP4
+# 8k, CP8 -- 4 nodes
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp4-automodel-8k.yaml \
+  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp8-automodel-8k.yaml \
   policy.model_name=/your/path/to/muse-glimmer-29b \
   policy.tokenizer.name=/your/path/to/muse-glimmer-29b
 
-# 4k, CP2 -- low-memory fallback
+# 4k, CP4 -- low-memory fallback, and the only recipe with overlong filtering
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-8n8g-fsdp2cp2-automodel-4k.yaml \
+  --config examples/configs/recipes/llm/dapo-muse-glimmer-29b-4n8g-fsdp2cp4-automodel-4k.yaml \
   policy.model_name=/your/path/to/muse-glimmer-29b \
   policy.tokenizer.name=/your/path/to/muse-glimmer-29b
 ```
