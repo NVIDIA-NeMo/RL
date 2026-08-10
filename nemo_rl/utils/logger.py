@@ -1083,6 +1083,21 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_metrics(metrics_to_log, step, prefix, step_metric, step_finished)
 
+    def define_metric(
+        self,
+        name: str,
+        *,
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Define a W&B metric series without affecting other backends.
+
+        TensorBoard and MLflow maintain independent steps per metric key, while
+        W&B needs an explicit custom step metric for event streams that advance
+        independently from the trainer step.
+        """
+        if self.wandb_logger is not None:
+            self.wandb_logger.define_metric(name, step_metric=step_metric)
+
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
 
