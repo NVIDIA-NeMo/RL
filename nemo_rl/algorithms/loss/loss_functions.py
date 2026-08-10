@@ -42,7 +42,6 @@ from nemo_rl.distributed.model_utils import (
     DistributedCrossEntropy,
     cp_shift_next,
     group_all_reduce_sum,
-    group_all_reduce_sum_with_grad,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
@@ -1636,7 +1635,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the Automodel CP path also supplies its sequence-local CE inputs.
+        the Automodel CP path also supplies its canonical full-sequence CE inputs.
         """
         ce_loss = self._compute_ce(
             logits,
@@ -1644,7 +1643,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             global_valid_toks,
             student_next_token_logprobs=student_next_token_logprobs,
             student_next_token_mask=student_next_token_mask,
-            cp_group=cp_group,
         )
 
         if self.kd_loss_mode == "sum":
@@ -2662,7 +2660,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         *,
         student_next_token_logprobs: Optional[torch.Tensor] = None,
         student_next_token_mask: Optional[torch.Tensor] = None,
-        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers)."""
         if student_next_token_logprobs is not None:
@@ -2672,16 +2669,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             ) * to_local_if_dtensor(data["sample_mask"]).to(
                 student_next_token_logprobs.device
             ).unsqueeze(-1)
-            local_ce = masked_mean(
+            return masked_mean(
                 -student_next_token_logprobs,
                 label_mask,
                 global_normalization_factor=global_valid_toks,
             )
-            # Each CP rank owns one contiguous CE window. Sum the normalized
-            # windows so every rank uses the same CE value (and therefore the
-            # same dynamic KD scale), while identity backward preserves the
-            # partitioned-loss gradient fanout of one.
-            return group_all_reduce_sum_with_grad(local_ce, cp_group)
 
         per_token_ce = student_next_token_ce(
             logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
