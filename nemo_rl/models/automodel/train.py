@@ -1049,7 +1049,16 @@ class FullLogitsPostProcessor:
             full = cp_sharder.gather_token_tensor(
                 logits, seq_dim=sequence_dim, trim=True
             )
-            local_len = full.shape[sequence_dim] // self.cp_size
+            full_seq_len = full.shape[sequence_dim]
+            if full_seq_len % self.cp_size != 0:
+                raise ValueError(
+                    "X-token teacher sequence length must be divisible by the "
+                    "teacher context parallel size, but got "
+                    f"sequence_length={full_seq_len}, cp_size={self.cp_size}. "
+                    "Set the teacher's make_sequence_length_divisible_by to a "
+                    "multiple of its dtensor_cfg.context_parallel_size."
+                )
+            local_len = full_seq_len // self.cp_size
             cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
             logits = full.narrow(
                 sequence_dim, cp_rank * local_len, local_len
