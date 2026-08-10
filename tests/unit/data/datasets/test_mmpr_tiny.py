@@ -194,7 +194,7 @@ _TEST_PROMPT_TEMPLATE = (
 )
 
 
-def _run_processor(tiny_image_path):
+def _run_processor(tiny_image_path, processor=None):
     """Helper: run vlm_hf_data_processor on an MMPR sample and return
     (result DatumSpec, stub processor with captured_call_text)."""
     from nemo_rl.data.interfaces import TaskDataSpec
@@ -202,7 +202,7 @@ def _run_processor(tiny_image_path):
 
     task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
     task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
-    processor = _make_stub_nemotron_processor()
+    processor = processor or _make_stub_nemotron_processor()
     sample = {
         "images": [tiny_image_path],
         "question": _RAW_QUESTION,
@@ -238,6 +238,20 @@ class TestVLMProcessorMMPRTiny:
         assert result["task_name"] == "mmpr-tiny"
         user_message = result["message_log"][0]
         assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
+        assert user_message["pixel_values"].pad_to_max_shape is True
+        assert user_message["pixel_values"].as_tensor().dtype == torch.float32
+
+    def test_conversation_preprocessor_is_preserved(self, tiny_image_path):
+        processor = _make_stub_nemotron_processor()
+        processor.conversation_preprocessor = MagicMock(
+            return_value={"role": "user", "content": "preprocessed"}
+        )
+
+        result, _ = _run_processor(tiny_image_path, processor=processor)
+
+        processor.conversation_preprocessor.assert_called_once()
+        assert result["vllm_content"] == "preprocessed"
+        assert processor.captured_call_text == "preprocessed"
 
     def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
         from nemo_rl.data.interfaces import TaskDataSpec

@@ -45,6 +45,13 @@ DEFAULT_MEDIA_EXTENSIONS = {
     "audio": ["wav", "flac", "mp3"],
 }
 
+_PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
+    {
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    }
+)
+
 
 # different media namings maybe used in the raw dataset,
 # in which case, they need to be mapped to the allowed ones
@@ -65,6 +72,19 @@ MEDIA_TAG_PATTERN = re.compile(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def uses_image_placeholder(processor: Any) -> bool:
+    """Return whether a processor requires explicit image placeholders.
+
+    Args:
+        processor: Multimodal processor to classify.
+
+    Returns:
+        Whether the processor expands image placeholders through ``__call__``
+        rather than tokenized ``apply_chat_template``.
+    """
+    return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
 
 
 class PackedTensor:
@@ -376,9 +396,77 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         header, encoded = image_path_or_image.split(",", 1)
         image_data = base64.b64decode(encoded)
         return Image.open(BytesIO(image_data)).convert("RGB")
+    elif image_path_or_image.startswith("file://"):
+        return Image.open(image_path_or_image.removeprefix("file://")).convert("RGB")
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
+
+
+def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
+    """Encode a PIL Image as a base64 ``data:`` URL.
+
+    Args:
+        image: PIL image to encode.
+        fmt: PIL image format used for serialization (e.g. ``"PNG"``, ``"JPEG"``).
+            The value is also lowercased and embedded in the MIME type of the
+            returned URL.
+
+    Returns:
+        A ``data:image/<fmt>;base64,<payload>`` URL suitable for embedding in
+        an OpenAI Responses ``input_image`` content part.
+    """
+    buf = BytesIO()
+    image.save(buf, format=fmt)
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/{fmt.lower()};base64,{encoded}"
+
+
+def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
+    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+
+    Walks each example's ``responses_create_params.input[].content[]`` items
+    and rewrites any ``input_image`` part whose ``image_url`` is a local path
+    (or ``file://`` URL) into a base64 ``data:`` URL via
+    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
+    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
+    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
+    without raising.
+
+    The examples are mutated in place; the same list is also returned for
+    convenience so callers can chain the call.
+
+    Args:
+        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
+            expected to contain a ``responses_create_params`` mapping with an
+            ``input`` list of Responses API messages.
+
+    Returns:
+        The same ``nemo_gym_examples`` list, with local image references
+        rewritten to base64 data URLs in place.
+    """
+    for example in nemo_gym_examples:
+        input_items = example.get("responses_create_params", {}).get("input", [])
+        if not isinstance(input_items, list):
+            continue
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "input_image":
+                    continue
+                url = part.get("image_url", "")
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if not isinstance(url, str) or not url:
+                    continue
+                if url.startswith(("http://", "https://", "data:")):
+                    continue
+                part["image_url"] = image_to_data_url(resolve_to_image(url))
+    return nemo_gym_examples
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
