@@ -182,8 +182,6 @@ policy:
     moe_permute_fusion: true
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
-    moe_flex_dispatcher_backend: "alltoall"
-    moe_hybridep_num_sms: 32
     moe_aux_loss_coeff: 0.0
     moe_shared_expert_overlap: false
 
@@ -437,10 +435,13 @@ env:
 
     # The internal Gym revision used by the baseline supplied these variants
     # from vllm_model_for_training.yaml. Define them here because the public Gym
-    # revision used by this branch only defines the base policy model.
+    # revision used by this branch only defines the base policy model. Do not
+    # add num_groups_nemo_rl: public Gym neither defines nor consumes it.
     policy_model:
       responses_api_models:
         vllm_model:
+          # Parallelize the HTTP/JSON proxy path for the large rollout fanout.
+          num_workers: 16
           chat_template_kwargs:
             enable_thinking: true
             truncate_history_thinking: false
@@ -449,6 +450,7 @@ env:
       _copy: policy_model
       responses_api_models:
         vllm_model:
+          num_workers: 4
           chat_template_kwargs:
             enable_thinking: false
 

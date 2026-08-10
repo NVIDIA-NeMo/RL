@@ -840,8 +840,6 @@ def _run_lightning_launcher(**overrides):
     )
     with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
         root = Path(temp_dir)
-        parser = root / "ultra_v3_reasoning_parser.py"
-        parser.touch()
         gym_source = root / "Gym"
         gym_actor = (
             gym_source
@@ -859,7 +857,6 @@ def _run_lightning_launcher(**overrides):
             "TRAIN_PATH": str(root / "train.jsonl"),
             "VAL_PATH": str(root / "validation.jsonl"),
             "GENRM_MODEL": "test-genrm-model",
-            "GENRM_REASONING_PARSER": str(parser),
             "NL2BASH_JUDGE_MODEL": "test-nl2bash-model",
             "SAFETY_JUDGE_MODEL": "test-safety-model",
             "CONTAINER": "test-container",
@@ -892,7 +889,8 @@ def test_lightning_launcher_dry_run_builds_reference_external_pool_topology():
     assert "NL2Bash:  4 independent TP=4, DP=1 servers" in result.stdout
     assert "base_url=__GENRM_BASE_URL__" in result.stdout
     assert "base_url=__NL2BASH_BASE_URL__" in result.stdout
-    assert "--reasoning-parser\n  ultra_v3" in result.stdout
+    assert "--reasoning-parser\n  nemotron_v3" in result.stdout
+    assert "--reasoning-parser-plugin" not in result.stdout
     assert "--attention-backend\n  TRITON_ATTN" in result.stdout
     assert result.stdout.count("--enable-expert-parallel") == 2
 

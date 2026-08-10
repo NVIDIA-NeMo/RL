@@ -198,6 +198,16 @@ persistent compile caches, container mounts, external vLLM services, and
 run-specific paths. Training hyperparameters and parallelism remain in
 `rlvr.yaml` and the launcher defaults.
 
+Optional knobs:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WALLTIME` | `4:00:00` | Slurm `--time` |
+| `NUM_TRAIN_NODES`, `NUM_GEN_NODES`, `NUM_GYM_NODES` | `32`, `32`, `2` | Training, policy-generation, and in-cluster Gym node counts |
+| `NRL_MAX_STEPS` | _from YAML_ | Override `grpo.max_num_steps` |
+| `WANDB_PROJ` | `nemotron-3.5-lightning` | W&B project name |
+| `DRY_RUN` | `0` | Set to `1` to print the resolved training command without submitting |
+
 ## Launch RLVR
 
 The following command launches the complete 86-node reference topology. Run it
@@ -212,13 +222,13 @@ MODEL_PATH=$SHARED_ROOT/models/nemotron-3.5-lightning-sft-checkpoint \
 TRAIN_PATH=$DATA_DIR/rlvr.jsonl \
 VAL_PATH=$DATA_DIR/rlvr.jsonl \
 GENRM_MODEL=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM \
-GENRM_REASONING_PARSER=$SHARED_ROOT/models/parsers/ultra_v3_reasoning_parser.py \
 NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
 SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 CONTAINER=$SHARED_ROOT/containers/nemo-rl-lightning35.sqsh \
 SANDBOX_CONTAINER=$SHARED_ROOT/containers/nemo-skills-sandbox.sqsh \
 PERSISTENT_CACHE=$SHARED_ROOT/cache/lightning35-rlvr \
 HF_HOME=$SHARED_ROOT/cache/huggingface \
+HF_TOKEN=$HF_TOKEN \
 RESULTS_DIR=$SHARED_ROOT/results/lightning35-rlvr \
 EXTERNAL_VLLM_SHARED_ROOT=$SHARED_ROOT \
 EXTRA_MOUNTS=$SHARED_ROOT:$SHARED_ROOT \

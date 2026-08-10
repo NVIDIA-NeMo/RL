@@ -22,7 +22,6 @@ set -euo pipefail
 #   SLURM_PARTITION=batch \
 #   SLURM_ACCOUNT=your_account \
 #   GENRM_MODEL=/path/to/genrm-checkpoint \
-#   GENRM_REASONING_PARSER=/path/to/ultra_v3_reasoning_parser.py \
 #   NL2BASH_JUDGE_MODEL=/path/to/general-judge-checkpoint \
 #   SAFETY_JUDGE_MODEL=/path/to/safety-checkpoint \
 #   RESULTS_DIR=/shared/results/lightning35-rlvr \
@@ -105,7 +104,6 @@ if [[ "${RESULTS_DIR}" != "${EXTERNAL_VLLM_SHARED_ROOT}" && "${RESULTS_DIR}" != 
 fi
 
 : "${GENRM_MODEL:?GENRM_MODEL is required}"
-: "${GENRM_REASONING_PARSER:?GENRM_REASONING_PARSER is required}"
 : "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required}"
 : "${SAFETY_JUDGE_MODEL:?SAFETY_JUDGE_MODEL is required}"
 
@@ -119,7 +117,7 @@ GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
 GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
 GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER:-}}"
 GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
-GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
+GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-nemotron_v3}"
 GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
 GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
 GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
@@ -156,8 +154,7 @@ register_external_vllm_pool GENRM \
   --vllm-port "${GENRM_VLLM_PORT}" \
   --lb-port "${GENRM_LB_PORT}" \
   --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
-  --url-placeholder "${GENRM_BASE_URL}" \
-  --shared-path "${GENRM_REASONING_PARSER}"
+  --url-placeholder "${GENRM_BASE_URL}"
 external_vllm_pool_env GENRM \
   "FLASHINFER_WORKSPACE_BASE=/tmp" \
   "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
@@ -169,7 +166,6 @@ genrm_vllm_args=(
   --max-num-seqs 256
   --gpu-memory-utilization 0.95
   --enable-prefix-caching
-  --reasoning-parser-plugin "${GENRM_REASONING_PARSER}"
   --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
   --enable-auto-tool-choice
   --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
