@@ -39,6 +39,11 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype,
     verify_right_padding,
 )
+from nemo_rl.models.generation.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    RolloutProfiler,
+    load_rollout_profiler,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
@@ -211,6 +216,8 @@ def _log_effective_quantization_ignore_patterns(
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
+    _rollout_profiler: RolloutProfiler | None = None
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -393,6 +400,31 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
+        self._rollout_profiler = None
+        if self.is_model_owner and os.environ.get(ROLLOUT_PROFILER_CLASS_ENV):
+            if (
+                self.tensor_parallel_size != 1
+                or self.pipeline_parallel_size != 1
+                or self.expert_parallel_size != 1
+            ):
+                raise ValueError(
+                    "Synchronous rollout profiling currently requires "
+                    "tensor_parallel_size=1, pipeline_parallel_size=1, and "
+                    "expert_parallel_size=1"
+                )
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "Synchronous rollout profiling currently requires "
+                    "async_engine=false"
+                )
+            try:
+                rollout_rank = int(os.environ["RANK"])
+            except (KeyError, ValueError) as exc:
+                raise RuntimeError(
+                    "Synchronous rollout profiling requires the generation "
+                    "worker RANK environment variable"
+                ) from exc
+            self._rollout_profiler = load_rollout_profiler(rank=rollout_rank)
         self._sparse_refit_receiver: Any = None
         if (
             self.is_model_owner
@@ -720,7 +752,7 @@ class BaseVllmGenerationWorker:
 
         _maybe_enable_vllm_native_tracing(llm_kwargs)
 
-        self._create_engine(llm_kwargs)
+        self._create_engine_with_profiler(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
         )
@@ -737,6 +769,46 @@ class BaseVllmGenerationWorker:
 
     def is_alive(self):
         """Check if the worker is alive."""
+        return True
+
+    def _create_engine_with_profiler(self, llm_kwargs: dict[str, Any]) -> None:
+        """Create the vLLM engine inside the profiler initialization window."""
+        profiler = self._rollout_profiler
+        engine_token = None
+        if profiler is not None:
+            engine_token = profiler.begin_engine_initialization()
+        try:
+            self._create_engine(llm_kwargs)
+        except BaseException as engine_error:
+            if profiler is not None:
+                try:
+                    profiler.end_engine_initialization(engine_token)
+                except Exception as profiler_error:
+                    engine_error.add_note(
+                        "Rollout profiler engine-initialization cleanup also "
+                        f"failed: {profiler_error!r}"
+                    )
+            raise
+        else:
+            if profiler is not None:
+                profiler.end_engine_initialization(engine_token)
+
+    def begin_rollout_profile(self, *, step_id: int | str) -> bool:
+        """Open one complete synchronous rollout profile window."""
+        if self._rollout_profiler is not None:
+            self._rollout_profiler.begin_rollout(step_id=step_id)
+        return True
+
+    def finish_rollout_profile(self) -> bool:
+        """Close a successful synchronous rollout profile window."""
+        if self._rollout_profiler is not None:
+            self._rollout_profiler.finish_rollout()
+        return True
+
+    def abort_rollout_profile(self, *, reason: str) -> bool:
+        """Abort a synchronous rollout profile window after an error."""
+        if self._rollout_profiler is not None:
+            self._rollout_profiler.abort_rollout(reason=reason)
         return True
 
     def _merge_stop_strings(self, batch_stop_strings):
@@ -1477,6 +1549,13 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            profiler_error = None
+            if self._rollout_profiler is not None:
+                try:
+                    self._rollout_profiler.close()
+                except Exception as error:
+                    profiler_error = error
+
             if self._sparse_refit_receiver is not None:
                 self._sparse_refit_receiver.shutdown()
 
@@ -1494,6 +1573,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             gc.collect()
             torch.cuda.empty_cache()
 
+            if profiler_error is not None:
+                raise profiler_error
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")

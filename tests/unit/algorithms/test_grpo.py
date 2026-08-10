@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _profile_sync_vllm_rollout,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
@@ -93,6 +94,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -190,6 +192,52 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
 
     assert metadata is None
     replay_buffer.load_from_path.remote.assert_not_called()
+
+
+def _mock_profiled_vllm_generation() -> VllmGeneration:
+    policy_generation = VllmGeneration.__new__(VllmGeneration)
+    policy_generation.rollout_profiler_enabled = True
+    policy_generation.begin_rollout_profile = MagicMock(return_value=True)
+    policy_generation.finish_rollout_profile = MagicMock(return_value=True)
+    policy_generation.abort_rollout_profile = MagicMock(return_value=True)
+    return policy_generation
+
+
+def test_profile_sync_vllm_rollout_finishes_successful_attempt():
+    policy_generation = _mock_profiled_vllm_generation()
+
+    with _profile_sync_vllm_rollout(policy_generation, step_id="step2/attempt3"):
+        pass
+
+    policy_generation.begin_rollout_profile.assert_called_once_with(
+        step_id="step2/attempt3"
+    )
+    policy_generation.finish_rollout_profile.assert_called_once_with()
+    policy_generation.abort_rollout_profile.assert_not_called()
+
+
+def test_profile_sync_vllm_rollout_aborts_failed_attempt():
+    policy_generation = _mock_profiled_vllm_generation()
+
+    with (
+        pytest.raises(RuntimeError, match="rollout failed"),
+        _profile_sync_vllm_rollout(policy_generation, step_id=1),
+    ):
+        raise RuntimeError("rollout failed")
+
+    policy_generation.abort_rollout_profile.assert_called_once_with(
+        reason="grpo_rollout_error"
+    )
+    policy_generation.finish_rollout_profile.assert_not_called()
+
+
+def test_profile_sync_vllm_rollout_is_inert_for_other_generation_backends():
+    policy_generation = _mock_policy_generation()
+
+    with _profile_sync_vllm_rollout(policy_generation, step_id=1):
+        pass
+
+    assert not hasattr(policy_generation, "rollout_profiler_enabled")
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
