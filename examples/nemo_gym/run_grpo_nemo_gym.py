@@ -152,8 +152,14 @@ def main() -> None:
         )
 
     with rl_init_timer.time("tokenizer"):
-        # setup tokenizer
-        tokenizer = get_tokenizer(config.policy["tokenizer"])
+        is_vlm = bool(config.policy.get("is_vlm"))
+        if is_vlm:
+            processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
+            tokenizer = processor.tokenizer
+        else:
+            processor = None
+            tokenizer = get_tokenizer(config.policy["tokenizer"])
+
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
@@ -171,6 +177,11 @@ def main() -> None:
             has_refit_draft_weights=has_refit_draft_weights,
             trains_mtp=trains_mtp,
         )
+        if is_vlm and "vllm_cfg" in config.policy["generation"]:
+            assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
+                "VLMs require tokenizer to be initialized before generation, "
+                "so skip_tokenizer_init must be set to False."
+            )
 
         # NeMo-Gym specific config setup.
         setup_nemo_gym_config(config, tokenizer)
@@ -181,8 +192,9 @@ def main() -> None:
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
         print("\n▶ Setting up data...")
+        data_tokenizer = processor if processor is not None else tokenizer
         train_dataset, val_dataset = setup_response_data(
-            tokenizer, config.data, env_configs=None
+            data_tokenizer, config.data, env_configs=None
         )
 
     # Validation dataset config setup.
@@ -231,7 +243,13 @@ The validation set you pass in will directly be used for validation with no addi
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
-        ) = setup(config, tokenizer, train_dataset, val_dataset)
+        ) = setup(
+            config,
+            tokenizer,
+            train_dataset,
+            val_dataset,
+            processor=processor,
+        )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
     rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
