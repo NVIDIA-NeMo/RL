@@ -427,6 +427,52 @@ def test_nemo_gym_postprocess_flags_empty_textual_tool_call():
     assert assistant["tool_call_payload_chars"] == 0
 
 
+def test_nemo_gym_postprocess_marks_runtime_rejected_structured_call_invalid():
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call-bad",
+                    "name": "str_replace_editor",
+                    "arguments": "{}",
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4],
+                    "generation_log_probs": [-0.1, -0.2],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-bad",
+                    "output": (
+                        "Validation failure for str_replace_editor: "
+                        'Missing required argument "path"'
+                    ),
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assistant = result["message_log"][1]
+    assert assistant["is_tool_call"] is True
+    assert assistant["is_invalid_tool_call"] is True
+    assert assistant["is_empty_tool_call"] is True
+    assert assistant["tool_call_payload_chars"] == 0
+
+
 def test_nemo_gym_postprocess_replaces_padding_with_minimal_dummy_tokens():
     class _Tokenizer:
         pad_token_id = 17

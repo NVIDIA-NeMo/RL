@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import math
 import os
 import re
@@ -185,7 +186,17 @@ def _tool_call_payload_char_count(
     function name followed only by repeated closing tags count as empty.
     """
     if output_item_dict.get("type") == "function_call":
-        return len(str(output_item_dict.get("arguments", "")).strip())
+        arguments = output_item_dict.get("arguments", "")
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                parsed_arguments = None
+            if isinstance(parsed_arguments, dict) and not parsed_arguments:
+                return 0
+        elif isinstance(arguments, dict) and not arguments:
+            return 0
+        return len(str(arguments).strip())
     if not is_invalid_tool_call:
         return None
 
@@ -435,6 +446,18 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        # OpenHands emits a function_call_output with the same call_id when it
+        # rejects a parsed call during argument validation. Mark only those
+        # runtime-confirmed failures; validating raw JSON against the advertised
+        # schema here would be wrong because OpenHands fills some action fields
+        # from assistant reasoning/content.
+        invalid_structured_tool_call_ids = {
+            item.get("call_id")
+            for item in nemo_gym_result["response"]["output"]
+            if item.get("type") == "function_call_output"
+            and str(item.get("output", "")).startswith("Validation failure for ")
+            and item.get("call_id")
+        }
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -506,9 +529,10 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
-            # Valid tool calls go through the structured API (tool_calls field) and get
-            # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
-            # the call was invalid and never executed — flag it so training can penalize it.
+            # Tool-call markup left in text is invalid. Structured calls must
+            # additionally satisfy the selected tool's required-argument schema;
+            # parsing into a function_call alone does not guarantee that the
+            # agent runtime can execute it.
             is_invalid_tool_call, has_malformed_thinking = (
                 _detect_invalid_tool_call_and_malformed_thinking(
                     output_item_dict,
@@ -517,6 +541,11 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     ),
                     thinking_tags=self.cfg.get("thinking_tags"),
                 )
+            )
+            is_invalid_tool_call = is_invalid_tool_call or (
+                output_item_dict.get("type") == "function_call"
+                and output_item_dict.get("call_id")
+                in invalid_structured_tool_call_ids
             )
             tool_call_payload_chars = _tool_call_payload_char_count(
                 output_item_dict, is_invalid_tool_call
