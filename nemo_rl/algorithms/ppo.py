@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
-import math
 import os
 import time
 import traceback
@@ -1347,27 +1346,39 @@ def _compute_rollout_critic_metrics(
     return metrics
 
 
-def _pad_compaction_train_batch(
-    train_data: BatchedDataDict,
+def _pad_compaction_batch(
+    data: BatchedDataDict,
     *,
-    policy_dp_size: int,
-    policy_mbs: int,
-    value_dp_size: int,
-    value_mbs: int,
+    batch_multiple: int,
+    mask_padding: bool,
 ) -> tuple[BatchedDataDict, int]:
-    """Mask-pad a variable segment batch for actor and critic sharding."""
-    batch_multiple = math.lcm(
-        policy_dp_size * policy_mbs,
-        value_dp_size * value_mbs,
-    )
-    padding = (-train_data.size) % batch_multiple
-    if padding == 0:
-        return train_data, 0
+    """Pad a variable segment batch to a model boundary's sharding multiple."""
+    if data.size == 0:
+        raise ValueError("Cannot pad an empty compaction batch")
+    if batch_multiple <= 0:
+        raise ValueError(f"batch_multiple must be positive, got {batch_multiple}")
 
-    indices = list(range(train_data.size)) + [train_data.size - 1] * padding
-    padded = train_data.select_indices(indices)
-    padded["sample_mask"][-padding:] = 0
+    padding = (-data.size) % batch_multiple
+    if padding == 0:
+        return data, 0
+
+    indices = list(range(data.size)) + [0] * padding
+    padded = data.select_indices(indices)
+    if mask_padding:
+        if "sample_mask" not in padded:
+            raise KeyError("sample_mask is required when masking compaction padding")
+        padded["sample_mask"][-padding:] = 0
     return padded, padding
+
+
+def _compaction_batch_multiple(dp_size: int, micro_batch_size: int) -> int:
+    """Return the global row multiple required by a DP-sharded model call."""
+    if dp_size <= 0 or micro_batch_size <= 0:
+        raise ValueError(
+            "Compaction batch alignment requires positive DP and micro-batch sizes, "
+            f"got dp_size={dp_size}, micro_batch_size={micro_batch_size}"
+        )
+    return dp_size * micro_batch_size
 
 
 # ===============================================================================
@@ -2779,11 +2790,34 @@ def async_ppo_train(
                 # end below). Load value only.
                 print("▶ Computing values...")
                 with timer.time("value_inference"):
+                    value_inference_data = train_data
+                    value_inference_padding = 0
+                    if cross_trajectory:
+                        value_inference_data, value_inference_padding = (
+                            _pad_compaction_batch(
+                                train_data,
+                                batch_multiple=_compaction_batch_multiple(
+                                    value_model.sharding_annotations.get_axis_size(
+                                        "data_parallel"
+                                    ),
+                                    master_config.value["train_micro_batch_size"],
+                                ),
+                                mask_padding=True,
+                            )
+                        )
                     value_model.prepare_for_inference()
-                    train_data["values"] = value_model.get_values(train_data)[
-                        "values"
-                    ].squeeze(-1)
+                    values = value_model.get_values(value_inference_data)["values"]
                     value_model.finish_inference()
+                    train_data["values"] = values[: train_data.size].squeeze(-1)
+                    del values
+                    if cross_trajectory:
+                        metrics["compaction/value_inference_padding_rows"] = (
+                            value_inference_padding
+                        )
+                        metrics["compaction/value_inference_physical_segments"] = (
+                            value_inference_data.size
+                        )
+                        del value_inference_data
 
                 # ---- 4. Policy / reference logprobs (policy on GPU, then off) ----
                 print("▶ Computing logprobs...")
@@ -2797,18 +2831,43 @@ def async_ppo_train(
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
+                    logprob_inference_data = logprob_data
+                    logprob_inference_padding = 0
+                    if cross_trajectory:
+                        logprob_inference_data, logprob_inference_padding = (
+                            _pad_compaction_batch(
+                                logprob_data,
+                                batch_multiple=_compaction_batch_multiple(
+                                    policy.data_parallel_size,
+                                    master_config.policy["logprob_batch_size"],
+                                ),
+                                mask_padding=False,
+                            )
+                        )
+                    prev_logprobs = policy.get_logprobs(
+                        logprob_inference_data, timer=timer
                     )["logprobs"]
+                    train_data["prev_logprobs"] = prev_logprobs[: train_data.size]
+                    del prev_logprobs
                     if not master_config.ppo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            logprob_inference_data,
+                            timer=timer,
+                        )["reference_logprobs"]
                         train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
-                                logprob_data,
-                                timer=timer,
-                            )["reference_logprobs"]
+                            reference_logprobs[: train_data.size]
                         )
+                        del reference_logprobs
+                    if cross_trajectory:
+                        metrics["compaction/policy_logprob_padding_rows"] = (
+                            logprob_inference_padding
+                        )
+                        metrics["compaction/policy_logprob_physical_segments"] = (
+                            logprob_inference_data.size
+                        )
+                        del logprob_inference_data
                     del logprob_data
                     del extra_multimodal_data
                     policy.finish_inference()
@@ -2902,19 +2961,44 @@ def async_ppo_train(
                 # frozen: it is never loaded/trained here, exactly as in sync
                 # ppo_train, so train_results stays None for the step.
                 is_policy_training_step = step >= policy_training_start_step
-                dynamic_gbs = None
+                actor_train_data = train_data
+                critic_train_data = train_data
+                actor_gbs = None
+                critic_gbs = None
                 if cross_trajectory:
-                    train_data, padding = _pad_compaction_train_batch(
+                    critic_train_data, critic_padding = _pad_compaction_batch(
                         train_data,
-                        policy_dp_size=policy.data_parallel_size,
-                        policy_mbs=master_config.policy["train_micro_batch_size"],
-                        value_dp_size=value_model.sharding_annotations.get_axis_size(
-                            "data_parallel"
+                        batch_multiple=_compaction_batch_multiple(
+                            value_model.sharding_annotations.get_axis_size(
+                                "data_parallel"
+                            ),
+                            master_config.value["train_micro_batch_size"],
                         ),
-                        value_mbs=master_config.value["train_micro_batch_size"],
+                        mask_padding=True,
                     )
-                    dynamic_gbs = train_data.size
-                    metrics["compaction/padded_training_segments"] = padding
+                    critic_gbs = critic_train_data.size
+                    metrics["compaction/critic_training_padding_rows"] = (
+                        critic_padding
+                    )
+                    metrics["compaction/critic_training_physical_segments"] = (
+                        critic_gbs
+                    )
+                    if is_policy_training_step:
+                        actor_train_data, actor_padding = _pad_compaction_batch(
+                            train_data,
+                            batch_multiple=_compaction_batch_multiple(
+                                policy.data_parallel_size,
+                                master_config.policy["train_micro_batch_size"],
+                            ),
+                            mask_padding=True,
+                        )
+                        actor_gbs = actor_train_data.size
+                        metrics["compaction/actor_training_padding_rows"] = (
+                            actor_padding
+                        )
+                        metrics[
+                            "compaction/actor_training_physical_segments"
+                        ] = actor_gbs
                 train_results = None
                 value_results = None
                 for critic_epoch in range(critic_train_epochs):
@@ -2925,10 +3009,15 @@ def async_ppo_train(
                         value_model.prepare_for_training()
                     with timer.time("value_training"):
                         value_results = value_model.train(
-                            train_data,
+                            critic_train_data,
                             value_loss_fn,
                             timer=timer,
-                            gbs=dynamic_gbs,
+                            gbs=critic_gbs,
+                            scheduler_increment=(
+                                master_config.value["train_global_batch_size"]
+                                if cross_trajectory
+                                else None
+                            ),
                         )
                         value_model.finish_training()
 
@@ -2948,13 +3037,23 @@ def async_ppo_train(
                             policy.prepare_for_training()
                         with timer.time("policy_training"):
                             train_results = policy.train(
-                                train_data,
+                                actor_train_data,
                                 loss_fn,
                                 timer=timer,
-                                gbs=dynamic_gbs,
+                                gbs=actor_gbs,
+                                scheduler_increment=(
+                                    master_config.policy["train_global_batch_size"]
+                                    if cross_trajectory
+                                    else None
+                                ),
                             )
                             if actor_epoch < ppo_epochs - 1:
                                 policy.offload_to_cpu()
+
+                if cross_trajectory:
+                    del critic_train_data
+                    if is_policy_training_step:
+                        del actor_train_data
 
                 # ---- 8. Refit once after all PPO epochs ----
                 # Warmup still advances the replay-buffer version, but skips the
@@ -3211,29 +3310,23 @@ def async_ppo_train(
                         )
 
             # ---- Logging ----
-            logged_train_data = (
-                train_data.select_indices(list(range(repeated_batch.size)))
-                if cross_trajectory and train_data.size != repeated_batch.size
-                else train_data
-            )
             log_data = {
                 "content": flat_messages_content,
                 "rewards": rewards.tolist(),
                 "input_lengths": input_lengths.tolist(),
-                "token_ids": logged_train_data["input_ids"].tolist(),
-                "token_loss_mask": logged_train_data["token_mask"].tolist(),
-                "sample_loss_mask": logged_train_data["sample_mask"].tolist(),
-                "advantages": logged_train_data["advantages"].tolist(),
-                "generation_logprobs": logged_train_data[
+                "token_ids": train_data["input_ids"].tolist(),
+                "token_loss_mask": train_data["token_mask"].tolist(),
+                "sample_loss_mask": train_data["sample_mask"].tolist(),
+                "advantages": train_data["advantages"].tolist(),
+                "generation_logprobs": train_data[
                     "generation_logprobs"
                 ].tolist(),
-                "prev_logprobs": logged_train_data["prev_logprobs"].tolist(),
+                "prev_logprobs": train_data["prev_logprobs"].tolist(),
             }
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
             del log_data
-            del logged_train_data
             del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(

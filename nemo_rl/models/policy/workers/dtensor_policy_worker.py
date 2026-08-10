@@ -605,6 +605,7 @@ class DTensorPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_increment: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
@@ -613,6 +614,7 @@ class DTensorPolicyWorkerImpl(
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
+        del scheduler_increment  # DTensor schedulers advance once per train call.
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
