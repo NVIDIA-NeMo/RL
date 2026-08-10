@@ -308,6 +308,7 @@ class Value(ValueInterface):
         *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_increment: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the value function on a batch of data with a given loss function.
@@ -318,6 +319,8 @@ class Value(ValueInterface):
             eval_mode: Whether to run in evaluation mode (no gradient updates)
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
+            scheduler_increment: Logical sample increment for the LR scheduler.
+                Defaults to the physical global batch size.
             timer: Optional timer for profiling
 
         Returns:
@@ -378,6 +381,7 @@ class Value(ValueInterface):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    "scheduler_increment": scheduler_increment,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)

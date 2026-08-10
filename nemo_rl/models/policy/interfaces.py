@@ -110,6 +110,7 @@ class PolicyInterface(ABC):
         *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_increment: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
@@ -120,6 +121,8 @@ class PolicyInterface(ABC):
             eval_mode: Whether to run in evaluation mode (no gradient updates)
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
+            scheduler_increment: Logical sample increment for the LR scheduler.
+                Defaults to the physical global batch size.
         """
         pass
 
