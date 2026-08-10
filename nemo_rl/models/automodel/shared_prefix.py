@@ -519,9 +519,67 @@ def register_shared_prefix_attention() -> None:
     )
 
 
+class _ChunkedTargetLogprobs(torch.autograd.Function):
+    """Target-only log-softmax with bounded fp32 activation memory.
+
+    The model already owns the input logits. Forward saves only those logits and
+    the target ids, while each fp32 log-softmax chunk is released immediately.
+    Backward rematerializes one fp32 softmax chunk at a time instead of retaining
+    ``response_tokens * vocab_size`` fp32 activations across the model backward.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        ctx.chunk_size = chunk_size
+        ctx.save_for_backward(logits, targets)
+
+        output = torch.empty(logits.shape[0], device=logits.device, dtype=torch.float32)
+        for start in range(0, logits.shape[0], chunk_size):
+            end = min(start + chunk_size, logits.shape[0])
+            log_probs = torch.nn.functional.log_softmax(
+                logits[start:end].float(), dim=-1
+            )
+            output[start:end] = log_probs.gather(
+                -1, targets[start:end].unsqueeze(-1)
+            ).squeeze(-1)
+            del log_probs
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None]:
+        logits, targets = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        grad_logits = torch.empty_like(logits)
+
+        for start in range(0, logits.shape[0], chunk_size):
+            end = min(start + chunk_size, logits.shape[0])
+            probabilities = torch.softmax(logits[start:end].float(), dim=-1)
+            probabilities.neg_()
+            target_indices = targets[start:end].unsqueeze(-1)
+            probabilities.scatter_add_(
+                -1,
+                target_indices,
+                torch.ones_like(target_indices, dtype=probabilities.dtype),
+            )
+            probabilities.mul_(grad_output[start:end].float().unsqueeze(-1))
+            grad_logits[start:end].copy_(probabilities)
+            del probabilities, target_indices
+
+        return grad_logits, None, None
+
+
 def response_logprobs_from_logits(
     logits: torch.Tensor,
     layout: SharedPrefixLayout,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
     """Select response-target logprobs from predictor-only Qwen3 logits."""
     if logits.ndim != 3 or logits.shape[0] != 1:
@@ -532,8 +590,16 @@ def response_logprobs_from_logits(
         raise ValueError(
             f"expected {layout.response_tokens} predictor logits, got {logits.shape[1]}"
         )
-    log_probs = torch.nn.functional.log_softmax(logits.squeeze(0).float(), dim=-1)
-    return log_probs.gather(-1, layout.response_target_ids.unsqueeze(-1)).squeeze(-1)
+    logits = logits.squeeze(0)
+    if chunk_size is None:
+        chunk_size = layout.response_tokens
+    if chunk_size <= 0:
+        raise ValueError("shared-prefix logprob_chunk_size must be positive")
+    return _ChunkedTargetLogprobs.apply(
+        logits,
+        layout.response_target_ids,
+        chunk_size,
+    )
 
 
 def scatter_response_logprobs(

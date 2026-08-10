@@ -620,7 +620,7 @@ class TestLossPostProcessor:
             reference_policy_kl_penalty=0.07,
             force_on_policy_ratio=force_on_policy_ratio,
         )
-        processor_cfg = base_cfg
+        processor_cfg = {**base_cfg, "logprob_chunk_size": 3}
         dense_processor = LossPostProcessor(
             loss_fn=ClippedPGLossFn(loss_cfg),
             cfg=processor_cfg,
@@ -662,7 +662,7 @@ class TestLossPostProcessor:
 
         with torch.no_grad():
             compact_current_logprobs = scatter_response_logprobs(
-                response_logprobs_from_logits(compact_logits, layout),
+                response_logprobs_from_logits(compact_logits, layout, chunk_size=3),
                 layout,
                 base=prev_shifted,
             )

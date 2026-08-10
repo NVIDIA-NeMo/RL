@@ -25,6 +25,7 @@ from nemo_rl.models.automodel.shared_prefix import (
     build_shared_prefix_layout,
     infer_shared_prefix_response_bounds,
     register_shared_prefix_attention,
+    response_logprobs_from_logits,
     scatter_response_logprobs,
     shared_prefix_flash_attention_forward,
 )
@@ -172,6 +173,77 @@ def test_scatter_response_logprobs_preserves_inactive_base_values():
     assert torch.equal(dense[0, :2], torch.tensor([-7.0, -7.0]))
     assert dense[2, 3] == -7.0
     assert dense[3, 3] == -7.0
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
+def test_chunked_response_logprobs_match_dense_values_and_gradients(chunk_size):
+    layout = build_shared_prefix_layout(*_interleaved_rollouts())
+    torch.manual_seed(17)
+    actual_logits = torch.randn(
+        1,
+        layout.response_tokens,
+        128,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    expected_logits = actual_logits.detach().clone().requires_grad_()
+    weights = torch.linspace(-1.0, 1.0, layout.response_tokens)
+
+    actual = response_logprobs_from_logits(
+        actual_logits,
+        layout,
+        chunk_size=chunk_size,
+    )
+    expected = (
+        torch.log_softmax(expected_logits.squeeze(0), dim=-1)
+        .gather(-1, layout.response_target_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    actual_loss = (actual * weights).sum()
+    expected_loss = (expected * weights).sum()
+    actual_grad = torch.autograd.grad(actual_loss, actual_logits)[0]
+    expected_grad = torch.autograd.grad(expected_loss, expected_logits)[0]
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_loss, expected_loss)
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_chunked_response_logprobs_do_not_save_fp32_vocab_activations():
+    layout = build_shared_prefix_layout(*_interleaved_rollouts())
+    logits = torch.randn(
+        1,
+        layout.response_tokens,
+        128,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    saved_tensors = []
+
+    def pack_hook(tensor):
+        saved_tensors.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+        response_logprobs_from_logits(logits, layout, chunk_size=3).sum().backward()
+
+    assert any(
+        tensor.dtype == torch.bfloat16
+        and tensor.shape == (layout.response_tokens, logits.shape[-1])
+        for tensor in saved_tensors
+    )
+    assert any(
+        tensor.dtype == torch.long and tensor.shape == (layout.response_tokens,)
+        for tensor in saved_tensors
+    )
+    assert not any(
+        tensor.dtype == torch.float32
+        and tensor.ndim == 2
+        and tensor.shape[-1] == logits.shape[-1]
+        for tensor in saved_tensors
+    )
+    assert logits.grad is not None
 
 
 def _reference_varlen_attention(
