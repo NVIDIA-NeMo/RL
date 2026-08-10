@@ -1014,6 +1014,15 @@ class DTensorPolicyWorkerV2Impl(
         # process, so the consumer can't observe a partially written buffer
         # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
+        # Under NIXL transport, D2H-copy the finished GPU storage into its
+        # registered pinned-host mirror so a cross-node student can RDMA-READ it
+        # (NIXL cannot register VRAM once NCCL is up; host staging is required).
+        if use_nixl and nixl_desc is not None and storage is not None:
+            from nemo_rl.algorithms.x_token.nixl_transport import (
+                stage_teacher_storage_to_host,
+            )
+
+            stage_teacher_storage_to_host(storage)
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 
     def release_ipc_buffer(self) -> None:

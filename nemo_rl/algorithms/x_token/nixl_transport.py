@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inter-node NIXL RDMA transport for teacher full-logits.
+"""Inter-node NIXL RDMA transport for teacher full-logits (host-staged).
 
 Intra-node teacher->student logit transport uses CUDA IPC
 (:func:`nemo_rl.models.policy.utils.get_handle_from_tensor` on the producer,
@@ -21,30 +21,29 @@ consumer). ``cudaIpcOpenMemHandle`` can only map a buffer created by a process
 on the SAME physical node, so a non-node-local teacher/student layout (e.g.
 ``teacher_dp != student_dp``) has no IPC path.
 
-This module ships the *same* persistent teacher-logit storage over NIXL
-(UCX / RDMA READ) for the cross-node case, reusing the low-level ``NixlAgent``
-primitives from :mod:`nemo_rl.utils.checkpoint_engines.nixl` (the same backend
-that already powers checkpoint-engine refit). It deliberately mirrors the CUDA
-IPC integration so the two transports are drop-in siblings:
+This module ships the *same* teacher-logit storage over NIXL (UCX / RDMA READ)
+for the cross-node case, reusing the low-level ``NixlAgent`` primitives from
+:mod:`nemo_rl.utils.checkpoint_engines.nixl`.
 
-- Producer: :func:`register_teacher_storage` is the NIXL analog of
-  ``get_handle_from_tensor`` — it registers the persistent storage buffer once
-  and returns a serializable descriptor that rides in the per-sample handle dict
-  alongside ``payload_ipc``.
-- Consumer: :func:`materialize_teacher_storage` is the NIXL-aware analog of
-  ``rebuild_cuda_tensor_from_ipc`` — it dispatches per shard on the producer's
-  node IP (same node -> zero-copy IPC map; remote -> RDMA READ into a local
-  buffer) and returns the same ``[N_mb, B, T_local, V_local]`` storage tensor
-  the reassembly code already slices.
+**Host-staged**: on these workers NIXL/UCX cannot register device (VRAM) memory
+once NCCL is initialized (``register_memory`` on a CUDA tensor returns
+``NIXL_ERR_BACKEND``), but pinned-host registration always works. So the
+transport bounces through a pinned-host mirror, exactly like the checkpoint
+engine's host path (``_allocate_transfer_buffer`` with ``pin_memory``):
 
-Everything else — the per-sample handle dict, the TP/CP shard routing metadata,
-and the reassembly in ``x_token.loss_utils`` — is transport-agnostic and
-unchanged.
+- Producer: keep the GPU storage (still needed for the intra-node IPC path);
+  allocate a pinned-host mirror, register *that*, and D2H-copy the GPU storage
+  into it after the teacher forward (:func:`stage_teacher_storage_to_host`).
+- Consumer: RDMA-READ the remote host mirror into a local pinned-host buffer,
+  then H2D-copy into a GPU tensor (:func:`read_teacher_storage`).
 
-The producer and consumer NIXL agents are process-global and lazily created
-(one per worker process), analogous to the process-global CUDA context the IPC
-path relies on: the consumer helpers stay callable from the pure reassembly
-functions without threading agent state through the loss signature.
+The per-sample handle dict, TP/CP shard routing, and reassembly in
+``x_token.loss_utils`` are transport-agnostic and unchanged; the consumer picks
+IPC (same node) or NIXL (remote) per shard via ``producer_node_ip``.
+
+The producer/consumer NIXL agents are process-global and lazily created (one per
+worker process), analogous to the process-global CUDA context the IPC path
+relies on.
 """
 
 from __future__ import annotations
@@ -54,13 +53,14 @@ from typing import Any, Optional
 
 import torch
 
+
 # ---------------------------------------------------------------------------
 # Process-global agents (one producer + one consumer NixlAgent per worker).
 # ---------------------------------------------------------------------------
 
-# Producer registration cache. Only one persistent teacher-logit storage buffer
-# is live per worker at a time, so we track a single (data_ptr -> registration).
 _PRODUCER_AGENT: Any = None
+# Producer state for the single persistent storage buffer: data_ptr ->
+# registered pinned-host mirror + its transfer descriptors.
 _PRODUCER_STATE: dict[str, Any] = {}
 
 _CONSUMER_AGENT: Any = None
@@ -104,40 +104,45 @@ def _consumer_agent() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Producer side (teacher worker) — NIXL analog of get_handle_from_tensor.
+# Producer side (teacher worker) — register a pinned-host mirror, D2H per export.
 # ---------------------------------------------------------------------------
 
 
 def register_teacher_storage(storage: torch.Tensor) -> dict[str, Any]:
-    """Register the persistent teacher-logit storage and return a NIXL descriptor.
+    """Register a pinned-host mirror of the teacher-logit storage; return a descriptor.
 
-    Mirrors ``get_handle_from_tensor``: called once per export, embedded in every
-    per-sample handle so a cross-node student rank can RDMA-READ the buffer. The
-    registration is cached by ``storage.data_ptr()`` — the storage is persistent
-    and reused across steps (``ensure_teacher_ipc_buffer`` only reallocates on
-    grow), so this normally registers once per worker and re-registers on realloc.
+    Called once per export (its result is embedded in every per-sample handle).
+    The host mirror is allocated and registered lazily, cached by
+    ``storage.data_ptr()`` — the GPU storage is persistent and reused across
+    steps (``ensure_teacher_ipc_buffer`` only reallocates on grow), so this
+    normally registers once per worker and re-registers on realloc.
+
+    NOTE: this only *registers* the host mirror; the GPU->host copy happens in
+    :func:`stage_teacher_storage_to_host` after the teacher forward has written
+    every microbatch into the GPU storage.
 
     ``content_uuid`` is regenerated every call so the consumer can dedupe RDMA
     reads of one export across the many shards/samples that share the buffer.
-
-    Returns a Ray-serializable dict: ``agent_metadata`` (producer agent handle),
-    ``remote_descs`` (whole-buffer transfer descriptors), ``node_ip`` (producer
-    node), and ``content_uuid`` (per-export read-cache key).
     """
     agent = _producer_agent()
     ptr = storage.data_ptr()
     if _PRODUCER_STATE.get("ptr") != ptr:
-        # Realloc (or first call): drop the stale registration, register anew.
         prev_reg = _PRODUCER_STATE.get("reg")
         if prev_reg is not None:
             try:
                 agent.agent.deregister_memory(prev_reg)
             except Exception:
                 pass
-        reg = agent.agent.register_memory(storage)
-        descs = agent.agent.get_xfer_descs(storage)
+        # Pinned-host mirror matching the GPU storage (RDMA-registerable where
+        # VRAM is not). Pinned so the D2H copy in stage_* can be async.
+        host_mirror = torch.empty(
+            tuple(storage.shape), dtype=storage.dtype, pin_memory=True
+        )
+        reg = agent.agent.register_memory(host_mirror)
+        descs = agent.agent.get_xfer_descs(host_mirror)
         _PRODUCER_STATE.update(
             ptr=ptr,
+            host_mirror=host_mirror,
             reg=reg,
             descs=descs,
             agent_metadata=agent.get_agent_metadata(),
@@ -151,11 +156,30 @@ def register_teacher_storage(storage: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def stage_teacher_storage_to_host(storage: torch.Tensor) -> None:
+    """D2H-copy the GPU storage into its registered pinned-host mirror.
+
+    Call once after the teacher forward has written every microbatch into
+    ``storage`` and after :func:`register_teacher_storage`, so the host mirror
+    the consumer RDMA-READs holds this export's logits.
+    """
+    host_mirror = _PRODUCER_STATE.get("host_mirror")
+    if host_mirror is None or _PRODUCER_STATE.get("ptr") != storage.data_ptr():
+        raise RuntimeError(
+            "stage_teacher_storage_to_host called before register_teacher_storage "
+            "for the current storage buffer."
+        )
+    host_mirror.copy_(storage, non_blocking=True)
+    # The consumer reads the host mirror over RDMA from another node; make sure
+    # the D2H copy has landed before the descriptor is handed out.
+    torch.cuda.synchronize(storage.device)
+
+
 def release_teacher_storage() -> None:
-    """Deregister the producer buffer and reset producer state.
+    """Deregister the host mirror and reset producer state.
 
     Mirrors ``release_ipc_buffer``: called when the persistent storage is freed
-    so the next export re-registers a fresh buffer.
+    so the next export re-registers a fresh mirror.
     """
     global _PRODUCER_AGENT
     reg = _PRODUCER_STATE.get("reg")
@@ -168,7 +192,7 @@ def release_teacher_storage() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Consumer side (student worker) — NIXL-aware analog of rebuild_cuda_tensor_from_ipc.
+# Consumer side (student worker) — RDMA-READ remote host mirror, then H2D.
 # ---------------------------------------------------------------------------
 
 
@@ -202,19 +226,19 @@ def read_teacher_storage(
     dtype: torch.dtype,
     device: int,
 ) -> torch.Tensor:
-    """RDMA-READ the producer's whole storage buffer into a local tensor.
+    """RDMA-READ the producer's host mirror, then H2D into a GPU tensor.
 
     Reads the entire ``[N_mb, B, T_local, V_local]`` buffer (matching what the
-    IPC path maps) so the caller can slice it identically. ``device`` is a CUDA
+    IPC path maps) into a local pinned-host buffer, then copies it to
+    ``cuda:device`` so the caller can slice it identically. ``device`` is a CUDA
     device index (matches ``rebuild_cuda_tensor_from_ipc``'s ``device_id``).
     """
     agent = _consumer_agent()
     remote = _remote_agent(agent, nixl_desc["agent_metadata"])
-    cuda_device = torch.device("cuda", device)
-    dst = torch.empty(tuple(storage_shape), dtype=dtype, device=cuda_device)
-    reg = agent.agent.register_memory(dst)
+    dst_host = torch.empty(tuple(storage_shape), dtype=dtype, pin_memory=True)
+    reg = agent.agent.register_memory(dst_host)
     try:
-        local_descs = agent.agent.get_xfer_descs(dst)
+        local_descs = agent.agent.get_xfer_descs(dst_host)
         notif = uuid.uuid4().bytes
         xfer_handle = agent.agent.initialize_xfer(
             "READ", local_descs, nixl_desc["remote_descs"], remote, notif
@@ -226,7 +250,8 @@ def read_teacher_storage(
         _wait_read_done(agent, xfer_handle, remote)
     finally:
         agent.agent.deregister_memory(reg)
-    # The READ lands asynchronously on the device; flush before the loss reads it.
+    cuda_device = torch.device("cuda", device)
+    dst = dst_host.to(cuda_device, non_blocking=True)
     torch.cuda.synchronize(cuda_device)
     return dst
 
