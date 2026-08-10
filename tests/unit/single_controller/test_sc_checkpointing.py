@@ -56,6 +56,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    WeightFifoSamplerConfig,
     WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import _default_grpo_save_state
@@ -358,6 +359,7 @@ class _FakeTQBuffer:
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+        self.target_step_list: list[Optional[int]] = []
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -386,6 +388,7 @@ class _FakeTQBuffer:
                 "expected_manifest_digest": expected_manifest_digest,
             }
         )
+        self.target_step_list = [group["target_step"] for group in state["groups"]]
         return self.load_return
 
 
@@ -432,12 +435,12 @@ def _actor_master_config(
     All fields are populated (init_tmp_checkpoint dumps the whole config to
     config.yaml); values satisfy validate_single_controller_config.
     buffer_checkpoint selects the sampler: windowed supports replay-buffer
-    checkpointing, the gated in_order sampler does not.
+    checkpointing, while weight_fifo remains unsupported.
     """
     sampler_cfg = (
         WindowedSamplerConfig(max_staleness_versions=1)
         if buffer_checkpoint
-        else InOrderSamplerConfig(max_lookahead_versions=1)
+        else WeightFifoSamplerConfig(max_staleness_versions=1)
     )
     config = MasterConfig.model_construct(
         policy={
@@ -525,7 +528,9 @@ def _make_actor_args(
     )
 
 
-def _sealed_recovery_ledger(*, group_id: str = "recovery-g0") -> RolloutRecoveryLedger:
+def _sealed_recovery_ledger(
+    *, group_id: str = "recovery-g0", target_step: Optional[int] = None
+) -> RolloutRecoveryLedger:
     ledger = RolloutRecoveryLedger()
     group = ledger.reserve_group(
         group_id=group_id,
@@ -537,7 +542,7 @@ def _sealed_recovery_ledger(*, group_id: str = "recovery-g0") -> RolloutRecovery
             "task_name": "nemo_gym",
         },  # type: ignore[arg-type]
         expected_generations=2,
-        target_step=None,
+        target_step=target_step,
         start_weight_version=0,
     )
     ledger.mark_group_dispatched(group.group_id)
@@ -606,7 +611,9 @@ def _run_train_pump(
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args)
         actor._sampler = _FakeSampler(
-            supports_buffer_checkpoint=(mc.async_rl.sampler.name == "windowed")
+            supports_buffer_checkpoint=(
+                mc.async_rl.sampler.supports_buffer_checkpoint is True
+            )
         )
         # In-process runs have no Ray runtime; the pump only reads the GPU
         # count for a throughput metric.
@@ -822,6 +829,41 @@ class TestSaveTrigger:
 
 
 class TestDataPlaneCheckpoint:
+    def test_in_order_restore_resumes_after_highest_admitted_target(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+            token_capture=True,
+            num_prompts_per_step=1,
+        )
+        mc.async_rl.sampler = InOrderSamplerConfig(max_lookahead_versions=1)
+        save_state = _default_grpo_save_state()
+        save_state["current_step"] = 5
+        save_state["trainer_version"] = 5
+        ledger = _sealed_recovery_ledger(target_step=6)
+        buffer = _FakeTQBuffer()
+        buffer.target_step_list = [5]
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(
+                save_state=save_state,
+                tq_buffer=buffer,
+                dp_client=_FakeDPClient(
+                    staging_sample_ids=sorted(ledger.expected_staging_keys())
+                ),
+                rollout_manager=_FakeRolloutManager(ledger),
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_payload_sha256": "digest"
+                },
+            ),
+        )
+
+        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
+
+        assert asyncio.run(actor._sampler.admit(trainer_version_fn=lambda: 6)) == 7
+        actor._checkpointer.shutdown()
+
     def test_restore_replays_fully_sealed_groups_before_pumps(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -1357,7 +1399,12 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     checkpointing block setup now reads.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "checkpointing_enabled": True,
+        },
         data={
             "use_multiple_dataloader": False,
             "shuffle": False,

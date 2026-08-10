@@ -57,7 +57,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     TQReplayMetadataState,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CheckpointDispatchSampler,
+    create_sampler,
+)
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -79,6 +82,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_recovery import (
+    PromptGroupRecoveryRecord,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     RolloutAttemptStatus,
@@ -327,7 +331,7 @@ class SingleControllerActor:
     async def _maybe_restore_replay_buffer(self) -> int:
         """Restore replay-buffer groups from the previous run's checkpoint.
 
-        No-op unless the sampler supports_buffer_checkpoint (ungated only).
+        No-op unless the sampler supports buffer checkpointing.
 
         Returns:
             Number of canonical replay groups restored.
@@ -523,6 +527,9 @@ class SingleControllerActor:
         """Recover sealed and partial groups before starting either SC pump."""
         metadata = self._data_plane_checkpoint_metadata or {}
         if "rollout_recovery_payload_sha256" not in metadata:
+            self._restore_sampler_dispatch_state(
+                [], restored_replay_groups=restored_replay_groups
+            )
             return
         recovery_ledger = self._rollout_manager.recovery_ledger
         if recovery_ledger is None:
@@ -533,6 +540,9 @@ class SingleControllerActor:
 
         recovery_ledger.prepare_for_restart()
         groups = recovery_ledger.groups()
+        self._restore_sampler_dispatch_state(
+            groups, restored_replay_groups=restored_replay_groups
+        )
         await self._validate_rollout_recovery_inventory(clear_unreferenced=True)
         if restored_replay_groups + len(groups) > self._async_cfg.max_buffered_rollouts:
             raise RuntimeError(
@@ -555,6 +565,46 @@ class SingleControllerActor:
         if groups:
             print(
                 f"rollout recovery replay completed: groups={len(groups)}",
+                flush=True,
+            )
+
+    def _restore_sampler_dispatch_state(
+        self,
+        recovery_groups: list[PromptGroupRecoveryRecord],
+        *,
+        restored_replay_groups: int,
+    ) -> None:
+        """Reconstruct gated admission from canonical and unfinished groups."""
+        if not self._sampler.supports_buffer_checkpoint:
+            return
+        if not isinstance(self._sampler, CheckpointDispatchSampler):
+            raise RuntimeError(
+                f"checkpoint-capable sampler {type(self._sampler).__name__} "
+                "does not implement dispatch-state recovery"
+            )
+        restored_target_steps = list(self._buffer.target_step_list)
+        if len(restored_target_steps) != restored_replay_groups:
+            raise RuntimeError(
+                "restored replay group count does not match the sampler target "
+                "index: "
+                f"groups={restored_replay_groups}, "
+                f"targets={len(restored_target_steps)}"
+            )
+        restored_target_steps.extend(
+            group.target_step for group in recovery_groups
+        )
+        self._sampler.restore_dispatch_state(
+            current_train_weight=self._trainer_version,
+            restored_target_steps=restored_target_steps,
+            groups_per_step=self._master_config.grpo["num_prompts_per_step"],
+        )
+        stamped_targets = [
+            target for target in restored_target_steps if target is not None
+        ]
+        if stamped_targets:
+            print(
+                "📦 Restored sampler dispatch state: "
+                f"highest_target_step={max(stamped_targets)}",
                 flush=True,
             )
 

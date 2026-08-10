@@ -31,7 +31,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    WeightFifoSamplerConfig,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
@@ -322,6 +325,7 @@ class TestSetup:
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.token_capture.enabled = True
+        mc.async_rl.sampler = WeightFifoSamplerConfig(max_staleness_versions=1)
         mc.data_plane.update(
             {
                 "backend": "simple",

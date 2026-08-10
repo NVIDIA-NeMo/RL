@@ -563,8 +563,7 @@ def setup_single_controller(
         ):
             raise NotImplementedError(
                 "Token-capture checkpoint recovery currently requires a "
-                "replay-checkpoint-capable sampler (windowed); restoring the "
-                "dispatch/readiness state of gated samplers is not implemented yet."
+                "replay-checkpoint-capable sampler (windowed or in_order)."
             )
         if not _should_use_nemo_gym(master_config):
             raise ValueError(
