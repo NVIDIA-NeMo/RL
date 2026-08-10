@@ -1137,6 +1137,64 @@ class RayVirtualCluster:
         )
         return reordered_bundle_indices
 
+    def get_topology_sorted_pg_indices(self) -> list[int]:
+        """Placement group indices ordered by physical topology.
+
+        The unified-PG path sorts *bundles* (see ``_get_sorted_bundle_indices``),
+        but with per-node placement groups the caller consumes whole PGs, and Ray
+        decides which physical node backs each one. Two PGs that are adjacent in
+        creation order can therefore sit in different NVLink domains, which for a
+        consumer whose unit spans several nodes (a TRT-LLM disaggregated replica,
+        say) silently demotes its inter-node traffic from NVLink to InfiniBand.
+
+        Sorting by ``(nvlink_domain's smallest topo_rank, topo_rank)`` puts nodes
+        of one domain next to each other, so consecutive PGs belong to the same
+        domain wherever the allocation allows it. Ordering *within* a domain is
+        not a bandwidth concern (an NVL72 fabric is uniform) but keeps a given
+        config reproducible across runs.
+
+        Returns:
+            Indices into ``get_placement_groups()``. Falls back to the existing
+            order when the cluster is CPU-only, is a single unified PG, or has no
+            topology information -- ordering is an optimization, never a
+            requirement.
+        """
+        pgs = self.get_placement_groups()
+        identity = list(range(len(pgs)))
+        if not self.use_gpus or len(pgs) <= 1:
+            return identity
+
+        topology = get_ray_cluster_topology()
+        if not any(
+            domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+        ):
+            return identity
+
+        node_of_pg: list[str] = []
+        for pg in pgs:
+            bundles_to_node = placement_group_table(pg)["bundles_to_node_id"]
+            if not bundles_to_node:
+                return identity
+            node_of_pg.append(next(iter(bundles_to_node.values())))
+        if any(node_id not in topology for node_id in node_of_pg):
+            return identity
+
+        # Rank domains by their smallest topo_rank so domain order is stable and
+        # follows the fabric, not dict iteration order.
+        domain_rank: dict[str, int] = {}
+        for domain, topo_rank in topology.values():
+            if domain not in domain_rank or topo_rank < domain_rank[domain]:
+                domain_rank[domain] = topo_rank
+
+        return sorted(
+            identity,
+            key=lambda i: (
+                domain_rank[topology[node_of_pg[i]][0]],
+                topology[node_of_pg[i]][1],
+                i,
+            ),
+        )
+
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
 

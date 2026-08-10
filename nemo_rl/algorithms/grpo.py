@@ -1039,9 +1039,39 @@ def setup(
                     )
                 elif generation_config["backend"] == "trtllm":
                     trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    gpus_per_instance = trtllm_cfg[
-                        "tensor_parallel_size"
-                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                    disagg_cfg = trtllm_cfg.get("disaggregation") or {}
+                    if disagg_cfg.get("enabled"):
+                        # Under PD disaggregation the unit to keep inside one
+                        # NVLink domain is the *replica*, not the engine: an
+                        # engine's TP group all-reduces internally, but the KV
+                        # cache handed from the replica's context engines to its
+                        # generation engines crosses the transceiver on every
+                        # turn. Sizing this by the engine (below) yields
+                        # nodes_per_instance=1 whenever an engine fits in a node,
+                        # which skips domain pinning entirely and lets a replica
+                        # straddle racks -- correct, but with the KV transfer
+                        # demoted from NVLink to InfiniBand.
+                        #
+                        # No pipeline_parallel_size factor: TrtllmGeneration
+                        # asserts pp == 1, so folding it in would only suggest a
+                        # dimension this backend does not have.
+                        def _role_tp(role: str) -> int:
+                            overrides = disagg_cfg.get(f"{role}_trtllm_kwargs") or {}
+                            return int(
+                                overrides.get(
+                                    "tensor_parallel_size",
+                                    trtllm_cfg["tensor_parallel_size"],
+                                )
+                            )
+
+                        gpus_per_instance = int(
+                            disagg_cfg["num_context_engines"] * _role_tp("ctx")
+                            + disagg_cfg["num_generation_engines"] * _role_tp("gen")
+                        )
+                    else:
+                        gpus_per_instance = trtllm_cfg[
+                            "tensor_parallel_size"
+                        ] * trtllm_cfg.get("pipeline_parallel_size", 1)
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
@@ -2304,6 +2334,42 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _apply_empty_rollout_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
+    """Zero loss_multiplier where the rollout produced nothing, and count it.
+
+    NemoGym stands a rollout that returned no assistant turn up as a
+    prompt-only sample so one dead rollout cannot fail the step. Such a sample
+    already contributes 0 to the loss -- it has no trainable tokens -- but
+    without zeroing loss_multiplier it still counts toward num_valid_samples,
+    which would then overstate how much of the batch actually trained.
+
+    The returned count answers "how many rollouts came back empty", which is a
+    statement about generation health, and it deliberately counts every empty
+    rollout rather than only the ones this call was first to zero. The masking
+    metrics are attribution, not a partition: with
+    env.should_mask_flagged_samples on, Gym flags an agent that timed out
+    before its first completion, so the same sample is counted here and in
+    num_mask_sample_filtered. Zeroing is idempotent so the loss is unaffected,
+    but the counts overlap and must not be summed -- num_valid_samples
+    (sample_mask.sum()) is the one authoritative figure for how much of the
+    batch trained.
+    """
+    if "empty_rollout" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    empty_rollout = repeated_batch["empty_rollout"]
+
+    if isinstance(empty_rollout, list):
+        empty_rollout = torch.tensor(empty_rollout, dtype=torch.bool)
+    empty_rollout_bool = empty_rollout.bool()
+
+    num_masked = int(empty_rollout_bool.sum().item())
+    loss_multiplier[empty_rollout_bool] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return num_masked
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -3277,6 +3343,10 @@ def grpo_train(
 
                     num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
+
+                    metrics["num_masked_seqs_by_empty_rollout"] = (
+                        _apply_empty_rollout_filter(repeated_batch)
+                    )
 
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
@@ -4920,6 +4990,9 @@ def async_grpo_train(
                         num_mask_sample_filtered = _apply_mask_sample_filter(
                             repeated_batch
                         )
+                        num_masked_seqs_by_empty_rollout = _apply_empty_rollout_filter(
+                            repeated_batch
+                        )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -5270,6 +5343,7 @@ def async_grpo_train(
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    "num_masked_seqs_by_empty_rollout": num_masked_seqs_by_empty_rollout,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),

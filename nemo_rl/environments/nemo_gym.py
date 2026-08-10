@@ -970,30 +970,99 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
 
-        if not nemo_rl_message_log:
+        is_empty_rollout = not nemo_rl_message_log
+        if is_empty_rollout:
+            # A rollout can end without producing a single assistant turn: the
+            # agent stalls before its first completion (Gym's wall-clock timeout
+            # then kills it, `agent_timed_out`), or every output item was a
+            # reasoning/tool-call item.
+            #
+            # NRL_SKIP_FAILING_EMPTY_ROLLOUT decides what that costs. Default
+            # "0" fails the run, because the usual causes -- a first-turn prompt
+            # over max_model_len, or generation engines that are broken -- are
+            # misconfigurations worth surfacing loudly rather than silently
+            # training around. Set it to "1" on long runs, where losing a step's
+            # other 127 rollouts to one bad sample costs more than the sample is
+            # worth; the sample is then stood up as prompt-only and masked out
+            # of the loss. Note this trades a crash for a run that can keep
+            # going while producing nothing: watch
+            # train/num_masked_seqs_by_empty_rollout, since there is no circuit
+            # breaker on a sustained rate.
             input_messages = nemo_gym_result["responses_create_params"]["input"]
+            prompt_error: Optional[Exception] = None
             try:
                 prompt_token_ids = tokenizer.apply_chat_template(
                     input_messages, tokenize=True
                 )
-                prompt_len_str = f"{len(prompt_token_ids)} tokens"
             except Exception as e:
-                prompt_len_str = (
-                    f"<unknown — apply_chat_template failed: {type(e).__name__}: {e}>"
-                )
+                # An agent that died this early can leave `input` malformed, so
+                # the prompt is not always recoverable.
+                prompt_error = e
+                prompt_token_ids = None
+
             output_item_types = [
                 o.get("type") for o in nemo_gym_result["response"]["output"]
             ]
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated; "
-                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
-                f"  Prompt length: {prompt_len_str}.\n"
-                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
-                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"above the prompt length above.\n"
-                f"  → If (2): inspect why no assistant content was produced for this rollout."
+
+            if os.environ.get("NRL_SKIP_FAILING_EMPTY_ROLLOUT", "0") != "1":
+                prompt_len_str = (
+                    f"{len(prompt_token_ids)} tokens"
+                    if prompt_error is None
+                    else f"<unknown — apply_chat_template failed: "
+                    f"{type(prompt_error).__name__}: {prompt_error}>"
+                )
+                raise ValueError(
+                    f"NeMo Gym returned a result with no generation data. "
+                    f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
+                    f"so vLLM rejected the request before any tokens could be generated; "
+                    f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
+                    f"  Prompt length: {prompt_len_str}.\n"
+                    f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                    f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                    f"above the prompt length above.\n"
+                    f"  → If (2): inspect why no assistant content was produced for this rollout.\n"
+                    f"  → To mask samples like this out of the loss instead of failing, "
+                    f"set NRL_SKIP_FAILING_EMPTY_ROLLOUT=1."
+                )
+
+            # Stand the sample up as prompt-only. With no assistant message it
+            # carries no trainable tokens, so token_loss_mask is empty and it
+            # contributes exactly 0 to the loss (masked_mean normalizes by the
+            # batch-global token count, so no division by zero). Its reward
+            # still reaches the group baseline, which is how every other masked
+            # sample behaves here -- overlong_filtering, Gym's mask_sample, and
+            # seq_logprob_error masking all zero the loss while leaving the
+            # reward in calculate_baseline_and_std_per_prompt (grpo.py passes
+            # torch.ones_like(rewards) as its valid_mask).
+            if prompt_error is not None:
+                # One pad token keeps the tensor typed and non-empty; nothing
+                # reads its value because the message is not trainable.
+                fallback_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+                prompt_token_ids = [fallback_id]
+                print(
+                    "NeMo Gym returned a rollout with no generation data and an "
+                    f"unusable prompt ({type(prompt_error).__name__}: "
+                    f"{prompt_error}); standing it up as a single-token "
+                    "placeholder.",
+                    file=sys.stderr,
+                )
+
+            print(
+                "NeMo Gym returned a result with no generation data; masking it "
+                "from the loss instead of failing the run "
+                "(NRL_SKIP_FAILING_EMPTY_ROLLOUT=1). response.output item "
+                f"types ({len(output_item_types)} items): {output_item_types}. "
+                "A run-wide rise in this message means rollouts are dying before "
+                "they generate -- check the generation engines rather than this "
+                "sample.",
+                file=sys.stderr,
+            )
+            nemo_rl_message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(prompt_token_ids),
+                }
             )
 
         if initial_multimodal_data_omitted:
@@ -1011,6 +1080,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
+            # Surfaced as train/num_masked_seqs_by_empty_rollout: these samples
+            # stand in for a rollout that produced nothing, so a rising count
+            # means generation is failing, not that the policy is doing badly.
+            "empty_rollout": is_empty_rollout,
         }
         if not include_initial_multimodal_data:
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
