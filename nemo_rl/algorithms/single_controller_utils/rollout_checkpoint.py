@@ -28,6 +28,7 @@ from typing import Any, Mapping, Optional
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 1
+BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 2
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
@@ -37,20 +38,96 @@ ROLLOUT_SNAPSHOT_LATEST_FILENAME = "LATEST"
 
 _SNAPSHOT_RE = re.compile(r"snapshot_(\d+)")
 
-# These sections contain paths, credentials, cluster addresses, retention, and
-# other operational values that may legitimately change across a restart.
-# Every other top-level field is included by default so newly added semantic
-# configuration cannot be silently omitted from bootstrap identity.
-_BOOTSTRAP_RUNTIME_CONFIG_FIELDS = frozenset(
+# Keep this projection limited to values needed to interpret persisted rollout
+# state or execute missing siblings. Trainer-only and post-rollout settings do
+# not belong in bootstrap compatibility.
+_BOOTSTRAP_POLICY_FIELDS = frozenset(
     {
-        "checkpointing",
-        "cluster",
-        "data_plane",
-        "logger",
-        "rollout_checkpointing",
-        "token_capture",
+        "model_name",
+        "pretrained_checkpoint",
+        "hf_config_overrides",
+        "max_total_sequence_length",
+        "tokenizer",
     }
 )
+_BOOTSTRAP_GENERATION_FIELDS = frozenset(
+    {
+        "backend",
+        "max_new_tokens",
+        "stop_strings",
+        "stop_token_ids",
+        "temperature",
+        "top_k",
+        "top_p",
+    }
+)
+_BOOTSTRAP_VLLM_FIELDS = frozenset(
+    {
+        "http_server_serving_chat_kwargs",
+        "max_model_len",
+        "reasoning_parser_plugin",
+    }
+)
+_BOOTSTRAP_GRPO_FIELDS = frozenset(
+    {
+        "max_rollout_turns",
+        "num_generations_per_prompt",
+        "num_prompts_per_step",
+        "seed",
+    }
+)
+_BOOTSTRAP_DATA_FIELDS = frozenset(
+    {
+        "default",
+        "max_input_seq_length",
+        "shuffle",
+        "train",
+    }
+)
+_BOOTSTRAP_TOKEN_CAPTURE_FIELDS = frozenset(
+    {
+        "enabled",
+        "min_valid_fraction_per_group",
+        "mixed_weight_version_policy",
+        "staging_partition",
+    }
+)
+_BOOTSTRAP_ENV_RUNTIME_FIELDS = frozenset(
+    {
+        "apptainer_memory_limit_mb",
+        "concurrency",
+        "nemo_gym_log_dir",
+        "num_gpu_nodes",
+        "port_range_high",
+        "port_range_low",
+        "should_log_nemo_gym_responses",
+        "skip_venv_if_present",
+        "use_absolute_ip",
+    }
+)
+
+
+def _select_fields(
+    mapping: Mapping[str, Any] | None,
+    fields: frozenset[str],
+) -> dict[str, Any]:
+    """Select explicitly rollout-semantic fields from one config section."""
+    if mapping is None:
+        return {}
+    return {key: mapping[key] for key in sorted(fields) if key in mapping}
+
+
+def _drop_runtime_fields(value: Any, runtime_fields: frozenset[str]) -> Any:
+    """Recursively strip known operational leaves from an environment."""
+    if isinstance(value, Mapping):
+        return {
+            key: _drop_runtime_fields(child, runtime_fields)
+            for key, child in value.items()
+            if key not in runtime_fields
+        }
+    if isinstance(value, list):
+        return [_drop_runtime_fields(child, runtime_fields) for child in value]
+    return value
 
 
 def _fsync_file(path: Path) -> None:
@@ -156,21 +233,79 @@ class ResolvedRolloutCheckpoint:
     manifest: RolloutSnapshotManifest
 
 
-def bootstrap_fingerprint(master_config: MasterConfig) -> str:
-    """Hash stable inputs needed to reconstruct the untrained policy exactly.
+@dataclass(frozen=True)
+class BootstrapCompatibilityIdentity:
+    """Rollout-semantic inputs that must match a trainer-version-zero cut."""
 
-    Runtime-only settings such as logging paths, checkpoint deadlines, and the
-    per-process Gym control token are deliberately excluded so a fresh process
-    can resume the same bootstrap state with different operational settings.
+    schema_version: int
+    model: Mapping[str, Any]
+    generation: Mapping[str, Any]
+    rollout: Mapping[str, Any]
+    dataset: Mapping[str, Any]
+    environment: Mapping[str, Any]
+    sampler: Mapping[str, Any]
+    token_capture: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def bootstrap_compatibility_identity(
+    master_config: MasterConfig,
+) -> BootstrapCompatibilityIdentity:
+    """Project a full run config onto inputs that affect recovered rollouts.
+
+    Dataset identity is intentionally retained because a bootstrap snapshot
+    restores the dataloader cursor together with its unfinished prompt ledger.
+    Cluster shape, logging, checkpoint paths, worker counts, and other runtime
+    tuning are excluded so they may change across a restart.
     """
     dumped = master_config.model_dump(mode="json")
-    identity = {
-        key: value
-        for key, value in dumped.items()
-        if key not in _BOOTSTRAP_RUNTIME_CONFIG_FIELDS
-    }
+    policy = dumped.get("policy", {})
+    generation = policy.get("generation", {})
+    generation_identity = _select_fields(
+        generation,
+        _BOOTSTRAP_GENERATION_FIELDS,
+    )
+    vllm_identity = _select_fields(
+        generation.get("vllm_cfg", {}),
+        _BOOTSTRAP_VLLM_FIELDS,
+    )
+    if vllm_identity:
+        generation_identity["vllm_cfg"] = vllm_identity
+
+    async_rl = dumped.get("async_rl", {})
+    sampler = async_rl.get("sampler", {})
+    if not isinstance(sampler, Mapping):
+        sampler = {}
+
+    return BootstrapCompatibilityIdentity(
+        schema_version=BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
+        model=_select_fields(policy, _BOOTSTRAP_POLICY_FIELDS),
+        generation=generation_identity,
+        rollout=_select_fields(dumped.get("grpo", {}), _BOOTSTRAP_GRPO_FIELDS),
+        dataset=_select_fields(dumped.get("data", {}), _BOOTSTRAP_DATA_FIELDS),
+        environment=_drop_runtime_fields(
+            dumped.get("env", {}),
+            _BOOTSTRAP_ENV_RUNTIME_FIELDS,
+        ),
+        sampler=dict(sampler),
+        token_capture=_select_fields(
+            dumped.get("token_capture", {}),
+            _BOOTSTRAP_TOKEN_CAPTURE_FIELDS,
+        ),
+    )
+
+
+def bootstrap_fingerprint(master_config: MasterConfig) -> str:
+    """Hash rollout-semantic inputs needed to reuse a bootstrap snapshot.
+
+    This is a compatibility guard, not a hash of the full training recipe.
+    Operational settings are deliberately excluded so a restart may use a
+    different cluster shape, checkpoint interval, or logging destination.
+    """
     payload = json.dumps(
-        identity,
+        bootstrap_compatibility_identity(master_config).to_dict(),
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -222,6 +357,24 @@ def ensure_bootstrap_anchor(checkpoint_dir: Path, *, fingerprint: str) -> Path:
     _fsync_directory(anchor)
     _fsync_directory(anchor.parent)
     return anchor
+
+
+def reset_bootstrap_anchor(checkpoint_dir: Path, *, fingerprint: str) -> Path:
+    """Discard skipped pre-step snapshots and start a new bootstrap lineage.
+
+    This is used only when restore mode deliberately skips partial-rollout
+    recovery and no trainer checkpoint exists. The user's restore choice makes
+    the previous state intentionally unreachable; removing it also prevents a
+    later periodic save from appending to an incompatible bootstrap anchor.
+    """
+    anchor = checkpoint_dir / BOOTSTRAP_DIRNAME
+    snapshot_root = anchor / ROLLOUT_SNAPSHOTS_DIRNAME
+    if snapshot_root.exists():
+        shutil.rmtree(snapshot_root)
+    manifest_path = anchor / BOOTSTRAP_MANIFEST_FILENAME
+    if manifest_path.exists():
+        manifest_path.unlink()
+    return ensure_bootstrap_anchor(checkpoint_dir, fingerprint=fingerprint)
 
 
 def validate_bootstrap_anchor(anchor: Path, *, fingerprint: str) -> None:

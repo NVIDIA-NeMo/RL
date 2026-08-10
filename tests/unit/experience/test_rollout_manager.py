@@ -1243,7 +1243,13 @@ class TestGenerateAndFinalizeFlow:
                 reward=0.5,
             )
 
-        committed = _run(mgr.recover_group(group.group_id))
+        committed = _run(
+            mgr.ensure_rollout_group(
+                _capture_sample(),
+                group_id=group.group_id,
+                target_step=None,
+            )
+        )
 
         assert committed is True
         assert mgr._impl.seen_rollout_ids is None

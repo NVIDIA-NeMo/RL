@@ -41,6 +41,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
+from collections import Counter
 from typing import (
     Annotated,
     Callable,
@@ -105,15 +106,43 @@ class PromptGroupSampler(Protocol):
     def supports_buffer_checkpoint(self) -> bool:
         """True when buffered groups may be checkpointed and restored.
 
-        Gated policies dispatch a fixed quota per trainer step, so groups
-        restored from a checkpoint can never complete an already-consumed
-        quota window — only ungated (over-sampled) policies can consume them.
+        Gated policies must additionally restore their admission cursor so
+        fresh dispatch cannot reuse a target already represented by restored
+        replay or recovery-ledger groups.
         """
         ...
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
+
+
+@runtime_checkable
+class TwoPhaseAdmissionSampler(Protocol):
+    """Sampler whose blocking gate is separate from its durable admission.
+
+    Waiting happens outside the checkpoint barrier. The non-blocking commit is
+    performed atomically with dataloader advancement and ledger reservation.
+    """
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None: ...
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]: ...
+
+
+@runtime_checkable
+class CheckpointDispatchSampler(Protocol):
+    """Sampler that can reconstruct dispatch state from restored groups."""
+
+    def restore_dispatch_state(
+        self,
+        *,
+        current_train_weight: int,
+        restored_target_steps: list[Optional[int]],
+        groups_per_step: int,
+    ) -> None: ...
 
 
 class BaseSampler(abc.ABC):
@@ -146,10 +175,32 @@ class BaseSampler(abc.ABC):
         self._dispatch_index: int = resume_from_step - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
-    @abc.abstractmethod
-    async def admit(
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        """Wait for and atomically claim one prompt-batch admission."""
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self.commit_admission(trainer_version=trainer_version_fn())
+
+    async def wait_until_admissible(
         self, *, trainer_version_fn: Callable[[], int]
-    ) -> Optional[int]: ...
+    ) -> None:
+        """Wait until one batch may be admitted; ungated by default."""
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]:
+        """Claim one already-admissible batch; unstamped by default."""
+        return None
+
+    def restore_dispatch_state(
+        self,
+        *,
+        current_train_weight: int,
+        restored_target_steps: list[Optional[int]],
+        groups_per_step: int,
+    ) -> None:
+        """Validate the default unstamped checkpoint representation."""
+        if any(target is not None for target in restored_target_steps):
+            raise ValueError(
+                f"{type(self).__name__} cannot restore stamped target steps"
+            )
 
     # ── train-pump side ──────────────────────────────────────────────────
     @abc.abstractmethod
@@ -334,9 +385,20 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]:
+        if self._dispatch_index >= trainer_version + self._gate_window:
+            raise RuntimeError(
+                "sampler admission was committed before its gate opened: "
+                f"dispatch_index={self._dispatch_index}, "
+                f"trainer_version={trainer_version}, "
+                f"gate_window={self._gate_window}"
+            )
         self._dispatch_index += 1
         return self._stamp()
 
@@ -419,6 +481,66 @@ class InOrderSampler(_GatedSampler):
     def _stamp(self) -> Optional[int]:
         return self._dispatch_index
 
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        return True
+
+    def restore_dispatch_state(
+        self,
+        *,
+        current_train_weight: int,
+        restored_target_steps: list[Optional[int]],
+        groups_per_step: int,
+    ) -> None:
+        """Resume after the highest target already admitted before the cut."""
+        if groups_per_step < 1:
+            raise ValueError(f"groups_per_step must be positive, got {groups_per_step}")
+        if not restored_target_steps:
+            return
+        if any(target is None for target in restored_target_steps):
+            raise ValueError("restored InOrder groups must have target_step values")
+
+        target_steps: list[int] = [
+            target for target in restored_target_steps if target is not None
+        ]
+        counts: Counter[int] = Counter(target_steps)
+        oldest_target = min(counts)
+        newest_target = max(counts)
+        if oldest_target < current_train_weight:
+            raise ValueError(
+                "restored InOrder target is older than the trainer: "
+                f"oldest_target={oldest_target}, "
+                f"trainer_version={current_train_weight}"
+            )
+        max_allowed_target = current_train_weight + self.max_lookahead_versions
+        if newest_target > max_allowed_target:
+            raise ValueError(
+                "restored InOrder target exceeds the configured lookahead: "
+                f"newest_target={newest_target}, "
+                f"max_allowed_target={max_allowed_target}"
+            )
+
+        expected_targets = set(range(current_train_weight, newest_target + 1))
+        if set(counts) != expected_targets:
+            raise ValueError(
+                "restored InOrder targets are not contiguous from the current "
+                f"trainer version: restored={sorted(counts)}, "
+                f"expected={sorted(expected_targets)}"
+            )
+        invalid_counts = {
+            target: count
+            for target, count in counts.items()
+            if count != groups_per_step
+        }
+        if invalid_counts:
+            raise ValueError(
+                "restored InOrder target batches do not contain exactly "
+                f"grpo.num_prompts_per_step={groups_per_step} groups: "
+                f"counts={dict(sorted(counts.items()))}"
+            )
+
+        self._dispatch_index = newest_target
+
     async def select(
         self,
         *,
@@ -472,7 +594,7 @@ class WeightFifoSamplerConfig(BaseModel, extra="allow"):
 
 
 class InOrderSamplerConfig(BaseModel, extra="allow"):
-    supports_buffer_checkpoint: ClassVar[bool] = False
+    supports_buffer_checkpoint: ClassVar[bool] = True
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
     max_lookahead_versions: NonNegativeInt = 1

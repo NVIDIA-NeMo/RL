@@ -27,7 +27,29 @@ MAX_BUFFERED_ROLLOUTS=${SC_TQ_RECOVERY_MAX_BUFFERED_ROLLOUTS:-8}
 MAX_NUM_STEPS=${SC_TQ_RECOVERY_MAX_NUM_STEPS:-10}
 TRAINER_SAVE_PERIOD=${SC_TQ_RECOVERY_SAVE_PERIOD:-5}
 PARTIAL_SNAPSHOT_TIMEOUT_S=${SC_TQ_RECOVERY_SNAPSHOT_TIMEOUT_S:-1800}
+SAMPLER_NAME=${SC_TQ_RECOVERY_SAMPLER_NAME:-windowed}
+IN_ORDER_LOOKAHEAD=${SC_TQ_RECOVERY_IN_ORDER_LOOKAHEAD:-1}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
+
+case "$SAMPLER_NAME" in
+    windowed)
+        SAMPLER_OVERRIDES=(
+            async_rl.sampler.name=windowed
+            '~async_rl.sampler.max_lookahead_versions'
+            '+async_rl.sampler.max_staleness_versions=1'
+        )
+        ;;
+    in_order)
+        SAMPLER_OVERRIDES=(
+            async_rl.sampler.name=in_order
+            async_rl.sampler.max_lookahead_versions="$IN_ORDER_LOOKAHEAD"
+        )
+        ;;
+    *)
+        echo "SC_TQ_RECOVERY_SAMPLER_NAME must be windowed or in_order"
+        exit 2
+        ;;
+esac
 
 if (( NUM_PROMPTS < 1 || NUM_GENERATIONS < 2 )); then
     echo "NUM_PROMPTS must be positive and NUM_GENERATIONS must be at least 2"
@@ -41,12 +63,17 @@ if (( MAX_BUFFERED_ROLLOUTS < NUM_PROMPTS )); then
     echo "MAX_BUFFERED_ROLLOUTS must hold at least one prompt batch"
     exit 2
 fi
+if [[ "$SAMPLER_NAME" == "in_order" ]] &&
+    (( MAX_BUFFERED_ROLLOUTS < NUM_PROMPTS * (IN_ORDER_LOOKAHEAD + 1) )); then
+    echo "MAX_BUFFERED_ROLLOUTS is too small for the InOrder lookahead window"
+    exit 2
+fi
 if (( TRAINER_SAVE_PERIOD < 1 || TRAINER_SAVE_PERIOD >= MAX_NUM_STEPS )); then
     echo "TRAINER_SAVE_PERIOD must be positive and smaller than MAX_NUM_STEPS"
     exit 2
 fi
 
-echo "Recovery test configuration: model=$MODEL_NAME prompts=$NUM_PROMPTS generations=$NUM_GENERATIONS min_sealed=$MIN_SEALED max_inflight=$MAX_INFLIGHT_PROMPTS max_buffered=$MAX_BUFFERED_ROLLOUTS steps=$MAX_NUM_STEPS trainer_save_period=$TRAINER_SAVE_PERIOD snapshot_timeout_s=$PARTIAL_SNAPSHOT_TIMEOUT_S"
+echo "Recovery test configuration: model=$MODEL_NAME prompts=$NUM_PROMPTS generations=$NUM_GENERATIONS min_sealed=$MIN_SEALED max_inflight=$MAX_INFLIGHT_PROMPTS max_buffered=$MAX_BUFFERED_ROLLOUTS steps=$MAX_NUM_STEPS trainer_save_period=$TRAINER_SAVE_PERIOD snapshot_timeout_s=$PARTIAL_SNAPSHOT_TIMEOUT_S sampler=$SAMPLER_NAME in_order_lookahead=$IN_ORDER_LOOKAHEAD"
 
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
@@ -80,9 +107,7 @@ COMMON_OVERRIDES=(
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
     checkpointing.save_period="$TRAINER_SAVE_PERIOD"
     ++data_plane.checkpointing_enabled=true
-    async_rl.sampler.name=windowed
-    '~async_rl.sampler.max_lookahead_versions'
-    '+async_rl.sampler.max_staleness_versions=1'
+    "${SAMPLER_OVERRIDES[@]}"
     async_rl.max_inflight_prompts="$MAX_INFLIGHT_PROMPTS"
     async_rl.max_buffered_rollouts="$MAX_BUFFERED_ROLLOUTS"
     ++rollout_checkpointing.interval_s=0.25
@@ -257,6 +282,9 @@ bash "$BASE_TEST" "${COMMON_OVERRIDES[@]}"
 grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q "Restored rollout recovery ledger" "$PHASE2_LOG"
+if [[ "$SAMPLER_NAME" == "in_order" ]]; then
+    grep -Eq "Restored sampler dispatch state: sampler=InOrderSampler, .*newest_target=" "$PHASE2_LOG"
+fi
 grep -Eq "rollout recovery finalized group: .*reused=[1-9][0-9]* redispatched=[1-9][0-9]*" "$PHASE2_LOG"
 grep -q "rollout recovery replay completed" "$PHASE2_LOG"
 grep -q "train step $MAX_NUM_STEPS/$MAX_NUM_STEPS" "$PHASE2_LOG"

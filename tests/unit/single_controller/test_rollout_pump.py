@@ -271,6 +271,18 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
 
 def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
     events: list[str] = []
+    barrier = DataPlaneCheckpointBarrier()
+
+    class _RecordingInOrderSampler(InOrderSampler):
+        async def wait_until_admissible(self, *, trainer_version_fn) -> None:
+            assert barrier._active_mutations == 0
+            events.append("wait")
+            await super().wait_until_admissible(trainer_version_fn=trainer_version_fn)
+
+        def commit_admission(self, *, trainer_version: int) -> int | None:
+            assert barrier._active_mutations == 1
+            events.append("commit")
+            return super().commit_admission(trainer_version=trainer_version)
 
     class _RecordingRolloutManager:
         def reserve_prompt_group(
@@ -281,15 +293,16 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
             events.append(f"reserve-{prompt_id}")
             return f"group-{prompt_id}"
 
-        async def generate_and_push(
+        async def ensure_rollout_group(
             self,
             prompt: Any,
             *,
             target_step: int | None = None,
-            recovery_group_id: str | None = None,
-        ) -> None:
+            group_id: str,
+        ) -> bool:
             del target_step
-            events.append(f"dispatch-{prompt['idx']}-{recovery_group_id}")
+            events.append(f"dispatch-{prompt['idx']}-{group_id}")
+            return True
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -299,7 +312,7 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
         token_capture=SimpleNamespace(enabled=True),
     )
     ctrl._rollout_manager = _RecordingRolloutManager()
-    ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+    ctrl._sampler = _RecordingInOrderSampler(None, max_lookahead_versions=1)
     ctrl._dataloader = [
         BatchedDataDict(
             {
@@ -311,7 +324,7 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
             }
         )
     ]
-    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._data_plane_checkpoint_barrier = barrier
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
@@ -327,10 +340,15 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
     asyncio.run(ctrl._rollout_pump())
 
     assert events == [
+        "wait",
+        "commit",
         "reserve-10",
         "reserve-11",
         "dispatch-10-group-10",
         "dispatch-11-group-11",
+        # The pump checks admission before probing end-of-epoch, but does not
+        # commit another dispatch index when the dataloader is exhausted.
+        "wait",
     ]
     # The two completed groups retain their buffer permits. The additional
     # end-of-epoch probe must return the pre-acquired batch capacity.
@@ -354,18 +372,19 @@ def test_token_capture_waits_for_capacity_before_reserving_next_batch() -> None:
                 self.reserved_prompt_ids.append(prompt_id)
                 return f"group-{prompt_id}"
 
-            async def generate_and_push(
+            async def ensure_rollout_group(
                 self,
                 prompt: Any,
                 *,
                 target_step: int | None = None,
-                recovery_group_id: str | None = None,
-            ) -> None:
-                del prompt, target_step, recovery_group_id
+                group_id: str,
+            ) -> bool:
+                del prompt, target_step, group_id
                 self._started += 1
                 if self._started == 2:
                     self.first_batch_started.set()
                 await asyncio.Event().wait()
+                return True
 
         manager = _BlockingRolloutManager()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
