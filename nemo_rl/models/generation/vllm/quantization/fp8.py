@@ -87,76 +87,6 @@ fp8_state: FP8State = FP8State()
 fp8_patches_applied = False
 
 
-def _str_to_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "on")
-
-
-def _set_fp8_config_env(fp8_config: FP8Config) -> None:
-    """Propagate refit settings to vLLM worker child processes."""
-    os.environ["NRL_FP8_USE_WEIGHT_POW2_SCALE"] = str(
-        int(fp8_config.use_weight_pow2_scale)
-    )
-    os.environ["NRL_FP8_USE_ACTIVATION_POW2_SCALE"] = str(
-        int(fp8_config.use_activation_pow2_scale)
-    )
-    os.environ["NRL_FP8_NUM_FIRST_LAYERS_IN_BF16"] = str(
-        fp8_config.num_first_layers_in_bf16
-    )
-    os.environ["NRL_FP8_NUM_LAST_LAYERS_IN_BF16"] = str(
-        fp8_config.num_last_layers_in_bf16
-    )
-    os.environ["NRL_FP8_MODEL_PARALLEL_SIZE"] = (
-        ""
-        if fp8_config.model_parallel_size is None
-        else str(fp8_config.model_parallel_size)
-    )
-    os.environ["NRL_FP8_KV_CACHE_DTYPE"] = fp8_config.kv_cache_dtype
-    os.environ["NRL_FP8_USE_WEIGHTS"] = str(int(fp8_config.use_fp8_weights))
-    os.environ["NRL_FP8_IS_MX"] = str(int(fp8_config.is_mx))
-
-
-def _resolve_fp8_config(model_runner: Any = None) -> FP8Config:
-    """Resolve FP8 settings in vLLM engine and Ray worker child processes."""
-    global global_fp8_config
-    if global_fp8_config is not None:
-        return global_fp8_config
-
-    vllm_config = getattr(model_runner, "vllm_config", None)
-    runner_fp8_config = getattr(vllm_config, "nrl_fp8_cfg", None)
-    if isinstance(runner_fp8_config, FP8Config):
-        global_fp8_config = runner_fp8_config
-        return global_fp8_config
-
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    cache_config = getattr(vllm_config, "cache_config", None)
-    model_parallel_size = getattr(parallel_config, "tensor_parallel_size", None)
-    kv_cache_dtype = getattr(cache_config, "cache_dtype", "auto")
-
-    global_fp8_config = FP8Config(
-        use_weight_pow2_scale=_str_to_bool(
-            os.environ.get("NRL_FP8_USE_WEIGHT_POW2_SCALE")
-        ),
-        use_activation_pow2_scale=_str_to_bool(
-            os.environ.get("NRL_FP8_USE_ACTIVATION_POW2_SCALE")
-        ),
-        num_first_layers_in_bf16=int(
-            os.environ.get("NRL_FP8_NUM_FIRST_LAYERS_IN_BF16", "0")
-        ),
-        num_last_layers_in_bf16=int(
-            os.environ.get("NRL_FP8_NUM_LAST_LAYERS_IN_BF16", "0")
-        ),
-        model_parallel_size=int(
-            os.environ.get("NRL_FP8_MODEL_PARALLEL_SIZE") or model_parallel_size or 1
-        ),
-        kv_cache_dtype=os.environ.get("NRL_FP8_KV_CACHE_DTYPE", kv_cache_dtype),
-        use_fp8_weights=_str_to_bool(os.environ.get("NRL_FP8_USE_WEIGHTS"), True),
-        is_mx=_str_to_bool(os.environ.get("NRL_FP8_IS_MX")),
-    )
-    return global_fp8_config
-
-
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
 
@@ -291,13 +221,6 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
-def ensure_fp8_patches_applied(model_runner: Any = None) -> None:
-    """Install FP8 vLLM monkey patches in the current worker process."""
-    if fp8_patches_applied:
-        return
-    apply_fp8_patches(None, _resolve_fp8_config(model_runner))
-
-
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
@@ -367,7 +290,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "pow2_activation_scaling_factors", False
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
-    _set_fp8_config_env(global_fp8_config)
 
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
@@ -1190,8 +1112,7 @@ def _restore_weight_loaders(
 
 
 def load_weights(weights, model_runner):
-    ensure_fp8_patches_applied(model_runner)
-    fp8_config = _resolve_fp8_config(model_runner)
+    fp8_config = global_fp8_config
     weights_quantized = []
     model = model_runner.model
     for k, v in weights:
@@ -1303,7 +1224,7 @@ def cast_tensor_to_fp8_blockwise(
     descale = max_abs / max_dtype
 
     if fp8_config is None:
-        fp8_config = _resolve_fp8_config()
+        fp8_config = global_fp8_config
     if fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
@@ -1556,7 +1477,6 @@ def _reset_fp8_moe_params_for_refit(model: torch.nn.Module) -> None:
 
 def prepare_fp8_model_for_refit(model_runner: Any) -> None:
     """Restore refit-loadable parameters before a streamed FP8 weight update."""
-    ensure_fp8_patches_applied(model_runner)
     # Import lazily because DeepGEMM is an optional vLLM runtime dependency.
     from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
