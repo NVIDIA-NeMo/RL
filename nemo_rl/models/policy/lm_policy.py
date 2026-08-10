@@ -38,6 +38,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.automodel.shared_prefix import (
+    SHARED_PREFIX_GROUP_IDS,
+    SHARED_PREFIX_LENGTHS,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -514,10 +518,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["train_mb_tokens"]
+            train_packing_args = self.sequence_packing_args
+            if self.cfg.get("shared_prefix_training"):
+                train_packing_args = {
+                    **self.sequence_packing_args,
+                    "shared_prefix_group_ids_key": SHARED_PREFIX_GROUP_IDS,
+                    "shared_prefix_lengths_key": SHARED_PREFIX_LENGTHS,
+                }
             sharded_data, _ = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
-                sequence_packing_args=self.sequence_packing_args,
+                sequence_packing_args=train_packing_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(

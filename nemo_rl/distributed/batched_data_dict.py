@@ -27,12 +27,16 @@ from typing import (
 )
 
 import torch
-from typing_extensions import Self
+from typing_extensions import NotRequired, Self
 
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
 )
-from nemo_rl.data.packing import get_packer
+from nemo_rl.data.packing import (
+    get_packer,
+    pack_shared_prefix_sequences,
+    shared_prefix_bin_length,
+)
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -54,6 +58,8 @@ class SequencePackingArgs(TypedDict):
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
+    shared_prefix_group_ids_key: NotRequired[str]
+    shared_prefix_lengths_key: NotRequired[str]
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -447,12 +453,23 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 data[k] = sorted_v
 
         elif sequence_packing_args is not None:
-            bin_packer = get_packer(
-                algorithm=sequence_packing_args["algorithm"],
-                bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
-                collect_metrics=False,  # TODO(ahmadki): make configurable
-                min_bin_count=shards,
-                bin_count_multiple=shards,
+            shared_group_key = sequence_packing_args.get("shared_prefix_group_ids_key")
+            shared_prompt_key = sequence_packing_args.get("shared_prefix_lengths_key")
+            if (shared_group_key is None) != (shared_prompt_key is None):
+                raise ValueError(
+                    "shared-prefix sequence packing requires both metadata keys"
+                )
+            use_shared_prefix_cost = shared_group_key is not None
+            bin_packer = (
+                None
+                if use_shared_prefix_cost
+                else get_packer(
+                    algorithm=sequence_packing_args["algorithm"],
+                    bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
+                    collect_metrics=False,  # TODO(ahmadki): make configurable
+                    min_bin_count=shards,
+                    bin_count_multiple=shards,
+                )
             )
 
             input_lengths_key = sequence_packing_args["input_lengths_key"]
@@ -465,6 +482,28 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             def _get_padded_seqlen(seqlen: int) -> int:
                 return (seqlen + pad_multiple - 1) // pad_multiple * pad_multiple
 
+            padded_input_lens = [
+                _get_padded_seqlen(int(sequence_length))
+                for sequence_length in input_lens.tolist()
+            ]
+            if use_shared_prefix_cost:
+                assert shared_group_key is not None and shared_prompt_key is not None
+                prompt_lens = [
+                    int(prompt_length)
+                    for prompt_length in self.data[shared_prompt_key].tolist()
+                ]
+                group_ids = [
+                    int(group_id) for group_id in self.data[shared_group_key].tolist()
+                ]
+                # Compact execution consumes the real input lengths and drops
+                # the ordinary TP-alignment tail. Charging rounded full lengths
+                # here would turn that tail into fake response tokens.
+                packing_input_lens = [
+                    int(sequence_length) for sequence_length in input_lens.tolist()
+                ]
+            else:
+                packing_input_lens = padded_input_lens
+
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
 
@@ -473,16 +512,23 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 chunk_start = chunk_idx * batch_size
                 chunk_end = (chunk_idx + 1) * batch_size
 
-                # Get sequence lengths for this chunk
-                chunk_seqlens = input_lens[chunk_start:chunk_end]
-                chunk_padded_seqlens_list = [
-                    _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
-                ]
+                chunk_padded_seqlens_list = packing_input_lens[chunk_start:chunk_end]
 
                 # Pack sequences in this chunk into bins
-                chunk_bin_assignments = bin_packer.pack(
-                    sequence_lengths=chunk_padded_seqlens_list,
-                )
+                if use_shared_prefix_cost:
+                    chunk_bin_assignments = pack_shared_prefix_sequences(
+                        sequence_lengths=chunk_padded_seqlens_list,
+                        prompt_lengths=prompt_lens[chunk_start:chunk_end],
+                        group_ids=group_ids[chunk_start:chunk_end],
+                        bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
+                        min_bin_count=shards,
+                        bin_count_multiple=shards,
+                    )
+                else:
+                    assert bin_packer is not None
+                    chunk_bin_assignments = bin_packer.pack(
+                        sequence_lengths=chunk_padded_seqlens_list,
+                    )
                 all_chunk_bin_assignments.append(chunk_bin_assignments)
 
             # create shards with the packed bins
@@ -509,12 +555,17 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         self.select_indices(global_bin_indices)
                     )
                     global_indices_per_shard[shard_idx].extend(global_bin_indices)
-                    bin_seqlen = sum(
-                        [
-                            _get_padded_seqlen(input_lens[i].item())
-                            for i in global_bin_indices
-                        ]
-                    )
+                    if use_shared_prefix_cost:
+                        bin_seqlen = shared_prefix_bin_length(
+                            global_bin_indices,
+                            packing_input_lens,
+                            prompt_lens,
+                            group_ids,
+                        )
+                    else:
+                        bin_seqlen = sum(
+                            padded_input_lens[i] for i in global_bin_indices
+                        )
 
                     if chunk_sharded_micro_indices[shard_idx] == []:
                         chunk_sharded_micro_indices[shard_idx].append(

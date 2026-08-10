@@ -652,6 +652,180 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         return [[idx for idx, _ in b] for b in bins if b]
 
 
+def shared_prefix_bin_length(
+    bin_indices: List[int],
+    sequence_lengths: List[int],
+    prompt_lengths: List[int],
+    group_ids: List[int],
+) -> int:
+    """Return physical tokens after deduplicating each group's prompt in a bin."""
+    seen_groups = set()
+    total = 0
+    for index in bin_indices:
+        prompt_length = prompt_lengths[index]
+        total += sequence_lengths[index] - prompt_length
+        if group_ids[index] not in seen_groups:
+            total += prompt_length
+            seen_groups.add(group_ids[index])
+    return total
+
+
+def pack_shared_prefix_sequences(
+    sequence_lengths: List[int],
+    prompt_lengths: List[int],
+    group_ids: List[int],
+    bin_capacity: int,
+    min_bin_count: Optional[int] = None,
+    bin_count_multiple: Optional[int] = None,
+) -> List[List[int]]:
+    """First-fit pack rollouts, charging a prompt once per group and bin.
+
+    Each group is first split into the minimum first-fit response fragments, each
+    charged for one prompt. Those fragments are then packed without splitting,
+    so another group's tail space cannot cause an avoidable prompt recomputation.
+    """
+    if not (len(sequence_lengths) == len(prompt_lengths) == len(group_ids)):
+        raise ValueError(
+            "sequence_lengths, prompt_lengths, and group_ids must have equal size"
+        )
+    if not sequence_lengths:
+        return []
+
+    rows_by_group: Dict[int, List[int]] = {}
+    group_order = []
+    group_prompt_lengths: Dict[int, int] = {}
+    for index, (sequence_length, prompt_length, group_id) in enumerate(
+        zip(sequence_lengths, prompt_lengths, group_ids)
+    ):
+        if not 0 < prompt_length < sequence_length <= bin_capacity:
+            raise ValueError(
+                "shared-prefix packing requires 0 < prompt < sequence <= capacity"
+            )
+        if group_id not in rows_by_group:
+            rows_by_group[group_id] = []
+            group_order.append(group_id)
+            group_prompt_lengths[group_id] = prompt_length
+        elif group_prompt_lengths[group_id] != prompt_length:
+            raise ValueError("a shared-prefix group must have one prompt length")
+        rows_by_group[group_id].append(index)
+
+    fragments: List[List[int]] = []
+    fragment_lengths: List[int] = []
+    fragment_prompt_lengths: List[int] = []
+    for group_id in group_order:
+        prompt_length = group_prompt_lengths[group_id]
+        rows = sorted(
+            rows_by_group[group_id],
+            key=lambda index: sequence_lengths[index] - prompt_lengths[index],
+            reverse=True,
+        )
+        group_fragments: List[List[int]] = []
+        group_response_lengths: List[int] = []
+        for index in rows:
+            response_length = sequence_lengths[index] - prompt_lengths[index]
+            for fragment_index, current_response_length in enumerate(
+                group_response_lengths
+            ):
+                if (
+                    prompt_length + current_response_length + response_length
+                    <= bin_capacity
+                ):
+                    group_fragments[fragment_index].append(index)
+                    group_response_lengths[fragment_index] += response_length
+                    break
+            else:
+                group_fragments.append([index])
+                group_response_lengths.append(response_length)
+        for fragment, response_length in zip(group_fragments, group_response_lengths):
+            fragments.append(fragment)
+            fragment_lengths.append(prompt_length + response_length)
+            fragment_prompt_lengths.append(prompt_length)
+
+    # Treat each minimal within-group fragment as indivisible when combining
+    # different prompt groups. This avoids creating an extra prompt copy merely
+    # to fill another group's small tail gap.
+    fragment_bins: List[List[int]] = []
+    outer_bin_lengths: List[int] = []
+    for fragment_index in sorted(
+        range(len(fragments)),
+        key=lambda index: fragment_lengths[index],
+        reverse=True,
+    ):
+        for bin_index, current_length in enumerate(outer_bin_lengths):
+            if current_length + fragment_lengths[fragment_index] <= bin_capacity:
+                fragment_bins[bin_index].append(fragment_index)
+                outer_bin_lengths[bin_index] += fragment_lengths[fragment_index]
+                break
+        else:
+            fragment_bins.append([fragment_index])
+            outer_bin_lengths.append(fragment_lengths[fragment_index])
+
+    target_bin_count = len(fragment_bins)
+    if min_bin_count is not None:
+        target_bin_count = max(target_bin_count, min_bin_count)
+    if bin_count_multiple is not None:
+        remainder = target_bin_count % bin_count_multiple
+        if remainder:
+            target_bin_count += bin_count_multiple - remainder
+    if target_bin_count > len(sequence_lengths):
+        raise ValueError(
+            f"Cannot create {target_bin_count} nonempty bins from "
+            f"{len(sequence_lengths)} sequences"
+        )
+    while len(fragment_bins) < target_bin_count:
+        multi_fragment_sources = [
+            index for index, contents in enumerate(fragment_bins) if len(contents) > 1
+        ]
+        if multi_fragment_sources:
+            source = max(
+                multi_fragment_sources,
+                key=lambda index: outer_bin_lengths[index],
+            )
+            moved_fragment = max(
+                fragment_bins[source], key=lambda index: fragment_lengths[index]
+            )
+            fragment_bins[source].remove(moved_fragment)
+            outer_bin_lengths[source] -= fragment_lengths[moved_fragment]
+            fragment_bins.append([moved_fragment])
+            outer_bin_lengths.append(fragment_lengths[moved_fragment])
+            continue
+
+        source = max(
+            (
+                index
+                for index in range(len(fragment_bins))
+                if len(fragments[fragment_bins[index][0]]) > 1
+            ),
+            key=lambda index: fragment_lengths[fragment_bins[index][0]],
+        )
+        fragment_index = fragment_bins[source][0]
+        left_rows: List[int] = []
+        right_rows: List[int] = []
+        response_totals = [0, 0]
+        for row in sorted(
+            fragments[fragment_index],
+            key=lambda index: sequence_lengths[index] - prompt_lengths[index],
+            reverse=True,
+        ):
+            target = 0 if response_totals[0] <= response_totals[1] else 1
+            (left_rows if target == 0 else right_rows).append(row)
+            response_totals[target] += sequence_lengths[row] - prompt_lengths[row]
+        prompt_length = fragment_prompt_lengths[fragment_index]
+        fragments[fragment_index] = left_rows
+        fragment_lengths[fragment_index] = prompt_length + response_totals[0]
+        outer_bin_lengths[source] = fragment_lengths[fragment_index]
+        fragments.append(right_rows)
+        fragment_lengths.append(prompt_length + response_totals[1])
+        fragment_prompt_lengths.append(prompt_length)
+        fragment_bins.append([len(fragments) - 1])
+        outer_bin_lengths.append(fragment_lengths[-1])
+
+    return [
+        [row for fragment_index in fragment_bin for row in fragments[fragment_index]]
+        for fragment_bin in fragment_bins
+    ]
+
+
 def get_packer(
     algorithm: Union[PackingAlgorithm, str],
     bin_capacity: int,

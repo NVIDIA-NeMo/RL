@@ -23,7 +23,101 @@ from nemo_rl.data.packing.algorithms import (
     PackingAlgorithm,
     SequencePacker,
     get_packer,
+    pack_shared_prefix_sequences,
+    shared_prefix_bin_length,
 )
+
+
+def test_shared_prefix_packer_fits_32_outputs_in_one_32k_bin():
+    prompt_length = 8192
+    response_length = 768
+    num_outputs = 32
+    sequence_lengths = [prompt_length + response_length] * num_outputs
+    prompt_lengths = [prompt_length] * num_outputs
+    group_ids = [0] * num_outputs
+
+    bins = pack_shared_prefix_sequences(
+        sequence_lengths,
+        prompt_lengths,
+        group_ids,
+        bin_capacity=32768,
+    )
+
+    assert bins == [list(range(num_outputs))]
+    assert (
+        shared_prefix_bin_length(bins[0], sequence_lengths, prompt_lengths, group_ids)
+        == 32768
+    )
+
+
+def test_shared_prefix_packer_recomputes_only_when_group_must_split():
+    bins = pack_shared_prefix_sequences(
+        sequence_lengths=[60] * 4,
+        prompt_lengths=[40] * 4,
+        group_ids=[0] * 4,
+        bin_capacity=100,
+        min_bin_count=4,
+        bin_count_multiple=4,
+    )
+
+    assert len(bins) == 4
+    assert sorted(index for bin_indices in bins for index in bin_indices) == list(
+        range(4)
+    )
+    assert all(
+        shared_prefix_bin_length(
+            bin_indices,
+            [60] * 4,
+            [40] * 4,
+            [0] * 4,
+        )
+        <= 100
+        for bin_indices in bins
+    )
+    # Four DP-required bins each pay one 40-token prompt plus one response.
+    assert (
+        sum(
+            shared_prefix_bin_length(
+                bin_indices,
+                [60] * 4,
+                [40] * 4,
+                [0] * 4,
+            )
+            for bin_indices in bins
+        )
+        == 240
+    )
+
+
+def test_shared_prefix_packer_balances_dp_required_bins():
+    bins = pack_shared_prefix_sequences(
+        sequence_lengths=[60] * 32,
+        prompt_lengths=[40] * 32,
+        group_ids=[0] * 32,
+        bin_capacity=1000,
+        min_bin_count=8,
+        bin_count_multiple=8,
+    )
+
+    assert len(bins) == 8
+    assert sorted(len(bin_indices) for bin_indices in bins) == [4] * 8
+
+
+def test_shared_prefix_packer_does_not_split_group_to_fill_another_tail():
+    # A costs 85. B's two rows cost 10 + 5 + 5 = 20 together. Splitting B to
+    # fill A's 15-token tail would unnecessarily recompute B's prompt.
+    sequence_lengths = [85, 15, 15]
+    prompt_lengths = [80, 10, 10]
+    group_ids = [0, 1, 1]
+
+    bins = pack_shared_prefix_sequences(
+        sequence_lengths,
+        prompt_lengths,
+        group_ids,
+        bin_capacity=100,
+    )
+
+    assert bins == [[0], [1, 2]]
 
 
 def validate_solution(

@@ -20,6 +20,8 @@ from nemo_rl.data.packing.algorithms import (
     PackingAlgorithm,
     SequencePacker,
     get_packer,
+    pack_shared_prefix_sequences,
+    shared_prefix_bin_length,
 )
 from nemo_rl.data.packing.metrics import PackingMetrics
 
@@ -31,5 +33,7 @@ __all__ = [
     "FirstFitShufflePacker",
     "ModifiedFirstFitDecreasingPacker",
     "get_packer",
+    "pack_shared_prefix_sequences",
+    "shared_prefix_bin_length",
     "PackingMetrics",
 ]

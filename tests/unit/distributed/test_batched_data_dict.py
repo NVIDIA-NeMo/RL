@@ -20,6 +20,112 @@ from nemo_rl.distributed.batched_data_dict import (
     DynamicBatchingArgs,
     SequencePackingArgs,
 )
+from nemo_rl.models.automodel.shared_prefix import build_shared_prefix_layout
+
+
+def test_shared_prefix_sequence_packing_uses_compact_32k_cost():
+    num_outputs = 32
+    prompt_length = 8192
+    response_length = 768
+    sequence_length = prompt_length + response_length
+    input_ids = torch.arange(sequence_length).repeat(num_outputs, 1)
+    batch = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.full((num_outputs,), sequence_length),
+            "shared_prefix_lengths": torch.full((num_outputs,), prompt_length),
+            "shared_prefix_group_ids": torch.zeros(num_outputs, dtype=torch.long),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=32768,
+        input_key="input_ids",
+        input_lengths_key="input_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        shared_prefix_lengths_key="shared_prefix_lengths",
+        shared_prefix_group_ids_key="shared_prefix_group_ids",
+    )
+
+    shards, _ = batch.shard_by_batch_size(
+        shards=1,
+        batch_size=num_outputs,
+        sequence_packing_args=packing_args,
+    )
+    microbatches = list(shards[0].make_microbatch_iterator_for_packable_sequences())
+
+    assert len(microbatches) == 1
+    assert microbatches[0].size == num_outputs
+    layout = build_shared_prefix_layout(
+        microbatches[0]["input_ids"],
+        microbatches[0]["input_lengths"],
+        microbatches[0]["shared_prefix_lengths"],
+        microbatches[0]["shared_prefix_group_ids"],
+    )
+    assert layout.compact_tokens == 32768
+    assert shards[0].micro_batch_lengths == [[32768]]
+
+
+def test_shared_prefix_sequence_packing_does_not_charge_alignment_padding():
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.ones((2, 65), dtype=torch.long),
+            "input_lengths": torch.tensor([65, 65]),
+            "shared_prefix_lengths": torch.tensor([64, 64]),
+            "shared_prefix_group_ids": torch.tensor([0, 0]),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=66,
+        input_key="input_ids",
+        input_lengths_key="input_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=64,
+        shared_prefix_lengths_key="shared_prefix_lengths",
+        shared_prefix_group_ids_key="shared_prefix_group_ids",
+    )
+
+    shards, indices = batch.shard_by_batch_size(
+        shards=1,
+        batch_size=2,
+        sequence_packing_args=packing_args,
+    )
+
+    assert indices == [0, 1]
+    assert shards[0].micro_batch_indices == [[[0, 2]]]
+    assert shards[0].micro_batch_lengths == [[66]]
+
+
+def test_shared_prefix_sequence_packing_recomputes_group_across_global_batches():
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.ones((4, 60), dtype=torch.long),
+            "input_lengths": torch.full((4,), 60),
+            "shared_prefix_lengths": torch.full((4,), 40),
+            "shared_prefix_group_ids": torch.zeros(4, dtype=torch.long),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=100,
+        input_key="input_ids",
+        input_lengths_key="input_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        shared_prefix_lengths_key="shared_prefix_lengths",
+        shared_prefix_group_ids_key="shared_prefix_group_ids",
+    )
+
+    shards, _ = batch.shard_by_batch_size(
+        shards=1,
+        batch_size=2,
+        sequence_packing_args=packing_args,
+    )
+
+    # The prompt group crosses the two optimizer global batches. Each batch
+    # therefore owns a separate compact bin and pays its 40-token prompt once.
+    assert shards[0].elem_counts_per_gb == [2, 2]
+    assert shards[0].micro_batch_indices == [[[0, 2]], [[0, 2]]]
+    assert shards[0].micro_batch_lengths == [[80], [80]]
 
 
 def test_shard_by_batch_size_basic():
