@@ -4908,7 +4908,10 @@ def async_grpo_train(
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
                     # (colocated collects them before the engine sleeps for training).
-                    if policy_generation is not None and generation_logger_metrics is None:
+                    if (
+                        policy_generation is not None
+                        and generation_logger_metrics is None
+                    ):
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )

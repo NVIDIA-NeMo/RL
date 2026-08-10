@@ -272,16 +272,22 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def blocks_training(self) -> bool:
-        """Colocated generation shares the training GPUs, so the training
-        loop must wind the engine down before it can train."""
+        """Whether the engine must stand down before a training step.
+
+        Colocated generation shares the training GPUs, so the training
+        loop must wind the engine down before it can train.
+        """
         return bool(self.cfg["colocated"]["enabled"])
 
     def invalidate_kv_cache(self) -> bool:
-        """Under "recompute" mode the engine drops and rebuilds its KV cache
+        """Report whether weight updates invalidate the KV cache.
+
+        Under "recompute" mode the engine drops and rebuilds its KV cache
         across the suspend/resume that brackets every weight update, so
         invalidation is genuinely handled; report it truthfully instead of
         inheriting the interface's `False` (which makes the trajectory
-        collector warn every step)."""
+        collector warn every step).
+        """
         return (
             self.cfg["mcore_generation_config"].get("kv_cache_management_mode")
             == "recompute"

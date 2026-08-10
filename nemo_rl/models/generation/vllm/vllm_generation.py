@@ -908,8 +908,11 @@ class VllmGeneration(GenerationInterface):
             return False
 
     def blocks_training(self) -> bool:
-        """Colocated vLLM shares the training GPUs (async colocated vLLM is
-        not supported yet, but the capability answers correctly for it)."""
+        """Whether the engine must stand down before a training step.
+
+        Colocated vLLM shares the training GPUs (async colocated vLLM is
+        not supported yet, but the capability answers correctly for it).
+        """
         return bool(self.cfg["colocated"]["enabled"])
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
