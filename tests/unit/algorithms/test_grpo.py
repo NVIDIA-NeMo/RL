@@ -39,11 +39,11 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
+    _profile_sync_vllm_rollout,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
-    _profile_sync_vllm_rollout,
     _should_use_async_rollouts,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
@@ -107,9 +107,9 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
 def _mock_profiled_vllm_generation() -> VllmGeneration:
     policy_generation = VllmGeneration.__new__(VllmGeneration)
     policy_generation.rollout_profiler_enabled = True
-    policy_generation.begin_rollout_profile = MagicMock(return_value=True)
-    policy_generation.finish_rollout_profile = MagicMock(return_value=True)
-    policy_generation.abort_rollout_profile = MagicMock(return_value=True)
+    policy_generation.begin_rollout_profile = MagicMock()
+    policy_generation.finish_rollout_profile = MagicMock()
+    policy_generation.abort_rollout_profile = MagicMock()
     return policy_generation
 
 

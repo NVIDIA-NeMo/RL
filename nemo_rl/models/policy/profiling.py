@@ -13,9 +13,11 @@
 # limitations under the License.
 """Optional policy-training profiler integration."""
 
-import importlib
-import os
 from typing import Protocol, cast
+
+from nemo_rl.models.profiling import load_profiler
+
+POLICY_PROFILER_CLASS_ENV = "NRL_POLICY_PROFILER_CLASS"
 
 
 class PolicyProfiler(Protocol):
@@ -48,55 +50,18 @@ def load_policy_profiler(*, rank: int) -> PolicyProfiler | None:
         RuntimeError: If the class cannot be imported, does not implement the
             profiler contract, or fails during initialization.
     """
-    class_path = os.environ.get("NRL_POLICY_PROFILER_CLASS", "")
-    if not class_path:
-        return None
-
-    module_path, separator, class_name = class_path.rpartition(".")
-    if not separator or not module_path or not class_name:
-        raise ValueError(
-            "NRL_POLICY_PROFILER_CLASS must be a fully qualified class path, "
-            f"got {class_path!r}"
-        )
-
-    # The selected profiler may be an optional package that ordinary NeMo RL
-    # environments do not install, so defer its import until it is configured.
-    try:
-        module = importlib.import_module(module_path)
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Could not import policy profiler module {module_path!r} from "
-            f"NRL_POLICY_PROFILER_CLASS={class_path!r}. Install the profiler "
-            "in the policy-worker environment."
-        ) from exc
-
-    profiler_class = getattr(module, class_name, None)
-    if not isinstance(profiler_class, type):
-        raise RuntimeError(
-            f"NRL_POLICY_PROFILER_CLASS={class_path!r} does not resolve to a class"
-        )
-
-    required_methods = (
-        "begin_train_step",
-        "finish_train_step",
-        "abort_train_step",
-        "close",
+    return cast(
+        PolicyProfiler | None,
+        load_profiler(
+            env_var=POLICY_PROFILER_CLASS_ENV,
+            profiler_kind="policy profiler",
+            required_methods=(
+                "begin_train_step",
+                "finish_train_step",
+                "abort_train_step",
+                "close",
+            ),
+            install_environment="policy-worker",
+            rank=rank,
+        ),
     )
-    missing_methods = [
-        method
-        for method in required_methods
-        if not callable(getattr(profiler_class, method, None))
-    ]
-    if missing_methods:
-        raise RuntimeError(
-            f"Policy profiler {class_path!r} is missing required method(s): "
-            f"{', '.join(missing_methods)}"
-        )
-
-    try:
-        profiler = profiler_class(rank=rank)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to initialize policy profiler {class_path!r} for rank {rank}"
-        ) from exc
-    return cast(PolicyProfiler, profiler)
