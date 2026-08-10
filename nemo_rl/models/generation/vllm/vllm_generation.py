@@ -41,7 +41,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.profiling import ROLLOUT_PROFILER_CLASS_ENV
+from nemo_rl.models.generation.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    validate_rollout_profiler_topology,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
@@ -96,33 +99,6 @@ def _record_vllm_generation_metrics(
         )
     except Exception:
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
-
-
-def _validate_rollout_profiler_topology(
-    *,
-    class_path: str,
-    tensor_parallel_size: int,
-    pipeline_parallel_size: int,
-    expert_parallel_size: int,
-    async_engine: bool,
-) -> None:
-    """Reject profiler configurations whose GPU work runs outside this actor."""
-    if not class_path:
-        return
-    if (
-        tensor_parallel_size != 1
-        or pipeline_parallel_size != 1
-        or expert_parallel_size != 1
-    ):
-        raise ValueError(
-            "Synchronous rollout profiling currently requires "
-            "tensor_parallel_size=1, pipeline_parallel_size=1, and "
-            "expert_parallel_size=1"
-        )
-    if async_engine:
-        raise ValueError(
-            "Synchronous rollout profiling currently requires async_engine=false"
-        )
 
 
 class VllmGeneration(GenerationInterface):
@@ -194,7 +170,7 @@ class VllmGeneration(GenerationInterface):
             )
         else:
             rollout_profiler_class = os.environ.get(ROLLOUT_PROFILER_CLASS_ENV, "")
-        _validate_rollout_profiler_topology(
+        validate_rollout_profiler_topology(
             class_path=rollout_profiler_class,
             tensor_parallel_size=self.tp_size,
             pipeline_parallel_size=self.pp_size,
@@ -662,28 +638,27 @@ class VllmGeneration(GenerationInterface):
             )
         self._step_metrics_snapshot = self._get_raw_spec_counters()
 
-    def begin_rollout_profile(self, *, step_id: int | str) -> bool:
+    def begin_rollout_profile(self, *, step_id: int | str) -> None:
         """Open one complete synchronous rollout on profiled workers."""
-        return self._run_rollout_profiler_rpc("begin_rollout_profile", step_id=step_id)
+        self._run_rollout_profiler_rpc("begin_rollout_profile", step_id=step_id)
 
-    def finish_rollout_profile(self) -> bool:
+    def finish_rollout_profile(self) -> None:
         """Close the current synchronous rollout on profiled workers."""
-        return self._run_rollout_profiler_rpc("finish_rollout_profile")
+        self._run_rollout_profiler_rpc("finish_rollout_profile")
 
-    def abort_rollout_profile(self, *, reason: str) -> bool:
+    def abort_rollout_profile(self, *, reason: str) -> None:
         """Abort the current synchronous rollout on profiled workers."""
-        return self._run_rollout_profiler_rpc("abort_rollout_profile", reason=reason)
+        self._run_rollout_profiler_rpc("abort_rollout_profile", reason=reason)
 
-    def _run_rollout_profiler_rpc(self, method_name: str, **kwargs: Any) -> bool:
+    def _run_rollout_profiler_rpc(self, method_name: str, **kwargs: Any) -> None:
         if not self.rollout_profiler_enabled:
-            return True
+            return
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             **kwargs,
         )
-        results = ray.get(futures)
-        return all(result for result in results if result is not None)
+        ray.get(futures)
 
     def get_step_metrics(self) -> dict[str, float]:
         """Get speculative decoding metrics delta since snapshot_step_metrics().

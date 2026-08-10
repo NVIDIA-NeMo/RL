@@ -178,38 +178,15 @@ def _profile_policy_step(
     """Profile one successful, non-evaluation monolithic policy update."""
 
     @functools.wraps(method)
-    def wrapped(
-        self: Any,
-        data: BatchedDataDict,
-        loss_fn: LossFunction,
-        eval_mode: bool = False,
-        gbs: Optional[int] = None,
-        mbs: Optional[int] = None,
-        check_dim_skip_keys: Optional[Iterable[str]] = None,
-    ) -> dict[str, Any]:
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        eval_mode = kwargs.get("eval_mode", args[2] if len(args) > 2 else False)
         profiler = getattr(self, "_policy_profiler", None)
         if profiler is None or eval_mode:
-            return method(
-                self,
-                data,
-                loss_fn,
-                eval_mode=eval_mode,
-                gbs=gbs,
-                mbs=mbs,
-                check_dim_skip_keys=check_dim_skip_keys,
-            )
+            return method(self, *args, **kwargs)
 
         _begin_policy_profiler_step(self, profiler)
         try:
-            result = method(
-                self,
-                data,
-                loss_fn,
-                eval_mode=eval_mode,
-                gbs=gbs,
-                mbs=mbs,
-                check_dim_skip_keys=check_dim_skip_keys,
-            )
+            result = method(self, *args, **kwargs)
         except Exception:
             _abort_policy_profiler_after_error(self, reason="policy_train_error")
             raise
@@ -241,6 +218,26 @@ def _profile_split_train_step_begin(
         except Exception:
             _abort_policy_profiler_after_error(self, reason="policy_train_begin_error")
             raise
+
+    return wrapped
+
+
+def _profile_split_train_step_finish(
+    method: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """Close the profiler after the split-step finish method fully returns."""
+
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            result = method(self, *args, **kwargs)
+        except Exception:
+            _abort_policy_profiler_after_error(self, reason="policy_train_finish_error")
+            raise
+
+        if getattr(self, "_policy_profiler", None) is not None:
+            _finish_policy_profiler_step(self)
+        return result
 
     return wrapped
 
@@ -1537,10 +1534,9 @@ class MegatronPolicyWorkerImpl(
         try:
             self._train_microbatch_body(state, data)
         except Exception:
-            if self._policy_profiler is not None:
-                _abort_policy_profiler_after_error(
-                    self, reason="policy_train_microbatch_error"
-                )
+            _abort_policy_profiler_after_error(
+                self, reason="policy_train_microbatch_error"
+            )
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
             # run with the PP scheduler bypass disabled and with no end-of-step
@@ -1697,16 +1693,13 @@ class MegatronPolicyWorkerImpl(
             if "loss" in m:
                 state["mb_losses"].append(m["loss"])
 
+    @_profile_split_train_step_finish
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()
         try:
             result = self._finish_train_step_body(state)
         except Exception:
-            if self._policy_profiler is not None:
-                _abort_policy_profiler_after_error(
-                    self, reason="policy_train_finish_error"
-                )
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
             # the body got). Restore unconditionally so future steps run with
@@ -1719,8 +1712,6 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
-        if self._policy_profiler is not None:
-            _finish_policy_profiler_step(self)
         return result
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
