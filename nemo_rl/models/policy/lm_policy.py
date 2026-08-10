@@ -674,6 +674,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        use_nixl: bool = False,
     ) -> list[dict[str, Any]]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
@@ -717,7 +718,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ],
                 # Keep every TP × CP output; consumer routes via overlap.
                 output_is_replicated=["pipeline_parallel"],
-                common_kwargs={"micro_batch_size": micro_batch_size},
+                common_kwargs={
+                    "micro_batch_size": micro_batch_size,
+                    "use_nixl": use_nixl,
+                },
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
         return aggregate_per_sample_handles(worker_results)

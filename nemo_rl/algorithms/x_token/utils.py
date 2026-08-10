@@ -84,6 +84,7 @@ def assert_xtoken_ipc_node_local(
     teacher_cp: int,
     student_dp: int,
     teacher_dp: int,
+    allow_cross_node: bool = False,
 ) -> None:
     """Fail fast if the teacher->student logit transport would cross a node.
 
@@ -92,8 +93,13 @@ def assert_xtoken_ipc_node_local(
     A single-node job is therefore always safe; a multi-node job is only safe
     when every student rank's required teacher shards live on its own node.
 
+    ``allow_cross_node`` disables the multi-node layout checks: it is set when a
+    cross-node transport (NIXL RDMA) is configured, in which case non-node-local
+    shards are read over RDMA instead of IPC and the node-alignment constraints
+    below no longer apply.
+
     """
-    if num_nodes <= 1:
+    if num_nodes <= 1 or allow_cross_node:
         return
 
     student_group = student_tp * student_cp

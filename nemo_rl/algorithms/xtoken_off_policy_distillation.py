@@ -128,6 +128,11 @@ class OffPolicyDistillationConfig(TypedDict):
         val_period: Validation cadence in steps. ``0`` disables validation.
         val_at_start: Run validation before training begins.
         val_at_end: Run validation on the final step.
+        teacher_logit_transport: How the teacher ships full-vocab logits to the
+            student. ``"ipc"`` (default when absent) uses node-local CUDA IPC and
+            requires a node-aligned teacher/student layout. ``"nixl"`` keeps IPC
+            for node-local shards but reads cross-node shards over NIXL RDMA,
+            lifting the node-alignment constraint for multi-node runs.
     """
 
     num_prompts_per_step: int
@@ -137,6 +142,7 @@ class OffPolicyDistillationConfig(TypedDict):
     val_period: int
     val_at_start: bool
     val_at_end: bool
+    teacher_logit_transport: NotRequired[str]
 
 
 class OffPolicyDistillationSaveState(TypedDict):
@@ -442,7 +448,8 @@ def setup(
         )
         # Node-local CUDA IPC: on >1 node it only works when teacher/student
         # share DP and a node-aligned model-parallel group, else a student rank
-        # would read teacher shards from another node.
+        # would read teacher shards from another node. The NIXL transport reads
+        # those cross-node shards over RDMA, so the constraint is lifted there.
         assert_xtoken_ipc_node_local(
             num_nodes=cluster_config["num_nodes"],
             gpus_per_node=cluster_config["gpus_per_node"],
@@ -452,6 +459,8 @@ def setup(
             teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
             student_dp=student_dp,
             teacher_dp=teacher_dp,
+            allow_cross_node=distillation_config.get("teacher_logit_transport")
+            == "nixl",
         )
 
     # ==========================
@@ -507,6 +516,7 @@ def export_teacher_logits_and_pack(
     teacher_mbs: list[int],
     *,
     timer: Optional[Timer] = None,
+    use_nixl: bool = False,
 ) -> BatchedDataDict[Any]:
     """Serially run each teacher's forward and pack the student ``train_data``.
 
@@ -561,7 +571,10 @@ def export_teacher_logits_and_pack(
 
         teacher_policy.prepare_for_lp_inference()
         handles = teacher_policy.get_full_logits_ipc(
-            teacher_data, micro_batch_size=teacher_mbs[i], timer=timer
+            teacher_data,
+            micro_batch_size=teacher_mbs[i],
+            timer=timer,
+            use_nixl=use_nixl,
         )
         train_data[f"teacher_{i}_full_logits_ipc"] = handles
         # Free the teacher's PARAMS to CPU; the persistent IPC buffers live in
@@ -601,6 +614,9 @@ def xtoken_off_policy_distillation_train(
     val_at_end = distill_cfg["val_at_end"]
     max_epochs = distill_cfg["max_num_epochs"]
     max_steps = distill_cfg["max_num_steps"]
+    # Ship cross-node teacher logits over NIXL RDMA when configured; node-local
+    # shards still use CUDA IPC (decided per shard on the consumer).
+    use_nixl = distill_cfg.get("teacher_logit_transport") == "nixl"
     # Per-teacher export MBS (each teacher's own train MBS) and the
     # non-student-seq keys the worker's check_sequence_dim must skip
     # (teacher-count-dependent, so built from the loss fn).
@@ -644,7 +660,12 @@ def xtoken_off_policy_distillation_train(
                     # loss derives the microbatch-global top-k subset
                     # student-side. Packs the per-teacher alignment payload too.
                     train_data = export_teacher_logits_and_pack(
-                        teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
+                        teacher_policies,
+                        loss_fn,
+                        batch,
+                        teacher_mbs,
+                        timer=timer,
+                        use_nixl=use_nixl,
                     )
 
                 with timer.time("training_prep"):
@@ -910,6 +931,7 @@ def validate(
     """
     distill_cfg = master_config.distillation
     timer = timer if timer is not None else Timer()
+    use_nixl = distill_cfg.get("teacher_logit_transport") == "nixl"
 
     losses: list[float] = []
     # The P-KL path emits kl_loss/ce_loss; the gold path emits
@@ -944,7 +966,12 @@ def validate(
             batch = pad_distillation_val_batch(batch, target_size)
 
             train_data = export_teacher_logits_and_pack(
-                teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
+                teacher_policies,
+                loss_fn,
+                batch,
+                teacher_mbs,
+                timer=timer,
+                use_nixl=use_nixl,
             )
             student_policy.prepare_for_training()
             try:

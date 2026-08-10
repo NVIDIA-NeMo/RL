@@ -863,6 +863,7 @@ class DTensorPolicyWorkerV2Impl(
         self,
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
+        use_nixl: bool = False,
     ) -> dict[str, Any]:
         """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
 
@@ -874,6 +875,12 @@ class DTensorPolicyWorkerV2Impl(
         consumer to index the slot view, plus the TP/CP shard metadata
         (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
         route shards across heterogeneous teacher/student TP/CP.
+
+        When ``use_nixl`` is set, the persistent storage is additionally
+        registered with NIXL and each handle carries a ``"nixl"`` descriptor
+        (producer agent + transfer descs + node IP) so a cross-node student rank
+        can RDMA-READ the buffer; node-local shards still use the CUDA IPC
+        payload. See :mod:`nemo_rl.algorithms.x_token.nixl_transport`.
         """
         forward_batch_size = (
             micro_batch_size
@@ -906,6 +913,10 @@ class DTensorPolicyWorkerV2Impl(
         per_sample_handles: list[dict[str, Any]] = []
         storage: Optional[torch.Tensor] = None
         payload_ipc: Optional[tuple[Any, ...]] = None
+        # NIXL descriptor for the persistent storage, computed once per call
+        # (storage is stable after the first microbatch alloc) and shared by
+        # every handle so cross-node reads dedupe on its ``content_uuid``.
+        nixl_desc: Optional[dict[str, Any]] = None
         with torch.no_grad():
             data.to("cuda")
             processed_iterator, iterator_len = get_microbatch_iterator(
@@ -959,6 +970,12 @@ class DTensorPolicyWorkerV2Impl(
                 )
                 storage = self._teacher_ipc_storage
                 payload_ipc = self._teacher_ipc_handle
+                if use_nixl and nixl_desc is None:
+                    from nemo_rl.algorithms.x_token.nixl_transport import (
+                        register_teacher_storage,
+                    )
+
+                    nixl_desc = register_teacher_storage(storage)
                 storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
                     vals
                 )
@@ -987,6 +1004,9 @@ class DTensorPolicyWorkerV2Impl(
                             "full_seq_len": full_seq_len,
                             "vocab_sharded": self.tp_size > 1,
                             "sequence_sharded": self.cp_size > 1,
+                            # Present only under NIXL transport; None otherwise so
+                            # the consumer falls back to the CUDA IPC payload.
+                            "nixl": nixl_desc,
                         }
                     )
         # The storage copies above are async on the current stream; force them
@@ -1000,6 +1020,11 @@ class DTensorPolicyWorkerV2Impl(
         """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""
         self._teacher_ipc_storage = None
         self._teacher_ipc_handle = None
+        # Drop any NIXL registration of the (now-freed) storage buffer so the
+        # next export re-registers a fresh one.
+        from nemo_rl.algorithms.x_token.nixl_transport import release_teacher_storage
+
+        release_teacher_storage()
         gc.collect()
         torch.cuda.empty_cache()
 

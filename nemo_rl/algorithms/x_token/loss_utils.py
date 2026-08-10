@@ -453,13 +453,18 @@ def assemble_teacher_logits_from_shards(
     student_cp_rank: int,
     student_cp_size: int,
     device: int,
+    read_cache: dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    """P2P-IPC-read overlapping teacher shards into a ``[T_t/CP_s, V_t]`` dest.
+    """P2P-read overlapping teacher shards into a ``[T_t/CP_s, V_t]`` dest.
 
+    Each shard's storage is materialized via
+    :func:`materialize_teacher_storage`, which reads it zero-copy over CUDA IPC
+    when node-local and RDMA-READs it over NIXL when the producer is remote.
     ``device`` is a CUDA device index (matches
-    :func:`rebuild_cuda_tensor_from_ipc`'s ``device_id`` signature).
+    :func:`rebuild_cuda_tensor_from_ipc`'s ``device_id`` signature);
+    ``read_cache`` dedupes remote reads across shards of the same export.
     """
-    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+    from nemo_rl.algorithms.x_token.nixl_transport import materialize_teacher_storage
 
     if not teacher_shards:
         raise ValueError("teacher_shards must be non-empty")
@@ -485,10 +490,10 @@ def assemble_teacher_logits_from_shards(
         full_seq_len=full_seq_len,
     )
     for handle, src_seq, src_vocab, dest_seq, dest_vocab in matches:
-        # Producer's IPC payload is the full contiguous storage
+        # Producer's storage is the full contiguous buffer
         # [N_microbatches, B_mb, T_t_local, V_t_local]; index the slot
         # then the sample row, then apply the seq/vocab overlap slices.
-        src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
+        src_full = materialize_teacher_storage(handle, device, read_cache).detach()
         buf_idx = int(handle["buf_idx"])
         sample_idx = int(handle["sample_index_in_buf"])
         local_seq_t, local_vocab_t = handle["actual_shape"]
@@ -503,19 +508,22 @@ def _try_zero_copy_teacher_logits(
     student_cp_rank: int,
     student_cp_size: int,
     device: int,
+    read_cache: dict[str, torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """Zero-copy ``[B, T_t/CP_s, V_t]`` view of the teacher logits, or None.
+    """Fast-path ``[B, T_t/CP_s, V_t]`` view of the teacher logits, or None.
 
-    Returns a view into the producer's IPC storage only when reassembly is
-    unnecessary: every sample's seq range is covered by a single full-vocab
-    teacher shard (i.e. teacher ``tp_size == 1`` and ``teacher_cp == student_cp``
-    or ``teacher_cp == 1``), and the microbatch's samples are a contiguous slab
-    (same payload + ``buf_idx``, sample rows ``0..B-1``) in one storage slot.
-    Otherwise returns None and the caller falls back to assemble + stack.
+    Returns a view into the producer storage (materialized via
+    :func:`materialize_teacher_storage`: zero-copy IPC when node-local, one RDMA
+    READ when remote) only when reassembly is unnecessary: every sample's seq
+    range is covered by a single full-vocab teacher shard (i.e. teacher
+    ``tp_size == 1`` and ``teacher_cp == student_cp`` or ``teacher_cp == 1``),
+    and the microbatch's samples are a contiguous slab (same payload +
+    ``buf_idx``, sample rows ``0..B-1``) in one storage slot. Otherwise returns
+    None and the caller falls back to assemble + stack.
     """
     if not per_sample_entries:
         return None
-    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+    from nemo_rl.algorithms.x_token.nixl_transport import materialize_teacher_storage
 
     first_shards = per_sample_entries[0]["teacher_shards"]
     if not first_shards:
@@ -555,7 +563,7 @@ def _try_zero_copy_teacher_logits(
         ):
             return None
 
-    src_full = rebuild_cuda_tensor_from_ipc(payload, device).detach()
+    src_full = materialize_teacher_storage(h0, device, read_cache).detach()
     seq_lo = student_seq_start - teacher_seq_start
     seq_hi = student_seq_end - teacher_seq_start
     return src_full[buf_idx, : len(chosen), seq_lo:seq_hi, :full_vocab_size]
@@ -580,14 +588,21 @@ def rebuild_teacher_full_logits_from_ipc(
         torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
     )
 
+    # One read-cache per call so remote (NIXL) storage buffers are RDMA-READ once
+    # and shared across every shard/sample of the same export; node-local shards
+    # ignore it (they map zero-copy over IPC).
+    read_cache: dict[str, torch.Tensor] = {}
+
     # Bypass: when the teacher layout lines up with this student rank (no
     # vocab sharding, seq covered by one shard), skip reassembly and return a
-    # zero-copy view of the IPC storage. Returns None when reassembly is needed.
+    # (zero-copy for IPC) view of the producer storage. None when reassembly is
+    # needed.
     view = _try_zero_copy_teacher_logits(
         per_sample_entries,
         student_cp_rank=student_cp_rank,
         student_cp_size=student_cp_size,
         device=device,
+        read_cache=read_cache,
     )
     if view is not None:
         return view
@@ -598,6 +613,7 @@ def rebuild_teacher_full_logits_from_ipc(
             student_cp_rank=student_cp_rank,
             student_cp_size=student_cp_size,
             device=device,
+            read_cache=read_cache,
         )
         for entry in per_sample_entries
     ]
