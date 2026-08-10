@@ -57,7 +57,7 @@ def fake_profiler_module():
 def test_profiler_is_disabled_without_class_path():
     with (
         patch.dict(os.environ, {}, clear=True),
-        patch("nemo_rl.models.policy.profiling.importlib.import_module") as importer,
+        patch("nemo_rl.models.profiling.importlib.import_module") as importer,
     ):
         assert load_policy_profiler(rank=3) is None
 
