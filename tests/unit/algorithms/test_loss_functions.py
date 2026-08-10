@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -2683,33 +2682,70 @@ def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     assert torch.allclose(ce_masked, ce_single, atol=1e-6)
 
 
-def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_windows(tmp_path):
-    """Precomputed CE sums contiguous CP-window contributions exactly once."""
+def test_cross_tokenizer_prepare_loss_input_keeps_full_canonical_ce(
+    tmp_path, monkeypatch
+):
+    """Automodel CP passes full canonical CE inputs through unchanged."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    full_logprobs = torch.tensor([[-1.0, -2.0, -3.0]], requires_grad=True)
+    token_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 3]]),
+            "token_mask": token_mask,
+            "sample_mask": torch.ones(1),
+        }
+    )
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        lambda *args, **kwargs: (torch.empty(0), {}, {}, None, None),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        lambda *args, **kwargs: full_logprobs,
+    )
+
+    loss_input, prepared_data = prepare_loss_input(
+        torch.empty(0),
+        data,
+        loss_fn,
+        cp_sharder=object(),
+    )
+
+    assert loss_input["student_next_token_logprobs"] is full_logprobs
+    torch.testing.assert_close(
+        loss_input["student_next_token_mask"],
+        token_mask[:, 1:],
+    )
+    assert prepared_data is data
+
+
+def test_cross_tokenizer_precomputed_ce_uses_full_canonical_sequence(tmp_path):
+    """Precomputed CE uses the full canonical sequence and preserves gradients."""
     loss_fn = CrossTokenizerDistillationLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     data = BatchedDataDict({"sample_mask": torch.ones(1)})
-    next_token_logprobs = torch.tensor([[-1.0, -2.0]])
-    next_token_mask = torch.ones_like(next_token_logprobs)
-    cp_group = object()
+    next_token_logprobs = torch.tensor([[-1.0, -2.0, -3.0]], requires_grad=True)
+    next_token_mask = torch.tensor([[1.0, 1.0, 0.0]])
 
-    with patch(
-        "nemo_rl.algorithms.loss.loss_functions.group_all_reduce_sum_with_grad",
-        side_effect=lambda value, group: value,
-    ) as reduce_sum:
-        ce = loss_fn._compute_ce(
-            torch.empty(0),
-            data,
-            torch.tensor(2.0),
-            student_next_token_logprobs=next_token_logprobs,
-            student_next_token_mask=next_token_mask,
-            cp_group=cp_group,
-        )
+    ce = loss_fn._compute_ce(
+        torch.empty(0),
+        data,
+        torch.tensor(2.0),
+        student_next_token_logprobs=next_token_logprobs,
+        student_next_token_mask=next_token_mask,
+    )
 
     torch.testing.assert_close(ce, torch.tensor(1.5))
-    reduced_value, reduced_group = reduce_sum.call_args.args
-    torch.testing.assert_close(reduced_value, torch.tensor(1.5))
-    assert reduced_group is cp_group
+    ce.backward()
+    torch.testing.assert_close(
+        next_token_logprobs.grad,
+        torch.tensor([[-0.5, -0.5, 0.0]]),
+    )
 
 
 # ── Metric-normalization advertisement (PR #2683) ─────────────────────────
