@@ -27,7 +27,9 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
     _profile_policy_step,
+    _profile_split_train_step_finish,
 )
+from nemo_rl.utils.nsys import wrap_with_nvtx_name  # noqa: E402
 
 pytestmark = pytest.mark.mcore
 
@@ -80,6 +82,38 @@ def test_monolithic_eval_does_not_profile():
     profiler.abort_train_step.assert_not_called()
 
 
+def test_monolithic_positional_eval_does_not_profile():
+    profiler = MagicMock()
+    worker = SimpleNamespace(_policy_profiler=profiler)
+    body = MagicMock(return_value={})
+
+    _wrapped_train(body)(worker, "data", "loss", True)
+
+    profiler.begin_train_step.assert_not_called()
+    profiler.finish_train_step.assert_not_called()
+
+
+def test_monolithic_wrapper_forwards_new_train_arguments():
+    profiler = MagicMock()
+    worker = SimpleNamespace(_policy_profiler=profiler)
+
+    @_profile_policy_step
+    def train(
+        self: Any,
+        data: Any,
+        loss_fn: Any,
+        *,
+        future_option: str,
+    ) -> dict[str, Any]:
+        return {"future_option": future_option}
+
+    assert train(worker, "data", "loss", future_option="forwarded") == {
+        "future_option": "forwarded"
+    }
+    profiler.begin_train_step.assert_called_once_with()
+    profiler.finish_train_step.assert_called_once_with()
+
+
 def test_monolithic_train_aborts_profiler_on_error():
     profiler = MagicMock()
     worker = SimpleNamespace(_policy_profiler=profiler)
@@ -100,6 +134,36 @@ def test_profiler_abort_error_does_not_mask_training_error():
 
     with pytest.raises(ValueError, match="bad batch"):
         _wrapped_train(body)(worker, "data", "loss")
+
+
+def test_split_finish_closes_nvtx_range_before_profiler():
+    events = []
+    profiler = MagicMock()
+    profiler.finish_train_step.side_effect = lambda: events.append("profiler_finish")
+    worker = SimpleNamespace(
+        _policy_profiler=profiler,
+        _policy_profiler_step_open=True,
+    )
+
+    @_profile_split_train_step_finish
+    @wrap_with_nvtx_name("test/finish")
+    def finish(self: Any) -> dict[str, Any]:
+        events.append("body")
+        return {"loss": 1.0}
+
+    with (
+        patch(
+            "nemo_rl.utils.nsys.torch.cuda.nvtx.range_push",
+            side_effect=lambda _: events.append("nvtx_push"),
+        ),
+        patch(
+            "nemo_rl.utils.nsys.torch.cuda.nvtx.range_pop",
+            side_effect=lambda: events.append("nvtx_pop"),
+        ),
+    ):
+        assert finish(worker) == {"loss": 1.0}
+
+    assert events == ["nvtx_push", "body", "nvtx_pop", "profiler_finish"]
 
 
 def test_shutdown_closes_profiler_then_cleans_up():

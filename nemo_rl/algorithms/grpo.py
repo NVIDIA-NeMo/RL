@@ -2320,27 +2320,18 @@ def _profile_sync_vllm_rollout(
         yield
         return
 
-    if not policy_generation.begin_rollout_profile(step_id=step_id):
-        raise RuntimeError("Failed to begin rollout profiling on every worker")
+    policy_generation.begin_rollout_profile(step_id=step_id)
     try:
         yield
     except BaseException as rollout_error:
         try:
-            profiler_aborted = policy_generation.abort_rollout_profile(
-                reason="grpo_rollout_error"
-            )
+            policy_generation.abort_rollout_profile(reason="grpo_rollout_error")
         except Exception as profiler_error:
             rollout_error.add_note(
                 f"Rollout profiler abort also failed: {profiler_error!r}"
             )
-        else:
-            if not profiler_aborted:
-                rollout_error.add_note(
-                    "Rollout profiler abort did not succeed on every worker"
-                )
         raise
-    if not policy_generation.finish_rollout_profile():
-        raise RuntimeError("Failed to finish rollout profiling on every worker")
+    policy_generation.finish_rollout_profile()
 
 
 def _preserve_router_replay_routed_experts(
