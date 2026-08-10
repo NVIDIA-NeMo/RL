@@ -483,7 +483,9 @@ class AsyncTrajectoryCollector:
             # Generate all prompt groups needed for this target in one batched worker.
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
 
-            use_nemo_gym = _should_use_nemo_gym(self.master_config)
+            use_nemo_gym = _should_use_nemo_gym(
+                cast(GRPOMasterConfig, self.master_config)
+            )
 
             if not self._refit_pause_cleared.is_set() and self.running:
                 with self._threads_lock:
