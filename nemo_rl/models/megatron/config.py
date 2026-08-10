@@ -37,6 +37,7 @@ class RuntimeConfig(NamedTuple):
     dtype: torch.dtype
     optimizer_cpu_offload: bool
     offload_optimizer_for_logprob: bool
+    offload_optimizer_for_refit: bool
     is_generation_colocated: Optional[bool]
     sampling_params: Optional[TrainingSamplingParams]
     final_padded_vocab_size: int

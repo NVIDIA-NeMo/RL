@@ -499,6 +499,7 @@ class MegatronPolicyWorkerImpl(
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
+        self.offload_optimizer_for_refit = runtime_config.offload_optimizer_for_refit
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
@@ -2936,6 +2937,7 @@ class MegatronPolicyWorkerImpl(
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
+            and self.offload_optimizer_for_refit
         ):
             self.move_optimizer("cpu")
 

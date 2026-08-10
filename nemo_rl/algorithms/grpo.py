@@ -1149,22 +1149,15 @@ def setup(
     def init_megatron_generation(policy=None):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
-        if colocated_inference:
-            mg = MegatronGeneration(
-                policy=policy,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-            )
-        else:
-            mg = MegatronGeneration(
-                cluster=inference_cluster,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-                weights_path=weights_path,
-                skip_weight_load=True,
-            )
+        mg = MegatronGeneration(
+            config=policy_config,
+            tokenizer=tokenizer,
+            cluster=None if colocated_inference else inference_cluster,
+            policy=policy if colocated_inference else None,
+            processor=processor,
+            weights_path=weights_path,
+            skip_weight_load=not colocated_inference,
+        )
         return mg, time.perf_counter() - t0
 
     def initialize_generation_with_policy(
