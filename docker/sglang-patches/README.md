@@ -1,6 +1,6 @@
 # SGLang source patches applied at image build time
 
-SGLang ships here as a PyPI wheel (`sglang==0.5.12.post1`, see the `sglang`
+SGLang ships here as a PyPI wheel (`sglang==0.5.13`, see the `sglang`
 extra in `pyproject.toml`) and its `srt/` tree is pure Python, so a fix that
 touches only `.py` files can be applied to the installed package instead of
 requiring a forked wheel.
@@ -15,7 +15,7 @@ no-op is not possible.
 Remove a patch from this directory once the corresponding fix is in the pinned
 SGLang release.
 
-## 0001-moe-trtllm-bf16-hot-reload.patch
+## 0001-moe-trtllm-bf16-hot-reload-0513.patch
 
 Fixes online weight updates under `moe_runner_backend=flashinfer_trtllm`.
 
@@ -44,16 +44,27 @@ file once that lands in the SGLang release pinned in `pyproject.toml`.
 
 That PR targets upstream `main`, where the hot-update entry points live in
 `model_executor/model_runner_components/weight_updater.py`. This file is the
-`srt/`-only backport onto `v0.5.12.post1`, where they are still in
-`model_executor/model_runner.py` and
-`_maybe_get_cached_w3_w1_permute_indices` takes three arguments rather than
-four. The executable code is otherwise identical to the PR — verified by
-comparing added lines with comments and docstrings stripped, 138 code lines
-across the three files, exact match. The PR also adds a test under
+`srt/`-only variant for **v0.5.13**, which sits between the two: it still keeps
+those entry points in `model_executor/model_runner.py` (so the `model_runner.py`
+hunk is the v0.5.12.post1 one), but it has already moved to the four-argument
+`_maybe_get_cached_w3_w1_permute_indices(..., is_gated_act_gemm=...)` form (so
+`base_config.py` and `unquant.py` come from the PR's main-branch version).
+
+Applying the older v0.5.12.post1 backport here with fuzz would silently revert
+that call to three arguments and change the permutation for non-gated MoE
+models — a wrong-weights bug that no shape check would catch. The one hunk that
+neither upstream version supplies, replacing the inline flashinfer block in
+`process_weights_after_loading` with the extracted helper, was reconciled by
+hand against the v0.5.13 tree.
+
+Verified: applies cleanly to a pristine v0.5.13 tree, round-trips byte-exact,
+`process_weights_after_loading` calls the helper exactly once, and all six
+patch-added methods are present. The PR also adds a test under
 `test/registered/`, which has no counterpart in a wheel install and is therefore
 not carried here.
 
-Validated on GB200 against this exact backport: bit-exact generation
+Validated on GB200 against the v0.5.12.post1 backport of the same change
+(the v0.5.13 variant has not yet been exercised on hardware): bit-exact generation
 (max abs logprob delta 0.0) across an adversarially bucketed push of all 18867
 checkpoint tensors, for `flashinfer_trtllm`, `flashinfer_trtllm_routed` and
 `triton`; the stock tree reproduces the reported failure under the same
