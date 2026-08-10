@@ -210,8 +210,10 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             make_nccl_reshard_refit_info_wire_safe,
         )
 
-        # SingleController sends this across vLLM's subprocess boundary, so avoid
-        # Megatron-dependent Tensor pickles.
+        # nccl_reshard_refit_info contains Torch Tensors that are created by
+        # Megatron, which will invoke `import megatron` when unpickled.
+        # To avoid this, we remove the Torch Tensors and restore them later,
+        # via `restore_nccl_reshard_refit_info()`.
         wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
             nccl_reshard_refit_info
         )
