@@ -72,8 +72,7 @@ apt-get install -y --no-install-recommends \
     less \
     vim \
     ccache \
-    nvidia-cuda-dev \
-    libcublas-dev-13-0
+    nvidia-cuda-dev
 
 # Nsight
 apt install -y --no-install-recommends gnupg
