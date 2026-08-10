@@ -27,11 +27,7 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    LinearBase,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -771,151 +767,6 @@ def _try_load_deepseek_v4_bmm_param(
     return False
 
 
-def _try_load_deepseek_v4_merged_column_param(
-    module_map: dict[str, torch.nn.Module],
-    param_name: str,
-    param: torch.nn.Parameter,
-    loaded_weight: object,
-    loaded_shard_id: object,
-) -> bool:
-    """Load a DSV4 merged-column shard after torch.compile erases its subclass.
-
-    vLLM's merged-column loader relies on methods provided by
-    ``ModelWeightParameter`` and ``BlockQuantScaleParameter``.  The FP8 model
-    processing keeps the Parameter object and its ``weight_loader`` callback,
-    but torch.compile may turn the object into a plain ``torch.nn.Parameter``.
-    Reproduce vLLM's merged-column slicing directly for that case.
-    """
-    if not isinstance(loaded_weight, torch.Tensor):
-        return False
-    if not isinstance(loaded_shard_id, int):
-        return False
-    if hasattr(param, "load_merged_column_weight"):
-        return False
-
-    module_name = _get_param_module_name(param_name)
-    if module_name is None:
-        return False
-    layer = module_map.get(module_name)
-    output_sizes = getattr(layer, "output_sizes", None)
-    if not output_sizes or not 0 <= loaded_shard_id < len(output_sizes):
-        return False
-
-    tp_size = int(getattr(layer, "tp_size", 1))
-    tp_rank = int(getattr(layer, "tp_rank", 0))
-    if tp_size <= 0:
-        raise ValueError(f"Invalid TP size {tp_size} for {param_name}")
-
-    full_shard_size = int(output_sizes[loaded_shard_id])
-    full_shard_offset = sum(int(size) for size in output_sizes[:loaded_shard_id])
-    if full_shard_size % tp_size != 0 or full_shard_offset % tp_size != 0:
-        raise ValueError(
-            "DeepSeek V4 merged-column refit requires TP-divisible shards: "
-            f"param={param_name}, output_sizes={list(output_sizes)}, tp_size={tp_size}"
-        )
-
-    shard_size = full_shard_size // tp_size
-    shard_offset = full_shard_offset // tp_size
-    if param_name.endswith((".weight_scale", ".weight_scale_inv")):
-        weight_block_size = getattr(layer, "weight_block_size", None)
-        if weight_block_size is None:
-            return False
-        # Keep this equivalent to vLLM linear.adjust_block_scale_shard without
-        # depending on that helper remaining importable across vLLM versions.
-        output_block_size = int(weight_block_size[0])
-        shard_offset = (shard_offset + output_block_size - 1) // output_block_size
-        shard_size = (shard_size + output_block_size - 1) // output_block_size
-
-    output_dim = 0
-    source_offset = tp_rank * shard_size
-    if param.data.shape[output_dim] < shard_offset + shard_size:
-        raise ValueError(
-            "DeepSeek V4 merged-column refit target is too small: "
-            f"param={param_name}, target={tuple(param.shape)}, "
-            f"offset={shard_offset}, size={shard_size}"
-        )
-    if loaded_weight.shape[output_dim] < source_offset + shard_size:
-        raise ValueError(
-            "DeepSeek V4 merged-column refit source is too small: "
-            f"param={param_name}, loaded={tuple(loaded_weight.shape)}, "
-            f"offset={source_offset}, size={shard_size}"
-        )
-
-    target = param.data.narrow(output_dim, shard_offset, shard_size)
-    source = loaded_weight.narrow(output_dim, source_offset, shard_size)
-    if target.shape != source.shape:
-        raise ValueError(
-            "DeepSeek V4 merged-column refit shape mismatch: "
-            f"param={param_name}, target={tuple(target.shape)}, "
-            f"loaded={tuple(source.shape)}, shard_id={loaded_shard_id}"
-        )
-    target.copy_(source)
-    return True
-
-
-def _try_load_deepseek_v4_parallel_linear_param(
-    module_map: dict[str, torch.nn.Module],
-    param_name: str,
-    param: torch.nn.Parameter,
-    loaded_weight: object,
-) -> bool:
-    """Load a non-fused TP linear after its vLLM Parameter subclass is lost."""
-    if not isinstance(loaded_weight, torch.Tensor):
-        return False
-
-    module_name = _get_param_module_name(param_name)
-    if module_name is None:
-        return False
-    layer = module_map.get(module_name)
-    if getattr(layer, "is_bmm", False):
-        return False
-
-    if isinstance(layer, RowParallelLinear):
-        loader_method = "load_row_parallel_weight"
-        shard_dim = 1
-    elif isinstance(layer, ColumnParallelLinear):
-        # Fused column-parallel layers need per-logical-shard offsets and are
-        # handled by _try_load_deepseek_v4_merged_column_param above.
-        if hasattr(layer, "output_sizes"):
-            return False
-        loader_method = "load_column_parallel_weight"
-        shard_dim = 0
-    else:
-        return False
-
-    if hasattr(param, loader_method):
-        return False
-    if loaded_weight.ndim == 0:
-        loaded_weight = loaded_weight.reshape(1)
-
-    target = param.data
-    if target.shape == loaded_weight.shape:
-        target.copy_(loaded_weight)
-        return True
-    if target.ndim <= shard_dim or loaded_weight.ndim <= shard_dim:
-        return False
-
-    tp_rank = int(getattr(layer, "tp_rank", 0))
-    shard_size = target.shape[shard_dim]
-    source_offset = tp_rank * shard_size
-    if loaded_weight.shape[shard_dim] < source_offset + shard_size:
-        raise ValueError(
-            "DeepSeek V4 parallel-linear refit source is too small: "
-            f"param={param_name}, loaded={tuple(loaded_weight.shape)}, "
-            f"dim={shard_dim}, offset={source_offset}, size={shard_size}"
-        )
-
-    source = loaded_weight.narrow(shard_dim, source_offset, shard_size)
-    if target.shape != source.shape:
-        raise ValueError(
-            "DeepSeek V4 parallel-linear refit shape mismatch: "
-            f"param={param_name}, target={tuple(target.shape)}, "
-            f"loaded={tuple(source.shape)}, dim={shard_dim}, tp_rank={tp_rank}"
-        )
-    target.copy_(source)
-    return True
-
-
 def _get_moe_module_name(param_name: str) -> str | None:
     for suffix in (
         ".w13_weight_scale_inv",
@@ -1047,11 +898,6 @@ def _wrap_deepseek_v4_weight_loaders_for_refit(
             **kwargs: Any,
         ) -> Any:
             loaded_weight = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
-            loaded_shard_id = (
-                args[2]
-                if len(args) > 2
-                else kwargs.get("loaded_shard_id", kwargs.get("shard_id"))
-            )
             weight_name = args[2] if len(args) > 2 else kwargs.get("weight_name")
             shard_id = args[3] if len(args) > 3 else kwargs.get("shard_id")
             expert_id = args[4] if len(args) > 4 else kwargs.get("expert_id")
@@ -1072,21 +918,6 @@ def _wrap_deepseek_v4_weight_loaders_for_refit(
                     return moe_scale_result if return_success else None
                 if _try_load_deepseek_v4_bmm_param(
                     module_map, _param_name, _param, loaded_weight
-                ):
-                    return True if return_success else None
-                if _try_load_deepseek_v4_merged_column_param(
-                    module_map=module_map,
-                    param_name=_param_name,
-                    param=_param,
-                    loaded_weight=loaded_weight,
-                    loaded_shard_id=loaded_shard_id,
-                ):
-                    return True if return_success else None
-                if _try_load_deepseek_v4_parallel_linear_param(
-                    module_map=module_map,
-                    param_name=_param_name,
-                    param=_param,
-                    loaded_weight=loaded_weight,
                 ):
                     return True if return_success else None
                 return _weight_loader(*args, **kwargs)
