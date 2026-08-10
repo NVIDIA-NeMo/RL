@@ -85,7 +85,7 @@ bash tests/test_suites/llm/single_update_1n8g.sh
 
 # Launch on SLURM with code snapshots
 # For full documentation on tools/launch, see:
-# https://github.com/NVIDIA-NeMo/RL/blob/main/tests/test_suites/README.md#launching-with-code-snapshots
+# https://github.com/NVIDIA-NeMo/RL/blob/main/.agents/contributor-skills/testing/adding-a-test.md#launching-with-code-snapshots
 bash ../../tools/launch tests/test_suites/llm/single_update_1n8g.sh
 
 # Dry run to estimate GPU hours needed

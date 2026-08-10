@@ -26,9 +26,9 @@ The mandated sections -- algo, model, cluster tuple, backend -- are checked
 **both ways**: the name must match the config and the config must match the
 name. Feature tokens are checked **one way only**: if the name claims a feature
 the config must have it, but a config may use a feature without advertising it.
-That asymmetry is deliberate. 94 recipes enable sequence packing; only a handful
-say ``seqpack``, because the token means "this test exists to cover packing",
-not "packing happens to be on".
+That asymmetry is deliberate. Of the recipes checked here, 64 enable sequence
+packing and 8 say ``seqpack``, because the token means "this test exists to
+cover packing", not "packing happens to be on".
 """
 
 import glob
