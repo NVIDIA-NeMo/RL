@@ -16,13 +16,20 @@
 #   - llguidance==0.7.29     → conflicts with nemorl override llguidance>=1.3.0,<1.4.0
 #   - triton==3.6.0          → nemorl base manages triton via pytorch-cu130 index
 #   - evaluate               → pulls in conflicting datasets==3.1.0 transitively
-#   - build / ninja / meson / patchelf  → build-time only, not runtime deps
+#   - build / ninja / meson / patchelf / packaging  → build-time only, not runtime deps
 #   - cuda-core              → included in cuda-python>=13
 #   - graphviz / polygraphy / mcp  → optional dev/test tools
+#   - PyNvVideoCodec~=2.1.0  → no aarch64/py3.13 wheel in that range (PyPI has
+#                              2.0.5 then 2.2.0). Only tensorrt_llm/media/decoding.py
+#                              imports it, function-locally, for Cosmos video
+#                              decode; LLM inference never touches it. Also
+#                              stripped from requirements.txt by
+#                              tools/build-custom-trtllm.sh, or the wheel build
+#                              dies in pip before cmake starts.
 
 [project]
 name = "tensorrt-llm"
-version = "1.3.0rc23"
+version = "1.3.0rc24"
 requires-python = ">=3.13"
 dependencies = [
   "mpi4py",
@@ -49,7 +56,7 @@ dependencies = [
   "sentencepiece>=0.1.99",
   "mistral-common>=1.10.0",
   "tiktoken",
-  "diffusers>=0.37.1",
+  "diffusers>=0.39.0",
   "peft>=0.18.1,<0.19.0",
   "optimum",
   "ftfy",
@@ -122,5 +129,5 @@ backend-path = ["."]
 # image is scoped by base image and architecture so valid compiler objects can
 # be reused across ref and uv-version changes. When bumping `ref`, also re-sync
 # [project].dependencies against the new requirements.txt.
-url = "https://github.com/hchings/TensorRT-LLM.git"
-ref = "a57b321622c4b516b827e91db5acb93fe27d6b21"    # pragma: allowlist secret
+url = "https://github.com/shuyixiong/TensorRT-LLM.git"
+ref = "3dbf513f3ed7487044ae64631c68bffde0fe4ad3"   # pragma: allowlist secret
