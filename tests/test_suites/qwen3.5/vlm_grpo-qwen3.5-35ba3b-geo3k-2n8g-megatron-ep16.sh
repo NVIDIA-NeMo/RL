@@ -4,7 +4,7 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
 SUITE=disabled
 SKU=h100
-DISABLED_REASON="Still hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of https://github.com/vllm-project/vllm/issues/36237, which..."
+DISABLED_REASON="Hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of https://github.com/vllm-project/vllm/issues/36237, which the bump does fix. Not specific to this vLLM version: the enabled grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2 hangs the same way, so this is the pre-existing Qwen3.5 + Megatron + EP hang."
 NUM_NODES=2
 STEPS_PER_RUN=20
 MAX_STEPS=20

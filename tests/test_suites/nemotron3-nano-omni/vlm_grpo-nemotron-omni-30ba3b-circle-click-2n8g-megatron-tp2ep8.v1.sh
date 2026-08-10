@@ -4,7 +4,7 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
 SUITE=disabled
 SKU=h100
-DISABLED_REASON="First multimodal NeMo-Gym recipe (circle_click at the pinned Gym)"
+DISABLED_REASON="First multimodal NeMo-Gym recipe (circle_click at the pinned Gym), disabled on landing: it has never been run end to end, so its reward threshold is an unvalidated smoke bound. Move to SUITE=nightly once a real run confirms it converges and the nightly h100 budget has room for its 32 GPU-hours."
 NUM_NODES=2
 GPUS_PER_NODE=8
 STEPS_PER_RUN=10
