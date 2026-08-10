@@ -267,8 +267,8 @@ because the wrapper bind-mounts that root into the service containers. Since
 |---|---|---|
 | `EXTERNAL_JUDGES` | `0` | `1` serves GenRM and NL2Bash in a second hetgroup |
 | `GENRM_REPLICAS`, `GENRM_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 GenRM servers and TP per server |
-| `GENRM_REASONING_PARSER` | _required_ | Path to the reasoning-parser plugin `.py` served with the GenRM checkpoint |
-| `GENRM_REASONING_PARSER_NAME` | `ultra_v3` | Parser name registered by that plugin, or a parser built into vLLM |
+| `GENRM_REASONING_PARSER_NAME` | `nemotron_v3` | Reasoning parser for the GenRM; `nemotron_v3` is built into vLLM and handles the `<think>`/`</think>` format |
+| `GENRM_REASONING_PARSER` | _unset_ | Path to a reasoning-parser plugin `.py`, only for a checkpoint whose parser vLLM does not ship |
 | `NL2BASH_REPLICAS`, `NL2BASH_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 NL2Bash servers and TP per server |
 | `EXTERNAL_VLLM_SEGMENT_SIZE` | `4` | SLURM `--segment` for the external component |
 
@@ -287,7 +287,6 @@ Building on the [Phase 1](#phase-1--49k-context-128-steps) invocation, add:
 ```bash
 EXTERNAL_JUDGES=1 \
 GENRM_MODEL=/path/to/genrm-checkpoint \
-GENRM_REASONING_PARSER=/lustre/path/to/ultra_v3_reasoning_parser.py \
 GENRM_REPLICAS=16 \
 NL2BASH_JUDGE_MODEL=/path/to/nl2bash-judge-checkpoint \
 NL2BASH_REPLICAS=4 \

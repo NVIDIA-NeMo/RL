@@ -48,9 +48,9 @@ set -euo pipefail
 #                                          Slurm hetgroup instead of inside Gym
 #   GENRM_REPLICAS=4                       External GenRM servers (DP=1 each)
 #   GENRM_TENSOR_PARALLEL_SIZE=4           TP per external GenRM server
-#   GENRM_REASONING_PARSER=                Reasoning-parser plugin .py;
-#                                          required when EXTERNAL_JUDGES=1
-#   GENRM_REASONING_PARSER_NAME=ultra_v3
+#   GENRM_REASONING_PARSER=                Reasoning-parser plugin .py; only
+#                                          needed for a parser vLLM lacks
+#   GENRM_REASONING_PARSER_NAME=nemotron_v3
 #   NL2BASH_REPLICAS=4                     External NL2Bash servers (DP=1 each)
 #   NL2BASH_TENSOR_PARALLEL_SIZE=4         TP per external NL2Bash server
 #   EXTERNAL_VLLM_SEGMENT_SIZE=4           Segment size for the external hetgroup
@@ -182,8 +182,11 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
   GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
   GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER}}"
   GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
-  : "${GENRM_REASONING_PARSER:?GENRM_REASONING_PARSER is required when EXTERNAL_JUDGES=1}"
-  GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
+  # nemotron_v3 is built into vLLM and parses the <think>/</think> format the
+  # GenRM emits. Set GENRM_REASONING_PARSER only for a checkpoint that needs a
+  # parser vLLM does not ship.
+  GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-}"
+  GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-nemotron_v3}"
   GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
   GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
   GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
@@ -224,7 +227,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
     --lb-port "${GENRM_LB_PORT}" \
     --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
     --url-placeholder "${GENRM_BASE_URL}" \
-    --shared-path "${GENRM_REASONING_PARSER}"
+    ${GENRM_REASONING_PARSER:+--shared-path "${GENRM_REASONING_PARSER}"}
   external_vllm_pool_env GENRM \
     "FLASHINFER_WORKSPACE_BASE=/tmp" \
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
@@ -236,13 +239,13 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
     --max-num-seqs 256
     --gpu-memory-utilization 0.95
     --enable-prefix-caching
-    --reasoning-parser-plugin "${GENRM_REASONING_PARSER}"
     --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
     --enable-auto-tool-choice
     --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
     --compilation-config "${GENRM_COMPILATION_CONFIG}"
     --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
   )
+  [[ -n "${GENRM_REASONING_PARSER}" ]] && genrm_vllm_args+=(--reasoning-parser-plugin "${GENRM_REASONING_PARSER}")
   [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
   external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
 fi
