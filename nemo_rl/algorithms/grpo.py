@@ -1456,14 +1456,12 @@ def setup(
             inference_cluster=None if colocated_inference else inference_cluster,
         )
         policy_generation.weight_synchronizer.init_communicator()
-        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
         if not colocated_inference:
             # Load the model weights now.
             t0 = time.perf_counter()
             policy_generation.weight_synchronizer.sync_weights()
-            worker_init_timing_metrics["initial_weight_sync_time_s"] = (
-                time.perf_counter() - t0
-            )
+            setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
