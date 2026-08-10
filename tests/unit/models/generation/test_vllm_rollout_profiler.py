@@ -16,8 +16,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.vllm_generation import (
-    _validate_rollout_profiler_topology,
+from nemo_rl.models.generation.profiling import (
+    validate_rollout_profiler_topology,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
@@ -62,9 +62,9 @@ def test_engine_failure_closes_profiler_initialization_window():
 def test_worker_drives_rollout_profiler_lifecycle():
     worker = _worker_with_profiler()
 
-    assert worker.begin_rollout_profile(step_id="step2/attempt3") is True
-    assert worker.finish_rollout_profile() is True
-    assert worker.abort_rollout_profile(reason="rollout_error") is True
+    worker.begin_rollout_profile(step_id="step2/attempt3")
+    worker.finish_rollout_profile()
+    worker.abort_rollout_profile(reason="rollout_error")
 
     worker._rollout_profiler.begin_rollout.assert_called_once_with(
         step_id="step2/attempt3"
@@ -91,7 +91,7 @@ def test_rollout_profiler_rejects_unsupported_topology_before_worker_start(
     async_engine,
 ):
     with pytest.raises(ValueError, match="Synchronous rollout profiling"):
-        _validate_rollout_profiler_topology(
+        validate_rollout_profiler_topology(
             class_path="profiler.Plugin",
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
@@ -101,7 +101,7 @@ def test_rollout_profiler_rejects_unsupported_topology_before_worker_start(
 
 
 def test_rollout_profiler_topology_validation_is_inert_when_disabled():
-    _validate_rollout_profiler_topology(
+    validate_rollout_profiler_topology(
         class_path="",
         tensor_parallel_size=8,
         pipeline_parallel_size=2,

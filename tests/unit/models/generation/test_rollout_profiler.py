@@ -63,9 +63,7 @@ def fake_profiler_module():
 def test_rollout_profiler_is_disabled_without_class_path():
     with (
         patch.dict(os.environ, {}, clear=True),
-        patch(
-            "nemo_rl.models.generation.profiling.importlib.import_module"
-        ) as importer,
+        patch("nemo_rl.models.profiling.importlib.import_module") as importer,
     ):
         assert load_rollout_profiler(rank=3) is None
 
