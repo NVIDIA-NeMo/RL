@@ -46,6 +46,10 @@ set -euo pipefail
 #   NUM_SPECULATIVE_TOKENS=5               MTP speculative tokens
 #   MAX_NUM_BATCHED_TOKENS=8480            vLLM max batched tokens (MTP)
 #   NRL_MAX_STEPS=                         Override grpo.max_num_steps
+#   TRAIN_ENTRYPOINT=                      Driver script, relative to CODE_ROOT.
+#                                          Defaults to the NeMo Gym GRPO runner;
+#                                          set ./examples/run_grpo_single_controller.py
+#                                          for SingleController recipes
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
@@ -75,7 +79,13 @@ set -euo pipefail
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
-: "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+# `?` rather than `:?`: an explicitly empty value is how a recipe opts out of
+# the nemo-skills sandbox. ray.sub only launches it when SANDBOX_CONTAINER and
+# SANDBOX_COMMAND are both non-empty, and that srun runs with
+# --kill-on-bad-exit=1, so one node failing sandbox startup tears the whole job
+# down. Blends that touch no sandbox-backed env are better off without it.
+# Leaving the variable unset is still an error, so the choice stays deliberate.
+: "${SANDBOX_CONTAINER?SANDBOX_CONTAINER is required (nemo-skills sandbox image; set it empty to disable the sandbox)}"
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
@@ -608,6 +618,9 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# SingleController recipes swap this for ./examples/run_grpo_single_controller.py.
+# Both drivers accept the same --config and Hydra override surface.
+TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
@@ -628,7 +641,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -663,6 +676,7 @@ echo "  Nemotron 3 Ultra — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
 echo "  Config:      ${CONFIG_PATH}"
+echo "  Entrypoint:  ${TRAIN_ENTRYPOINT}"
 echo "  Nodes:       ${NUM_TOTAL_NODES} total  (segment=${SEGMENT_SIZE})"
 echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"
