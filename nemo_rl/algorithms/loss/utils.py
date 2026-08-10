@@ -183,33 +183,11 @@ def prepare_loss_input(
                 cp_sharder,
                 chunk_size=chunk_size,
             )
-            full_logprobs = torch.cat(
-                [next_token_logprobs, torch.zeros_like(next_token_logprobs[:, :1])],
-                dim=1,
-            )
-            cp_size = (
-                torch.distributed.get_world_size(context_parallel_group)
-                if context_parallel_group is not None
-                else 1
-            )
-            cp_rank = (
-                torch.distributed.get_rank(context_parallel_group)
-                if context_parallel_group is not None
-                else 0
-            )
-            local_seq_len = full_logprobs.shape[1] // cp_size
-            seq_start = cp_rank * local_seq_len
-            next_token_mask = (
-                data["token_mask"].to(full_logprobs.device).roll(shifts=-1, dims=1)
-            )
-            next_token_mask[:, -1] = 0
             loss_input.update(
-                student_next_token_logprobs=full_logprobs.narrow(
-                    1, seq_start, local_seq_len
-                ).contiguous(),
-                student_next_token_mask=next_token_mask.narrow(
-                    1, seq_start, local_seq_len
-                ).contiguous(),
+                student_next_token_logprobs=next_token_logprobs,
+                student_next_token_mask=data["token_mask"][:, 1:]
+                .to(next_token_logprobs.device)
+                .contiguous(),
             )
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
