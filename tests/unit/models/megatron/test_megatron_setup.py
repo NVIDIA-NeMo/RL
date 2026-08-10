@@ -25,11 +25,35 @@ nemo_rl.models.megatron.setup, focusing on:
 """
 
 import os
+from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
+
+@dataclass
+class _NestedModelConfig:
+    enabled: bool = False
+    mode: str = "default"
+
+
+@dataclass
+class _SerializableModelConfig:
+    masked_softmax_fusion: bool = True
+    nested_config: _NestedModelConfig = field(default_factory=_NestedModelConfig)
+    mapping_config: dict[str, Any] = field(
+        default_factory=lambda: {"preserved": 1, "nested": {"old": 2}}
+    )
+    finalized: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        pass
+
+    def finalize(self) -> None:
+        self.finalized = True
 
 
 @pytest.mark.mcore
@@ -517,19 +541,12 @@ class TestValidateModelPaths:
 class TestApplyModelOverrides:
     """Tests for generic Megatron Bridge model-provider overrides."""
 
-    def test_applies_leaf_nested_object_and_mapping_overrides(self):
-        """Overrides follow the hierarchy without replacing nested configs."""
-        from nemo_rl.models.megatron.setup import _apply_model_overrides
+    def test_constructs_provider_with_nested_and_mapping_overrides(self):
+        """Overrides construct a new provider and preserve the original config."""
+        from nemo_rl.models.megatron.setup import _merge_model_overrides
 
-        nested_config = SimpleNamespace(enabled=False, mode="default")
-        mapping_config = {"preserved": 1, "nested": {"old": 2}}
-        model_cfg = SimpleNamespace(
-            masked_softmax_fusion=True,
-            nested_config=nested_config,
-            mapping_config=mapping_config,
-        )
-
-        _apply_model_overrides(
+        model_cfg = _SerializableModelConfig()
+        merged_model_cfg = _merge_model_overrides(
             model_cfg,
             {
                 "masked_softmax_fusion": False,
@@ -538,13 +555,20 @@ class TestApplyModelOverrides:
             },
         )
 
-        assert model_cfg.masked_softmax_fusion is False
-        assert model_cfg.nested_config is nested_config
-        assert model_cfg.nested_config.enabled is True
-        assert model_cfg.nested_config.mode == "default"
-        assert model_cfg.mapping_config == {
+        assert merged_model_cfg is not model_cfg
+        assert merged_model_cfg.masked_softmax_fusion is False
+        assert merged_model_cfg.nested_config is not model_cfg.nested_config
+        assert merged_model_cfg.nested_config.enabled is True
+        assert merged_model_cfg.nested_config.mode == "default"
+        assert merged_model_cfg.mapping_config == {
             "preserved": 1,
             "nested": {"old": 2, "new": 3},
+        }
+        assert model_cfg.masked_softmax_fusion is True
+        assert model_cfg.nested_config.enabled is False
+        assert model_cfg.mapping_config == {
+            "preserved": 1,
+            "nested": {"old": 2},
         }
 
     @pytest.mark.parametrize(
@@ -561,12 +585,30 @@ class TestApplyModelOverrides:
         self, overrides, expected_path
     ):
         """Misspelled provider fields fail early with an actionable path."""
-        from nemo_rl.models.megatron.setup import _apply_model_overrides
+        from nemo_rl.models.megatron.setup import _merge_model_overrides
 
-        model_cfg = SimpleNamespace(nested_config=SimpleNamespace(enabled=False))
+        model_cfg = _SerializableModelConfig()
 
         with pytest.raises(AttributeError, match=expected_path):
-            _apply_model_overrides(model_cfg, overrides)
+            _merge_model_overrides(model_cfg, overrides)
+
+    def test_rejects_first_class_megatron_config_conflict(self):
+        """A first-class field cannot also be supplied through model_overrides."""
+        from nemo_rl.models.megatron.setup import (
+            _validate_model_override_conflicts,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "policy.megatron_cfg.model_overrides.tensor_model_parallel_size "
+                "conflicts with policy.megatron_cfg.tensor_model_parallel_size"
+            ),
+        ):
+            _validate_model_override_conflicts(
+                {"model_overrides": {"tensor_model_parallel_size": 2}},
+                {"tensor_model_parallel_size": 2},
+            )
 
 
 @pytest.mark.mcore
@@ -2116,29 +2158,34 @@ class TestSetupModelConfig:
             rope_scaling={"rope_type": "yarn", "factor": 4.0},
         )
 
-    def test_applies_model_overrides_to_loaded_provider(self, tmp_path, request):
-        """model_overrides must update the provider returned by Bridge."""
+    def test_model_overrides_are_finalized_and_serialized(self, tmp_path, request):
+        """The reconstructed provider is the finalized, serializable config."""
+        from megatron.bridge.training.config import ConfigContainer
+
         from nemo_rl.models.megatron.setup import setup_model_config
 
-        self._apply_patches(request)
+        mocks = self._apply_patches(request)
 
         iteration_dir = tmp_path / "iter_0000000"
         iteration_dir.mkdir()
         (iteration_dir / "run_config.yaml").touch()
-        model_cfg = SimpleNamespace(
-            masked_softmax_fusion=True,
-            __post_init__=MagicMock(),
-        )
+        model_cfg = _SerializableModelConfig()
         config = {
             "pretrained_checkpoint": None,
-            "megatron_cfg": {"model_overrides": {"masked_softmax_fusion": False}},
+            "megatron_cfg": {
+                "model_overrides": {
+                    "masked_softmax_fusion": False,
+                    "nested_config": {"enabled": True},
+                    "mapping_config": {"nested": {"new": 3}},
+                }
+            },
         }
 
         with patch(
             "nemo_rl.models.megatron.setup.load_model_config",
             return_value=(model_cfg, None),
         ):
-            setup_model_config(
+            _, merged_model_cfg = setup_model_config(
                 config,
                 rank=0,
                 dtype=torch.bfloat16,
@@ -2146,8 +2193,21 @@ class TestSetupModelConfig:
                 pretrained_path=str(tmp_path),
             )
 
-        assert model_cfg.masked_softmax_fusion is False
-        model_cfg.__post_init__.assert_called_once_with()
+        container_model_cfg = mocks["_create_megatron_config"].call_args.args[0]
+        serialized_model_cfg = ConfigContainer._convert_value_to_dict(
+            container_model_cfg
+        )
+
+        assert merged_model_cfg is container_model_cfg
+        assert merged_model_cfg is not model_cfg
+        assert merged_model_cfg.finalized is True
+        assert serialized_model_cfg["masked_softmax_fusion"] is False
+        assert serialized_model_cfg["nested_config"]["enabled"] is True
+        assert serialized_model_cfg["mapping_config"] == {
+            "preserved": 1,
+            "nested": {"old": 2, "new": 3},
+        }
+        assert model_cfg.masked_softmax_fusion is True
 
     def test_megatron_lm_no_overrides_calls_autoconfig_without_extra_kwargs(
         self, request
