@@ -7,9 +7,6 @@ recipe, and understand the settings that are specific to this model.
 > [!IMPORTANT]
 > **Early access.** Muse Glimmer runs end-to-end in NeMo RL and short GRPO runs
 > have been numerically validated, but long-run convergence has not been established.
-> The AutoModel dependency is a private repository (see
-> [Build the Environment](#build-the-environment)), so this branch is not yet usable
-> without access to it.
 
 ## Support Status
 
@@ -35,12 +32,6 @@ Notes:
 - **Context Parallel (CP)** is supported and is what makes long sequences possible;
   see [Choose a Recipe](#choose-a-recipe). Tensor Parallel and Pipeline Parallel are
   not used on the training side — absorb memory pressure into CP and FSDP2 instead.
-- **Generation** runs on vLLM with tensor parallel 4. Onyx has 2 KV heads and vLLM's
-  `OnyxAttention` allows `tp_size % num_kv_heads == 0` by replicating KV heads, so
-  TP4 is legal even though 4 does not divide 2.
-- **The vLLM build is text-only.** It warns and skips the vision tower; the recipes
-  set `policy.generation.vllm_kwargs.language_model_only: true` to match, and freeze
-  the vision and audio towers on the training side.
 
 ## Build the Environment
 
@@ -51,11 +42,8 @@ and vLLM must come from local sources.
 
 Sources:
 
-- **AutoModel** — a git submodule on this branch, pinned to the branch carrying the
-  Onyx training path. The repository is private, cloned over SSH; make sure your key
-  is loaded (`ssh-add -l`) first. See
-  [Experiment with Custom vLLM](../use-custom-vllm.md#ssh-setup-for-private-repositories)
-  if you need to set up an agent.
+- **AutoModel** — [main branch](https://github.com/NVIDIA-NeMo/Automodel), where Muse
+  Glimmer support is merged.
 - **vLLM** — [main branch](https://github.com/vllm-project/vllm), where Muse Glimmer
   support is merged.
 
@@ -68,10 +56,6 @@ git clone https://github.com/vllm-project/vllm.git 3rdparty/vLLM-workspace/vllm
 
 `pyproject.toml` installs vLLM from `3rdparty/vLLM-workspace/vllm` as an editable
 source, so `uv sync` fails if that directory is empty.
-
-If you check out a vLLM revision other than the one `uv.lock` was resolved against,
-re-run `uv lock` and keep the `flashinfer-*` and `nvidia-cutlass-dsl` pins in the
-`vllm` extra in sync with that revision's `requirements/cuda.txt`.
 
 ### 2. Force a worker-venv rebuild
 
@@ -94,76 +78,6 @@ export VLLM_PRECOMPILED_WHEEL_LOCATION=/path/to/vllm-<version>-cp38-abi3-manylin
 # lock on the distribution cache".
 export UV_LOCK_TIMEOUT=3600
 ```
-
-Skipping the CUDA build is safe because Muse Glimmer support is pure Python on
-top of upstream vLLM — `git diff` of `csrc/`, `CMakeLists.txt` and `cmake/`
-against the upstream base commit is empty, and that base already requires torch
-2.13, so the prebuilt extensions link the same ABI. Take the wheel for the
-upstream base commit from `https://wheels.vllm.ai/<commit>/`, and re-stage it
-whenever you move the vLLM checkout.
-
-> [!IMPORTANT]
-> **The first rebuild is slow on a cold cache, and the venvs belong on
-> node-local disk.** This branch is on torch 2.13, which no prebuilt
-> `flash-attn` wheel targets, so `flash-attn`, Transformer Engine, `mamba-ssm`,
-> `causal-conv1d` and `nv-grouped-gemm` compile from source the first time. On a
-> shared filesystem that is pathologically slow: measured throughput on Lustre
-> was ~0.4 MB/s, against 257 packages in 16 s on node-local disk. Point
-> `NEMO_RL_VENV_DIR` at local disk and keep `UV_CACHE_DIR` on the shared
-> filesystem so the built wheels persist across jobs. Inside a writable
-> container there is nothing to do: the published images already set
-> `NEMO_RL_VENV_DIR=/opt/ray_venvs`, which is node-local. Do not reach for
-> `UV_PROJECT_ENVIRONMENT` — `create_local_venv` overwrites it unconditionally
-> (`nemo_rl/utils/venvs.py`), so setting it has no effect on where worker venvs
-> land. With a warm cache a full 4-node rebuild plus two training steps takes
-> about 15 minutes.
->
-> Once a run has built the venvs, save the container so later jobs reuse them
-> instead of rebuilding — `_env_builder` early-returns when the venv's `python`
-> already exists, so a baked container skips this step entirely.
-
-#### Starting from a stock release container
-
-`NRL_FORCE_REBUILD_VENVS` only rebuilds the **worker** venvs. Two things about
-the container's own base environment have to line up first, and neither fails in
-a way that points at its own cause. Both were confirmed against
-`nemo-rl-0.7.0.sqsh`:
-
-- **The container's CPython must satisfy this branch's `requires-python`.** The
-  0.7.0 image ships 3.13.13; the branch requires `>=3.13.14`, and a compute node
-  cannot download one. `uv run` then dies with `No interpreter found for Python
-  3.13.14` before it does any venv work. The driver `srun` also passes
-  `--no-container-mount-home`, so uv cannot fall back to the host home's managed
-  installs. Stage the interpreter on the shared filesystem and point uv at it:
-
-  ```bash
-  export UV_PYTHON_INSTALL_DIR=/path/to/shared/uv-python   # holds cpython-3.13.14-linux-x86_64-gnu
-  ```
-
-- **Sync the base venv on every node before Ray starts.** `ray.sub` runs
-  `ray start` from the image's baked `/opt/nemo_rl_venv`, but the driver's
-  `uv run` re-syncs that same venv (it is `UV_PROJECT_ENVIRONMENT`) to this
-  branch's lock. If the branch moved Ray, `ray.init` then fails with
-  `Version mismatch: The cluster was started with Ray 2.55.1 / Python 3.13.13,
-  this process ... Ray 2.56.1 / Python 3.13.14`. `SETUP_COMMAND` runs on every
-  node before `ray start`, so sync there:
-
-  ```bash
-  SETUP_COMMAND="cd $PWD && uv sync --locked" \
-  CONTAINER=... MOUNTS=... sbatch ... ray.sub
-  ```
-
-A container built from this branch needs neither, because its baked base venv
-already matches the lock — which is the case the rest of this section assumes.
-
-> [!WARNING]
-> Keep the **policy** worker venv on whatever `nemo-automodel` pins for
-> `transformers`. It is tempting to force the vLLM build's newer `transformers` into
-> every worker venv, but AutoModel's Onyx forward depends on transformers internals;
-> a mismatched policy venv produces `gen_kl_error` around 3.5 **before any weight
-> update**, which silently destroys the checkpoint over the following steps. The
-> vLLM/transformers pairing evidence comes from generation tests, where both live in
-> the same venv — it does not transfer to the policy venv.
 
 ## Get the Weights
 
@@ -225,36 +139,6 @@ correctness. `train/truncation_rate` early in training runs around **0.6 at 4k**
 > `train/mean_gen_tokens_per_sample`, **not** mean generation length alone. When the cap
 > binds, mean generation length *falls*, which reads like "the model does not need the
 > tokens" and means the opposite.
-
-### Per-rank tokens are the memory budget
-
-The head is unusually memory-hungry: the vocabulary is 202048 entries and the final
-soft cap in AutoModel's Onyx `model.py` runs
-
-```python
-logits = soft_cap * torch.tanh(logits.float() * multiplier / soft_cap)
-```
-
-which materializes roughly four full-vocab fp32 tensors. That is about **3.1 GB at 1024
-tokens** and **12.3 GB at 4096** — so per-rank token count, not parameter count, is what
-decides whether a configuration fits.
-
-Per-rank load is `max_total_sequence_length / cp_size`, independent of node count; the
-node count only sets how much data parallelism sits on top. Two ways to control it:
-
-- **Context parallelism** splits a single sequence across ranks, which FSDP2 cannot do.
-  It is **not memory neutral** — Transformer Engine's ring-attention backward keeps
-  roughly `cp_size` copies of `dq`/`dk`/`dv` — so budget about half the per-rank tokens
-  you would use at `cp=1`. This is how the 6k recipe reaches 1536 tokens/rank.
-- **`policy.dynamic_batching.train_mb_tokens`** caps tokens per microbatch directly. It
-  defaults to the sequence length, and lowering it is mathematically free: gradient
-  accumulation is exact, only the number of microbatches changes. This is how the 4k
-  recipe survives at `cp=1`.
-
-CP also constrains the rest of the config: it is rejected for VLMs and for sequence
-packing, and it forces `attn_implementation=sdpa`. The recipes already set
-`policy.sequence_packing.enabled: false` and `attn_implementation: sdpa`; leave both
-alone.
 
 ## Launch
 
