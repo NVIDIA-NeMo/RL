@@ -64,12 +64,19 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.automodel.config import (
     DistributedContext,
     ModelAndOptimizerState,
     RuntimeConfig,
+)
+from nemo_rl.models.automodel.shared_prefix import (
+    SHARED_PREFIX_ATTENTION,
+    register_shared_prefix_attention,
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
@@ -293,6 +300,7 @@ def validate_and_prepare_config(
     offload_optimizer_for_logprob = config.get("offload_optimizer_for_logprob", False)
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
+    enable_shared_prefix_training = bool(config.get("shared_prefix_training"))
     model_name = config["model_name"]
 
     # Validate sequence packing
@@ -318,18 +326,22 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
-    attn_impl = (
-        "flash_attention_2"
-        if (enable_seq_packing and cp_size_cfg == 1)
-        else ("sdpa" if cp_size_cfg > 1 else None)
-    )
+    if enable_shared_prefix_training:
+        register_shared_prefix_attention()
+        attn_impl = SHARED_PREFIX_ATTENTION
+    else:
+        attn_impl = (
+            "flash_attention_2"
+            if (enable_seq_packing and cp_size_cfg == 1)
+            else ("sdpa" if cp_size_cfg > 1 else None)
+        )
 
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
         torch_dtype=torch.float32,  # Always load in float32 for master weights
         trust_remote_code=True,
-        attn_implementation="flash_attention_2" if enable_seq_packing else None,
+        attn_implementation=attn_impl,
         **hf_config_overrides,
     )
 
@@ -379,6 +391,47 @@ def validate_and_prepare_config(
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+
+    if enable_shared_prefix_training:
+        automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs")
+        if not config["dtensor_cfg"].get("_v2"):
+            raise ValueError("shared-prefix training requires DTensor v2")
+        if not enable_seq_packing:
+            raise ValueError("shared-prefix training requires sequence packing")
+        if config["dynamic_batching"]["enabled"]:
+            raise ValueError("shared-prefix training does not support dynamic batching")
+        if tp_size != 1 or cp_size != 1 or sequence_parallel_enabled:
+            raise ValueError(
+                "shared-prefix training currently requires TP=1, CP=1, and sequence_parallel=false"
+            )
+        if automodel_kwargs is None or automodel_kwargs.get("force_hf") is not True:
+            raise ValueError(
+                "shared-prefix training requires "
+                "policy.dtensor_cfg.automodel_kwargs.force_hf=true"
+            )
+        if is_vlm or is_reward_model:
+            raise ValueError(
+                "shared-prefix training currently supports text causal language models only"
+            )
+        if model_config.model_type != "qwen3":
+            raise ValueError(
+                f"shared-prefix training currently supports qwen3, got {model_config.model_type}"
+            )
+        layer_types = getattr(model_config, "layer_types", ["full_attention"])
+        if any(layer_type != "full_attention" for layer_type in layer_types):
+            raise ValueError(
+                "shared-prefix training currently supports full-attention Qwen3 layers only"
+            )
+        if getattr(model_config, "attention_dropout", 0.0) != 0.0:
+            raise ValueError("shared-prefix training requires attention_dropout=0")
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "shared-prefix FA2 training requires float16 or bfloat16 precision"
+            )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            raise ValueError(
+                "shared-prefix training does not yet support train-time top-k/top-p filtering"
+            )
 
     # Validate parallelization configuration
     if cp_size > 1 and enable_seq_packing:
@@ -696,9 +749,14 @@ def setup_model_and_optimizer(
         # other backend would silently run cross-document attention. Packing with
         # cp_size > 1 is already rejected above (see the cp_size/enable_seq_packing
         # check), so enable_seq_packing here implies cp_size == 1 -> flash_attention_2.
-        if runtime_config.enable_seq_packing and requested != "flash_attention_2":
+        expected_attention = (
+            SHARED_PREFIX_ATTENTION
+            if config.get("shared_prefix_training")
+            else "flash_attention_2"
+        )
+        if runtime_config.enable_seq_packing and requested != expected_attention:
             raise ValueError(
-                "sequence_packing requires attn_implementation='flash_attention_2', "
+                f"sequence_packing requires attn_implementation={expected_attention!r}, "
                 f"but the recipe set automodel_kwargs.attn_implementation={requested!r}."
             )
         attn_impl = requested

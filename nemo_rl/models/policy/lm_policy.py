@@ -112,6 +112,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        if config.get("shared_prefix_training") and (
+            megatron_enable
+            or not dtensor_enable
+            or not config.get("dtensor_cfg", {}).get("_v2", False)
+        ):
+            raise ValueError(
+                "shared-prefix training requires the DTensor v2 backend and does "
+                "not support Megatron or DTensor v1"
+            )
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "

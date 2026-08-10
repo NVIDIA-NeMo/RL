@@ -25,6 +25,7 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
@@ -32,6 +33,11 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     check_sequence_dim,
     make_processed_microbatch_iterator,
+)
+from nemo_rl.models.automodel.shared_prefix import (
+    build_shared_prefix_layout,
+    response_logprobs_from_logits,
+    scatter_response_logprobs,
 )
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
@@ -171,6 +177,27 @@ class TestModelForward:
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" in call_kwargs
+
+    def test_forward_with_shared_prefix_layout(self, mock_model):
+        input_ids = torch.tensor([[1, 2, 3], [1, 2, 4]])
+        layout = build_shared_prefix_layout(
+            input_ids,
+            input_lengths=torch.tensor([3, 3]),
+            prompt_lengths=torch.tensor([2, 2]),
+            group_ids=torch.tensor([0, 0]),
+        )
+        processed_inputs = ProcessedInputs(
+            input_ids=layout.compact_input_ids,
+            position_ids=layout.compact_position_ids,
+            seq_len=layout.compact_tokens,
+            shared_prefix_layout=layout,
+        )
+
+        model_forward(mock_model, processed_inputs)
+
+        call_kwargs = mock_model.call_args.kwargs
+        assert call_kwargs["shared_prefix_layout"] is layout
+        assert torch.equal(call_kwargs["logits_to_keep"], layout.predictor_indices)
 
     def test_forward_with_multimodal(self, mock_model, processed_inputs_multimodal):
         result = model_forward(mock_model, processed_inputs_multimodal)
@@ -452,6 +479,232 @@ class TestLossPostProcessor:
         mock_wrapper_class.assert_called_once()
         # Verify the wrapper was called instead of raw loss_fn
         mock_wrapper_instance.assert_called_once()
+
+    @pytest.mark.parametrize("force_on_policy_ratio", [False, True])
+    def test_shared_prefix_clipped_pg_loss_parity(
+        self,
+        force_on_policy_ratio,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+        mock_tp_mesh,
+    ):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required by the dense next-token logprob path")
+
+        device = torch.device("cuda")
+        input_ids = torch.tensor(
+            [
+                [10, 11, 12, 21, 22],
+                [40, 41, 51, 52, 53],
+                [10, 11, 12, 31, 0],
+                [40, 41, 61, 62, 0],
+            ],
+            device=device,
+        )
+        input_lengths = torch.tensor([5, 5, 4, 4], device=device)
+        prompt_lengths = torch.tensor([3, 2, 3, 2], device=device)
+        group_ids = torch.tensor([7, 9, 7, 9], device=device)
+        layout = build_shared_prefix_layout(
+            input_ids,
+            input_lengths=input_lengths,
+            prompt_lengths=prompt_lengths,
+            group_ids=group_ids,
+        )
+
+        token_mask = torch.tensor(
+            [
+                [0, 0, 0, 1, 1],
+                [0, 0, 1, 1, 1],
+                [0, 0, 0, 1, 0],
+                [0, 0, 1, 1, 0],
+            ],
+            device=device,
+        )
+        sample_mask = torch.ones(4, device=device)
+        active_mask = token_mask[:, 1:].bool()
+
+        torch.manual_seed(1234)
+        vocab_size = 64
+        dense_logits = torch.randn(
+            4,
+            5,
+            vocab_size,
+            device=device,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        compact_logits = (
+            dense_logits.detach()[:, :-1]
+            .reshape(-1, vocab_size)
+            .index_select(0, layout.loss_logprob_scatter_indices)
+            .clone()
+            .unsqueeze(0)
+            .requires_grad_()
+        )
+
+        with torch.no_grad():
+            dense_current_logprobs = (
+                torch.log_softmax(dense_logits[:, :-1], dim=-1)
+                .gather(-1, input_ids[:, 1:].unsqueeze(-1))
+                .squeeze(-1)
+            )
+
+        # Full-shape fields deliberately contain finite non-zero values outside
+        # the response mask. ClippedPGLossFn owns the [:, 1:] shift and masking.
+        advantages = torch.full((4, 5), 3.0, device=device)
+        advantages[:, 1:] = torch.tensor(
+            [1.0, -0.75, 0.5, -1.25], device=device
+        ).unsqueeze(-1)
+
+        desired_ratios = torch.tensor([1.5, 0.5, 1.1, 0.9], device=device).unsqueeze(-1)
+        desired_log_ratios = desired_ratios.log().expand(-1, 4)
+        prev_shifted = torch.full((4, 4), -2.5, device=device)
+        prev_shifted[active_mask] = (
+            dense_current_logprobs.detach() - desired_log_ratios
+        )[active_mask]
+
+        generation_shifted = torch.full((4, 4), -3.0, device=device)
+        generation_offsets = torch.tensor(
+            [-0.10, 0.15, -0.20, 0.05], device=device
+        ).unsqueeze(-1)
+        generation_shifted[active_mask] = (prev_shifted + generation_offsets)[
+            active_mask
+        ]
+
+        reference_shifted = torch.full((4, 4), -3.5, device=device)
+        reference_offsets = torch.tensor(
+            [0.20, -0.25, 0.30, -0.15], device=device
+        ).unsqueeze(-1)
+        reference_shifted[active_mask] = (
+            dense_current_logprobs.detach() + reference_offsets
+        )[active_mask]
+
+        def _prepend(values: torch.Tensor, first_value: float) -> torch.Tensor:
+            return torch.cat(
+                (
+                    torch.full((values.shape[0], 1), first_value, device=device),
+                    values,
+                ),
+                dim=1,
+            )
+
+        data_tensors = {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "advantages": advantages,
+            "prev_logprobs": _prepend(prev_shifted, -2.0),
+            "generation_logprobs": _prepend(generation_shifted, -2.0),
+            "reference_policy_logprobs": _prepend(reference_shifted, -2.0),
+        }
+
+        def _data_copy() -> BatchedDataDict:
+            return BatchedDataDict(
+                {name: value.clone() for name, value in data_tensors.items()}
+            )
+
+        dense_processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=input_ids.shape[1],
+        )
+        shared_processed_inputs = ProcessedInputs(
+            input_ids=layout.compact_input_ids,
+            position_ids=layout.compact_position_ids,
+            seq_len=layout.compact_tokens,
+            shared_prefix_layout=layout,
+        )
+
+        loss_cfg = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.07,
+            force_on_policy_ratio=force_on_policy_ratio,
+        )
+        processor_cfg = base_cfg
+        dense_processor = LossPostProcessor(
+            loss_fn=ClippedPGLossFn(loss_cfg),
+            cfg=processor_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+            dp_size=1,
+            enable_seq_packing=False,
+        )
+        shared_processor = LossPostProcessor(
+            loss_fn=ClippedPGLossFn(loss_cfg),
+            cfg=processor_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+            dp_size=1,
+            enable_seq_packing=True,
+        )
+
+        global_valid_seqs = sample_mask.sum()
+        global_valid_toks = (token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum()
+
+        dense_loss, dense_metrics = dense_processor(
+            logits=dense_logits,
+            data_dict=_data_copy(),
+            processed_inputs=dense_processed_inputs,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
+        shared_loss, shared_metrics = shared_processor(
+            logits=compact_logits,
+            data_dict=_data_copy(),
+            processed_inputs=shared_processed_inputs,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
+
+        with torch.no_grad():
+            compact_current_logprobs = scatter_response_logprobs(
+                response_logprobs_from_logits(compact_logits, layout),
+                layout,
+                base=prev_shifted,
+            )
+        torch.testing.assert_close(
+            compact_current_logprobs[active_mask],
+            dense_current_logprobs[active_mask],
+        )
+        torch.testing.assert_close(shared_loss, dense_loss)
+        assert shared_metrics.keys() == dense_metrics.keys()
+        for metric_name in dense_metrics:
+            assert shared_metrics[metric_name] == pytest.approx(
+                dense_metrics[metric_name], rel=1e-6, abs=1e-6
+            )
+
+        if force_on_policy_ratio:
+            assert shared_metrics["probs_ratio"] == pytest.approx(1.0)
+            assert shared_metrics["probs_ratio_min"] == pytest.approx(1.0)
+            assert shared_metrics["probs_ratio_max"] == pytest.approx(1.0)
+
+        dense_loss.backward()
+        shared_loss.backward()
+        dense_grad = dense_logits.grad[:, :-1].reshape(-1, vocab_size)
+        selected_dense_grad = dense_grad.index_select(
+            0, layout.loss_logprob_scatter_indices
+        )
+        torch.testing.assert_close(
+            compact_logits.grad.squeeze(0),
+            selected_dense_grad,
+        )
+
+        selected_positions = torch.zeros(
+            dense_grad.shape[0], device=device, dtype=torch.bool
+        )
+        selected_positions[layout.loss_logprob_scatter_indices] = True
+        torch.testing.assert_close(
+            dense_grad[~selected_positions],
+            torch.zeros_like(dense_grad[~selected_positions]),
+        )
+        torch.testing.assert_close(
+            dense_logits.grad[:, -1],
+            torch.zeros_like(dense_logits.grad[:, -1]),
+        )
 
     def test_loss_processor_initialization(
         self,

@@ -51,6 +51,7 @@ from nemo_rl.models.automodel.setup import (
     setup_reference_model_state,
     validate_and_prepare_config,
 )
+from nemo_rl.models.automodel.shared_prefix import SHARED_PREFIX_GROUP_IDS
 from nemo_rl.models.automodel.train import (
     FullLogitsPostProcessor,
     LogprobsPostProcessor,
@@ -400,6 +401,14 @@ class DTensorPolicyWorkerV2Impl(
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         self.timer.start("train")
+        if (
+            self.cfg.get("shared_prefix_training")
+            and SHARED_PREFIX_GROUP_IDS not in data
+        ):
+            raise ValueError(
+                "shared-prefix training is enabled, but the training batch has no "
+                "GRPO shared-prefix metadata"
+            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:

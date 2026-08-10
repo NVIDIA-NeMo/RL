@@ -27,6 +27,12 @@ from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
 )
+from nemo_rl.models.automodel.shared_prefix import (
+    SHARED_PREFIX_GROUP_IDS,
+    SHARED_PREFIX_LENGTHS,
+    SharedPrefixLayout,
+    build_shared_prefix_layout,
+)
 
 
 @dataclass
@@ -54,6 +60,10 @@ class ProcessedInputs:
     # Context parallel support (cp_size > 1)
     cp_buffers: list[torch.Tensor] = field(default_factory=list)
     seq_index: Optional[torch.Tensor] = None
+
+    # Present only for train-time Qwen3 shared-prefix execution. Keeping this
+    # optional preserves the normal inference, reward-model, and VLM paths.
+    shared_prefix_layout: Optional[SharedPrefixLayout] = None
 
     @property
     def has_context_parallel(self) -> bool:
@@ -216,9 +226,43 @@ def process_microbatch(
     Returns:
         ProcessedInputs containing all tensors and metadata for forward pass
     """
+    has_shared_groups = SHARED_PREFIX_GROUP_IDS in mb
+    has_shared_lengths = SHARED_PREFIX_LENGTHS in mb
+    if has_shared_groups != has_shared_lengths:
+        raise ValueError("shared-prefix training requires both metadata tensors")
+    if has_shared_groups and not cfg.get("shared_prefix_training"):
+        raise ValueError(
+            "shared-prefix metadata is present, but shared_prefix_training is disabled"
+        )
+
     input_ids = mb.get("input_ids").cuda()
 
-    if enable_seq_packing:
+    if has_shared_groups:
+        if not enable_seq_packing:
+            raise ValueError(
+                "shared-prefix training currently requires sequence packing"
+            )
+        if cp_size != 1:
+            raise ValueError(
+                "shared-prefix training does not support context parallelism"
+            )
+        if len(mb.get_multimodal_dict(as_tensors=False)) > 0:
+            raise ValueError(
+                "shared-prefix training does not support multimodal inputs"
+            )
+        shared_prefix_layout = build_shared_prefix_layout(
+            input_ids=input_ids,
+            input_lengths=mb["input_lengths"],
+            prompt_lengths=mb[SHARED_PREFIX_LENGTHS],
+            group_ids=mb[SHARED_PREFIX_GROUP_IDS],
+        )
+        input_ids = shared_prefix_layout.compact_input_ids
+        position_ids = shared_prefix_layout.compact_position_ids
+        seq_len = input_ids.shape[1]
+        attention_mask = None
+        flash_attn_kwargs = {}
+    elif enable_seq_packing:
+        shared_prefix_layout = None
         input_ids, position_ids, _ = pack_sequences(
             input_ids=input_ids,
             input_lengths=mb["input_lengths"],
@@ -227,9 +271,14 @@ def process_microbatch(
             ],  # flash attention 2 expects flattened input
             padding_value=tokenizer.eos_token_id,
             return_attention_mask=False,
-            min_seq_len=cfg["sequence_packing"][
-                "train_mb_tokens"
-            ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+            # The fixed-size tail is a TP workaround. Shared-prefix v1 requires
+            # TP=1, and its model-wide custom backend needs physical tokens to
+            # match the real-token cu_seqlens during dense logprob forwards.
+            min_seq_len=(
+                0
+                if cfg.get("shared_prefix_training")
+                else cfg["sequence_packing"]["train_mb_tokens"]
+            ),
         )
         seq_len = input_ids.shape[1]
         attention_mask = None
@@ -237,6 +286,7 @@ def process_microbatch(
             input_lengths=mb["input_lengths"],
         )
     else:
+        shared_prefix_layout = None
         batch_size, seq_len = input_ids.shape
 
         # DTensor requires the causal attention kernel to hit,
@@ -318,6 +368,7 @@ def process_microbatch(
         cp_buffers=cp_buffers,
         seq_index=seq_index,
         seq_len=seq_len,
+        shared_prefix_layout=shared_prefix_layout,
     )
 
 

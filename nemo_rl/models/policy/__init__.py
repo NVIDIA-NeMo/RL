@@ -535,6 +535,9 @@ class PolicyConfig(TypedDict):
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
+    # Train Qwen3 on one physical prompt plus all responses sharing it. The
+    # first version is DTensor v2/HF/FA2-only and leaves logprob inference dense.
+    shared_prefix_training: NotRequired[bool]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)

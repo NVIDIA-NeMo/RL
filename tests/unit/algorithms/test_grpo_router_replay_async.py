@@ -20,11 +20,16 @@ import torch
 
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    _add_shared_prefix_training_metadata,
     _build_async_grpo_train_data,
     _default_grpo_save_state,
     async_grpo_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.shared_prefix import (
+    SHARED_PREFIX_GROUP_IDS,
+    SHARED_PREFIX_LENGTHS,
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -107,6 +112,69 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
         assert torch.equal(train_data["routed_experts"], routes)
     else:
         assert "routed_experts" not in train_data
+
+
+def test_add_shared_prefix_training_metadata_uses_grpo_prompt_groups():
+    train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, 3, 4],
+                    [1, 2, 5, 0],
+                    [6, 7, 8, 9],
+                    [6, 7, 10, 11],
+                ]
+            ),
+            "input_lengths": torch.tensor([4, 3, 4, 4]),
+            "token_mask": torch.tensor(
+                [
+                    [0, 0, 1, 1],
+                    [0, 0, 1, 0],
+                    [0, 0, 1, 1],
+                    [0, 0, 1, 1],
+                ]
+            ),
+        }
+    )
+
+    _add_shared_prefix_training_metadata(
+        train_data,
+        {"shared_prefix_training": True},
+        num_generations_per_prompt=2,
+    )
+
+    assert train_data[SHARED_PREFIX_GROUP_IDS].tolist() == [0, 0, 1, 1]
+    assert train_data[SHARED_PREFIX_LENGTHS].tolist() == [2, 2, 2, 2]
+
+
+def test_add_shared_prefix_training_metadata_crops_terminal_environment_tokens():
+    train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, 3, 4, 90, 91],
+                    [1, 2, 5, 6, 92, 0],
+                ]
+            ),
+            "input_lengths": torch.tensor([6, 5], dtype=torch.int32),
+            "token_mask": torch.tensor(
+                [
+                    [0, 0, 1, 1, 0, 0],
+                    [0, 0, 1, 1, 0, 0],
+                ]
+            ),
+        }
+    )
+
+    _add_shared_prefix_training_metadata(
+        train_data,
+        {"shared_prefix_training": True},
+        num_generations_per_prompt=2,
+    )
+
+    assert train_data[SHARED_PREFIX_LENGTHS].tolist() == [2, 2]
+    assert train_data["input_lengths"].dtype == torch.int32
+    assert train_data["input_lengths"].tolist() == [4, 4]
 
 
 def test_async_grpo_r3_rejects_data_plane_until_async_tq_exists():

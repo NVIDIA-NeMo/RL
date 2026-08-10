@@ -27,6 +27,10 @@ from nemo_rl.models.automodel.data import (
     process_global_batch,
     process_microbatch,
 )
+from nemo_rl.models.automodel.shared_prefix import (
+    SHARED_PREFIX_GROUP_IDS,
+    SHARED_PREFIX_LENGTHS,
+)
 
 
 @pytest.fixture
@@ -380,6 +384,81 @@ class TestProcessMicrobatch:
         assert result.position_ids is not None
         assert "cu_seqlens" in result.flash_attn_kwargs
         assert result.vlm_kwargs == {}
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="process_microbatch requires CUDA"
+    )
+    def test_shared_prefix_compaction(self, mock_tokenizer):
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.tensor(
+                    [
+                        [10, 11, 12, 21, 22],
+                        [10, 11, 12, 31, 0],
+                    ]
+                ),
+                "input_lengths": torch.tensor([5, 4]),
+                SHARED_PREFIX_LENGTHS: torch.tensor([3, 3]),
+                SHARED_PREFIX_GROUP_IDS: torch.tensor([0, 0]),
+            }
+        )
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": 32},
+            "shared_prefix_training": True,
+        }
+
+        result = process_microbatch(
+            mb=mb,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=True,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        assert result.input_ids.cpu().tolist() == [[10, 11, 12, 21, 22, 31]]
+        assert result.position_ids.cpu().tolist() == [[0, 1, 2, 3, 4, 3]]
+        assert result.shared_prefix_layout is not None
+        assert result.flash_attn_kwargs == {}
+
+    @pytest.mark.parametrize(
+        "metadata,enabled,match",
+        [
+            ({SHARED_PREFIX_GROUP_IDS: torch.tensor([0])}, True, "both metadata"),
+            (
+                {
+                    SHARED_PREFIX_GROUP_IDS: torch.tensor([0]),
+                    SHARED_PREFIX_LENGTHS: torch.tensor([1]),
+                },
+                False,
+                "is disabled",
+            ),
+        ],
+    )
+    def test_shared_prefix_metadata_requires_enabled_complete_pair(
+        self, mock_tokenizer, metadata, enabled, match
+    ):
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[10, 11]]),
+                "input_lengths": torch.tensor([2]),
+                **metadata,
+            }
+        )
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": 8},
+            "shared_prefix_training": enabled,
+        }
+
+        with pytest.raises(ValueError, match=match):
+            process_microbatch(
+                mb=mb,
+                tokenizer=mock_tokenizer,
+                enable_seq_packing=True,
+                cfg=cfg,
+                cp_size=1,
+            )
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
         # Create test microbatch with multimodal data

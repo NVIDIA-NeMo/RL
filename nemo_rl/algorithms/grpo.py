@@ -102,6 +102,11 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.automodel.shared_prefix import (
+    SHARED_PREFIX_GROUP_IDS,
+    SHARED_PREFIX_LENGTHS,
+    infer_shared_prefix_response_bounds,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -344,6 +349,22 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
+    if policy_config.get("shared_prefix_training") and (
+        master_config.data_plane or {}
+    ).get("enabled", False):
+        raise NotImplementedError(
+            "shared-prefix training v1 requires data_plane.enabled=false"
+        )
+    if (
+        policy_config.get("shared_prefix_training")
+        and grpo_config["use_dynamic_sampling"]
+        and grpo_config["use_leave_one_out_baseline"]
+    ):
+        raise NotImplementedError(
+            "shared-prefix training v1 does not support dynamic sampling with "
+            "leave-one-out baselines because it can retain partial prompt groups"
+        )
+
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
@@ -512,6 +533,13 @@ def setup(
     loss_fn = ClippedPGLossFn(
         loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
     )
+    if (
+        policy_config.get("shared_prefix_training")
+        and loss_config.positive_example_nll_weight != 0
+    ):
+        raise NotImplementedError(
+            "shared-prefix training v1 does not support positive_example_nll_weight"
+        )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -1791,6 +1819,42 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _add_shared_prefix_training_metadata(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    policy_config: PolicyConfig,
+    num_generations_per_prompt: int,
+) -> None:
+    """Attach logical prompt groups without changing the dense GRPO batch."""
+    if not policy_config.get("shared_prefix_training"):
+        return
+    batch_size = train_data.size
+    if batch_size % num_generations_per_prompt != 0:
+        raise ValueError(
+            "shared-prefix GRPO expects complete prompt groups before policy.train"
+        )
+
+    prompt_lengths, effective_input_lengths = infer_shared_prefix_response_bounds(
+        train_data["token_mask"], train_data["input_lengths"]
+    )
+    train_data[SHARED_PREFIX_LENGTHS] = prompt_lengths.to(
+        device=train_data["input_lengths"].device,
+        dtype=train_data["input_lengths"].dtype,
+    )
+    # Native rollouts append a terminal environment observation after the
+    # generated assistant response. It has zero loss mask and no later trainable
+    # token depends on it, so compact training can safely drop that tail.
+    train_data["input_lengths"] = effective_input_lengths.to(
+        device=train_data["input_lengths"].device,
+        dtype=train_data["input_lengths"].dtype,
+    )
+    train_data[SHARED_PREFIX_GROUP_IDS] = (
+        torch.arange(
+            batch_size, device=train_data["input_ids"].device, dtype=torch.long
+        )
+        // num_generations_per_prompt
+    )
+
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
@@ -2731,6 +2795,11 @@ def grpo_train(
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
+                    )
+                    _add_shared_prefix_training_metadata(
+                        train_data,
+                        master_config.policy,
+                        master_config.grpo["num_generations_per_prompt"],
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
@@ -4248,6 +4317,13 @@ def async_grpo_train(
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
+                    # Async logprob inference consumes train_data directly, so
+                    # attach train-only compaction metadata only after it ends.
+                    _add_shared_prefix_training_metadata(
+                        train_data,
+                        master_config.policy,
+                        master_config.grpo["num_generations_per_prompt"],
+                    )
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 

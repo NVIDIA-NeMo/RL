@@ -349,6 +349,26 @@ def test_dtensor_dp_replicate_size_requires_v2(
     mock_ray_worker_group.assert_not_called()
 
 
+@pytest.mark.parametrize("backend", ["dtensor_v1", "megatron"])
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_shared_prefix_training_requires_dtensor_v2(
+    mock_ray_worker_group,
+    backend,
+):
+    cluster = create_mock_cluster(world_size=1)
+    tokenizer = create_mock_tokenizer()
+    if backend == "dtensor_v1":
+        config = create_dtensor_config("unused-model", tp=1)
+    else:
+        config = create_megatron_config("unused-model", tp=1)
+    config["shared_prefix_training"] = True
+
+    with pytest.raises(ValueError, match="requires the DTensor v2 backend"):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    mock_ray_worker_group.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,pp,cp,should_pass,expected_error_type,description",
     [

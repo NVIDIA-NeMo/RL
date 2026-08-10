@@ -41,6 +41,7 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
+    setup,
     validate,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
@@ -568,6 +569,18 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=True
     )
+
+
+def test_setup_rejects_shared_prefix_dynamic_sampling_with_loo(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["shared_prefix_training"] = True
+    master_config.grpo["use_dynamic_sampling"] = True
+    master_config.grpo["use_leave_one_out_baseline"] = True
+
+    with pytest.raises(NotImplementedError, match="partial prompt groups"):
+        setup(master_config, MagicMock(), MagicMock(), None)
 
 
 def test_raise_if_message_level_advantage_penalties_enabled_noops_when_unset(

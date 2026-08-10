@@ -42,7 +42,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -52,6 +52,10 @@ from nemo_rl.distributed.model_utils import (
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
+from nemo_rl.models.automodel.shared_prefix import (
+    response_logprobs_from_logits,
+    scatter_response_logprobs,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -111,6 +115,13 @@ def model_forward(
         position_ids=processed_inputs.position_ids,
         use_cache=use_cache,
     )
+
+    if processed_inputs.shared_prefix_layout is not None:
+        layout = processed_inputs.shared_prefix_layout
+        model_args["shared_prefix_layout"] = layout
+        # Qwen3 accepts an arbitrary index tensor here. Repeated prompt-last
+        # indices make one shared hidden state predict each response's first token.
+        model_args["logits_to_keep"] = layout.predictor_indices
 
     # Add flash attention kwargs if applicable
     if processed_inputs.has_flash_attention:
@@ -606,6 +617,40 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
+        layout = processed_inputs.shared_prefix_layout
+        if layout is not None:
+            if self.loss_fn.input_type != LossInputType.LOGPROB:
+                raise ValueError(
+                    "shared-prefix training currently supports logprob losses only"
+                )
+            if getattr(self.loss_fn, "use_fused_linear_logprobs", False):
+                raise ValueError(
+                    "shared-prefix training does not support fused linear logprobs"
+                )
+            if need_top_k_or_top_p_filtering(self.sampling_params):
+                raise ValueError(
+                    "shared-prefix training does not support train-time top-k/top-p"
+                )
+            local_logits = to_local_if_dtensor(logits)
+            response_logprobs = response_logprobs_from_logits(local_logits, layout)
+            prev_logprobs = data_dict.get("prev_logprobs")
+            logprob_base = (
+                prev_logprobs[:, 1:]
+                if isinstance(prev_logprobs, torch.Tensor)
+                else None
+            )
+            next_token_logprobs = scatter_response_logprobs(
+                response_logprobs,
+                layout,
+                base=logprob_base,
+            )
+            return self.loss_fn(
+                data=data_dict,
+                next_token_logprobs=next_token_logprobs,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+            )
+
         # Handle CP redistribution
         if self.cp_size > 1:
             _, data_dict = prepare_data_for_cp(
