@@ -44,6 +44,29 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
 
+def _tag_nsys_output(output_spec: str, tag: str) -> str:
+    """Append *tag* to the filename in an nsys ``-o`` spec.
+
+    Operates on the filename rather than substituting a known worker name,
+    because the spec may be the built-in default or anything the user put in
+    ``NRL_NSYS_EXTRA_OPTIONS`` -- including a directory, which must be left
+    where it is so the reports still land where the user asked. The value
+    arrives quoted from ``get_nsight_config_if_pattern_matches``; a
+    user-supplied one may not be, so the quoting is preserved either way.
+
+    Appended rather than prefixed so the documented report names stay
+    prefix-matchable: ``trtllm_async_generation_worker_*`` keeps finding every
+    report (docs/nsys-profiling.md), disaggregated or not.
+    """
+    quote = ""
+    if len(output_spec) >= 2 and output_spec[0] == output_spec[-1]:
+        if output_spec[0] in "'\"":
+            quote, output_spec = output_spec[0], output_spec[1:-1]
+
+    head, sep, name = output_spec.rpartition("/")
+    return f"{quote}{head}{sep}{name}_{tag}{quote}"
+
+
 class TrtllmAsyncGenerationWorkerImpl:
     """Plain (non-actor) implementation of the async TRT-LLM generation worker.
 
@@ -79,6 +102,12 @@ class TrtllmAsyncGenerationWorkerImpl:
             # parent placement group via get_current_placement_group() and hands both
             # to TRT-LLM as ray_placement_config (instead of TRTLLM_RAY_BUNDLE_INDICES).
             init_kwargs["bundle_indices"] = bundle_indices[1]
+            # The placement-group index completes the engine's identity, which
+            # the worker uses to find its own entry in trtllm_cfg's
+            # _engine_overrides map (see TrtllmGeneration._engine_key). Local
+            # bundle indices alone are ambiguous across per-node PGs, which
+            # each restart numbering at 0.
+            init_kwargs["bundle_pg_idx"] = bundle_indices[0]
 
         init_kwargs["fraction_of_gpus"] = num_gpus
 
@@ -87,26 +116,61 @@ class TrtllmAsyncGenerationWorkerImpl:
     def __repr__(self) -> str:
         return "TrtllmAsyncGenerationWorker"
 
+    def _engine_overrides(self) -> dict[str, Any]:
+        """This engine's entry in the driver-built ``_engine_overrides`` map.
+
+        Keyed by ``(placement group index, local bundle indices)`` -- the same
+        tuple ``TrtllmGeneration`` used to create this worker, so the two sides
+        agree without per-worker init kwargs. Returns ``{}`` for uniform runs,
+        which carry no map at all.
+        """
+        overrides = self.cfg["trtllm_cfg"].get("_engine_overrides")
+        if not overrides or self._bundle_indices is None:
+            return {}
+        key = f"{self._bundle_pg_idx}:" + ",".join(
+            str(i) for i in self._bundle_indices
+        )
+        entry = overrides.get(key)
+        if entry is None:
+            raise RuntimeError(
+                f"No engine override entry for {key!r}. Known keys: "
+                f"{sorted(overrides)}. TrtllmGeneration._engine_key() and this "
+                f"lookup must stay in sync."
+            )
+        return entry
+
     def __init__(
         self,
         config: TrtllmConfig,
         bundle_indices: Optional[list[int]] = None,
+        bundle_pg_idx: Optional[int] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
     ) -> None:
         self.cfg = config
+        self._bundle_pg_idx = bundle_pg_idx
         # Allow gen side to use a quantized checkpoint
         self.model_name = (
             self.cfg.get("trtllm_cfg", {}).get("model_name") or self.cfg["model_name"]
         )
         self.is_model_owner = bundle_indices is not None
         self._bundle_indices = bundle_indices
+        # This engine's effective config: the shared trtllm_cfg with this
+        # engine's role overrides merged over it. Everything that describes the
+        # engine -- constructor kwargs, the HTTP server's limits -- must read
+        # this, never the raw trtllm_cfg, or a role's overrides apply to some
+        # settings and not others. Equal to trtllm_cfg without disaggregation.
+        self.engine_cfg: dict[str, Any] = {
+            **self.cfg["trtllm_cfg"],
+            **self._engine_overrides(),
+        }
         self._fraction_of_gpus = fraction_of_gpus
         self._seed = seed
         self.llm = None
         self.TrtSamplingParams = None
         self._http_thread = None
         self._http_base_url: Optional[str] = None
+        self._http_addr: Optional[tuple[str, int]] = None
         self._http_server = None
 
         if not self.is_model_owner:
@@ -126,8 +190,13 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         self.TrtSamplingParams = TrtSamplingParams
 
-        trtllm_cfg = self.cfg["trtllm_cfg"]
-        tp_size = trtllm_cfg["tensor_parallel_size"]
+        engine_cfg = self.engine_cfg
+        # This engine's TP is the number of bundles TrtllmGeneration tied to it,
+        # not the config value: under PD disaggregation with asymmetric TP the
+        # context and generation engines are different widths, and the config
+        # holds only the default. Identical to engine_cfg["tensor_parallel_size"]
+        # whenever the layout is uniform.
+        tp_size = len(self._bundle_indices)
         self._colocated = self.cfg["colocated"]["enabled"]
 
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -157,15 +226,15 @@ class TrtllmAsyncGenerationWorkerImpl:
             model=self.model_name,
             backend="pytorch",
             tensor_parallel_size=tp_size,
-            dtype=trtllm_cfg["precision"],
-            max_seq_len=trtllm_cfg["max_model_len"],
-            max_batch_size=trtllm_cfg["max_batch_size"],
-            max_num_tokens=trtllm_cfg["max_num_tokens"],
+            dtype=engine_cfg["precision"],
+            max_seq_len=engine_cfg["max_model_len"],
+            max_batch_size=engine_cfg["max_batch_size"],
+            max_num_tokens=engine_cfg["max_num_tokens"],
             # vLLM accepts prompts up to max_model_len (no separate input cap; it clamps output so
             # input+output <= max_model_len). TRT-LLM defaults max_input_len=1024, which rejects long
             # SWE-agent prompts before any tokens generate -> NeMo Gym sees "no generation data".
             # Match the input cap to the context window so it isn't the bottleneck.
-            max_input_len=trtllm_cfg["max_model_len"],
+            max_input_len=engine_cfg["max_model_len"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
             placement_groups=placement_groups_list,
@@ -176,7 +245,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             ),
             cuda_graph_config=CudaGraphConfig(
                 enable_padding=True,
-                max_batch_size=trtllm_cfg["max_batch_size"],
+                max_batch_size=engine_cfg["max_batch_size"],
             ),
         )
 
@@ -186,19 +255,42 @@ class TrtllmAsyncGenerationWorkerImpl:
         # AsyncLLM kwargs (which are validated against LlmArgs.model_fields and
         # reject unknown keys) — pass them via kv_cache_config instead. The rest
         # of trtllm_kwargs is spread as top-level AsyncLLM kwargs below.
+        # A role may override kv_cache_config too: prefill and decode engines
+        # usually want different KV pool sizes.
         extra_trtllm_kwargs = dict(self.cfg.get("trtllm_kwargs") or {})
+        extra_trtllm_kwargs.update(engine_cfg.get("trtllm_kwargs") or {})
         kv_cache_kwargs = dict(extra_trtllm_kwargs.pop("kv_cache_config", None) or {})
 
-        # gpu_memory_utilization is a dedicated trtllm_cfg knob for
+        # gpu_memory_utilization is a dedicated engine_cfg knob for
         # free_gpu_memory_fraction; an explicit kv_cache_config value wins.
-        gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
+        gpu_mem_util = engine_cfg.get("gpu_memory_utilization")
         if gpu_mem_util is not None:
             kv_cache_kwargs.setdefault("free_gpu_memory_fraction", gpu_mem_util)
         if kv_cache_kwargs:
             llm_kwargs["kv_cache_config"] = KvCacheConfig(**kv_cache_kwargs)
 
-        moe_tp = trtllm_cfg.get("moe_tensor_parallel_size")
-        moe_ep = trtllm_cfg.get("moe_expert_parallel_size")
+        # PD disaggregation: every engine gets a cache transceiver. The
+        # context/generation role is per *request* in TRT-LLM
+        # (DisaggregatedParams.request_type), not per engine, so engines are
+        # symmetric here; which pool an engine lands in is decided by the
+        # replica's disagg server from its address alone.
+        disagg_cfg = engine_cfg.get("disaggregation") or {}
+        if disagg_cfg.get("enabled"):
+            from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+            transceiver_kwargs: dict[str, Any] = {
+                "backend": disagg_cfg["cache_transceiver_backend"],
+            }
+            if disagg_cfg.get("max_tokens_in_buffer") is not None:
+                transceiver_kwargs["max_tokens_in_buffer"] = disagg_cfg[
+                    "max_tokens_in_buffer"
+                ]
+            llm_kwargs["cache_transceiver_config"] = CacheTransceiverConfig(
+                **transceiver_kwargs
+            )
+
+        moe_tp = engine_cfg.get("moe_tensor_parallel_size")
+        moe_ep = engine_cfg.get("moe_expert_parallel_size")
         if moe_tp is not None:
             llm_kwargs["moe_tensor_parallel_size"] = moe_tp
         if moe_ep is not None:
@@ -231,6 +323,21 @@ class TrtllmAsyncGenerationWorkerImpl:
             "trtllm_async_generation_worker"
         ).get("nsight")
         if _nsight and "ray_worker_nsight_options" not in llm_kwargs:
+            _disagg_role = self.engine_cfg.get("_disagg_role")
+            if _disagg_role:
+                # Under disaggregation every engine reports the same worker
+                # name, so the report name distinguishes them only by the %p
+                # pid -- which means matching a report to the context or
+                # generation side is a search through the driver log. Tag the
+                # filename with the role and its ordinal (a layout can run
+                # several engines of one role); %p still separates the ranks
+                # within an engine. Aggregated runs have no role and are left
+                # alone.
+                _nsight = dict(_nsight)
+                _nsight["o"] = _tag_nsys_output(
+                    _nsight["o"],
+                    f"{_disagg_role}{self.engine_cfg['_disagg_role_ordinal']}",
+                )
             llm_kwargs["ray_worker_nsight_options"] = _nsight
 
         # Defer __await__ (which fires setup_async) to post_init_async so
@@ -254,6 +361,9 @@ class TrtllmAsyncGenerationWorkerImpl:
         print("[TrtllmAsyncWorker] AsyncLLM ready", flush=True)
 
         if self.cfg["trtllm_cfg"].get("expose_http_server"):
+            # Every engine serves HTTP, context and generation alike: under
+            # disaggregation an address is the only way the disagg server can
+            # reach one.
             self.start_http_server()
 
     def shutdown(self) -> bool:
@@ -291,19 +401,28 @@ class TrtllmAsyncGenerationWorkerImpl:
             tokenizer=tokenizer,
             model_name=self.model_name,
             port=port,
-            max_seq_len=self.cfg["trtllm_cfg"]["max_model_len"],
+            # engine_cfg, not trtllm_cfg: the server must not accept requests
+            # longer than the engine it fronts was built for, and a role may
+            # have overridden that length.
+            max_seq_len=self.engine_cfg["max_model_len"],
             sampling_config={
                 "temperature": self.cfg["temperature"],
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
             },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
-            default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
+            default_chat_template_kwargs=self.engine_cfg.get(
                 "default_chat_template_kwargs"
             ),
-            tool_parser=self.cfg["trtllm_cfg"].get("tool_parser"),
-            reasoning_parser=self.cfg["trtllm_cfg"].get("reasoning_parser"),
+            tool_parser=self.engine_cfg.get("tool_parser"),
+            reasoning_parser=self.engine_cfg.get("reasoning_parser"),
         )
+        # host:port of the URL just returned; the disagg server is configured
+        # with addresses, not URLs.
+        _hostport = self._http_base_url.rsplit("/v1", 1)[0].rsplit("//", 1)[1]
+        _host, _port = _hostport.rsplit(":", 1)
+        self._http_addr = (_host, int(_port))
+
         print(
             f"[TrtllmAsyncWorker] HTTP server started: {self._http_base_url}",
             flush=True,
@@ -316,9 +435,27 @@ class TrtllmAsyncGenerationWorkerImpl:
             self._http_server = None
             self._http_thread = None
             self._http_base_url = None
+            self._http_addr = None
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self._http_base_url
+
+    async def report_http_addr(self) -> Optional[dict[str, Any]]:
+        """This engine's ``{host, port, node_id}``.
+
+        Under disaggregation an address is the only thing the replica's disagg
+        server is given about an engine, so host/port is what feeds its context
+        and generation pools. The node id lets the driver put that server's
+        actor beside its engines.
+        """
+        if self._http_addr is None:
+            return None
+        host, port = self._http_addr
+        return {
+            "host": host,
+            "port": port,
+            "node_id": ray.get_runtime_context().get_node_id(),
+        }
 
     # ------------------------------------------------------------------ #
     #  Collective RPC / refit
