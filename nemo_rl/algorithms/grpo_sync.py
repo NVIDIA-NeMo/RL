@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
+    _policy_dtype,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
@@ -624,7 +625,10 @@ def grpo_train_sync(
                                 }
                             )
                             calibration_data.update(
-                                calib_flat.get_multimodal_dict(as_tensors=False)
+                                calib_flat.get_multimodal_dict(
+                                    as_tensors=False,
+                                    pixel_dtype=_policy_dtype(master_config.policy),
+                                )
                             )
                             calibration_data.to("cpu")
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(

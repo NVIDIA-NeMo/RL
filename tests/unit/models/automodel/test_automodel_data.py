@@ -384,11 +384,8 @@ class TestProcessMicrobatch:
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
         image = torch.randn(1, 3, 224, 224)
-        pixel_values = (
-            PackedTensor(image, dim_to_pack=0)
-            .enable_deduplication()
-            .repeat_interleave(2)
-        )
+        pixel_row = PackedTensor(image, dim_to_pack=0).enable_deduplication()
+        pixel_values = PackedTensor.concat([pixel_row] * 2)
         mb = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, 1000, (2, 64)),

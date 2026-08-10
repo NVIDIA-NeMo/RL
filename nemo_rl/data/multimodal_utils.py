@@ -193,13 +193,6 @@ class PackedTensor:
         """Whether this value carries stable physical-segment provenance."""
         return self._segment_provenance is not None
 
-    @property
-    def logical_segment_count(self) -> int:
-        """Number of segment occurrences after logical expansion."""
-        if self._segment_indices is not None:
-            return len(self._segment_indices)
-        return len(self.tensors)
-
     def logical_segment_counts_by_row(self) -> list[int]:
         """Return the number of non-empty media segments in each logical row."""
         if self._row_offsets is None:
@@ -230,39 +223,6 @@ class PackedTensor:
                 uuid.uuid4().bytes for _ in range(len(self.tensors))
             ]
         return self
-
-    def repeat_interleave(self, num_repeats: int) -> "PackedTensor":
-        """Repeat logical rows while retaining one copy of each physical segment."""
-        if not self.deduplication_enabled:
-            raise ValueError(
-                "PackedTensor repeat_interleave requires deduplication to be enabled"
-            )
-        if num_repeats < 0:
-            raise ValueError("num_repeats must be non-negative")
-        if num_repeats == 0:
-            return PackedTensor(
-                [],
-                self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
-                _row_offsets=[0],
-                _segment_indices=[],
-                _segment_provenance=[],
-            )
-        segment_indices = []
-        row_offsets = [0]
-        for row in range(len(self)):
-            row_segments = self._row_segment_indices(row)
-            for _ in range(num_repeats):
-                segment_indices.extend(row_segments)
-                row_offsets.append(len(segment_indices))
-        return PackedTensor(
-            list(self.tensors),
-            self.dim_to_pack,
-            pad_to_max_shape=self.pad_to_max_shape,
-            _row_offsets=row_offsets,
-            _segment_indices=segment_indices,
-            _segment_provenance=list(self._segment_provenance or []),
-        )
 
     def _row_segment_indices(self, row: int) -> list[int]:
         if self._row_offsets is None:
@@ -378,20 +338,26 @@ class PackedTensor:
         return self
 
     def to_dtype(self, dtype: torch.dtype) -> "PackedTensor":
-        """Return a dtype-converted value without expanding logical segments.
+        """Return an independent wrapper without expanding logical segments.
 
         Dtype conversion creates new physical tensor values, so deduplicated
-        inputs receive new provenance. The logical row-to-segment mapping is
-        preserved exactly.
+        inputs receive new provenance. When the dtype already matches, immutable
+        tensor segments and their provenance remain shared, but mutable wrapper
+        state is copied. The logical row-to-segment mapping is preserved exactly.
         """
-        if all(item is None or item.dtype == dtype for item in self.tensors):
-            return self
+        requires_conversion = any(
+            item is not None and item.dtype != dtype for item in self.tensors
+        )
 
         return PackedTensor(
-            [
-                item.to(dtype=dtype) if item is not None else None
-                for item in self.tensors
-            ],
+            (
+                [
+                    item.to(dtype=dtype) if item is not None else None
+                    for item in self.tensors
+                ]
+                if requires_conversion
+                else list(self.tensors)
+            ),
             self.dim_to_pack,
             pad_to_max_shape=self.pad_to_max_shape,
             _row_offsets=(
@@ -404,8 +370,12 @@ class PackedTensor:
             ),
             _segment_provenance=(
                 [uuid.uuid4().bytes for _ in self.tensors]
-                if self._segment_provenance is not None
-                else None
+                if requires_conversion and self._segment_provenance is not None
+                else (
+                    list(self._segment_provenance)
+                    if self._segment_provenance is not None
+                    else None
+                )
             ),
         )
 
@@ -573,7 +543,11 @@ class PackedTensor:
     def merge_segments(
         cls, from_packed_tensors: list["PackedTensor"]
     ) -> "PackedTensor":
-        """Merge message-turn values into one logical conversation row."""
+        """Merge message-turn values, collapsing compact inputs to one row.
+
+        The legacy path retains one logical row per physical segment; its caller
+        materializes those segments into one conversation row later.
+        """
         if not any(
             packed_tensor.deduplication_enabled
             or packed_tensor._row_offsets is not None
@@ -631,6 +605,10 @@ class PackedTensor:
             or packed_tensor._row_offsets is not None
             for packed_tensor in from_packed_tensors
         ):
+            assert all(len(p) == 1 for p in from_packed_tensors), (
+                "flattened_concat requires one logical row per input; "
+                "merge_segments only collapses dedup-enabled values"
+            )
             return cls.concat(from_packed_tensors)
         tensors = [p.as_tensor() for p in from_packed_tensors]
         return cls(

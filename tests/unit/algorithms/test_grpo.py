@@ -86,17 +86,7 @@ def _mock_policy_generation() -> MagicMock:
     return policy_generation
 
 
-@pytest.mark.parametrize(
-    ("checkpointing_config", "expected_count"),
-    [
-        ({}, 7),
-        ({"save_replay_buffer": True}, 7),
-        ({"save_replay_buffer": False}, None),
-    ],
-)
-def test_save_async_replay_buffer_checkpoint_gate(
-    tmp_path, checkpointing_config, expected_count
-):
+def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer = MagicMock()
     replay_buffer.save_to_path.remote.return_value = 7
 
@@ -104,16 +94,12 @@ def test_save_async_replay_buffer_checkpoint_gate(
         count = _save_async_replay_buffer_checkpoint(
             replay_buffer,
             str(tmp_path),
-            checkpointing_config,
         )
 
-    assert count == expected_count
-    if expected_count is None:
-        replay_buffer.save_to_path.remote.assert_not_called()
-    else:
-        replay_buffer.save_to_path.remote.assert_called_once_with(
-            str(tmp_path / "replay_buffer.pt")
-        )
+    assert count == 7
+    replay_buffer.save_to_path.remote.assert_called_once_with(
+        str(tmp_path / "replay_buffer.pt")
+    )
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
@@ -1744,7 +1730,7 @@ def test_dapo_cache_aligns_deduplicated_media_with_text_only_batch(
             media = PackedTensor(
                 torch.tensor([[1.0]]), dim_to_pack=0
             ).enable_deduplication()
-            batch["pixel_values"] = media.repeat_interleave(3)
+            batch["pixel_values"] = PackedTensor.concat([media] * 3)
         return batch
 
     master_config = mock_grpo_components["master_config"]

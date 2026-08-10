@@ -69,7 +69,6 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -84,7 +83,6 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
-    NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.rollouts import (
@@ -147,38 +145,11 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _get_next_nemo_gym_task_index(
-    rollouts_state: dict[str, Any] | None,
-    replay_buffer_state: dict[str, Any] | None,
-) -> int:
-    """Recover the next unique NeMo-Gym task index from checkpoint state."""
-    next_task_index = int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0))
-    if replay_buffer_state is None:
-        return next_task_index
-
-    saved_task_indices = [
-        int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
-        for trajectory in replay_buffer_state.get("trajectories", [])
-        if trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
-    ]
-    if saved_task_indices:
-        next_task_index = max(next_task_index, max(saved_task_indices) + 1)
-    return next_task_index
-
-
 def _save_async_replay_buffer_checkpoint(
     replay_buffer: Any,
     checkpoint_path: str,
-    checkpointing_config: CheckpointingConfig,
-) -> int | None:
-    """Checkpoint replay state inside its actor, or skip it when configured."""
-    if not checkpointing_config.get("save_replay_buffer", True):
-        print(
-            "⏭️ Skipping replay buffer checkpoint "
-            "(checkpointing.save_replay_buffer=false)"
-        )
-        return None
-
+) -> int:
+    """Checkpoint replay state inside its actor."""
     print("📦 Saving replay buffer state...")
     num_buffered_trajectories = ray.get(
         replay_buffer.save_to_path.remote(
@@ -2104,17 +2075,9 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
-def _should_normalize_sparse_replay_media(
-    batches: list[BatchedDataDict],
-    *,
-    deduplicate_multimodal_data: bool,
-) -> bool:
-    """Keep sparse compact checkpoints readable across a flag transition."""
-    return deduplicate_multimodal_data or any(
-        isinstance(value, PackedTensor) and value.deduplication_enabled
-        for batch in batches
-        for value in batch.values()
-    )
+def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
+    """Resolve the configured policy precision to its matching torch dtype."""
+    return getattr(torch, policy_config["precision"])
 
 
 def _build_async_grpo_train_data(
@@ -2136,7 +2099,7 @@ def _build_async_grpo_train_data(
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
-        as_tensors=False, pixel_dtype=torch.bfloat16
+        as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
     )
     train_data.update(extra_multimodal_data)
     return train_data
@@ -2951,7 +2914,8 @@ def grpo_train(
                             )
                             calibration_data.update(
                                 calib_flat.get_multimodal_dict(
-                                    as_tensors=False, pixel_dtype=torch.bfloat16
+                                    as_tensors=False,
+                                    pixel_dtype=_policy_dtype(master_config.policy),
                                 )
                             )
                             calibration_data.to("cpu")
@@ -3226,7 +3190,8 @@ def grpo_train(
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
-                        as_tensors=False, pixel_dtype=torch.bfloat16
+                        as_tensors=False,
+                        pixel_dtype=_policy_dtype(master_config.policy),
                     )
                     train_data.update(extra_multimodal_data)
                     print_multimodal_payload_metrics(
@@ -4301,15 +4266,14 @@ def async_grpo_train(
             # weights_only=False: this is a trusted same-job checkpoint artifact.
             rollouts_state = torch.load(rollouts_path, weights_only=False)
 
-    next_nemo_gym_task_index = _get_next_nemo_gym_task_index(
-        rollouts_state=rollouts_state,
-        replay_buffer_state=None,
+    next_nemo_gym_task_index = max(
+        int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
+        int(
+            (replay_buffer_restore_metadata or {}).get(
+                NEXT_NEMO_GYM_TASK_INDEX_KEY, 0
+            )
+        ),
     )
-    if replay_buffer_restore_metadata is not None:
-        next_nemo_gym_task_index = max(
-            next_nemo_gym_task_index,
-            replay_buffer_restore_metadata[NEXT_NEMO_GYM_TASK_INDEX_KEY],
-        )
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -4667,15 +4631,11 @@ def async_grpo_train(
 
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
-                    normalize_sparse_media = _should_normalize_sparse_replay_media(
-                        per_prompt_batches,
-                        deduplicate_multimodal_data=(
-                            master_config.grpo.deduplicate_multimodal_data
-                        ),
-                    )
                     repeated_batch = BatchedDataDict.from_batches(
                         per_prompt_batches,
-                        allow_missing_packed_tensors=normalize_sparse_media,
+                        allow_missing_packed_tensors=(
+                            master_config.grpo.deduplicate_multimodal_data
+                        ),
                     )
 
                     # Teacher logprobs are stored in batch dict by collection-time
@@ -5215,7 +5175,6 @@ def async_grpo_train(
                         _save_async_replay_buffer_checkpoint(
                             replay_buffer,
                             checkpoint_path,
-                            master_config.checkpointing,
                         )
                         rollouts_state = ray.get(
                             trajectory_collector.get_rollouts_state.remote()

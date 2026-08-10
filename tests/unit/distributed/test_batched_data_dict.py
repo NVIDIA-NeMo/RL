@@ -703,9 +703,25 @@ def test_repeat_interleave_shares_native_image_video_and_audio_leaves():
     assert flag_on["vllm_audios"][0][0][0] is flag_on["vllm_audios"][1][0][0]
 
 
+@pytest.mark.parametrize("share_immutable_media", [False, True])
+def test_repeat_interleave_rejects_top_level_packed_tensor(share_immutable_media):
+    batch = BatchedDataDict(
+        {"pixel_values": PackedTensor(torch.ones(1, 2), dim_to_pack=0)}
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="PackedTensor does not currently support repeat_interleave",
+    ):
+        batch.repeat_interleave(
+            2,
+            share_immutable_media=share_immutable_media,
+        )
+
+
 def test_shards_reintern_shared_segments_locally():
     media = PackedTensor(torch.ones(1, 2), dim_to_pack=0).enable_deduplication()
-    repeated_media = media.repeat_interleave(4)
+    repeated_media = PackedTensor.concat([media] * 4)
     batch = BatchedDataDict(
         {
             "input_ids": torch.arange(8).reshape(4, 2),
@@ -721,8 +737,8 @@ def test_shards_reintern_shared_segments_locally():
 
 
 def test_sequence_packing_reinterns_shared_segments_per_shard_for_cp_padding():
-    media = PackedTensor(torch.ones(1, 2), dim_to_pack=0)
-    repeated_media = media.enable_deduplication().repeat_interleave(8)
+    media = PackedTensor(torch.ones(1, 2), dim_to_pack=0).enable_deduplication()
+    repeated_media = PackedTensor.concat([media] * 8)
     sequence_lengths = torch.tensor([5, 6, 7, 8, 9, 10, 11, 12])
     batch = BatchedDataDict(
         {
@@ -830,33 +846,63 @@ def test_get_multimodal_dict_casts_only_pixels_without_materializing_dedup():
     pixels = PackedTensor(
         [torch.randn(2, 3, 8, 8, dtype=torch.float32)], dim_to_pack=0
     ).enable_deduplication()
-    pixels = pixels.repeat_interleave(4)
+    pixels = PackedTensor.concat([pixels] * 4)
+    video_pixels = PackedTensor(
+        [torch.randn(2, 3, 4, 8, 8, dtype=torch.float32)], dim_to_pack=0
+    ).enable_deduplication()
+    video_pixels = PackedTensor.concat([video_pixels] * 4)
     image_sizes = PackedTensor(
         [torch.tensor([[8, 8]], dtype=torch.int64)], dim_to_pack=0
     ).enable_deduplication()
-    image_sizes = image_sizes.repeat_interleave(4)
+    image_sizes = PackedTensor.concat([image_sizes] * 4)
+    video_grid = PackedTensor(
+        [torch.tensor([[4, 8, 8]], dtype=torch.int64)], dim_to_pack=0
+    ).enable_deduplication()
+    video_grid = PackedTensor.concat([video_grid] * 4)
     original_provenance = list(pixels._segment_provenance)
-    batch = BatchedDataDict({"pixel_values": pixels, "imgs_sizes": image_sizes})
+    original_video_provenance = list(video_pixels._segment_provenance)
+    batch = BatchedDataDict(
+        {
+            "pixel_values": pixels,
+            "imgs_sizes": image_sizes,
+            "pixel_values_videos": video_pixels,
+            "video_grid_thw": video_grid,
+        }
+    )
 
     multimodal = batch.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
     cast_pixels = multimodal["pixel_values"]
+    cast_video_pixels = multimodal["pixel_values_videos"]
 
     assert isinstance(cast_pixels, PackedTensor)
+    assert isinstance(cast_video_pixels, PackedTensor)
     assert len(cast_pixels) == 4
+    assert len(cast_video_pixels) == 4
     assert len(cast_pixels.tensors) == 1
-    assert cast_pixels.logical_segment_count == 4
+    assert len(cast_video_pixels.tensors) == 1
+    assert sum(cast_pixels.logical_segment_counts_by_row()) == 4
+    assert sum(cast_video_pixels.logical_segment_counts_by_row()) == 4
     assert cast_pixels.tensors[0].dtype == torch.bfloat16
+    assert cast_video_pixels.tensors[0].dtype == torch.bfloat16
     assert pixels.tensors[0].dtype == torch.float32
+    assert video_pixels.tensors[0].dtype == torch.float32
     assert cast_pixels._row_offsets == pixels._row_offsets
+    assert cast_video_pixels._row_offsets == video_pixels._row_offsets
     assert cast_pixels._segment_indices == pixels._segment_indices
+    assert cast_video_pixels._segment_indices == video_pixels._segment_indices
     assert cast_pixels._segment_provenance != original_provenance
+    assert cast_video_pixels._segment_provenance != original_video_provenance
     assert multimodal["imgs_sizes"] is image_sizes
+    assert multimodal["video_grid_thw"] is video_grid
 
     materialized = batch.get_multimodal_dict(
         as_tensors=True, pixel_dtype=torch.bfloat16
     )
     assert materialized["pixel_values"].dtype == torch.bfloat16
     assert materialized["pixel_values"].shape[0] == 8
+    assert materialized["pixel_values_videos"].dtype == torch.bfloat16
+    assert materialized["pixel_values_videos"].shape[0] == 8
+    assert materialized["video_grid_thw"].dtype == torch.int64
 
 
 def test_from_batches_pads_3d_tensors_along_sequence_dim():
@@ -1016,7 +1062,7 @@ def test_from_batches_can_align_optional_deduplicated_media_keys():
     shared_pixels = PackedTensor(
         torch.tensor([[1.0]]), dim_to_pack=0
     ).enable_deduplication()
-    pixel_rows = shared_pixels.repeat_interleave(2)
+    pixel_rows = PackedTensor.concat([shared_pixels] * 2)
     distinct_image_sizes = PackedTensor(
         [torch.tensor([[10, 20]]), torch.tensor([[30, 40]])],
         dim_to_pack=0,
@@ -1129,6 +1175,28 @@ def test_model_materialization_validates_coupled_media_segment_order():
         invalid.get_multimodal_dict(as_tensors=True)
 
 
+def test_model_materialization_skips_coupled_scan_for_legacy_media():
+    legacy = BatchedDataDict(
+        {
+            "pixel_values": PackedTensor(
+                [torch.tensor([[1.0]]), torch.tensor([[2.0]])],
+                dim_to_pack=0,
+            ),
+            "imgs_sizes": PackedTensor(
+                torch.tensor([[10, 20]]),
+                dim_to_pack=0,
+            ),
+        }
+    )
+
+    materialized = legacy.get_multimodal_dict(as_tensors=True)
+
+    torch.testing.assert_close(
+        materialized["pixel_values"], torch.tensor([[1.0], [2.0]])
+    )
+    torch.testing.assert_close(materialized["imgs_sizes"], torch.tensor([[10, 20]]))
+
+
 def test_size_supports_packed_tensor_as_first_key_and_empty_batches():
     media = PackedTensor(
         [torch.tensor([[1.0]]), torch.tensor([[2.0]])],
@@ -1149,7 +1217,7 @@ def test_deduplicated_media_survives_chunk_reorder_and_select_indices():
     first = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0).enable_deduplication()
     second = PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0).enable_deduplication()
     media = PackedTensor.concat(
-        [first.repeat_interleave(2), second.repeat_interleave(2)]
+        [PackedTensor.concat([first] * 2), PackedTensor.concat([second] * 2)]
     )
     batch = BatchedDataDict(
         {

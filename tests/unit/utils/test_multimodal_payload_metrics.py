@@ -136,7 +136,7 @@ def test_payload_metrics_measure_physical_and_logical_dedup_savings():
     flag_on_media = PackedTensor(tensor, dim_to_pack=0).enable_deduplication()
     flag_on = {
         "input_ids": flag_off["input_ids"],
-        "pixel_values": flag_on_media.repeat_interleave(4),
+        "pixel_values": PackedTensor.concat([flag_on_media] * 4),
     }
 
     off = collect_multimodal_payload_metrics(flag_off, "off", enabled=True)
@@ -203,7 +203,7 @@ def test_sharded_payload_metrics_measure_exact_worker_arguments():
     media.enable_deduplication()
     payload = {
         "input_ids": torch.ones(4, 2, dtype=torch.long),
-        "pixel_values": media.repeat_interleave(4),
+        "pixel_values": PackedTensor.concat([media] * 4),
     }
     shards = [
         {
@@ -236,8 +236,8 @@ def test_nested_payload_metrics_aggregate_by_media_key():
     second_media = PackedTensor(torch.ones(2, 2), dim_to_pack=0).enable_deduplication()
     nested = {
         "trajectories": [
-            {"batch": {"pixel_values": first_media.repeat_interleave(2)}},
-            {"batch": {"pixel_values": second_media.repeat_interleave(3)}},
+            {"batch": {"pixel_values": PackedTensor.concat([first_media] * 2)}},
+            {"batch": {"pixel_values": PackedTensor.concat([second_media] * 3)}},
         ]
     }
 

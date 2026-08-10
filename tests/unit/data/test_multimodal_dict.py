@@ -496,7 +496,7 @@ def test_packedtensor_dedup_uses_provenance_not_prompt_position():
     packed = PackedTensor.concat([shared, shared_copy, same_prompt_but_different_media])
 
     assert len(packed) == 3
-    assert packed.logical_segment_count == 3
+    assert sum(packed.logical_segment_counts_by_row()) == 3
     assert len(packed.tensors) == 2
     torch.testing.assert_close(packed.as_tensor(), torch.tensor([[1.0], [1.0], [1.0]]))
 
@@ -515,7 +515,7 @@ def test_packedtensor_multiturn_csr_preserves_shared_seed_and_unique_media():
     packed = PackedTensor.flattened_concat([row_1, row_2])
 
     assert len(packed) == 2
-    assert packed.logical_segment_count == 4
+    assert sum(packed.logical_segment_counts_by_row()) == 4
     assert len(packed.tensors) == 3
     torch.testing.assert_close(
         packed.as_tensor(), torch.tensor([[1.0], [2.0], [1.0], [3.0]])
@@ -548,14 +548,35 @@ def test_packedtensor_dedup_expands_before_dynamic_shape_padding():
     torch.testing.assert_close(materialized[2, :, 0], 2 * torch.ones(2))
 
 
-def test_packedtensor_dedup_dim_one_slice_empty_and_cloudpickle_roundtrip():
+def test_packedtensor_to_dtype_returns_independent_wrapper_when_dtype_matches():
+    packed = PackedTensor(
+        torch.ones(1, 2, dtype=torch.bfloat16), dim_to_pack=0
+    ).enable_deduplication()
+    compact = PackedTensor.concat([packed] * 2)
+
+    unchanged = compact.to_dtype(torch.bfloat16)
+
+    assert unchanged is not compact
+    assert unchanged.tensors is not compact.tensors
+    assert unchanged.tensors[0] is compact.tensors[0]
+    assert unchanged._row_offsets == compact._row_offsets
+    assert unchanged._row_offsets is not compact._row_offsets
+    assert unchanged._segment_indices == compact._segment_indices
+    assert unchanged._segment_indices is not compact._segment_indices
+    assert unchanged._segment_provenance == compact._segment_provenance
+    assert unchanged._segment_provenance is not compact._segment_provenance
+
+
+def test_packedtensor_compact_dim_one_slice_empty_and_cloudpickle_roundtrip():
     first = torch.tensor([[1.0], [2.0]])
     second = torch.tensor([[3.0, 4.0], [5.0, 6.0]])
     packed = PackedTensor(
         [first, second],
         dim_to_pack=1,
     ).enable_deduplication()
-    repeated = packed.repeat_interleave(2)
+    repeated = PackedTensor.concat(
+        [packed.slice([row]) for row in range(len(packed)) for _ in range(2)]
+    )
 
     assert len(repeated) == 4
     assert len(repeated.tensors) == 2
@@ -578,9 +599,9 @@ def test_packedtensor_dedup_dim_one_slice_empty_and_cloudpickle_roundtrip():
     assert len(restored.tensors) == 2
     torch.testing.assert_close(restored.as_tensor(), selected.as_tensor())
 
-    empty = packed.repeat_interleave(0)
+    empty = PackedTensor.empty_rows_like(packed, 0)
     assert len(empty) == 0
-    assert empty.logical_segment_count == 0
+    assert sum(empty.logical_segment_counts_by_row()) == 0
     assert empty.as_tensor() is None
 
 
@@ -597,7 +618,7 @@ def test_packedtensor_unpickles_pre_deduplication_state():
 
     assert not restored.deduplication_enabled
     assert len(restored) == 1
-    assert restored.logical_segment_count == 1
+    assert sum(restored.logical_segment_counts_by_row()) == 1
     torch.testing.assert_close(restored.as_tensor(), tensor)
     restored.enable_deduplication()
     assert restored.deduplication_enabled
@@ -616,6 +637,6 @@ def test_packedtensor_empty_legacy_rows_survive_copy_pickle_and_slice():
     sliced = empty.slice([])
     for value in (copied, restored, sliced):
         assert len(value) == 0
-        assert value.logical_segment_count == 0
+        assert sum(value.logical_segment_counts_by_row()) == 0
         assert not value.deduplication_enabled
         assert value.as_tensor() is None

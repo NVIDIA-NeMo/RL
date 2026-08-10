@@ -242,21 +242,19 @@ def _deduplicated_expanded_fixture(device: torch.device):
             ),
         }
     )
+    pixel_row = PackedTensor(
+        image,
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    ).enable_deduplication()
+    image_size_row = PackedTensor(
+        image_size,
+        dim_to_pack=0,
+    ).enable_deduplication()
     flag_on = BatchedDataDict(
         {
-            "pixel_values": PackedTensor(
-                image,
-                dim_to_pack=0,
-                pad_to_max_shape=True,
-            )
-            .enable_deduplication()
-            .repeat_interleave(2),
-            "imgs_sizes": PackedTensor(
-                image_size,
-                dim_to_pack=0,
-            )
-            .enable_deduplication()
-            .repeat_interleave(2),
+            "pixel_values": PackedTensor.concat([pixel_row] * 2),
+            "imgs_sizes": PackedTensor.concat([image_size_row] * 2),
         }
     )
     return input_ids, lengths, flag_off, flag_on

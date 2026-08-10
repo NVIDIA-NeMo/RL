@@ -54,6 +54,7 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
     return MasterConfig.model_construct(
         **{
             "policy": {
+                "precision": "bfloat16",
                 "router_replay": {"enabled": True},
                 "generation": {
                     "backend": "vllm",
@@ -70,8 +71,8 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
 @pytest.mark.parametrize(
     ("policy_config", "expect_routed_experts"),
     [
-        ({"router_replay": {"enabled": True}}, True),
-        ({"router_replay": {"enabled": False}}, False),
+        ({"precision": "bfloat16", "router_replay": {"enabled": True}}, True),
+        ({"precision": "bfloat16", "router_replay": {"enabled": False}}, False),
     ],
 )
 def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
@@ -132,11 +133,21 @@ def test_build_async_grpo_train_data_accepts_all_text_vlm_replay_batch():
     assert train_data.get_multimodal_dict(as_tensors=False) == {}
 
 
-def test_build_async_grpo_train_data_precasts_pixels_without_expanding_dedup():
+@pytest.mark.parametrize(
+    ("precision", "expected_dtype"),
+    [
+        ("float32", torch.float32),
+        ("bfloat16", torch.bfloat16),
+        ("float16", torch.float16),
+    ],
+)
+def test_build_async_grpo_train_data_uses_policy_dtype_without_expanding_dedup(
+    precision, expected_dtype
+):
     pixels = PackedTensor(
         [torch.randn(2, 3, 8, 8, dtype=torch.float32)], dim_to_pack=0
     ).enable_deduplication()
-    pixels = pixels.repeat_interleave(4)
+    pixels = PackedTensor.concat([pixels] * 4)
     flat_messages = BatchedDataDict(
         {
             "token_ids": torch.tensor([[1, 2, 3]] * 4),
@@ -150,15 +161,15 @@ def test_build_async_grpo_train_data_precasts_pixels_without_expanding_dedup():
         flat_messages,
         torch.tensor([3] * 4),
         BatchedDataDict({"loss_multiplier": torch.ones(4)}),
-        {"router_replay": {"enabled": False}},
+        {"precision": precision, "router_replay": {"enabled": False}},
     )
 
     cast_pixels = train_data["pixel_values"]
     assert isinstance(cast_pixels, PackedTensor)
     assert len(cast_pixels) == 4
     assert len(cast_pixels.tensors) == 1
-    assert cast_pixels.logical_segment_count == 4
-    assert cast_pixels.tensors[0].dtype == torch.bfloat16
+    assert sum(cast_pixels.logical_segment_counts_by_row()) == 4
+    assert cast_pixels.tensors[0].dtype == expected_dtype
     assert pixels.tensors[0].dtype == torch.float32
 
 

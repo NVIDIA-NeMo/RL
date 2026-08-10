@@ -804,7 +804,6 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     container[key], _ = _without_initial_image_sources(
                         container[key], raw_initial_sources
                     )
-            nemo_gym_result["_nemo_rl_initial_media_omitted"] = True
 
         result = {
             "message_log": nemo_rl_message_log,

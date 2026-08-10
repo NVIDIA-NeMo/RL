@@ -41,8 +41,6 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
-    _get_next_nemo_gym_task_index,
-    _should_normalize_sparse_replay_media,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
@@ -53,35 +51,6 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-
-
-@pytest.mark.parametrize(
-    ("rollouts_state", "replay_buffer_state", "expected"),
-    [
-        (None, None, 0),
-        ({"next_ng_task_index": 20}, None, 20),
-        (
-            {"next_ng_task_index": 8},
-            {
-                "trajectories": [
-                    {"_ng_task_index": 4},
-                    {"_ng_task_index": 12},
-                    {},
-                ]
-            },
-            13,
-        ),
-        (
-            {"next_ng_task_index": 20},
-            {"trajectories": [{"_ng_task_index": 12}]},
-            20,
-        ),
-    ],
-)
-def test_get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state, expected):
-    assert (
-        _get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state) == expected
-    )
 
 
 @ray.remote(num_cpus=0)
@@ -362,11 +331,10 @@ class TestReplayBufferImplCheckpointing:
         self, tmp_path
     ):
         checkpoint_path = tmp_path / "replay_buffer.pt"
-        compact_media = (
-            PackedTensor(torch.tensor([[1.0, 2.0]]), dim_to_pack=0)
-            .enable_deduplication()
-            .repeat_interleave(2)
-        )
+        compact_media_row = PackedTensor(
+            torch.tensor([[1.0, 2.0]]), dim_to_pack=0
+        ).enable_deduplication()
+        compact_media = PackedTensor.concat([compact_media_row] * 2)
         source = ReplayBufferImpl(max_size=10)
         assert (
             source.add(
@@ -1072,14 +1040,15 @@ class TestReplayBuffer:
     def test_replay_buffer_checkpoint_with_torch_save(self, tmp_path):
         """Actor-side compact replay checkpoint survives a config flag flip."""
         buffer1 = ReplayBuffer.remote(max_size=10)
+        pixel_row = PackedTensor(
+            torch.tensor([[1.0, 2.0]]), dim_to_pack=0
+        ).enable_deduplication()
 
         trajectory = {
             "batch": {
                 "token_ids": torch.tensor([1, 2, 3]),
                 "rewards": torch.tensor([0.5]),
-                "pixel_values": PackedTensor(torch.tensor([[1.0, 2.0]]), dim_to_pack=0)
-                .enable_deduplication()
-                .repeat_interleave(2),
+                "pixel_values": PackedTensor.concat([pixel_row] * 2),
             },
             "rollout_metrics": {"reward": 1.0, "length": 10},
             "timestamp": 12345.0,
@@ -1113,63 +1082,6 @@ class TestReplayBuffer:
         torch.testing.assert_close(
             restored_media.as_tensor(),
             torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
-        )
-
-        restored_sparse_batches = [
-            BatchedDataDict(
-                {
-                    "token_ids": torch.tensor([[1]]),
-                    "pixel_values": restored_media.slice([0]),
-                }
-            ),
-            BatchedDataDict({"token_ids": torch.tensor([[2]])}),
-        ]
-        assert _should_normalize_sparse_replay_media(
-            restored_sparse_batches,
-            deduplicate_multimodal_data=False,
-        )
-        restored_sparse = BatchedDataDict.from_batches(
-            restored_sparse_batches,
-            allow_missing_packed_tensors=True,
-        )
-        assert len(restored_sparse["pixel_values"]) == 2
-        assert restored_sparse["pixel_values"].logical_segment_count == 1
-
-        # The representation is self-describing: after a flag-on checkpoint is
-        # restored by a flag-off run, newly collected legacy media can be
-        # concatenated without expanding the restored physical segment.
-        legacy_media = PackedTensor(torch.tensor([[3.0, 4.0]]), dim_to_pack=0)
-        mixed_after_flag_off = BatchedDataDict.from_batches(
-            [
-                {"pixel_values": restored_media},
-                {"pixel_values": legacy_media},
-            ],
-            allow_missing_packed_tensors=True,
-        )
-        assert len(mixed_after_flag_off["pixel_values"].tensors) == 2
-        torch.testing.assert_close(
-            mixed_after_flag_off["pixel_values"].as_tensor(),
-            torch.tensor([[1.0, 2.0], [1.0, 2.0], [3.0, 4.0]]),
-        )
-
-        # The inverse transition is valid too: legacy checkpoint media is
-        # assigned fresh provenance when combined with new compact media.
-        new_compact_media = (
-            PackedTensor(torch.tensor([[5.0, 6.0]]), dim_to_pack=0)
-            .enable_deduplication()
-            .repeat_interleave(2)
-        )
-        mixed_after_flag_on = BatchedDataDict.from_batches(
-            [
-                {"pixel_values": legacy_media},
-                {"pixel_values": new_compact_media},
-            ],
-            allow_missing_packed_tensors=True,
-        )
-        assert len(mixed_after_flag_on["pixel_values"].tensors) == 2
-        torch.testing.assert_close(
-            mixed_after_flag_on["pixel_values"].as_tensor(),
-            torch.tensor([[3.0, 4.0], [5.0, 6.0], [5.0, 6.0]]),
         )
 
         ray.kill(buffer2)

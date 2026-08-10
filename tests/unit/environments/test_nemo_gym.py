@@ -364,11 +364,9 @@ def test_nemo_gym_dedup_redacts_initial_images_from_actor_return(
 
     if include_initial_multimodal_data:
         assert "_initial_multimodal_data_omitted" not in result
-        assert "_nemo_rl_initial_media_omitted" not in result["full_result"]
         assert data_url in json.dumps(result["full_result"])
     else:
         assert result["_initial_multimodal_data_omitted"] is True
-        assert result["full_result"]["_nemo_rl_initial_media_omitted"] is True
         assert data_url not in json.dumps(result["full_result"])
         assert result["full_result"]["responses_create_params"]["input"][0][
             "content"

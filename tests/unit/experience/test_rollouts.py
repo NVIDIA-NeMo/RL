@@ -22,6 +22,7 @@ from dataclasses import asdict
 import pytest
 import ray
 import torch
+from PIL import Image
 from transformers import AutoTokenizer
 
 import nemo_rl.experience.rollouts as rollouts_mod
@@ -29,7 +30,7 @@ from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import PackedTensor, image_to_data_url
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -72,6 +73,67 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
+
+
+def _initial_gym_image_batch() -> BatchedDataDict:
+    image_url = image_to_data_url(Image.new("RGB", (2, 3), color="red"))
+    return BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "content": ""}]],
+            "extra_env_info": [
+                {
+                    "responses_create_params": {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_image", "image_url": image_url}
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ],
+        }
+    )
+
+
+def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
+    batch = _initial_gym_image_batch()
+    attached = PackedTensor(torch.ones(1, 3, 2, 3), dim_to_pack=0)
+
+    class _Processor:
+        image_processor = object()
+
+    processor = _Processor()
+    calls = []
+
+    def fake_attach(message, *, images, processor):
+        calls.append((message, images, processor))
+        message["pixel_values"] = attached
+
+    monkeypatch.setattr(
+        rollouts_mod, "attach_image_model_inputs_to_message", fake_attach
+    )
+
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor)
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor)
+
+    assert len(calls) == 1
+    assert calls[0][0] is batch["message_log"][0][0]
+    assert calls[0][1][0].size == (2, 3)
+    assert calls[0][2] is processor
+    assert batch["message_log"][0][0]["pixel_values"] is attached
+
+
+def test_attach_initial_nemo_gym_image_payloads_requires_processor():
+    batch = _initial_gym_image_batch()
+
+    with pytest.raises(
+        ValueError,
+        match="requires the multimodal processor",
+    ):
+        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, None)
 
 
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
@@ -211,7 +273,7 @@ def test_nemo_gym_initial_media_stays_compact_through_replay_and_policy_flatten(
 
     assert media.deduplication_enabled
     assert len(media) == generations
-    assert media.logical_segment_count == generations
+    assert sum(media.logical_segment_counts_by_row()) == generations
     assert len(media.tensors) == 1
     assert media.as_tensor().shape == (generations, 3, 2, 2)
 

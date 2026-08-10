@@ -36,6 +36,26 @@ Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _validated_packed_values(key: str, values: list[Any]) -> list[PackedTensor]:
+    """Return packed values while rejecting mixed non-empty representations."""
+    if not any(isinstance(value, PackedTensor) for value in values):
+        return []
+
+    packed_values: list[PackedTensor] = []
+    invalid_types: list[str] = []
+    for value in values:
+        if isinstance(value, PackedTensor):
+            packed_values.append(value)
+        elif value is not None:
+            invalid_types.append(type(value).__name__)
+    if invalid_types:
+        raise TypeError(
+            f"Packed multimodal key {key!r} also contains non-packed "
+            f"values: {invalid_types}"
+        )
+    return packed_values
+
+
 def message_log_to_flat_messages(
     message_log: LLMMessageLogType,
 ) -> FlatMessagesType:
@@ -114,20 +134,8 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
-        packed_values = [
-            value for value in result[key] if isinstance(value, PackedTensor)
-        ]
+        packed_values = _validated_packed_values(key, result[key])
         if packed_values:
-            invalid_values = [
-                value
-                for value in result[key]
-                if value is not None and not isinstance(value, PackedTensor)
-            ]
-            if invalid_values:
-                raise TypeError(
-                    f"Packed multimodal key {key!r} also contains non-packed "
-                    f"values: {[type(value).__name__ for value in invalid_values]}"
-                )
             try:
                 concat[key] = PackedTensor.merge_segments(packed_values)
             except Exception as e:
@@ -375,21 +383,11 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        packed_values = [value for value in values if isinstance(value, PackedTensor)]
+        packed_values = _validated_packed_values(key, values)
         # Preserve one logical row for conversations missing this media key.
         # Async replay may concatenate text-only and multimodal prompt groups in
         # either order, so the first row cannot determine the value type.
         if packed_values:
-            invalid_values = [
-                value
-                for value in values
-                if value is not None and not isinstance(value, PackedTensor)
-            ]
-            if invalid_values:
-                raise TypeError(
-                    f"Packed multimodal key {key!r} also contains non-packed "
-                    f"values: {[type(value).__name__ for value in invalid_values]}"
-                )
             template = packed_values[0]
             aligned_values = [
                 (

@@ -123,7 +123,7 @@ class DynamicBatchingArgs(TypedDict):
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
-    _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values"})
+    _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values", "pixel_values_videos"})
 
     # keys that are model specific, but not part of the PackedTensor
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
@@ -155,6 +155,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 metadata = self.data.get(metadata_key)
                 if not isinstance(value, PackedTensor) or not isinstance(
                     metadata, PackedTensor
+                ):
+                    continue
+                # Legacy values have no logical indirection to validate. Keep
+                # the per-row scan off the flag-off policy hot path.
+                if not (
+                    value.deduplication_enabled
+                    or value._row_offsets is not None
+                    or metadata.deduplication_enabled
+                    or metadata._row_offsets is not None
                 ):
                     continue
                 value_counts = value.logical_segment_counts_by_row()
@@ -918,13 +927,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # For tensors, use repeat_interleave to repeat each element
                 repeated_batch[k] = v.repeat_interleave(num_repeats, dim=0)
             elif isinstance(v, PackedTensor):
-                if not share_immutable_media:
-                    raise NotImplementedError(
-                        "PackedTensor does not currently support repeat_interleave "
-                        "unless share_immutable_media is enabled"
-                    )
-                repeated_batch[k] = v.enable_deduplication().repeat_interleave(
-                    num_repeats
+                raise NotImplementedError(
+                    "PackedTensor does not currently support repeat_interleave"
                 )
             else:
                 # For lists or other sequences, use a list comprehension to repeat each element

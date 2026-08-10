@@ -102,9 +102,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
-        debug_payload_metrics: bool = False,
     ):
-        self.debug_payload_metrics = debug_payload_metrics
+        self.debug_payload_metrics = False
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:

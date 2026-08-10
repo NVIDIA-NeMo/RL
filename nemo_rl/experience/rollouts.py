@@ -74,11 +74,6 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
-def _set_untyped_message_field(message: Any, key: str, value: Any) -> None:
-    """Set a restored extension field outside the typed core message schema."""
-    message[key] = value
-
-
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
@@ -200,10 +195,8 @@ def _reattach_original_multimodal_payloads(
             ]
             for original, target in zip(original_user_messages, target_user_messages):
                 for key, value in original.items():
-                    if isinstance(value, PackedTensor):
-                        _set_untyped_message_field(target, key, value)
-                    elif key in NATIVE_MULTIMODAL_KEYS:
-                        _set_untyped_message_field(target, key, value)
+                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+                        target[key] = value
 
 
 def _add_r3_fallback_metrics(
