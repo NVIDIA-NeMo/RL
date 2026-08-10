@@ -159,7 +159,7 @@ class TestFactory:
         [
             (WindowedSamplerConfig(), True),
             (WeightFifoSamplerConfig(), False),
-            (InOrderSamplerConfig(), False),
+            (InOrderSamplerConfig(), True),
             (
                 CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
                 False,
@@ -355,6 +355,49 @@ class TestDispatchCursorRestore:
         s.set_dispatch_index(7)
         assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
         assert _run(s.admit(trainer_version_fn=lambda: 8)) == 8
+
+    def test_in_order_restores_after_highest_admitted_target(self):
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=2, resume_from_step=5)
+        s.restore_dispatch_state(
+            current_train_weight=5,
+            restored_target_steps=[5, 5, 6, 6],
+            groups_per_step=2,
+        )
+
+        # Targets 5 and 6 already belong to restored groups. With two versions
+        # of lookahead, target 7 is still admissible while the trainer is at 5.
+        assert _run(s.admit(trainer_version_fn=lambda: 5)) == 7
+
+        # The live target plus two lookahead targets now fill the gate. Target
+        # 8 must wait until the trainer advances to 6.
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 5), timeout=0.05))
+        assert _run(s.admit(trainer_version_fn=lambda: 6)) == 8
+
+    @pytest.mark.parametrize(
+        ("target_steps", "lookahead", "error"),
+        [
+            ([5, None], 1, "must have target_step"),
+            ([4, 4], 1, "older than the trainer"),
+            ([5, 5, 7, 7], 2, "not contiguous"),
+            ([5], 1, "do not contain exactly"),
+            ([5, 5, 6, 6, 7, 7], 1, "exceeds the configured lookahead"),
+        ],
+    )
+    def test_in_order_rejects_inconsistent_restored_targets(
+        self, target_steps, lookahead, error
+    ):
+        s = InOrderSampler(
+            FakeBuffer(),
+            max_lookahead_versions=lookahead,
+            resume_from_step=5,
+        )
+        with pytest.raises(ValueError, match=error):
+            s.restore_dispatch_state(
+                current_train_weight=5,
+                restored_target_steps=target_steps,
+                groups_per_step=2,
+            )
 
     def test_resumed_gate_admits_window_then_blocks(self):
         s = WeightFifoSampler(FakeBuffer(), max_staleness_versions=0)
