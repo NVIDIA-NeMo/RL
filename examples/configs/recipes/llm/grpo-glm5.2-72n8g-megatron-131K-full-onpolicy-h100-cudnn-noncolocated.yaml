@@ -18,7 +18,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
 policy:
-  model_name: /lustre/fsw/portfolios/llmservice/users/slikhite/models/GLM-5.2
+  model_name: zai-org/GLM-5.2
   hf_config_overrides:
     qk_rope_head_dim: 64
   train_global_batch_size: 8
