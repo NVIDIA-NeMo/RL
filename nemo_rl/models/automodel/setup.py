@@ -583,6 +583,11 @@ def setup_model_and_optimizer(
                 "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
             )
 
+        if is_vlm:
+            raise AssertionError(
+                "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
+            )
+
         if model_config.model_type == "qwen3_5_moe":
             try:
                 import fla  # noqa: F401
