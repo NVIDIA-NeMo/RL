@@ -29,6 +29,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -639,14 +640,14 @@ def test_create_advantage_estimator_gae():
     # because the estimator accesses .use_kl_in_reward / .reference_policy_kl_*
     # as attributes, not dict keys.
     master_config = SimpleNamespace(
-        ppo={
-            "adv_estimator": {
+        ppo=PPOConfig(
+            adv_estimator={
                 "name": "gae",
                 **_make_gae_config(
                     gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
                 ),
             },
-        },
+        ),
         loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
@@ -662,9 +663,9 @@ def test_create_advantage_estimator_raw_reward():
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={
-            "adv_estimator": {"name": "raw_reward", "normalize_advantages": True},
-        },
+        ppo=PPOConfig(
+            adv_estimator={"name": "raw_reward", "normalize_advantages": True},
+        ),
         loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 
@@ -679,7 +680,7 @@ def test_create_advantage_estimator_rejects_unsupported_name():
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={"adv_estimator": {"name": "grpo"}},
+        ppo=PPOConfig(adv_estimator={"name": "grpo"}),
         loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 
@@ -687,19 +688,17 @@ def test_create_advantage_estimator_rejects_unsupported_name():
         _create_advantage_estimator(master_config)
 
 
-def test_create_advantage_estimator_requires_adv_estimator_key():
-    """No more silent default — missing `adv_estimator` should KeyError."""
+def test_create_advantage_estimator_uses_ppo_config_default():
+    """The PPO schema provides the centralized default estimator config."""
     from types import SimpleNamespace
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
-    master_config = SimpleNamespace(
-        ppo={},
-        loss_fn={},
-    )
+    master_config = SimpleNamespace(ppo=PPOConfig(), loss_fn=_make_loss_config())
 
-    with pytest.raises(KeyError):
-        _create_advantage_estimator(master_config)
+    assert isinstance(
+        _create_advantage_estimator(master_config), GeneralizedAdvantageEstimator
+    )
 
 
 def _make_ppo_loop_batch(
@@ -894,22 +893,22 @@ def _run_mock_ppo_train(
     )
 
     master_config = SimpleNamespace(
-        ppo={
-            "max_num_steps": max_num_steps,
-            "max_num_epochs": 1,
-            "max_rollout_turns": 1,
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 1,
-            "overlong_filtering": overlong_filtering,
-            "policy_training_start_step": policy_training_start_step,
-            "ppo_epochs": ppo_epochs,
-            "reward_scaling": {"enabled": False},
-            "reward_shaping": RewardShapingConfig(enabled=False),
-            "seq_logprob_error_threshold": seq_logprob_error_threshold,
-            "val_at_start": False,
-            "val_at_end": False,
-            "val_period": 0,
-        },
+        ppo=PPOConfig(
+            max_num_steps=max_num_steps,
+            max_num_epochs=1,
+            max_rollout_turns=1,
+            num_prompts_per_step=2,
+            num_generations_per_prompt=1,
+            overlong_filtering=overlong_filtering,
+            policy_training_start_step=policy_training_start_step,
+            ppo_epochs=ppo_epochs,
+            reward_scaling={"enabled": False},
+            reward_shaping=RewardShapingConfig(enabled=False),
+            seq_logprob_error_threshold=seq_logprob_error_threshold,
+            val_at_start=False,
+            val_at_end=False,
+            val_period=0,
+        ),
         policy={
             "generation": {
                 "backend": "vllm",
@@ -1161,27 +1160,27 @@ def _make_noncolocated_setup_config(
         value_loss_fn=MseValueLossConfig(),
         env=env_config,
         data=data_config,
-        ppo={
-            "max_num_steps": 1,
-            "max_num_epochs": 1,
-            "num_prompts_per_step": 1,
-            "num_generations_per_prompt": 1,
-            "max_rollout_turns": 1,
-            "val_period": 0,
-            "val_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-            "max_val_samples": 1,
-            "seed": 42,
-            "overlong_filtering": False,
-            "use_dynamic_sampling": False,
-            "batch_multiplier": 1,
-            "ppo_epochs": 1,
-            "policy_training_start_step": 0,
-            "reward_shaping": {"enabled": False},
-            "reward_scaling": {"enabled": False},
-            "adv_estimator": {"name": "raw_reward"},
-        },
+        ppo=PPOConfig(
+            max_num_steps=1,
+            max_num_epochs=1,
+            num_prompts_per_step=1,
+            num_generations_per_prompt=1,
+            max_rollout_turns=1,
+            val_period=0,
+            val_batch_size=1,
+            val_at_start=False,
+            val_at_end=False,
+            max_val_samples=1,
+            seed=42,
+            overlong_filtering=False,
+            use_dynamic_sampling=False,
+            batch_multiplier=1,
+            ppo_epochs=1,
+            policy_training_start_step=0,
+            reward_shaping={"enabled": False},
+            reward_scaling={"enabled": False},
+            adv_estimator={"name": "raw_reward"},
+        ),
         logger={"num_val_samples_to_print": 0},
         cluster={
             "num_nodes": total_nodes,
@@ -1756,12 +1755,10 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     config = _make_noncolocated_setup_config()
     config.policy["dtensor_cfg"]["enabled"] = False
     config.policy["megatron_cfg"]["enabled"] = True
-    config.ppo.update(
-        max_num_steps=10,
-        max_num_epochs=1,
-        ppo_epochs=3,
-        async_ppo=AsyncPPOConfig(enabled=async_enabled),
-    )
+    config.ppo.max_num_steps = 10
+    config.ppo.max_num_epochs = 1
+    config.ppo.ppo_epochs = 3
+    config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
 
     _run_noncolocated_setup(monkeypatch, config)
 
@@ -1855,9 +1852,7 @@ def test_noncolocated_reward_model_node_leaves_shared_train_inference_node(
 
 
 def _make_async_ppo_config() -> SimpleNamespace:
-    from nemo_rl.algorithms.grpo import RewardScalingConfig
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
-    from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 
     return SimpleNamespace(
         policy={
@@ -1871,14 +1866,14 @@ def _make_async_ppo_config() -> SimpleNamespace:
             use_importance_sampling_correction=True,
             reference_policy_kl_penalty=0,
         ),
-        ppo={
-            "async_ppo": AsyncPPOConfig(enabled=True),
-            "policy_training_start_step": 0,
-            "ppo_epochs": 1,
-            "use_dynamic_sampling": False,
-            "reward_scaling": RewardScalingConfig(),
-            "reward_shaping": RewardShapingConfig(),
-        },
+        ppo=PPOConfig(
+            async_ppo=AsyncPPOConfig(enabled=True),
+            policy_training_start_step=0,
+            ppo_epochs=1,
+            use_dynamic_sampling=False,
+            reward_scaling={"enabled": False},
+            reward_shaping=RewardShapingConfig(enabled=False),
+        ),
         data={"use_multiple_dataloader": False},
         env={},
         checkpointing={"checkpoint_must_save_by": None},
@@ -1935,10 +1930,10 @@ def _call_async_ppo_until_guard(
             lambda cfg: cfg.policy["generation"]["colocated"].update(enabled=True),
             "non-colocated",
         ),
-        (lambda cfg: cfg.ppo.update(ppo_epochs=0), "ppo_epochs"),
+        (lambda cfg: setattr(cfg.ppo, "ppo_epochs", 0), "ppo_epochs"),
         (
             lambda cfg: (
-                cfg.ppo.update(skip_reference_policy_logprobs_calculation=True),
+                setattr(cfg.ppo, "skip_reference_policy_logprobs_calculation", True),
                 setattr(cfg.loss_fn, "reference_policy_kl_penalty", 0.1),
             ),
             "Skipping reference logprobs",
@@ -1956,15 +1951,15 @@ def test_async_ppo_entry_guards(mutate, message):
     ("mutate", "message"),
     [
         (
-            lambda cfg: cfg.ppo.update(use_dynamic_sampling=True),
+            lambda cfg: setattr(cfg.ppo, "use_dynamic_sampling", True),
             "Dynamic sampling",
         ),
         (
-            lambda cfg: setattr(cfg.ppo["reward_scaling"], "enabled", True),
+            lambda cfg: setattr(cfg.ppo.reward_scaling, "enabled", True),
             "Reward scaling",
         ),
         (
-            lambda cfg: setattr(cfg.ppo["reward_shaping"], "enabled", True),
+            lambda cfg: setattr(cfg.ppo.reward_shaping, "enabled", True),
             "Reward shaping",
         ),
         (
@@ -2199,15 +2194,13 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     from nemo_rl.algorithms import ppo
 
     config = _make_async_ppo_config()
-    config.ppo.update(
-        max_num_steps=10,
-        max_num_epochs=2,
-        val_period=0,
-        val_at_start=False,
-        val_at_end=False,
-        num_prompts_per_step=1,
-        skip_reference_policy_logprobs_calculation=False,
-    )
+    config.ppo.max_num_steps = 10
+    config.ppo.max_num_epochs = 2
+    config.ppo.val_period = 0
+    config.ppo.val_at_start = False
+    config.ppo.val_at_end = False
+    config.ppo.num_prompts_per_step = 1
+    config.ppo.skip_reference_policy_logprobs_calculation = False
     config.checkpointing = {
         "checkpoint_must_save_by": None,
         "ft_save_period": None,
@@ -2257,17 +2250,18 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
 
     config = _make_async_ppo_config()
     config.policy["make_sequence_length_divisible_by"] = 1
-    config.ppo.update(
-        max_num_steps=2,
-        max_num_epochs=2,
-        val_period=0,
-        val_at_start=False,
-        val_at_end=False,
-        num_prompts_per_step=1,
-        max_rollout_turns=1,
-        skip_reference_policy_logprobs_calculation=False,
-        adv_estimator={"name": "raw_reward", "normalize_advantages": False},
-    )
+    config.ppo.max_num_steps = 2
+    config.ppo.max_num_epochs = 2
+    config.ppo.val_period = 0
+    config.ppo.val_at_start = False
+    config.ppo.val_at_end = False
+    config.ppo.num_prompts_per_step = 1
+    config.ppo.max_rollout_turns = 1
+    config.ppo.skip_reference_policy_logprobs_calculation = False
+    config.ppo.adv_estimator = {
+        "name": "raw_reward",
+        "normalize_advantages": False,
+    }
     config.checkpointing = {
         "checkpoint_must_save_by": None,
         "ft_save_period": None,
@@ -2352,7 +2346,9 @@ def test_validate_uses_async_rollout_for_async_engine(monkeypatch):
 
     config = _make_async_ppo_config()
     config.policy["max_total_sequence_length"] = 16
-    config.ppo.update(max_val_samples=1, val_batch_size=1, max_rollout_turns=1)
+    config.ppo.max_val_samples = 1
+    config.ppo.val_batch_size = 1
+    config.ppo.max_rollout_turns = 1
     config.logger = {"num_val_samples_to_print": 0}
 
     ppo.validate(

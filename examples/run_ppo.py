@@ -112,14 +112,14 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    async_config = config.ppo.get("async_ppo")
-    async_ppo_enabled = async_config is not None and async_config.enabled
+    async_config = config.ppo.async_ppo
+    async_ppo_enabled = async_config.enabled
     if async_ppo_enabled:
         # Match the async GRPO launcher checks after common setup.
         unsupported_features = {
-            "use_dynamic_sampling": config.ppo["use_dynamic_sampling"],
-            "reward_scaling": config.ppo["reward_scaling"].enabled,
-            "reward_shaping": config.ppo["reward_shaping"].enabled,
+            "use_dynamic_sampling": config.ppo.use_dynamic_sampling,
+            "reward_scaling": config.ppo.reward_scaling.enabled,
+            "reward_shaping": config.ppo.reward_shaping.enabled,
         }
         for feature, enabled in unsupported_features.items():
             if enabled:

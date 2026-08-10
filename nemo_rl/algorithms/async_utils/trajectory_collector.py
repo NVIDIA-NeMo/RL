@@ -89,15 +89,9 @@ class AsyncTrajectoryCollector:
         if isinstance(master_config, GRPOMasterConfig):
             algorithm_config = master_config.grpo
             async_config = algorithm_config.async_grpo
-            num_prompts_per_step = algorithm_config.num_prompts_per_step
-            num_generations_per_prompt = algorithm_config.num_generations_per_prompt
-            max_rollout_turns = algorithm_config.max_rollout_turns
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
-            async_config = algorithm_config["async_ppo"]
-            num_prompts_per_step = algorithm_config["num_prompts_per_step"]
-            num_generations_per_prompt = algorithm_config["num_generations_per_prompt"]
-            max_rollout_turns = algorithm_config["max_rollout_turns"]
+            async_config = algorithm_config.async_ppo
         else:
             raise TypeError(
                 "master_config must be a GRPO or PPO MasterConfig, got "
@@ -105,9 +99,9 @@ class AsyncTrajectoryCollector:
             )
         self.algorithm_config = algorithm_config
         self.async_config = async_config
-        self._num_prompts_per_step = int(num_prompts_per_step)
-        self._num_generations_per_prompt = num_generations_per_prompt
-        self._max_rollout_turns = max_rollout_turns
+        self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
+        self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
+        self._max_rollout_turns = algorithm_config.max_rollout_turns
         self.replay_buffer = replay_buffer
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}

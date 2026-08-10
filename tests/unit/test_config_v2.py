@@ -33,7 +33,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
 )
-from nemo_rl.algorithms.ppo import AsyncPPOConfig
+from nemo_rl.algorithms.ppo import AsyncPPOConfig, PPOConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -141,7 +141,8 @@ def test_config_v2_same_as_v1(config_file):
     if "grpo" in config_v1 and "async_grpo" in config_v1["grpo"]:
         assert isinstance(config_v2.grpo.async_grpo, AsyncGRPOConfig)
     if "ppo" in config_v1 and "async_ppo" in config_v1["ppo"]:
-        assert isinstance(config_v2.ppo["async_ppo"], AsyncPPOConfig)
+        assert isinstance(config_v2.ppo, PPOConfig)
+        assert isinstance(config_v2.ppo.async_ppo, AsyncPPOConfig)
     config_v2 = config_v2.model_dump()
 
     # Check v1 keys missing from v2, and differing values

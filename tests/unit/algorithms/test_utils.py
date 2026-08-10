@@ -20,6 +20,7 @@ import torch
 
 from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -262,7 +263,9 @@ def _base_ppo_master_config(colocated: bool):
                 },
             }
         },
-        ppo={"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
+        ppo=PPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
     )
 
 

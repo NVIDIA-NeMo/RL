@@ -1263,6 +1263,7 @@ class TestAsyncTrajectoryCollector:
         """The shared collector derives PPO settings from its master config."""
         from nemo_rl.algorithms.ppo import (
             AsyncPPOConfig,
+            PPOConfig,
         )
         from nemo_rl.algorithms.ppo import (
             MasterConfig as PPOMasterConfig,
@@ -1274,12 +1275,12 @@ class TestAsyncTrajectoryCollector:
         )
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},
-            ppo={
-                "num_prompts_per_step": 2,
-                "num_generations_per_prompt": 4,
-                "max_rollout_turns": 1,
-                "async_ppo": async_config,
-            },
+            ppo=PPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=4,
+                max_rollout_turns=1,
+                async_ppo=async_config,
+            ),
         )
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
         collector = collector_cls(

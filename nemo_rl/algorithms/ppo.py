@@ -171,47 +171,70 @@ class AdvEstimatorConfig(TypedDict):
     length_adaptive_alpha: NotRequired[float]
 
 
-class PPOConfig(TypedDict):
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_num_epochs: int
-    max_num_steps: int
-    max_rollout_turns: int
-    val_period: int
-    val_batch_size: int
-    val_at_start: bool
+class PPOConfig(BaseModel, extra="allow"):
+    num_prompts_per_step: int = 32
+    num_generations_per_prompt: int = 16
+    max_num_epochs: int = 100000
+    max_num_steps: int = 100000
+    max_rollout_turns: int = 1
+    val_period: int = 20
+    val_batch_size: int = 256
+    val_at_start: bool = True
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    max_val_samples: int
-    skip_reference_policy_logprobs_calculation: NotRequired[bool]
-    seed: int
-    overlong_filtering: bool
+    val_at_end: bool = False
+    max_val_samples: int = 256
+    skip_reference_policy_logprobs_calculation: bool = True
+    seed: int = 42
+    overlong_filtering: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
-    use_dynamic_sampling: bool
+    use_dynamic_sampling: bool = False
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
-    dynamic_sampling_max_gen_batches: NotRequired[int]
+    dynamic_sampling_max_gen_batches: int = 10
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
-    batch_multiplier: NotRequired[float]
-    ppo_epochs: int
-    reward_shaping: RewardShapingConfig
-    reward_scaling: RewardScalingConfig
-    # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
-    calculate_advantages_on_gpu: NotRequired[bool]
+    batch_multiplier: float = 1.0
+    ppo_epochs: int = 4
+    reward_shaping: RewardShapingConfig = Field(
+        default_factory=lambda: RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=2048,
+            overlong_buffer_penalty=1,
+            max_response_length=14336,
+        )
+    )
+    reward_scaling: RewardScalingConfig = Field(
+        default_factory=lambda: RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        )
+    )
     # Advantage estimator configuration (gae or raw_reward)
-    adv_estimator: AdvEstimatorConfig
+    adv_estimator: AdvEstimatorConfig = Field(
+        default_factory=lambda: AdvEstimatorConfig(
+            name="gae",
+            gae_lambda=0.95,
+            gae_gamma=1.0,
+            normalize_advantages=True,
+            gae_lambda_value=None,
+            gae_lambda_policy=None,
+            length_adaptive_alpha=0.0,
+        )
+    )
     # Number of PPO steps of critic-only warmup before policy training begins.
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
-    policy_training_start_step: NotRequired[int]
+    policy_training_start_step: int = 0
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
-    seq_logprob_error_threshold: float | None
+    seq_logprob_error_threshold: float | None = None
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
-    async_ppo: NotRequired[AsyncPPOConfig]
+    async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
 
 
 class PPOSaveState(TypedDict):
@@ -350,7 +373,7 @@ def setup(
         # Policy optimizer state first appears after critic warmup, so a cached
         # checkpoint layout cannot represent both the warmup and training states.
         assert not (
-            ppo_config["policy_training_start_step"] > 0
+            ppo_config.policy_training_start_step > 0
             and master_config.checkpointing["enabled"]
             and master_config.checkpointing["save_optimizer"]
             and "checkpoint" in policy_megatron_config
@@ -392,7 +415,7 @@ def setup(
         )
 
     # Set seed for all random number generators
-    set_seed(ppo_config["seed"])
+    set_seed(ppo_config.seed)
 
     # ==========================
     #         Logger
@@ -415,9 +438,9 @@ def setup(
     #           Data
     # ==========================
     # Validate batch_multiplier
-    batch_multiplier = ppo_config["batch_multiplier"]
-    dataloader_batch_size = ppo_config["num_prompts_per_step"]
-    if not ppo_config["use_dynamic_sampling"]:
+    batch_multiplier = ppo_config.batch_multiplier
+    dataloader_batch_size = ppo_config.num_prompts_per_step
+    if not ppo_config.use_dynamic_sampling:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
         )
@@ -440,17 +463,13 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if (
-        ppo_config["val_period"] > 0
-        or ppo_config["val_at_start"]
-        or ppo_config["val_at_end"]
-    ):
+    if ppo_config.val_period > 0 or ppo_config.val_at_start or ppo_config.val_at_end:
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=ppo_config["val_batch_size"],
+            batch_size=ppo_config.val_batch_size,
             shuffle=False,
             collate_fn=rl_collate_fn,
             num_workers=data_config["num_workers"],
@@ -469,8 +488,7 @@ def setup(
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
         assert (
-            ppo_config["num_prompts_per_step"]
-            * ppo_config["num_generations_per_prompt"]
+            ppo_config.num_prompts_per_step * ppo_config.num_generations_per_prompt
             == policy_config["train_global_batch_size"]
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
@@ -729,14 +747,14 @@ def setup(
     # per outer step. So total ticks = (outer steps) * ppo_epochs.
     # Scale train_iters accordingly so the configured warmup/decay horizon
     # matches the actual scheduler-step count.
-    ppo_epochs = ppo_config["ppo_epochs"]
-    async_config = ppo_config.get("async_ppo")
-    if async_config is not None and async_config.enabled:
-        outer_training_steps = ppo_config["max_num_steps"]
+    ppo_epochs = ppo_config.ppo_epochs
+    async_config = ppo_config.async_ppo
+    if async_config.enabled:
+        outer_training_steps = ppo_config.max_num_steps
     else:
         outer_training_steps = min(
-            ppo_config["max_num_steps"],
-            ppo_config["max_num_epochs"] * len(dataloader),
+            ppo_config.max_num_steps,
+            ppo_config.max_num_epochs * len(dataloader),
         )
     total_train_iters = outer_training_steps * ppo_epochs
 
@@ -1024,8 +1042,8 @@ def dynamic_sampling(
 
     # Required batch size for training
     train_prompts_size = (
-        master_config.ppo["num_prompts_per_step"]
-        * master_config.ppo["num_generations_per_prompt"]
+        master_config.ppo.num_prompts_per_step
+        * master_config.ppo.num_generations_per_prompt
     )
     # Store the baseline, std and total_reward for the current unfiltered batch.
     repeated_batch["baseline"] = baseline
@@ -1036,7 +1054,7 @@ def dynamic_sampling(
     # Dynamic sampling algorithm (used in DAPO algorithm)
     # This block implements dynamic sampling by selecting prompt groups with non-zero std.
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
-    if master_config.ppo["use_dynamic_sampling"]:
+    if master_config.ppo.use_dynamic_sampling:
         with timer.time("dynamic_sampling"):
             # Get the prompt indices with non-zero std
             non_zero_std_mask = std != 0.0
@@ -1079,9 +1097,9 @@ def dynamic_sampling(
 
             # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
             if filtered_prompts_size < train_prompts_size:
-                dynamic_sampling_max_gen_batches = master_config.ppo[
-                    "dynamic_sampling_max_gen_batches"
-                ]
+                dynamic_sampling_max_gen_batches = (
+                    master_config.ppo.dynamic_sampling_max_gen_batches
+                )
                 assert dynamic_sampling_max_gen_batches > 0, (
                     "When using ppo.use_dynamic_sampling, ppo.dynamic_sampling_max_gen_batches must be > 0"
                 )
@@ -1107,7 +1125,7 @@ def dynamic_sampling(
 
     batch_to_return = (
         filtered_repeated_batch
-        if master_config.ppo["use_dynamic_sampling"]
+        if master_config.ppo.use_dynamic_sampling
         else repeated_batch
     )
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
@@ -1133,7 +1151,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
     ppo_config = master_config.ppo
     loss_config = master_config.loss_fn
 
-    adv_estimator_config = ppo_config["adv_estimator"]
+    adv_estimator_config = ppo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config["name"]
     if adv_estimator_name == "gae":
@@ -1229,7 +1247,7 @@ def ppo_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
-    if master_config.ppo.get("skip_reference_policy_logprobs_calculation"):
+    if master_config.ppo.skip_reference_policy_logprobs_calculation:
         assert master_config.loss_fn.reference_policy_kl_penalty == 0
         print(
             "Reference policy logprob calculation will be skipped since `ppo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
@@ -1241,19 +1259,19 @@ def ppo_train(
     # common config/state
     current_step = ppo_save_state["current_step"]
     total_steps = ppo_save_state["total_steps"]
-    max_num_steps = master_config.ppo["max_num_steps"]
+    max_num_steps = master_config.ppo.max_num_steps
     current_epoch = ppo_save_state["current_epoch"]
-    max_num_epochs = master_config.ppo["max_num_epochs"]
-    ppo_epochs = master_config.ppo["ppo_epochs"]
+    max_num_epochs = master_config.ppo.max_num_epochs
+    ppo_epochs = master_config.ppo.ppo_epochs
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
-    policy_training_start_step = master_config.ppo["policy_training_start_step"]
+    policy_training_start_step = master_config.ppo.policy_training_start_step
     consumed_samples = ppo_save_state["consumed_samples"]
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
-    val_at_start = master_config.ppo["val_at_start"]
-    val_at_end = master_config.ppo["val_at_end"]
-    val_period = master_config.ppo["val_period"]
+    val_at_start = master_config.ppo.val_at_start
+    val_at_end = master_config.ppo.val_at_end
+    val_period = master_config.ppo.val_period
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -1312,7 +1330,7 @@ def ppo_train(
                 with timer.time("data_processing"):
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config.ppo["num_generations_per_prompt"]
+                            master_config.ppo.num_generations_per_prompt
                         )
                     )
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
@@ -1413,7 +1431,7 @@ def ppo_train(
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config.ppo["max_rollout_turns"],
+                            max_rollout_turns=master_config.ppo.max_rollout_turns,
                             greedy=False,
                         )
                     else:
@@ -1425,7 +1443,7 @@ def ppo_train(
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config.ppo["max_rollout_turns"],
+                            max_rollout_turns=master_config.ppo.max_rollout_turns,
                             greedy=False,
                         )
                     policy_generation.finish_generation()
@@ -1437,9 +1455,9 @@ def ppo_train(
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 repeated_batch = scale_rewards(
-                    repeated_batch, master_config.ppo["reward_scaling"]
+                    repeated_batch, master_config.ppo.reward_scaling
                 )
-                reward_shaping_config = master_config.ppo["reward_shaping"]
+                reward_shaping_config = master_config.ppo.reward_shaping
                 if reward_shaping_config.enabled:
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, reward_shaping_config
@@ -1452,7 +1470,7 @@ def ppo_train(
                     rewards = repeated_batch["total_reward"]
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config.ppo["overlong_filtering"]
+                    use_overlong_filtering = master_config.ppo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
@@ -1534,9 +1552,7 @@ def ppo_train(
                         logprob_data, timer=timer
                     )["logprobs"]
 
-                    if not master_config.ppo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    ):
+                    if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
                                 logprob_data,
@@ -1555,9 +1571,9 @@ def ppo_train(
                 ) = _apply_ppo_seq_logprob_error_masking(
                     train_data=train_data,
                     rewards=rewards,
-                    seq_logprob_error_threshold=master_config.ppo[
-                        "seq_logprob_error_threshold"
-                    ],
+                    seq_logprob_error_threshold=(
+                        master_config.ppo.seq_logprob_error_threshold
+                    ),
                 )
 
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
@@ -1792,7 +1808,7 @@ def ppo_train(
                     total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                consumed_samples += master_config.ppo["num_prompts_per_step"]
+                consumed_samples += master_config.ppo.num_prompts_per_step
                 timeout.mark_iteration()
 
                 should_save_by_step = (
@@ -1939,8 +1955,8 @@ def ppo_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             number_of_samples_per_step = (
-                master_config.ppo["num_prompts_per_step"]
-                * master_config.ppo["num_generations_per_prompt"]
+                master_config.ppo.num_prompts_per_step
+                * master_config.ppo.num_generations_per_prompt
             )
             total_num_gpus = (
                 master_config.cluster["num_nodes"]
@@ -1966,10 +1982,10 @@ def ppo_train(
                 metrics,
                 timing_metrics,
                 master_config,
-                num_prompts_per_step=master_config.ppo["num_prompts_per_step"],
-                num_generations_per_prompt=master_config.ppo[
-                    "num_generations_per_prompt"
-                ],
+                num_prompts_per_step=master_config.ppo.num_prompts_per_step,
+                num_generations_per_prompt=(
+                    master_config.ppo.num_generations_per_prompt
+                ),
                 include_training_worker_idle_ratio=False,
             )
 
@@ -2116,22 +2132,22 @@ def async_ppo_train(
     if colocated_inference:
         raise ValueError("Async PPO requires non-colocated generation")
 
-    async_config = master_config.ppo["async_ppo"]
+    async_config = master_config.ppo.async_ppo
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
     warmup_max_trajectory_age_steps = (
         async_config.effective_warmup_max_trajectory_age_steps
     )
-    policy_training_start_step = master_config.ppo["policy_training_start_step"]
-    if master_config.ppo["ppo_epochs"] < 1:
+    policy_training_start_step = master_config.ppo.policy_training_start_step
+    if master_config.ppo.ppo_epochs < 1:
         raise ValueError("ppo.ppo_epochs must be at least 1")
     # Keep launcher restrictions here as defensive checks for direct callers.
     if master_config.env.get("should_use_nemo_gym"):
         raise NotImplementedError("NeMo Gym rollout is not supported for async PPO")
-    if master_config.ppo["use_dynamic_sampling"]:
+    if master_config.ppo.use_dynamic_sampling:
         raise NotImplementedError("Dynamic sampling is not supported for async PPO")
-    if master_config.ppo["reward_scaling"].enabled:
+    if master_config.ppo.reward_scaling.enabled:
         raise NotImplementedError("Reward scaling is not supported for async PPO")
-    if master_config.ppo["reward_shaping"].enabled:
+    if master_config.ppo.reward_shaping.enabled:
         raise NotImplementedError("Reward shaping is not supported for async PPO")
     if master_config.data["use_multiple_dataloader"]:
         raise NotImplementedError(
@@ -2160,7 +2176,7 @@ def async_ppo_train(
     if getattr(policy_generation, "requires_kv_scale_sync", False):
         raise NotImplementedError("FP8 KV-scale synchronization is not supported yet")
 
-    if master_config.ppo.get("skip_reference_policy_logprobs_calculation"):
+    if master_config.ppo.skip_reference_policy_logprobs_calculation:
         if master_config.loss_fn.reference_policy_kl_penalty != 0:
             raise ValueError(
                 "Skipping reference logprobs requires "
@@ -2175,12 +2191,12 @@ def async_ppo_train(
     weight_version = step
     consumed_samples = ppo_save_state["consumed_samples"]
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
-    max_num_steps = master_config.ppo["max_num_steps"]
-    ppo_epochs = master_config.ppo["ppo_epochs"]
-    val_period = master_config.ppo["val_period"]
-    val_at_start = master_config.ppo["val_at_start"]
-    val_at_end = master_config.ppo["val_at_end"]
-    num_prompts_per_step = master_config.ppo["num_prompts_per_step"]
+    max_num_steps = master_config.ppo.max_num_steps
+    ppo_epochs = master_config.ppo.ppo_epochs
+    val_period = master_config.ppo.val_period
+    val_at_start = master_config.ppo.val_at_start
+    val_at_end = master_config.ppo.val_at_end
+    num_prompts_per_step = master_config.ppo.num_prompts_per_step
     ft_save_period = master_config.checkpointing.get("ft_save_period")
     max_training_steps = max_num_steps
 
@@ -2498,8 +2514,8 @@ def async_ppo_train(
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
                 expected_batch_size = (
-                    master_config.ppo["num_prompts_per_step"]
-                    * master_config.ppo["num_generations_per_prompt"]
+                    master_config.ppo.num_prompts_per_step
+                    * master_config.ppo.num_generations_per_prompt
                 )
                 if repeated_batch.size != expected_batch_size:
                     raise RuntimeError(
@@ -2512,7 +2528,7 @@ def async_ppo_train(
                 with timer.time("data_processing"):
                     rewards = repeated_batch["total_reward"]
 
-                    use_overlong_filtering = master_config.ppo["overlong_filtering"]
+                    use_overlong_filtering = master_config.ppo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
@@ -2589,9 +2605,7 @@ def async_ppo_train(
                     train_data["prev_logprobs"] = policy.get_logprobs(
                         logprob_data, timer=timer
                     )["logprobs"]
-                    if not master_config.ppo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    ):
+                    if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
                                 logprob_data,
@@ -2609,9 +2623,9 @@ def async_ppo_train(
                 ) = _apply_ppo_seq_logprob_error_masking(
                     train_data=train_data,
                     rewards=rewards,
-                    seq_logprob_error_threshold=master_config.ppo[
-                        "seq_logprob_error_threshold"
-                    ],
+                    seq_logprob_error_threshold=(
+                        master_config.ppo.seq_logprob_error_threshold
+                    ),
                 )
 
                 # ---- 6. GAE advantages/returns (uses fresh values) ----
@@ -2846,7 +2860,7 @@ def async_ppo_train(
                 metrics.update(seq_logprob_error_metrics)
 
                 # ---- Checkpointing ----
-                consumed_samples += master_config.ppo["num_prompts_per_step"]
+                consumed_samples += master_config.ppo.num_prompts_per_step
                 timeout.mark_iteration()
                 should_save_by_step = (
                     is_last_step
@@ -3026,10 +3040,10 @@ def async_ppo_train(
                 metrics,
                 timing_metrics,
                 master_config,
-                num_prompts_per_step=master_config.ppo["num_prompts_per_step"],
-                num_generations_per_prompt=master_config.ppo[
-                    "num_generations_per_prompt"
-                ],
+                num_prompts_per_step=master_config.ppo.num_prompts_per_step,
+                num_generations_per_prompt=(
+                    master_config.ppo.num_generations_per_prompt
+                ),
                 include_training_worker_idle_ratio=False,
             )
 
@@ -3098,7 +3112,7 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config.ppo["val_period"] == 0, (
+        assert val_dataloader is not None or master_config.ppo.val_period == 0, (
             "val_dataloader is None, so ppo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
@@ -3113,7 +3127,7 @@ def validate(
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
-            master_config.ppo["max_val_samples"] // master_config.ppo["val_batch_size"]
+            master_config.ppo.max_val_samples // master_config.ppo.val_batch_size
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -3132,7 +3146,7 @@ def validate(
                 tokenizer=tokenizer,
                 task_to_env=val_task_to_env,
                 max_seq_len=master_config.policy["max_total_sequence_length"],
-                max_rollout_turns=master_config.ppo["max_rollout_turns"],
+                max_rollout_turns=master_config.ppo.max_rollout_turns,
                 greedy=False,
             )
 
