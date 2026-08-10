@@ -110,6 +110,10 @@ policy:
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
+      # Work around https://github.com/NVIDIA-NeMo/RL/issues/3412: vLLM 0.25
+      # defaults to RayExecutorV2, while FP8 worker patching currently uses V1.
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
       use_deep_gemm: true
       pow2_weight_scaling_factors: true
       tensor_parallel_size: 8
