@@ -32,6 +32,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     get_sparse_projection_matrix,
     next_token_accuracy,
     project_student_to_teacher_vocab,
+    slice_sparse_projection_cols,
     select_teacher_topk_indices,
     student_next_token_ce,
     valid_chunk_mask,
@@ -2306,10 +2307,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             student_vocab_size=self.student_vocab_size,
             teacher_vocab_size=teacher_vocab_size,
         )  # [V_s, V_t] sparse COO, fp32
-        projected_full = project_student_to_teacher_vocab(
-            student_probs, sparse_projection, tp_group=tp_group
-        )  # [B, T_s_local, V_t]
-        full_teacher_vocab_size = projected_full.shape[-1]
+        # The projection itself is deferred until the top-k columns are known
+        # (see below); its teacher-vocab width is available from the matrix.
+        full_teacher_vocab_size = sparse_projection.size(1)
 
         # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
         # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
@@ -2340,8 +2340,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits, vocab_topk, cp_group=cp_group
         )  # [k]
 
-        # Slice both sides to the shared [k] columns.
-        projected_topk = projected_full[..., global_top_indices]  # [B, T_s, k]
+        # Slice both sides to the shared [k] columns. On the student side the
+        # slice is folded into the projection matrix rather than applied to its
+        # output: every teacher column of ``M.t() @ p`` is an independent
+        # contraction over the student axis, so restricting M's columns first is
+        # value-preserving, and the only renormalization here is within the [k]
+        # subset (below), never over V_t. Projecting all V_t columns and then
+        # discarding all but k built -- and all-reduced, under TP -- a
+        # [B, T_s, V_t] fp32 tensor to read k of its columns.
+        if vocab_topk < full_teacher_vocab_size:
+            sparse_projection = slice_sparse_projection_cols(
+                sparse_projection, global_top_indices
+            )
+        projected_topk = project_student_to_teacher_vocab(
+            student_probs, sparse_projection, tp_group=tp_group
+        )  # [B, T_s_local, k]
         teacher_topk_logits = teacher_full_logits[
             ..., global_top_indices
         ]  # [B, T_t, k]
