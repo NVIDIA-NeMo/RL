@@ -71,6 +71,49 @@ if (( NUM_GPUS < 3 )); then
     exit 0
 fi
 
+# How long to wait for device memory to come back: on entry, because the previous test in
+# the lane may still be releasing it, and on exit, so this test cannot poison the next one.
+# The lane runs five recovery variants back to back and then a chaos test, so every one of
+# those handoffs is a chance to pass on a GPU that is still being reclaimed.
+GPU_WAIT_S=${GPU_WAIT_S:-120}
+GPU_SETTLE_S=${GPU_SETTLE_S:-60}
+
+# GPUs whose used memory is low enough to place a worker on.
+free_gpu_count() {
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+        | awk -v lim=1024 '$1 <= lim' | wc -l
+}
+
+# Waits up to $1 seconds for $USED_GPUS of them; non-zero if the budget runs out.
+#
+# Sampling once is wrong: SIGKILL does not free device memory synchronously, the driver
+# takes seconds to tear down a context holding tens of GB, and killing a shard is the
+# entire point of this test. See grpo_dp_single_controller_chaos.sh, where a one-shot
+# sample 280ms after the previous test's cleanup aborted a GitHub CI run before it had
+# executed a single line of product code.
+wait_for_free_gpus() {
+    local budget_s=$1 free
+    for _ in $(seq 1 "$budget_s"); do
+        free=$(free_gpu_count) || free=0
+        if (( free >= USED_GPUS )); then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Refuse to start on a dirty machine rather than misreport a leftover allocation as a
+# failure of the code under test. Requires only the $USED_GPUS this test actually places
+# on, not every GPU on the host -- on a large runner one unrelated process elsewhere says
+# nothing about whether this test can run.
+if command -v nvidia-smi >/dev/null 2>&1 && ! wait_for_free_gpus "$GPU_WAIT_S"; then
+    echo "[recovery] FAIL: need $USED_GPUS free GPUs, still $(free_gpu_count) after ${GPU_WAIT_S}s; clean up before running"
+    nvidia-smi --query-gpu=index,memory.used --format=csv
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+    exit 1
+fi
+
 # Enough steps that the kill lands mid-run and enough refits follow it that a rebuilt
 # communicator has to actually carry weights, not just be constructed.
 #
@@ -167,6 +210,12 @@ cleanup() {
     pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
     pkill -9 -f "megatron_policy_worker" 2>/dev/null || true
     ray stop --force >/dev/null 2>&1 || true
+    # Signalling is not reclaiming: wait for the memory to actually come back before
+    # handing the machine to the next test, which starts with no gap at all.
+    if command -v nvidia-smi >/dev/null 2>&1 && ! wait_for_free_gpus "$GPU_SETTLE_S"; then
+        echo "[recovery] WARN: ${GPU_SETTLE_S}s after cleanup, fewer than $USED_GPUS GPUs are free:"
+        nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+    fi
 }
 trap cleanup EXIT
 
