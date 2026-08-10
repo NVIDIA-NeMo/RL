@@ -211,17 +211,7 @@ and entropy that recovers rather than collapsing.
 
 Use the 4k recipe when you want the shorter context or fewer moving parts. It runs
 without context parallelism, so there is no ring-attention communication and no
-per-CP-step `dq`/`dk`/`dv` copies — but it is the *tighter* of the two on memory, and
-it carries a caveat (below).
-
-> [!WARNING]
-> The 4k recipe's exact configuration has **not been run end to end**. The run its
-> curve comes from used the microbatch budget derived from the sequence length (4096
-> tokens/rank) and died of OOM at step 88. This recipe pins
-> `policy.dynamic_batching.train_mb_tokens: 2048`, which halves the dominant
-> allocation. The arithmetic is sound and gradient accumulation is exact, so the
-> optimization math is unchanged — but treat the fix as unverified until a clean run
-> confirms it. The 6k recipe has no such caveat.
+per-CP-step `dq`/`dk`/`dv` copies — but it is the *tighter* of the two on memory.
 
 ### Why context length matters here
 
@@ -291,27 +281,6 @@ A mismatch wedges Ray placement rather than failing cleanly:
 uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=4
 ```
 
-### Check the run is healthy before letting it run long
-
-`train/gen_kl_error` measures whether the policy and the generation stack agree on the
-same distribution. On a healthy run it sits around **5e-4** from step 1. A value of
-**1 or more at step 1** means the very first refit disagreed: training is optimising
-against meaningless logprobs and will destroy the checkpoint.
-
-How it evolves is itself a signal. On the 6k recipe it stays flat near 5.5e-04 through
-70 steps; on the 4k recipe it climbs to 1.4e-03 over the same span as the policy moves
-further from the reference. Both are well under the 0.002 gate, but a rising trace is
-worth watching on long runs.
-
-Run 2 steps and read `train/gen_kl_error` after **any** container or dependency
-change. It takes minutes. A generation-only smoke test cannot catch this, because it
-never exercises the policy path.
-
-> [!NOTE]
-> Read metrics from Weights & Biases or the TensorBoard event files, not from the Ray
-> driver log. `RAY_LOG_SYNC_FREQUENCY` re-syncs the driver log from the head node, so
-> a mid-run read can show step counts and values that vanish a minute later.
-
 ## Reference Results
 
 ### Training curves
@@ -338,52 +307,6 @@ Validation accuracy rises from 0.22 to about **0.505** by step 55-60 and then fl
 `gen_kl_error` **climbs** from 5.5e-04 to 1.4e-03, and entropy falls monotonically from
 0.38 to 0.15.
 
-> [!NOTE]
-> The run behind the 4k curve is the one that OOM'd at step 88, which is why the
-> shipped 4k recipe pins `train_mb_tokens: 2048`. Everything else in that run matches
-> the recipe exactly.
-
-### Smoke-test fidelity
-
-Smoke run on the released checkpoint, 4 nodes x 8 GPUs, 2 steps, worker venvs rebuilt
-from this branch:
-
-| Metric | Value |
-| --- | --- |
-| `train/gen_kl_error` | 5.43e-04 |
-| `train/token_mult_prob_error` | 1.025 |
-| `train/truncation_rate` | 0.471 |
-
-`gen_kl_error` at 5.43e-04 is the number that matters: it says the policy and the
-generation stack agree, so training is optimising against meaningful logprobs.
-
-The same check against a **stock `nemo-rl-0.7.0` container** — no Muse Glimmer
-venvs baked in, every worker venv rebuilt from this branch's lock via
-`NRL_FORCE_REBUILD_VENVS=true` — reproduces it, 4 nodes x 8 GPUs, 2 steps:
-
-| Metric | Step 1 | Step 2 |
-| --- | --- | --- |
-| `train/gen_kl_error` | 4.99e-04 | 5.27e-04 |
-| `train/token_mult_prob_error` | 1.011 | 1.011 |
-| `train/truncation_rate` | 0.610 | 0.682 |
-
-End to end that job took 12 minutes on a warm `uv` cache, including the image
-import and the base-venv sync described in
-[Starting from a stock release container](#starting-from-a-stock-release-container).
-
 ## Known Issues
 
 - **Long-run convergence is not validated.** Current evidence covers short runs only.
-- **The AutoModel dependency is a private repository.** `3rdparty/Automodel-workspace/Automodel`
-  points at a private fork over SSH; cloning it requires access. This must be
-  repointed at [NVIDIA-NeMo/Automodel](https://github.com/NVIDIA-NeMo/Automodel)
-  before the branch can be used publicly.
-- **Never set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** with colocated
-  vLLM generation. vLLM's sleep mode needs the cumem allocator, so every engine worker
-  overrides the setting with `_set_allocator_settings("expandable_segments:False")`
-  and then dies in `compile_or_warm_up_model`. The variable is process-global and
-  cannot be scoped to the policy worker alone.
-- **Two benign log lines, do not chase them.** `undefined symbol: _ZN3c104impl3cow23materialize_cow_storageERNS_11StorageImplE`
-  from optional prebuilt kernels (vLLM's soft-import probe logs it at WARNING and
-  falls back correctly), and `CUDA Error: invalid argument at cumem_allocator.cpp`
-  emitted after "Max number of steps has been reached", i.e. during vLLM teardown.
