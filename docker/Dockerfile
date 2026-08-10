@@ -151,6 +151,7 @@ ARG FLASHINFER_SOURCE_REF=super_vl_rl_v0.6.13
 ARG FLASHINFER_FMHA_ARTIFACT_PATH=e3a8eba02eb19f4485652f84f5095524350246b5/fmha/trtllm-gen/
 ARG FLASHINFER_FMHA_MANIFEST_SHA256=03e0f29f970de40b0fd3c6025a16a39fb6c9af2a6549a63da73cf3da8494e658
 ARG FLASHINFER_FMHA_MANIFEST_ENTRIES=19227
+ARG FLASHINFER_CUDA_ARCH_LIST=10.0a
 
 # Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
@@ -167,6 +168,8 @@ ENV UV_LINK_MODE=copy
 ENV FLASHINFER_FMHA_ARTIFACT_PATH=${FLASHINFER_FMHA_ARTIFACT_PATH}
 ENV FLASHINFER_FMHA_MANIFEST_SHA256=${FLASHINFER_FMHA_MANIFEST_SHA256}
 ENV FLASHINFER_FMHA_MANIFEST_ENTRIES=${FLASHINFER_FMHA_MANIFEST_ENTRIES}
+ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+ENV VLLM_USE_FASTOKENS=1
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
@@ -423,7 +426,7 @@ if [[ -n "${WARMUP_FLASHINFER_KERNELS:-}" && -z "${SKIP_VLLM_BUILD:-}" ]]; then
             "${venv_python}" /opt/nemo-rl/tools/warmup-custom-flashinfer.py
             WARMED=$((WARMED + 1))
         fi
-    done < <(find "${NEMO_RL_VENV_DIR}" -mindepth 3 -maxdepth 3 -path '*/bin/python' -type f | sort)
+    done < <(find -L "${NEMO_RL_VENV_DIR}" -mindepth 3 -maxdepth 3 -path '*/bin/python' -type f | sort)
     test "${WARMED}" -gt 0
 fi
 EOF
