@@ -47,6 +47,7 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  seq_logprob_error_threshold: null
 
 loss_fn:
   disable_ppo_ratio: false
@@ -222,6 +223,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
@@ -430,3 +434,6 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null

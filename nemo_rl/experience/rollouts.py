@@ -55,6 +55,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GenerationSamplingParams,
 )
 from nemo_rl.utils.timer import Timer
 
@@ -2007,7 +2008,9 @@ def apply_reward_penalties(
 
 
 def _prepare_nemo_gym_rows(
-    rows: list[dict], generation_config: GenerationConfig
+    rows: list[dict],
+    generation_config: GenerationConfig,
+    sampling_params: GenerationSamplingParams,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
     for row_index, row in enumerate(rows):
@@ -2017,8 +2020,8 @@ def _prepare_nemo_gym_rows(
                 "Each NeMo-Gym row must contain a responses_create_params dict"
             )
 
-        responses_create_params["temperature"] = generation_config["temperature"]
-        responses_create_params["top_p"] = generation_config["top_p"]
+        responses_create_params["temperature"] = sampling_params.temperature
+        responses_create_params["top_p"] = sampling_params.top_p
         configured_max_tokens = generation_config["max_new_tokens"]
         row_max_tokens = responses_create_params.get("max_output_tokens")
         responses_create_params["max_output_tokens"] = (
@@ -2059,6 +2062,7 @@ async def run_async_nemo_gym_rollout(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
+    sampling_params: Optional[GenerationSamplingParams] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2089,6 +2093,9 @@ async def run_async_nemo_gym_rollout(
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
+        sampling_params: Sampling profile stamped onto every NeMo-Gym row.
+            ``None`` uses the train profile from ``generation_config``;
+            validation passes its own profile explicitly.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2139,9 +2146,13 @@ async def run_async_nemo_gym_rollout(
     assert not generation_config["stop_token_ids"], (
         "Stop strings is not supported in the generation config in NeMo-Gym path!"
     )
+    if sampling_params is None:
+        sampling_params = GenerationSamplingParams.from_generation_config(
+            generation_config
+        )
     # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
-    assert not generation_config["top_k"], (
-        "Top k is not supported in the generation config in NeMo-Gym path!"
+    assert not sampling_params.top_k, (
+        "Top k is not supported in the sampling params in NeMo-Gym path!"
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
@@ -2162,7 +2173,7 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config)
+        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2248,6 +2259,7 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
@@ -2271,6 +2283,9 @@ def run_nemo_gym_rollout_sync(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        sampling_params: Sampling profile stamped onto every NeMo-Gym row.
+            ``None`` uses the train profile from ``generation_config``;
+            validation passes its own profile explicitly.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
 
@@ -2304,6 +2319,7 @@ def run_nemo_gym_rollout_sync(
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
+            sampling_params=sampling_params,
         ):
             pass
         if rollout_result is None:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
@@ -201,6 +202,13 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    # Validation-only sampling. The exemplar YAMLs default these to the train
+    # values above via interpolation (${.temperature}, ...), so validation
+    # samples exactly like training unless overridden. Only honored on the
+    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    val_temperature: float
+    val_top_p: float
+    val_top_k: int | None
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
@@ -213,6 +221,33 @@ class GenerationConfig(TypedDict):
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+
+
+@dataclass
+class GenerationSamplingParams:
+    """Sampling profile threaded explicitly through rollout entry points.
+
+    Rollout callers construct one from the relevant ``GenerationConfig``
+    fields (train or validation) so the sampling used for a rollout is
+    visible at the call site instead of flowing through config side-channels.
+    Named to distinguish it from ``TrainingSamplingParams`` (train-time logit
+    filtering) and vLLM's own ``SamplingParams``.
+    """
+
+    temperature: float
+    top_p: float
+    top_k: int | None
+
+    @classmethod
+    def from_generation_config(
+        cls, generation_config: "GenerationConfig"
+    ) -> "GenerationSamplingParams":
+        """Build the train-time sampling profile from a generation config."""
+        return cls(
+            temperature=generation_config["temperature"],
+            top_p=generation_config["top_p"],
+            top_k=generation_config["top_k"],
+        )
 
 
 class GenerationDatumSpec(TypedDict):

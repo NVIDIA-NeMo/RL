@@ -1393,6 +1393,7 @@ def setup_model_and_optimizer(
     get_position_embedding_ranks=None,
     pre_load_checkpoint_hook: Optional[Callable] = None,
     additional_pre_wrap_hooks: Optional[list[Callable]] = None,
+    load_weights: bool = True,
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
@@ -1485,6 +1486,14 @@ def setup_model_and_optimizer(
                 # Handle VLM models
                 if hasattr(model_module, "thinker"):
                     model_module = model_module.thinker
+                # NemotronVLModel / NemotronOmniModel wrap the GPT under
+                # `.llava_model.language_model`; unwrap that layer first so the
+                # generic `.language_model.decoder.layers` walk below finds the
+                # MoE router.
+                if getattr(model_module, "llava_model", None) is not None and hasattr(
+                    model_module.llava_model, "language_model"
+                ):
+                    model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):
                     model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
@@ -1576,7 +1585,9 @@ def setup_model_and_optimizer(
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
 
-    if megatron_cfg.peft is not None:
+    if not load_weights:
+        should_load_checkpoint = False
+    elif megatron_cfg.peft is not None:
         should_load_checkpoint = resume_checkpoint_exists
         if should_load_checkpoint:
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
