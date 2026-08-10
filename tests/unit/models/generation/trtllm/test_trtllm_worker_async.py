@@ -166,7 +166,6 @@ def test_build_sampling_params_null_top_k_maps_to_zero():
     """null top_k (default) must reach TRT-LLM as 0, its spelling of 'no restriction'."""
     worker = _worker()
     worker.cfg["top_k"] = None
-    worker._resolve_end_id = MagicMock(return_value=2)
 
     worker._build_sampling_params(greedy=False)
 
@@ -175,7 +174,6 @@ def test_build_sampling_params_null_top_k_maps_to_zero():
         top_p=0.9,
         top_k=0,
         max_tokens=4,
-        end_id=2,
         stop_token_ids=[9],
         include_stop_str_in_output=True,
         logprobs=True,
@@ -185,7 +183,6 @@ def test_build_sampling_params_null_top_k_maps_to_zero():
 
 def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
     worker = _worker()
-    worker._resolve_end_id = MagicMock(return_value=2)
 
     worker._build_sampling_params(greedy=True)
     worker.TrtSamplingParams.assert_called_once_with(
@@ -193,7 +190,6 @@ def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
         top_p=0.9,
         top_k=1,
         max_tokens=4,
-        end_id=2,
         stop_token_ids=[9],
         include_stop_str_in_output=True,
         logprobs=True,
@@ -207,7 +203,6 @@ def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
         top_p=0.9,
         top_k=20,
         max_tokens=4,
-        end_id=2,
         stop_token_ids=[9],
         include_stop_str_in_output=True,
         logprobs=True,
