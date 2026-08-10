@@ -16,7 +16,7 @@ import gc
 import os
 import traceback
 from enum import Enum
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 import requests
 import torch
@@ -36,6 +36,14 @@ try:
         NeMoAutoModelForImageTextToText,
         NeMoAutoModelForTextToWaveform,
     )
+
+    # Side-effect import: installs the resolver hook that routes FP8-native
+    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
+    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
+    try:
+        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
+    except ImportError:
+        pass
 
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
@@ -259,6 +267,84 @@ def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
     return reduce_tensor(tensor.detach())[1:]
 
 
+def ensure_teacher_ipc_buffer(
+    storage: Optional[torch.Tensor],
+    handle: Optional[tuple[Any, ...]],
+    num_microbatches: int,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, tuple[Any, ...]]:
+    """Lazy-alloc / grow ``[N_mb, B, T, V]`` teacher-logits IPC storage.
+
+    Returns the (possibly reallocated) ``(storage, handle)``. Reallocates and
+    re-exports the IPC handle whenever any dim of the requested shape exceeds
+    the current storage, or dtype/device changed; otherwise the existing
+    storage and cached handle are returned unchanged.
+    """
+    needs_realloc = (
+        storage is None
+        or storage.shape[0] < num_microbatches
+        or storage.shape[1] < batch_size
+        or storage.shape[2] < seq_len
+        or storage.shape[3] < vocab_size
+        or storage.dtype != dtype
+        or storage.device != device
+    )
+    if needs_realloc:
+        storage = torch.empty(
+            (num_microbatches, batch_size, seq_len, vocab_size),
+            dtype=dtype,
+            device=device,
+        )
+        handle = get_handle_from_tensor(storage)
+    assert storage is not None and handle is not None
+    return storage, handle
+
+
+def aggregate_per_sample_handles(
+    worker_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flatten teacher per-sample IPC handles into a global-batch-ordered list.
+
+    Each worker returns ``{"dp_rank": int, "per_sample_handles": list}`` where
+    the handle list is in local sample order; the several workers sharing a
+    ``dp_rank`` are TP/CP replicas that each contribute one shard per sample.
+    Concatenating samples in ``sorted(dp_rank)`` order reproduces the original
+    global sample order (rank 0 holds the first ``gbs/dp`` samples, rank 1 the
+    next, ...), so the result is a length-``gbs`` list independent of the
+    teacher's DP degree. Element ``i`` is ``{"teacher_shards": [shard, ...]}``
+    holding all TP×CP shards of global sample ``i``.
+    """
+    handles_by_dp_rank: dict[int, list[list[dict[str, Any]]]] = {}
+    for worker_result in worker_results:
+        dp_rank = worker_result["dp_rank"]
+        handles_by_dp_rank.setdefault(dp_rank, []).append(
+            worker_result["per_sample_handles"]
+        )
+    aggregated: list[dict[str, Any]] = []
+    for dp_rank in sorted(handles_by_dp_rank.keys()):
+        worker_handles_in_dp = handles_by_dp_rank[dp_rank]
+        num_samples = len(worker_handles_in_dp[0])
+        for worker_handles in worker_handles_in_dp:
+            assert len(worker_handles) == num_samples, (
+                f"dp={dp_rank}: per_sample_handles length mismatch "
+                f"{[len(h) for h in worker_handles_in_dp]}"
+            )
+        for sample_idx in range(num_samples):
+            aggregated.append(
+                {
+                    "teacher_shards": [
+                        worker_handles[sample_idx]
+                        for worker_handles in worker_handles_in_dp
+                    ]
+                }
+            )
+    return aggregated
+
+
 def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
     """Calculate aligned size for memory alignment.
 
@@ -329,6 +415,17 @@ def stream_weights_via_ipc_zmq_impl(
     buffer_b: torch.Tensor | None = None
     current_buffer: torch.Tensor | None = None
 
+    def release_staging_buffers() -> None:
+        """Release acyclic IPC buffers without scanning the worker object graph."""
+        nonlocal buffer_a, buffer_b, current_buffer
+
+        had_buffers = buffer_a is not None or buffer_b is not None
+        current_buffer = None
+        buffer_a = None
+        buffer_b = None
+        if had_buffers:
+            torch.cuda.empty_cache()
+
     used_bytes = 0
     param_names = []
     await_recv = False
@@ -338,14 +435,56 @@ def stream_weights_via_ipc_zmq_impl(
         for name, tensor in params_generator:
             # Initialize device and buffers on first tensor
             if buffer_a is None:
-                buffer_a = allocate_buffer(tensor.device)
-                buffer_b = allocate_buffer(tensor.device)
+                buffer_device = tensor.device
+                if buffer_device.type == "cpu" and torch.cuda.is_available():
+                    buffer_device = torch.device("cuda", torch.cuda.current_device())
+                buffer_a = allocate_buffer(buffer_device)
+                buffer_b = allocate_buffer(buffer_device)
                 current_buffer = buffer_a
 
             aligned_size = calculate_aligned_size(tensor.nbytes)
-            assert aligned_size <= buffer_size_bytes, (
-                f"Parameter {name} too large for buffer: {aligned_size} > {buffer_size_bytes}"
-            )
+
+            # A parameter larger than a single staging buffer cannot be packed
+            # at all. Ship it on its own in a buffer sized to fit rather than
+            # failing the refit. The staging buffers are sized from *free
+            # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
+            # for ping-pong) with no floor at the largest parameter, so a big
+            # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
+            # is 1.73 GiB against a 1.65 GiB buffer. This mirrors the HTTP
+            # streaming path, which already gives an oversized parameter a
+            # bucket of its own instead of raising.
+            if aligned_size > buffer_size_bytes:
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    current_buffer = (
+                        buffer_b if current_buffer is buffer_a else buffer_a
+                    )
+                    used_bytes, param_names = 0, []
+
+                oversized_buffer = torch.empty(
+                    aligned_size,
+                    device=current_buffer.device,
+                    dtype=torch.uint8,
+                    requires_grad=False,
+                )
+                try:
+                    packed_bytes = pack_tensor(oversized_buffer, tensor, 0)
+                    send_buffer_group_overlap(
+                        oversized_buffer, [name], packed_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    # Unlike the ping-pong pair, this buffer is not kept alive
+                    # across the next send, so its ACK must be consumed here
+                    # before it is freed.
+                    zmq_socket.recv()
+                    await_recv = False
+                finally:
+                    del oversized_buffer
+                    torch.cuda.empty_cache()
+                continue
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
@@ -373,8 +512,13 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Final synchronization and completion signal
+        # The receiver synchronizes and drops every IPC view before ACKing a
+        # group, so the final data ACK is the staging buffers' safe lifetime
+        # boundary. Reclaim them before asking the receiver to run its final
+        # post-load conversion, which can otherwise retain both large buffers
+        # for the whole conversion and amplify a single-rank tail.
         torch.cuda.current_stream().synchronize()
+        release_staging_buffers()
         zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
         zmq_socket.recv()
 
@@ -399,15 +543,10 @@ def stream_weights_via_ipc_zmq_impl(
         ) from e
 
     finally:
-        # Clean up buffers in finally block to ensure cleanup even on exceptions
-        if buffer_a is not None:
-            del buffer_a
-        if buffer_b is not None:
-            del buffer_b
-
-        # Force garbage collection and clear CUDA cache
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Tensor references are acyclic and deterministic; a full gc.collect()
+        # scans the entire model object graph and can become a multi-second
+        # rank straggler without releasing anything that refcounting cannot.
+        release_staging_buffers()
 
 
 def rebuild_cuda_tensor_from_ipc(

@@ -1,0 +1,372 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""IntentDataset: HumanOmniV2 IntentTrain / IntentBench loader for GRPO.
+
+Loads the PhilipC/IntentTrain (training) or PhilipC/IntentBench (validation)
+datasets that ship as a JSON manifest plus a ``videos.zip`` archive on
+HuggingFace, filters samples to the configured ``problem_type`` allow-list, and
+emits OpenAI-style messages whose user content carries both a video reference
+and the audio track extracted from that same video. Audio and video flow as
+two independent ``{type:audio}`` / ``{type:video}`` content items so the
+Qwen2.5-Omni chat template renders both ``<|VIDEO|>`` and ``<|AUDIO|>``
+placeholders into the prompt -- vLLM's multimodal prompt replacement on the
+rollout side requires those placeholders to exist before it accepts matching
+``mm_items``. The ``use_audio_in_video=True`` time-alignment hint is NOT
+threaded through here because the installed transformers + vLLM stack
+rejected that path during Round 1 testing (see BitLesson
+BL-20260428-omni-use-audio-in-video).
+"""
+
+import ast
+import json
+import logging
+import os
+import zipfile
+from typing import Any
+
+from huggingface_hub import snapshot_download
+
+from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.utils import get_huggingface_cache_path, load_audio_from_file
+
+logger = logging.getLogger(__name__)
+
+# Per-problem-type instruction appended to the question. The wording asks
+# the model to first think between <think>...</think> tags and then commit
+# the final answer between <answer>...</answer> tags so both NeMo-RL reward
+# functions (format_reward checks for <think> + <answer>; exact_alnum
+# extracts content from <answer>) can score the response. Without the
+# explicit "<think>" instruction the base Qwen2.5-Omni-3B emits a bare
+# letter (e.g. "B") and both rewards collapse to 0.
+_TYPE_TEMPLATE = {
+    "multiple choice": (
+        " First reason briefly between <think> </think> tags, then output "
+        "only the single option letter (e.g., A, B, C, D, ...) between "
+        "<answer> </answer> tags. Format example: "
+        "<think>your reasoning</think><answer>A</answer>"
+    ),
+    "emer_ov_mc": (
+        " First reason briefly between <think> </think> tags, then output "
+        "the single or multi-letter answer (e.g., A for single, A,E for "
+        "multiple) between <answer> </answer> tags. Format example: "
+        "<think>your reasoning</think><answer>A,E</answer>"
+    ),
+    "numerical": (
+        " First reason briefly between <think> </think> tags, then output "
+        "the numerical value (e.g., 42 or 3.14) between <answer> </answer> "
+        "tags. Format example: <think>your reasoning</think><answer>42</answer>"
+    ),
+    "judge": (
+        " First reason briefly between <think> </think> tags, then answer "
+        "Yes or No between <answer> </answer> tags. Format example: "
+        "<think>your reasoning</think><answer>Yes</answer>"
+    ),
+    "free-form": (
+        " First reason briefly between <think> </think> tags, then provide "
+        "your final text answer between <answer> </answer> tags. Format "
+        "example: <think>your reasoning</think><answer>your answer</answer>"
+    ),
+}
+
+
+def _format_options(options: Any) -> str:
+    """Render a record's multiple-choice options into the prompt text.
+
+    IntentTrain/IntentBench manifests store ``options`` as a list of strings
+    like ``["A.first choice", "B.second choice", ...]`` (occasionally as a
+    string repr of that list). These MUST be appended to the prompt: without
+    them the model only sees the question stem and has to emit a bare option
+    letter blind (capping accuracy near chance). Mirrors HumanOmniV2's prompt
+    construction. Returns an empty string when no options are present.
+    """
+    if not options:
+        return ""
+    if isinstance(options, str):
+        try:
+            options = ast.literal_eval(options)
+        except (ValueError, SyntaxError):
+            return f" Options:\n{options}"
+    if isinstance(options, (list, tuple)):
+        return " Options:\n" + "\n".join(str(o) for o in options)
+    return f" Options:\n{options}"
+
+
+# Per-split HF repo + manifest filenames for the HumanOmniV2 IntentTrain /
+# IntentBench releases. Each split downloads a videos.zip and one or more JSON
+# manifests; manifest entries point at relative paths inside the extracted
+# archive.
+_SPLIT_CONFIG = {
+    "train": {
+        "repo_id": "PhilipC/IntentTrain",
+        "manifests": ["emer_rewrite.json", "social_iq_v2_rewrite.json"],
+        "task_name": "intent-train",
+    },
+    "validation": {
+        "repo_id": "PhilipC/IntentBench",
+        "manifests": ["qa.json"],
+        "task_name": "intent-bench",
+    },
+}
+
+_EXTRACTION_SENTINEL = ".intent_videos_extracted"
+
+
+def _extract_videos_zip_once(snapshot_dir: str) -> str:
+    """Idempotently extract ``videos.zip`` inside ``snapshot_dir``.
+
+    Returns the directory the archive was extracted into. A sentinel file is
+    written after a successful extraction so subsequent constructions skip
+    re-extraction.
+    """
+    archive = os.path.join(snapshot_dir, "videos.zip")
+    if not os.path.isfile(archive):
+        raise FileNotFoundError(
+            f"videos.zip not found in HuggingFace snapshot at {snapshot_dir}. "
+            "Was the dataset downloaded correctly?"
+        )
+
+    sentinel = os.path.join(snapshot_dir, _EXTRACTION_SENTINEL)
+    if os.path.isfile(sentinel):
+        return snapshot_dir
+
+    with zipfile.ZipFile(archive, "r") as zf:
+        zf.extractall(snapshot_dir)
+
+    with open(sentinel, "w", encoding="utf-8") as f:
+        f.write("ok\n")
+    return snapshot_dir
+
+
+def _resolve_video_path(snapshot_dir: str, relpath: str) -> str | None:
+    """Resolve a manifest's relative video path to an absolute file on disk.
+
+    The IntentTrain/IntentBench archives extract their contents either directly
+    under the snapshot directory or under a ``videos/`` subdirectory. Try both
+    and return the first path that exists, or ``None`` if neither does.
+    """
+    candidate = os.path.join(snapshot_dir, relpath)
+    if os.path.isfile(candidate):
+        return candidate
+    candidate = os.path.join(snapshot_dir, "videos", relpath)
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def _read_manifest(snapshot_dir: str, manifest_filename: str) -> list[dict[str, Any]]:
+    manifest_path = os.path.join(snapshot_dir, manifest_filename)
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(
+            f"Manifest {manifest_filename} not found in HF snapshot at "
+            f"{snapshot_dir}. Available files: {sorted(os.listdir(snapshot_dir))}"
+        )
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        if manifest_filename.endswith(".jsonl"):
+            return [json.loads(line) for line in f if line.strip()]
+        return json.load(f)
+
+
+class IntentDataset(RawDataset):
+    """HumanOmniV2 IntentTrain / IntentBench loader for VLM GRPO.
+
+    Each sample emits both a video file path and a 16 kHz mono audio array
+    decoded from that same file as two independent content items
+    (``{type:video}`` and ``{type:audio}``) plus a text prompt. The
+    Qwen2.5-Omni processor and vLLM rollout both treat the two streams as
+    independent multimodal sources; the explicit time-alignment via
+    ``use_audio_in_video=True`` is intentionally not used in v1 because the
+    installed transformers + vLLM stack rejected that path. Samples whose
+    ``problem_type`` is not in ``allowed_problem_types`` are dropped before
+    iteration.
+
+    Args:
+        split: ``"train"`` (PhilipC/IntentTrain) or ``"validation"``
+            (PhilipC/IntentBench).
+        allowed_problem_types: List of ``problem_type`` values to retain.
+            Defaults to ``["multiple choice"]`` per DEC-2.
+        max_samples: Optional cap on the number of samples after filtering.
+            Useful for smoke runs.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        allowed_problem_types: list[str] | None = None,
+        max_samples: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if split not in _SPLIT_CONFIG:
+            raise ValueError(
+                f"Invalid split: {split!r}. Supported: {sorted(_SPLIT_CONFIG.keys())}."
+            )
+        # The think/answer instruction is baked into the user prompt, so a
+        # system prompt is unsupported and would produce undefined behavior.
+        if kwargs.get("system_prompt_file") is not None:
+            raise ValueError(
+                "IntentDataset does not support a system prompt; set "
+                "data.*.system_prompt_file=null."
+            )
+        if kwargs.get("prompt_file") is not None:
+            raise ValueError(
+                "IntentDataset does not support a prompt file; set "
+                "data.*.prompt_file=null."
+            )
+        self.split = split
+        self._cfg = _SPLIT_CONFIG[split]
+        self.task_name = self._cfg["task_name"]
+        self.allowed_problem_types = list(
+            allowed_problem_types
+            if allowed_problem_types is not None
+            else ["multiple choice"]
+        )
+
+        self.snapshot_dir = self._download_and_extract()
+
+        records = self._load_records()
+        records = self._filter_records(records)
+        if max_samples is not None:
+            records = records[:max_samples]
+        if not records:
+            raise ValueError(
+                f"IntentDataset({split=}) yielded 0 samples after filtering by "
+                f"allowed_problem_types={self.allowed_problem_types}. "
+                "Check the manifest contents and filter list."
+            )
+
+        from datasets import Dataset
+
+        self.dataset = Dataset.from_list(records)
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
+        )
+        self.preprocessor = self.format_data
+        self.val_dataset = None
+
+    def _download_and_extract(self) -> str:
+        """Download the HF dataset snapshot and extract ``videos.zip`` once."""
+        repo_id = self._cfg["repo_id"]
+        cache_dir = get_huggingface_cache_path(repo_id)
+        if not cache_dir:
+            cache_dir = snapshot_download(repo_id=repo_id, repo_type="dataset")
+        if not cache_dir:
+            raise ValueError(f"Cannot download {repo_id}.")
+        return _extract_videos_zip_once(cache_dir)
+
+    def _load_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for manifest in self._cfg["manifests"]:
+            try:
+                manifest_records = _read_manifest(self.snapshot_dir, manifest)
+            except FileNotFoundError:
+                if len(self._cfg["manifests"]) == 1:
+                    raise
+                logger.warning(
+                    "Manifest %s missing in snapshot %s; skipping",
+                    manifest,
+                    self.snapshot_dir,
+                )
+                continue
+            records.extend(manifest_records)
+        if not records:
+            raise ValueError(
+                f"No manifest entries loaded for {self._cfg['repo_id']}. "
+                f"Expected one of: {self._cfg['manifests']}."
+            )
+        return records
+
+    def _filter_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        allowed = set(self.allowed_problem_types)
+        filtered: list[dict[str, Any]] = []
+        for record in records:
+            problem_type = record.get("problem_type")
+            if problem_type not in allowed:
+                continue
+            data_type = record.get("data_type", "video")
+            if data_type != "video":
+                # Mixed modalities (e.g. image-only entries from
+                # Video-R1_rewrite.json) are out of scope; the recipe is
+                # video-first per DEC-1 / DEC-2.
+                continue
+            relpath = record.get("video") or record.get("path")
+            if not isinstance(relpath, str):
+                continue
+            local_path = _resolve_video_path(self.snapshot_dir, relpath)
+            if local_path is None:
+                logger.warning(
+                    "Skipping manifest entry: video not found for relpath=%s",
+                    relpath,
+                )
+                continue
+            filtered.append(
+                {
+                    "problem": record.get("problem", ""),
+                    "problem_type": problem_type,
+                    "answer": record.get("answer", ""),
+                    "options": record.get("options"),
+                    "video_path": local_path,
+                }
+            )
+        return filtered
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Format a manifest record into NeMo-RL OpenAI-style messages.
+
+        Each yielded sample carries the video file path AND the audio track
+        decoded from that same file at 16 kHz mono. Both arrive as
+        independent ``{type: video}`` / ``{type: audio}`` content items so
+        the Qwen2.5-Omni chat template renders both ``<|VIDEO|>`` and
+        ``<|AUDIO|>`` placeholders in the prompt; vLLM's multimodal prompt
+        replacement on the rollout side requires those placeholders to exist
+        in the prompt before it will accept matching ``mm_items``.
+
+        We deliberately do NOT pass ``use_audio_in_video=True`` to the
+        processor in v1: that flag would entangle the audio and video
+        placeholder accounting in ways the current installed transformers
+        + vLLM stack does not handle (see Round 1 BitLesson). The model
+        still receives both modalities; the only thing missing is the
+        explicit time alignment hint.
+        """
+        instruction = _TYPE_TEMPLATE.get(data["problem_type"], "")
+        options_text = _format_options(data.get("options"))
+        prompt_text = f"{data['problem']}{options_text}{instruction}"
+        audio_array = load_audio_from_file(data["video_path"])
+        user_content = [
+            {"type": "video", "video": data["video_path"]},
+            {"type": "audio", "audio": audio_array},
+            {"type": "text", "text": prompt_text},
+        ]
+        return {
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": str(data["answer"])},
+            ],
+            "task_name": self.task_name,
+        }
+
+
+class IntentTrainDataset(IntentDataset):
+    """Convenience wrapper that pins ``split="train"`` for IntentTrain."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault("split", "train")
+        super().__init__(**kwargs)
+
+
+class IntentBenchDataset(IntentDataset):
+    """Convenience wrapper that pins ``split="validation"`` for IntentBench."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault("split", "validation")
+        super().__init__(**kwargs)

@@ -16,17 +16,20 @@
 
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
-- GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, sum then normalize)
+- GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, optional per-reward weights, then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
+- OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
 - GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
+- MOPD: https://arxiv.org/abs/2601.02780
 """
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -38,15 +41,30 @@ from nemo_rl.algorithms.utils import (
 )
 
 
+class AdvEstimatorConfig(BaseModel, extra="allow"):
+    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
+
+    name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
+    # GRPO specific
+    normalize_rewards: bool = True
+    use_leave_one_out_baseline: bool = True
+    # GDPO specific: optional per-component weights w_n for the aggregation.
+    reward_weights: list[float] | None = None
+    # Reinforce++ specific
+    minus_baseline: bool = True
+
+
 class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
 
     Note: GRPO computes advantages over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
@@ -86,9 +104,14 @@ class GDPOAdvantageEstimator:
     Note: GDPO computes advantages for each reward separately over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
+        # Optional per-reward weights w_n for the aggregation A = sum_n w_n * A_n
+        # (paper: https://arxiv.org/abs/2601.05242). None => equal weights (all 1.0).
+        self.reward_weights = estimator_config.reward_weights
 
     def compute_advantage(
         self,
@@ -103,7 +126,7 @@ class GDPOAdvantageEstimator:
         Args:
             prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
-            repeated_batch: Batch containing reward1, reward2, ... keys.
+            repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
@@ -113,9 +136,21 @@ class GDPOAdvantageEstimator:
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
             raise ValueError(
-                f"GDPO requires multiple reward components (reward1, reward2, ...). "
-                f"This batch has {len(reward_component_keys)} component(s). "
+                f"GDPO requires multiple reward components (reward/name1, reward/name2, ...). "
+                f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
+            )
+        # Resolve per-reward weights (ordered to match the reward/<name> components,
+        # sorted alphabetically by name — same order as reward_component_keys).
+        weights = self.reward_weights
+        if weights is None:
+            weights = [1.0] * len(reward_component_keys)
+        elif len(weights) != len(reward_component_keys):
+            raise ValueError(
+                f"reward_weights has {len(weights)} entries but this batch has "
+                f"{len(reward_component_keys)} reward components ({reward_component_keys}). "
+                "Provide exactly one weight per component, ordered alphabetically by "
+                "component name (matching the sorted reward/<name> keys)."
             )
         valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
         leave_one_out = self.use_leave_one_out_baseline
@@ -142,7 +177,9 @@ class GDPOAdvantageEstimator:
 
             advantage_parts.append(adv_k)
 
-        advantages = sum(advantage_parts)
+        advantages = sum(
+            weight * adv_k for weight, adv_k in zip(weights, advantage_parts)
+        )
         # Normalize combined advantage to zero mean and unit std
         adv_std = advantages.std()
         if adv_std > 0:
@@ -161,8 +198,10 @@ class ReinforcePlusPlusAdvantageEstimator:
         use_kl_in_reward: If True, add KL penalty to reward instead of loss.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.minus_baseline = estimator_config["minus_baseline"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.minus_baseline = estimator_config.minus_baseline
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
@@ -507,3 +546,82 @@ class GeneralizedAdvantageEstimator:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
         return advantages, returns
+
+
+class OPDAdvantageEstimator:
+    """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator (arXiv:2601.02780).
+
+    Computes token-level distillation advantages:
+        Â_MOPD,t = sg[log π_teacher - log π_student]
+
+    This is Equation 8 from the MOPD paper. The IS truncation (w_t, the
+    hard gate on the training-to-inference ratio) is handled separately by
+    ICE-POP mode in ClippedPGLoss — not here.
+
+    The loss function should be configured with:
+        disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
+        use_importance_sampling_correction: true
+        truncated_importance_sampling_type: icepop
+        truncated_importance_sampling_ratio_min: <eps_low>
+        truncated_importance_sampling_ratio: <eps_high>
+
+    Required kwargs in compute_advantage:
+        teacher_logprobs: [B, S] teacher model log probabilities
+        prev_logprobs: [B, S] student training-engine log probabilities
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: dict):
+        self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=None,
+        prev_logprobs=None,
+        **kwargs,
+    ):
+        """Compute OPD distillation advantages.
+
+        Args:
+            prompt_ids: [B] prompt IDs (unused, kept for interface compatibility)
+            rewards: [B] rewards (unused for pure distillation)
+            mask: [B, S] token mask
+            teacher_logprobs: [B, S] teacher model logprobs (required)
+            prev_logprobs: [B, S] student training-engine logprobs (required)
+
+        Returns:
+            [B, S] token-level distillation advantages (stop-gradient)
+        """
+        if teacher_logprobs is None:
+            raise ValueError("OPD requires teacher_logprobs")
+        if prev_logprobs is None:
+            raise ValueError("OPD requires prev_logprobs")
+
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
+        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+
+        # Apply mask
+        advantages = distill_advantages * mask
+
+        # Metrics
+        self._compute_metrics(distill_advantages, advantages, mask)
+
+        return advantages
+
+    def _compute_metrics(self, distill_advantages, advantages, mask):
+        """Compute OPD logging metrics and store in self.last_metrics."""
+        valid_bool = mask.bool()
+        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        adv_valid = torch.masked_select(advantages, valid_bool)
+
+        distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0
+        adv_mean = adv_valid.mean().item() if adv_valid.numel() > 0 else 0.0
+        adv_std = adv_valid.std().item() if adv_valid.numel() > 1 else 0.0
+
+        self.last_metrics = {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
+            "on_policy_distillation/adv_mean": adv_mean,
+            "on_policy_distillation/adv_std": adv_std,
+        }

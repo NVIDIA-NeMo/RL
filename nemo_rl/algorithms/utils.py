@@ -14,7 +14,6 @@
 
 import math
 import random
-import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -29,13 +28,15 @@ from transformers import (
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
-def get_gdpo_reward_component_keys(batch) -> list:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
+def get_gdpo_reward_component_keys(batch) -> list[str]:
+    """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
+    return sorted(
+        k for k in batch.keys() if isinstance(k, str) and k.startswith("reward/")
+    )
 
 
 def calculate_kl(
@@ -44,6 +45,7 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
+    importance_sampling_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
@@ -57,13 +59,26 @@ def calculate_kl(
                            If None, no clamping is applied.
         output_clamp_value: Optional clamping value for kl to prevent numerical instability.
                            If None, no clamping is applied.
+        importance_sampling_weights: Optional per-token importance weights. When
+                                     provided, weights are multiplied into the KL
+                                     before output clamping. If input clamping
+                                     applies to a token, the corresponding weight
+                                     is detached so the clamp suppresses both KL
+                                     and sampling-weight gradients.
 
     Returns:
         torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
-        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        logr_clamped = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = torch.where(
+                logr == logr_clamped,
+                importance_sampling_weights,
+                importance_sampling_weights.detach(),
+            )
+        logr = logr_clamped
 
     if kl_type == "k1":
         kl = -logr
@@ -76,6 +91,9 @@ def calculate_kl(
 
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
+
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
 
     if output_clamp_value is not None:
         kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
@@ -338,6 +356,8 @@ def get_tokenizer(
         >>>
         ```
     """
+    maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
+
     processor = None
 
     if get_processor:
@@ -720,10 +740,11 @@ def print_performance_metrics(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
-    grpo_config = getattr(master_config, "grpo", {})
     if (
-        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
-    ) and not colocated_inference:
+        "exposed_generation" in timing_metrics
+        and master_config.grpo.async_grpo.enabled
+        and not colocated_inference
+    ):
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -744,14 +765,15 @@ def print_performance_metrics(
         )
 
     # Detect which algorithm config key is being used
-    algo_config = (
-        getattr(master_config, "grpo", None)
-        or getattr(master_config, "ppo", None)
-        or {}
-    )
-    number_of_samples_per_step = algo_config.get(
-        "num_prompts_per_step", 1
-    ) * algo_config.get("num_generations_per_prompt", 1)
+    grpo_config = getattr(master_config, "grpo", None)
+    algo_config = grpo_config or getattr(master_config, "ppo", None) or {}
+    if isinstance(algo_config, dict):
+        num_prompts_per_step = algo_config.get("num_prompts_per_step", 1)
+        num_generations_per_prompt = algo_config.get("num_generations_per_prompt", 1)
+    else:
+        num_prompts_per_step = algo_config.num_prompts_per_step
+        num_generations_per_prompt = algo_config.num_generations_per_prompt
+    number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
 
     if colocated_inference:
         training_num_gpus = total_num_gpus
@@ -838,10 +860,17 @@ def print_performance_metrics(
     # FLOPS
     # =====================================================
 
-    if "total_flops" in train_results:
-        total_tflops = (
-            train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+    packing_enabled = master_config.policy.get("sequence_packing", {}).get(
+        "enabled", False
+    )
+    if "total_flops" in train_results and not packing_enabled:
+        # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
+        # over the driver-side policy_training timer, which returns as soon as the Ray
+        # future is submitted and can be much shorter than actual GPU compute time.
+        train_elapsed_seconds = train_results.get(
+            "train_elapsed_seconds", timing_metrics["policy_training"]
         )
+        total_tflops = train_results["total_flops"] / train_elapsed_seconds / 1e12
         num_ranks = train_results["num_ranks"]
         print(
             f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
@@ -913,3 +942,95 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+WALL_CLOCK_EFFICIENCY_CATEGORIES = [
+    "init/total",
+    "idle/buffer_starvation",
+    "idle/refit_bubble",
+    "idle/validation",
+]
+
+THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES = [
+    "idle/buffer_full_backoff",
+    "idle/generation_limit_pause",
+    "idle/refit_event_wait",
+    "wasted/failed_trajectory",
+]
+
+EFFICIENCY_CATEGORIES = (
+    WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
+)
+
+
+def print_efficiency_summary(
+    efficiency_metrics: dict[str, float],
+    total_wall_time_s: float,
+    step: int,
+) -> dict[str, float]:
+    """Print a summary table of efficiency metrics and return loggable dict.
+
+    Wall-clock categories (driver-side idle) are used for the efficiency
+    percentage.  Collector-side categories are summed across concurrent
+    threads and reported separately as thread-seconds so they are not
+    compared directly against a single wall-clock denominator.
+
+    Args:
+        efficiency_metrics: Dict mapping category labels to total seconds spent.
+        total_wall_time_s: Total wall-clock time in seconds since training began.
+        step: Current training step number.
+
+    Returns:
+        Dict of metrics suitable for logging to WandB/TensorBoard, including
+        per-category seconds and percentages, total waste, and efficiency_pct.
+    """
+    print(f"\n📊 Efficiency Summary (Step {step}):")
+    print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
+    print(f"  {'─' * 57}")
+
+    loggable: dict[str, float] = {}
+
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        pct = (duration / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+        print(f"  {category:<35} {duration:>10.2f} {pct:>9.2f}%")
+        loggable[f"efficiency/{category}_s"] = duration
+        loggable[f"efficiency/{category}_pct"] = pct
+
+    thread_seconds_total = 0.0
+    for category in THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        thread_seconds_total += duration
+        print(f"  {category + ' (thread-s)':<35} {duration:>10.2f} {'n/a':>10}")
+        loggable[f"efficiency/{category}_s"] = duration
+
+    wall_waste = sum(
+        efficiency_metrics.get(cat, 0.0) for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
+    )
+    if total_wall_time_s > 0 and wall_waste > total_wall_time_s:
+        wall_waste = total_wall_time_s
+
+    productive = max(0.0, total_wall_time_s - wall_waste)
+    efficiency_pct = (
+        (productive / total_wall_time_s * 100) if total_wall_time_s > 0 else 100.0
+    )
+    efficiency_pct = min(100.0, max(0.0, efficiency_pct))
+    waste_pct = (wall_waste / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+    waste_pct = min(100.0, max(0.0, waste_pct))
+
+    print(f"  {'─' * 57}")
+    print(
+        f"  {'Collector thread-seconds (info)':<35} "
+        f"{thread_seconds_total:>10.2f} {'n/a':>10}"
+    )
+    print(f"  {'Wall-clock waste':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%")
+    print(f"  {'Productive time':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%")
+    print(f"  {'Efficiency':<35} {'':>10} {efficiency_pct:>9.2f}%")
+
+    loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
+    loggable["efficiency/total_waste_s"] = wall_waste
+    loggable["efficiency/productive_time_s"] = productive
+    loggable["efficiency/efficiency_pct"] = efficiency_pct
+    loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+
+    return loggable

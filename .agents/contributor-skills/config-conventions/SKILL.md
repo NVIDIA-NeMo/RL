@@ -174,4 +174,35 @@ if "milestones" in scheduler_cfg:
     configure_milestones(scheduler_cfg["milestones"])
 ```
 
+## Avoid `dict[str, Any]` for Known-Field Config
+
+If a config block has a known set of fields, model it as a `BaseModel` (or, pre-migration, a `TypedDict`) —
+do not type it as `dict[str, Any]` and read keys with `.get(k, default)`. A bare `dict[str, Any]` both loses
+type-safety and pushes per-key defaults to the call site (the Forbidden Pattern above).
+
+If the block must also pass arbitrary keys through to another system, use `BaseModel(extra="allow")`: the known
+fields get types + centralized defaults, and unknown keys still come through (`model_extra`).
+
+**Don't:**
+```python
+class NonColocatedTeachersConfig(BaseModel, extra="allow"):
+    default_teacher_cfg: dict[str, Any] = Field(default_factory=dict)   # known fields hidden behind Any
+
+# ...so defaults end up scattered at the call site:
+tp = cfg.get("tensor_model_parallel_size", 1)
+precision = cfg.get("precision", "bf16")
+```
+
+**Do:**
+```python
+class TeacherResourceConfig(BaseModel, extra="allow"):  # extra="allow" keeps the passthrough escape hatch
+    tensor_model_parallel_size: int = 1
+    precision: str = "bf16"
+    micro_batch_size: int = 4
+    # ...
+
+class NonColocatedTeachersConfig(BaseModel, extra="allow"):
+    default_teacher_cfg: TeacherResourceConfig = Field(default_factory=TeacherResourceConfig)
+```
+
 See also: @docs/design-docs/design-and-philosophy.md (Configuration Schema: BaseModel, dataclass, and TypedDict section).

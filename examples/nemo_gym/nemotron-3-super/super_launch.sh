@@ -44,6 +44,29 @@ EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 SIF_DIR="${SIF_DIR:-}"
 CONTAINER_FORMATTER="${CONTAINER_FORMATTER:-}"
 
+# ---- MTP speculative decoding (optional) ----
+# Set ENABLE_MTP_INFERENCE=1 to turn on MTP (multi-token prediction) speculative
+# decoding for vLLM inference. The MTP weights are part of the model and arrive
+# via refit, so no separate draft checkpoint is needed.
+# Tune via NUM_SPECULATIVE_TOKENS / MAX_NUM_BATCHED_TOKENS if needed.
+#   ENABLE_MTP_INFERENCE=1 ./super_launch.sh
+#   ENABLE_MTP_INFERENCE=1 NUM_SPECULATIVE_TOKENS=3 ./super_launch.sh
+ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
+MTP_EXTRA_ARGS=""
+if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
+    MTP_EXTRA_ARGS="\
+++policy.generation.vllm_cfg.enable_prefix_caching=false \
+++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
+++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
+++policy.generation.vllm_kwargs.mamba_cache_mode=align \
+~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes \
+++policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS} \
+++policy.generation.vllm_kwargs.speculative_config.method=mtp"
+    echo "MTP speculative decoding ENABLED (num_speculative_tokens=${NUM_SPECULATIVE_TOKENS})"
+fi
+
 # ---- Derived paths ----
 CODE_DIR=$(realpath "$PWD")
 WANDB_NAME="${EXP_NAME}"
@@ -53,7 +76,7 @@ LOG_DIR="logs/${EXP_NAME}"
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
-GYM_VENV_DIR="${GYM_VENV_DIR:-${PERSISTENT_CACHE}/gym_venvs}"
+GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
 HF_MODULES_CACHE_DIR="${HF_MODULES_CACHE:-${PERSISTENT_CACHE}/hf_modules/${EXP_NAME}}"
 UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
@@ -156,11 +179,22 @@ if [[ -n "$CONTAINER_FORMATTER" ]]; then
     COMMAND="$COMMAND env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${CONTAINER_FORMATTER}"
 fi
 
+if [[ -n "$MTP_EXTRA_ARGS" ]]; then
+    COMMAND="$COMMAND ${MTP_EXTRA_ARGS}"
+fi
+
+# Arbitrary extra Hydra overrides (space-separated), appended last so they win.
+if [[ -n "${EXTRA_HYDRA_ARGS:-}" ]]; then
+    COMMAND="$COMMAND ${EXTRA_HYDRA_ARGS}"
+fi
+
 export CONTAINER
 
 # ---- Container mounts ----
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+# Mount gym to handle swe venvs
+BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 

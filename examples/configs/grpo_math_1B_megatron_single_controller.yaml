@@ -1,0 +1,62 @@
+# SingleController variant of grpo_math_1B.yaml.
+defaults: grpo_math_1B.yaml
+
+# SC does not support validation yet.
+grpo:
+  val_period: 0
+
+async_rl:
+  sampler:
+    name: in_order
+    # How far generation may run ahead of the trainer.
+    max_lookahead_versions: 1
+  # Recompute generation KV caches after each weight update.
+  recompute_kv_cache_after_weight_updates: false
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  # Cap on in-flight generate_and_push calls in the rollout pump.
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
+  max_buffered_rollouts: 64
+  # Enable per-rollout diagnostic prints (prompt content / completion previews).
+  diagnostics: false
+
+# SC does not support checkpointing yet.
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-single-controller
+
+policy:
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    mcore_generation_config:
+      unified_memory_level: 0
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+logger:
+  wandb:
+    name: grpo-single-controller-dev
+  swanlab:
+    name: grpo-single-controller-dev
+  mlflow:
+    run_name: grpo-single-controller-dev
+
+data_plane:
+  enabled: true
+
+cluster:
+  gpus_per_node: 2
+  master_port_range_low: 25000
+  master_port_range_high: 28000

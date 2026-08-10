@@ -24,6 +24,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
+from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
@@ -298,8 +299,10 @@ def _verify_router_replay_forward_context() -> Iterator[None]:
 
     with _patch_lock:
         if _router_replay_patch_depth == 0:
-            _original_get_replay_topk = RouterReplay.get_replay_topk
+            original_get_replay_topk = RouterReplay.get_replay_topk
+            _original_get_replay_topk = original_get_replay_topk
 
+            @wraps(original_get_replay_topk)
             def wrapped_get_replay_topk(
                 replay_instance: Any,
                 scores: Any,

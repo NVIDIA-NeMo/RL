@@ -1,0 +1,37 @@
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  val_period: 0
+policy:
+  train_global_batch_size: 64
+  logprob_batch_size: 1
+  megatron_cfg:
+    use_fused_linear_logprobs: true
+    converter_type: LlamaForCausalLM
+    attention_backend: flash
+    scheduler:
+      lr_decay_iters: 500
+      lr_warmup_iters: 10
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+  generation:
+    vllm_cfg:
+      env_vars:
+        VLLM_USE_FLASHINFER_MOE_FP16: '0'
+        VLLM_USE_FLASHINFER_MOE_FP8: '0'
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-30ba3b-2n8g-megatron-fused-linear-logprobs
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen3-30ba3b-2n8g-megatron-fused-linear-logprobs
+  mlflow:
+    run_name: grpo-qwen3-30ba3b-2n8g-megatron-fused-linear-logprobs
+cluster:
+  num_nodes: 2

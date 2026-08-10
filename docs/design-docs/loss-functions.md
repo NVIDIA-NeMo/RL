@@ -30,7 +30,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 class SimpleAverageLoss(LossFunction):
     """Simple average loss function that demonstrates proper microbatch handling.
     
-    NOTE: We assume for simplicity that the losses per token are passed directly into the this loss function.
+    NOTE: We assume for simplicity that the losses per token are passed directly into this loss function.
           This is not the case in practice!
     """
 

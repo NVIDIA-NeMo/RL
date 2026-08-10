@@ -131,7 +131,7 @@ Here is a comparison of Muon vs Adam for DAPO with Qwen2.5-7B:
 The command to generate the Muon results is:
 
 ```bash
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml \
   policy.megatron_cfg.enabled=true \
   policy.dtensor_cfg.enabled=false \

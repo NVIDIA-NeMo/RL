@@ -77,6 +77,9 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -88,6 +91,7 @@ policy:
     num_layers_in_last_pipeline_stage: null
     sequence_parallel: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     optimizer:
       optimizer: "adam"

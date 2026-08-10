@@ -233,6 +233,7 @@ def setup_configs(args, tokenizer):
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -650,7 +651,7 @@ def initialize_generation_with_policy(
         worker_init_timing_metrics[init_time_key] = generation_time
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
         worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-        worker_init_timing_metrics["parallel_init_enabled"] = True
+        worker_init_timing_metrics["parallel_init_enabled"] = 1.0
     else:
         print(
             "  ⚙️  Using sequential worker initialization (colocated mode)",

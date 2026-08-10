@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-teacher cross-tokenizer off-policy distillation entrypoint."""
+"""Multi-teacher cross-tokenizer off-policy distillation entrypoint."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse CLI args; unknown args become Hydra overrides."""
     parser = argparse.ArgumentParser(
-        description="Run single-teacher cross-tokenizer off-policy distillation"
+        description="Run multi-teacher cross-tokenizer off-policy distillation"
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
@@ -66,25 +66,12 @@ def main() -> None:
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
 
-    # Scope gate: this entrypoint only handles the cross-tokenizer flavor of
-    # off-policy distillation. Same-tokenizer off-policy distillation is
-    # tracked in https://github.com/NVIDIA-NeMo/RL/issues/2545 and will get
-    # its own entrypoint (or a shared `run_off_policy_distillation.py` with
-    # a `cross_tokenizer` switch) once that lands. Until then, fail loudly
-    # if the config doesn't look cross-tokenizer rather than silently
-    # running the wrong code path.
-    policy_tok = config.policy["tokenizer"]["name"]
-    teacher_tok = config.teacher["tokenizer"]["name"]
-    proj_path = config.loss_fn.get("projection_matrix_path")
-    assert policy_tok != teacher_tok and proj_path is not None, (
-        "run_xtoken_off_policy_distillation currently supports only the "
-        "cross-tokenizer flavor (distinct policy/teacher tokenizers + a "
-        "non-null loss_fn.projection_matrix_path). Same-tokenizer "
-        "off-policy distillation is tracked in #2545. Got "
-        f"policy.tokenizer.name={policy_tok!r}, "
-        f"teacher.tokenizer.name={teacher_tok!r}, "
-        f"loss_fn.projection_matrix_path={proj_path!r}."
-    )
+    # Per-teacher same-vocab vs cross-tokenizer is determined solely by
+    # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
+    # cross-tokenizer). The consistency check (a same-vocab teacher must
+    # actually share the student's vocab) needs the real tokenizers and lives
+    # in `setup()` — comparing tokenizer *names* here is wrong, e.g.
+    # Llama-3.2-3B and Llama-3.2-1B have different names but the same vocab.
 
     print("Final config:")
     pprint.pprint(config)
@@ -98,9 +85,13 @@ def main() -> None:
 
     init_ray()
 
-    # Two tokenizers — one each for student and teacher.
+    # Student tokenizer + one tokenizer per teacher (same-tokenizer teachers
+    # included — needed for vocab sizing in setup()).
     student_tokenizer = get_tokenizer(config.policy["tokenizer"])
-    teacher_tokenizer = get_tokenizer(config.teacher["tokenizer"])
+    teacher_tokenizers = [
+        get_tokenizer(teacher.policy_config()["tokenizer"])
+        for teacher in config.teachers
+    ]
 
     # `env_configs=None` skips the env-creation block (no rollout path);
     # `setup_response_data` then handles dataset construction, the optional
@@ -113,7 +104,7 @@ def main() -> None:
 
     (
         student_policy,
-        teacher_policy,
+        teacher_policies,
         train_dataloader,
         val_dataloader,
         loss_fn,
@@ -121,19 +112,22 @@ def main() -> None:
         checkpointer,
         off_policy_distillation_state,
         master_config,
-    ) = setup(config, student_tokenizer, teacher_tokenizer, train_dataset, val_dataset)
+    ) = setup(config, student_tokenizer, teacher_tokenizers, train_dataset, val_dataset)
 
-    xtoken_off_policy_distillation_train(
-        student_policy,
-        teacher_policy,
-        train_dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        off_policy_distillation_state,
-        master_config,
-    )
+    # The checkpointer owns background async-checkpoint finalization threads;
+    # the context manager guarantees they are flushed (rename + delete) on exit.
+    with checkpointer:
+        xtoken_off_policy_distillation_train(
+            student_policy,
+            teacher_policies,
+            train_dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            off_policy_distillation_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":

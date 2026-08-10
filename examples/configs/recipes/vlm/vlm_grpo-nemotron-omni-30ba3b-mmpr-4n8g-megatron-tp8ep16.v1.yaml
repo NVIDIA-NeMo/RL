@@ -1,0 +1,65 @@
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
+grpo:
+  num_prompts_per_step: 512
+  overlong_filtering: true
+  zero_variance_prompt_filtering: false
+  deduplicate_multimodal_data: false
+loss_fn:
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_megatron
+  keep_top_k: 4
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  train_global_batch_size: 2048
+  logprob_chunk_size: 1024
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    expert_model_parallel_size: 16
+    optimizer:
+      lr: 3.0e-06
+      min_lr: 2.0e-09
+      weight_decay: 0.0
+      adam_beta2: 0.99
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      tensor_parallel_size: 2
+      load_format: auto
+      enforce_eager: false
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.75
+    vllm_kwargs:
+      max_num_batched_tokens: 32768
+      max_num_seqs: 512
+data:
+  train:
+    dataset_name: mmpr-tiny
+    download_dir: results/mmpr_tiny_processed
+    split_validation_size: 0.008
+    seed: 42
+  default:
+    prompt_file: null
+    env_name: mmpr-tiny
+env:
+  mmpr-tiny:
+    num_workers: 8
+    reward_functions:
+    - name: geo3k
+      weight: 1.0
+      kwargs:
+        format_score: 0.1
+logger:
+  wandb_enabled: true
+  wandb:
+    project: nemotron-omni-main-migration
+    name: nemotron-omni-mmpr-megatron
+cluster:
+  num_nodes: 4

@@ -13,7 +13,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 2
+  val_num_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
@@ -22,10 +22,15 @@ grpo:
   advantage_clip_low: -50
   advantage_clip_high: 50
   val_period: -1
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
   max_val_samples: null
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
 
@@ -129,6 +134,7 @@ policy:
     apply_rope_fusion: True
     bias_activation_fusion: False
     gradient_accumulation_fusion: False
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: True
     moe_per_layer_logging: True
 
@@ -184,6 +190,13 @@ policy:
 
     env_vars: null
 
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
   dynamic_batching:
     enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
@@ -206,13 +219,16 @@ policy:
   scheduler: null
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
@@ -242,6 +258,7 @@ policy:
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
+      mamba_cache_mode: align
       compilation_config:
         cudagraph_mode: PIECEWISE
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
@@ -269,12 +286,16 @@ data:
 
 env:
   should_use_nemo_gym: true
+  # true: skip expensive train_data_step*.jsonl (recommended for large Gym runs); false: write full jsonl.
+  should_log_nemo_gym_responses: true
+  # false: ignore env mask_sample flags so the loss trains on every sample.
+  should_mask_flagged_samples: true
   nemo_gym:
     uv_venv_dir: "${oc.env:PERSISTENT_CACHE}/gym_venvs"
     skip_venv_if_present: true
     num_gpu_nodes: 7
-    port_range_low: 15001
-    port_range_high: 20000
+    port_range_low: 5000
+    port_range_high: 5999
     invalid_tool_call_patterns:
       - "<tool_call>"
       - "</tool_call>"
@@ -326,6 +347,8 @@ env:
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
             VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
             data_parallel_size: 8
             tensor_parallel_size: 1
@@ -349,7 +372,13 @@ env:
           hf_home: null
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
             data_parallel_size: 2
             tensor_parallel_size: 8
             pipeline_parallel_size: 1
@@ -363,6 +392,7 @@ env:
               enable_multithread_load: true
               num_threads: 112
             compilation_config:
+              cudagraph_mode: NONE  # vllm v0.2 workaround
               cudagraph_capture_sizes: [1,2,4,8,16,32]
           debug: false
 
@@ -446,7 +476,11 @@ env:
           hf_home: null
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
             data_parallel_size: 4
             tensor_parallel_size: 8
             pipeline_parallel_size: 1
@@ -502,6 +536,7 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

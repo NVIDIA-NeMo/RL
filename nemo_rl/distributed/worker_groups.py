@@ -143,6 +143,7 @@ class RayWorkerBuilder:
             placement_group_bundle_index: int,
             num_gpus: int,
             bundle_indices: Optional[tuple] = None,
+            num_gpus_per_node: Optional[int] = None,
             **extra_options: Optional[dict[str, Any]],
         ):
             """Create a Ray worker with the specified configuration.
@@ -160,6 +161,11 @@ class RayWorkerBuilder:
                 placement_group_bundle_index: Index of the bundle in the placement group
                 num_gpus: Number of GPUs to allocate to this worker
                 bundle_indices: Tuple of (node_idx, local_bundle_indices) for tensor parallelism (if applicable)
+                num_gpus_per_node: Number of GPUs per node in the cluster. Passed to
+                    configure_worker so it can map a bundle id to a node-local index,
+                    for example when assigning ports to model-parallel engines that
+                    span more than one node. None when the caller does not supply
+                    cluster topology.
                 extra_options: Additional options to pass to the Ray actor (may be overridden by actor's configure_worker(...) method)
 
             Returns:
@@ -181,6 +187,7 @@ class RayWorkerBuilder:
                     worker_class.configure_worker(
                         num_gpus=num_gpus,
                         bundle_indices=bundle_indices,
+                        num_gpus_per_node=num_gpus_per_node,
                     )
                 )
 
@@ -474,15 +481,16 @@ class RayWorkerGroup:
         placement_groups = self.cluster.get_placement_groups()
 
         # Get available address and port for each worker
-        available_addresses = []
-        available_ports = []
-        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
-            for local_rank, bundle_idx in enumerate(local_bundle_indices):
-                addr, port = self.cluster.get_available_address_and_port(
-                    pg_idx, bundle_idx
-                )
-                available_addresses.append(addr)
-                available_ports.append(port)
+        pg_bundle_pairs = [
+            (pg_idx, bundle_idx)
+            for pg_idx, local_bundle_indices in bundle_indices_list
+            for bundle_idx in local_bundle_indices
+        ]
+        addr_port_results = self.cluster.get_available_addresses_and_ports_batch(
+            pg_bundle_pairs
+        )
+        available_addresses = [addr for addr, _ in addr_port_results]
+        available_ports = [port for _, port in addr_port_results]
 
         # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
         # per worker. All workers on a node share the same py_executable, so
@@ -580,6 +588,7 @@ class RayWorkerGroup:
                     bundle_idx,
                     num_gpus,
                     worker_bundle_indices,
+                    num_gpus_per_node=self.cluster.num_gpus_per_node,
                     **extra_options,
                 )
 

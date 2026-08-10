@@ -118,9 +118,10 @@ class TestTopoRankValues:
     """Ray stores resource values as floats; int(float) must round-trip correctly."""
 
     def test_slurm_procid_value_as_float(self):
-        # SLURM_PROCID fallback: $(( 10#7 )) -> TOPO_RANK=7, stored as 7.0 by Ray
-        topo_rank = int(7.0)
-        assert topo_rank == 7
+        # SLURM_PROCID fallback (worker): $(( 10#7 + 2 )) -> TOPO_RANK=9, stored as 9.0 by Ray
+        # (head node is pinned to TOPO_RANK=1)
+        topo_rank = int(9.0)
+        assert topo_rank == 9
 
     def test_hostname_digits_value_as_float(self):
         # hostname node007 -> $(( 10#007 )) -> 7, stored as 7.0 by Ray
@@ -133,15 +134,15 @@ class TestTopoRankValues:
         assert topo_rank == 20000000015
 
     def test_sorting_with_slurm_procid_ranks(self):
-        # Nodes labelled by SLURM_PROCID (0..7) across two domains
+        # Nodes labelled by SLURM_PROCID (1..8) across two domains
         bundle_data = _make_bundle_data(
             {
-                "nvlink_domain_A": [4, 5, 6, 7],  # higher SLURM_PROCID
-                "nvlink_domain_B": [0, 1, 2, 3],  # lower SLURM_PROCID
+                "nvlink_domain_A": [5, 6, 7, 8],  # higher TOPO_RANK
+                "nvlink_domain_B": [1, 2, 3, 4],  # lower TOPO_RANK
             }
         )
         result = _sort_bundle_indices_by_topology(bundle_data)
-        # Domain B min rank=0 < domain A min rank=4 → B comes first
+        # Domain B min rank=1 < domain A min rank=5 → B comes first
         node_ids = [bundle_data[i][3] for i in result]
         # First 4 nodes should all be from domain B (nodes 4..7 in bundle_data list)
         for node_id in node_ids[:4]:
@@ -322,6 +323,35 @@ class TestSelectSegmentNodes:
         selected, remaining = select_segment_nodes(topo, segment_size=8, num_nodes=24)
         assert set(selected) | set(remaining) == set(topo.keys())
         assert len(set(selected) & set(remaining)) == 0  # no overlap
+
+    def test_unknown_domain_nodes_excluded_from_selection(self):
+        # Regression: nodes with no NVLink-domain info (UNKNOWN, topo_rank -1)
+        # must never be selected. They sort first (rank -1), so a naive selection
+        # would pick them and emit a {"unknown": 0.001} placement-group constraint
+        # that ray.sub never registers as a resource -> unschedulable bundle.
+        # This happens on heterogeneous / partial-probe clusters (e.g. a GPU-less
+        # or unprobed head node).
+        topo = _make_topology(
+            {
+                NVLINK_DOMAIN_UNKNOWN: [TOPO_RANK_UNKNOWN, TOPO_RANK_UNKNOWN],
+                "domain_A": [0, 1],
+                "domain_B": [2, 3],
+            }
+        )
+        selected, remaining = select_segment_nodes(topo, segment_size=2, num_nodes=4)
+        selected_domains = {topo[n][0] for n in selected}
+        assert NVLINK_DOMAIN_UNKNOWN not in selected_domains
+        assert selected_domains == {"domain_A", "domain_B"}
+        # The unknown nodes (e.g. a GPU-less head) fall through to remaining.
+        assert {topo[n][0] for n in remaining} == {NVLINK_DOMAIN_UNKNOWN}
+        assert set(selected) | set(remaining) == set(topo.keys())
+
+    def test_unknown_domain_only_raises_instead_of_unschedulable_pg(self):
+        # If every node is UNKNOWN there is no real domain to pin to, so we must
+        # raise rather than emit an unschedulable {"unknown": ...} constraint.
+        topo = _make_topology({NVLINK_DOMAIN_UNKNOWN: [TOPO_RANK_UNKNOWN] * 4})
+        with pytest.raises(ResourceInsufficientError, match="Cannot form"):
+            select_segment_nodes(topo, segment_size=2, num_nodes=4)
 
 
 # ---------------------------------------------------------------------------

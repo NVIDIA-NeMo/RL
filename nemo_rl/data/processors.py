@@ -461,8 +461,10 @@ def vlm_hf_data_processor(
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
         get_dim_to_pack_along,
+        get_multimodal_default_settings_from_processor,
         get_multimodal_keys_from_processor,
         resolve_to_image,
+        uses_image_placeholder,
     )
 
     # depending on the task, format the data differently
@@ -484,6 +486,10 @@ def vlm_hf_data_processor(
         pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
     elif datum_dict["task_name"] == "mmau":
         pass  # MMAU data is already formatted by MMAUDataset.format_data
+    elif datum_dict["task_name"] == "daily-omni":
+        pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
+    elif datum_dict["task_name"] in ("intent-train", "intent-bench"):
+        pass  # IntentDataset.format_data already produces the message structure
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
@@ -499,6 +505,8 @@ def vlm_hf_data_processor(
     #
     images = []
     audios = []
+    videos = []
+    load_video_kwargs: dict[str, Any] = {}
     if isinstance(problem, list):
         for content in problem:
             # for image, video, audio, just append it
@@ -521,6 +529,21 @@ def vlm_hf_data_processor(
                 audios.append(
                     (content["audio"], processor.feature_extractor.sampling_rate)
                 )
+            elif content["type"] == "video":
+                from transformers.video_utils import load_video
+
+                if not load_video_kwargs:
+                    load_video_kwargs = get_multimodal_default_settings_from_processor(
+                        processor
+                    ).get("video", {})
+                video_value = content["video"]
+                if isinstance(video_value, str):
+                    video_value = load_video(
+                        video_value, backend="torchcodec", **load_video_kwargs
+                    )[0]
+                # Replace path with loaded frames so apply_chat_template can consume it
+                user_message["content"].append({"type": "video", "video": video_value})
+                videos.append(video_value)
             else:
                 raise ValueError(f"Unsupported content type: {content['type']}")
     else:
@@ -533,13 +556,9 @@ def vlm_hf_data_processor(
     # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
     # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
     # so we must use processor(text=..., images=...) directly.
-    _PLACEHOLDER_STYLE_PROCESSORS = (
-        "NemotronNanoVLV2Processor",
-        "NemotronH_Nano_Omni_Reasoning_V3Processor",
-    )
-    _uses_image_placeholder = type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSORS
+    uses_placeholder = uses_image_placeholder(processor)
 
-    if _uses_image_placeholder and images:
+    if uses_placeholder and images:
         # Convert content list to <image> placeholder text format
         image_token = getattr(processor, "image_token", "<image>")
         text_parts = []
@@ -560,27 +579,25 @@ def vlm_hf_data_processor(
     else:
         user_message_for_chat_template = user_message_for_tokenize
 
-    # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
         [user_message_for_chat_template],
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    # this is the id-tokenized and image processed conversation template for the policy
-    if _uses_image_placeholder and images:
+    if uses_placeholder and images:
         # Dynamic-resolution path: keep pixel_values in float32 to match vLLM's
         # DynamicResolutionImageTiler bit-for-bit. vLLM stores/normalizes in
         # float32 and only casts at the vision_model boundary; matching that
         # rounding order tightens rollout/train logprob agreement. The model
         # forward dispatches on imgs_sizes and handles the bf16 cast.
-        message: dict = processor(
+        message = processor(
             text=string_formatted_dialog,
             images=images,
             return_tensors="pt",
         )
     else:
-        message: dict = processor.apply_chat_template(
+        message = processor.apply_chat_template(
             [user_message_for_tokenize],
             tokenize=True,
             add_generation_prompt=True,
@@ -592,15 +609,39 @@ def vlm_hf_data_processor(
     user_message["token_ids"] = message["input_ids"][0]
     # add all keys and values to the user message, and the list of keys
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # imgs_sizes is not declared in model_input_names by the NemotronOmni
-    # checkpoint's bundled image_processor, so append it explicitly when
-    # present. It packs along dim=0 (per-image).
+    # Current Nemotron Omni processors emit imgs_sizes. Historical MMPR
+    # checkpoints instead emit a batch of fixed-size image tiles and only
+    # declare pixel_values. Treat each tile as one dynamic-resolution image so
+    # the Nemotron Omni path can patchify it and preserve the processor's exact
+    # placeholder count.
+    if (
+        uses_placeholder
+        and "pixel_values" in message
+        and "imgs_sizes" not in message
+        and message["pixel_values"].ndim == 4
+    ):
+        pixel_values = message["pixel_values"]
+        num_tiles, _, height, width = pixel_values.shape
+        message["imgs_sizes"] = torch.tensor(
+            [[height, width]] * num_tiles, dtype=torch.long
+        )
+
+    # imgs_sizes is not always declared in model_input_names by bundled image
+    # processors, so append it explicitly when present. RADIO uses temporal
+    # patching even for still images and requires one num_frames=1 entry per
+    # image/tile.
     if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
         multimodal_keys.append("imgs_sizes")
+    if "imgs_sizes" in message and "num_frames" not in message:
+        message["num_frames"] = torch.ones(len(message["imgs_sizes"]), dtype=torch.long)
+    if "num_frames" in message and "num_frames" not in multimodal_keys:
+        multimodal_keys.append("num_frames")
     for key in multimodal_keys:
         if key in message:
             user_message[key] = PackedTensor(
-                message[key], dim_to_pack=get_dim_to_pack_along(processor, key)
+                message[key],
+                dim_to_pack=get_dim_to_pack_along(processor, key),
+                pad_to_max_shape=uses_placeholder and key == "pixel_values",
             )
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
@@ -622,6 +663,7 @@ def vlm_hf_data_processor(
             "vllm_content": None,
             "vllm_images": [],
             "vllm_audios": [],
+            "vllm_videos": [],
         }
 
         # make smaller and mask out
@@ -639,6 +681,7 @@ def vlm_hf_data_processor(
             "vllm_content": string_formatted_dialog,
             "vllm_images": images,
             "vllm_audios": audios,
+            "vllm_videos": videos,
         }
 
     output: DatumSpec = {
@@ -813,7 +856,12 @@ def nemo_gym_data_processor(
     max_seq_length: int | None,
     idx: int,
 ) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym.
+
+    NeMo-Gym builds the real cumulative prompt server-side. Both LLM and VLM
+    rows therefore use a placeholder here; VLM inputs are processed once after
+    the complete rollout has been collected.
+    """
     output: DatumSpec = {
         # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
         "extra_env_info": json.loads(datum_dict["extra_env_info"]),

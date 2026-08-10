@@ -1,6 +1,6 @@
-# Contributing To Nemo-RL
+# Contributing To NeMo RL
 
-Thanks for your interest in contributing to Nemo-RL!
+Thanks for your interest in contributing to NeMo RL!
 
 ## Setting Up
 
@@ -168,7 +168,7 @@ This ensures that all significant changes are well-thought-out and properly docu
 1. **User Adoption**: Helps users understand how to effectively use the library's features in their projects
 2. **Developer Extensibility**: Enables developers to understand the internal architecture and implementation details, making it easier to modify, extend, or adapt the code for their specific use cases
 
-Quality documentation is essential for both the usability of Nemo-RL and its ability to be customized by the community.
+Quality documentation is essential for both the usability of NeMo RL and its ability to be customized by the community.
 
 ## Code Quality
 

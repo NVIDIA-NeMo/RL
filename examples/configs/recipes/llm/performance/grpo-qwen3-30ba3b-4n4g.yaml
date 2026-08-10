@@ -2,11 +2,14 @@ defaults: ../../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
+loss_fn:
+  force_on_policy_ratio: true
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g
 policy:
   model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 2048
   train_micro_batch_size: 1
   logprob_batch_size: 2
   max_total_sequence_length: 4096
@@ -50,4 +53,4 @@ logger:
 cluster:
   gpus_per_node: 4
   num_nodes: 4
-
+  segment_size: 4

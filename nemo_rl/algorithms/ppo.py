@@ -15,10 +15,10 @@ import gc
 import os
 import time
 import warnings
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
+import ray
 import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -31,9 +31,9 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
-    _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
     refit_policy_generation,
     scale_rewards,
@@ -58,26 +58,41 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    TOPO_RANK_UNKNOWN,
+    ClusterConfig,
+    RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_vllm_refit_config,
+)
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
+from nemo_rl.utils.logger import (
+    Logger,
+    LoggerConfig,
+    print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
+)
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -139,6 +154,9 @@ class PPOConfig(TypedDict):
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: NotRequired[int]
+    # Nullable sequence-level multiplicative probability-error threshold.
+    # None logs metrics without masking; values above the threshold are excluded.
+    seq_logprob_error_threshold: float | None
 
 
 class PPOSaveState(TypedDict):
@@ -161,6 +179,30 @@ def _default_ppo_save_state() -> PPOSaveState:
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _apply_ppo_seq_logprob_error_masking(
+    train_data: BatchedDataDict,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: float | None,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Apply optional mismatch masking and return the advantage mask and metrics."""
+    metrics = compute_and_apply_seq_logprob_error_masking(
+        train_data=train_data,
+        rewards=rewards,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
+    )
+    metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
+
+    advantage_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+    if not advantage_mask.bool().any():
+        raise RuntimeError(
+            "PPO has no valid response tokens after filtering. Check overlong "
+            "filtering and ppo.seq_logprob_error_threshold to avoid an optimizer "
+            "step with an empty batch."
+        )
+
+    return advantage_mask, metrics
 
 
 class PPOLoggerConfig(LoggerConfig):
@@ -229,20 +271,69 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    if generation_config["backend"] == "vllm":
+        vllm_config = cast(VllmConfig, generation_config)
+        normalize_vllm_refit_config(vllm_config)
+        refit_transport = vllm_config.get("refit_transport")
+        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError(
+                "Remote sparse refit is currently supported only by GRPO; PPO "
+                "support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
+        if refit_transport is not None:
+            raise ValueError(
+                f"policy.generation.refit_transport={refit_transport!r} is not yet "
+                "supported by PPO (colocated or non-colocated); PPO refits over the "
+                "default collective path. Set policy.generation.refit_transport=null. "
+                "Tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
 
-    # Value model on Megatron does not yet support sequence packing or context
-    # parallelism in the training-path forward. Reject up front rather than
-    # crashing inside a Megatron forward.
-    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2687.
-    if value_config.get("megatron_cfg", {}).get("enabled", False):
-        assert not value_config["sequence_packing"]["enabled"], (
-            "Sequence packing is currently not supported for the Megatron PPO "
-            "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
+
+        # Policy optimizer state first appears after critic warmup, so a cached
+        # checkpoint layout cannot represent both the warmup and training states.
+        assert not (
+            ppo_config["policy_training_start_step"] > 0
+            and master_config.checkpointing["enabled"]
+            and master_config.checkpointing["save_optimizer"]
+            and "checkpoint" in policy_megatron_config
+            and policy_megatron_config["checkpoint"].get(
+                "ckpt_assume_constant_structure"
+            )
+        ), (
+            "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
+            "is incompatible with PPO critic warmup when optimizer checkpointing "
+            "is enabled. Set ckpt_assume_constant_structure=false, "
+            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
         )
-        assert value_config["megatron_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the "
-            "Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
+
+    if value_config["megatron_cfg"]["enabled"]:
+        # Context parallelism for the Megatron value model requires sequence packing,
+        # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
+        if value_config["megatron_cfg"]["context_parallel_size"] > 1:
+            assert value_config["sequence_packing"]["enabled"], (
+                "Context parallelism (CP>1) for the Megatron PPO value model requires "
+                "value.sequence_packing.enabled=true."
+            )
+    else:
+        # DTensor PPO value model currently doesn't support sequence packing and CP.
+        assert value_config["dtensor_cfg"]["enabled"], (
+            "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
+            "must be true for the PPO value model."
+        )
+        assert value_config["sequence_packing"]["enabled"] is False, (
+            "Sequence packing is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
+        )
+        assert value_config["dtensor_cfg"]["context_parallel_size"] == 1, (
+            "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
+        )
+        assert value_config["dynamic_batching"]["enabled"] is False, (
+            "Dynamic batching currently has some issue for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
         )
 
     # Set seed for all random number generators
@@ -337,14 +428,16 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    assert colocated_inference, (
-        "PPO currently requires colocated generation (vLLM / SGLang sharing GPUs "
-        "with the policy worker). Set policy.generation.colocated.enabled=true. "
-        "Non-colocated PPO is not yet supported."
-    )
-    reward_model_enabled = (
-        "env_name" in data_config and data_config["env_name"] == "reward_model"
-    )
+    backend = generation_config["backend"]
+    if not colocated_inference and backend != "vllm":
+        raise NotImplementedError(
+            "Non-colocated PPO generation currently supports only vLLM; "
+            f"got backend={backend!r}. SGLang does not yet implement the "
+            "cross-cluster collective weight update path."
+        )
+
+    reward_model_enabled = "reward_model" in extract_necessary_env_names(data_config)
+    segment_size = cluster_config.get("segment_size")
 
     total_nodes = cluster_config["num_nodes"]
     if reward_model_enabled:
@@ -364,62 +457,216 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if total_nodes == 1:
-        policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
-        assert policy_gpus_per_node > 0, (
-            "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-            "when cluster.num_nodes = 1, "
-            f"but got {policy_gpus_per_node}."
+    if colocated_inference:
+        if total_nodes == 1:
+            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            assert policy_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                "when cluster.num_nodes = 1, "
+                f"but got {policy_gpus_per_node}."
+            )
+        else:
+            policy_gpus_per_node = cluster_config["gpus_per_node"]
+
+        cluster = RayVirtualCluster(
+            name="ppo_policy_cluster",
+            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=policy_gpus_per_node,
+            max_colocated_worker_groups=1 if backend == "megatron" else 3,
+        )
+        train_cluster = cluster
+        inference_cluster = cluster
+        print(
+            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
+            flush=True,
         )
     else:
-        policy_gpus_per_node = cluster_config["gpus_per_node"]
+        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_nodes = policy_nodes
 
-    cluster = RayVirtualCluster(
-        name="grpo_policy_cluster",
-        bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
-        use_gpus=True,
-        num_gpus_per_node=policy_gpus_per_node,
-        max_colocated_worker_groups=1
-        if generation_config["backend"] == "megatron"
-        else 3,
-    )
-    train_cluster = cluster
-    inference_cluster = cluster
-    print(
-        f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
-        flush=True,
-    )
+        inference_resources = generation_config["colocated"]["resources"]
+        inference_gpus_per_node = inference_resources["gpus_per_node"]
+        inference_nodes = inference_resources["num_nodes"]
+        shared_node_inference = policy_nodes == 1
+
+        if shared_node_inference:
+            assert (
+                inference_gpus_per_node is not None and inference_gpus_per_node > 0
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
+                "when policy_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
+            )
+            assert inference_nodes is None or inference_nodes == 1, (
+                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
+                "when policy_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+
+            inference_nodes = 1
+            reward_gpus_to_subtract = rm_gpus_per_node if total_nodes == 1 else 0
+            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
+            assert train_gpus_per_node > 0, (
+                "Not enough GPUs for PPO training after reserving non-colocated "
+                "generation resources: "
+                f"train_gpus_per_node={train_gpus_per_node}, "
+                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}, "
+                f"inference_gpus_per_node={inference_gpus_per_node}, "
+                f"reward_gpus_per_node={reward_gpus_to_subtract}."
+            )
+        else:
+            assert inference_nodes is not None and inference_nodes > 0, (
+                "policy.generation.colocated.resources.num_nodes must be > 0 "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            assert (
+                inference_gpus_per_node is not None
+                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, "
+                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+            )
+            train_nodes -= inference_nodes
+
+        assert train_nodes > 0 and inference_nodes > 0, (
+            "Non-colocated PPO requires both training and inference resources, "
+            f"but got train_nodes={train_nodes}, inference_nodes={inference_nodes}."
+        )
+        assert inference_gpus_per_node is not None
+
+        node_resource_constraints = None
+        inference_node_resource_constraints = None
+        inference_segment_size = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            num_alive_nodes = len(topology)
+            required_nodes = (
+                train_nodes if shared_node_inference else train_nodes + inference_nodes
+            )
+            assert num_alive_nodes >= required_nodes, (
+                "Not enough alive Ray nodes for all PPO roles: "
+                f"need {required_nodes} "
+                f"(train={train_nodes}, inference={inference_nodes}, "
+                f"shared_node={shared_node_inference}), "
+                f"but only {num_alive_nodes} alive nodes found"
+            )
+            node_resource_constraints, remaining_node_ids, topology = (
+                prepare_segment_topology(
+                    segment_size,
+                    train_nodes,
+                    topology=topology,
+                    role="training",
+                )
+            )
+            if node_resource_constraints is not None:
+                training_node_ids = set(topology) - set(remaining_node_ids)
+                nodes_missing_topo_rank = [
+                    nid
+                    for nid in training_node_ids
+                    if topology[nid][1] == TOPO_RANK_UNKNOWN
+                ]
+                if nodes_missing_topo_rank:
+                    print(
+                        f"  ⚠ {len(nodes_missing_topo_rank)} selected training nodes have NVLink domain "
+                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
+                        flush=True,
+                    )
+
+                if generation_config["backend"] == "vllm":
+                    vllm_cfg = generation_config.get("vllm_cfg", {})
+                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                        "pipeline_parallel_size", 1
+                    )
+                elif generation_config["backend"] == "trtllm":
+                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
+                    gpus_per_instance = trtllm_cfg[
+                        "tensor_parallel_size"
+                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                else:
+                    sglang_cfg = generation_config.get("sglang_cfg", {})
+                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                nodes_per_instance = (
+                    gpus_per_instance + inference_gpus_per_node - 1
+                ) // inference_gpus_per_node
+                if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                    remaining_topology = {
+                        node_id: topology[node_id] for node_id in remaining_node_ids
+                    }
+                    (
+                        inference_node_resource_constraints,
+                        _,
+                        _,
+                    ) = prepare_segment_topology(
+                        nodes_per_instance,
+                        inference_nodes,
+                        topology=remaining_topology,
+                        role="inference",
+                    )
+                    inference_segment_size = nodes_per_instance
+                elif nodes_per_instance > 1:
+                    print(
+                        f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                        f"nodes_per_instance={nodes_per_instance}; skipping inference "
+                        "topology constraints",
+                        flush=True,
+                    )
+
+        train_cluster = RayVirtualCluster(
+            name="ppo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=2,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
+        )
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
+
+        inference_cluster = RayVirtualCluster(
+            name="ppo_inference_cluster",
+            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+            use_gpus=True,
+            num_gpus_per_node=inference_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
+        )
+        if inference_node_resource_constraints is not None:
+            VllmGeneration.init_cluster_placement_groups(
+                inference_cluster, generation_config
+            )
+
+        print(
+            "  ✓ Separate PPO clusters initialized: "
+            f"train={train_nodes}x{train_gpus_per_node} GPUs for policy/value, "
+            f"inference={inference_nodes}x{inference_gpus_per_node} GPUs for vLLM",
+            flush=True,
+        )
 
     # ==========================
     #   Training and Inference
     # ==========================
     print("\n▶ Setting up model and training...", flush=True)
 
-    # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
-    backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    # Prepare checkpoint paths.  During critic warmup the policy is not saved,
-    # so the directory may not exist even when resuming from a valid checkpoint.
-    if last_checkpoint_path:
-        _policy_weights = Path(last_checkpoint_path) / "policy" / "weights"
-        _policy_optim = Path(last_checkpoint_path) / "policy" / "optimizer"
-        weights_path = _policy_weights if _policy_weights.exists() else None
-        optimizer_path = _policy_optim if _policy_optim.exists() else None
-        if weights_path is None:
-            print(
-                f"  ⚠ Policy weights not found in checkpoint {last_checkpoint_path} "
-                f"(likely saved during critic warmup). Using base model weights.",
-                flush=True,
-            )
-        else:
-            print(f"  ✓ Resuming policy from checkpoint: {weights_path}", flush=True)
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+        last_checkpoint_path,
+        model_component="value",
+    )
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call (matching upstream main's per-rollout
@@ -466,31 +713,6 @@ def setup(
     def init_value():
         """Initialize value model training workers."""
         t0 = time.perf_counter()
-        # Prepare checkpoint paths for value model. Mirror the policy's
-        # .exists() probe (see weights_path/optimizer_path resolution above):
-        # the previous run may not have had a value model, so the value sub-
-        # directory of last_checkpoint_path may be missing.
-        if last_checkpoint_path:
-            _value_weights = Path(last_checkpoint_path) / "value" / "weights"
-            _value_optim = Path(last_checkpoint_path) / "value" / "optimizer"
-            value_weights_path = _value_weights if _value_weights.exists() else None
-            value_optimizer_path = _value_optim if _value_optim.exists() else None
-            if value_weights_path is None:
-                print(
-                    f"  ⚠ Value weights not found in checkpoint {last_checkpoint_path} "
-                    f"(likely the previous run didn't have a value model). "
-                    f"Initializing value model from base weights.",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"  ✓ Resuming value from checkpoint: {value_weights_path}",
-                    flush=True,
-                )
-        else:
-            value_weights_path = None
-            value_optimizer_path = None
-
         v = Value(
             cluster=train_cluster,
             config=value_config,
@@ -534,12 +756,12 @@ def setup(
             worker_init_timing_metrics: Dictionary to store timing metrics
 
         Returns:
-            Tuple of (policy_generation, policy)
+            Tuple of (policy_generation, policy, value_model)
         """
-        # Initialize generation engine first so it claims its GPU memory
-        # before policy/value workers are constructed; then policy, then value.
-        print("  ⚙️  Initializing workers (colocated mode)", flush=True)
+        mode = "colocated" if colocated_inference else "non-colocated"
+        print(f"  ⚙️  Initializing workers ({mode} mode)", flush=True)
 
+        # Policy and value initialize serially because they share training GPUs.
         policy_generation, generation_time = init_generation_fn()
         worker_init_timing_metrics[init_time_key] = generation_time
 
@@ -547,7 +769,7 @@ def setup(
         # Block until the policy worker's __init__ completes and offload to
         # CPU, freeing GPU for value model initialization. Policy will be
         # reloaded before the vLLM refit step below.
-        policy.offload_after_refit()
+        policy.offload_to_cpu()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
         print("  ⚙️  Initializing value model for GAE...", flush=True)
@@ -636,6 +858,26 @@ def setup(
     # Reload policy weights to GPU before refit (they may have been offloaded
     # during setup to free GPU for value model initialization).
     policy.prepare_for_training()
+
+    if not colocated_inference:
+        assert policy_generation is not None
+        t0 = time.perf_counter()
+        ip, port = train_cluster.get_master_address_and_port()
+        print(
+            f"Using ip: {ip}, port: {port} for collective communication",
+            flush=True,
+        )
+        train_world_size = train_cluster.world_size()
+        world_size = train_world_size + inference_cluster.world_size()
+
+        futures_train = policy.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        futures_inference = policy_generation.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )  # type: ignore[call-arg]
+        ray.get(futures_train + futures_inference)
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -944,6 +1186,11 @@ def ppo_train(
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
+            if not colocated_inference:
+                # Colocated refit offloads policy inside
+                # `refit_policy_generation`. Do it here so the value
+                # model can reuse the training GPUs.
+                policy.offload_to_cpu()
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -959,6 +1206,8 @@ def ppo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -1035,10 +1284,16 @@ def ppo_train(
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        if not colocated_inference:
+                            # Colocated refit offloads policy inside
+                            # `refit_policy_generation`. Do it here so the value
+                            # model can reuse the training GPUs.
+                            with timer.time("policy_offload_after_refit"):
+                                policy.offload_to_cpu()
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()
+                            policy.offload_to_cpu()
                         policy_generation.prepare_for_generation()
 
                 with timer.time("generation"):
@@ -1047,13 +1302,17 @@ def ppo_train(
 
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                wandb_enabled=master_config.logger["wandb_enabled"],
+                                wandb_config=master_config.logger["wandb"],
+                            ),
                             max_rollout_turns=None,
                             greedy=False,
                         )
@@ -1061,11 +1320,6 @@ def ppo_train(
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
-
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
 
                     elif _should_use_async_rollouts(master_config):
                         (
@@ -1105,9 +1359,10 @@ def ppo_train(
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.ppo["reward_scaling"]
                 )
-                if master_config.ppo["reward_shaping"]["enabled"]:
+                reward_shaping_config = master_config.ppo["reward_shaping"]
+                if reward_shaping_config.enabled:
                     repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config.ppo["reward_shaping"]
+                        repeated_batch, reward_shaping_config
                     )
 
                 # Process rewards and build training data
@@ -1214,6 +1469,17 @@ def ppo_train(
 
                     policy.finish_inference()
 
+                (
+                    advantage_mask,
+                    seq_logprob_error_metrics,
+                ) = _apply_ppo_seq_logprob_error_masking(
+                    train_data=train_data,
+                    rewards=rewards,
+                    seq_logprob_error_threshold=master_config.ppo[
+                        "seq_logprob_error_threshold"
+                    ],
+                )
+
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
                 # Use the token-length-based extractor so multi-turn prompts containing
                 # assistant messages still resolve to the original prompt only.
@@ -1234,7 +1500,7 @@ def ppo_train(
                     adv_kwargs = dict(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
-                        mask=train_data["token_mask"],
+                        mask=advantage_mask,
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
                     )
@@ -1297,7 +1563,7 @@ def ppo_train(
                                 timer=timer,
                             )
                             if step < ppo_epochs - 1:
-                                policy.offload_after_refit()
+                                policy.offload_to_cpu()
 
                     if train_results is not None:
                         print(
@@ -1337,10 +1603,16 @@ def ppo_train(
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        if not colocated_inference:
+                            # Colocated refit offloads policy inside
+                            # `refit_policy_generation`. Do it here so the value
+                            # model can reuse the training GPUs.
+                            with timer.time("policy_offload_after_refit"):
+                                policy.offload_to_cpu()
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()
+                            policy.offload_to_cpu()
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
@@ -1361,11 +1633,10 @@ def ppo_train(
 
                 # Metrics
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
                 del flat_messages
 
                 response_advantages = torch.masked_select(
-                    flat_advantages, flat_token_mask.bool()
+                    flat_advantages, advantage_mask.bool()
                 )
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
@@ -1474,6 +1745,7 @@ def ppo_train(
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
+                metrics.update(seq_logprob_error_metrics)
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += metrics["global_valid_toks"]
 
@@ -1485,6 +1757,10 @@ def ppo_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
@@ -1538,49 +1814,44 @@ def ppo_train(
                             total_steps + 1, ppo_save_state, master_config
                         )
 
-                        # Save policy FIRST, then value.  This ordering
-                        # matters: the resume path uses the presence of
-                        # policy/weights to decide whether the policy was
-                        # trained.  By saving policy first we guarantee that
-                        # if any policy dir exists in a finalized checkpoint
-                        # (tmp→step rename is atomic), its contents are
-                        # complete.  During critic warmup the policy optimizer
-                        # has no state yet (master_param not initialized), so
-                        # we skip it entirely — the resume path will fall back
-                        # to the base model weights.
-                        if total_steps >= policy_training_start_step:
-                            policy.prepare_for_training()
-                            policy.save_checkpoint(
-                                weights_path=os.path.join(
-                                    checkpoint_path, "policy", "weights"
-                                ),
-                                optimizer_path=os.path.join(
-                                    checkpoint_path, "policy", "optimizer"
-                                ),
-                                tokenizer_path=os.path.join(
-                                    checkpoint_path, "policy", "tokenizer"
-                                ),
-                                checkpointing_cfg=master_config.checkpointing,
-                            )
-                            policy.offload_after_refit()
-                        else:
-                            print(
-                                f"Skipping policy checkpoint (critic warmup: "
-                                f"step {total_steps} < {policy_training_start_step})",
-                                flush=True,
-                            )
+                        # Always save policy weights so every PPO checkpoint has
+                        # the same component layout. Before the first real policy
+                        # update, omit optimizer and scheduler state because their
+                        # lazily initialized state is not yet safe to checkpoint.
+                        policy.prepare_for_training()
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "policy", "optimizer")
+                                if (
+                                    checkpointer.save_optimizer
+                                    and total_steps >= policy_training_start_step
+                                )
+                                else None
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config.checkpointing,
+                        )
+                        policy.offload_to_cpu()
 
                         value_model.prepare_for_training()
                         value_model.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "value", "weights"
                             ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "value", "optimizer"
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "value", "optimizer")
+                                if checkpointer.save_optimizer
+                                else None
                             ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         value_model.finish_training()
 
@@ -1588,7 +1859,13 @@ def ppo_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # The value worker finalizes its own write synchronously
+                        # (blocking=True) inside save_checkpoint, so only the
+                        # policy's async write needs to be awaited before rename.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             # Logging
             memory_tracker.snapshot_start_of_stage("Logging", dir())
@@ -1602,6 +1879,7 @@ def ppo_train(
             print("\n📊 Training Results:")
             if train_results is not None:
                 print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
+                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
             if value_results is not None:
                 print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
                 print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
@@ -1670,10 +1948,12 @@ def ppo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -1683,6 +1963,13 @@ def ppo_train(
 
         current_epoch += 1
         current_step = 0
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(

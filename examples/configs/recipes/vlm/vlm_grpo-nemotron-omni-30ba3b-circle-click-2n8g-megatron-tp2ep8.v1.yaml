@@ -1,0 +1,160 @@
+defaults: ../../vlm_grpo_3B_megatron.yaml
+grpo:
+  num_prompts_per_step: 1
+  num_val_generations_per_prompt: 1
+  max_num_steps: 100
+  val_period: 500
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: null
+  seq_logprob_error_threshold: 2
+loss_fn:
+  reference_policy_kl_penalty: 0
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nemotron-omni-30ba3b-gymv-circle-click
+  metric_name: val:total_reward/mean
+  keep_top_k: 1000000
+  checkpoint_must_save_by: 00:03:40:00
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 2048
+  megatron_cfg:
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.001
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    optimizer:
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      weight_decay: 0.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: 3.0e-07
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+      average_in_collective: false
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: 32
+  optimizer: null
+  scheduler: null
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    bad_words: []
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      activation_checkpointing: false
+      mamba_inference_ssm_states_dtype: float32
+      inference_moe_token_dispatcher_type: nccl
+      inference_grouped_gemm_backend: vllm
+      moe_router_num_groups: null
+      moe_router_group_topk: null
+      pipeline_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: true
+      context_parallel_size: 1
+      tensor_model_parallel_size: 2
+      buffer_size_gb: 20
+      num_cuda_graphs: -1
+      max_tokens: ${policy.max_total_sequence_length}
+      async_engine: true
+      expose_http_server: true
+      enable_prefix_caching: true
+      parsers:
+      - deepseek-r1-reasoning
+      - qwen3-coder-tool
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 8
+      enforce_eager: true
+      enable_prefix_caching: false
+      expose_http_server: true
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        chat_template_content_format: string
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 1
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: float32
+      compilation_config:
+        backend: eager
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+data:
+  max_input_seq_length: null
+  shuffle: false
+  train:
+    data_path: /path/to/train_dataset.jsonl
+  validation:
+    data_path: /path/to/eval_dataset.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    is_trajectory_collection: false
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/circle_click/configs/circle_click.yaml
+    circle_click_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+logger:
+  log_dir: logs/grpo-nemotron-omni-30ba3b-gymv-circle-click
+  wandb_enabled: true
+  wandb:
+    project: grpo-nemotron-omni-gymv
+    name: grpo-nemotron-omni-30ba3b-gymv-circle-click
+  mlflow:
+    experiment_name: grpo-nemotron-omni-gymv
+    run_name: grpo-nemotron-omni-30ba3b-gymv-circle-click
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

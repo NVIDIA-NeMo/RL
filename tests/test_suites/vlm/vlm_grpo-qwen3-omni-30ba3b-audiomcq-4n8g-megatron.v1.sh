@@ -15,6 +15,10 @@ NUM_MINUTES=60
 
 exit_if_max_steps_reached
 
+# PyTorch alters behaviour (disabling certain optimizations) when CI=true.
+# Unset it here so the training environment is identical to a local run.
+unset CI
+
 # Run the experiment
 cd $PROJECT_ROOT
 uv run examples/run_vlm_grpo.py \

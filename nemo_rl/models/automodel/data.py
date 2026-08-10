@@ -14,11 +14,14 @@
 
 """Data processing utilities for automodel training and inference."""
 
+import inspect
 import itertools
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any, Iterable, Iterator, Optional, Tuple
 
 import torch
+from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
@@ -27,6 +30,60 @@ from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
 )
+
+
+@cache
+def _accepted_forward_kwargs(
+    model_type: type[nn.Module],
+) -> Optional[frozenset[str]]:
+    """Return explicit ``forward`` kwargs, or ``None`` when all kwargs are accepted."""
+    try:
+        parameters = inspect.signature(model_type.forward).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return None
+    return frozenset(
+        parameter.name for parameter in parameters if parameter.name != "self"
+    )
+
+
+def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:
+    """Return True if every image in the batch has the same (height, width)."""
+    if imgs_sizes.ndim != 2 or imgs_sizes.shape[0] <= 1:
+        return True
+    return bool((imgs_sizes == imgs_sizes[0]).all())
+
+
+def filter_multimodal_kwargs_for_model(
+    model: nn.Module, multimodal_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop processor metadata that is not accepted by an AutoModel forward."""
+    accepted_kwargs = _accepted_forward_kwargs(type(model))
+    if accepted_kwargs is None:
+        return multimodal_kwargs
+    # A forward that cannot consume imgs_sizes also cannot crop the per-image
+    # pad_to_max_shape padding, so mixed-resolution batches would feed padded
+    # pixels to the vision encoder and mismatch the placeholder count. This is
+    # the AutoModel Nemotron Omni path (nvidia/Nemotron-3-Nano-Omni-30B-A3B-
+    # Reasoning-BF16), whose HF forward takes pixel_values but not imgs_sizes,
+    # unlike the mcore NemotronOmniModel which crops via imgs_sizes.
+    imgs_sizes = multimodal_kwargs.get("imgs_sizes")
+    if (
+        imgs_sizes is not None
+        and "imgs_sizes" not in accepted_kwargs
+        and not _all_image_sizes_equal(imgs_sizes)
+    ):
+        raise ValueError(
+            "This AutoModel does not accept `imgs_sizes` and cannot crop padded "
+            "pixel_values, but the batch contains mixed-resolution images. The "
+            "AutoModel backend only supports equal-resolution images/tiles; use "
+            "the Megatron backend for mixed-resolution inputs."
+        )
+    return {
+        key: value for key, value in multimodal_kwargs.items() if key in accepted_kwargs
+    }
 
 
 @dataclass
@@ -282,6 +339,32 @@ def process_microbatch(
         attention_mask = None
         seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
         cp_buffers = [input_ids, position_ids, seq_index]
+
+        # Cross-tokenizer distillation rides student-seq-aligned alignment /
+        # mask fields on the same mb. CP-shard the student-seq fields with
+        # the student cp_mesh so the loss sees matching seq dims against
+        # the redistributed student logits. Teacher-seq fields (T_t may
+        # differ from T_s) stay full; the loss slices them contiguously by
+        # student CP rank because the IPC consumer ships contiguous teacher
+        # slices (see FullLogitsPostProcessor un-interleave in train.py).
+        # There is one set of student-seq alignment fields per teacher:
+        # single-teacher uses the unprefixed ``alignment_student_*`` keys,
+        # multi-teacher uses ``alignment_{i}_student_*`` (the suffix match
+        # captures both and excludes teacher-seq ``*_teacher_*`` fields).
+        student_seq_alignment_fields = [
+            k
+            for k in mb
+            if k.startswith("alignment_")
+            and (
+                k.endswith("_student_chunk_id")
+                or k.endswith("_student_exact_partition_mask")
+            )
+        ]
+        if student_seq_alignment_fields:
+            if "token_mask" in mb:
+                cp_buffers.append(mb["token_mask"])
+            for student_seq_field in student_seq_alignment_fields:
+                cp_buffers.append(mb[student_seq_field])
 
     return ProcessedInputs(
         input_ids=input_ids,

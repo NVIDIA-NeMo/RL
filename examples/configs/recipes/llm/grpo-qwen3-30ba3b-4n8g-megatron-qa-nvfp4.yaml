@@ -1,0 +1,13 @@
+defaults: ../../../../examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
+
+cluster:
+  gpus_per_node: 8
+  segment_size: null
+
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2

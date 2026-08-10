@@ -29,17 +29,10 @@ from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
-from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
-from ._rollout_shapes import mooncake_available
-
-# ── loud-skip helpers ─────────────────────────────────────────────────────────
-
-# ── fixtures ──────────────────────────────────────────────────────────────────
 
 
 def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
@@ -89,69 +82,9 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
     ]
 
 
-@pytest.fixture
-def tq_client():
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(local_mode=False, include_dashboard=False)
-
-    client = build_data_plane_client(
-        {
-            "enabled": True,
-            "impl": "transfer_queue",
-            "backend": "simple",
-            "storage_capacity": 1024,
-            "num_storage_units": 1,
-            "claim_meta_poll_interval_s": 0.5,
-            "global_segment_size": 8589934592,  # 8 GiB (only read by mooncake_cpu)
-            "local_buffer_size": 1073741824,  # 1 GiB (only read by mooncake_cpu)
-        }
-    )
-    yield client
-    client.close()
-
-
-@pytest.fixture(
-    scope="module",
-    params=["simple", "mooncake_cpu"],
-    ids=["simple", "mooncake_cpu"],
-)
-def tq_client_backends(request):
-    """Parametrized fixture over simple and mooncake_cpu backends.
-
-    mooncake_cpu is skipped when the mooncake wheel is not installed.
-    Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
-
-    Module-scoped to dodge mooncake's close→re-init race (stale C++ mount
-    registry); safe because each test uses a distinct ``partition_id``.
-    """
-    backend = request.param
-    if backend == "mooncake_cpu" and not mooncake_available():
-        pytest.skip(
-            "mooncake not installed — skipping mooncake_cpu backend "
-            "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
-        )
-
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(local_mode=False, include_dashboard=False)
-
-    client = build_data_plane_client(
-        {
-            "enabled": True,
-            "impl": "transfer_queue",
-            "backend": backend,
-            "storage_capacity": 1024,
-            "num_storage_units": 1,
-            "claim_meta_poll_interval_s": 0.5,
-            "global_segment_size": 8589934592,  # 8 GiB
-            "local_buffer_size": 1073741824,  # 1 GiB
-        }
-    )
-    yield client
-    client.close()
+# ``tq_client`` (simple) and ``tq_client_backends`` (parametrized over
+# simple + mooncake_cpu) are session-scoped fixtures provided by
+# ``tests/unit/data_plane/conftest.py``. See that file for the rationale.
 
 
 def test_smoke_round_trip(tq_client) -> None:
@@ -201,10 +134,11 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
         consumer_tasks=["read"],
     )
     keys = ["a", "b", "c", "d"]
+    values = torch.arange(12).reshape(4, 3)
     client.put_samples(
         sample_ids=keys,
         partition_id="smoke-backend",
-        fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
+        fields=TensorDict({"x": values}, batch_size=[4]),
     )
 
     meta = client.claim_meta(
@@ -217,7 +151,9 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
     assert meta.size == 4
 
     data = client.get_data(meta)
-    expected = torch.tensor([keys.index(k) for k in meta.sample_ids])
+    expected = torch.stack([values[keys.index(k)] for k in meta.sample_ids])
+    assert not data["x"].is_nested
+    assert data["x"].shape == expected.shape
     assert torch.equal(data["x"], expected)
 
     client.clear_samples(sample_ids=None, partition_id="smoke-backend")
@@ -231,11 +167,11 @@ def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     this for mooncake_cpu; simple passes the tensor through unchanged.
     """
     n = 6
-    reward = torch.arange(n, dtype=torch.float32)
+    total_reward = torch.arange(n, dtype=torch.float32)
 
     tq_client_backends.register_partition(
         partition_id="smoke-1d",
-        fields=["reward"],
+        fields=["total_reward"],
         num_samples=n,
         consumer_tasks=["read"],
     )
@@ -243,21 +179,21 @@ def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     tq_client_backends.put_samples(
         sample_ids=keys,
         partition_id="smoke-1d",
-        fields=TensorDict({"reward": reward}, batch_size=[n]),
+        fields=TensorDict({"total_reward": total_reward}, batch_size=[n]),
     )
 
     meta = tq_client_backends.claim_meta(
         partition_id="smoke-1d",
         task_name="read",
-        required_fields=["reward"],
+        required_fields=["total_reward"],
         batch_size=n,
         timeout_s=30.0,
     )
     data = tq_client_backends.get_data(meta)
 
-    assert data["reward"].shape == reward.shape, (
-        f"Expected shape {tuple(reward.shape)} for 1D field, "
-        f"got {tuple(data['reward'].shape)}. "
+    assert data["total_reward"].shape == total_reward.shape, (
+        f"Expected shape {tuple(total_reward.shape)} for 1D field, "
+        f"got {tuple(data['total_reward'].shape)}. "
         "TQ must not unsqueeze 1D tensors silently (R-C2)."
     )
 

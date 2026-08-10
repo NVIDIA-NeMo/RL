@@ -19,3 +19,4 @@ logger:
     name: grpo-deepseek-v3-32n4g
 cluster:
   gpus_per_node: 4
+  segment_size: 16

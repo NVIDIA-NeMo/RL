@@ -22,13 +22,15 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    DistillationConfig,
     MasterConfig,
-    _default_distillation_save_state,
+    _get_distillation_save_state,
+    _initial_distillation_save_state,
     check_vocab_equality,
     distillation_train,
     validate,
 )
-from nemo_rl.algorithms.loss import DistillationLossFn
+from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -109,11 +111,11 @@ def mock_components():
     tokenizer.pad_token_id = 0
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     logger = MagicMock()
@@ -126,20 +128,20 @@ def mock_components():
     # Create mock master config
     master_config = MasterConfig.model_construct(
         **{
-            "distillation": {
-                "max_num_steps": 5,
-                "max_num_epochs": 10,
-                "val_period": 100,
-                "val_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-                "max_val_samples": 10,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,
-                "num_generations_per_prompt": 1,
-                "max_rollout_turns": 0,  # No environment interaction needed for distillation
-                "seed": 42,
-            },
+            "distillation": DistillationConfig.model_construct(
+                max_num_steps=5,
+                max_num_epochs=10,
+                val_period=100,
+                val_batch_size=1,
+                val_at_start=False,
+                val_at_end=False,
+                max_val_samples=10,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                num_generations_per_prompt=1,
+                max_rollout_turns=0,
+                seed=42,
+            ),
             "policy": {
                 "train_global_batch_size": 1,
                 "make_sequence_length_divisible_by": 8,
@@ -148,6 +150,9 @@ def mock_components():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "colocated": {
                         "enabled": False,
                     },
@@ -156,11 +161,11 @@ def mock_components():
             "teacher": {
                 "model_name": "test-teacher",
             },
-            "loss_fn": {
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
             "data": {
                 "dataset_name": "test_dataset",
             },
@@ -171,6 +176,8 @@ def mock_components():
             },
             "logger": {
                 "num_val_samples_to_print": 5,
+                "wandb_enabled": False,
+                "wandb": {"log_nemo_gym_full_result_tables": False},
             },
             "cluster": {
                 "num_nodes": 1,
@@ -201,11 +208,53 @@ def mock_components():
     }
 
 
+def test_get_distillation_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_distillation_save_state({}) == _initial_distillation_save_state()
+
+    loaded_state = {
+        "total_steps": 13,
+        "current_epoch": 1,
+        "current_step": 3,
+        "consumed_samples": 32,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _get_distillation_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "total_steps": 13,
+        "current_epoch": 1,
+        "current_step": 3,
+        "val_reward": -99999999.0,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
+    assert not hasattr(save_state, "val:accuracy")
+
+
+def test_distillation_save_state_checkpoint_round_trip():
+    save_state = _initial_distillation_save_state()
+    save_state.current_step = 4
+    save_state.total_steps = 4
+    save_state.total_valid_tokens = 128
+    save_state.val_reward = 0.8
+    setattr(save_state, "val:accuracy", 0.8)
+
+    restored_state = _get_distillation_save_state(vars(save_state))
+
+    assert restored_state.current_step == 4
+    assert restored_state.total_steps == 4
+    assert restored_state.total_valid_tokens == 128
+    assert restored_state.val_reward == 0.8
+    assert not hasattr(restored_state, "val:accuracy")
+
+
 def test_distillation_train_max_steps(mock_components):
     """Test that training terminates correctly when maximum steps are reached."""
-    mock_components["master_config"].distillation["max_num_steps"] = 5
+    mock_components["master_config"].distillation.max_num_steps = 5
 
-    distillation_save_state = _default_distillation_save_state()
+    distillation_save_state = _initial_distillation_save_state()
 
     # Run training
     distillation_train(
@@ -227,11 +276,48 @@ def test_distillation_train_max_steps(mock_components):
     assert mock_components["student_policy"].train.call_count == 5
 
 
+def test_ft_save_period_triggers_periodic_saves(mock_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_components["master_config"]
+    cfg.distillation.max_num_steps = 5
+    cfg.distillation.val_period = 0
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    distillation_save_state = _initial_distillation_save_state()
+
+    with patch("nemo_rl.algorithms.distillation.torch.save"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            checkpointer,
+            distillation_save_state,
+            cfg,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]
+
+
 def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
-    master_config.distillation["max_num_steps"] = 1
-    master_config.distillation["max_num_epochs"] = 1
-    master_config.distillation["val_period"] = 0
+    master_config.distillation.max_num_steps = 1
+    master_config.distillation.max_num_epochs = 1
+    master_config.distillation.val_period = 0
     master_config.env["should_use_nemo_gym"] = True
     master_config.policy["generation"]["backend"] = "vllm"
     master_config.policy["generation"]["vllm_cfg"] = {
@@ -246,7 +332,7 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
 
     with (
         patch(
-            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            "nemo_rl.algorithms.distillation.run_nemo_gym_rollout_sync",
             return_value=mock_rollout_result,
         ) as mock_nemo_gym_rollout,
         patch(
@@ -266,7 +352,7 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
             mock_components["val_task_to_env"],
             mock_components["logger"],
             mock_components["checkpointer"],
-            _default_distillation_save_state(),
+            _initial_distillation_save_state(),
             master_config,
         )
 
@@ -285,9 +371,9 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
 def test_exit_on_timeout(mock_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
-    mock_components["master_config"].distillation["max_num_steps"] = 100
+    mock_components["master_config"].distillation.max_num_steps = 100
 
-    distillation_save_state = _default_distillation_save_state()
+    distillation_save_state = _initial_distillation_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
     with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
@@ -339,6 +425,86 @@ def test_exit_on_timeout(mock_components, capsys):
             )
 
 
+def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
+    mock_components,
+):
+    """Student optimizer state must be offloaded before the teacher is onloaded.
+
+    In non-colocated mode the refit path no longer offloads the student
+    optimizer, so it stays on the train GPUs, and the training loop must
+    offload it (offload_before_refit) before each teacher prepare_for_lp_inference
+    call, otherwise the teacher top-k forward OOMs once optimizer state
+    materializes after the first training step.
+    """
+    mock_components["master_config"].distillation.max_num_steps = 2
+    assert not mock_components["master_config"].policy["generation"]["colocated"][
+        "enabled"
+    ]
+
+    # Reparent the relevant child mocks onto one manager to record global call order.
+    manager = MagicMock()
+    manager.attach_mock(
+        mock_components["student_policy"].offload_before_refit, "student_offload"
+    )
+    manager.attach_mock(
+        mock_components["teacher_policy"].prepare_for_lp_inference, "teacher_prep"
+    )
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _initial_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    # student_generation is None so refit never runs; every offload_before_refit
+    # call comes from the teacher-inference prep path, once per step, and must
+    # immediately precede the teacher onload.
+    call_names = [name for name, _, _ in manager.mock_calls]
+    assert call_names == [
+        "student_offload",
+        "teacher_prep",
+        "student_offload",
+        "teacher_prep",
+    ]
+
+
+def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
+    mock_components,
+):
+    """In colocated mode refit already offloads the student; the loop must not."""
+    mock_components["master_config"].distillation.max_num_steps = 2
+    mock_components["master_config"].policy["generation"]["colocated"]["enabled"] = True
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _initial_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    assert mock_components["teacher_policy"].prepare_for_lp_inference.call_count == 2
+    mock_components["student_policy"].offload_before_refit.assert_not_called()
+
+
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
     # Run validation
@@ -361,8 +527,8 @@ def test_validate_function(mock_components):
 
 def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
-    master_config.distillation["max_val_samples"] = 1
-    master_config.distillation["val_batch_size"] = 1
+    master_config.distillation.max_val_samples = 1
+    master_config.distillation.val_batch_size = 1
     master_config.env["should_use_nemo_gym"] = True
     master_config.env["should_log_nemo_gym_responses"] = False
     master_config.policy["generation"]["backend"] = "vllm"
@@ -395,13 +561,12 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
         rollout_metrics={
             "mean_gen_tokens_per_sample": 2.0,
             "score": 0.5,
-            "full_result_debug": {"large_response": True},
         },
     )
 
     with (
         patch(
-            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            "nemo_rl.algorithms.distillation.run_nemo_gym_rollout_sync",
             return_value=mock_rollout_result,
         ) as mock_nemo_gym_rollout,
         patch(
@@ -426,13 +591,13 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert rollout_kwargs["max_seq_len"] is None
     assert rollout_kwargs["max_rollout_turns"] is None
     assert rollout_kwargs["greedy"] is False
+    assert rollout_kwargs["log_full_result_tables"] is False
     mock_async_rollout.assert_not_called()
     mock_rollout.assert_not_called()
     assert val_metrics["accuracy"] == 1.0
     assert val_metrics["avg_length"] == 2.0
     assert val_metrics["mean_gen_tokens_per_sample"] == 2.0
     assert val_metrics["score"] == 0.5
-    assert "full_result_debug" not in val_metrics
     assert isinstance(validation_timings, dict)
 
 
@@ -469,7 +634,7 @@ def test_validate_logs_data_when_logger_provided(mock_components):
     mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
 
     master_config = mock_components["master_config"]
-    master_config.distillation["val_batch_size"] = 1
+    master_config.distillation.val_batch_size = 1
     master_config.logger["num_val_samples_to_print"] = 1
 
     with (
@@ -689,6 +854,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "colocated": {
                         "enabled": False,  # Non-colocated
@@ -707,15 +875,19 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     "enabled": False,
                 },
             },
-            "loss_fn": {},
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,  # Config extraction requires this key
-                "val_period": 0,  # Config extraction requires this key
-                "val_at_start": False,  # Config extraction requires this key
-                "val_at_end": False,  # Config extraction requires this key
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "logger": {},  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
@@ -745,7 +917,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
-def test_distillation_setup_non_colocated_smoke(monkeypatch):
+@pytest.mark.parametrize("refit_transport", [None, "nixl"])
+def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
     """Smoke test: calling setup with a non-colocated config should succeed."""
     from unittest.mock import MagicMock, patch
 
@@ -759,7 +932,12 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
+                    "refit_transport": refit_transport,
+                    "refit_cfg": None,
                     "colocated": {
                         "enabled": False,
                         "resources": {
@@ -779,21 +957,21 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
                     "enabled": False,
                 },
             },
-            "loss_fn": {
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            },
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,
-                "max_num_epochs": 10,
-                "max_num_steps": 100,
-                "val_period": 0,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                max_num_epochs=10,
+                max_num_steps=100,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "logger": {},
             "checkpointing": {},
@@ -821,6 +999,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             return ip_port
 
     class DummyPolicy:
+        collective_calls = []
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -831,11 +1011,15 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             return None
 
         def init_collective(self, *args, **kwargs):
+            self.collective_calls.append((args, kwargs))
             return [MagicMock()]
 
     class DummyVllmGeneration:
+        collective_calls = []
+
         def __init__(self, *args, **kwargs):
-            pass
+            self.cfg = kwargs["config"]
+            self.weight_synchronizer = None
 
         def finish_generation(self):
             return None
@@ -844,6 +1028,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             return None
 
         def init_collective(self, *args, **kwargs):
+            self.collective_calls.append((args, kwargs))
             return [MagicMock()]
 
     with (
@@ -853,6 +1038,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(
+            distil_mod, "create_weight_synchronizer"
+        ) as mock_create_synchronizer,
         patch.object(distil_mod, "get_nemo_gym_uv_cache_dir") as mock_uv_cache_dir,
         patch.object(distil_mod, "get_nemo_gym_venv_dir") as mock_uv_venv_dir,
         patch.object(distil_mod, "ray") as mock_ray,
@@ -869,6 +1057,15 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         assert result[3] is None
         mock_uv_cache_dir.assert_not_called()
         mock_uv_venv_dir.assert_not_called()
+        if refit_transport == "nixl":
+            mock_create_synchronizer.assert_called_once()
+            mock_create_synchronizer.return_value.init_communicator.assert_called_once()
+            assert not DummyPolicy.collective_calls
+            assert not DummyVllmGeneration.collective_calls
+        else:
+            mock_create_synchronizer.assert_not_called()
+            assert DummyPolicy.collective_calls
+            assert DummyVllmGeneration.collective_calls
 
 
 @pytest.mark.parametrize(
@@ -917,10 +1114,14 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         **{
             "policy": {
                 "model_name": "test-policy",
+                "tokenizer": {"name": "test-policy", "use_fastokens": False},
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "vllm_kwargs": {},
                     "vllm_cfg": {
@@ -941,21 +1142,21 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
                     "enabled": False,
                 },
             },
-            "loss_fn": {
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            },
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,
-                "max_num_epochs": 1,
-                "max_num_steps": 1,
-                "val_period": 0,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                max_num_epochs=1,
+                max_num_steps=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "env": {
                 "should_use_nemo_gym": True,
@@ -1086,20 +1287,21 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
 def test_nemo_gym_distillation_runner_uses_setup_actor():
     from examples.nemo_gym import run_distillation_nemo_gym as runner
 
-    config_dict = {
-        "policy": {
+    master_config = MasterConfig.model_construct(
+        policy={
             "tokenizer": {"name": "test-tokenizer"},
             "generation": {"backend": "vllm"},
         },
-        "teacher": {},
-        "loss_fn": {},
-        "distillation": {"max_val_samples": None},
-        "data": {},
-        "env": {"should_use_nemo_gym": True, "nemo_gym": {}},
-        "logger": {"log_dir": "/tmp/logs"},
-        "checkpointing": {"enabled": False},
-        "cluster": {},
-    }
+        teacher={},
+        loss_fn={},
+        distillation=DistillationConfig(max_val_samples=None),
+        data={},
+        env={"should_use_nemo_gym": True, "nemo_gym": {}},
+        logger={"log_dir": "/tmp/logs"},
+        checkpointing={"enabled": False},
+        cluster={},
+    )
+
     tokenizer = MagicMock()
     student_policy = MagicMock()
     teacher_policy = MagicMock()
@@ -1110,7 +1312,6 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
     logger = MagicMock()
     checkpointer = MagicMock()
     distillation_state = MagicMock()
-    master_config = MasterConfig.model_construct(**copy.deepcopy(config_dict))
 
     with (
         patch.object(runner, "register_omegaconf_resolvers"),
@@ -1119,14 +1320,10 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
             "parse_args",
             return_value=(SimpleNamespace(config="config.yaml"), []),
         ),
-        patch.object(runner, "load_config", return_value=config_dict),
+        patch.object(runner, "load_config", return_value=master_config.model_dump()),
         patch.object(runner, "parse_hydra_overrides", side_effect=lambda cfg, _: cfg),
         patch.object(runner, "OmegaConf") as mock_omegaconf,
-        patch.object(
-            runner,
-            "MasterConfig",
-            lambda **kwargs: MasterConfig.model_construct(**kwargs),
-        ),
+        patch.object(runner, "MasterConfig", return_value=master_config),
         patch.object(runner, "get_next_experiment_dir", return_value="/tmp/logs/exp"),
         patch.object(runner, "get_tokenizer", return_value=tokenizer),
         patch.object(
@@ -1178,6 +1375,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "colocated": {
                         "enabled": False,  # Non-colocated
@@ -1196,17 +1396,21 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     "enabled": False,
                 },
             },
-            "loss_fn": {},
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "max_num_epochs": 10,
-                "max_num_steps": 100,
-                "num_prompts_per_step": 1,  # Config extraction requires this key
-                "val_period": 0,  # Config extraction requires this key
-                "val_at_start": False,  # Config extraction requires this key
-                "val_at_end": False,  # Config extraction requires this key
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                max_num_epochs=10,
+                max_num_steps=100,
+                num_prompts_per_step=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "logger": {},  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key

@@ -33,7 +33,7 @@ Since reinforcement learning consists of training, generation and transition bet
 
 ## Performance Summary for Large Language Models
 
-Below are performance benchmarks for various large language models organized by release version. These results were obtained using performance recipes available [here](https://github.com/NVIDIA-NeMo/RL/tree/r0.4.0/examples/configs/recipes/llm/performance).
+Below are performance benchmarks for various large language models organized by release version. These results were obtained using performance recipes available [here](https://github.com/NVIDIA-NeMo/RL/tree/r0.6.0/examples/configs/recipes/llm/performance).
 
 The performance data includes:
 
@@ -43,13 +43,13 @@ The performance data includes:
 
 ---
 
-## Nemo RL v0.6
+## NeMo RL v0.6
 
 ### H100 BF16 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2); DAPO dataset: [DAPOMath17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k); SWE dataset: refer to [Nemotron super-v3 documentation - stage 2.2](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md#stage-22---swe-2-64-nodes)
 * System: DGX-H100
 * Precision: Training BF16, Generation BF16
-* Training Backend: Megatron-core.
+* Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
@@ -68,7 +68,7 @@ The performance data includes:
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
 * System: DGX-H100
 * Precision: Generation FP8, Training FP8
-* Training Backend: Megatron-core.
+* Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
@@ -78,7 +78,7 @@ The performance data includes:
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
 * System: GB200-NVL72
 * Precision: Training BF16, Generation BF16
-* Training Backend: Megatron-core.
+* Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|

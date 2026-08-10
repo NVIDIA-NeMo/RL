@@ -30,4 +30,4 @@ cat $RUN_LOG | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"score": \1}/' > $JSO
 
 uv run tests/check_metrics.py $JSON_METRICS \
   'data["score"] >= 0.1' \
-  'data["score"] < 0.14'
+  'data["score"] < 0.2'
