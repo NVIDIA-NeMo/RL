@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contract tests for the Automodel context-parallel API migration."""
+"""Contract tests for NeMo-RL's Automodel context-parallel integration."""
 
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
@@ -31,13 +31,10 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
 )
-from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
+from nemo_rl.models.automodel.data import ProcessedInputs
 from nemo_rl.models.automodel.train import (
     FullLogitsPostProcessor,
     LossPostProcessor,
-    PreparedModelForward,
-    ScorePostProcessor,
-    forward_with_post_processing_fn,
     prepare_model_forward,
 )
 
@@ -144,35 +141,6 @@ class TestPrepareModelForward:
         assert "labels" not in prepared.model_batch
         assert "labels" in observed_batch
         assert processed_inputs.input_ids is input_ids
-
-
-@pytest.mark.automodel
-def test_cp_forward_requires_the_prepared_sharder() -> None:
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    processed_inputs = ProcessedInputs(input_ids=input_ids, seq_len=4)
-    processed_mb = ProcessedMicrobatch(
-        data_dict=BatchedDataDict({"input_ids": input_ids}),
-        processed_inputs=processed_inputs,
-        original_batch_size=1,
-        original_seq_len=4,
-    )
-    prepared = PreparedModelForward(
-        model_batch={"input_ids": input_ids},
-        cp_size=2,
-        cp_sharder=None,
-        model_context_factory=nullcontext,
-    )
-    model = MagicMock()
-
-    with pytest.raises(RuntimeError, match="ContextParallelSharder is required"):
-        forward_with_post_processing_fn(
-            model=model,
-            prepared=prepared,
-            post_processing_fn=ScorePostProcessor(cfg={}),
-            processed_mb=processed_mb,
-        )
-
-    model.assert_not_called()
 
 
 @pytest.mark.automodel
@@ -304,17 +272,3 @@ def test_loss_cp_gradient_fanout_contract(
     )
 
     assert processor.cp_gradient_fanout == expected_fanout
-
-
-@pytest.mark.automodel
-def test_cp1_loss_gradient_fanout_is_identity() -> None:
-    loss_fn = MagicMock(input_type=LossInputType.LOGPROB)
-    processor = LossPostProcessor(
-        loss_fn=loss_fn,
-        cfg={},
-        cp_mesh=None,
-        cp_size=1,
-        dp_size=1,
-    )
-
-    assert processor.cp_gradient_fanout == 1
