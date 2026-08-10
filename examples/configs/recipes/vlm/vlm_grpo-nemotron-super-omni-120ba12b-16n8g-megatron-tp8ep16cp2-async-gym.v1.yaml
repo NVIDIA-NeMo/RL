@@ -78,6 +78,9 @@ policy:
         chat_template_content_format: openai
         reasoning_parser: deepseek_r1
     vllm_kwargs:
+      # Match the higher-throughput backend used by the earlier successful
+      # policy-serving runs. This must remain compatible with repeated refits.
+      moe_backend: flashinfer_cutlass
       limit_mm_per_prompt:
         image: 3
       mm_processor_cache_gb: 0
