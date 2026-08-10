@@ -279,7 +279,6 @@ class DTensorPolicyWorkerV2Impl(
         self.rank = torch.distributed.get_rank()
         self.timer = Timer(context={"worker": "dtensor_policy_v2", "rank": self.rank})
         self.device_mesh = distributed_context.device_mesh
-        self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]

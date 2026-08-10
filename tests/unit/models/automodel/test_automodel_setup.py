@@ -15,6 +15,7 @@
 """Unit tests for automodel setup utilities."""
 
 import os
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -165,26 +166,28 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_with_vlm_raises_error(
+    def test_context_parallel_with_vlm_is_allowed(
         self,
         mock_dynamo,
         mock_resolve_class,
         mock_autoconfig_class,
         mock_config,
+        mock_autoconfig,
     ):
-        """VLM CP fails during setup before model construction."""
+        """VLM CP is delegated to Automodel after configuration validation."""
         mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
 
-        with pytest.raises(
-            ValueError, match="Context parallel is not supported for VLM"
-        ):
-            validate_and_prepare_config(
-                config=mock_config,
-                processor=MagicMock(),
-                rank=0,
-            )
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=MagicMock(),
+            rank=0,
+        )
 
-        mock_autoconfig_class.from_pretrained.assert_not_called()
+        assert isinstance(result, RuntimeConfig)
+        assert result.attn_impl == "sdpa"
+        mock_autoconfig_class.from_pretrained.assert_called_once()
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -729,7 +732,9 @@ class TestSetupDistributed:
 
         result = setup_distributed(mock_config, mock_runtime_config)
 
-        mock_torch_dist.init_process_group.assert_called_once_with(backend="nccl")
+        mock_torch_dist.init_process_group.assert_called_once_with(
+            backend="nccl", timeout=timedelta(minutes=30)
+        )
         assert isinstance(result, DistributedContext)
         assert result.device_mesh == mock_device_mesh
         assert result.moe_mesh == mock_moe_mesh
@@ -776,7 +781,7 @@ class TestSetupDistributed:
         result = setup_distributed(mock_config, runtime_config)
 
         mock_torch_dist.init_process_group.assert_called_once_with(
-            backend="cuda:nccl,cpu:gloo"
+            backend="cuda:nccl,cpu:gloo", timeout=timedelta(minutes=30)
         )
         assert isinstance(result, DistributedContext)
 
@@ -1528,7 +1533,7 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
-    def test_setup_model_with_cp_raises_for_vlm(
+    def test_setup_model_with_cp_allows_vlm(
         self,
         mock_get_class,
         mock_get_rank,
@@ -1537,7 +1542,7 @@ class TestSetupModelAndOptimizer:
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
-        """Test that context parallel with VLM raises AssertionError."""
+        """Test that VLM context parallel setup is delegated to Automodel."""
         mock_get_rank.return_value = 0
         mock_fsdp2_config = MagicMock()
         mock_fsdp2_config.sequence_parallel = False
@@ -1558,17 +1563,18 @@ class TestSetupModelAndOptimizer:
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
 
-        with pytest.raises(
-            AssertionError, match="Context parallel is yet not supported for VLM models"
-        ):
-            setup_model_and_optimizer(
-                config=mock_config,
-                tokenizer=mock_tokenizer,
-                runtime_config=mock_runtime_config,
-                distributed_context=distributed_context,
-                checkpoint_manager=mock_checkpoint_manager,
-                is_vlm=True,
-            )
+        result = setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+            is_vlm=True,
+            init_optimizer=False,
+        )
+
+        assert isinstance(result, ModelAndOptimizerState)
+        mock_runtime_config.model_class.from_pretrained.assert_called_once()
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")

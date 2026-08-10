@@ -1059,14 +1059,27 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     # contiguous IPC-consumer window. Legacy callers retain the existing
     # load-balanced-to-contiguous conversion.
     if cp_sharder is not None:
+        # Keep the student-logit autograd graph intact: to_local_if_dtensor()
+        # runs DTensor.to_local() under torch.no_grad(), which would detach the
+        # X-token KD loss from the student model for TP > 1.
+        local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
         full_student_logits = cp_sharder.gather_token_tensor(
-            to_local_if_dtensor(logits), seq_dim=1, trim=True
+            local_logits, seq_dim=1, trim=True
         )
         cp_size = (
             torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
         )
+        full_student_seq_len = full_student_logits.shape[1]
+        if full_student_seq_len % cp_size != 0:
+            raise ValueError(
+                "X-token student sequence length must be divisible by the student "
+                "context parallel size, but got "
+                f"sequence_length={full_student_seq_len}, cp_size={cp_size}. "
+                "Set policy.make_sequence_length_divisible_by to a multiple of "
+                "policy.dtensor_cfg.context_parallel_size."
+            )
         cp_rank = torch.distributed.get_rank(cp_group) if cp_group is not None else 0
-        student_seq_len = full_student_logits.shape[1] // cp_size
+        student_seq_len = full_student_seq_len // cp_size
         student_seq_start = cp_rank * student_seq_len
         student_logits_contig = full_student_logits.narrow(
             1, student_seq_start, student_seq_len

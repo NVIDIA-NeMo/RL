@@ -17,6 +17,7 @@
 import importlib
 import inspect
 import os
+from datetime import timedelta
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -312,12 +313,6 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
-    if is_vlm and cp_size_cfg > 1:
-        raise ValueError(
-            "Context parallel is not supported for VLM models on the Automodel "
-            "policy worker. Set policy.dtensor_cfg.context_parallel_size = 1."
-        )
-
     attn_impl = (
         "flash_attention_2"
         if (enable_seq_packing and cp_size_cfg == 1)
@@ -450,7 +445,10 @@ def setup_distributed(
     """
     # Initialize process group
     backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
-    torch.distributed.init_process_group(backend=backend)
+    # Large multi-node checkpoints can materialize at different speeds on each
+    # node. Keep the default process group alive long enough for lagging ranks
+    # to reach the first DTensor initialization collective.
+    torch.distributed.init_process_group(backend=backend, timeout=timedelta(minutes=30))
     world_size = torch.distributed.get_world_size()
 
     # Extract configuration values
@@ -596,17 +594,6 @@ def setup_model_and_optimizer(
                 "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "
                 "Please either set cp_size = 1 or disable sequence parallel. "
                 "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
-            )
-
-        if is_vlm:
-            raise AssertionError(
-                "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
-            )
-
-        if model_config.model_type == "qwen3_5":
-            raise AssertionError(
-                "Context parallel is not supported for Qwen3.5 dense models (only torch attention backend is available). "
-                "Please set cp_size = 1. For Qwen3.5 MoE models, CP is supported with the TE backend."
             )
 
         if model_config.model_type == "qwen3_5_moe":
