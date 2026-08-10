@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 
@@ -78,11 +78,17 @@ def compute_nvfp4_input_scale(input_amax: torch.Tensor | None) -> torch.Tensor:
             f"Invalid ModelOpt input amax for NVFP4 W4A4 export: {input_amax}"
         )
 
-    from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
+    # ModelOpt is an optional runtime dependency loaded only for NVFP4 refit.
+    from modelopt.torch.quantization.qtensor.nvfp4_tensor import (  # pyrefly: ignore[import-error]
+        NVFP4QTensor,
+    )
 
     canonical_export = getattr(NVFP4QTensor, "get_activation_scaling_factor", None)
     if callable(canonical_export):
-        input_scale = canonical_export(_Nvfp4InputQuantizerView(input_amax))
+        input_scale = cast(
+            torch.Tensor | None,
+            canonical_export(_Nvfp4InputQuantizerView(input_amax)),
+        )
     else:
         input_scale = input_amax / _NVFP4_AMAX_DENOMINATOR
     if (
@@ -99,7 +105,8 @@ def compute_nvfp4_input_scale(input_amax: torch.Tensor | None) -> torch.Tensor:
 
 def get_modelopt_quant_exporter(quant_mode: str) -> tuple[str, object]:
     """Return the ModelOpt NVFP4 format and dependency-light exporter."""
-    from modelopt.torch.export import quant_utils
+    # ModelOpt is an optional runtime dependency loaded only for NVFP4 refit.
+    from modelopt.torch.export import quant_utils  # pyrefly: ignore[import-error]
 
     normalized_mode = quant_mode.lower()
     if normalized_mode == "nvfp4":
@@ -199,14 +206,17 @@ def _load_quant_meta() -> type[_QuantMeta]:
 def _as_nvfp4_exporter(exporter: object) -> _NVFP4Exporter:
     if not callable(exporter):
         raise TypeError("ModelOpt returned a non-callable NVFP4 exporter")
-    return exporter
+    return cast(_NVFP4Exporter, exporter)
 
 
 def _compute_nvfp4_weight_scale(
     weight: torch.Tensor,
     meta: _QuantMeta,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
+    # ModelOpt is an optional runtime dependency loaded only for NVFP4 refit.
+    from modelopt.torch.quantization.qtensor.nvfp4_tensor import (  # pyrefly: ignore[import-error]
+        NVFP4QTensor,
+    )
 
     weight_scale_2 = (
         meta.weight_amax.to(weight.device).float().abs() / _NVFP4_AMAX_DENOMINATOR
@@ -235,7 +245,8 @@ def _quantize_nvfp4_weight(
     weight: torch.Tensor,
     meta: _QuantMeta,
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    from modelopt.torch.export.quant_utils import (
+    # ModelOpt is an optional runtime dependency loaded only for NVFP4 refit.
+    from modelopt.torch.export.quant_utils import (  # pyrefly: ignore[import-error]
         QUANTIZATION_NVFP4,
         to_quantized_weight,
     )

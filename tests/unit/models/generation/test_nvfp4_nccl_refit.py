@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Iterator
 import json
 import os
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,6 @@ from safetensors.torch import save_file
 
 from nemo_rl.modelopt.calibration_artifact import load_nvfp4_calibration
 from nemo_rl.modelopt.models.generation import nvfp4_refit
-
 
 _GATE = "model.layers.0.mlp.experts.3.gate_proj.weight"
 _UP = "model.layers.0.mlp.experts.3.up_proj.weight"
