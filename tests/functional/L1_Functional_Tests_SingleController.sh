@@ -70,6 +70,18 @@ run_test env REFIT_TRANSPORT=nccl_reshard uv run --no-sync bash ./tests/function
 # chance -- it both passed and wedged on consecutive runs of identical code. This is the
 # only test that reliably exercises the abort-and-rebuild path.
 run_test env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+# ...and the same mid-refit kill on the RESHARD transport, which is a different abort.
+#
+# The two are not interchangeable. The collective path aborts one communicator; reshard
+# holds TWO families -- the per-PP-stage bulk groups and the shared model_update_group --
+# and a hang can be in either, so the watchdog is handed both and the rebuild has to
+# regenerate the refit plan as well as the communicators. Nothing about that is exercised
+# by the step-boundary variant above, which recovers between refits and never aborts.
+#
+# Without this, the reshard abort path had only signature assertions behind it: the
+# deadline was plumbed and unit-tested, but no test had ever made a reshard refit
+# actually abort on hardware.
+run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what

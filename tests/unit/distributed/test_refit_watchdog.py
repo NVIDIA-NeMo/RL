@@ -266,3 +266,61 @@ class TestMultipleGroups:
         with RefitAbortWatchdog([], 0.05) as guard:
             assert not guard.armed
         assert guard.fired is False
+
+
+class TestBothTransportsCanBeHeldOpen:
+    """The fault-injection hook must be reachable on BOTH refit receives.
+
+    Source inspection rather than import: vllm_backend does `import vllm` at module
+    scope, so the default unit lane cannot import it at all. The property being
+    protected is structural -- "this call site exists inside the guarded block" -- and
+    that is exactly what a source assertion can check.
+
+    Worth guarding because the reshard abort path is otherwise invisible to unit tests:
+    the deadline is plumbed and signature-tested, but whether a reshard refit can be
+    made to abort at all depends on this one call, and only a GPU functional test
+    (recovery-reshard-refit) can prove it end to end.
+    """
+
+    @staticmethod
+    def _backend_source() -> str:
+        from pathlib import Path
+
+        import nemo_rl
+
+        path = (
+            Path(nemo_rl.__file__).parent
+            / "models"
+            / "generation"
+            / "vllm"
+            / "vllm_backend.py"
+        )
+        return path.read_text()
+
+    def _guarded_body(self, method: str) -> str:
+        """Return the text between `def <method>` and the next top-level def."""
+        src = self._backend_source()
+        start = src.index(f"    def {method}(")
+        nxt = src.index("\n    def ", start + 1)
+        return src[start:nxt]
+
+    def test_the_collective_receive_can_be_held(self):
+        body = self._guarded_body("update_weights_from_collective")
+        assert "hold_refit_for_fault_injection()" in body
+
+    def test_the_reshard_receive_can_be_held(self):
+        """The gap this closes: reshard had the deadline but no way to aim at it."""
+        body = self._guarded_body("nccl_reshard_refit")
+        assert "hold_refit_for_fault_injection()" in body
+
+    def test_the_hold_is_inside_the_watchdog_not_before_it(self):
+        """Order matters. Held outside the guard, the deadline clock never starts and
+        the victim is killed during an unguarded pause -- the run would hang exactly as
+        it did before the watchdog existed, and the test would look like it passed."""
+        for method in ("update_weights_from_collective", "nccl_reshard_refit"):
+            body = self._guarded_body(method)
+            guard_at = body.index("with RefitAbortWatchdog(")
+            hold_at = body.index("hold_refit_for_fault_injection()")
+            assert hold_at > guard_at, (
+                f"{method}: the hold must be INSIDE the RefitAbortWatchdog block"
+            )
