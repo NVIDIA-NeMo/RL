@@ -1,22 +1,18 @@
 defaults: ../../grpo_math_1B.yaml
-# Nano v3.5 (NemotronH + MTP) DAPO-512 recipe on the AUTOMODEL (DTensor v2)
-# backend. Mirrors nano-v3 training semantics but uses dtensor_cfg + nemo_automodel.
-#
-# MTP handling: the v3.5 checkpoint carries extra mtp.* tensors and
-# num_nextn_predict_layers=1 in config.json. Both are ignored end-to-end with
-# NO code changes, provided:
+# Nano v3.5 (NemotronH + MTP) DAPO-512 on the automodel (DTensor v2) backend.
+# The checkpoint's mtp.* tensors / num_nextn_predict_layers=1 are ignored
+# end-to-end with no code changes, provided:
 #   - dtensor_cfg.automodel_kwargs.force_hf is NOT set
 #   - generation speculative_config is NOT set
-#   - Automodel stays pinned at 24b47e85 (commit 1f13c9aa+ auto-builds MTP)
+#   - Automodel stays pinned at 24b47e85 (1f13c9aa+ auto-builds MTP)
+# moe_parallelizer.ignore_router_for_ac is required with activation
+# checkpointing: bf16 router top-k is nondeterministic, and recomputed expert
+# permutation buffers can change shape and crash backward (CheckpointError).
 grpo:
-  # DAPO-512: 32 prompts x 16 generations = 512 rollouts/step
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
   max_num_epochs: 2
   val_at_start: true
   use_dynamic_sampling: true
   batch_multiplier: 3
-  dynamic_sampling_max_gen_batches: 10
   overlong_filtering: true
   use_leave_one_out_baseline: false
   reward_scaling:
@@ -29,22 +25,15 @@ grpo:
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
-  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
 checkpointing:
   checkpoint_dir: results/dapo-nanov3.5-30BA3B-4n8g-automodel
-  enabled: true
-  save_period: 10
-  keep_top_k: 3
-  save_optimizer: true
-  checkpoint_must_save_by: "00:03:45:00"
+  checkpoint_must_save_by: 00:03:45:00
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
-  tokenizer:
-    name: ${policy.model_name}
-  train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 9216
@@ -76,8 +65,6 @@ policy:
     expert_parallel_size: 8
     activation_checkpointing: true
     moe_parallelizer:
-      # Router top-k is nondeterministic at bf16; recomputed permutation buffers
-      # can change shape and crash backward with CheckpointError (jobs 14420678/14420680).
       ignore_router_for_ac: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
@@ -96,15 +83,11 @@ policy:
   dynamic_batching:
     enabled: true
   generation:
-    backend: vllm
     max_new_tokens: 8192
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
       enforce_eager: true
-      max_model_len: ${policy.max_total_sequence_length}
-    colocated:
-      enabled: true
 data:
   max_input_seq_length: 2048
   train:
