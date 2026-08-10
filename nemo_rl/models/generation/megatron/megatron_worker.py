@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import errno
 import gc
 import os
+import socket
 import threading
 import time
 import warnings
@@ -58,6 +60,33 @@ from nemo_rl.models.megatron.memory_saver import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def bind_reserved_http_server_socket(port: int) -> socket.socket:
+    """Bind and hold the driver-reserved OpenAI server port.
+
+    Args:
+        port: The port reserved by the driver for this node.
+
+    Returns:
+        The bound, listening socket, to be given to `start_text_gen_server` when the server starts.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", port))
+    except OSError as e:
+        sock.close()
+        if e.errno == errno.EADDRINUSE:
+            raise RuntimeError(
+                f"Reserved OpenAI server port {port} is already in use on this "
+                "node; the URL pre-published to NeMo Gym would be unreachable. "
+                "Configure a less contended "
+                "generation.mcore_generation_config.http_server_port_range_low/high."
+            ) from e
+        raise
+    sock.listen(128)
+    return sock
+
+
 class MegatronGenerationMixin:
     """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
 
@@ -69,6 +98,7 @@ class MegatronGenerationMixin:
      - tokenizer: HF tokenizer.
      - megatron_tokenizer: tokenizer for inference.
      - is_generation_colocated: Whether colocated or distributed.
+     - _reserved_http_server_socket: driver-reserved server socket, or None.
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
@@ -314,18 +344,23 @@ class MegatronGenerationMixin:
         )
 
         ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        reserved_socket = self._reserved_http_server_socket
+        if reserved_socket is not None:
+            server_port = reserved_socket.getsockname()[1]
+        else:
+            server_port = _get_free_port_local()
 
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
             rank=torch.distributed.get_rank(),
-            server_port=free_port,
+            server_port=server_port,
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
+            sock=reserved_socket,
         )
 
-        base_url = f"http://{ip}:{free_port}/v1"
+        base_url = f"http://{ip}:{server_port}/v1"
         max_wait_time = 300
         start_time = time.time()
         with requests.Session() as session:
