@@ -457,7 +457,7 @@ def _get_params_in_layers(param_names, layers):
 
 def _get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
     packed_modules_mapping = dict(getattr(model, "packed_modules_mapping", {}) or {})
-    if type(model).__name__.lower() == "deepseekv4forcausallm":
+    if _is_deepseek_v4_model(model):
         # vLLM's DeepSeek V4 loader fuses these checkpoint modules without
         # exposing a packed_modules_mapping for refit's FP8 module lookup.
         packed_modules_mapping.update(
@@ -471,7 +471,6 @@ def _get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
                     "shared_experts.w1",
                     "shared_experts.w3",
                 ],
-                "shared_experts.down_proj": ["shared_experts.w2"],
             }
         )
     return packed_modules_mapping
@@ -489,29 +488,9 @@ def _replace_packed_module_suffix(
     return module_path
 
 
-def _apply_hf_to_vllm_mapping(
-    model: torch.nn.Module, module_path: list[str]
-) -> list[str]:
-    mapper = getattr(model, "hf_to_vllm_mapper", None)
-    if mapper is None:
-        return module_path
-
-    orig_to_new_prefix = getattr(mapper, "orig_to_new_prefix", {}) or {}
-    if module_path and module_path[0] in orig_to_new_prefix:
-        module_path[0] = orig_to_new_prefix[module_path[0]]
-
-    orig_to_new_substr = getattr(mapper, "orig_to_new_substr", {}) or {}
-    return [orig_to_new_substr.get(part, part) for part in module_path]
-
-
 def _candidate_module_paths(model: torch.nn.Module, name: str) -> list[list[str]]:
-    candidate_names = [name]
     mapper = getattr(model, "hf_to_vllm_mapper", None)
-    map_name = getattr(mapper, "_map_name", None)
-    if map_name is not None:
-        mapped_name = map_name(name)
-        if mapped_name != name:
-            candidate_names.append(mapped_name)
+    candidate_names = mapper.apply_list([name]) if mapper is not None else [name]
 
     packed_modules_mapping = _get_packed_modules_mapping(model)
     module_paths = []
@@ -522,27 +501,10 @@ def _candidate_module_paths(model: torch.nn.Module, name: str) -> list[list[str]
         module_path = _replace_packed_module_suffix(
             path_parts[:-1], packed_modules_mapping
         )
-        module_path = _apply_hf_to_vllm_mapping(model, module_path)
         module_paths.append(module_path)
         if module_path[0] != "model" and hasattr(model, "model"):
             module_paths.append(["model", *module_path])
     return module_paths
-
-
-def _is_routed_experts_weight_owner(module: object) -> bool:
-    """Recognize the module that owns vLLM's fused expert parameters.
-
-    Pluggable MoE backends can replace ``RoutedExperts`` with a generated
-    backend-specific module while retaining the same parameter interface.
-    Refit operates on that interface, so an exact class check is too narrow.
-    """
-    return isinstance(module, RoutedExperts) or (
-        module is not None
-        and all(
-            isinstance(getattr(module, name, None), torch.Tensor)
-            for name in ("w13_weight", "w2_weight")
-        )
-    )
 
 
 def _resolve_module_path(
@@ -556,13 +518,9 @@ def _resolve_module_path(
             # delegates to a RoutedExperts submodule owning the expert weights
             # (w13_weight/w2_weight), so stop at either and return the
             # weight-owning module.
-            routed_experts = getattr(current_module, "routed_experts", None)
-            if isinstance(current_module, MoERunner) or (
-                routed_experts is not None
-                and _is_routed_experts_weight_owner(routed_experts)
-            ):
-                return routed_experts
-            if _is_routed_experts_weight_owner(current_module):
+            if isinstance(current_module, MoERunner):
+                return current_module.routed_experts
+            if isinstance(current_module, RoutedExperts):
                 return current_module
             if part == "model" and not hasattr(current_module, part):
                 # Some HF/vLLM model classes expose the decoder directly (for
@@ -583,12 +541,8 @@ def _resolve_module_path(
         return None
     # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
     # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
-    routed_experts = getattr(current_module, "routed_experts", None)
-    if isinstance(current_module, MoERunner) or (
-        routed_experts is not None
-        and _is_routed_experts_weight_owner(routed_experts)
-    ):
-        return routed_experts
+    if isinstance(current_module, MoERunner):
+        return current_module.routed_experts
     return current_module
 
 
@@ -614,7 +568,7 @@ def _is_fp8_weight(name, model):
                 isinstance(module, LinearBase)
                 and module.weight.dtype == torch.float8_e4m3fn
                 or (
-                    _is_routed_experts_weight_owner(module)
+                    isinstance(module, RoutedExperts)
                     and module.w13_weight.dtype == torch.float8_e4m3fn
                     and module.w2_weight.dtype == torch.float8_e4m3fn
                 )
@@ -660,12 +614,6 @@ def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     return "deepseek_v4" in model_type or any(
         "deepseekv4" in str(architecture).lower() for architecture in architectures
     )
-
-
-def _format_tensor_for_weight_load_debug(tensor: object) -> str:
-    if not isinstance(tensor, torch.Tensor):
-        return repr(type(tensor))
-    return f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}"
 
 
 def _get_param_module_name(param_name: str) -> str | None:
@@ -794,27 +742,15 @@ def _get_moe_module_name(param_name: str) -> str | None:
 
 def _get_routed_experts_module(
     module_map: dict[str, torch.nn.Module], module_name: str
-) -> torch.nn.Module | None:
+) -> RoutedExperts | None:
     layer = module_map.get(module_name)
-    routed_experts = getattr(layer, "routed_experts", None)
-    if isinstance(layer, MoERunner) or (
-        routed_experts is not None
-        and _is_routed_experts_weight_owner(routed_experts)
-    ):
-        layer = routed_experts
-    return layer if _is_routed_experts_weight_owner(layer) else None
+    if isinstance(layer, MoERunner):
+        layer = layer.routed_experts
+    return layer if isinstance(layer, RoutedExperts) else None
 
 
 def _get_moe_tp_size_and_rank(layer: RoutedExperts) -> tuple[int, int]:
-    moe_config = layer.moe_config
-    parallel_config = getattr(moe_config, "moe_parallel_config", None)
-    tp_size = getattr(moe_config, "tp_size", None)
-    tp_rank = getattr(moe_config, "tp_rank", None)
-    if tp_size is None:
-        tp_size = getattr(parallel_config, "tp_size", 1)
-    if tp_rank is None:
-        tp_rank = getattr(parallel_config, "tp_rank", 0)
-    return int(tp_size), int(tp_rank)
+    return int(layer.moe_config.tp_size), int(layer.moe_config.tp_rank)
 
 
 def _try_load_deepseek_v4_moe_block_scale(
@@ -917,31 +853,22 @@ def _wrap_deepseek_v4_weight_loaders_for_refit(
             return_success = (
                 args[5] if len(args) > 5 else kwargs.get("return_success", False)
             )
-            try:
-                moe_scale_result = _try_load_deepseek_v4_moe_block_scale(
-                    module_map=module_map,
-                    param_name=_param_name,
-                    param=_param,
-                    loaded_weight=loaded_weight,
-                    weight_name=weight_name,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                if moe_scale_result is not None:
-                    return moe_scale_result if return_success else None
-                if _try_load_deepseek_v4_bmm_param(
-                    module_map, _param_name, _param, loaded_weight
-                ):
-                    return True if return_success else None
-                return _weight_loader(*args, **kwargs)
-            except Exception:
-                print(
-                    "NeMo-RL FP8 refit failed while loading vLLM parameter "
-                    f"{_param_name}: "
-                    f"param {_format_tensor_for_weight_load_debug(_param)}, "
-                    f"loaded {_format_tensor_for_weight_load_debug(loaded_weight)}"
-                )
-                raise
+            moe_scale_result = _try_load_deepseek_v4_moe_block_scale(
+                module_map=module_map,
+                param_name=_param_name,
+                param=_param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            if moe_scale_result is not None:
+                return moe_scale_result if return_success else None
+            if _try_load_deepseek_v4_bmm_param(
+                module_map, _param_name, _param, loaded_weight
+            ):
+                return True if return_success else None
+            return _weight_loader(*args, **kwargs)
 
         original_weight_loaders.append((param, weight_loader))
         setattr(param, "weight_loader", refit_weight_loader)
@@ -995,7 +922,6 @@ def get_quantized_weight_iterator(
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
-                fp8_config=fp8_config,
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
         if is_mx:
@@ -1034,7 +960,6 @@ def load_weights(
 def cast_tensor_to_fp8_blockwise(
     data_hp,
     weight_block_size,
-    fp8_config: FP8Config | None = None,
 ):
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
@@ -1079,9 +1004,7 @@ def cast_tensor_to_fp8_blockwise(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
-    if fp8_config is None:
-        fp8_config = global_fp8_config
-    if fp8_config.use_weight_pow2_scale:
+    if global_fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
         exponent = torch.clamp(exponent, min=-127, max=127) + 127
@@ -1266,30 +1189,15 @@ def _reset_e8m0_fp8_linear_scales_for_refit(model: torch.nn.Module) -> None:
 def _reset_fp8_moe_params_for_refit(model: torch.nn.Module) -> None:
     """Restore RoutedExperts weights and scales to their pre-kernel layout."""
     for layer in model.modules():
-        if not _is_routed_experts_weight_owner(layer):
+        if not isinstance(layer, RoutedExperts):
             continue
         weight_block_size = getattr(layer, "weight_block_size", None)
         if weight_block_size is None:
             continue
 
-        moe_config = getattr(layer, "moe_config", None)
-
-        def dimension(name: str, fallback: int | None = None) -> int:
-            value = getattr(layer, name, None)
-            if value is None:
-                value = getattr(moe_config, name, None)
-            if value is None:
-                value = fallback
-            if value is None:
-                raise ValueError(
-                    f"DeepSeek V4 MoE refit cannot determine {name} for "
-                    f"{type(layer).__name__}"
-                )
-            return int(value)
-
-        num_experts = dimension("num_experts", layer.w13_weight.shape[0])
-        hidden_size = dimension("hidden_size")
-        intermediate_size = dimension("intermediate_size_per_partition")
+        num_experts = layer.num_experts
+        hidden_size = layer.hidden_size
+        intermediate_size = layer.intermediate_size_per_partition
         raw_weight_shapes = {
             "w13": (num_experts, 2 * intermediate_size, hidden_size),
             "w2": (num_experts, hidden_size, intermediate_size),
