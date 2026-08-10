@@ -143,13 +143,11 @@ vllm = [
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Default wheels on GitHub are cu130. See v0.25.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.25.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.25.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Source is overridden in [tool.uv.sources] to the Super VL RL branch. The
+  # version stays pinned so uv.lock records a reproducible v0.25.1 Python layer.
+  "vllm==0.25.1",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.13",
+  "flashinfer-python[cu13]==0.6.13",
   "flashinfer-cubin==0.6.13",
   "flashinfer-jit-cache==0.6.13",
   "nvidia-cutlass-dsl[cu13]==4.5.2",
@@ -267,6 +265,13 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+# Super VL RL custom inference stack. uv.lock pins the branch HEADs resolved
+# from these sources, and Docker installs them through uv like any other extra.
+# Keep these sources scoped to the vllm extra: sglang and mcore intentionally
+# resolve different FlashInfer versions from their normal package indexes.
+vllm = { git = "https://github.com/TomerBN-Nvidia/vllm.git", branch = "super_vl_rl_v0.25.1", extra = "vllm" }
+flashinfer-python = { git = "https://github.com/TomerBN-Nvidia/flashinfer.git", branch = "super_vl_rl_v0.6.13", extra = "vllm" }
+flashinfer-cubin = { git = "https://github.com/TomerBN-Nvidia/flashinfer.git", branch = "super_vl_rl_v0.6.13", subdirectory = "flashinfer-cubin", extra = "vllm" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
@@ -499,6 +504,13 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 deep_gemm = [{ requirement = "torch", match-runtime = true }]
+vllm = ["setuptools", "setuptools-scm", "wheel", "packaging"]
+flashinfer-python = [
+  "setuptools",
+  "wheel",
+  { requirement = "torch", match-runtime = true },
+]
+flashinfer-cubin = ["setuptools", "wheel"]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
@@ -506,7 +518,120 @@ causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 
+[tool.uv.extra-build-variables]
+vllm = { VLLM_USE_PRECOMPILED = "1", SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM = "0.25.1", SETUPTOOLS_SCM_PRETEND_VERSION = "0.25.1" }
+flashinfer-python = { FLASHINFER_CUDA_ARCH_LIST = "10.0a" }
+flashinfer-cubin = { FLASHINFER_CUDA_ARCH_LIST = "10.0a" }
+
 # Needed when building from source
+[[tool.uv.dependency-metadata]]
+name = "vllm"
+version = "0.25.1"
+requires-dist = [
+  "aiohttp>=3.13.3",
+  "anthropic>=0.71.0",
+  "apache-tvm-ffi==0.1.9",
+  "blake3",
+  "cachetools",
+  "cbor2",
+  "cloudpickle",
+  "compressed-tensors==0.17.0",
+  "depyf==0.20.0",
+  "diskcache==5.6.3",
+  "einops",
+  "fastapi[standard]>=0.133.0,<0.137.0",
+  "fastsafetensors>=0.3.2",
+  "filelock>=3.16.1",
+  "flashinfer-cubin==0.6.13",
+  "flashinfer-python==0.6.13",
+  "humming-kernels[cu13]==0.1.10",
+  "ijson",
+  "jsonschema>=4.23.0",
+  "lark==1.2.2",
+  "llguidance>=1.7.0,<1.8.0; platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'",
+  "lm-format-enforcer==0.11.3",
+  "mcp",
+  "mistral-common[image]>=1.11.5",
+  "model-hosting-container-standards>=0.1.14,<1.0.0",
+  "msgspec",
+  "ninja",
+  "numba==0.65.0",
+  "numpy",
+  "nvidia-cudnn-frontend>=1.19.1",
+  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "nvtx==0.2.15",
+  "openai>=2.0.0",
+  "openai-harmony>=0.0.3",
+  "opencv-python-headless>=4.13.0",
+  "opentelemetry-api>=1.27.0",
+  "opentelemetry-exporter-otlp>=1.27.0",
+  "opentelemetry-sdk>=1.27.0",
+  "opentelemetry-semantic-conventions-ai>=0.4.1",
+  "outlines-core==0.2.14",
+  "partial-json-parser",
+  "pillow",
+  "prometheus-client>=0.18.0",
+  "prometheus-fastapi-instrumentator>=8.0.0",
+  "protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*",
+  "psutil",
+  "py-cpuinfo",
+  "pybase64",
+  "pydantic>=2.12.0",
+  "pynvvideocodec==2.0.4",
+  "python-json-logger",
+  "pyyaml",
+  "pyzmq>=25.0.0",
+  "quack-kernels>=0.3.3",
+  "regex",
+  "requests>=2.26.0",
+  "safetensors>=0.6.2",
+  "sentencepiece",
+  "setproctitle",
+  "setuptools>=77.0.3,<81.0.0; python_full_version >= '3.12'",
+  "six>=1.16.0; python_full_version >= '3.12'",
+  "starlette>=1.0.1",
+  "tiktoken>=0.6.0",
+  "tilelang==0.1.9",
+  "tokenizers>=0.21.1",
+  "tokenspeed-mla==0.1.2; sys_platform == 'linux'",
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
+  "torchcodec>=0.14",
+  "torchvision==0.26.0",
+  "tqdm",
+  "transformers>=5.5.3",
+  "typing-extensions>=4.10",
+  "watchfiles",
+  "xgrammar>=0.2.1,<1.0.0; platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-python"
+version = "0.6.13"
+provides-extra = ["cu13"]
+requires-dist = [
+  "apache-tvm-ffi",
+  "click",
+  "cuda-tile==1.1.0",
+  "einops",
+  "ninja",
+  "numpy",
+  "nvidia-cudnn-frontend",
+  "nvidia-cutlass-dsl==4.5.2",
+  "nvidia-cutlass-dsl[cu13]==4.5.2; extra == 'cu13'",
+  "nvidia-ml-py",
+  "packaging",
+  "requests",
+  "tabulate",
+  "torch",
+  "tqdm",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-cubin"
+version = "0.6.13"
+requires-dist = []
+
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]

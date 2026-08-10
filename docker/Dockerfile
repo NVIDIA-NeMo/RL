@@ -66,11 +66,14 @@ apt-get install -y --no-install-recommends \
     jq \
     curl \
     git \
+    ninja-build \
     rsync \
     wget \
     less \
     vim \
     ccache \
+    nvidia-cuda-dev \
+    libcublas-dev-13-0
 
 # Nsight
 apt install -y --no-install-recommends gnupg
@@ -143,6 +146,12 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
+ARG WARMUP_FLASHINFER_KERNELS=1
+ARG FLASHINFER_SOURCE_URL=https://github.com/TomerBN-Nvidia/flashinfer.git
+ARG FLASHINFER_SOURCE_REF=super_vl_rl_v0.6.13
+ARG FLASHINFER_FMHA_ARTIFACT_PATH=e3a8eba02eb19f4485652f84f5095524350246b5/fmha/trtllm-gen/
+ARG FLASHINFER_FMHA_MANIFEST_SHA256=03e0f29f970de40b0fd3c6025a16a39fb6c9af2a6549a63da73cf3da8494e658
+ARG FLASHINFER_FMHA_MANIFEST_ENTRIES=19227
 
 # Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
@@ -156,6 +165,9 @@ ARG TRTLLM_BUILD_JOBS=24
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
+ENV FLASHINFER_FMHA_ARTIFACT_PATH=${FLASHINFER_FMHA_ARTIFACT_PATH}
+ENV FLASHINFER_FMHA_MANIFEST_SHA256=${FLASHINFER_FMHA_MANIFEST_SHA256}
+ENV FLASHINFER_FMHA_MANIFEST_ENTRIES=${FLASHINFER_FMHA_MANIFEST_ENTRIES}
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
@@ -184,6 +196,7 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY --from=nemo-rl tools/warmup-custom-flashinfer.py ./tools/warmup-custom-flashinfer.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -334,6 +347,9 @@ FROM hermetic AS release
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
+ARG WARMUP_FLASHINFER_KERNELS=1
+ARG FLASHINFER_SOURCE_URL=https://github.com/TomerBN-Nvidia/flashinfer.git
+ARG FLASHINFER_SOURCE_REF=super_vl_rl_v0.6.13
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
@@ -391,6 +407,25 @@ if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+fi
+
+if [[ -n "${WARMUP_FLASHINFER_KERNELS:-}" && -z "${SKIP_VLLM_BUILD:-}" ]]; then
+    FLASHINFER_SOURCE_DIR=$(mktemp -d /tmp/flashinfer-source.XXXXXX)
+    export FLASHINFER_SOURCE_DIR
+    trap 'rm -rf "${FLASHINFER_SOURCE_DIR}"' EXIT
+    git clone "${FLASHINFER_SOURCE_URL}" "${FLASHINFER_SOURCE_DIR}"
+    git -C "${FLASHINFER_SOURCE_DIR}" checkout "${FLASHINFER_SOURCE_REF}"
+    git -C "${FLASHINFER_SOURCE_DIR}" submodule update --init --recursive --depth=1
+
+    WARMED=0
+    while IFS= read -r venv_python; do
+        if "${venv_python}" -c 'import flashinfer, flashinfer_cubin, flashinfer_jit_cache' >/dev/null 2>&1; then
+            echo "Warming FlashInfer kernels in ${venv_python}"
+            "${venv_python}" /opt/nemo-rl/tools/warmup-custom-flashinfer.py
+            WARMED=$((WARMED + 1))
+        fi
+    done < <(find "${NEMO_RL_VENV_DIR}" -mindepth 3 -maxdepth 3 -path '*/bin/python' -type f | sort)
+    test "${WARMED}" -gt 0
 fi
 EOF
 
