@@ -83,6 +83,60 @@ ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-20}
 # scenario -- a bounded failure with nothing to fall back to. Defined once because the
 # pre-flight check below has to agree with it.
 GPUS=2
+# How long to wait for device memory to come back: on entry, because the previous test in
+# the lane may still be releasing it, and on exit, so this test cannot poison the next one.
+GPU_WAIT_S=${GPU_WAIT_S:-120}
+GPU_SETTLE_S=${GPU_SETTLE_S:-60}
+
+# GPUs whose used memory is low enough to place a worker on.
+free_gpu_count() {
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+        | awk -v lim=1024 '$1 <= lim' | wc -l
+}
+
+# Waits up to $1 seconds for $GPUS of them; non-zero if the budget runs out.
+#
+# Sampling once is wrong, because SIGKILL does not free device memory synchronously: the
+# driver tears the context down, and a worker holding tens of GB stays visible to
+# nvidia-smi for seconds after it dies. The lane runs tests back to back -- run_test is
+# just `time "$@"` -- so a single sample reads the previous test's corpse. That is exactly
+# what broke GitHub CI: chaos-idle passed at 19:51:42, its cleanup killed the
+# VLLM::EngineCore it had orphaned on purpose, and chaos-serving sampled 280ms later,
+# found GPU 0 still holding 50470MiB, and refused to start without running a single line
+# of product code. It had always passed on the cluster only because submit-ci.sh sleeps 5s
+# between tests -- and that hygiene belongs here, in the test that makes the mess, not in
+# one particular driver that happens to run it.
+wait_for_free_gpus() {
+    local budget_s=$1 free
+    for _ in $(seq 1 "$budget_s"); do
+        free=$(free_gpu_count) || free=0
+        if (( free >= GPUS )); then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Refuse to start on a dirty machine rather than misreport a leftover allocation as a
+# failure of the code under test.
+#
+# Counts how many GPUs are free and requires enough of them, rather than requiring that
+# EVERY GPU on the host is free. The latter is an OR that gets likelier to trip the bigger
+# the machine: this test pins itself to $GPUS GPUs, so on an 8-GPU CI runner one unrelated
+# process on one GPU would abort it with six sitting idle -- a false failure that says
+# nothing about the code. It still catches the case it was written for, a previous test in
+# the lane leaking a VLLM::EngineCore, because that drops the free count below $GPUS.
+#
+# This runs BEFORE the training launch. It used to run after, which meant a refusal was
+# not a refusal: the driver was already up, the EXIT trap shot it back down, and the log
+# carried a bare "line 129: <pid> Killed" from bash job control on top of the real message.
+if command -v nvidia-smi >/dev/null 2>&1 && ! wait_for_free_gpus "$GPU_WAIT_S"; then
+    echo "[chaos] FAIL: need $GPUS free GPUs, still $(free_gpu_count) after ${GPU_WAIT_S}s; clean up before running"
+    nvidia-smi --query-gpu=index,memory.used --format=csv
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+    exit 1
+fi
 
 rm -rf "$EXP_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
@@ -140,28 +194,14 @@ cleanup() {
     ray stop --force >/dev/null 2>&1 || true
     pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
     pkill -9 -f "megatron_policy_worker" 2>/dev/null || true
+    # Signalling is not reclaiming: wait for the memory to actually come back before
+    # handing the machine to the next test, which starts with no gap at all.
+    if command -v nvidia-smi >/dev/null 2>&1 && ! wait_for_free_gpus "$GPU_SETTLE_S"; then
+        echo "[chaos] WARN: ${GPU_SETTLE_S}s after cleanup, fewer than $GPUS GPUs are free:"
+        nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+    fi
 }
 trap cleanup EXIT
-
-# Same reasoning in reverse: refuse to start on a dirty machine rather than misreport a
-# leftover allocation as a failure of the code under test.
-#
-# Counts how many GPUs are free and requires enough of them, rather than requiring that
-# EVERY GPU on the host is free. The latter is an OR that gets likelier to trip the bigger
-# the machine: this test pins itself to $GPUS GPUs, so on an 8-GPU CI runner one unrelated
-# process on one GPU would abort it with six sitting idle -- a false failure that says
-# nothing about the code. It still catches the case it was written for, a previous test in
-# the lane leaking a VLLM::EngineCore, because that drops the free count below $GPUS.
-if command -v nvidia-smi >/dev/null 2>&1; then
-    FREE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
-           | awk -v lim=1024 '$1 <= lim' | wc -l)
-    if (( FREE < GPUS )); then
-        echo "[chaos] FAIL: need $GPUS free GPUs, found $FREE; clean up before running"
-        nvidia-smi --query-gpu=index,memory.used --format=csv
-        nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-        exit 1
-    fi
-fi
 
 echo "[chaos] training pid=$TRAIN_PID, waiting for the first train step..."
 for _ in $(seq 1 120); do
