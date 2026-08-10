@@ -118,6 +118,21 @@ class PromptGroupSampler(Protocol):
 
 
 @runtime_checkable
+class TwoPhaseAdmissionSampler(Protocol):
+    """Sampler whose blocking gate is separate from its durable admission.
+
+    Waiting happens outside the checkpoint barrier. The non-blocking commit is
+    performed atomically with dataloader advancement and ledger reservation.
+    """
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None: ...
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]: ...
+
+
+@runtime_checkable
 class CheckpointDispatchSampler(Protocol):
     """Sampler that can reconstruct dispatch state from restored groups."""
 
@@ -160,10 +175,32 @@ class BaseSampler(abc.ABC):
         self._dispatch_index: int = resume_from_step - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
-    @abc.abstractmethod
-    async def admit(
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        """Wait for and atomically claim one prompt-batch admission."""
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self.commit_admission(trainer_version=trainer_version_fn())
+
+    async def wait_until_admissible(
         self, *, trainer_version_fn: Callable[[], int]
-    ) -> Optional[int]: ...
+    ) -> None:
+        """Wait until one batch may be admitted; ungated by default."""
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]:
+        """Claim one already-admissible batch; unstamped by default."""
+        return None
+
+    def restore_dispatch_state(
+        self,
+        *,
+        current_train_weight: int,
+        restored_target_steps: list[Optional[int]],
+        groups_per_step: int,
+    ) -> None:
+        """Validate the default unstamped checkpoint representation."""
+        if any(target is not None for target in restored_target_steps):
+            raise ValueError(
+                f"{type(self).__name__} cannot restore stamped target steps"
+            )
 
     # ── train-pump side ──────────────────────────────────────────────────
     @abc.abstractmethod
@@ -204,19 +241,6 @@ class BaseSampler(abc.ABC):
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
-
-    def restore_dispatch_state(
-        self,
-        *,
-        current_train_weight: int,
-        restored_target_steps: list[Optional[int]],
-        groups_per_step: int,
-    ) -> None:
-        """Validate the default unstamped checkpoint representation."""
-        if any(target is not None for target in restored_target_steps):
-            raise ValueError(
-                f"{type(self).__name__} cannot restore stamped target steps"
-            )
 
     # ── shared helpers ───────────────────────────────────────────────────
     def _eviction_window(self) -> int:
@@ -361,9 +385,20 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]:
+        if self._dispatch_index >= trainer_version + self._gate_window:
+            raise RuntimeError(
+                "sampler admission was committed before its gate opened: "
+                f"dispatch_index={self._dispatch_index}, "
+                f"trainer_version={trainer_version}, "
+                f"gate_window={self._gate_window}"
+            )
         self._dispatch_index += 1
         return self._stamp()
 
@@ -465,7 +500,7 @@ class InOrderSampler(_GatedSampler):
         if any(target is None for target in restored_target_steps):
             raise ValueError("restored InOrder groups must have target_step values")
 
-        target_steps = [
+        target_steps: list[int] = [
             target for target in restored_target_steps if target is not None
         ]
         counts: Counter[int] = Counter(target_steps)

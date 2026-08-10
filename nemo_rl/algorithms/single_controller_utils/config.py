@@ -111,10 +111,24 @@ class RolloutCheckpointConfig(BaseModel, extra="allow"):
     after step zero, a snapshot is skipped until the matching trainer step has
     been made durable by a full-checkpoint trigger such as
     ``checkpointing.save_period``.
+
+    ``restore_mode="latest"`` restores the newest compatible rollout snapshot.
+    ``restore_mode="trainer_checkpoint"`` deliberately ignores newer rollout
+    snapshots and falls back to the selected durable trainer checkpoint. If no
+    trainer checkpoint exists, it starts from the initial model/dataloader state
+    and begins a new bootstrap snapshot lineage.
+    ``restore_mode="none"`` still resumes trainer weights, optimizer, and step
+    counters, but skips all rollout, replay, ledger, and dataloader recovery.
+    Use it for an intentional dataset or rollout-semantics transition. InOrder
+    is the default Single Controller sampler and supports replay recovery, so
+    ``checkpointing.enabled=true`` with either restoring mode requires
+    ``data_plane.checkpointing_enabled=true``. Select ``none`` explicitly for
+    trainer-only resume without native TQ checkpointing.
     """
 
     interval_s: Optional[float] = Field(default=None, gt=0)
     keep_latest_k: int = Field(default=2, ge=1)
+    restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -153,6 +167,17 @@ def validate_sampler_buffer_capacity(
         )
 
 
+def required_rollout_recovery_capacity(
+    *, num_prompts_per_step: int, min_groups_for_streaming_train: int
+) -> int:
+    """Return capacity that prevents a partial restored buffer deadlock.
+
+    A restored population below the trainer's streaming threshold must leave
+    enough free capacity for one complete fresh dataloader batch.
+    """
+    return num_prompts_per_step + min_groups_for_streaming_train - 1
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     async_config = master_config.async_rl
@@ -173,6 +198,27 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             f"grpo.num_prompts_per_step ({num_prompts_per_step}) so one "
             "dataloader batch can own capacity before durable reservation"
         )
+    if (
+        master_config.token_capture.enabled
+        and master_config.checkpointing["enabled"]
+    ):
+        recovery_capacity = required_rollout_recovery_capacity(
+            num_prompts_per_step=num_prompts_per_step,
+            min_groups_for_streaming_train=(
+                async_config.min_groups_for_streaming_train
+            ),
+        )
+        if async_config.max_buffered_rollouts < recovery_capacity:
+            raise ValueError(
+                "token-capture rollout recovery requires "
+                "async_rl.max_buffered_rollouts "
+                f"({async_config.max_buffered_rollouts}) to be >= "
+                "grpo.num_prompts_per_step + "
+                "async_rl.min_groups_for_streaming_train - 1 "
+                f"({recovery_capacity}); otherwise a partially restored buffer "
+                "can leave the trainer below its streaming threshold while the "
+                "rollout pump waits for capacity for one complete prompt batch"
+            )
 
     rl_step_samples = (
         num_prompts_per_step * master_config.grpo["num_generations_per_prompt"]

@@ -190,9 +190,7 @@ class TestFactory:
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
 
-    def test_factory_rejects_config_implementation_capability_drift(
-        self, monkeypatch
-    ):
+    def test_factory_rejects_config_implementation_capability_drift(self, monkeypatch):
         monkeypatch.setattr(
             WindowedSampler,
             "supports_buffer_checkpoint",

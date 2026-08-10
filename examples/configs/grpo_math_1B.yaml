@@ -498,7 +498,9 @@ data_plane:
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   # SingleController only: save native TQ state. Required when trainer
   # checkpointing is enabled with a replay-checkpoint-capable sampler;
-  # supported samplers restore from metadata-only replay indexes.
+  # supported samplers restore from metadata-only replay indexes. InOrder is
+  # checkpoint-capable and is the SingleController default. For intentional
+  # trainer-only resume, set rollout_checkpointing.restore_mode=none.
   checkpointing_enabled: false
   global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
