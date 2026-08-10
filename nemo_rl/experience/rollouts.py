@@ -22,7 +22,7 @@ import statistics
 import warnings
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import ray
@@ -50,13 +50,16 @@ from nemo_rl.data.multimodal_utils import (
     extract_input_images_from_responses_messages,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.interfaces import (
-    EnvironmentInterface,
-    EnvironmentReturn,
-)
+from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    TaskMetricSamples,
+    calculate_single_metric,
+    collect_nemo_gym_metric_samples,
+    pct,
+    summarize_nemo_gym_metric_samples,
+)
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
@@ -1361,6 +1364,7 @@ class RolloutGroupResult:
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
     task_index: Optional[int] = None
+    nemo_gym_metric_samples_by_task: TaskMetricSamples = field(default_factory=dict)
 
 
 def _aggregate_multi_turn_rollout_metrics(
@@ -1671,6 +1675,7 @@ class NemoGymRolloutResult:
     rollout_metrics: dict[str, Any]
     # Stable prompt identity used by the async collector; absent for sync callers.
     task_index: Optional[int]
+    nemo_gym_metric_samples_by_task: TaskMetricSamples = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2665,6 +2670,60 @@ def _postprocess_single_nemo_gym_group(
             # / batch_size,
         }
 
+        task_names = list(input_batch.get("task_name", []))
+        if task_names and len(task_names) != batch_size:
+            raise ValueError(
+                "NeMo-Gym task_name count does not match result count: "
+                f"{len(task_names)} != {batch_size}"
+            )
+        task_to_indices: dict[str, list[int]] = defaultdict(list)
+        for index, task_name in enumerate(task_names):
+            task_to_indices[str(task_name)].append(index)
+
+        for task_name, indices in task_to_indices.items():
+            task_sample_metrics = [all_sample_metrics[index] for index in indices]
+            task_turn_counts = [m["turn_count"] for m in task_sample_metrics]
+            task_max_gen_tokens = [
+                m["max_gen_tokens_per_turn"] for m in task_sample_metrics
+            ]
+            task_metrics = {
+                **calculate_single_metric(
+                    [m["total_reward"] for m in task_sample_metrics],
+                    len(indices),
+                    "total_reward",
+                ),
+                **calculate_single_metric(
+                    task_turn_counts, len(indices), "turns_per_sample"
+                ),
+                "turns_per_sample/p95": pct(task_turn_counts, 95),
+                "turns_per_sample/p99": pct(task_turn_counts, 99),
+                **calculate_single_metric(
+                    [m["total_tokens"] for m in task_sample_metrics],
+                    len(indices),
+                    "total_tokens_per_sample",
+                ),
+                **calculate_single_metric(
+                    [m["assistant_tokens"] for m in task_sample_metrics],
+                    len(indices),
+                    "gen_tokens_per_sample",
+                ),
+                **calculate_single_metric(
+                    task_max_gen_tokens,
+                    len(indices),
+                    "max_gen_tokens_per_turn",
+                ),
+                "max_gen_tokens_per_turn/p95": pct(task_max_gen_tokens, 95),
+                "natural_termination_rate": sum(
+                    not m["hit_max_tokens"] for m in task_sample_metrics
+                )
+                / len(indices),
+                "truncation_rate": sum(m["hit_max_tokens"] for m in task_sample_metrics)
+                / len(indices),
+            }
+            rollout_metrics.update(
+                {f"{task_name}_{name}": value for name, value in task_metrics.items()}
+            )
+
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
@@ -2699,6 +2758,26 @@ def _postprocess_single_nemo_gym_group(
                 )
 
         rollout_metrics.update(per_agent_metrics)
+
+    full_results = [result["full_result"] for result in results]
+    all_message_logs = [result["message_log"] for result in results]
+    all_nemo_gym_samples = collect_nemo_gym_metric_samples(
+        full_results, message_logs=all_message_logs
+    )
+    rollout_metrics.update(summarize_nemo_gym_metric_samples(all_nemo_gym_samples))
+    nemo_gym_metric_samples_by_task: TaskMetricSamples = {}
+    for task_name, indices in task_to_indices.items():
+        task_samples = collect_nemo_gym_metric_samples(
+            [full_results[index] for index in indices],
+            message_logs=[all_message_logs[index] for index in indices],
+        )
+        nemo_gym_metric_samples_by_task[task_name] = task_samples
+        rollout_metrics.update(
+            summarize_nemo_gym_metric_samples(
+                task_samples,
+                prefix=f"{task_name}_rollout_metrics/nemo_gym",
+            )
+        )
 
     # Necessary for downstream nemo rl logging/printing.
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
@@ -2739,6 +2818,8 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
+    if task_names:
+        final_batch["task_name"] = task_names
     # Env/agent mask flag: flagged samples are dropped from the loss but still
     # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
@@ -2817,4 +2898,5 @@ def _postprocess_single_nemo_gym_group(
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
         task_index=group_task_index,
+        nemo_gym_metric_samples_by_task=nemo_gym_metric_samples_by_task,
     )

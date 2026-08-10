@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest.mock as mock
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.weights import UNWEIGHTED_TASK_NAME
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -1777,7 +1779,10 @@ class TestAsyncTrajectoryCollector:
 
         assert len(replay_buffer.add.calls) == 2
         for group_index, call in enumerate(replay_buffer.add.calls):
-            trajectory_group, generation_weight, target = call
+            trajectory_group, generation_weight, target, task_name = call
+            # These batches carry no task_name column, so the collector falls
+            # back to the unweighted label rather than dropping attribution.
+            assert task_name == UNWEIGHTED_TASK_NAME
             assert trajectory_group["batch"] is batches[group_index]
             assert (
                 trajectory_group["rollout_metrics"]["metric"]
@@ -2562,3 +2567,113 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+class TestReplayBufferPerTaskGating:
+    """Per-task release gating for weighted multi-dataset training.
+
+    Without a quota the buffer releases whichever groups arrive first, which
+    over-represents fast tasks and starves slow ones. With a quota it must hold
+    the batch until every task has filled its slots.
+    """
+
+    def _add(self, buffer, task_name, count, target=0, version=0):
+        for i in range(count):
+            buffer.add(
+                {"batch": {"data": f"{task_name}_{i}"}, "rollout_metrics": {}},
+                version,
+                target,
+                task_name,
+            )
+
+    def test_gate_holds_until_every_task_fills_its_slots(self):
+        buffer = ReplayBufferImpl(max_size=64)
+        quota = {"fast": 24, "slow": 8}
+
+        self._add(buffer, "fast", 24)
+        self._add(buffer, "slow", 4)
+
+        # 28 groups buffered, but "slow" is 4 short of its quota.
+        assert not buffer.has_complete_batch(0, 32, max_age_steps=1, quota=quota)
+        assert buffer.sample(32, 0, max_age_steps=1, quota=quota) is None
+
+        self._add(buffer, "slow", 4)
+        assert buffer.has_complete_batch(0, 32, max_age_steps=1, quota=quota)
+
+    def test_released_batch_matches_quota_not_arrival_order(self):
+        """The regression test for the whole feature: extra fast-task groups
+        must not displace slow-task groups in the released batch."""
+        buffer = ReplayBufferImpl(max_size=64)
+        quota = {"fast": 24, "slow": 8}
+
+        # Fast task overshoots and arrives entirely before the slow task.
+        self._add(buffer, "fast", 30)
+        self._add(buffer, "slow", 8)
+
+        sampled = buffer.sample(32, 0, max_age_steps=1, quota=quota)
+        assert sampled is not None
+        counts = Counter(
+            traj["batch"]["data"].rsplit("_", 1)[0] for traj in sampled["trajectories"]
+        )
+        assert counts == quota
+
+    def test_unquoted_sample_is_first_come_first_served(self):
+        """Without a quota the original behavior is preserved."""
+        buffer = ReplayBufferImpl(max_size=64)
+        self._add(buffer, "fast", 30)
+        self._add(buffer, "slow", 2)
+
+        sampled = buffer.sample(32, 0, max_age_steps=1)
+        assert sampled is not None
+        assert len(sampled["trajectories"]) == 32
+
+    def test_task_deficits_report_shortfall_per_task(self):
+        buffer = ReplayBufferImpl(max_size=64)
+        quota = {"fast": 24, "slow": 8}
+        self._add(buffer, "fast", 24)
+        self._add(buffer, "slow", 3)
+
+        deficits = buffer.get_task_deficits(0, quota, max_age_steps=1)
+        assert deficits == {"fast": 0, "slow": 5}
+
+    def test_task_names_survive_state_dict_round_trip(self):
+        """If task_names is dropped from the checkpoint the gate silently
+        degrades to first-come-first-served after a resume."""
+        buffer = ReplayBufferImpl(max_size=64)
+        self._add(buffer, "fast", 3)
+        self._add(buffer, "slow", 2)
+
+        state = buffer.state_dict()
+        assert state["task_names"] == ["fast"] * 3 + ["slow"] * 2
+
+        restored = ReplayBufferImpl(max_size=64)
+        restored.load_state_dict(state)
+        assert restored.task_names == ["fast"] * 3 + ["slow"] * 2
+
+    def test_legacy_checkpoint_without_task_names_is_rejected_when_weighted(self):
+        """A pre-gating checkpoint restored into a weighted run must fail loudly
+        rather than stall forever on task names it will never see."""
+        buffer = ReplayBufferImpl(max_size=64)
+        legacy_state = {
+            "trajectories": [
+                {"batch": {"data": f"t{i}"}, "rollout_metrics": {}} for i in range(4)
+            ],
+            "trajectory_versions": [0, 0, 0, 0],
+            "target_weight_versions": [0, 0, 0, 0],
+            "last_target_weight_already_generated": -1,
+            "max_size": 64,
+        }
+        buffer.load_state_dict(legacy_state)
+
+        with pytest.raises(ValueError, match="no task labels"):
+            buffer.has_complete_batch(0, 4, max_age_steps=1, quota={"fast": 4})
+
+    def test_removal_keeps_parallel_lists_aligned(self):
+        """Task attribution must stay aligned through eviction."""
+        buffer = ReplayBufferImpl(max_size=64)
+        self._add(buffer, "fast", 3)
+        self._add(buffer, "slow", 3)
+
+        buffer._remove_indices([0, 4])
+        buffer._assert_parallel_lengths()
+        assert buffer.task_names == ["fast", "fast", "slow", "slow"]

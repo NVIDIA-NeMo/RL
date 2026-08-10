@@ -1,0 +1,53 @@
+# Smoke test for weighted multi-dataset mixing (branch laurad/multienv).
+#
+# gsm8k:DAPOMath17K = 3:1, so num_prompts_per_step=4 splits exactly into
+# {gsm8k: 3, DAPOMath17K: 1} with no remainder ambiguity. Both datasets are
+# already in the hsg2 HF cache, share env_name=math, and emit the
+# {messages: [user, assistant], task_name} shape math_hf_data_processor wants.
+#
+# Inherits grpo_math_1B.yaml directly (not grpo_smoke.yaml) to keep the
+# data._override_ resolution to a single inheritance hop.
+defaults: grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_num_steps: 10
+  val_period: -1
+  # Refused alongside weights by grpo.setup; pinned false so the smoke run
+  # exercises the weighted path rather than the guardrail.
+  use_dynamic_sampling: false
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 16   # = num_prompts_per_step * num_generations_per_prompt
+  train_micro_batch_size: 8     # logprob_batch_size follows via ${policy.train_micro_batch_size}
+
+data:
+  _override_: true  # replace the inherited data config rather than merging into it
+
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+
+  # Weighted mixing requires one dataloader per task.
+  use_multiple_dataloader: true
+  # Read unconditionally at grpo.py:429, but ignored once weights are set --
+  # per-task batch sizes come from the quota instead.
+  num_prompts_per_dataloader: 2
+  custom_dataloader: nemo_rl.data.dataloader.weighted_custom_dataloader
+
+  train:
+    - dataset_name: gsm8k
+      weight: 3.0
+    - dataset_name: DAPOMath17K
+      weight: 1.0
+
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"

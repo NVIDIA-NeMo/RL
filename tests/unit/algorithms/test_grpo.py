@@ -54,6 +54,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
+    task_sampling_metrics,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -66,17 +67,12 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.interfaces import (
-    EnvironmentInterface,
-    EnvironmentReturn,
-)
+from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
-from tests.unit.algorithms.utils import (
-    create_mock_batch,
-)
+from tests.unit.algorithms.utils import create_mock_batch
 
 
 def _mock_policy_generation() -> MagicMock:
@@ -4574,6 +4570,21 @@ class TestAggregateRolloutMetrics:
         assert result["total_turns"] == 45
         assert result["accuracy"] == pytest.approx(0.8)
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
+
+
+def test_task_sampling_metrics_reports_quota_and_actual_share():
+    metrics = task_sampling_metrics(
+        ["env_a", "env_a", "env_a", "env_b"],
+        quota={"env_a": 3, "env_b": 1},
+        max_deficits={"env_a": 0, "env_b": 1},
+    )
+
+    assert metrics["env_a_sampling/configured_quota"] == 3
+    assert metrics["env_a_sampling/sampled_prompt_groups"] == 3
+    assert metrics["env_a_sampling/sampled_share"] == 0.75
+    assert metrics["env_b_sampling/configured_share"] == 0.25
+    assert metrics["env_b_sampling/quota_deficit"] == 0
+    assert metrics["env_b_sampling/max_quota_deficit_while_waiting"] == 1
 
 
 def _cfg(

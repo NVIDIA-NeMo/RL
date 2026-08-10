@@ -31,6 +31,14 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    # Relative sampling weight for this dataset within a training step.
+    # All-or-nothing: if any train entry sets `weight`, every non-evaluation
+    # entry must. Weights are normalized across non-evaluation entries and
+    # turned into exact per-step prompt counts. Requires use_multiple_dataloader.
+    weight: NotRequired[float]
+    # When true, the dataset is loaded and registered for validation but
+    # contributes zero training prompts and is excluded from normalization.
+    evaluation_only: NotRequired[bool]
 
 
 class PreferenceDatasetConfig(TypedDict):

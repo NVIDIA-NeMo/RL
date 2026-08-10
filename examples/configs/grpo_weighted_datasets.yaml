@@ -1,0 +1,51 @@
+# GRPO Algorithm Configuration -- weighted multi-dataset training.
+#
+# Each training step draws prompts from every dataset in the configured
+# proportions. With num_prompts_per_step=32 and the weights below, every step is
+# exactly 24 OpenMathInstruct-2 prompts and 8 DeepScaler prompts.
+#
+# See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#weighted-dataset-mixing
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  # Dynamic sampling drops zero-std prompt groups without regard to task, which
+  # would skew the trained mixture away from the weights below. The two cannot
+  # be combined; setup raises if this is enabled alongside weights.
+  use_dynamic_sampling: false
+
+data:
+  _override_: true # override the data config instead of merging with it
+
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+  shuffle: true
+  num_workers: 1
+
+  # Weighted mixing requires one dataloader per task.
+  use_multiple_dataloader: true
+  # Ignored when weights are set: per-task batch sizes come from the weights.
+  num_prompts_per_dataloader: 16
+  # Built-in mixer that concatenates one batch from each task dataloader.
+  custom_dataloader: nemo_rl.data.dataloader.weighted_custom_dataloader
+
+  # dataset
+  # `weight` is all-or-nothing: if any train entry sets it, every entry that is
+  # not evaluation_only must set it too. Weights are relative and normalized
+  # across non-evaluation entries, so 3.0/1.0 is the same mixture as 0.75/0.25.
+  train:
+    - dataset_name: OpenMathInstruct-2
+      weight: 3.0
+    - dataset_name: DeepScaler
+      weight: 1.0
+    # Loaded and evaluated, but contributes no training prompts and is excluded
+    # from weight normalization.
+    - dataset_name: AIME2024
+      weight: 0.0
+      evaluation_only: true
+
+  # default settings for all datasets
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
