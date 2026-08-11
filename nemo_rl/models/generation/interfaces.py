@@ -418,6 +418,6 @@ class GenerationInterface(ABC):
         """
         return {}
 
-    def get_latest_logger_metrics(self) -> dict[str, Any]:
-        """Get a bounded latest-value snapshot for frequent telemetry polls."""
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume a bounded latest-value snapshot for frequent telemetry polls."""
         return self.get_logger_metrics()
