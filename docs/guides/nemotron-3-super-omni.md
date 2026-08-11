@@ -21,7 +21,7 @@ handoff:
 | Train global batch size | 4096 |
 | Maximum sequence length | 16,384 |
 | Async policy lag | at most one version |
-| MTP and speculative decoding | disabled |
+| MTP and speculative decoding | disabled (see the MTP variants below) |
 
 The recipe enables raw vLLM log probabilities, truncated importance sampling
 in the range 0.5 to 2.0, in-flight weight updates, and the existing NeMo RL
@@ -30,6 +30,36 @@ policy-to-vLLM refit path.
 The visual encoder and projection remain trainable. The sound encoder and
 projection are frozen for this image-and-text workload. The model's own chat
 template is passed to both the Hugging Face tokenizer and the vLLM chat server.
+
+## MTP variants
+
+Two recipes inherit the base above and add Multi-Token Prediction. Both keep
+its parallelism, data, and batch settings, so the table applies unchanged
+apart from the rows below.
+
+| Recipe | MTP head | Speculative decoding |
+|---|---|---|
+| [`...-async-gym.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml) | absent | disabled |
+| [`...-async-gym-mtp.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.yaml) | trained (`mtp_loss_scaling_factor: 0.1`) | disabled |
+| [`...-async-gym-mtp-specdec.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp-specdec.v1.yaml) | trained | MTP drafter, 5 tokens |
+
+The checkpoint ships one physical MTP layer, so `mtp_num_layers: 1` with
+`mtp_use_repeated_layer: false` maps directly onto it. `mtp_detach_heads: true`
+keeps MTP gradients out of the backbone, and also tags the MTP parameters into
+their own gradient-norm group, so they are clipped separately rather than
+against the backbone's norm. Set `mtp_loss_scaling_factor: 0.0` to keep the
+head present for speculative decoding without training it.
+
+The speculative-decoding variant additionally sets `mamba_cache_mode: align`.
+Super is a hybrid Mamba model, so the recurrent SSM state has to roll back
+when draft tokens are rejected; the default (`none`) does not do that.
+
+Point the launcher at either recipe with `CONFIG_PATH`:
+
+```bash
+CONFIG_PATH=examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.yaml \
+bash examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh
+```
 
 ## Launch
 
