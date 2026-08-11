@@ -651,7 +651,12 @@ def sft_train(
             else:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1
