@@ -102,6 +102,7 @@ After all subagents return: merge results and deduplicate (same file+line+issue 
 - Cross-reference existing review comments (PR mode only, from step 4) to avoid duplicating points already raised by other reviewers
 - Compare any new component to its nearest existing analog in the repo (a new worker group ↔ `lm_policy.py`, a new advantage estimator ↔ the existing estimators, a new config block ↔ `MasterConfig`) and flag missing affordances: backend dispatch, override hooks (e.g. `resolve_policy_worker_cls`), guards/validation, type annotations, return-shape consistency. "It works for the shipped recipe" is not enough if it silently diverges from the sibling's contract
 - Also apply any patterns from review memory files
+- If the diff touches `tests/test_suites/` or `examples/configs/recipes/`, work through the checklist at the end of the `testing` skill. The unit tests already cover naming, budgets, and declarations, so do not re-derive those — the reviewer's job is the part they cannot check: whether the test catches something no existing test does, whether it is worth its GPU-hours (nightly costs 7× its per-run price every week), whether feature coverage belongs on the vehicle model instead, and whether a linked W&B run shows it converging
 - Categorize findings:
   - **[BUG]** — Logic errors, null refs, race conditions, syntax errors
   - **[TEST]** — Missing or insufficient test coverage

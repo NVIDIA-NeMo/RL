@@ -173,6 +173,29 @@ CONTAINER=... bash tests/run_functional_in_docker.sh tests/functional/sft.sh
 
 The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docker.md).
 
+## Suite Tests
+
+The nightly, release and performance suites are multi-node convergence and
+throughput runs on Slurm, not something you run locally. Each is a pair: a
+recipe YAML under `examples/configs/recipes/<family>/` and a driver script at
+the mirrored path under `tests/test_suites/<family>/`.
+
+A driver declares which suite it belongs to in its `CONFIG` block, so listing a
+suite means reading the declarations:
+
+```sh
+tools/list-suites nightly
+tools/list-suites --gpu-hours release    # per-test and total GPU hours
+tools/list-suites --suites               # every suite name it understands
+```
+
+Adding one is governed by conventions that a unit test cannot check on its own —
+what a nightly slot costs, how much coverage a model is entitled to, which model
+new feature tests belong on. Those live in the `testing` skill
+(`.agents/contributor-skills/testing/`); see
+[tests/test_suites/README.md](../tests/test_suites/README.md) for the entry
+point.
+
 ## Bisecting Failing Tests
 
 > [!IMPORTANT]
