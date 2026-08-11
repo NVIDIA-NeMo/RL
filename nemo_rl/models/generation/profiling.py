@@ -23,7 +23,7 @@ ROLLOUT_PROFILER_CLASS_ENV = "NRL_ROLLOUT_PROFILER_CLASS"
 
 
 class RolloutProfiler(Protocol):
-    """Lifecycle contract for profiling complete synchronous rollouts."""
+    """Lifecycle contract for profiling complete rollouts."""
 
     def begin_engine_initialization(self) -> Any: ...
 
@@ -46,7 +46,7 @@ def load_rollout_profiler(*, rank: int) -> RolloutProfiler | None:
     the generation-worker rank, and validated against :class:`RolloutProfiler`.
 
     Args:
-        rank: Dense rank of the synchronous generation worker.
+        rank: Dense rank of the vLLM GPU worker.
 
     Returns:
         The configured profiler, or ``None`` when profiling is disabled.
@@ -81,22 +81,14 @@ def validate_rollout_profiler_topology(
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
     expert_parallel_size: int,
-    async_engine: bool,
 ) -> None:
-    """Reject profiler configurations whose GPU work runs outside this actor."""
+    """Reject profiler configurations not covered by the worker integration."""
     if not class_path:
         return
-    if (
-        tensor_parallel_size != 1
-        or pipeline_parallel_size != 1
-        or expert_parallel_size != 1
-    ):
+    if tensor_parallel_size < 1:
+        raise ValueError("Rollout profiling requires tensor_parallel_size >= 1")
+    if pipeline_parallel_size != 1 or expert_parallel_size != 1:
         raise ValueError(
-            "Synchronous rollout profiling currently requires "
-            "tensor_parallel_size=1, pipeline_parallel_size=1, and "
-            "expert_parallel_size=1"
-        )
-    if async_engine:
-        raise ValueError(
-            "Synchronous rollout profiling currently requires async_engine=false"
+            "Rollout profiling currently requires pipeline_parallel_size=1 "
+            "and expert_parallel_size=1"
         )
