@@ -1120,8 +1120,8 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
-    def get_vllm_logger_metrics(self) -> dict[str, Any]:
-        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+    def _collect_vllm_logger_metrics(self, worker_method_name: str) -> dict[str, Any]:
+        """Collect one logger payload from every model-owner vLLM worker."""
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
         if not self.cfg["vllm_cfg"].get("async_engine", False):
@@ -1132,7 +1132,7 @@ class VllmGeneration(GenerationInterface):
         for dp_idx in range(self.worker_group.dp_size):
             worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
             future = self.worker_group.run_single_worker_single_data(
-                "get_vllm_logger_metrics",
+                worker_method_name,
                 worker_idx=worker_idx,
             )
             futures.append(future)
@@ -1166,6 +1166,14 @@ class VllmGeneration(GenerationInterface):
 
         return vllm_logger_metrics
 
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect vLLM metric histories for step-level performance reports."""
+        return self._collect_vllm_logger_metrics("get_vllm_logger_metrics")
+
+    def get_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect bounded latest-value snapshots for frequent telemetry polls."""
+        return self._collect_vllm_logger_metrics("get_latest_vllm_logger_metrics")
+
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
@@ -1184,6 +1192,10 @@ class VllmGeneration(GenerationInterface):
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting."""
         return self.get_vllm_logger_metrics()
+
+    def get_latest_logger_metrics(self) -> dict[str, Any]:
+        """Get latest logger values without transferring full worker histories."""
+        return self.get_latest_vllm_logger_metrics()
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
