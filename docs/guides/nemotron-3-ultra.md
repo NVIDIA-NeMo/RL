@@ -201,6 +201,7 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 | `GENRM_MODEL` | GenRM judge: HF repo id or local path. Default is [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM). Served in-cluster from the gym pool at TP=4 (DP varies by stage). Required unless `GENRM_BASE_URL` is set. |
 | `GENRM_BASE_URL` | _Optional._ URL of a separately-deployed GenRM service (e.g. `http://genrm-host:9213/v1`). If set, routes judging to that endpoint and ignores `GENRM_MODEL`. Useful when sharing a single GenRM deployment across many training jobs. |
 | `NL2BASH_JUDGE_MODEL` | NL2Bash / general-purpose judge: HF repo id or local path. Default judge is `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`. |
+| `NL2BASH_BASE_URL` | _Optional._ URL of a separately-deployed NL2Bash judge service. Same semantics as `GENRM_BASE_URL`. |
 | `SAFETY_JUDGE_MODEL` | Content-safety judge: HF repo id or local path. Default is [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B). |
 
 > **Serving GenRM outside Gym.** For a separately deployed OpenAI-compatible
@@ -209,10 +210,8 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 > deployment to back multiple training runs.
 >
 > To co-schedule dedicated model servers with training in one Slurm
-> heterogeneous allocation, use the
-> [external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md).
-> They place the server fleet in a second hetgroup, start load balancers on the
-> training component, and inject the resolved endpoints into the driver command.
+> heterogeneous allocation, set `EXTERNAL_JUDGES=1` — see
+> [External judge services](#external-judge-services) below.
 
 Optional knobs:
 
@@ -227,6 +226,86 @@ Optional knobs:
 | `HF_HOME`, `HF_TOKEN` | _unset_ | Shared HuggingFace cache and gated-model token |
 | `USE_SNAPSHOT` | `1` | Snapshot the source tree at submission time |
 | `DRY_RUN` | `0` | Set to `1` to print the resolved `TRAIN_CMD` without submitting |
+
+### External judge services
+
+By default the GenRM and NL2Bash judges are served by NeMo Gym inside the
+training Ray cluster, consuming part of `NUM_GYM_NODES`. Setting
+`EXTERNAL_JUDGES=1` instead serves them as fixed-model vLLM pools in a second
+Slurm heterogeneous component. This keeps judge serving off the training Ray
+cluster, so a judge restart or OOM cannot destabilise training, and it lets each
+judge be scaled independently of the Gym pool.
+
+The launcher registers both pools through the
+[external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md)
+and submits `tools/external_gym_vllm/run_in_allocation.sh` instead of `ray.sub`.
+That wrapper starts every replica in its own private Ray cluster, brings up one
+OpenAI-compatible load balancer per pool, waits for all backends to become
+healthy, substitutes the resolved URLs into the driver command, and only then
+starts `ray.sub` on the training component. If a required service exits, the
+training job is stopped.
+
+In this mode `GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are the checkpoints the
+pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` /
+`NL2BASH_SERVED_MODEL_NAME` (both `model` by default). Setting
+`GENRM_BASE_URL` or `NL2BASH_BASE_URL` by hand is rejected, since the wrapper
+supplies those.
+
+Each pool is registered only when its model variable is set, so set at least
+one of them. Stages declare only the judges they use — `rlhf_teacher` has no
+NL2Bash block, `reasoning_teacher` has no GenRM block, `swe_teacher` has
+neither — and setting a judge the stage does not declare makes the driver fail
+on an unknown config key.
+
+`BASE_LOG_DIR` and `EXTERNAL_VLLM_TOOLS_DIR_HOST` (the repo's
+`tools/external_gym_vllm`) must resolve under `EXTERNAL_VLLM_SHARED_ROOT`,
+because the wrapper bind-mounts that root into the service containers. Since
+`RESULTS_DIR` defaults to a path relative to the repo, pass an explicit
+`BASE_LOG_DIR` on the shared filesystem when the checkout lives elsewhere.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EXTERNAL_JUDGES` | `0` | `1` serves GenRM and NL2Bash in a second hetgroup |
+| `GENRM_REPLICAS`, `GENRM_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 GenRM servers and TP per server |
+| `GENRM_REASONING_PARSER_NAME` | `nemotron_v3` | Reasoning parser for the GenRM; `nemotron_v3` is built into vLLM and handles the `<think>`/`</think>` format |
+| `GENRM_REASONING_PARSER` | _unset_ | Path to a reasoning-parser plugin `.py`, only for a checkpoint whose parser vLLM does not ship |
+| `NL2BASH_REPLICAS`, `NL2BASH_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 NL2Bash servers and TP per server |
+| `EXTERNAL_VLLM_SEGMENT_SIZE` | `4` | SLURM `--segment` for the external component |
+
+Node counts are derived from the replica shapes, not set directly:
+`nodes = REPLICAS × TENSOR_PARALLEL_SIZE / GPUS_PER_NODE` per pool. The two
+components are validated separately — `NUM_TRAIN_NODES + NUM_GEN_NODES +
+NUM_GYM_NODES` must be a multiple of `SEGMENT_SIZE`, and the external node total
+must be a multiple of `EXTERNAL_VLLM_SEGMENT_SIZE`. With both judges external,
+`NUM_GYM_NODES` only has to cover the safety judge. Model paths, the parser
+plugin, and `BASE_LOG_DIR` must live under `EXTERNAL_VLLM_SHARED_ROOT`
+(`/lustre` by default), which is mounted into the service containers.
+`INTERACTIVE=1` is not supported in this mode.
+
+Building on the [Phase 1](#phase-1--49k-context-128-steps) invocation, add:
+
+```bash
+EXTERNAL_JUDGES=1 \
+GENRM_MODEL=/path/to/genrm-checkpoint \
+GENRM_REPLICAS=16 \
+NL2BASH_JUDGE_MODEL=/path/to/nl2bash-judge-checkpoint \
+NL2BASH_REPLICAS=4 \
+NUM_TRAIN_NODES=64 \
+NUM_GEN_NODES=172 \
+NUM_GYM_NODES=4 \
+BASE_LOG_DIR=/lustre/path/to/ray_logs \
+EXP_NAME=... CONFIG_PATH=... MODEL_PATH=... TRAIN_PATH=... VAL_PATH=... \
+CONTAINER=... SANDBOX_CONTAINER=... PERSISTENT_CACHE=... \
+SLURM_PARTITION=$SLURM_PARTITION SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
+```
+
+That allocates 64 + 172 + 4 = 240 NeMo RL nodes (a multiple of `SEGMENT_SIZE`,
+with Gym now hosting only the safety judge) plus 16 GenRM + 4 NL2Bash = 20
+external nodes. Set only `GENRM_MODEL` or only `NL2BASH_JUDGE_MODEL` to move
+just that judge out of Gym — useful for the teacher stages, which declare only
+the judges they use.
 
 ## Stage 1 — Student RLVR
 
