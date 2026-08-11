@@ -327,6 +327,28 @@ class VllmAsyncGenerationWorkerImpl(
             }
         return metric
 
+    def get_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Return latest samples and prune histories after a telemetry poll."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            histories = {
+                "inflight_batch_sizes": self.inflight_batch_sizes,
+                "num_pending_samples": self.num_pending_samples,
+                "kv_cache_usage_perc": self.kv_cache_usage_perc,
+                "generation_tokens": self.generation_tokens,
+            }
+            latest = {
+                name: [values[-1]] if values else []
+                for name, values in histories.items()
+            }
+            self.inflight_batch_sizes = latest["inflight_batch_sizes"]
+            self.num_pending_samples = latest["num_pending_samples"]
+            self.kv_cache_usage_perc = latest["kv_cache_usage_perc"]
+            self.generation_tokens = latest["generation_tokens"]
+            return latest
+
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
