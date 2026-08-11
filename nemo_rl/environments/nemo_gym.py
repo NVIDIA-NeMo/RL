@@ -645,7 +645,7 @@ def spinup_nemo_gym_actor(
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags, num_gpu_nodes).
+            thinking_tags, num_gpu_nodes) and the Ray actor knob max_concurrency.
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
@@ -663,6 +663,12 @@ def spinup_nemo_gym_actor(
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+
+    # Ray actor option rather than a Gym global config key. None keeps Ray's own
+    # default, which for an async actor like this one is
+    # DEFAULT_MAX_CONCURRENCY_ASYNC (1000 concurrent tasks); offering the actor
+    # more in-flight rollouts than that queues the excess instead of running it.
+    max_concurrency = nemo_gym_dict.pop("max_concurrency", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -704,6 +710,8 @@ def spinup_nemo_gym_actor(
             "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
         },
     }
+    if max_concurrency is not None:
+        nemo_gym_opts["max_concurrency"] = max_concurrency
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
     ray.get(actor._spinup.remote())

@@ -195,6 +195,30 @@ async_rl:
   diagnostics: false
 
 # =============================================================================
+# NeMo-Gym rollout actor
+# =============================================================================
+env:
+  nemo_gym:
+    # Ray's max_concurrency for the single NemoGym actor: the ceiling on rollout
+    # tasks it executes at once. NemoGym.run_rollouts is `async def`, so the
+    # actor takes Ray's asyncio branch and null leaves
+    # DEFAULT_MAX_CONCURRENCY_ASYNC = 1000 in force. Tasks past the cap queue on
+    # the actor rather than running, and a deep enough backlog makes Ray log
+    # "More than 5000 tasks pending submission to actor NemoGym" (the threshold
+    # starts at 5000 and doubles on each crossing).
+    #
+    # Valid values: null (Ray's default) or a positive int. Keep it at or above
+    # async_rl.max_inflight_prompts. That is 640 here, comfortably under 1000,
+    # so null is the recommended default for this recipe. A shape that offers
+    # more than 1000 in-flight prompts (the 6K run offered 5120) must raise this
+    # to match, or generation silently throttles to 1000 concurrent rollouts.
+    #
+    # Declared explicitly rather than left to the `+` override form because
+    # Hydra runs in struct mode: an undeclared key cannot be set from the
+    # command line.
+    max_concurrency: null
+
+# =============================================================================
 # TransferQueue data plane — mandatory for the SC path
 # =============================================================================
 # run_grpo_single_controller.py refuses to start unless enabled is true, and

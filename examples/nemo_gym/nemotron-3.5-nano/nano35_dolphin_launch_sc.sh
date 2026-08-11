@@ -40,6 +40,7 @@ set -euo pipefail
 #   MAX_LOOKAHEAD_VERSIONS=4     # async_rl.sampler.max_lookahead_versions
 #                                # 1 restores parity with the async-1 baseline
 #   NUM_STORAGE_UNITS=16         # data_plane.num_storage_units
+#   GYM_MAX_CONCURRENCY=1280     # env.nemo_gym.max_concurrency; unset = Ray's 1000
 #   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
 #
 # Extra positional args are forwarded as Hydra overrides, after ours, so they win.
@@ -70,6 +71,20 @@ export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc
 STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-32}"
 NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-16}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-4}"
+
+# Ray's max_concurrency for the single NemoGym actor. Empty means "don't pass
+# it", leaving Ray's asyncio default of 1000, which is above this recipe's 640
+# in-flight prompts and therefore not binding. Set it when the offered load
+# crosses 1000 (the 6K shape offered 5120 and completed no steps), or to cap the
+# actor below the offered load deliberately as an inverse probe.
+#
+# Expanded below as ${_GYM_OVERRIDES[@]+"${_GYM_OVERRIDES[@]}"} because `set -u`
+# treats a plain "${arr[@]}" on an empty array as unbound on bash before 4.4.
+GYM_MAX_CONCURRENCY="${GYM_MAX_CONCURRENCY:-}"
+_GYM_OVERRIDES=()
+if [[ -n "${GYM_MAX_CONCURRENCY}" ]]; then
+  _GYM_OVERRIDES+=("env.nemo_gym.max_concurrency=${GYM_MAX_CONCURRENCY}")
+fi
 
 # Which selection policy the slack above configures. The two samplers spell it
 # differently — in_order counts dispatch batches of lookahead, windowed counts
@@ -117,6 +132,7 @@ echo "  Streaming  : min ${STREAM_MIN_GROUPS} of ${_NUM_PROMPTS_PER_STEP} groups
 echo "  Sampler    : ${SAMPLER} (slack ${MAX_LOOKAHEAD_VERSIONS})"
 echo "  Capacity   : buffer ${_BUFFER_CAPACITY} groups, ${_BUFFER_CAPACITY} in flight"
 echo "  TQ units   : ${NUM_STORAGE_UNITS}"
+echo "  Gym concur : ${GYM_MAX_CONCURRENCY:-unset (Ray default 1000)}"
 echo "================================================================"
 echo ""
 
@@ -127,4 +143,5 @@ exec bash "${SCRIPT_DIR}/nano35_dolphin_launch.sh" \
   "async_rl.max_buffered_rollouts=${_BUFFER_CAPACITY}" \
   "data_plane.num_storage_units=${NUM_STORAGE_UNITS}" \
   "policy.generation.refit_transport=${REFIT_TRANSPORT}" \
+  ${_GYM_OVERRIDES[@]+"${_GYM_OVERRIDES[@]}"} \
   "$@"
