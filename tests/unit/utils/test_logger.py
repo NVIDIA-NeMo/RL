@@ -459,10 +459,9 @@ class TestWandbLogger:
 
         logger.log_metrics(metrics, step, step_metric=step_metric)
 
-        # Check that log was called with metrics and commit=False
-        # When using step_metric, step should be ignored and commit=False should be used
+        # The custom metric supplies the x-axis, while each event commits a row.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(metrics, commit=False)
+        mock_run.log.assert_called_once_with(metrics)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
@@ -480,15 +479,14 @@ class TestWandbLogger:
 
         logger.log_metrics(metrics, step, prefix=prefix, step_metric=step_metric)
 
-        # Check that log was called with prefixed metrics and commit=False
-        # The step_metric key gets prefixed based on the current implementation
+        # The step_metric key gets prefixed based on the current implementation.
         mock_run = mock_wandb.init.return_value
         expected_metrics = {
             "train/loss": 0.5,
             "train/accuracy": 0.8,
             "train/iteration": 15,
         }
-        mock_run.log.assert_called_once_with(expected_metrics, commit=False)
+        mock_run.log.assert_called_once_with(expected_metrics)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
