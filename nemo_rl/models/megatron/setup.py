@@ -769,9 +769,8 @@ def _merge_model_overrides(
             )
         return merged_mapping
 
-    # explicitly collect the allowed fields so we can trace 
-    # a potential the error to the config / override path
-    # that triggered it
+    # Explicitly collect the allowed fields so we can trace a potential
+    # error back to the config / override path that triggered it.
     dataclass_init_fields = None
     if is_dataclass(target):
         dataclass_init_fields = {field.name for field in fields(target) if field.init}
