@@ -87,8 +87,11 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
+    FRONTIER_ORDINAL_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
+    RESUME_BASE_ORDINAL_KEY,
+    RETAINED_TASK_INDICES_KEY,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -4257,6 +4260,41 @@ def async_grpo_train(
         ),
     )
 
+    # Frontier-aligned resume: the checkpoint saved the dataloader state at
+    # the trained frontier rather than the live cursor, so the collector
+    # re-yields the covered window and regenerates every prompt that is
+    # neither trained nor retained in the restored buffer. Legacy checkpoints
+    # (no frontier metadata) keep today's behavior.
+    frontier_ordinal = (rollouts_state or {}).get(FRONTIER_ORDINAL_KEY)
+    resume_base_ordinal = (rollouts_state or {}).get(RESUME_BASE_ORDINAL_KEY)
+    frontier_restore = frontier_ordinal is not None and resume_base_ordinal is not None
+    if frontier_restore:
+        retained_task_indices = list(
+            (replay_buffer_restore_metadata or {}).get(RETAINED_TASK_INDICES_KEY, [])
+        )
+        collector_start_kwargs: dict[str, Any] = {
+            "next_nemo_gym_task_index": int(resume_base_ordinal),
+            "resume_frontier_ordinal": int(frontier_ordinal),
+            "resume_covered_task_indices": retained_task_indices,
+            # The rewound dataloader re-yields any carried-over remainder.
+            "pending_batch": None,
+            "ordinals_frontier_aligned": True,
+        }
+        print(
+            "📦 Frontier-aligned resume: dataloader rewound to ordinal "
+            f"{resume_base_ordinal}, trained frontier {frontier_ordinal}, "
+            f"{len(retained_task_indices)} retained prompt groups"
+        )
+    else:
+        collector_start_kwargs = {
+            "next_nemo_gym_task_index": next_nemo_gym_task_index,
+            "pending_batch": (rollouts_state or {}).get(PENDING_PROMPTS_KEY),
+            # Ordinal == stream position only holds for runs that have used
+            # frontier-aligned checkpoints from the start; a legacy resume
+            # keeps live-cursor checkpoints.
+            "ordinals_frontier_aligned": last_checkpoint_path is None,
+        }
+
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
     )
@@ -4292,9 +4330,8 @@ def async_grpo_train(
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
-        next_nemo_gym_task_index=next_nemo_gym_task_index,
         processor=processor,
-        pending_batch=(rollouts_state or {}).get(PENDING_PROMPTS_KEY),
+        **collector_start_kwargs,
     )
 
     # Start trajectory collection in background
@@ -5151,12 +5188,21 @@ def async_grpo_train(
                             ),
                             checkpointing_cfg=master_config.checkpointing,
                         )
-                        # Get dataloader state from trajectory collector
-                        actual_dataloader_state = ray.get(
-                            trajectory_collector.get_dataloader_state.remote()
+                        # Save the dataloader state aligned with the trained
+                        # frontier (consumed_samples) rather than the live
+                        # cursor, which has already advanced past prompts that
+                        # are still in flight or buffered. A resume re-yields
+                        # the covered window and regenerates whatever the
+                        # restored buffer does not retain, so no prompt is
+                        # skipped. Falls back to the live cursor for runs
+                        # whose ordinals are not frontier-aligned.
+                        dataloader_snapshot = ray.get(
+                            trajectory_collector.get_checkpoint_dataloader_state.remote(
+                                grpo_save_state.consumed_samples
+                            )
                         )
                         torch.save(
-                            actual_dataloader_state,
+                            dataloader_snapshot["dataloader_state"],
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         _save_async_replay_buffer_checkpoint(
@@ -5166,6 +5212,13 @@ def async_grpo_train(
                         rollouts_state = ray.get(
                             trajectory_collector.get_rollouts_state.remote()
                         )
+                        if dataloader_snapshot["frontier_aligned"]:
+                            rollouts_state[FRONTIER_ORDINAL_KEY] = (
+                                grpo_save_state.consumed_samples
+                            )
+                            rollouts_state[RESUME_BASE_ORDINAL_KEY] = (
+                                dataloader_snapshot["base_ordinal"]
+                            )
                         torch.save(
                             rollouts_state,
                             os.path.join(checkpoint_path, "rollouts.pt"),

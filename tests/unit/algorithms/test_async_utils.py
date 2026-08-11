@@ -38,6 +38,9 @@ from nemo_rl.algorithms.async_utils import (
     ReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
+from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    _group_task_index_from_batch,
+)
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
@@ -52,7 +55,11 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.experience.interfaces import PENDING_PROMPTS_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_TASK_INDEX_KEY,
+    PENDING_PROMPTS_KEY,
+    RETAINED_TASK_INDICES_KEY,
+)
 
 
 @ray.remote(num_cpus=0)
@@ -374,10 +381,13 @@ class TestReplayBufferImplCheckpointing:
         )
 
         # Metadata accounts for every saved task index, including trajectories
-        # discarded during resume cleanup, so an index is never reused.
+        # discarded during resume cleanup, so an index is never reused. The
+        # retained list reflects only post-filter survivors, so a frontier
+        # resume regenerates the dropped stale group instead of skipping it.
         assert metadata == {
             "num_trajectories": 2,
             "next_ng_task_index": 42,
+            RETAINED_TASK_INDICES_KEY: [7],
         }
         assert restored.size() == 1
         restored_state = restored.state_dict()
@@ -1071,6 +1081,7 @@ class TestReplayBuffer:
         assert restore_metadata == {
             "num_trajectories": 1,
             "next_ng_task_index": 12,
+            RETAINED_TASK_INDICES_KEY: [11],
         }
         assert ray.get(buffer2.size.remote()) == 1
         debug_info = ray.get(buffer2.get_debug_info.remote())
@@ -1365,6 +1376,136 @@ class TestAsyncTrajectoryCollector:
 
         batch = self.create_mock_batch(size=2)
         assert collector._process_batch(batch) is batch
+
+    class _FakeStatefulLoader:
+        """List-backed stand-in for StatefulDataLoader with a position cursor."""
+
+        def __init__(self, batches, start: int = 0):
+            self._batches = batches
+            self._pos = start
+
+        def state_dict(self) -> dict:
+            return {"pos": self._pos}
+
+        def __iter__(self):
+            while self._pos < len(self._batches):
+                batch = self._batches[self._pos]
+                self._pos += 1
+                yield batch
+
+    def _run_loop_collecting(self, collector, loader):
+        """Drive _collection_loop to exhaustion, returning processed batches."""
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = loader
+        collector._collection_loop()
+        return processed
+
+    @staticmethod
+    def _ordinals(batches) -> list[int]:
+        return [
+            row[NEMO_GYM_TASK_INDEX_KEY]
+            for batch in batches
+            for row in batch["extra_env_info"]
+        ]
+
+    def test_collection_loop_stamps_ordinals_and_records_snapshots(self):
+        """Fresh batches get stream-position ordinals; the ring keys on them."""
+        collector = self.create_local_collector()
+        loader = self._FakeStatefulLoader(
+            [self.create_mock_batch(2), self.create_mock_batch(2)]
+        )
+
+        processed = self._run_loop_collecting(collector, loader)
+
+        assert self._ordinals(processed) == [0, 1, 2, 3]
+        assert [
+            (base, state["pos"]) for base, state in collector._dataloader_snapshots
+        ] == [(0, 0), (2, 1)]
+        assert collector._next_nemo_gym_task_index == 4
+
+    def test_get_checkpoint_dataloader_state_selects_frontier_snapshot(self):
+        """The snapshot just at/below the frontier wins; misaligned falls back."""
+        collector = self.create_local_collector()
+        collector._dataloader_snapshots.extend(
+            [(0, {"pos": 0}), (4, {"pos": 1}), (8, {"pos": 2})]
+        )
+
+        snapshot = collector.get_checkpoint_dataloader_state(5)
+        assert snapshot["frontier_aligned"] is True
+        assert snapshot["base_ordinal"] == 4
+        assert snapshot["dataloader_state"] == {"pos": 1}
+
+        assert collector.get_checkpoint_dataloader_state(3)["base_ordinal"] == 0
+        assert collector.get_checkpoint_dataloader_state(11)["base_ordinal"] == 8
+
+        collector._ordinals_frontier_aligned = False
+        fallback = collector.get_checkpoint_dataloader_state(5)
+        assert fallback["frontier_aligned"] is False
+        assert fallback["base_ordinal"] is None
+
+    def test_stamping_falls_back_when_rows_cannot_carry_ordinals(self):
+        """Un-stampable batches disable frontier alignment instead of crashing."""
+        collector = self.create_local_collector()
+        batch = self.create_mock_batch(2)
+        batch["extra_env_info"] = [None, None]
+
+        assert collector._stamp_task_indices(batch) is False
+        assert collector._ordinals_frontier_aligned is False
+        assert collector.get_checkpoint_dataloader_state(0)["frontier_aligned"] is False
+
+    def test_frontier_restore_regenerates_exactly_the_uncovered_prompts(self):
+        """Save/restore round trip: no prompt skipped, none duplicated.
+
+        Phase A yields ordinals 0-11 and checkpoints at trained frontier 5
+        with groups {6, 7, 10} retained in the buffer. Phase B rewinds the
+        loader to the saved snapshot and must re-process exactly the ordinals
+        that are neither trained (< 5) nor retained — then drop the filter.
+        """
+        batches = [self.create_mock_batch(4) for _ in range(4)]
+
+        phase_a = self.create_local_collector()
+        loader_a = self._FakeStatefulLoader(batches[:3])
+        self._run_loop_collecting(phase_a, loader_a)
+
+        snapshot = phase_a.get_checkpoint_dataloader_state(5)
+        assert snapshot["frontier_aligned"] is True
+        assert snapshot["base_ordinal"] == 4
+
+        phase_b = self.create_local_collector()
+        phase_b._next_nemo_gym_task_index = snapshot["base_ordinal"]
+        phase_b._ordinals_frontier_aligned = True
+        phase_b._resume_frontier_ordinal = 5
+        phase_b._covered_task_indices = {6, 7, 10}
+        phase_b._skip_horizon = 10
+        loader_b = self._FakeStatefulLoader(
+            batches, start=snapshot["dataloader_state"]["pos"]
+        )
+
+        processed = self._run_loop_collecting(phase_b, loader_b)
+
+        assert self._ordinals(processed) == [5, 8, 9, 11, 12, 13, 14, 15]
+        # The filter shuts off once the covered window has been re-yielded.
+        assert phase_b._resume_frontier_ordinal is None
+
+    def test_group_task_index_from_batch(self):
+        unanimous = BatchedDataDict[DatumSpec](
+            {"extra_env_info": [{NEMO_GYM_TASK_INDEX_KEY: 7}] * 3}
+        )
+        mixed = BatchedDataDict[DatumSpec](
+            {
+                "extra_env_info": [
+                    {NEMO_GYM_TASK_INDEX_KEY: 7},
+                    {NEMO_GYM_TASK_INDEX_KEY: 8},
+                ]
+            }
+        )
+        unstamped = BatchedDataDict[DatumSpec]({"extra_env_info": [{}, {}]})
+
+        assert _group_task_index_from_batch(unanimous) == 7
+        assert _group_task_index_from_batch(mixed) is None
+        assert _group_task_index_from_batch(unstamped) is None
 
     def test_rollouts_state_roundtrips_pending_batch(self, tmp_path):
         """The pending remainder survives torch.save/load and collector restore."""
@@ -1759,7 +1900,11 @@ class TestAsyncTrajectoryCollector:
             trajectory_collector_mod._threading, "Thread", RecordingThread
         )
 
-        collector._process_batch(self.create_mock_batch(size=2))
+        # Stamping happens at yield time in _collection_loop; _process_batch
+        # must preserve the ordinals through slicing and repetition.
+        batch = self.create_mock_batch(size=2)
+        assert collector._stamp_task_indices(batch) is True
+        collector._process_batch(batch)
 
         assert len(started_threads) == 1
         assert captured["use_nemo_gym"] is True

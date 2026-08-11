@@ -1037,6 +1037,23 @@ class StubAsyncTrajectoryCollector:
         mock.remote = MagicMock(return_value={NEXT_NEMO_GYM_TASK_INDEX_KEY: 0})
         return mock
 
+    @property
+    def get_checkpoint_dataloader_state(self):
+        """Return a remote-callable mock yielding a frontier snapshot result.
+
+        Mirrors the fallback shape (not frontier-aligned) so the checkpoint
+        path persists the plain dataloader state without frontier metadata.
+        """
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "dataloader_state": {},
+                "base_ordinal": None,
+                "frontier_aligned": False,
+            }
+        )
+        return mock
+
 
 def mock_async_grpo_infrastructure(
     mock_batch,
