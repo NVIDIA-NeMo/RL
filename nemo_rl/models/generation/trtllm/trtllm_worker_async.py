@@ -144,7 +144,7 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         # Must run before AsyncLLM spawns RayGPUWorker processes.
         if self._trtllm_metrics_enabled:
-            self._install_ifb_stats_patch()
+            self._install_stats_patch()
 
         trtllm_cfg = self.cfg["trtllm_cfg"]
         tp_size = trtllm_cfg["tensor_parallel_size"]
@@ -304,55 +304,27 @@ class TrtllmAsyncGenerationWorkerImpl:
                 cur = getattr(cur, k, None)
         return cur
 
-    def _install_ifb_stats_patch(self) -> None:
+    def _install_stats_patch(self) -> None:
         """Expose a sync ``fetch_stats_serialized`` on TRT-LLM's BaseWorker.
 
         Applied in-process and via base_worker.py source append for the
-        separate RayGPUWorker processes. See _ifb_stats_patch for rationale.
+        separate RayGPUWorker processes. See patches for rationale.
         """
-        try:
-            from nemo_rl.models.generation.trtllm import _ifb_stats_patch
+        import logging
 
-            _ifb_stats_patch.apply()
+        _logger = logging.getLogger(__name__)
+        from nemo_rl.models.generation.trtllm import patches
+
+        try:
+            patches.apply()
         except Exception as e:  # pragma: no cover
             print(
                 f"[TrtllmAsyncWorker] ifb in-process patch skipped: {e!r}",
                 flush=True,
             )
 
-        marker = "# --- nemo-rl IFB metric patch ---"
-        block = (
-            "\n\n" + marker + "\n"
-            "def _nemorl_fetch_stats_serialized(self):\n"
-            "    return [self._stats_serializer(s) for s in self.fetch_stats()]\n"
-            "try:\n"
-            "    BaseWorker.fetch_stats_serialized = _nemorl_fetch_stats_serialized\n"
-            "except Exception:\n"
-            "    pass\n"
-            "# --- end nemo-rl IFB metric patch ---\n"
-        )
         try:
-            import fcntl
-
-            import tensorrt_llm.executor.base_worker as _bw
-
-            path = os.path.abspath(_bw.__file__)
-            # a+ appends regardless of seek; flock serializes the co-located
-            # replica actors that share this node's container venv.
-            with open(path, "a+") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    f.seek(0)
-                    already = marker in f.read()
-                    if not already:
-                        f.write(block)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            print(
-                f"[TrtllmAsyncWorker] IFB stats patch "
-                f"{'present' if already else 'appended'} in {path}",
-                flush=True,
-            )
+            patches._patch_trtllm_fetch_stats_serialized(_logger)
         except Exception as e:
             print(
                 f"[TrtllmAsyncWorker] ifb base_worker append skipped: {e!r}",
@@ -366,12 +338,18 @@ class TrtllmAsyncGenerationWorkerImpl:
         scheduled this iteration).
         """
         assert self.llm is not None
+        assert "trtllm_metrics_logger_interval" in self.cfg["trtllm_cfg"], (
+            "trtllm_metrics_logger_interval must be set in trtllm_cfg if enable_trtllm_metrics_logger is True"
+        )
         interval = float(self.cfg["trtllm_cfg"]["trtllm_metrics_logger_interval"])
+        assert interval > 0, (
+            f"trtllm_metrics_logger_interval must be a positive float, got {interval}"
+        )
         _err_logged = 0
         while True:
             try:
                 # fetch_stats_serialized is a sync serializing method injected onto
-                # BaseWorker — see _ifb_stats_patch for why this RPC is needed.
+                # BaseWorker — see patches for why this RPC is needed.
                 try:
                     rank_results = await self.llm.collective_rpc(
                         "fetch_stats_serialized"
@@ -409,14 +387,14 @@ class TrtllmAsyncGenerationWorkerImpl:
                         ifb = self._get_stat_field(
                             stats, "inflightBatchingStats", "numScheduledRequests"
                         )
-                        ctx = self._get_stat_field(
-                            stats, "inflightBatchingStats", "numContextRequests"
-                        )
+                        queued = self._get_stat_field(stats, "numQueuedRequests")
+                        if queued is None:
+                            # Fallback for older engines: numContextRequests is prefill-only.
+                            queued = self._get_stat_field(
+                                stats, "inflightBatchingStats", "numContextRequests"
+                            )
                         ifb_sample = int(ifb) if ifb is not None else 0
-                        # numContextRequests is prefill-only; approximates
-                        # queued/pending prefill work. Keep the same two-series
-                        # shape the consumer asserts on.
-                        ctx_sample = int(ctx) if ctx is not None else 0
+                        ctx_sample = int(queued) if queued is not None else 0
                         # kv = usedNumBlocks/maxNumBlocks (fallback: 1 - freeNumBlocks/maxNumBlocks),
                         # guarded for maxNumBlocks == 0.
                         kv_stats = self._get_stat_field(stats, "kvCacheStats")
