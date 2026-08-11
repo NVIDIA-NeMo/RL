@@ -4,6 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
+GPUS_PER_NODE=4
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
@@ -36,7 +37,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["10"] < 1.1' \
-        'mean(data["train/grad_norm"], 2, 0) > 0.06'
+        'mean(data["train/grad_norm"], 2, 0) > 0.10'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
