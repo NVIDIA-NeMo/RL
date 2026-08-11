@@ -25,3 +25,4 @@ def test_search_r1_recipe_instantiates_master_config() -> None:
     assert isinstance(resolved_config, dict)
     config = MasterConfig(**resolved_config)
     assert config.policy["tokenizer"]["chat_template"] is None
+    assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is True

@@ -80,6 +80,7 @@ policy:
       gpu_memory_utilization: 0.6
       tensor_parallel_size: 1
       max_model_len: 4096
+      enforce_eager: true
       http_server_serving_chat_kwargs:
         enable_auto_tools: false
         chat_template: "{% for message in messages %}{{ message['content'] }}{% endfor %}"
