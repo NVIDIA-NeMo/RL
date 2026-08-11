@@ -73,12 +73,13 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    # Default to RDMA so production clusters pick up the zero-copy
-    # MooncakeStore path introduced in TQ v0.1.8 without needing env tweaks.
-    # Hosts without a RoCE-capable mlx5 device fall back to TCP below, so the
-    # dev path (laptop, non-RDMA cluster) still works.
-    requested = os.environ.get("MC_MOONCAKE_PROTOCOL")
-    if (requested or "rdma") != "rdma":
+    # RDMA is the transport for real runs — it is the zero-copy MooncakeStore
+    # path from TQ v0.1.8 and the reason to pick mooncake_cpu over the simple
+    # backend at all. TCP is reachable only by opting in explicitly, for hosts
+    # with no RoCE NIC (dev laptops, CI runners exercising the mooncake code
+    # path). Anything else missing a device raises rather than degrading
+    # quietly, so a run can never report mooncake/RDMA coverage it did not do.
+    if os.environ.get("MC_MOONCAKE_PROTOCOL") == "tcp":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
     if not device:
@@ -98,23 +99,13 @@ def _mooncake_transport_config() -> dict:
         except Exception:
             pass
     if not device:
-        detail = "no RoCE-capable mlx5 device detected under /sys/class/infiniband"
-        if requested:
-            # Explicitly asked for RDMA. Falling back to TCP here would let a
-            # verification run pass without ever touching RDMA, so refuse.
-            raise RuntimeError(
-                f"MC_MOONCAKE_PROTOCOL=rdma was requested explicitly but {detail}. "
-                "Refusing to fall back to TCP. Set MC_MOONCAKE_PROTOCOL=tcp to "
-                "use TCP, or MC_MOONCAKE_DEVICE=<dev> to name the device."
-            )
-        # RDMA is only the default here, not a request.
-        warnings.warn(
-            f"RDMA is the default transport but {detail}; falling back to TCP. "
-            "Set MC_MOONCAKE_PROTOCOL=tcp to silence.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise RuntimeError(
+            "data_plane.backend='mooncake_cpu' uses RDMA, but no RoCE-capable "
+            "mlx5 device was detected under /sys/class/infiniband. Name one "
+            "with MC_MOONCAKE_DEVICE=<dev>, set MC_MOONCAKE_PROTOCOL=tcp to "
+            "opt into the TCP transport (dev/test only), or use "
+            "data_plane.backend='simple'."
         )
-        return {"protocol": "tcp"}
     os.environ.setdefault("MC_GID_INDEX", "3")
     return {"protocol": "rdma", "device_name": device}
 
