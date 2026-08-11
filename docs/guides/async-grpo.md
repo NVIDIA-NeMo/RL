@@ -161,6 +161,8 @@ Async GRPO checkpoints the replay buffer alongside the rest of training state so
 
 On each checkpoint, a `replay_buffer.pt` file is written next to the other checkpoint artifacts. It contains all trajectories currently in the buffer together with their weight and target versions, and the `last_target_weight_already_generated` watermark.
 
+The dataloader state saved alongside it is **frontier-aligned**: it captures the position of the first prompt that training has not yet consumed, rather than the collector's live cursor (which has already advanced past prompts that are still generating or sitting in the buffer). Every yielded prompt carries a monotonic ordinal, and the saved replay buffer records which ordinals its groups cover.
+
 ### Restore behaviour
 
 On resume, the buffer is restored before the trajectory collector starts, then cleaned up as follows:
@@ -170,13 +172,17 @@ On resume, the buffer is restored before the trajectory collector starts, then c
 3. **Incomplete targets kept** — target steps that still lack a full batch are kept in the buffer. The collector will *gap-fill* only the missing trajectories for those targets before moving on.
 4. **Buffer truncated** — if the restored count exceeds `max_size`, the buffer is truncated, prioritising entries closest to the resume step.
 
+The dataloader then re-yields the window between the trained frontier and the old cursor. Prompts already trained or retained in the restored buffer are dropped; everything else — in-flight work lost at the save, groups evicted during cleanup — is regenerated in order, so **no prompt is skipped and none is duplicated** across a save/restore cycle. (Resumes from checkpoints written before frontier alignment keep the previous live-cursor behaviour.)
+
 ### Gap-filling after restore
 
 After a restore, `last_target_weight_already_generated` is reset to `current_training_step - 1` so the collector re-evaluates every target from the resume step onward. For each target it queries `get_trajectories_needed` and spawns only the workers required to complete the batch — previously buffered trajectories are reused and the collector does not regenerate them.
 
 ### Disabling replay-buffer restore
 
-If no `replay_buffer.pt` file is found in the latest checkpoint directory, training starts with an empty buffer and waits for the collector to fill it before the first training step.
+Set `checkpointing.load_replay_buffer: false` to skip the restore: the buffer starts empty and, on a frontier-aligned checkpoint, the whole buffered window is regenerated fresh from the rewound dataloader. This trades resume compute for an unbiased step composition — a prompt group completes only when its *longest* rollout finishes, so the groups sitting in the buffer at a save boundary systematically skew toward short rollouts; regenerating the window removes that bias. Restoration remains enabled by default and for legacy configs that omit the field.
+
+If no `replay_buffer.pt` file is found in the latest checkpoint directory, training likewise starts with an empty buffer and waits for the collector to fill it before the first training step.
 
 ## Usage Tips
 
