@@ -324,12 +324,12 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
 def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_size):
     """Test from_parallel_logits_to_logprobs_packed_sequences with coverage.
 
-    Uses _pack_input_ids to build packed targets and compares:
+    Uses _pack_sequence_tensor to build packed targets and compares:
       1. target_is_pre_rolled=False against the unpacked baseline (CP=1 only)
       2. target_is_pre_rolled=True against target_is_pre_rolled=False
     with variable-length sequences.
     """
-    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+    from nemo_rl.algorithms.loss.utils import _pack_sequence_tensor
 
     # Build 2-D process groups: inner=TP, outer=CP
     tp_groups = []
@@ -403,8 +403,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
             packed_logits[:, offset : offset + psl, :] = padded_seq
 
     # --- Path 1: target_is_pre_rolled=False ---
-    # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
-    packed_target_raw = _pack_input_ids(input_ids, cu_seqlens, cu_seqlens_padded)
+    # Pack raw (unrolled) input_ids to [1, T_padded].
+    packed_target_raw = _pack_sequence_tensor(input_ids, cu_seqlens, cu_seqlens_padded)
 
     logprobs_not_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
@@ -420,7 +420,7 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     )
 
     # --- Path 2: target_is_pre_rolled=True ---
-    packed_target_pre_rolled = _pack_input_ids(
+    packed_target_pre_rolled = _pack_sequence_tensor(
         input_ids,
         cu_seqlens,
         cu_seqlens_padded,

@@ -408,23 +408,43 @@ def _validate_topk_opd_config(
             "Top-k OPD currently supports only grpo.async_grpo.enabled=true."
         )
     packing_enabled = policy_config["sequence_packing"]["enabled"]
-    context_parallel_size = megatron_cfg.get("context_parallel_size", 1)
     if topk_source == "student":
         if packing_enabled:
             raise NotImplementedError(
                 "Student-top-k OPD does not yet support sequence packing."
             )
-        if context_parallel_size != 1:
+        if megatron_cfg["context_parallel_size"] != 1:
             raise NotImplementedError(
                 "Student-top-k OPD does not yet support context parallelism."
             )
     elif topk_source == "teacher":
-        if context_parallel_size != 1 and not packing_enabled:
+        # Defer this worker-layer import for non-OPD setup paths.
+        from nemo_rl.models.policy.teacher_worker_group import (
+            create_teacher_configs_from_opd_config,
+        )
+
+        teacher_configs = create_teacher_configs_from_opd_config(
+            opd_module._opd_cfg(master_config)
+        )
+        cp_teachers = []
+        for config in teacher_configs:
+            teacher_cp_size = config.context_parallel_size
+            if "context_parallel_size" in config.megatron_cfg_overrides:
+                teacher_cp_size = int(
+                    config.megatron_cfg_overrides["context_parallel_size"]
+                )
+            if teacher_cp_size > 1:
+                cp_teachers.append(config.alias)
+        student_cp_enabled = megatron_cfg["context_parallel_size"] != 1
+        if (student_cp_enabled or cp_teachers) and not packing_enabled:
+            cp_owners = (["student policy"] if student_cp_enabled else []) + [
+                f"teacher '{alias}'" for alias in cp_teachers
+            ]
             raise NotImplementedError(
                 "Teacher-top-k OPD requires sequence packing when context "
-                "parallelism is enabled."
+                f"parallelism is enabled for: {cp_owners}."
             )
-        if packing_enabled and not policy_config["sequence_packing"]["fuse_loss"]:
+        if packing_enabled and not policy_config["sequence_packing"].get("fuse_loss"):
             raise NotImplementedError(
                 "Packed teacher-top-k OPD requires "
                 "policy.sequence_packing.fuse_loss=true."

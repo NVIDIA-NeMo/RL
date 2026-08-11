@@ -1461,12 +1461,14 @@ def gather_vocab_parallel_logprobs_at_indices(
     cu_seqlens_padded: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Normalize and gather selected logprobs with bounded sequence memory.
+    """Normalize and gather selected logprobs in sequence chunks.
 
     ``vocab_parallel_logits`` and ``global_indices`` must already have the same
-    CP-local sequence layout. Each chunk materializes only its local fp32
-    vocabulary shard; selected values are then TP-reduced and finally restored
-    to contiguous full-sequence order across CP ranks.
+    CP-local sequence layout. During inference, each chunk bounds the live fp32
+    vocabulary working set. Under autograd, softmax buffers from every chunk may
+    be retained until backward, so this is not a rematerializing memory bound.
+    Selected values are TP-reduced and restored to contiguous full-sequence
+    order across CP ranks.
 
     Args:
         vocab_parallel_logits: CP/TP-local logits ``[B, S_local, V_local]``.
@@ -1485,7 +1487,7 @@ def gather_vocab_parallel_logprobs_at_indices(
         shaped ``[B, S_full, K]``.
 
     Raises:
-        ValueError: If logits and indices do not share their leading layout.
+        ValueError: If layouts differ or packed boundaries are absent with CP.
     """
     if global_indices.ndim != vocab_parallel_logits.ndim:
         raise ValueError(
@@ -1530,24 +1532,23 @@ def gather_vocab_parallel_logprobs_at_indices(
     )
     if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
         if cu_seqlens_padded is None:
-            selected = allgather_cp_sharded_tensor(selected, cp_group, seq_dim=1)
-        else:
-            cp_size = torch.distributed.get_world_size(cp_group)
-            total_packed_len = int(cu_seqlens_padded[-1].item())
-            gathered_selected = selected.new_zeros(
-                (selected.shape[0], total_packed_len, selected.shape[-1])
+            raise ValueError("cu_seqlens_padded is required with context parallelism.")
+        cp_size = torch.distributed.get_world_size(cp_group)
+        total_packed_len = int(cu_seqlens_padded[-1].item())
+        gathered_selected = selected.new_zeros(
+            (selected.shape[0], total_packed_len, selected.shape[-1])
+        )
+        for sample_idx in range(cu_seqlens_padded.shape[0] - 1):
+            start = int(cu_seqlens_padded[sample_idx].item())
+            end = int(cu_seqlens_padded[sample_idx + 1].item())
+            if end <= start:
+                continue
+            local = selected[:, start // cp_size : end // cp_size]
+            gathered = allgather_cp_sharded_tensor(local, cp_group, seq_dim=1)
+            gathered_selected[:, start:end] = gathered.reshape(
+                selected.shape[0], end - start, selected.shape[-1]
             )
-            for sample_idx in range(cu_seqlens_padded.shape[0] - 1):
-                start = int(cu_seqlens_padded[sample_idx].item())
-                end = int(cu_seqlens_padded[sample_idx + 1].item())
-                if end <= start:
-                    continue
-                local = selected[:, start // cp_size : end // cp_size]
-                gathered = allgather_cp_sharded_tensor(local, cp_group, seq_dim=1)
-                gathered_selected[:, start:end] = gathered.reshape(
-                    selected.shape[0], end - start, selected.shape[-1]
-                )
-            selected = gathered_selected
+        selected = gathered_selected
     return selected
 
 

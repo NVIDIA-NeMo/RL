@@ -1069,6 +1069,77 @@ class TestTopkLogitsPostProcessor:
         expected_targets = torch.cat([torch.zeros(1, 1), target_by_logit[:, :1]], dim=1)
         torch.testing.assert_close(result["logprobs"], expected_targets)
 
+    def test_teacher_topk_packed_matches_unpacked_at_cp1(self):
+        """Packed teacher support and target logprobs match the unpacked path."""
+        from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
+
+        input_ids = torch.tensor([[0, 1, 2, 0], [3, 4, 0, 0]])
+        input_lengths = torch.tensor([3, 2])
+        unpacked_logits = torch.tensor(
+            [
+                [
+                    [0.2, 1.1, -0.3, 0.7, 0.0],
+                    [1.2, -0.4, 0.8, 0.1, 0.3],
+                    [-0.1, 0.5, 1.4, 0.2, 0.9],
+                    [0.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+                [
+                    [0.4, -0.2, 0.6, 1.3, 0.1],
+                    [0.9, 0.3, -0.5, 0.2, 1.1],
+                    [0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+            ]
+        )
+        cu_seqlens_padded = torch.tensor([0, 4, 7])
+        packed_logits = torch.zeros(1, 7, unpacked_logits.shape[-1])
+        packed_logits[:, 0:3] = unpacked_logits[0:1, :3]
+        packed_logits[:, 4:6] = unpacked_logits[1:2, :2]
+        data = BatchedDataDict({"input_ids": input_ids, "input_lengths": input_lengths})
+
+        def local_all_gather(outputs, value, group=None):
+            outputs[0].copy_(value)
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.train.get_tensor_model_parallel_group",
+                return_value=None,
+            ),
+            patch(
+                "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.all_gather", side_effect=local_all_gather),
+        ):
+            _, unpacked = TopkLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": False},
+                    "megatron_cfg": {"context_parallel_size": 1},
+                },
+                k=2,
+                return_logprobs=True,
+            )(data, cu_seqlens_padded=None)(unpacked_logits)
+            _, packed = TopkLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": True},
+                    "megatron_cfg": {"context_parallel_size": 1},
+                },
+                k=2,
+                return_logprobs=True,
+            )(data, cu_seqlens_padded=cu_seqlens_padded)(packed_logits)
+
+        for sample_idx, seq_len in enumerate(input_lengths.tolist()):
+            for key in ("topk_logits", "topk_indices", "topk_logprobs"):
+                torch.testing.assert_close(
+                    packed[key][sample_idx, :seq_len],
+                    unpacked[key][sample_idx, :seq_len],
+                )
+            torch.testing.assert_close(
+                packed["logprobs"][sample_idx, :seq_len],
+                unpacked["logprobs"][sample_idx, :seq_len],
+            )
+
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0

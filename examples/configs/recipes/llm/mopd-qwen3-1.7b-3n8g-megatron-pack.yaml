@@ -39,6 +39,8 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 32768
   logprob_chunk_size: 2048
+  sequence_packing:
+    fuse_loss: true
   dtensor_cfg:
     enabled: false
   megatron_cfg:

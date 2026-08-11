@@ -191,11 +191,22 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   data.validation.data_path=/path/to/val.jsonl
 ```
 
-Use `on_policy_distillation.teacher_topk=64` instead of `student_topk=64` to
-run the teacher-selected variant. Teacher selection is performed inside each
-teacher worker in the same forward that computes sampled-token probabilities;
-the selected indices and normalized log-probabilities are stored with the
-trajectory and reused by the trainer.
+To run the teacher-selected variant with the recipe's inherited sequence
+packing, keep packing enabled and select the teacher support explicitly:
+
+```sh
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
+  on_policy_distillation.teacher_topk=64 \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/val.jsonl
+```
+
+The recipe sets `policy.sequence_packing.fuse_loss=true`, as required for
+packed teacher-top-k. Teacher selection is performed inside each teacher worker
+in the same forward that computes sampled-token probabilities; the selected
+indices and normalized log-probabilities are stored with the trajectory and
+reused by the trainer.
 
 This remains a smoke-test configuration. Measure throughput, peak memory, and
 loss/reward convergence against full-vocabulary MOPD before using it as a
