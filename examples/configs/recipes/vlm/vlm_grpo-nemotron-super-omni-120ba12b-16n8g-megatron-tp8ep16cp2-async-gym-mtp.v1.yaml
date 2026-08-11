@@ -35,7 +35,3 @@ logger:
     name: nemotron-super-omni-async-gym-mtp
 checkpointing:
   checkpoint_dir: results/nemotron-super-omni-async-gym-mtp
-# Repeated from the base recipe rather than inherited: super_launch.sh reads
-# cluster.num_nodes out of this file with awk and does not resolve `defaults:`.
-cluster:
-  num_nodes: 16

@@ -35,7 +35,24 @@ done
 CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml}"
 ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_grpo_nemo_gym.py}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
-SBATCH_NUM_NODES="${SBATCH_NUM_NODES:-$(awk '/^cluster:/{f=1} f && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")}"
+# Read the cluster block from the *resolved* recipe. Scraping the raw file
+# with awk only sees keys written literally in it, which forced every recipe
+# to repeat cluster: even when it inherits one -- and silently produced an
+# empty value for a recipe that does not. tools/config_cli.py resolves
+# `defaults:` the same way the driver does. Fall back to the raw scrape if the
+# resolver is unavailable (no venv on the submit host), so submission keeps
+# working in that case for recipes that do carry a literal cluster block.
+_expanded_cfg="$(uv run --no-sync python tools/config_cli.py expand "${CONFIG_PATH}" 2>/dev/null || true)"
+_read_cluster_key() {
+    if [[ -n "${_expanded_cfg}" ]]; then
+        awk -v k="$1" '/^cluster:/{f=1} f && $1==k":"{print $2; exit}' <<<"${_expanded_cfg}"
+    else
+        awk -v k="$1" '/^cluster:/{f=1} f && $1==k":"{print $2; exit}' "${CONFIG_PATH}"
+    fi
+}
+SBATCH_NUM_NODES="${SBATCH_NUM_NODES:-$(_read_cluster_key num_nodes)}"
+SBATCH_GPUS_PER_NODE="${SBATCH_GPUS_PER_NODE:-$(_read_cluster_key gpus_per_node)}"
+SBATCH_GPUS_PER_NODE="${SBATCH_GPUS_PER_NODE:-8}"
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:-}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
@@ -205,7 +222,7 @@ SBATCH_ARGS=(
     --job-name="${EXP_NAME}"
     --partition="${SLURM_PARTITION}"
     --time="${SLURM_TIME_LIMIT}"
-    --gres=gpu:8
+    --gres=gpu:"${SBATCH_GPUS_PER_NODE}"
     --exclusive
     --dependency=singleton
     ray.sub
