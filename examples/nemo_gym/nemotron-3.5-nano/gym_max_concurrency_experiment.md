@@ -102,11 +102,35 @@ exactly. Both components clear their segment checks at the nano values
 (`SEGMENT_SIZE=2` divides 56, `EXTERNAL_VLLM_SEGMENT_SIZE=2` divides 12), so
 neither arm should be rejected at submission.
 
+### `RESULTS_DIR` must be set explicitly — the arms fail without it
+
+`nano35_dolphin_launch.sh:288` reads:
+
+```bash
+export RESULTS_DIR="${RESULTS_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/runs/${EXP_NAME}}"
+```
+
+That default points into **another user's tree**. Left unset, the launcher fails
+three times with
+
+```
+mkdir: cannot create directory '/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/runs/<EXP_NAME>': Permission denied
+```
+
+and never reaches `TRAIN_CMD`. This is a genuine permission failure, not a
+sandbox artifact — it reproduced with sandboxing fully disabled.
+
+Every command below therefore sets `RESULTS_DIR` under
+`/lustre/fsw/portfolios/llmservice/users/sauramishra/runs/`, where every other
+run in this series wrote. It must also be set for the dry-run normalisation
+described in "Validated by dry run" below, for the same reason.
+
 ### Arm A — cap below offered load
 
 ```bash
 EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armA-cap256 \
+RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/sauramishra/runs/sauramishra-nano35-sc-conc-probe-armA-cap256 \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=4 \
 NUM_STORAGE_UNITS=8 \
@@ -119,6 +143,7 @@ GYM_MAX_CONCURRENCY=256 \
 ```bash
 EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armB-default \
+RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/sauramishra/runs/sauramishra-nano35-sc-conc-probe-armB-default \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=4 \
 NUM_STORAGE_UNITS=8 \
@@ -147,6 +172,64 @@ are configured. Three things to read off the output:
 
 A dry run is cheap and submits nothing; do it for both arms before either goes
 to the queue.
+
+### Validated by dry run
+
+Both arms were dry-run and their `TRAIN_CMD`s diffed token by token, with
+`EXP_NAME` normalised to a common value so the run-name and log-path tokens
+match. **The diff is exactly one line, 62 tokens against 61:**
+
+```
+< env.nemo_gym.max_concurrency=256
+```
+
+Everything else is byte-identical, including `async_rl.max_inflight_prompts=640`
+and `async_rl.max_buffered_rollouts=640` (buffer equals in-flight, as required),
+`data_plane.num_storage_units=8`, `async_rl.sampler.name=windowed` and
+`+async_rl.sampler.max_staleness_versions=4`. The arms are therefore a clean
+single-variable pair.
+
+Resolved values observed in the same dry run, confirming the derivations above:
+
+| Source | Value |
+|--------|-------|
+| SC banner | `Capacity   : buffer 640 groups, 640 in flight` |
+| SC banner | `TQ units   : 8` |
+| SC banner | `Gym concur : 256` (Arm A) / `unset (Ray default 1000)` (Arm B) |
+| ultra banner | `Hetgroup 0: 56 NeMo RL nodes (segment=2)` |
+| ultra banner | `Hetgroup 1: 12 external-service nodes (segment=2)` |
+| `TRAIN_CMD` | `cluster.num_nodes=48` |
+| `TRAIN_CMD` | `policy.generation.colocated.resources.num_nodes=40` |
+| `TRAIN_CMD` | `env.nemo_gym.num_gpu_nodes=8` |
+
+`cluster.num_nodes=48` is 8 train + 40 generation. The 8 Gym nodes are counted
+separately, via `env.nemo_gym.num_gpu_nodes=8`, which is how hetgroup 0 reaches
+56 rather than 48 — worth knowing before reading 48 as a shortfall.
+
+To repeat this check after any launcher change:
+
+```bash
+dump() {
+  env DRY_RUN=1 EXTERNAL_JUDGES=1 EXP_NAME=probe \
+    RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/sauramishra/runs/probe \
+    SAMPLER=windowed MAX_LOOKAHEAD_VERSIONS=4 NUM_STORAGE_UNITS=8 "$@" \
+    bash examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch_sc.sh \
+    | sed -n '/--- TRAIN_CMD ---/,$p' | tr ' ' '\n'
+}
+dump GYM_MAX_CONCURRENCY=256 > /tmp/armA.tokens   # Arm A
+dump                          > /tmp/armB.tokens   # Arm B
+wc -l /tmp/armA.tokens /tmp/armB.tokens            # expect 62 and 61
+diff /tmp/armA.tokens /tmp/armB.tokens             # expect the single < line above
+```
+
+`EXP_NAME=probe` and the matching `RESULTS_DIR=.../runs/probe` are what make the
+two dumps comparable; without both, every path and run-name token differs and
+the diff is useless.
+
+**Status: nothing has been submitted.** Both arms remain unlaunched pending a
+scheduling decision. The three v1 arms (6032239, 6032458, 6032460) have been
+PENDING on Resources for more than four hours, and launching these would add
+queue competition ahead of them.
 
 ## Parity warning: storage units
 
@@ -227,6 +310,7 @@ raising the cap rescues it.
 # Arm C — over the gate, Ray's default cap (expected to gate)
 EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armC-1152-default \
+RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/sauramishra/runs/sauramishra-nano35-sc-conc-probe-armC-1152-default \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=8 \
 NUM_STORAGE_UNITS=16 \
@@ -235,6 +319,7 @@ NUM_STORAGE_UNITS=16 \
 # Arm D — same load, cap raised above it
 EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armD-1152-cap2048 \
+RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/sauramishra/runs/sauramishra-nano35-sc-conc-probe-armD-1152-cap2048 \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=8 \
 NUM_STORAGE_UNITS=16 \
