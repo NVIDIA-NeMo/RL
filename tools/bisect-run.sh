@@ -69,7 +69,7 @@ Examples:
 Example nightly bisect:
 
 rsync -ahP --delete tools/ tools.bisect/  # This copies bisect utilities outside of VCS so we always run the latest copy
-TEST_CASE=tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
+TEST_CASE=tests/test_suites/llama3.1/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 
 HF_HOME=... \
 HF_DATASETS_CACHE=... \

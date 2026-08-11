@@ -48,7 +48,7 @@ nrl-k8s run infra/nrl_k8s/examples/<recipe>.yaml \
   --infra infra/nrl_k8s/examples/<recipe>.<profile>.infra.yaml
 ```
 
-- **Recipe** (e.g. `qwen3_30b_math_8n_4gpu.yaml`) — NeMo-RL config: model, GRPO/SFT knobs, `cluster.{gpus_per_node,num_nodes}`. Uses `defaults:` to inherit from `examples/configs/recipes/llm/...`.
+- **Recipe** (e.g. `qwen3_30b_math_8n_4gpu.yaml`) — NeMo-RL config: model, GRPO/SFT knobs, `cluster.{gpus_per_node,num_nodes}`. Uses `defaults:` to inherit from `examples/configs/recipes/<model-family>/...`.
 - **Infra** (e.g. `*.<profile>.infra.yaml`) — K8s/Ray shape: namespace, image, service account, RayCluster spec under `kuberay:`, optional Deployments under `deployments:`, `submit.submitter`, `launch.{mode,codeSource,codePath,entrypoint}`. Pair names follow `<recipe>.<profile>[.prod].infra.yaml` where `<profile>` names the hardware target (e.g. `gb300`).
 
 Example pairs in `infra/nrl_k8s/examples/` — read the neighbouring files to see the current conventions for the target profile.
@@ -277,4 +277,4 @@ The pod's `default` service account needs an `edit` RoleBinding in the namespace
 - CLI code: `infra/nrl_k8s/src/nrl_k8s/` (`cli.py`, `orchestrate.py`, `manifest.py`, `rayjob.py`, `k8s.py`, `submitters/`, `schema.py`).
 - Tests: `infra/nrl_k8s/tests/unit/` — run with `uv run --extra test pytest -x -q` from `infra/nrl_k8s/`.
 - Recipe + infra examples: `infra/nrl_k8s/examples/`.
-- Base recipes this tool wraps: `examples/configs/recipes/llm/…` and `examples/nemo_gym/…`.
+- Base recipes this tool wraps: `examples/configs/recipes/<model-family>/…` and `examples/nemo_gym/…`.

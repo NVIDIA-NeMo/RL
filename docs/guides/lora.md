@@ -191,17 +191,17 @@ See the [DPO guide](dpo.md) for the full DPO workflow.
 
 ## Example Recipes
 
-Ready-to-run LoRA recipes live under `examples/configs/recipes/llm/`:
+Ready-to-run LoRA recipes live under `examples/configs/recipes/<model-family>/`:
 
 | Recipe | Algorithm | Backend |
 | --- | --- | --- |
-| [`sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml) | SFT | DTensor |
-| [`sft-llama3.1-8b-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-megatron-lora.yaml) | SFT | Megatron |
-| [`sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | SFT | DTensor |
-| [`grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml) | GRPO | DTensor |
-| [`grpo-qwen3-8b-base-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.yaml) | GRPO | Megatron |
-| [`grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | GRPO | DTensor |
-| [`grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml) | GRPO | Megatron |
+| [`sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml`](../../examples/configs/recipes/llama3.1/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml) | SFT | DTensor |
+| [`sft-llama3.1-8b-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llama3.1/sft-llama3.1-8b-1n8g-megatron-lora.yaml) | SFT | Megatron |
+| [`sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/nemotron3-nano/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | SFT | DTensor |
+| [`grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/qwen3/grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml) | GRPO | DTensor |
+| [`grpo-qwen3-8b-base-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/qwen3/grpo-qwen3-8b-base-1n8g-megatron-lora.yaml) | GRPO | Megatron |
+| [`grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | GRPO | DTensor |
+| [`grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml`](../../examples/configs/recipes/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml) | GRPO | Megatron |
 
 DPO LoRA is supported on both backends but ships no dedicated recipe — enable it on an existing DPO config with the overrides shown in [Usage by Algorithm → DPO](#dpo).
 

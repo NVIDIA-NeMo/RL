@@ -22,7 +22,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run $PROJECT_ROOT/examples/run_sft.py \
-    --config $PROJECT_ROOT/examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-megatron.yaml \
+    --config $PROJECT_ROOT/examples/configs/recipes/llama3.1/sft-llama3.1-8b-1n8g-megatron.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.tokenizer.name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \

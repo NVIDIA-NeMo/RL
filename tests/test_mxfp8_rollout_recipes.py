@@ -18,8 +18,8 @@ import pytest
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PERF_CONFIG_DIR = PROJECT_ROOT / "examples/configs/recipes/llm/performance"
-PERF_SUITE_DIR = PROJECT_ROOT / "tests/test_suites/llm/performance"
+PERF_CONFIG_DIR = PROJECT_ROOT / "examples/configs/recipes/qwen3/performance"
+PERF_SUITE_DIR = PROJECT_ROOT / "tests/test_suites/qwen3/performance"
 GB200_SUITE = PROJECT_ROOT / "tests/test_suites/performance_gb200.txt"
 
 MXFP8_CASES = {
@@ -146,7 +146,7 @@ def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:
     suite_text = GB200_SUITE.read_text(encoding="utf-8")
 
     for case_name in MXFP8_CASES:
-        assert f"tests/test_suites/llm/performance/{case_name}.sh" in suite_text
+        assert f"tests/test_suites/qwen3/performance/{case_name}.sh" in suite_text
 
 
 def test_mxfp8_rollout_backend_variant_recipes_are_not_kept() -> None:

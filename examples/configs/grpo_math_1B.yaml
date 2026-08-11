@@ -522,6 +522,6 @@ data_plane:
 # models into the policy via token-level teacher-minus-student logprob advantages,
 # served by non-colocated teacher worker groups (OPD advantage estimator +
 # nemo_gym). null = disabled (default). See
-# examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml for a full
+# examples/configs/recipes/qwen3/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml for a full
 # enabled example.
 on_policy_distillation: null

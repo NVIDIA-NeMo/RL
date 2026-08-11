@@ -47,8 +47,11 @@ Known exceptions currently present:
 - Some recipes include additional short flags in the strategy token (e.g., `fsdp2tp8sp`). Treat these as modifiers appended to the strategy.
 
 Directory placement and naming parity:
-- Place driver scripts under `tests/test_suites/llm/` or `tests/test_suites/vlm/`.
-- The script filename should mirror the YAML recipe filename under `examples/configs/recipes/**` but with a `.sh` suffix.
+- Recipes are grouped by model family: `examples/configs/recipes/<family>/`, e.g. `qwen3/`, `llama3.1/`, `nemotron3-super/`. The family is the model *generation*, taken from the recipe's resolved `policy.model_name`.
+- Performance recipes live in `examples/configs/recipes/<family>/performance/`. They are tuned for peak throughput, so their hyperparameters are not a place to add feature coverage.
+- `examples/configs/recipes/reproduce/` holds recipes built on a model outside any official family, such as the DeepScaleR context-extension chain.
+- Hardware is **not** a directory. A GB200 variant is a filename token (`4n4g`) and a `defaults:` child of its H100 counterpart.
+- Place driver scripts at the mirrored path under `tests/test_suites/<family>/`, with the same filename and a `.sh` suffix. `common.env` resolves the project root from the `tests/test_suites` path component, so drivers work at any depth.
 - Add the relative script path to `tests/test_suites/nightly.txt` for nightly execution.
 
 ## Running manually

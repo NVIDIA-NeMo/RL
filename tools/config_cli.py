@@ -34,22 +34,25 @@ The `expand` and `minimize` commands support printing to stdout or in-place edit
 
 Example:
   # Expand a config with a root level "defaults" key to see the full config; print to stdout
-  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  tools/config_cli.py expand examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml
 
   # Expand a config with a root level "defaults" key to see the full config; edit the config in place
-  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  tools/config_cli.py expand examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml --in-place
 
   # Minimize a config (base inferred from its defaults key); print to stdout
-  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  tools/config_cli.py minimize examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml
 
   # Minimize a config in place
-  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  tools/config_cli.py minimize examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml --in-place
 
   # Minimize with explicit base (rebase to a different parent)
-  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --base examples/configs/dpo.yaml --in-place
+  tools/config_cli.py minimize examples/configs/recipes/llama3.1/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml --base examples/configs/dpo.yaml --in-place
 
-  # Minimize all configs:
-  for recipe in examples/configs/recipes/{llm,vlm}/*.yaml; do
+  # Minimize all configs (recipes are nested under <family>/, so recurse;
+  # skip performance/, whose configs are hand-tuned and not minimized):
+  shopt -s globstar
+  for recipe in examples/configs/recipes/**/*.yaml; do
+    [[ "$recipe" == */performance/* ]] && continue
     if ! tools/config_cli.py minimize-check $recipe 2>/dev/null; then
       tools/config_cli.py minimize $recipe --in-place
     fi

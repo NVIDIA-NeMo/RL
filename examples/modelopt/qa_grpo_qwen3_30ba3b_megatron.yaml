@@ -1,4 +1,4 @@
-defaults: "../configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml"
+defaults: "../configs/recipes/qwen3/performance/grpo-qwen3-30ba3b-4n4g.yaml"
 
 # Example usage:
 #   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml

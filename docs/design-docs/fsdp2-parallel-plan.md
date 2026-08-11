@@ -70,4 +70,4 @@ The data-parallel size is `dp_size = world_size / (tp_size * cp_size * ep_size)`
 - **`dp_replicate_size: 1` (default, pure FSDP2)** — single-node runs, or multi-node runs where the model fits comfortably and inter-node bandwidth is not the bottleneck. Lowest memory footprint per rank.
 - **`dp_replicate_size > 1` (HSDP)** — multi-node runs where step time is dominated by inter-node FSDP collectives. Trades memory (one full sharded copy per replica) for faster steps.
 
-See [examples/configs/recipes/llm/sft-llama3.2-1b-2n8g-hsdp.yaml](../../examples/configs/recipes/llm/sft-llama3.2-1b-2n8g-hsdp.yaml) for a working recipe.
+See [examples/configs/recipes/llama3.2/sft-llama3.2-1b-2n8g-hsdp.yaml](../../examples/configs/recipes/llama3.2/sft-llama3.2-1b-2n8g-hsdp.yaml) for a working recipe.

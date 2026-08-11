@@ -31,13 +31,13 @@ rollout and policy data path as the `routed_experts` field.
 An example recipe is available at:
 
 ```text
-examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
+examples/configs/recipes/qwen3/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
 ```
 
 The native async TransferQueue path uses the SingleController entrypoint with:
 
 ```text
-examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
+examples/configs/recipes/qwen3/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
 ```
 
 ## Validation

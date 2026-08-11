@@ -20,7 +20,7 @@
 * [04/06/2026] New Model Support
     * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
     * Added support for [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) for GRPO training.
-    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel.yaml)
+    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/qwen3.5/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml](/examples/configs/recipes/qwen3.5/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/glm/grpo-glm47-flash-4n8g-automodel.yaml)
 * [03/12/2026] GDPO Support
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
     * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
@@ -32,9 +32,9 @@
     * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
     * LoRA DPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
     * Nano v3 LoRA recipes:
-        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
-        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
-        * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
+        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/nemotron3-nano/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/nemotron3-nano/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
 
 <details>
 <summary>Previous News</summary>

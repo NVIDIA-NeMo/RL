@@ -193,7 +193,7 @@ teachers:
   # at once (aggregated per `loss_fn.kd_loss_mode`). OmegaConf replaces lists
   # wholesale on merge, so a recipe that wants multiple teachers must restate
   # the whole list (see the multi-teacher nightly recipe under
-  # examples/configs/recipes/llm/). Example second teacher — Llama-3.2-3B, same
+  # examples/configs/recipes/<model-family>/). Example second teacher — Llama-3.2-3B, same
   # tokenizer as the student => same-vocab direct KL (projection_matrix_path: null,
   # no alignment). Uncomment to enable:
   - model_name: "meta-llama/Llama-3.2-3B"

@@ -21,10 +21,10 @@ This installs system FFmpeg (required by `torchcodec` at runtime) and pins `torc
 Run GRPO training with the provided config:
 
 ```
-uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.yaml
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/qwen2.5/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.yaml
 ```
 
-Config: `examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.yaml`
+Config: `examples/configs/recipes/qwen2.5/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.yaml`
 
 Key hyperparameters:
 

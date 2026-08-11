@@ -69,7 +69,7 @@ repos:
   - repo: local
     hooks:
       - id: configs-minimize-check
-        name: minimize-check llm recipes
+        name: minimize-check recipes
         language: system
         pass_filenames: false
         entry: bash
@@ -77,4 +77,19 @@ repos:
           - -lc
           - |
             set -euo pipefail
-            ./tools/config_cli.py minimize-check examples/configs/recipes/{llm,vlm}/*.yaml
+            # Recipes are nested one level deeper than they used to be
+            # (<family>/, <family>/performance/), so this has to recurse.
+            # performance/ is excluded: those configs are hand-tuned for peak
+            # throughput and are deliberately not minimized.
+            shopt -s globstar nullglob
+            recipes=()
+            for f in examples/configs/recipes/**/*.yaml; do
+              [[ "$f" == */performance/* ]] || recipes+=("$f")
+            done
+            # An empty list means the tree moved again and this hook went blind,
+            # which is how it silently stopped checking anything before.
+            if [[ ${#recipes[@]} -eq 0 ]]; then
+              echo "no recipe configs matched -- has examples/configs/recipes moved?" >&2
+              exit 1
+            fi
+            ./tools/config_cli.py minimize-check "${recipes[@]}"
