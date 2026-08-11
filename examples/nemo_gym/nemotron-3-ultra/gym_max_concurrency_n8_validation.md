@@ -92,14 +92,21 @@ node reservation. It is **not** true of the branch 5982305 ran on.
 
 It matters directly here: actor count multiplies effective concurrency
 (`N * max_concurrency`), so it is the one variable that could counterfeit the
-result. **Both new arms must pin `num_rollout_workers=1`.** Note the fallback
-would also give 1 (`max(1, num_gpu_nodes)` with `num_gpu_nodes=1`), but pass it
-explicitly so the provenance matches 5982305 token for token.
+result. **Arms 1 and 2 must both pin `num_rollout_workers=1`**, so that the only
+thing separating them is the cap. Note the fallback would also give 1
+(`max(1, num_gpu_nodes)` with `num_gpu_nodes=1`), but pass it explicitly so the
+provenance matches 5982305 token for token.
+
+It also means a sharded arm costs a config value rather than a build, which is
+why Arm 3 exists. Arm 3 moves actor count and *nothing else* relative to Arm 2.
+It is deliberately not a combined arm: changing cap and actor count together
+against Arm 1 is what made 5960334 uninformative, and repeating that would leave
+any difference unattributable.
 
 ### The confound, and why the peak survives it
 
-Both arms were badly damaged, but **not by the same fault**, and neither matches
-the circulated error counts.
+Both reference runs were badly damaged, but **not by the same fault**, and
+neither matches the circulated error counts.
 
 - **5982307 (w16)** hit the renderer defect: `RuntimeError: cannot schedule new
   futures after shutdown`, raised from `VllmAsyncGenerationWorker`, **8,610
@@ -111,11 +118,14 @@ the circulated error counts.
   by a repeating vLLM `AsyncLLM` output-queue traceback (`out = q.get_nowait()
   or await q.get()` → `raise output`) from a single generation worker.
 
-So the symptom was the same (the policy endpoint 500-ing on nearly everything)
-but the named mechanism is confirmed only for w16. Calling 5982305's failure
-"the renderer-executor defect" is **UNVERIFIED**; the mass-500 symptom is not.
-The circulated figures of ~21,800 and ~15,800 connection errors did not
-reproduce under any pattern scanned.
+So the symptom was the same — the policy endpoint 500-ing on nearly everything —
+but **the renderer-executor defect belongs to 5982307 alone.** Zero occurrences
+across 5982305's driver log and every per-server log is positive evidence of
+absence, not merely a failure to confirm, so 5982305 should not be described as
+an instance of that defect anywhere. Its mass-500 symptom is real and measured;
+its mechanism is the vLLM output-queue traceback above. The circulated figures
+of ~21,800 and ~15,800 connection errors did not reproduce under any pattern
+scanned.
 
 **I agree the in-flight peak survives this, and the direction of the bias is
 what makes it safe.** Failed requests return *fast*, which frees admission slots
@@ -128,54 +138,124 @@ That same bias creates one asymmetric risk, handled in the refute criterion
 below: a 500 storm in Arm 2 could hold its peak *under* 1000 for throughput
 reasons, which must not be misread as the knob failing.
 
-## Prerequisite: the fix and the metric are on different branches
+## Branch topology — read this before rerunning anything
 
-Neither worktree can run this experiment as it stands.
+Three branches are involved and no single one of them held everything. Getting
+this wrong is the failure mode that silently invalidates a rerun months later,
+so it is recorded explicitly.
 
-| | `max_concurrency` fix | `gym_fanin` telemetry, `num_rollout_workers`, the n8 config and launcher |
-|---|---|---|
-| `RL-scft` @ `validate/sc-fault-tolerance-n8` | yes (`de9a8d4bf`) | no |
-| `RL-gymshard` @ `validate/gym-sharding-fanin-n8` | no — only mentioned in comments | yes |
+| Worktree @ branch | `max_concurrency` fix | `gym_fanin` telemetry, `num_rollout_workers`, the n8 config and launcher | Role |
+|---|---|---|---|
+| `RL-scft` @ `validate/sc-fault-tolerance-n8` | yes, `de9a8d4bf` | no | where the fix was written; **holds this document** |
+| `RL-gymshard` @ `validate/gym-sharding-fanin-n8` | no | yes | the code 5982305 and 5982307 ran; source of all telemetry above |
+| `RL-gymshard` @ `validate/gym-max-concurrency-n8` | yes | yes | **all three arms run from here** |
 
-The decisive metric exists only in the gymshard tree, and that tree is also the
-exact code 5982305 ran. So: **cherry-pick `de9a8d4bf` onto a branch cut from
-`d5e18928` in `RL-gymshard`.** One commit on top of the reproduction's own code
-is the smallest possible perturbation and keeps the before/after honest.
+`validate/gym-max-concurrency-n8` is cut from
+`d5e189289ca98df56d8b327c9504d2cf2277cdf3` — the exact commit 5982305 ran — with
+one commit on top:
 
-```bash
-cd /lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/sauramishra/RL-gymshard
-git checkout -b validate/gym-max-concurrency-n8 d5e189289ca98df56d8b327c9504d2cf2277cdf3
-git cherry-pick -x de9a8d4bf     # resolve against the NemoGymRolloutPool hunk
+```
+c8a2ef81715b10c54a920124d369d4e0f672844d  feat(nemo_gym): make each rollout actor's Ray max_concurrency configurable
+d5e189289ca98df56d8b327c9504d2cf2277cdf3  feat(gym): per-actor rollout fan-in telemetry   <- 5982305 ran this
 ```
 
-Two things to check while resolving:
+One commit on top of the reproduction's own code is the smallest possible
+perturbation, which is what keeps the before/after honest.
 
-1. The cherry-pick lands in `spinup_nemo_gym_actor`, which on this branch also
-   builds the pool. Apply `max_concurrency` to the **head** actor's
-   `nemo_gym_opts`, which is what these arms exercise.
-2. The pool's extra actors use a separate `worker_opts = {"runtime_env": ...}`
-   that would **not** receive `max_concurrency`. Irrelevant while
-   `num_rollout_workers=1`, but it must be fixed before anyone combines the two
-   knobs, or a sharded run would silently leave every non-head actor at 1000.
+Two notes on the base. First, `validate/gym-sharding-fanin-n8` has since moved
+two commits past `d5e18928`, but those are a fan-in threading fix and its own
+revert, so `git diff d5e18928 <tip>` is empty and the branch tip's tree is
+byte-identical to the reproduction's. Cutting from `d5e18928` therefore costs
+nothing and is provenance-exact. Second, `USE_SNAPSHOT=0` is the launcher
+default, so the arms execute the **live worktree**, not a snapshot: confirm
+`RL-gymshard` is on `validate/gym-max-concurrency-n8` and otherwise clean before
+launching. The only expected dirt is the `3rdparty/Gym-workspace/Gym` submodule
+pointer, which was already modified when 5982305 ran.
 
-`USE_SNAPSHOT=0` is the launcher default, so both arms execute the live
-worktree. Confirm nothing else is dirty before launching.
+### What the cherry-pick carried, and what it dropped
+
+- **Carried:** the `nemo_gym.py` change. `max_concurrency` is popped from
+  `nemo_gym_dict` alongside `num_rollout_workers` and passed as a Ray actor
+  option, so the key never reaches Gym's `initial_global_config_dict`.
+- **Fixed in the same commit:** the pool's extra actors were built from a
+  separate `worker_opts = {"runtime_env": ...}` that did **not** receive
+  `max_concurrency`. Harmless at `num_rollout_workers=1`, but it would have left
+  every non-head actor at Ray's 1000 the moment Arm 3 ran — a half-effect that
+  reads as "the cap does not work". `worker_opts` is now derived from the head's
+  options minus the node pin, so the cap applies uniformly and the `None`
+  sentinel still means "Ray's default everywhere".
+- **Dropped:** the `nano35_dolphin_launch_sc.sh` and `rlvr_dolphin_sc.yaml`
+  hunks. That recipe has diverged on this branch — its launcher predates the
+  `SAMPLER` block — so taking those hunks would have imported unrelated nano
+  changes. No n8 arm loads either file. The 68-node probe document was dropped
+  for the same reason and stays on `RL-scft`.
+- **Added instead:** `env.nemo_gym.max_concurrency: null` in
+  `pipeclean_6k_sc_fanin_n8.yaml`, which the arms do load.
 
 ## The arms
 
-Eight nodes, `short` QoS, two hours. Identical except one Hydra override.
+Eight nodes, `short` QoS, two hours each. **Each arm moves exactly one variable
+relative to its predecessor** — that is the whole discipline here, and the
+reason 5960334, which moved two at once, taught us nothing.
 
-| Arm | `max_concurrency` | Offered in-flight | Cap binding? | Expected peak |
-|-----|-------------------|-------------------|--------------|---------------|
-| 1 | unset → Ray's 1000 | 5120 | Yes | pins at exactly 1000 |
-| 2 | 8192 | 5120 | No | materially above 1000 |
+| Arm | `max_concurrency` | `num_rollout_workers` | Moves, vs. | Question it answers |
+|-----|-------------------|----------------------|-----------|---------------------|
+| 1 | unset → Ray's 1000 | 1 | 5982305: nothing | Does the failure reproduce? |
+| 2 | 8192 | 1 | Arm 1: the cap | Is the cap what pinned in-flight at 1000? |
+| 3 | 8192 | 4 | Arm 2: actor count | With the cap gone, does spreading fan-in help? |
 
-**Why 8192.** It only has to exceed the 5120 the sampler can admit; 8192 is the
-next power of two above it, giving 1.6x headroom so the cap cannot bind even
-transiently. For an *async* actor Ray's `max_concurrency` bounds concurrent
-asyncio tasks rather than sizing a thread pool, so a large value costs little —
-this is not 8192 threads. 10000 would serve equally well; anything at or below
-5120 would reintroduce a binding cap and waste the arm.
+Arms 1 and 2 are the experiment. Arm 3 is a follow-on and should only be
+launched once Arm 2 has answered its question; if Arm 2 refutes, Arm 3 is moot.
+
+**Why 8192 for the cap.** It only has to exceed the 5120 the sampler can admit;
+8192 is the next power of two above it, giving 1.6x headroom so the cap cannot
+bind even transiently. For an *async* actor Ray's `max_concurrency` bounds
+concurrent asyncio tasks rather than sizing a thread pool, so a large value
+costs little — this is not 8192 threads. 10000 would serve equally well;
+anything at or below 5120 would reintroduce a binding cap and waste the arm.
+
+### Why 4 actors for Arm 3, and why not 16
+
+Arm 3 tests the *other* half of the sharding rationale. Arm 2 removes the
+concurrency ceiling; a single actor still serializes every rollout's
+postprocessing — a tokenizer decode plus re-encode per generation — onto one
+thread on one node, which the branch's own docstrings already call out as the
+second bottleneck. Arm 3 asks whether relieving that buys throughput once the
+cap is out of the way.
+
+**4 is the largest count that keeps the fix falsifiable.** With 5120 offered
+prompts round-robined across `N` actors, each actor's share is `5120 / N`. That
+share has to exceed Ray's 1000 default for the per-actor cap to matter at all:
+
+| N | Per-actor share | Above Ray's 1000? |
+|---|-----------------|-------------------|
+| 1 | 5120 | yes |
+| 4 | 1280 | yes |
+| 6 | 853 | no |
+| 16 | 320 | no |
+
+At `N >= 6` no individual actor ever wants more than 1000 in flight, so the
+uniform-cap fix would be inert and Arm 3 could not distinguish a working fix
+from a broken one. At `N = 4` each non-head actor wants 1280, so **a per-actor
+in-flight above 1000 is direct evidence the cap reached the non-head actors** —
+which is exactly the trap the fix closes. 2, 3 and 5 also satisfy this; 4 is
+picked as the largest power of two among them, giving the widest spread of
+postprocessing while staying observable.
+
+**16 is disqualified, and cautiously so.** w16 is not a promising precedent: it
+peaked at 189 in flight and completed **1** group, against w1's peak 1000 and
+**119** groups. More actors completed *fewer* groups. That is unexplained, and
+until it is explained the honest reading is that actor count carries its own
+pathology, not that it helps. Two hints sit in the telemetry: only **11 of 16**
+actors ever reported `gym_fanin`, suggesting several never came up, and w16's
+peak of 189 is nowhere near any cap, so whatever throttled it was not
+concurrency. Arm 3 at 4 is a probe of that region, not an endorsement of it: if
+4 behaves like 1, the w16 pathology is superlinear in actor count; if 4 already
+degrades, it is not.
+
+Because of that, **Arm 3 is not expected to improve anything, and a null or
+negative result is a perfectly good outcome.** Its load-bearing job is the
+uniform-cap check; the throughput question is secondary.
 
 `MAX_INFLIGHT_PROMPTS` is already 5120 by default, and the launcher rejects
 anything above it (the sampler could not admit more). It is passed explicitly
@@ -200,9 +280,26 @@ MAX_INFLIGHT_PROMPTS=5120 \
 EXP_NAME=sauramishra-gymconc-n8-inflight5120-cap8192 \
   bash examples/nemo_gym/nemotron-3-ultra/launch_6k_pipeclean_sc_fanin_n8.sh \
   ++env.nemo_gym.num_rollout_workers=1 \
-  ++env.nemo_gym.max_concurrency=8192 \
+  env.nemo_gym.max_concurrency=8192 \
   env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.data_parallel_size=1
 ```
+
+### Arm 3 — cap held at Arm 2's value, actor count raised
+
+Launch only after Arm 2 has reported.
+
+```bash
+cd /lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/sauramishra/RL-gymshard
+MAX_INFLIGHT_PROMPTS=5120 \
+EXP_NAME=sauramishra-gymconc-n8-inflight5120-cap8192-w4 \
+  bash examples/nemo_gym/nemotron-3-ultra/launch_6k_pipeclean_sc_fanin_n8.sh \
+  ++env.nemo_gym.num_rollout_workers=4 \
+  env.nemo_gym.max_concurrency=8192 \
+  env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.data_parallel_size=1
+```
+
+Arm 3's command is Arm 2's with `1` changed to `4`. That is the diff, and it
+should stay the diff.
 
 `DRY_RUN=1` renders the sbatch command without submitting.
 
@@ -225,10 +322,20 @@ EXP_NAME=sauramishra-gymconc-n8-inflight5120-cap8192 \
   new arms reproduce the identical 8-node shape with the same single Gym node,
   so the GPU scarcity that forced it has not changed, and dropping it both
   risks the judge failing to find free GPUs and breaks parity with 5982305.
-- `++` is used for `max_concurrency` because no config in this chain declares
-  it and Hydra runs in struct mode. This mirrors how `num_rollout_workers` is
-  already passed. Declaring it in `pipeclean_6k_sc_fanin_n8.yaml` instead would
-  also work and would be tidier if these arms become routine.
+- **`max_concurrency` uses a bare `key=value`; `num_rollout_workers` needs
+  `++`.** The distinction is deliberate. `nemo_rl/utils/config.py` calls Hydra's
+  real `OverridesParser` and `ConfigLoaderImpl._apply_overrides_to_config` under
+  `OmegaConf.set_struct(cfg, True)`, so full Hydra semantics apply: `key=value`
+  requires the key to exist, `+key=value` requires it not to, and `++key=value`
+  forces it either way. `++env.nemo_gym.max_concurrency=8192` would therefore
+  work with **no YAML declaration at all** — that is how 5982305 passed
+  `++env.nemo_gym.num_rollout_workers=1`, a key nothing in the chain declares.
+  The declaration was still added, because `++` silently invents the key: run
+  the arm from a checkout that predates the cherry-pick and `++` sets a config
+  value nobody reads, producing a clean-looking run that is really Arm 1 wearing
+  Arm 2's name. The bare form raises instead. `num_rollout_workers` keeps `++`
+  because it genuinely is undeclared and because 5982305's provenance spells it
+  that way, which is worth matching token for token.
 
 ### Container: keep the same image, deliberately
 
@@ -247,9 +354,10 @@ default and the image 5982305 used. The tradeoff, stated rather than hidden:
   Using a newer one means staging a fresh squashfs first, which is separate work
   and would delay a run that currently schedules in minutes.
 
-Recommendation: run the pair on the identical image, and if the secondary
-metrics turn out to matter, add a **third** arm on a newer image later rather
-than perturbing the pair.
+Recommendation: run all three arms on the identical image. If the secondary
+metrics turn out to matter, add a separate image arm afterwards rather than
+perturbing this sequence — the same one-variable rule applies, so an image
+change must be its own arm and not be folded into Arm 3.
 
 ## What confirms, what refutes
 
@@ -257,8 +365,9 @@ The decisive metric is the **in-flight peak** from `gym_fanin`, not throughput.
 
 **Confirms:** Arm 1's peak pins at exactly 1000 while Arm 2's peak materially
 exceeds it — treat anything above roughly 1500 as material, with a peak
-approaching the 5120 offered being the strongest form. Both arms must report
-`distinct_actors=1`.
+approaching the 5120 offered being the strongest form. Arms 1 and 2 must both
+report `actors=1`; anything higher means the rollout pool came back and the
+comparison is void.
 
 **Refutes, and this is the point of running it cheaply:** Arm 2's in-flight
 **pins at exactly 1000 across consecutive samples**, the same ceiling signature
@@ -283,6 +392,28 @@ zero if the cap was lifted, and `started`, which should climb past Arm 1's 2224.
 
 **Also stop and investigate** if Arm 1 fails to reproduce peak 1000. The pair is
 meaningless until the "before" reproduces.
+
+### Arm 3, judged separately
+
+Arm 3 does not re-adjudicate the cap; Arms 1 and 2 have already done that. It
+has one decisive check and one open question, and they are scored differently.
+
+**Decisive — did the cap reach the non-head actors?** Read in-flight
+*per actor*, not summed. Each of the 4 actors should want roughly `5120 / 4 =
+1280` in flight. If **every** actor's peak sits at exactly 1000 while the total
+sits near 4000, the uniform-cap fix is not working and the non-head actors fell
+back to Ray's default — the exact trap this arm exists to detect. At least one
+non-head actor exceeding 1000 confirms the fix. Note that a peak *below* 1000 on
+some actors is not evidence either way; it only means that actor was starved,
+which the 500 storm makes likely.
+
+**Open, not decisive — did sharding buy throughput?** Compare `started` and
+`completed` against Arm 2. Given w16 completed 1 group against w1's 119, treat a
+regression as the expected-if-disappointing outcome rather than as a bug in the
+arm. Record it and move on. What would be genuinely informative either way:
+whether all 4 actors report `gym_fanin` at all (w16 lost 5 of 16) and how
+`first_generation_after` compares, since extra actor startup on a single Gym
+node is the leading suspect for w16's collapse.
 
 ### Secondary, recorded but not decisive
 
@@ -319,16 +450,41 @@ awk '/gym_fanin/{
                 n, na, mi, mp, ms, mc, p, last}' "$DRV"
 ```
 
-`actors=1` is a validity check: anything higher means the rollout pool came
-back and the arm is void. To see whether in-flight *sits* at the ceiling rather
-than merely touching it — the discriminator in the refute criterion — read the
-series rather than the maximum:
+`actors` is a validity check: it must be **1** for Arms 1 and 2 — anything
+higher means the rollout pool came back and the arm is void — and **4** for
+Arm 3, where fewer than 4 means actors failed to start, which is itself the w16
+finding worth reporting.
+
+To see whether in-flight *sits* at the ceiling rather than merely touching it —
+the discriminator in the refute criterion — read the series rather than the
+maximum:
 
 ```bash
 grep -a 'gym_fanin' "$DRV" | grep -ao 'inflight=[0-9]*' | cut -d= -f2
 ```
 
+For Arm 3 the same maxima must be taken **per actor**, since the summed peak
+hides the thing being tested. A pool where every actor tops out at exactly 1000
+is the broken-uniform-cap signature:
+
+```bash
+grep -a 'gym_fanin' "$DRV" \
+  | sed -n 's/.*actor=\([^ ]*\) .* peak=\([0-9]*\).*/\1 \2/p' \
+  | awk '{if($2>m[$1])m[$1]=$2} END{for(k in m)printf "actor=%s peak=%d\n", k, m[k]}'
+```
+
+`peak` is the actor's own running maximum (`stats.inflight_peak`), so its last
+sample is already the answer; taking the max over samples just guards against a
+truncated tail. Each `gym_fanin` line is
+`actor=<id> node=<ip> inflight=.. peak=.. started=.. completed=..`, one per
+actor every reporting interval.
+
 ## Status
 
-Nothing has been submitted. Both arms are unlaunched and carry the cherry-pick
-prerequisite above, which must be done first.
+Nothing has been submitted. All three arms are unlaunched.
+
+The cherry-pick prerequisite is **done**: `validate/gym-max-concurrency-n8` @
+`c8a2ef81715b10c54a920124d369d4e0f672844d` exists in `RL-gymshard`, carries the
+`max_concurrency` fix applied uniformly to head and pool actors, and declares
+the key in `pipeclean_6k_sc_fanin_n8.yaml`. Nothing blocks Arm 1 and Arm 2 but
+the decision to submit. Arm 3 waits on Arm 2's result.
