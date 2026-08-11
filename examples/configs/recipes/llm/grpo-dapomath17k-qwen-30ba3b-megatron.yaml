@@ -1,0 +1,64 @@
+# Qwen3-30B-A3B DAPO 8K — to match Humans&'s blog and miles setup: https://github.com/radixark/miles/pull/1261
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 32 # --rollout-batch-size
+  num_generations_per_prompt: 8 # --n-samples-per-prompt
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0 # --kl-loss-coef
+  ratio_clip_max: 0.28 # --eps-clip-high
+
+
+policy:
+  train_global_batch_size: 256 # --global-batch-size
+  max_total_sequence_length: 10240 # Miles --eval-max-response-len; engine ceiling for 8192 train rollout + prompt
+  logprob_chunk_size: 2048 # chunk vocab-parallel logprob softmax along seq dim (OOM relief); requires defer_fp32_logits
+  router_replay:
+    enabled: true # MoE routing replay for zero-KL colocated generation
+  megatron_cfg:
+    activation_checkpointing: true # --recompute-granularity full
+    defer_fp32_logits: true # required when logprob_chunk_size is set
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    moe_token_dispatcher_type: alltoall
+    moe_router_dtype: fp32 # fp64 crashes TE fused_multi_row_padding (Invalid type 7) in NVFP4 MoE generation
+    moe_pad_experts_for_cuda_graph_inference: true # TE colocated decode with CUDA graphs (zero-KL MoE combine)
+    cuda_graph_impl: none # training-side graphs off; generation graphs in mcore_generation_config
+    moe_permute_fusion: false
+    optimizer:
+      lr: 1.0e-06 # --lr
+      min_lr: 1.0e-06 # no warmup; match lr for constant schedule
+      weight_decay: 0.0 # --weight-decay
+      adam_beta2: 0.98 # --adam-beta2
+    scheduler:
+      lr_decay_style: constant # --lr-decay-style constant
+      lr_warmup_iters: 0 # Miles: no warmup
+      lr_warmup_init: 1.0e-06
+  generation:
+    max_new_tokens: 8192 # --rollout-max-response-len
+    mcore_generation_config:
+      use_cuda_graphs_for_non_decode_steps: true
+      cuda_graph_impl: local
+      num_cuda_graphs: 4
+      inference_cuda_graph_scope: block
+      kv_cache_management_mode: persist
+      buffer_size_gb: 16
+
+data:
+  train:
+    dataset_name: DAPOMath17K # zhuzilin/dapo-math-17k
+  validation:
+    dataset_name: DAPOMathAIME2024 # zhuzilin/aime-2024
+  default:
+    prompt_file: examples/prompts/cot.txt # ask model for \boxed{} final answer (Miles/deepscaler grades boxed)
+
+env:
+  math:
+    # Miles grades with --rm-type deepscaler (boxed rule-based 0/1). Enable boxed
+    # grading via NRL_DAPO_VERIFY_STRICT_BOX=1 at launch; cot.txt asks for \boxed{}.
+    math_verify_impl: dapo_math_verify
