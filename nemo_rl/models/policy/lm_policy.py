@@ -658,13 +658,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
         worker_batches = self.worker_group.get_all_worker_results(futures)
         all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
-        all_topk_logprobs = [wb["topk_logprobs"] for wb in worker_batches]
         all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
 
         stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
-        stacked["topk_logprobs"] = torch.cat(all_topk_logprobs, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+        if all("topk_logprobs" in batch for batch in worker_batches):
+            stacked["topk_logprobs"] = torch.cat(
+                [batch["topk_logprobs"] for batch in worker_batches], dim=0
+            )
 
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)

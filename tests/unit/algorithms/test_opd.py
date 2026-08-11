@@ -115,6 +115,19 @@ class _MockTeacherWorkerGroup:
             {"reference_logprobs": torch.full((B, S), self._fill_value)}
         )
 
+    def get_logprobs_on_support(self, data):
+        input_ids = data["input_ids"]
+        topk_indices = data["topk_indices"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        assert input_ids.shape[0] % dp_size == 0
+        return BatchedDataDict(
+            {
+                "support_logprobs": torch.full(
+                    topk_indices.shape, self._fill_value, dtype=torch.float32
+                )
+            }
+        )
+
 
 def _make_collector(**overrides):
     """Build a bare AsyncTrajectoryCollector (bypass Ray) for unit testing."""
@@ -209,6 +222,37 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
     assert torch.allclose(result[1], torch.tensor(2.0))
     assert torch.allclose(result[2], torch.tensor(1.0))
     assert torch.allclose(result[3], torch.tensor(2.0))
+
+
+def test_compute_teacher_support_logprobs_routes_and_trims_dp_padding():
+    math_twg = _MockTeacherWorkerGroup(fill_value=-1.0, dp_size=4)
+    code_twg = _MockTeacherWorkerGroup(fill_value=-2.0, dp_size=2)
+    collector = _make_collector(
+        teacher_worker_groups={"math": math_twg, "code": code_twg},
+        alias_to_group_alias={"math": "math", "code": "code"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "math": "/ckpt/math",
+                "code": "/ckpt/code",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+    input_ids = torch.arange(15).reshape(3, 5)
+    topk_indices = torch.zeros(3, 5, 2, dtype=torch.long)
+    agent_refs = [{"name": "math"}, {"name": "code"}, {"name": "math"}]
+
+    result, _ = collector._compute_teacher_support_logprobs(
+        input_ids,
+        topk_indices,
+        agent_refs,
+        input_lengths=torch.tensor([5, 4, 3]),
+    )
+
+    assert result.shape == (3, 5, 2)
+    torch.testing.assert_close(result[0], torch.full((5, 2), -1.0))
+    torch.testing.assert_close(result[1], torch.full((5, 2), -2.0))
+    torch.testing.assert_close(result[2], torch.full((5, 2), -1.0))
 
 
 def test_compute_teacher_logprobs_deduplication():

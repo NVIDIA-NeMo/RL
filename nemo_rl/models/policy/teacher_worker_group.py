@@ -115,7 +115,7 @@ class TeacherWorkerGroup:
     - Never initializes an optimizer
     - Never initializes a reference model
     - Loads the checkpoint once at startup
-    - Only exposes get_logprobs()
+    - Exposes sampled-token and caller-selected-support logprob inference
     """
 
     def __init__(
