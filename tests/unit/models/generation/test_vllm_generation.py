@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import types
 from copy import deepcopy
 from pathlib import Path
@@ -252,6 +253,29 @@ def test_sampling_params_preserve_bad_words():
     )
 
     assert sampling_params["bad_words"] == ["<image>", "<img>"]
+
+
+def test_vllm_latest_metric_snapshot_prunes_worker_histories():
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"enable_vllm_metrics_logger": True}}
+    worker._vllm_metrics_lock = threading.Lock()
+    worker.inflight_batch_sizes = [1, 2]
+    worker.num_pending_samples = [3, 4]
+    worker.kv_cache_usage_perc = [0.2, 0.6]
+    worker.generation_tokens = [10, 30]
+
+    latest = worker.get_latest_vllm_logger_metrics()
+
+    assert latest == {
+        "inflight_batch_sizes": [2],
+        "num_pending_samples": [4],
+        "kv_cache_usage_perc": [0.6],
+        "generation_tokens": [30],
+    }
+    assert worker.inflight_batch_sizes == [2]
+    assert worker.num_pending_samples == [4]
+    assert worker.kv_cache_usage_perc == [0.6]
+    assert worker.generation_tokens == [30]
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
