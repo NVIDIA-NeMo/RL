@@ -40,3 +40,23 @@ uv run --with pandas --with pyarrow \
 Generated Parquet and runtime artifacts remain untracked. Each experiment log
 records the exact source commits, commands, hardware, package versions, stage
 timings, search request log, and one-second GPU/host memory samples.
+
+The separate full-quality experiment follows Search-R1's official 7B training
+setup instead of this small performance fixture. Its exact parity contract,
+including the few places where the paper and repository disagree, is recorded
+in [`SEARCH_R1_PARITY.md`](SEARCH_R1_PARITY.md).
+
+Download and convert the official question data with:
+
+```bash
+bash examples/nemo_gym/ai_search/comparison/download_search_r1_data.sh \
+  /path/to/nq_hotpotqa_train
+
+uv run --with pandas --with pyarrow \
+  python examples/nemo_gym/ai_search/comparison/prepare_search_r1_data.py \
+  --source-dir /path/to/nq_hotpotqa_train
+```
+
+The 2018 Wikipedia corpus and E5 index are separate artifacts of roughly 70 GB
+combined. Stage them on storage visible to the retrieval service rather than in
+this repository.

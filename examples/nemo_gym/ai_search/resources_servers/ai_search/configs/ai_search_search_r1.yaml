@@ -1,0 +1,80 @@
+ai_search:
+  resources_servers:
+    ai_search:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: Search-R1-compatible Wikipedia retrieval and exact-match reward
+      value: Train text-action search policies with the official Search-R1 protocol
+      num_workers: 1
+      search:
+        provider: http
+        http_url: http://127.0.0.1:8000/retrieve
+        http_timeout_s: 30.0
+        # Dense-only fields remain schema-valid but are unused by the HTTP provider.
+        corpus_path: data/search_r1/unused.jsonl
+        embeddings_path: data/search_r1/unused.npy
+        verify_artifact_hash: false
+        encoder:
+          kind: hash
+          model_name: unused-by-http-provider
+          device: cpu
+          dtype: float32
+          batch_size: 1
+          max_length: 8
+          dimension: 8
+          query_prefix: ""
+          passage_prefix: ""
+          normalize: true
+          trust_remote_code: false
+        index:
+          kind: numpy
+          algorithm: brute_force
+          metric: cosine
+          serialized_index_path: null
+          save_built_index: false
+          graph_degree: 2
+          intermediate_graph_degree: 2
+          build_algorithm: ivf_pq
+          search_width: 1
+          itopk_size: 3
+        default_top_k: 3
+        max_top_k: 3
+        max_query_chars: 4096
+        max_passage_chars: 4096
+        max_search_calls: 4
+        batch_max_size: 256
+        batch_wait_ms: 2.0
+        query_cache_size: 0
+        include_scores: false
+        reward:
+          answer_metric: search_r1_exact_match
+          answer_weight: 1.0
+          retrieval_weight: 0.0
+          format_weight: 0.0
+          efficiency_weight: 0.0
+          answer_threshold_for_efficiency: 0.5
+
+ai_search_search_r1_agent:
+  responses_api_agents:
+    search_r1_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: ai_search
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_turns: 4
+      top_k: 3
+      max_observation_tokens: 500
+      tokenizer_name: Qwen/Qwen2.5-7B
+      datasets:
+      - name: search_r1_train
+        type: train
+        jsonl_fpath: resources_servers/ai_search/data/search_r1/train.jsonl
+        license: TBD
+      - name: search_r1_validation
+        type: validation
+        jsonl_fpath: resources_servers/ai_search/data/search_r1/validation.jsonl
+        license: TBD

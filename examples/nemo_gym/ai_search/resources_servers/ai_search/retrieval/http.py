@@ -76,21 +76,33 @@ class HttpSearchProvider:
             hits: list[SearchHit] = []
             for rank, raw_hit in enumerate(raw_hits, start=1):
                 raw_document = raw_hit["document"]
+                title, text = self._document_text(raw_document)
                 hits.append(
                     SearchHit(
                         document=Document(
                             id=str(raw_document["id"]),
-                            title=str(raw_document["title"]),
-                            text=str(raw_document["text"]),
+                            title=title,
+                            text=text,
                         ),
                         score=float(raw_hit["score"]),
                         rank=rank,
                     )
                 )
-            results.append(
-                SearchResult(query=query, hits=tuple(hits), timings=timings)
-            )
+            results.append(SearchResult(query=query, hits=tuple(hits), timings=timings))
         return results
+
+    @staticmethod
+    def _document_text(raw_document: dict[str, Any]) -> tuple[str, str]:
+        """Accept both local title/text docs and Search-R1's contents field."""
+        if "title" in raw_document and "text" in raw_document:
+            return str(raw_document["title"]), str(raw_document["text"])
+        contents = raw_document.get("contents")
+        if not isinstance(contents, str):
+            raise ValueError(
+                "Retriever documents must contain title/text or a string contents field"
+            )
+        title, separator, text = contents.partition("\n")
+        return title, text if separator else ""
 
     def close(self) -> None:
         """Close the persistent HTTP connection pool."""

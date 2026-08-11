@@ -19,6 +19,8 @@ from resources_servers.ai_search.app import (
     AISearchResourcesServerConfig,
     AISearchVerifyRequest,
     _parse_final_answer,
+    _parse_search_r1_answer,
+    _normalize_search_r1_answer,
     _token_f1,
 )
 from resources_servers.ai_search.retrieval.config import (
@@ -66,6 +68,18 @@ def test_answer_tag_is_accepted_but_format_is_invalid() -> None:
     answer, valid = _parse_final_answer("<answer>Selka</answer>")
     assert answer == "Selka"
     assert valid is False
+
+
+def test_search_r1_answer_parser_is_case_sensitive_and_uses_last_tag() -> None:
+    assert _parse_search_r1_answer("<answer>first</answer><answer>second</answer>") == (
+        "second",
+        True,
+    )
+    assert _parse_search_r1_answer("<ANSWER>wrong case</ANSWER>") == ("", False)
+
+
+def test_search_r1_normalization_deletes_ascii_punctuation() -> None:
+    assert _normalize_search_r1_answer("The Sam-I-am") == "samiam"
 
 
 def test_token_f1_allows_semantically_matching_short_answer() -> None:
@@ -234,4 +248,104 @@ async def test_verifier_combines_decomposed_reward(
     assert result.exact_match == expected_exact_match
     assert result.retrieval_recall == 1.0
     assert result.num_search_calls == 1
+    server._provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_text", "expected_reward", "expected_format"),
+    [
+        ("<answer>Sam-I-am</answer>", 1.0, 1.0),
+        ("Final Answer: Sam-I-am", 0.0, 0.0),
+        ("<ANSWER>Sam-I-am</ANSWER>", 0.0, 0.0),
+    ],
+)
+async def test_search_r1_exact_match_requires_answer_tags(
+    tmp_path, response_text: str, expected_reward: float, expected_format: float
+) -> None:
+    corpus_path = tmp_path / "corpus.jsonl"
+    embeddings_path = tmp_path / "embeddings.npy"
+    corpus_path.write_text(
+        '{"id":"d1","title":"Sam-I-am","text":"A character."}\n',
+        encoding="utf-8",
+    )
+
+    encoder = EncoderConfig(
+        kind="hash",
+        model_name="deterministic-hash",
+        device="cpu",
+        dtype="float32",
+        batch_size=1,
+        max_length=8,
+        dimension=8,
+        query_prefix="",
+        passage_prefix="",
+        normalize=True,
+        trust_remote_code=False,
+    )
+    runtime = SearchRuntimeConfig(
+        provider="http",
+        http_url="http://127.0.0.1:8100/retrieve",
+        corpus_path=corpus_path,
+        embeddings_path=embeddings_path,
+        verify_artifact_hash=False,
+        encoder=encoder,
+        index=IndexConfig(
+            kind="numpy",
+            algorithm="brute_force",
+            metric="cosine",
+            serialized_index_path=None,
+            save_built_index=False,
+            graph_degree=2,
+            intermediate_graph_degree=2,
+            build_algorithm="ivf_pq",
+            search_width=1,
+            itopk_size=2,
+        ),
+        default_top_k=3,
+        max_top_k=3,
+        max_query_chars=128,
+        max_passage_chars=512,
+        max_search_calls=4,
+        batch_max_size=8,
+        batch_wait_ms=0.0,
+        query_cache_size=0,
+        include_scores=False,
+        reward=RewardConfig(
+            answer_metric="search_r1_exact_match",
+            answer_weight=1.0,
+            retrieval_weight=0.0,
+            format_weight=0.0,
+            efficiency_weight=0.0,
+            answer_threshold_for_efficiency=0.5,
+        ),
+    )
+    server = AISearchResourcesServer(
+        config=AISearchResourcesServerConfig(
+            host="127.0.0.1",
+            port=8080,
+            entrypoint="app.py",
+            name="ai_search",
+            search=runtime,
+        ),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    request = MagicMock()
+    request.session = {"session_id": "session"}
+
+    result = await server.verify(
+        request,
+        AISearchVerifyRequest(
+            question="Who is the main character?",
+            answers=["Sam-I-am"],
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
+                input=[{"role": "user", "content": "question"}]
+            ),
+            response=_make_response(response_text),
+        ),
+    )
+
+    assert result.reward == expected_reward
+    assert result.exact_match == expected_reward
+    assert result.format_valid == expected_format
     server._provider.close()

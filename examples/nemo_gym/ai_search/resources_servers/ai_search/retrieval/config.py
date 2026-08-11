@@ -63,7 +63,9 @@ class IndexConfig(BaseModel):
 class RewardConfig(BaseModel):
     """Weights used to combine independent, observable reward components."""
 
-    answer_metric: Literal["token_f1", "exact_match"] = "token_f1"
+    answer_metric: Literal["token_f1", "exact_match", "search_r1_exact_match"] = (
+        "token_f1"
+    )
     answer_weight: float = Field(ge=0.0)
     retrieval_weight: float = Field(ge=0.0)
     format_weight: float = Field(ge=0.0)

@@ -5,6 +5,7 @@
 
 import json
 import re
+import string
 import unicodedata
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseOutputMessage
 from nemo_gym.server_utils import SESSION_ID_KEY
 from resources_servers.ai_search.retrieval.batching import AsyncSearchBatcher
 from resources_servers.ai_search.retrieval.config import SearchRuntimeConfig
@@ -37,6 +39,7 @@ _FINAL_ANSWER_PATTERN = re.compile(
 _ANSWER_TAG_PATTERN = re.compile(
     r"<answer>\s*(.*?)\s*</answer>", flags=re.IGNORECASE | re.DOTALL
 )
+_SEARCH_R1_ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", flags=re.DOTALL)
 _ARTICLES_PATTERN = re.compile(r"\b(a|an|the)\b", flags=re.IGNORECASE)
 
 
@@ -141,6 +144,16 @@ def _normalize_answer(text: str) -> str:
     return " ".join(no_articles.split())
 
 
+def _normalize_search_r1_answer(text: str) -> str:
+    """Match Search-R1's ASCII-punctuation exact-match normalization."""
+    lowered = text.lower()
+    no_punctuation = "".join(
+        character for character in lowered if character not in string.punctuation
+    )
+    no_articles = _ARTICLES_PATTERN.sub(" ", no_punctuation)
+    return " ".join(no_articles.split())
+
+
 def _token_f1(prediction: str, reference: str) -> float:
     prediction_tokens = _normalize_answer(prediction).split()
     reference_tokens = _normalize_answer(reference).split()
@@ -173,6 +186,27 @@ def _parse_final_answer(output_text: str) -> tuple[str, bool]:
     if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
         return parsed["answer"].strip(), False
     return stripped, False
+
+
+def _parse_search_r1_answer(output_text: str) -> tuple[str, bool]:
+    """Extract the last case-sensitive answer tag emitted by the policy."""
+    matches = _SEARCH_R1_ANSWER_PATTERN.findall(output_text)
+    if not matches:
+        return "", False
+    return matches[-1].strip(), True
+
+
+def _response_assistant_text(response: NeMoGymResponse) -> str:
+    """Read assistant text while ignoring interleaved user observations."""
+    chunks: list[str] = []
+    for item in response.output:
+        if not isinstance(item, NeMoGymResponseOutputMessage):
+            continue
+        for content in item.content:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                chunks.append(text)
+    return "".join(chunks)
 
 
 def _mean(values: list[float]) -> float:
@@ -325,19 +359,25 @@ class AISearchResourcesServer(SimpleResourcesServer):
         session_id = request.session[SESSION_ID_KEY]
         metrics = self._session_metrics.pop(session_id, _SessionMetrics())
 
-        output_text = body.response.output_text or ""
-        parsed_answer, format_valid_bool = _parse_final_answer(output_text)
+        output_text = _response_assistant_text(body.response)
+        reward_config = self.config.search.reward
+        if reward_config.answer_metric == "search_r1_exact_match":
+            parsed_answer, format_valid_bool = _parse_search_r1_answer(output_text)
+            normalize_for_exact_match = _normalize_search_r1_answer
+        else:
+            parsed_answer, format_valid_bool = _parse_final_answer(output_text)
+            normalize_for_exact_match = _normalize_answer
         answer_f1 = max(_token_f1(parsed_answer, answer) for answer in body.answers)
         exact_match = float(
             any(
-                _normalize_answer(parsed_answer) == _normalize_answer(answer)
+                normalize_for_exact_match(parsed_answer)
+                == normalize_for_exact_match(answer)
                 for answer in body.answers
             )
         )
-        reward_config = self.config.search.reward
         answer_score = (
             exact_match
-            if reward_config.answer_metric == "exact_match"
+            if reward_config.answer_metric in ("exact_match", "search_r1_exact_match")
             else answer_f1
         )
 

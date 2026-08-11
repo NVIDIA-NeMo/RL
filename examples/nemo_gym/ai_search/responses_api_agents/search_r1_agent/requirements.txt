@@ -1,0 +1,2 @@
+-e nemo-gym[dev] @ ../../../../../3rdparty/Gym-workspace/Gym
+transformers>=5.5.0,<5.9.0

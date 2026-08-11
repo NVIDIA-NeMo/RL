@@ -68,8 +68,6 @@ def test_http_provider_converts_search_r1_response() -> None:
                 {
                     "document": {
                         "id": "d1",
-                        "title": "Title",
-                        "text": "Passage",
                         "contents": "Title\nPassage",
                     },
                     "score": 2.5,
@@ -83,6 +81,8 @@ def test_http_provider_converts_search_r1_response() -> None:
     results = provider.search_batch(["query"], top_k=1)
 
     assert results[0].hits[0].document.id == "d1"
+    assert results[0].hits[0].document.title == "Title"
+    assert results[0].hits[0].document.text == "Passage"
     assert results[0].hits[0].score == 2.5
     assert results[0].timings.batch_size == 1
     provider.close()

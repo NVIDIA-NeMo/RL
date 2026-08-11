@@ -1,0 +1,125 @@
+# Search-R1 paper-v5 GRPO target, using the official Search-R1 rollout behavior.
+defaults: grpo_qwen2_5_3b_aligned_benchmark.yaml
+
+grpo:
+  max_num_epochs: 15
+  max_num_steps: 500
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 5
+  # NeMo Gym owns the four text-action turns inside one environment rollout.
+  max_rollout_turns: 1
+  val_period: 50
+  val_start_at: 0
+  val_at_start: true
+  val_at_end: true
+  val_num_generations_per_prompt: 1
+  skip_reference_policy_logprobs_calculation: false
+  invalid_tool_call_advantage: null
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+    reward_weights: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+  reference_policy_kl_type: k3
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  token_level_loss: true
+
+policy:
+  model_name: Qwen/Qwen2.5-7B
+  tokenizer:
+    name: Qwen/Qwen2.5-7B
+    # Search-R1 concatenates prompt, generated actions, and observations directly.
+    chat_template: null
+  # 512 prompts * 5 responses = 2,560 rollouts. The public Search-R1 worker
+  # shards its configured 256/64 train batches over eight data-parallel ranks,
+  # resulting in ten global mini-batches of 256 and a local micro-batch of 8.
+  train_global_batch_size: 256
+  train_micro_batch_size: 8
+  # Search-R1 shards its configured log-prob batch of 128 over eight ranks.
+  logprob_batch_size: 16
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: true
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 142
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: [142]
+  generation:
+    max_new_tokens: 500
+    temperature: 1.0
+    top_p: 1.0
+    val_temperature: 1.0
+    val_top_p: 1.0
+    vllm_cfg:
+      gpu_memory_utilization: 0.6
+      tensor_parallel_size: 1
+      max_model_len: 4096
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: false
+        chat_template: "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+
+data:
+  shuffle: true
+  train:
+    data_path: examples/nemo_gym/ai_search/resources_servers/ai_search/data/search_r1/train.jsonl
+  validation:
+    data_path: examples/nemo_gym/ai_search/resources_servers/ai_search/data/search_r1/validation.jsonl
+
+env:
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/ai_search/configs/ai_search_search_r1.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            stop: ["</search>", "</answer>"]
+            include_stop_str_in_output: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-ai-search-qwen2.5-7b-search-r1
+  keep_top_k: 5
+  save_period: 100
+  save_optimizer: true
+
+logger:
+  log_dir: logs/grpo-ai-search-qwen2.5-7b-search-r1
+  num_val_samples_to_print: 4
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-ai-search
+    name: qwen2.5-7b-search-r1-parity
+
+cluster:
+  gpus_per_node: 8
