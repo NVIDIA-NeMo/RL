@@ -1816,9 +1816,12 @@ class MegatronPolicyWorkerImpl(
         k: int,
         micro_batch_size: Optional[int] = None,
     ):
-        """Get the top-k logits and indices for a batch of data.
+        """Get top-k model outputs for a batch of data.
 
-        The major difference from get_logprobs is that we compute top-k logits and indices for each position in the sequence.
+        Args:
+            data: Tokenized model inputs.
+            k: Number of vocabulary entries to return per position.
+            micro_batch_size: Optional inference microbatch size.
 
         Returns:
             BatchedDataDict containing:
@@ -1867,53 +1870,41 @@ class MegatronPolicyWorkerImpl(
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
-            logprobs_chunks = []
             indices_chunks = []
             for out in list_of_outputs:
                 tk = out["topk_logits"]
-                tlp = out["topk_logprobs"]
                 ti = out["topk_indices"]
                 pad_len = seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
-                    tlp = torch.nn.functional.pad(tlp, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
                 logits_chunks.append(tk)
-                logprobs_chunks.append(tlp)
                 indices_chunks.append(ti)
 
             topk_logits = torch.cat(logits_chunks, dim=0)
-            topk_logprobs = torch.cat(logprobs_chunks, dim=0)
             topk_indices = torch.cat(indices_chunks, dim=0)
 
             tensors_to_broadcast = {
                 "topk_logits": topk_logits,
-                "topk_logprobs": topk_logprobs,
                 "topk_indices": topk_indices,
             }
         else:
             tensors_to_broadcast = {
                 "topk_logits": None,
-                "topk_logprobs": None,
                 "topk_indices": None,
             }
 
         # Broadcast tensors from last stage to all stages
         broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
         topk_logits = broadcasted["topk_logits"]
-        topk_logprobs = broadcasted["topk_logprobs"]
         topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict.from_batches(
-            [
-                {
-                    "topk_logits": topk_logits.cpu(),
-                    "topk_logprobs": topk_logprobs.cpu(),
-                    "topk_indices": topk_indices.cpu(),
-                }
-            ]
-        )
+        result = {
+            "topk_logits": topk_logits.cpu(),
+            "topk_indices": topk_indices.cpu(),
+        }
+        return BatchedDataDict.from_batches([result])
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_on_support")
     def get_logprobs_on_support(
@@ -1922,7 +1913,17 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Evaluate normalized model logprobs at caller-provided top-k indices."""
+        """Evaluate normalized model log-probabilities on a supplied support.
+
+        Args:
+            data: Model inputs containing ``topk_indices`` with shape
+                ``[batch, sequence, k]``.
+            micro_batch_size: Optional inference microbatch size.
+
+        Returns:
+            Full-vocabulary-normalized ``support_logprobs`` aligned with the
+            supplied support indices.
+        """
         if self.cfg["sequence_packing"]["enabled"]:
             raise NotImplementedError(
                 "get_logprobs_on_support does not yet support sequence packing."

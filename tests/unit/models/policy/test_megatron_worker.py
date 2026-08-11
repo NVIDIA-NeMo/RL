@@ -2096,15 +2096,13 @@ def test_megatron_policy_topk_logits(topk_setup):
     outputs = policy.get_topk_logits(data, k=k)
 
     # Basic validation
-    assert all(
-        key in outputs for key in ("topk_logits", "topk_logprobs", "topk_indices")
-    ), "Top-k outputs should contain logits, globally normalized logprobs, and indices"
+    assert "topk_logits" in outputs and "topk_indices" in outputs, (
+        "Top-k outputs should contain both 'topk_logits' and 'topk_indices'"
+    )
     topk_logits = outputs["topk_logits"]
-    topk_logprobs = outputs["topk_logprobs"]
     topk_indices = outputs["topk_indices"]
 
     assert isinstance(topk_logits, torch.Tensor)
-    assert isinstance(topk_logprobs, torch.Tensor)
     assert isinstance(topk_indices, torch.Tensor)
     assert topk_logits.dtype == torch.float32
     assert topk_indices.dtype in (torch.int32, torch.int64, torch.long)
@@ -2112,7 +2110,6 @@ def test_megatron_policy_topk_logits(topk_setup):
     # Shape checks
     B, S = data.get("input_ids").shape
     assert topk_logits.shape == (B, S, k)
-    assert topk_logprobs.shape == (B, S, k)
     assert topk_indices.shape == (B, S, k)
 
     # Mask invalid positions and check for NaN/Inf

@@ -77,8 +77,54 @@ def test_student_topk_adds_sampled_tail_only_outside_support():
         target_in_support=torch.tensor([True]),
     )
 
-    expected_tail = -(teacher_target - student_target).detach() * student_target
+    expected_tail = (1.0 - (teacher_target - student_target).detach()) * student_target
     torch.testing.assert_close(outside_loss - inside_loss, expected_tail)
+
+
+def test_student_topk_tail_gradient_is_unbiased():
+    """Enumerating sampled tail tokens recovers the exact reverse-KL gradient."""
+    student_logits = torch.tensor(
+        [[0.4, -0.3, 0.8, -0.7]], dtype=torch.float64, requires_grad=True
+    )
+    teacher_logits = torch.tensor([[-0.2, 0.6, 0.1, -0.4]], dtype=torch.float64)
+    student_logprobs = student_logits.log_softmax(dim=-1)
+    teacher_logprobs = teacher_logits.log_softmax(dim=-1)
+    support_indices = torch.tensor([2, 0])
+    tail_indices = torch.tensor([1, 3])
+
+    exact_reverse_kl = (
+        student_logprobs.exp() * (student_logprobs - teacher_logprobs)
+    ).sum()
+    exact_grad = torch.autograd.grad(
+        exact_reverse_kl, student_logits, retain_graph=True
+    )[0]
+
+    expected_estimator = student_logits.new_zeros(())
+    sampling_probs = student_logprobs.exp().detach()
+    for target_index in tail_indices:
+        sampled_loss = student_topk_reverse_kl_loss(
+            student_support_logprobs=student_logprobs[:, support_indices],
+            teacher_support_logprobs=teacher_logprobs[:, support_indices],
+            student_target_logprobs=student_logprobs[:, target_index],
+            teacher_target_logprobs=teacher_logprobs[:, target_index],
+            target_in_support=torch.tensor([False]),
+        )
+        expected_estimator = (
+            expected_estimator + sampling_probs[:, target_index] * sampled_loss.sum()
+        )
+
+    # Samples inside the support contribute the exact head term as well. Their
+    # probabilities complete the expectation over the student's vocabulary.
+    support_loss = (
+        student_logprobs[:, support_indices].exp()
+        * (student_logprobs[:, support_indices] - teacher_logprobs[:, support_indices])
+    ).sum()
+    expected_estimator = (
+        expected_estimator + sampling_probs[:, support_indices].sum() * support_loss
+    )
+    estimator_grad = torch.autograd.grad(expected_estimator, student_logits)[0]
+
+    torch.testing.assert_close(estimator_grad, exact_grad)
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +145,10 @@ class _MockShardingAnnotations:
 class _MockTeacherWorkerGroup:
     """Returns logprobs filled with a constant; validates DP-divisible batch."""
 
-    def __init__(self, fill_value=1.0, dp_size=4):
+    def __init__(self, fill_value=1.0, dp_size=4, include_input_ids=False):
         self._fill_value = fill_value
         self.sharding_annotations = _MockShardingAnnotations(dp_size)
+        self._include_input_ids = include_input_ids
 
     def get_logprobs(self, data):
         input_ids = data["input_ids"]
@@ -120,13 +167,12 @@ class _MockTeacherWorkerGroup:
         topk_indices = data["topk_indices"]
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         assert input_ids.shape[0] % dp_size == 0
-        return BatchedDataDict(
-            {
-                "support_logprobs": torch.full(
-                    topk_indices.shape, self._fill_value, dtype=torch.float32
-                )
-            }
+        support_logprobs = torch.full(
+            topk_indices.shape, self._fill_value, dtype=torch.float32
         )
+        if self._include_input_ids:
+            support_logprobs = support_logprobs + input_ids.unsqueeze(-1)
+        return BatchedDataDict({"support_logprobs": support_logprobs})
 
 
 def _make_collector(**overrides):
@@ -225,8 +271,12 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
 
 
 def test_compute_teacher_support_logprobs_routes_and_trims_dp_padding():
-    math_twg = _MockTeacherWorkerGroup(fill_value=-1.0, dp_size=4)
-    code_twg = _MockTeacherWorkerGroup(fill_value=-2.0, dp_size=2)
+    math_twg = _MockTeacherWorkerGroup(
+        fill_value=-1.0, dp_size=4, include_input_ids=True
+    )
+    code_twg = _MockTeacherWorkerGroup(
+        fill_value=-2.0, dp_size=2, include_input_ids=True
+    )
     collector = _make_collector(
         teacher_worker_groups={"math": math_twg, "code": code_twg},
         alias_to_group_alias={"math": "math", "code": "code"},
@@ -250,9 +300,15 @@ def test_compute_teacher_support_logprobs_routes_and_trims_dp_padding():
     )
 
     assert result.shape == (3, 5, 2)
-    torch.testing.assert_close(result[0], torch.full((5, 2), -1.0))
-    torch.testing.assert_close(result[1], torch.full((5, 2), -2.0))
-    torch.testing.assert_close(result[2], torch.full((5, 2), -1.0))
+    torch.testing.assert_close(
+        result[0], input_ids[0].unsqueeze(-1).expand(-1, 2) - 1.0
+    )
+    torch.testing.assert_close(
+        result[1], input_ids[1].unsqueeze(-1).expand(-1, 2) - 2.0
+    )
+    torch.testing.assert_close(
+        result[2], input_ids[2].unsqueeze(-1).expand(-1, 2) - 1.0
+    )
 
 
 def test_compute_teacher_logprobs_deduplication():

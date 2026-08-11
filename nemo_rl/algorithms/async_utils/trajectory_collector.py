@@ -799,7 +799,19 @@ class AsyncTrajectoryCollector:
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, float]:
-        """Route student-selected supports to teachers and stitch their logprobs."""
+        """Route student-selected supports to teachers and stitch their logprobs.
+
+        Args:
+            input_ids: Student token IDs with shape ``[batch, sequence]``.
+            topk_indices: Student-selected vocabulary indices with shape
+                ``[batch, sequence, k]``.
+            agent_refs: Per-sample agent metadata used for teacher routing.
+            input_lengths: Optional unpadded sequence lengths.
+
+        Returns:
+            Teacher support log-probabilities in original batch order and the
+            elapsed teacher-evaluation time.
+        """
         if topk_indices.ndim != 3 or topk_indices.shape[:2] != input_ids.shape:
             raise ValueError(
                 "topk_indices must have shape [B, S, K] aligned with input_ids; "
@@ -885,7 +897,18 @@ class AsyncTrajectoryCollector:
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, float]:
-        """Run blocking teacher support inference without blocking the actor loop."""
+        """Run teacher support inference without blocking the actor event loop.
+
+        Args:
+            input_ids: Student token IDs with shape ``[batch, sequence]``.
+            topk_indices: Student-selected vocabulary indices with shape
+                ``[batch, sequence, k]``.
+            agent_refs: Per-sample agent metadata used for teacher routing.
+            input_lengths: Optional unpadded sequence lengths.
+
+        Returns:
+            Teacher support log-probabilities and evaluation time.
+        """
         return await asyncio.to_thread(
             self._compute_teacher_support_logprobs,
             input_ids,

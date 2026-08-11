@@ -1011,10 +1011,8 @@ class TestTopkLogitsPostProcessor:
         loss, result = wrapped_fn(output_tensor)
 
         assert "topk_logits" in result
-        assert "topk_logprobs" in result
         assert "topk_indices" in result
         assert result["topk_logits"].shape[-1] == k
-        assert result["topk_logprobs"].shape == result["topk_logits"].shape
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1061,7 +1059,6 @@ class TestTopkLogitsPostProcessor:
         loss, result = wrapped_fn(output_tensor)
 
         assert "topk_logits" in result
-        assert "topk_logprobs" in result
         assert "topk_indices" in result
         # Output should be unpacked to batch shape
         assert result["topk_logits"].shape[0] == 1
@@ -1153,8 +1150,7 @@ class TestTopkLogitsPostProcessor:
         # allgather returns the full gathered tensor
         gathered_vals = torch.randn(1, seq_len, k)
         gathered_idx = torch.randint(0, 100, (1, seq_len, k))
-        gathered_logprobs = torch.randn(1, seq_len, k)
-        mock_allgather.side_effect = [gathered_vals, gathered_idx, gathered_logprobs]
+        mock_allgather.side_effect = [gathered_vals, gathered_idx]
 
         cu_seqlens_padded = torch.tensor([0, seq_len])
 
@@ -1166,10 +1162,9 @@ class TestTopkLogitsPostProcessor:
         output_tensor = torch.randn(1, local_seq_len, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        # Verify allgather was called for logits, indices, and logprobs.
-        assert mock_allgather.call_count == 3
+        # Verify allgather was called for logits and indices.
+        assert mock_allgather.call_count == 2
         assert "topk_logits" in result
-        assert "topk_logprobs" in result
         assert "topk_indices" in result
         # Output should be unpacked: (batch_size=1, unpacked_seqlen=8, k=3)
         assert result["topk_logits"].shape == (1, 8, k)
@@ -1220,7 +1215,7 @@ class TestTopkLogitsPostProcessor:
         mock_topk_idx = torch.randint(0, 100, (1, local_packed_len, k))
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
-        # allgather is called once per sequence for logits, indices, and logprobs.
+        # allgather is called once per sequence for logits and indices.
         def fake_allgather(local_tensor, group, seq_dim):
             # Simulate gathering: double the seq_dim since cp_size=2
             return local_tensor.repeat(1, cp_size, 1)
@@ -1237,9 +1232,8 @@ class TestTopkLogitsPostProcessor:
         output_tensor = torch.randn(1, local_packed_len, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        assert mock_allgather.call_count == 6
+        assert mock_allgather.call_count == 4
         assert "topk_logits" in result
-        assert "topk_logprobs" in result
         assert "topk_indices" in result
         # Output should be unpacked: (batch_size=2, unpacked_seqlen=6, k=3)
         assert result["topk_logits"].shape == (2, unpacked_seqlen, k)

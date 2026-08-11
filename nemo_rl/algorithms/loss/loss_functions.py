@@ -174,7 +174,6 @@ class ClippedPGLossDataDict(TypedDict):
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
     prev_topk_indices: NotRequired[torch.Tensor]
-    prev_topk_logprobs: NotRequired[torch.Tensor]
     teacher_support_logprobs: NotRequired[torch.Tensor]
     teacher_reference_logprobs: NotRequired[torch.Tensor]
     __extra__: Any
@@ -604,7 +603,6 @@ class ClippedPGLossFn(LossFunction):
                 raise ValueError("Student-top-k OPD requires current_support_logprobs.")
             required_fields = (
                 "prev_topk_indices",
-                "prev_topk_logprobs",
                 "teacher_support_logprobs",
                 "teacher_reference_logprobs",
             )
@@ -615,12 +613,10 @@ class ClippedPGLossFn(LossFunction):
                 )
 
             support_indices = data["prev_topk_indices"][:, :-1]
-            previous_support_logprobs = data["prev_topk_logprobs"][:, :-1]
             teacher_support_logprobs = data["teacher_support_logprobs"][:, :-1]
             expected_support_shape = support_indices.shape
             for name, value in (
                 ("current_support_logprobs", current_support_logprobs),
-                ("prev_topk_logprobs", previous_support_logprobs),
                 ("teacher_support_logprobs", teacher_support_logprobs),
             ):
                 if value.shape != expected_support_shape:
