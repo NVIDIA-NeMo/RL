@@ -47,6 +47,45 @@ def _build_reasoning_parser(name: str, chat_template_kwargs: dict[str, Any]) -> 
     return ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
 
 
+def _build_sampling_params(
+    sampling_params_cls: Any,
+    *,
+    sampling_config: dict[str, Any],
+    stop_token_ids: list[int] | None,
+    max_tokens: int,
+) -> Any:
+    """Build the TRT-LLM sampling params for one HTTP rollout request.
+
+    Mirrors the direct generate() path
+    (``TrtllmAsyncGenerationWorkerImpl._build_sampling_params``) so both paths
+    sample from the same distribution for a given generation config.
+
+    Args:
+        sampling_params_cls: ``tensorrt_llm.SamplingParams``, injected so this
+            helper stays importable and testable without the TRT-LLM runtime.
+        sampling_config: NeMo-RL generation config (temperature / top_p / top_k).
+        stop_token_ids: Extra stop tokens from the generation config, if any.
+        max_tokens: Output cap for this request, already clamped to the context window.
+
+    Returns:
+        A ``SamplingParams`` instance to hand to ``llm.generate_async``.
+    """
+    # TRT-LLM spells "no top-k restriction" as 0, the generation config as null.
+    top_k_cfg = sampling_config["top_k"]
+    stop_ids = list(stop_token_ids or [])
+    return sampling_params_cls(
+        temperature=float(sampling_config["temperature"]),
+        top_p=float(sampling_config["top_p"]),
+        top_k=int(top_k_cfg) if top_k_cfg is not None else 0,
+        max_tokens=int(max_tokens),
+        stop_token_ids=stop_ids or None,
+        # Include generated stop tokens so the adapter can trim tokens and logprobs together.
+        include_stop_str_in_output=True,
+        logprobs=True,
+        logprobs_simple_format=True,
+    )
+
+
 def create_app(
     llm: Any,
     tokenizer: Any,
@@ -122,9 +161,9 @@ def create_app(
         # for sampling params.
         for key in ("temperature", "top_p", "top_k"):
             if body.get(key) is not None:
-                assert body[key] == sampling_config.get(key), (
+                assert body[key] == sampling_config[key], (
                     f"request {key} {body[key]!r} must match the "
-                    f"NeMo-RL generation config ({sampling_config.get(key)})"
+                    f"NeMo-RL generation config ({sampling_config[key]})"
                 )
 
         # Request kwargs override server defaults.
@@ -198,18 +237,11 @@ def create_app(
         from tensorrt_llm import SamplingParams as TrtSamplingParams
         from tensorrt_llm.executor.utils import RequestError
 
-        # Same convention as the direct path (_build_sampling_params): TRT-LLM
-        # spells "no top-k restriction" as 0, the generation config as null.
-        top_k_cfg = sampling_config.get("top_k")
-        sampling = TrtSamplingParams(
-            temperature=float(sampling_config["temperature"]),
-            top_p=float(sampling_config["top_p"]),
-            top_k=int(top_k_cfg) if top_k_cfg is not None else 0,
-            max_tokens=int(max_tokens),
-            # Include generated stop tokens so the adapter can trim tokens and logprobs together.
-            include_stop_str_in_output=True,
-            logprobs=True,
-            logprobs_simple_format=True,
+        sampling = _build_sampling_params(
+            TrtSamplingParams,
+            sampling_config=sampling_config,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
         )
 
         try:
