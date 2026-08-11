@@ -70,6 +70,9 @@ def _make_bare_controller() -> Any:
     ctrl = object.__new__(controller_cls)
     ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
     ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_slot_waiters = 0
+    ctrl._rollout_permitted_waiters = 0
+    ctrl._buffer_capacity_waiters = 0
     return ctrl
 
 

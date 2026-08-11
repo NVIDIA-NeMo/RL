@@ -459,7 +459,7 @@ class _FakeGeneration:
     def get_logger_metrics(self) -> dict[str, Any]:
         return {}
 
-    def get_latest_logger_metrics(self) -> dict[str, Any]:
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
         return {}
 
 
@@ -1089,7 +1089,7 @@ class TestPeriodicRolloutCheckpoint:
         )
 
         class _Generation:
-            def get_latest_logger_metrics(self):
+            def drain_latest_logger_metrics(self):
                 return next(generation_snapshots)
 
         actor._gen = _Generation()
@@ -1147,6 +1147,42 @@ class TestPeriodicRolloutCheckpoint:
 
         asyncio.run(_exercise())
 
+    def test_vllm_rate_skips_worker_membership_changes(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._rollout_manager.telemetry_snapshot = lambda: {
+            "canonical_groups_finalized": 0,
+            "canonical_output_tokens": 0,
+            "recovery_siblings_reused": 0,
+            "recovery_siblings_redispatched": 0,
+        }
+        generation_snapshots = iter(
+            [
+                {"generation_tokens": {0: [100]}},
+                {"generation_tokens": {0: [120], 1: [50]}},
+            ]
+        )
+
+        class _Generation:
+            def drain_latest_logger_metrics(self):
+                return next(generation_snapshots)
+
+        actor._gen = _Generation()
+
+        async def _sample_twice() -> None:
+            await actor._log_rollout_throughput_metrics(emit=False)
+            await actor._log_rollout_throughput_metrics()
+
+        with patch(
+            "nemo_rl.algorithms.single_controller.time.monotonic",
+            new=_SteppingClock(start=10.0, step=10.0),
+        ):
+            asyncio.run(_sample_twice())
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["vllm_counter_discontinuity"] == 1
+        assert "vllm_output_tokens_per_second" not in logged
+
     def test_logs_parallel_recovery_duration_and_reuse(self, tmp_path):
         actor, _, _ = self._make_periodic_actor(tmp_path)
         actor._logger = MagicMock()
@@ -1179,9 +1215,11 @@ class TestPeriodicRolloutCheckpoint:
 
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["total_seconds"] > 0
-        assert logged["groups"] == 2
-        assert logged["groups_per_second"] == pytest.approx(
-            logged["groups"] / logged["total_seconds"]
+        assert logged["groups_attempted"] == 2
+        assert logged["groups_completed"] == 2
+        assert logged["groups_dropped"] == 0
+        assert logged["completed_groups_per_second"] == pytest.approx(
+            logged["groups_completed"] / logged["total_seconds"]
         )
         assert logged["siblings_reused"] == 3
         assert logged["siblings_redispatched"] == 3
@@ -1194,6 +1232,27 @@ class TestPeriodicRolloutCheckpoint:
             "prefix": "timing/rollout_recovery",
             "step_metric": "telemetry/wall_time_seconds",
         }
+
+    def test_recovery_telemetry_reports_dropped_groups(self, tmp_path):
+        actor, _, _ = self._make_periodic_actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._rollout_manager.telemetry_snapshot = lambda: {
+            "recovery_siblings_reused": 0,
+            "recovery_siblings_redispatched": 0,
+        }
+        results = iter([True, False])
+
+        async def _execute(_work_item, *, task_started_event, **_kwargs) -> bool:
+            task_started_event.set()
+            return next(results)
+
+        actor._execute_rollout_work_item = _execute
+        asyncio.run(actor._recover_prepared_rollout_groups([object(), object()]))
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["groups_attempted"] == 2
+        assert logged["groups_completed"] == 1
+        assert logged["groups_dropped"] == 1
 
     def test_checkpoint_outcome_records_skip_reason_and_elapsed_axis(self, tmp_path):
         actor, _, _ = self._make_periodic_actor(tmp_path)
@@ -1221,8 +1280,8 @@ class TestPeriodicRolloutCheckpoint:
 
         async def _save_twice() -> tuple[bool, bool]:
             return (
-                await actor._save_rollout_checkpoint(),
-                await actor._save_rollout_checkpoint(),
+                (await actor._save_rollout_checkpoint()).saved,
+                (await actor._save_rollout_checkpoint()).saved,
             )
 
         assert asyncio.run(_save_twice()) == (True, False)
@@ -1298,11 +1357,13 @@ class TestPeriodicRolloutCheckpoint:
         (bootstrap_snapshots / "snapshot_000001").mkdir(parents=True)
 
         async def _save_without_then_with_anchor() -> tuple[bool, bool, bool]:
-            without_anchor = await actor._save_rollout_checkpoint(force=True)
-            without_anchor_again = await actor._save_rollout_checkpoint(force=True)
+            without_anchor = (await actor._save_rollout_checkpoint(force=True)).saved
+            without_anchor_again = (
+                await actor._save_rollout_checkpoint(force=True)
+            ).saved
             assert dp_client.save_calls == []
             step_dir.mkdir(parents=True)
-            with_anchor = await actor._save_rollout_checkpoint(force=True)
+            with_anchor = (await actor._save_rollout_checkpoint(force=True)).saved
             return without_anchor, without_anchor_again, with_anchor
 
         assert asyncio.run(_save_without_then_with_anchor()) == (False, False, True)

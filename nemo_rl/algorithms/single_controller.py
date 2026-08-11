@@ -49,7 +49,7 @@ from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import ray
 import torch
@@ -123,6 +123,24 @@ _TELEMETRY_PREFIXES = (
     "rollout/throughput",
 )
 
+RolloutCheckpointSkipReason = Literal[
+    "train_step_active",
+    "unchanged_state",
+    "trainer_checkpoint_not_durable",
+    "state_changed_while_waiting",
+]
+
+
+@dataclass(frozen=True)
+class RolloutCheckpointSaveResult:
+    """Result of one rollout-checkpoint save attempt."""
+
+    saved: bool
+    skip_reason: Optional[RolloutCheckpointSkipReason] = None
+
+    def __bool__(self) -> bool:
+        return self.saved
+
 
 @dataclass(frozen=True)
 class _RolloutWorkItem:
@@ -145,16 +163,19 @@ class _RolloutCheckpointCut:
     tq_save_seconds: float
 
 
-def _latest_vllm_values(metrics: dict[str, Any], metric_name: str) -> list[float]:
-    """Return the latest value reported by each vLLM data-parallel worker."""
+def _latest_vllm_values(metrics: dict[str, Any], metric_name: str) -> dict[int, float]:
+    """Return the latest value keyed by vLLM data-parallel worker."""
     per_worker = metrics.get(metric_name)
     if not isinstance(per_worker, dict):
-        return []
-    return [
-        float(values[-1])
-        for values in per_worker.values()
-        if isinstance(values, list) and values and isinstance(values[-1], (int, float))
-    ]
+        return {}
+    return {
+        worker_id: float(values[-1])
+        for worker_id, values in per_worker.items()
+        if isinstance(worker_id, int)
+        and isinstance(values, list)
+        and values
+        and isinstance(values[-1], (int, float))
+    }
 
 
 def _percentile(values: list[float], quantile: float) -> float:
@@ -238,12 +259,11 @@ class SingleControllerActor:
                 stacklevel=2,
             )
         self._throughput_sample_time: Optional[float] = None
-        self._throughput_generation_tokens: Optional[int] = None
+        self._throughput_generation_tokens_by_worker: Optional[dict[int, int]] = None
         self._throughput_rollout_counters: Optional[dict[str, int]] = None
         self._rollout_telemetry_lock = asyncio.Lock()
         self._rollout_completion_durations_s: deque[float] = deque(maxlen=10_000)
         self._rollout_queue_wait_durations_s: deque[float] = deque(maxlen=10_000)
-        self._last_rollout_checkpoint_skip_reason: Optional[str] = None
         self._last_successful_rollout_checkpoint_time: Optional[float] = None
 
         # Also built here, not on the driver: TimeoutChecker must capture
@@ -1028,6 +1048,8 @@ class SingleControllerActor:
                 )
 
             if work_items:
+                groups_completed = sum(result is True for result in recovery_results)
+                groups_dropped = sum(result is False for result in recovery_results)
                 recovery_seconds = max(
                     time.monotonic() - recovery_started,
                     1e-9,
@@ -1047,8 +1069,11 @@ class SingleControllerActor:
                 self._log_telemetry_metrics(
                     {
                         "total_seconds": recovery_seconds,
-                        "groups": float(len(work_items)),
-                        "groups_per_second": len(work_items) / recovery_seconds,
+                        "groups_attempted": float(len(work_items)),
+                        "groups_completed": float(groups_completed),
+                        "groups_dropped": float(groups_dropped),
+                        "completed_groups_per_second": groups_completed
+                        / recovery_seconds,
                         "siblings_reused": float(reused),
                         "siblings_redispatched": float(redispatched),
                         "siblings_per_second": recovered_siblings / recovery_seconds,
@@ -1060,7 +1085,9 @@ class SingleControllerActor:
                 )
                 print(
                     "rollout recovery replay completed: "
-                    f"groups={len(work_items)}, "
+                    f"groups_attempted={len(work_items)}, "
+                    f"groups_completed={groups_completed}, "
+                    f"groups_dropped={groups_dropped}, "
                     f"max_concurrency={self._async_cfg.max_inflight_prompts}, "
                     f"duration={recovery_seconds:.2f}s, "
                     f"reused={reused}, redispatched={redispatched}",
@@ -1318,24 +1345,23 @@ class SingleControllerActor:
 
             await asyncio.to_thread(_write_config)
 
-    async def _save_rollout_checkpoint(self, *, force: bool = False) -> bool:
+    async def _save_rollout_checkpoint(
+        self, *, force: bool = False
+    ) -> RolloutCheckpointSaveResult:
         """Publish a lightweight rollout snapshot when trainer state is anchored.
 
-        Returns ``True`` when a new snapshot was committed and ``False`` when
-        there was no new mutation or the controller was in an unsafe window.
+        The result names why an attempt was skipped instead of communicating
+        through controller side state.
         """
         async with self._checkpoint_save_lock:
-            self._last_rollout_checkpoint_skip_reason = None
             if self._train_step_active:
-                self._last_rollout_checkpoint_skip_reason = "train_step_active"
-                return False
+                return RolloutCheckpointSaveResult(False, "train_step_active")
             if (
                 not force
                 and self._last_rollout_snapshot_mutation_version
                 == self._data_plane_checkpoint_barrier.mutation_version
             ):
-                self._last_rollout_checkpoint_skip_reason = "unchanged_state"
-                return False
+                return RolloutCheckpointSaveResult(False, "unchanged_state")
 
             save_started = time.monotonic()
             await asyncio.to_thread(self._checkpointer.finalize_pending)
@@ -1373,10 +1399,9 @@ class SingleControllerActor:
                             flush=True,
                         )
                         self._last_missing_rollout_snapshot_anchor = skip_key
-                    self._last_rollout_checkpoint_skip_reason = (
-                        "trainer_checkpoint_not_durable"
+                    return RolloutCheckpointSaveResult(
+                        False, "trainer_checkpoint_not_durable"
                     )
-                    return False
                 try:
                     await asyncio.to_thread(
                         prune_bootstrap_snapshots,
@@ -1409,10 +1434,9 @@ class SingleControllerActor:
                         or self._trainer_version != expected_trainer_version
                     ):
                         await asyncio.to_thread(shutil.rmtree, tmp_path)
-                        self._last_rollout_checkpoint_skip_reason = (
-                            "state_changed_while_waiting"
+                        return RolloutCheckpointSaveResult(
+                            False, "state_changed_while_waiting"
                         )
-                        return False
                     snapshot_epoch = self._current_epoch
                     cut = await self._capture_rollout_checkpoint_cut(tmp_path)
                 barrier_released = time.monotonic()
@@ -1479,14 +1503,14 @@ class SingleControllerActor:
                 f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
                 flush=True,
             )
-            return True
+            return RolloutCheckpointSaveResult(True)
 
     def _log_rollout_checkpoint_outcome(
         self,
         *,
         outcome: str,
         attempt_duration_seconds: float,
-        skip_reason: Optional[str] = None,
+        skip_reason: Optional[RolloutCheckpointSkipReason] = None,
     ) -> None:
         """Record every scheduled checkpoint attempt, including no-op cuts."""
         metrics = {
@@ -1507,13 +1531,7 @@ class SingleControllerActor:
                 )
             self._last_successful_rollout_checkpoint_time = completed_at
         elif outcome == "skipped":
-            known_reasons = (
-                "train_step_active",
-                "unchanged_state",
-                "trainer_checkpoint_not_durable",
-                "state_changed_while_waiting",
-            )
-            reason = skip_reason if skip_reason in known_reasons else "unknown"
+            reason = skip_reason or "unknown"
             metrics[f"skip_{reason}"] = 1.0
 
         self._log_telemetry_metrics(
@@ -1537,7 +1555,7 @@ class SingleControllerActor:
                 and self._timeout.would_save()
             )
             try:
-                saved = await self._save_rollout_checkpoint(force=deadline_due)
+                save_result = await self._save_rollout_checkpoint(force=deadline_due)
             except Exception as error:
                 self._log_rollout_checkpoint_outcome(
                     outcome="failed",
@@ -1555,13 +1573,13 @@ class SingleControllerActor:
                 continue
 
             self._log_rollout_checkpoint_outcome(
-                outcome="completed" if saved else "skipped",
+                outcome="completed" if save_result.saved else "skipped",
                 attempt_duration_seconds=time.monotonic() - attempt_started,
-                skip_reason=self._last_rollout_checkpoint_skip_reason,
+                skip_reason=save_result.skip_reason,
             )
 
             if deadline_due:
-                if not saved:
+                if not save_result.saved:
                     print(
                         "Pre-step checkpoint deadline reached during an unsafe "
                         "snapshot window; retrying without consuming the trainer "
@@ -2263,7 +2281,7 @@ class SingleControllerActor:
         generation_metrics: dict[str, Any] = {}
         try:
             generation_metrics = await asyncio.to_thread(
-                self._gen.get_latest_logger_metrics
+                self._gen.drain_latest_logger_metrics
             )
         except Exception as error:
             warnings.warn(
@@ -2275,8 +2293,18 @@ class SingleControllerActor:
         generated_token_values = _latest_vllm_values(
             generation_metrics, "generation_tokens"
         )
+        generated_tokens_by_worker = (
+            {
+                worker_id: int(value)
+                for worker_id, value in generated_token_values.items()
+            }
+            if generated_token_values
+            else None
+        )
         generated_tokens = (
-            int(sum(generated_token_values)) if generated_token_values else None
+            sum(generated_tokens_by_worker.values())
+            if generated_tokens_by_worker is not None
+            else None
         )
         metrics: dict[str, float] = {
             key: float(value) for key, value in counters.items()
@@ -2333,11 +2361,11 @@ class SingleControllerActor:
         waiting = _latest_vllm_values(generation_metrics, "num_pending_samples")
         kv_usage = _latest_vllm_values(generation_metrics, "kv_cache_usage_perc")
         if running:
-            metrics["vllm_requests_running"] = sum(running)
+            metrics["vllm_requests_running"] = sum(running.values())
         if waiting:
-            metrics["vllm_requests_waiting"] = sum(waiting)
+            metrics["vllm_requests_waiting"] = sum(waiting.values())
         if kv_usage:
-            metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage) / len(kv_usage)
+            metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
         if generated_tokens is not None:
             metrics["vllm_output_tokens"] = float(generated_tokens)
 
@@ -2366,7 +2394,9 @@ class SingleControllerActor:
 
         previous_time = self._throughput_sample_time
         previous_counters = self._throughput_rollout_counters
-        previous_generated_tokens = self._throughput_generation_tokens
+        previous_generated_tokens_by_worker = (
+            self._throughput_generation_tokens_by_worker
+        )
         if previous_time is not None and previous_counters is not None:
             elapsed = now - previous_time
             if elapsed > 0:
@@ -2384,16 +2414,30 @@ class SingleControllerActor:
                     canonical_token_delta / elapsed
                 )
                 if (
-                    generated_tokens is not None
-                    and previous_generated_tokens is not None
-                    and generated_tokens >= previous_generated_tokens
+                    generated_tokens_by_worker is not None
+                    and previous_generated_tokens_by_worker is not None
                 ):
-                    metrics["vllm_output_tokens_per_second"] = (
-                        generated_tokens - previous_generated_tokens
-                    ) / elapsed
+                    current_workers = set(generated_tokens_by_worker)
+                    previous_workers = set(previous_generated_tokens_by_worker)
+                    monotonic = all(
+                        generated_tokens_by_worker[worker_id]
+                        >= previous_generated_tokens_by_worker[worker_id]
+                        for worker_id in current_workers & previous_workers
+                    )
+                    if current_workers == previous_workers and monotonic:
+                        generated_delta = sum(
+                            generated_tokens_by_worker[worker_id]
+                            - previous_generated_tokens_by_worker[worker_id]
+                            for worker_id in current_workers
+                        )
+                        metrics["vllm_output_tokens_per_second"] = (
+                            generated_delta / elapsed
+                        )
+                    else:
+                        metrics["vllm_counter_discontinuity"] = 1.0
 
         self._throughput_sample_time = now
-        self._throughput_generation_tokens = generated_tokens
+        self._throughput_generation_tokens_by_worker = generated_tokens_by_worker
         self._throughput_rollout_counters = counters
         if emit:
             self._log_telemetry_metrics(

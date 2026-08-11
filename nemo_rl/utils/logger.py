@@ -46,6 +46,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
 
+# W&B owns one monotonically increasing internal history row counter per run.
+# Keep the NeMo-RL caller step as a custom axis so independently committed
+# telemetry rows cannot advance past, and thereby invalidate, trainer steps.
+_WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
+
 
 class WandbConfig(TypedDict):
     project: NotRequired[str]
@@ -220,6 +225,9 @@ class WandbLogger(LoggerInterface):
         wandb_init_config = dict(cfg)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
+        self._log_lock = threading.Lock()
+        self.run.define_metric(_WANDB_CALLER_STEP_METRIC, hidden=True)
+        self.run.define_metric("*", step_metric=_WANDB_CALLER_STEP_METRIC)
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -353,7 +361,8 @@ class WandbLogger(LoggerInterface):
             name: Name of the metric or pattern (e.g. 'ray/*')
             step_metric: Optional name of the step metric to use
         """
-        self.run.define_metric(name, step_metric=step_metric)
+        with self._log_lock:
+            self.run.define_metric(name, step_metric=step_metric)
 
     def log_metrics(
         self,
@@ -378,16 +387,13 @@ class WandbLogger(LoggerInterface):
                 for k, v in metrics.items()
             }
 
-        # A defined custom axis selects the plotted x-value; each call still
-        # needs to commit its own W&B history row.
-        if step_metric and step_metric in metrics:
-            self.run.log(metrics)
-        elif step_finished:
-            # Commit param defaults to None. By default if step is set, then commit defaults to False
-            # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
-            self.run.log(metrics, step=step, commit=True)
-        else:
-            self.run.log(metrics, step=step)
+        # Every call is an independent W&B event row. The caller's logical step
+        # is a custom axis rather than W&B's internal row number, so asynchronous
+        # telemetry cannot make a later trainer step look stale and get dropped.
+        event_metrics = dict(metrics)
+        event_metrics[_WANDB_CALLER_STEP_METRIC] = step
+        with self._log_lock:
+            self.run.log(event_metrics)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to wandb.
@@ -404,7 +410,8 @@ class WandbLogger(LoggerInterface):
             figure: Matplotlib figure to log
             step: Global step value
         """
-        self.run.log({name: figure}, step=step)
+        with self._log_lock:
+            self.run.log({name: figure, _WANDB_CALLER_STEP_METRIC: step})
 
     def finish(self) -> None:
         """Flush queued metrics and close the wandb service.
@@ -412,9 +419,10 @@ class WandbLogger(LoggerInterface):
         Required when the run lives inside a Ray actor: Ray tears the worker
         down before wandb's atexit hook can drain the IPC queue to the service.
         """
-        if self.run is not None:
-            self.run.finish()
-            self.run = None
+        with self._log_lock:
+            if self.run is not None:
+                self.run.finish()
+                self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to wandb.
@@ -425,11 +433,23 @@ class WandbLogger(LoggerInterface):
             name: Name of the metric
         """
         try:
-            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+            with self._log_lock:
+                self.run.log(
+                    {
+                        name: wandb.Histogram(histogram),
+                        _WANDB_CALLER_STEP_METRIC: step,
+                    }
+                )
         except ValueError:
             # When all values are identical, numpy cannot create finite-sized bins.
             # Log the scalar value instead.
-            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
+            with self._log_lock:
+                self.run.log(
+                    {
+                        name: histogram[0] if len(histogram) > 0 else 0,
+                        _WANDB_CALLER_STEP_METRIC: step,
+                    }
+                )
 
 
 class SwanlabLogger(LoggerInterface):
