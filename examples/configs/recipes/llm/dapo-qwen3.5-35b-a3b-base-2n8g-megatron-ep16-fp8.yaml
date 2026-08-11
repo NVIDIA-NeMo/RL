@@ -85,6 +85,8 @@ policy:
     vllm_cfg:
       precision: "fp8"
       use_deep_gemm: true
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
       max_model_len: 4096
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.45

@@ -239,10 +239,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
-    # FP8 patches v1 RayDistributedExecutor.collective_rpc to initialize every
-    # engine worker. RayExecutorV2 bypasses that hook, so select the v1 backend.
-    os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
-
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
         # vllm so that upon spawning the thread it applies our FP8 patches

@@ -10,6 +10,8 @@ policy:
     vllm_cfg:
       precision: "fp8"
       use_deep_gemm: true
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
       gpu_memory_utilization: 0.5
   megatron_cfg:
     moe_router_dtype: fp32
