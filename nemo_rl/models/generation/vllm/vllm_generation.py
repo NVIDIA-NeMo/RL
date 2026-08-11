@@ -647,7 +647,7 @@ class VllmGeneration(GenerationInterface):
             collect_sharded_multimodal_payload_metrics(
                 sharded_data,
                 "vllm_generation",
-                enabled=self.cfg.get("debug_payload_metrics", False),
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
             )
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
@@ -705,7 +705,7 @@ class VllmGeneration(GenerationInterface):
             collect_sharded_multimodal_payload_metrics(
                 sharded_data,
                 "vllm_text_generation",
-                enabled=self.cfg.get("debug_payload_metrics", False),
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
             )
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
@@ -781,7 +781,7 @@ class VllmGeneration(GenerationInterface):
             collect_multimodal_payload_metrics(
                 data,
                 "vllm_generation_async",
-                enabled=self.cfg.get("debug_payload_metrics", False),
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
             )
         )
 

@@ -1023,7 +1023,7 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
-    generation_config["debug_payload_metrics"] = grpo_config.debug_payload_metrics
+    generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
     remote_synchronizer_cls = None
     remote_baseline_init_refs: list[Any] = []

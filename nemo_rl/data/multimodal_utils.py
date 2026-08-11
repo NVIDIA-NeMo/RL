@@ -344,17 +344,25 @@ class PackedTensor:
         inputs receive new provenance. When the dtype already matches, immutable
         tensor segments and their provenance remain shared, but mutable wrapper
         state is copied. The logical row-to-segment mapping is preserved exactly.
+
+        Non-floating-point segments are returned unchanged. Integer media
+        metadata (grid sizes, frame counts) is index data, so casting it to a
+        float dtype would silently corrupt it.
         """
+
+        def converted(item: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if item is None or not item.is_floating_point():
+                return item
+            return item.to(dtype=dtype)
+
         requires_conversion = any(
-            item is not None and item.dtype != dtype for item in self.tensors
+            item is not None and item.is_floating_point() and item.dtype != dtype
+            for item in self.tensors
         )
 
         return PackedTensor(
             (
-                [
-                    item.to(dtype=dtype) if item is not None else None
-                    for item in self.tensors
-                ]
+                [converted(item) for item in self.tensors]
                 if requires_conversion
                 else list(self.tensors)
             ),

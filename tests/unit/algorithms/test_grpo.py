@@ -318,6 +318,7 @@ def mock_grpo_components():
                 ),
             ),
             "policy": {
+                "precision": "bfloat16",
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
                 "max_total_sequence_length": 2048,

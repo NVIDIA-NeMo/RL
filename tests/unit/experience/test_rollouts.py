@@ -517,6 +517,7 @@ class _CapturingSyncVllmGeneration:
                 "input_lengths": data["input_lengths"].clone(),
                 "vllm_content": list(data["vllm_content"]),
                 "vllm_images": data["vllm_images"],
+                "has_policy_media": "pixel_values" in data,
             }
         )
         input_lengths = data["input_lengths"].to(dtype=torch.long)
@@ -599,6 +600,11 @@ def test_sync_vlm_multiturn_drops_stale_native_content(
     assert generation.calls[1]["vllm_images"][0][0] is image
     assert generation.calls[0]["input_ids"][0, :1].tolist() == [1]
     assert generation.calls[1]["input_ids"][0, :3].tolist() == [1, 9, 7]
+    # Deduplication sends only the native vLLM media; flag-off also sends the
+    # policy-ready representation. Without this the two legs are identical.
+    assert [call["has_policy_media"] for call in generation.calls] == [
+        not deduplicate_multimodal_data
+    ] * 2
 
 
 def test_async_vlm_generation_receives_exact_compact_native_media_payload():
@@ -695,6 +701,7 @@ def test_async_vlm_multiturn_drops_stale_native_content(
             {
                 "message_log": deepcopy(sample_message_log),
                 "multimodal": dict(sample_multimodal_data or {}),
+                "dedup": deduplicate_multimodal_data,
             }
         )
         updated = deepcopy(sample_message_log)
@@ -765,6 +772,8 @@ def test_async_vlm_multiturn_drops_stale_native_content(
         [9],
         [7],
     ]
+    # Without this the two parametrized legs assert exactly the same thing.
+    assert [call["dedup"] for call in calls] == [deduplicate_multimodal_data] * 2
 
 
 def test_generate_responses_async_requires_sglang_opt_in():
