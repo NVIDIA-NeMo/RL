@@ -73,17 +73,17 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    # Default to RDMA so production clusters (RoCE/IB) pick up the
-    # zero-copy MooncakeStore path introduced in TQ v0.1.8 without
-    # needing env tweaks. Hosts without an mlx5 device fall back to TCP
-    # below so the dev path (laptop, non-RDMA cluster) still works.
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "rdma")
-    if protocol != "rdma":
+    # Default to RDMA so production clusters pick up the zero-copy
+    # MooncakeStore path introduced in TQ v0.1.8 without needing env tweaks.
+    # Hosts without a RoCE-capable mlx5 device fall back to TCP below, so the
+    # dev path (laptop, non-RDMA cluster) still works.
+    requested = os.environ.get("MC_MOONCAKE_PROTOCOL")
+    if (requested or "rdma") != "rdma":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
     if not device:
         try:
-            out = subprocess.run(
+            device = subprocess.run(
                 [
                     "sh",
                     "-c",
@@ -95,12 +95,11 @@ def _mooncake_transport_config() -> dict:
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            device = out or ""
         except Exception:
-            device = ""
+            pass
     if not device:
         detail = "no RoCE-capable mlx5 device detected under /sys/class/infiniband"
-        if "MC_MOONCAKE_PROTOCOL" in os.environ:
+        if requested:
             # Explicitly asked for RDMA. Falling back to TCP here would let a
             # verification run pass without ever touching RDMA, so refuse.
             raise RuntimeError(
@@ -108,8 +107,7 @@ def _mooncake_transport_config() -> dict:
                 "Refusing to fall back to TCP. Set MC_MOONCAKE_PROTOCOL=tcp to "
                 "use TCP, or MC_MOONCAKE_DEVICE=<dev> to name the device."
             )
-        # RDMA is only the default here, not a request — keep the dev path
-        # (laptop, non-RDMA cluster) working.
+        # RDMA is only the default here, not a request.
         warnings.warn(
             f"RDMA is the default transport but {detail}; falling back to TCP. "
             "Set MC_MOONCAKE_PROTOCOL=tcp to silence.",
@@ -192,19 +190,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
-        # Mooncake segment / local buffer sizing, both **per client process**.
-        # MooncakeStoreClient.setup() runs in every process that opens a TQ
-        # client — one per GPU — so a node pays gpus_per_node x (segment +
-        # buffer), not a single node-wide allocation.
-        #
-        # Under ``protocol="rdma"`` (the default, see _mooncake_transport_config)
-        # that cost is *resident*, not virtual: mooncake registers the segment
-        # with the NIC via ibv_reg_mr, which pins the pages so they can be
-        # DMA'd, charging the whole segment to RSS at setup before any traffic.
-        # Over TCP the mapping is lazy and only touched pages count — so sizing
-        # these as generous upper bounds is safe there and is not safe here.
-        # Keep the per-node product in mind when raising them; under-sizing
-        # surfaces as ``batch_get_tensor returned None``.
+        # Sizes are per client process and RDMA-pinned — see DataPlaneConfig
+        # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         overlay = {
             **controller_overlay,
             "backend": {
