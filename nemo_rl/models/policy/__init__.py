@@ -464,7 +464,7 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: NotRequired[str]
+    chat_template: NotRequired[str | None]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
     # Multimodal configs
