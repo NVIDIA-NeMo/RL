@@ -602,7 +602,9 @@ def init_sglang(inference_cluster, generation_config):
         sglang_cfg=generation_config,
     )
     pg.check_weights(action="snapshot")
-    pg.check_weights(action="reset")
+    # SGLang names this action "reset_tensors"; "reset" is unsupported and
+    # raises, which failed this verifier before it could refit.
+    pg.check_weights(action="reset_tensors")
     pg.finish_generation()
     return pg, time.perf_counter() - t0
 
