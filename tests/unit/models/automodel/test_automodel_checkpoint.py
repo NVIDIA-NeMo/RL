@@ -438,17 +438,19 @@ class TestAutomodelCheckpointManager:
         DTensorPolicyWorkerV2 passes is_async=True, so grpo.py's
         wait_fn=policy.finalize_async_save has to resolve to a real wait.
         """
-        from nemo_rl.models.policy.workers.base_policy_worker import BasePolicyWorker
+        from nemo_rl.models.policy.workers.base_policy_worker import (
+            AbstractPolicyWorker,
+        )
         from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-            DTensorPolicyWorkerV2,
+            DTensorPolicyWorkerV2Impl,
         )
 
         assert (
-            DTensorPolicyWorkerV2.finalize_async_save
-            is not BasePolicyWorker.finalize_async_save
+            DTensorPolicyWorkerV2Impl.finalize_async_save
+            is not AbstractPolicyWorker.finalize_async_save
         )
 
-        worker = object.__new__(DTensorPolicyWorkerV2)
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
         worker.checkpoint_manager = MagicMock()
         worker.finalize_async_save()
         worker.checkpoint_manager.finalize_async_save.assert_called_once_with()
