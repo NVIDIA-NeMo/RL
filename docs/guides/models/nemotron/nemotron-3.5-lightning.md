@@ -280,27 +280,21 @@ unset, otherwise the MTP module is instantiated.
 
 ### Launch training
 
-Launch through `ray.sub` like the other Slurm recipes (see the
-[cluster guide](../../../cluster.md)). From the repository root:
+From the repository root:
 
 ```bash
-CONTAINER=<path-to-nemo-rl-sqsh> \
-COMMAND="uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml logger.wandb_enabled=True" \
-sbatch --nodes=4 --gres=gpu:8 \
-    --account=<account> --partition=<partition> --time=4:00:00 \
-    --job-name=dapo-nanov3.5-lightning --dependency=singleton \
-    ray.sub
+uv run examples/run_grpo.py \
+    --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml \
+    logger.wandb_enabled=True
 ```
 
-`checkpointing.checkpoint_must_save_by: "00:03:45:00"` forces a checkpoint
-save and clean exit before a 4-hour wall clock. To train longer than one
-allocation, submit the same command several times with the same job name:
-`--dependency=singleton` chains the jobs and each run resumes automatically
+For launching on a multi-node Slurm or Kubernetes cluster, see the
+[cluster guide](../../../cluster.md). Interrupted runs resume automatically
 from the latest checkpoint in `checkpointing.checkpoint_dir`.
 
 ### Results
 
-Over roughly 210 steps (about seven 4-hour segments), training reward climbs
+Over roughly 210 steps, training reward climbs
 from -0.7 to about 0.5 and AIME-2024 validation accuracy improves from 0.33
 to about 0.75. The truncation rate drops from ~0.5 to ~0.1 as responses
 shorten from ~5,500 to ~3,000 generated tokens per sample.
