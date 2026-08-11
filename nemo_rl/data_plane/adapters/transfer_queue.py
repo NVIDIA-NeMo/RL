@@ -130,8 +130,15 @@ def _connect_existing() -> None:
     tq.init()
 
 
-def _init_tq(cfg: DataPlaneConfig) -> None:
-    """Driver-process path: bootstrap the TQ controller for the chosen backend."""
+def _init_tq(cfg: DataPlaneConfig, gpus_per_node: int) -> None:
+    """Driver-process path: bootstrap the TQ controller for the chosen backend.
+
+    Args:
+        cfg: Data-plane config.
+        gpus_per_node: GPUs on each host, from ``cluster.gpus_per_node``. One
+            TQ client process is created per GPU, so this is the multiplier
+            that turns the per-process mooncake sizes into a per-machine cost.
+    """
     from omegaconf import OmegaConf
 
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
@@ -208,16 +215,15 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         # ``data_plane.host_memory_fraction`` of host RAM.
         segment_size = int(cfg["global_segment_size"])
         buffer_size = int(cfg["local_buffer_size"])
-        procs_per_host = max(torch.cuda.device_count(), 1)
         host_budget = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         per_proc_budget = (
-            int(host_budget * cfg["host_memory_fraction"]) // procs_per_host
+            int(host_budget * cfg["host_memory_fraction"]) // gpus_per_node
         )
         if segment_size + buffer_size > per_proc_budget:
             scale = per_proc_budget / (segment_size + buffer_size)
             warnings.warn(
                 f"data_plane mooncake sizing {segment_size + buffer_size} B/process "
-                f"x {procs_per_host} processes exceeds host_memory_fraction="
+                f"x {gpus_per_node} processes exceeds host_memory_fraction="
                 f"{cfg['host_memory_fraction']} of {host_budget} B; scaling by "
                 f"{scale:.3f}. Lower data_plane.global_segment_size to silence, or "
                 "raise data_plane.host_memory_fraction if the host can afford it.",
@@ -373,7 +379,13 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
-    def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
+    def __init__(
+        self,
+        cfg: DataPlaneConfig,
+        *,
+        bootstrap: bool = True,
+        gpus_per_node: int | None = None,
+    ) -> None:
         """Construct a TQ-backed client.
 
         Args:
@@ -383,6 +395,10 @@ class TQDataPlaneClient(DataPlaneClient):
                 already-running named controller actor in the Ray
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
+            gpus_per_node: GPUs on each host, from ``cluster.gpus_per_node``.
+                Required when ``bootstrap`` is True — it is the per-machine
+                multiplier for the mooncake sizing bound. Ignored on workers,
+                which do not bootstrap the controller.
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
@@ -419,7 +435,13 @@ class TQDataPlaneClient(DataPlaneClient):
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
-            _init_tq(cfg)
+            if gpus_per_node is None:
+                raise ValueError(
+                    "TQDataPlaneClient(bootstrap=True) requires gpus_per_node "
+                    "(from cluster.gpus_per_node) to bound the per-machine "
+                    "mooncake sizing."
+                )
+            _init_tq(cfg, gpus_per_node)
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
