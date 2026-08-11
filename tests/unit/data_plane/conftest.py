@@ -29,6 +29,8 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
@@ -67,6 +69,10 @@ def _session_tq_client_mooncake_cpu():
             "mooncake not installed — skipping mooncake_cpu "
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
         )
+    # These tests exercise the mooncake code path, not the transport. Opt into
+    # TCP so they run on hosts with no RoCE NIC — without it the adapter raises,
+    # since it will not silently downgrade a run that asked for RDMA.
+    os.environ.setdefault("MC_MOONCAKE_PROTOCOL", "tcp")
     client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
     yield client
     client.close()
