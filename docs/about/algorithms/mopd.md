@@ -172,6 +172,22 @@ The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across
 student and teacher are identical, the OPD loss stays near zero — it is a
 correctness smoke test, not a demonstration of distillation gains.
 
+To exercise the student-top-k path with that recipe, disable its inherited
+sequence packing and set the support size explicitly:
+
+```sh
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
+  policy.sequence_packing.enabled=false \
+  on_policy_distillation.student_topk=64 \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/val.jsonl
+```
+
+This remains a smoke-test configuration. Measure throughput, peak memory, and
+loss/reward convergence against full-vocabulary MOPD before using it as a
+performance or quality baseline.
+
 ## References
 
 - LLM-Core Xiaomi, *MiMo-V2-Flash Technical Report*, which introduces the

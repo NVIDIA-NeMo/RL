@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock
+
+import torch
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
 
 def test_teacher_resource_config_defaults():
     from nemo_rl.algorithms.opd import TeacherResourceConfig
@@ -77,3 +83,39 @@ def test_create_teacher_configs_deduplicates():
         }
     )
     assert len(configs) == 2
+
+
+def test_get_logprobs_on_support_routes_shards_and_preserves_worker_order():
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    teacher = object.__new__(TeacherWorkerGroup)
+    teacher.use_sequence_packing = False
+    teacher.cfg = {"megatron_cfg": {"context_parallel_size": 1}}
+    teacher._micro_batch_size = 3
+    teacher.sharding_annotations = MagicMock()
+    teacher.sharding_annotations.get_axis_size.return_value = 2
+    teacher.worker_group = MagicMock()
+    teacher.worker_group.run_all_workers_sharded_data.return_value = ["f0", "f1"]
+    first = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+    second = torch.tensor([[[5.0, 6.0]], [[7.0, 8.0]]])
+    teacher.worker_group.get_all_worker_results.return_value = [
+        {"support_logprobs": first},
+        {"support_logprobs": second},
+    ]
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(4).unsqueeze(1),
+            "topk_indices": torch.zeros(4, 1, 2, dtype=torch.long),
+        }
+    )
+
+    result = teacher.get_logprobs_on_support(data)
+
+    torch.testing.assert_close(
+        result["support_logprobs"], torch.cat((first, second), dim=0)
+    )
+    teacher.worker_group.run_all_workers_sharded_data.assert_called_once()
+    call = teacher.worker_group.run_all_workers_sharded_data.call_args
+    assert call.args == ("get_logprobs_on_support",)
+    assert len(call.kwargs["data"]) == 2
+    assert call.kwargs["common_kwargs"] == {"micro_batch_size": 3}

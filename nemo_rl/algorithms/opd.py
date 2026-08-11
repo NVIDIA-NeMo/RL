@@ -128,6 +128,7 @@ def get_student_topk(master_config: Any) -> Optional[int]:
 
 
 def student_topk_reverse_kl_loss(
+    *,
     student_support_logprobs: torch.Tensor,
     teacher_support_logprobs: torch.Tensor,
     student_target_logprobs: torch.Tensor,
