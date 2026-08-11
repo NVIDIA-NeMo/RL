@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -173,6 +173,10 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    prev_topk_indices: NotRequired[torch.Tensor]
+    prev_topk_logprobs: NotRequired[torch.Tensor]
+    teacher_support_logprobs: NotRequired[torch.Tensor]
+    teacher_reference_logprobs: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -225,13 +229,45 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(
-        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+        self,
+        cfg: ClippedPGLossConfig,
+        use_fused_linear_logprobs: bool = False,
+        opd_student_topk: Optional[int] = None,
     ):
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.opd_student_topk = opd_student_topk
+        self.input_type = (
+            LossInputType.OPD_STUDENT_TOPK
+            if opd_student_topk is not None
+            else LossInputType.LOGPROB
+        )
+        if opd_student_topk is not None:
+            if opd_student_topk < 1:
+                raise ValueError(
+                    f"opd_student_topk must be at least 1, got {opd_student_topk}."
+                )
+            if use_fused_linear_logprobs:
+                raise ValueError(
+                    "Student-top-k OPD is incompatible with fused linear logprobs."
+                )
+            if not cfg.disable_ppo_ratio:
+                raise ValueError(
+                    "Student-top-k OPD requires loss_fn.disable_ppo_ratio=true."
+                )
+            if cfg.use_cispo:
+                raise ValueError("Student-top-k OPD is incompatible with CISPO.")
+            if cfg.ratio_clip_c is not None:
+                raise ValueError(
+                    "Student-top-k OPD is incompatible with dual PPO clipping."
+                )
+            if cfg.sequence_level_importance_ratios or not cfg.token_level_loss:
+                raise ValueError(
+                    "Student-top-k OPD requires token-level loss and importance ratios."
+                )
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
@@ -369,6 +405,15 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.opd_student_topk is not None:
+            self.metric_normalizations.update(
+                {
+                    "opd_topk_head_loss": MetricNormalizer.TOKENS,
+                    "opd_topk_tail_loss": MetricNormalizer.TOKENS,
+                    "opd_topk_student_mass": MetricNormalizer.TOKENS,
+                    "opd_topk_target_outside_fraction": MetricNormalizer.TOKENS,
+                }
+            )
 
     def __call__(
         self,
@@ -376,6 +421,7 @@ class ClippedPGLossFn(LossFunction):
         data: BatchedDataDict[ClippedPGLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        current_support_logprobs: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         curr_logprobs = next_token_logprobs
@@ -549,6 +595,97 @@ class ClippedPGLossFn(LossFunction):
 
             # Determine which value to use for clipping (max for pessimistic estimate)
             clip_loss = torch.max(loss1, loss2)
+
+        opd_topk_metrics: dict[str, float] = {}
+        if self.opd_student_topk is not None:
+            from nemo_rl.algorithms.opd import student_topk_reverse_kl_loss
+
+            if current_support_logprobs is None:
+                raise ValueError("Student-top-k OPD requires current_support_logprobs.")
+            required_fields = (
+                "prev_topk_indices",
+                "prev_topk_logprobs",
+                "teacher_support_logprobs",
+                "teacher_reference_logprobs",
+            )
+            missing = [field for field in required_fields if field not in data]
+            if missing:
+                raise ValueError(
+                    "Student-top-k OPD training data is missing: " + ", ".join(missing)
+                )
+
+            support_indices = data["prev_topk_indices"][:, :-1]
+            previous_support_logprobs = data["prev_topk_logprobs"][:, :-1]
+            teacher_support_logprobs = data["teacher_support_logprobs"][:, :-1]
+            expected_support_shape = support_indices.shape
+            for name, value in (
+                ("current_support_logprobs", current_support_logprobs),
+                ("prev_topk_logprobs", previous_support_logprobs),
+                ("teacher_support_logprobs", teacher_support_logprobs),
+            ):
+                if value.shape != expected_support_shape:
+                    raise ValueError(
+                        f"{name} must have shape {expected_support_shape}, "
+                        f"got {value.shape}."
+                    )
+            teacher_support_logprobs = teacher_support_logprobs.to(
+                device=current_support_logprobs.device,
+                dtype=current_support_logprobs.dtype,
+            )
+            if expected_support_shape[-1] != self.opd_student_topk:
+                raise ValueError(
+                    "Student top-k data does not match configured support size: "
+                    f"expected {self.opd_student_topk}, got "
+                    f"{expected_support_shape[-1]}."
+                )
+
+            target_indices = data["input_ids"][:, 1:].to(
+                device=support_indices.device,
+                dtype=support_indices.dtype,
+            )
+            target_in_support = support_indices.eq(target_indices.unsqueeze(-1)).any(
+                dim=-1
+            )
+            teacher_target_logprobs = data["teacher_reference_logprobs"][:, 1:].to(
+                device=curr_logprobs.device,
+                dtype=curr_logprobs.dtype,
+            )
+            clip_loss = student_topk_reverse_kl_loss(
+                student_support_logprobs=current_support_logprobs,
+                teacher_support_logprobs=teacher_support_logprobs,
+                student_target_logprobs=curr_logprobs,
+                teacher_target_logprobs=teacher_target_logprobs,
+                target_in_support=target_in_support,
+            )
+            with torch.no_grad():
+                current_support_probs = current_support_logprobs.exp()
+                head_loss = (
+                    current_support_probs
+                    * (current_support_logprobs - teacher_support_logprobs)
+                ).sum(dim=-1)
+                tail_loss = clip_loss - head_loss
+                opd_topk_metrics = {
+                    "opd_topk_head_loss": masked_mean(
+                        head_loss,
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "opd_topk_tail_loss": masked_mean(
+                        tail_loss,
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "opd_topk_student_mass": masked_mean(
+                        current_support_probs.sum(dim=-1),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "opd_topk_target_outside_fraction": masked_mean(
+                        (~target_in_support).to(mask.dtype),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                }
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
             assert self.ratio_clip_c > 1, (
@@ -783,6 +920,7 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
+                **opd_topk_metrics,
             },
         )
 
